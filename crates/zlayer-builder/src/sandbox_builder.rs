@@ -35,11 +35,12 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::dockerfile::{
-    expand_variables, AddInstruction, CopyInstruction, Dockerfile, HealthcheckInstruction,
-    ImageRef, Instruction, ShellOrExec,
+    expand_variables, AddInstruction, CopyInstruction, Dockerfile, DockerfileFromTarget,
+    HealthcheckInstruction, Instruction, ShellOrExec,
 };
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
+use zlayer_types::ImageReference;
 
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
@@ -410,7 +411,7 @@ impl SandboxImageBuilder {
             self.send_event(BuildEvent::StageStarted {
                 index: stage_idx,
                 name: stage.name.clone(),
-                base_image: stage.base_image.to_string_ref(),
+                base_image: stage.base_image.to_string(),
             });
 
             // Step 1: Set up the rootfs from the base image
@@ -432,7 +433,7 @@ impl SandboxImageBuilder {
             // If this stage uses a toolchain, inject its env vars into the config.
             // Skip if the config already has these vars (e.g., loaded from cached image config.json).
             if let Some(spec) =
-                crate::macos_toolchain::detect_toolchain(&stage.base_image.to_string_ref())
+                crate::macos_toolchain::detect_toolchain(&stage.base_image.to_string())
             {
                 let has_toolchain_env = spec
                     .env
@@ -588,13 +589,17 @@ impl SandboxImageBuilder {
     /// For `scratch`, creates an empty rootfs. For registry images, checks if
     /// we already have the image locally; otherwise pulls via `zlayer-registry`.
     #[allow(clippy::too_many_lines)]
-    async fn setup_base_image(&self, image_ref: &ImageRef, rootfs_dir: &Path) -> Result<()> {
+    async fn setup_base_image(
+        &self,
+        image_ref: &DockerfileFromTarget,
+        rootfs_dir: &Path,
+    ) -> Result<()> {
         match image_ref {
-            ImageRef::Scratch => {
+            DockerfileFromTarget::Scratch => {
                 info!("Using scratch base image (empty rootfs)");
                 Ok(())
             }
-            ImageRef::Stage(name) => {
+            DockerfileFromTarget::Stage(name) => {
                 // Look for a previously built stage in the images directory
                 let sanitized = sanitize_image_name(name);
                 let stage_rootfs = self.data_dir.join("images").join(&sanitized).join("rootfs");
@@ -611,8 +616,8 @@ impl SandboxImageBuilder {
                     Err(BuildError::StageNotFound { name: name.clone() })
                 }
             }
-            ImageRef::Registry { .. } => {
-                let raw_ref = image_ref.to_string_ref();
+            DockerfileFromTarget::Image(r) => {
+                let raw_ref = image_ref.to_string();
 
                 // macOS 3-tier resolution for known images
                 #[cfg(target_os = "macos")]
@@ -680,8 +685,11 @@ impl SandboxImageBuilder {
                 }
 
                 // --- NOT a rewritable image: existing resolution logic ---
-                let qualified = image_ref.qualify();
-                let full_ref = qualified.to_string_ref();
+                // `ImageReference::from_str` normalizes during parse (Docker Hub
+                // default registry, `library/` namespace), so the parsed `r`
+                // is already the fully-qualified form.
+                let qualified: ImageReference = r.clone();
+                let full_ref = qualified.to_string();
 
                 // Check 1: exact qualified name in local cache
                 let sanitized = sanitize_image_name(&full_ref);
@@ -699,15 +707,20 @@ impl SandboxImageBuilder {
                 #[cfg(feature = "local-registry")]
                 if let Some(ref registry) = self.local_registry {
                     // Try the raw (unqualified) reference first
-                    let (name, tag) = parse_image_name_tag(&raw_ref);
+                    let name = r.repository().to_string();
+                    let tag = r.tag().unwrap_or("latest").to_string();
                     if registry.has_manifest(&name, &tag).await {
                         info!("Found '{}' in local registry, extracting layers", raw_ref);
                         return self
                             .extract_from_local_registry(registry, &name, &tag, rootfs_dir)
                             .await;
                     }
-                    // Also try the fully-qualified reference
-                    let (qname, qtag) = parse_image_name_tag(&full_ref);
+                    // Also try the fully-qualified reference. Since `r` is
+                    // already fully qualified by parse, this collapses to the
+                    // same (name, tag) — kept for parity with the previous
+                    // behavior.
+                    let qname = qualified.repository().to_string();
+                    let qtag = qualified.tag().unwrap_or("latest").to_string();
                     if (qname != name || qtag != tag) && registry.has_manifest(&qname, &qtag).await
                     {
                         info!("Found '{}' in local registry, extracting layers", full_ref);
@@ -924,13 +937,16 @@ impl SandboxImageBuilder {
     /// Checks for a cached `image_config.json` alongside the rootfs first;
     /// falls back to pulling from the registry when the `cache` feature is
     /// enabled.
-    async fn load_base_image_config(&self, image_ref: &ImageRef) -> Result<SandboxImageConfig> {
+    async fn load_base_image_config(
+        &self,
+        image_ref: &DockerfileFromTarget,
+    ) -> Result<SandboxImageConfig> {
         match image_ref {
-            ImageRef::Scratch => Ok(SandboxImageConfig {
+            DockerfileFromTarget::Scratch => Ok(SandboxImageConfig {
                 working_dir: "/".to_string(),
                 ..Default::default()
             }),
-            ImageRef::Stage { .. } => {
+            DockerfileFromTarget::Stage(_) => {
                 // For stage references, there's no external config to load —
                 // the config is built up from Dockerfile instructions.
                 Ok(SandboxImageConfig {
@@ -938,8 +954,8 @@ impl SandboxImageBuilder {
                     ..Default::default()
                 })
             }
-            ImageRef::Registry { .. } => {
-                let raw_ref = image_ref.to_string_ref();
+            DockerfileFromTarget::Image(r) => {
+                let raw_ref = image_ref.to_string();
 
                 // Check rewritten macOS image config first
                 #[cfg(target_os = "macos")]
@@ -962,8 +978,10 @@ impl SandboxImageBuilder {
                     }
                 }
 
-                let qualified = image_ref.qualify();
-                let full_ref = qualified.to_string_ref();
+                // `ImageReference::from_str` already normalized this ref;
+                // reuse the parsed form as the "qualified" name.
+                let qualified: ImageReference = r.clone();
+                let full_ref = qualified.to_string();
 
                 // Check for cached config (qualified name first, then raw)
                 for name in [&full_ref, &raw_ref] {
@@ -2133,15 +2151,6 @@ fn resolve_dest_path(rootfs_dir: &Path, working_dir: &str, dest: &str) -> PathBu
 /// Sanitize an image name for use as a filesystem directory name.
 pub(crate) fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
-}
-
-/// Parse an image reference into (name, tag) parts.
-fn parse_image_name_tag(reference: &str) -> (String, String) {
-    if let Some((name, tag)) = reference.rsplit_once(':') {
-        (name.to_string(), tag.to_string())
-    } else {
-        (reference.to_string(), "latest".to_string())
-    }
 }
 
 /// Generate a short build ID for unique naming.

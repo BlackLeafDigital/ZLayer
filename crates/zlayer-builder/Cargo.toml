@@ -73,6 +73,9 @@ zlayer-paths.workspace = true
 # routing manifest pulls through `ImagePuller::with_platform`.
 zlayer-spec.workspace = true
 
+# Shared types (re-exports oci_client::Reference as ImageReference)
+zlayer-types = { path = "../zlayer-types" }
+
 # Windows-only dependencies for the HCS (Host Compute Service) build backend.
 # The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer
 # primitives (scratch layer creation, BackupRead-based diff capture) with a

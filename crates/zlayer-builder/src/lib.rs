@@ -107,7 +107,7 @@
 //! let executor = BuildahExecutor::new()?;
 //!
 //! // Create a working container from the base image
-//! let from_cmd = BuildahCommand::from_image(&stage.base_image.to_string_ref());
+//! let from_cmd = BuildahCommand::from_image(&stage.base_image.to_string());
 //! let output = executor.execute_checked(&from_cmd).await?;
 //! let container_id = output.stdout.trim();
 //!
@@ -235,7 +235,6 @@ pub use dockerfile::{
     ExposeInstruction,
     ExposeProtocol,
     HealthcheckInstruction,
-    ImageRef,
     Instruction,
     RunInstruction,
     ShellOrExec,

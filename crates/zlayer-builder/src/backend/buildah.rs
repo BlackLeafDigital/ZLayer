@@ -12,7 +12,7 @@ use tracing::{debug, info};
 
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuildOptions, BuiltImage, PullBaseMode, RegistryAuth};
-use crate::dockerfile::{Dockerfile, ImageRef, Instruction, RunMount, Stage};
+use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction, RunMount, Stage};
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 
@@ -156,25 +156,26 @@ impl BuildahBackend {
     /// 2. Fall back to Docker Hub qualification (`docker.io/library/...`)
     async fn resolve_base_image(
         &self,
-        image_ref: &ImageRef,
+        image_ref: &DockerfileFromTarget,
         stage_images: &HashMap<String, String>,
         options: &BuildOptions,
     ) -> Result<String> {
         match image_ref {
-            ImageRef::Stage(name) => {
+            DockerfileFromTarget::Stage(name) => {
                 return stage_images
                     .get(name)
                     .cloned()
                     .ok_or_else(|| BuildError::stage_not_found(name));
             }
-            ImageRef::Scratch => return Ok("scratch".to_string()),
-            ImageRef::Registry { .. } => {}
+            DockerfileFromTarget::Scratch => return Ok("scratch".to_string()),
+            DockerfileFromTarget::Image(_) => {}
         }
 
         // Check if name is already fully qualified (has registry hostname).
         let is_qualified = match image_ref {
-            ImageRef::Registry { image, .. } => {
-                let first = image.split('/').next().unwrap_or("");
+            DockerfileFromTarget::Image(r) => {
+                let repo = r.repository();
+                let first = repo.split('/').next().unwrap_or("");
                 first.contains('.') || first.contains(':') || first == "localhost"
             }
             _ => false,
@@ -187,25 +188,26 @@ impl BuildahBackend {
             }
         }
 
-        // Fall back: qualify to docker.io and build the full string.
-        let qualified = image_ref.qualify();
-        match &qualified {
-            ImageRef::Registry { image, tag, digest } => {
-                let mut result = image.clone();
-                if let Some(t) = tag {
+        // Fall back: rely on oci-spec normalization performed during parse.
+        // Reconstruct the fully-qualified reference string from the parsed
+        // ImageReference (registry/repository[:tag][@digest]).
+        match image_ref {
+            DockerfileFromTarget::Image(r) => {
+                let mut result = format!("{}/{}", r.registry(), r.repository());
+                if let Some(t) = r.tag() {
                     result.push(':');
                     result.push_str(t);
                 }
-                if let Some(d) = digest {
+                if let Some(d) = r.digest() {
                     result.push('@');
                     result.push_str(d);
                 }
-                if tag.is_none() && digest.is_none() {
+                if r.tag().is_none() && r.digest().is_none() {
                     result.push_str(":latest");
                 }
                 Ok(result)
             }
-            _ => unreachable!("qualify() preserves Registry variant"),
+            _ => unreachable!("Stage and Scratch handled above"),
         }
     }
 
@@ -215,13 +217,14 @@ impl BuildahBackend {
     #[allow(clippy::unused_async)]
     async fn try_resolve_from_sources(
         &self,
-        image_ref: &ImageRef,
+        image_ref: &DockerfileFromTarget,
         options: &BuildOptions,
     ) -> Option<String> {
         let (name, tag_str) = match image_ref {
-            ImageRef::Registry { image, tag, .. } => {
-                (image.as_str(), tag.as_deref().unwrap_or("latest"))
-            }
+            DockerfileFromTarget::Image(r) => (
+                r.repository().to_string(),
+                r.tag().unwrap_or("latest").to_string(),
+            ),
             _ => return None,
         };
 
@@ -350,7 +353,7 @@ impl BuildBackend for BuildahBackend {
                 BuildEvent::StageStarted {
                     index: stage_idx,
                     name: stage.name.clone(),
-                    base_image: stage.base_image.to_string_ref(),
+                    base_image: stage.base_image.to_string(),
                 },
             );
 
@@ -374,7 +377,7 @@ impl BuildBackend for BuildahBackend {
 
             // Track the current WORKDIR for this stage.
             let mut current_workdir = match &stage.base_image {
-                ImageRef::Stage(name) => stage_workdirs
+                DockerfileFromTarget::Stage(name) => stage_workdirs
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| String::from("/")),

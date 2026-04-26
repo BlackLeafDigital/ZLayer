@@ -12274,6 +12274,7 @@ dependencies = [
  "zlayer-registry",
  "zlayer-spec",
  "zlayer-tui",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12766,6 +12767,14 @@ dependencies = [
  "tracing",
  "uuid",
  "zlayer-spec",
+]
+
+[[package]]
+name = "zlayer-types"
+version = "0.1.0"
+dependencies = [
+ "oci-client",
+ "serde",
 ]
 
 [[package]]

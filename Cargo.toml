@@ -29,6 +29,7 @@ members = [
   "crates/zlayer-client",
   "crates/zlayer-hcs",
   "crates/zlayer-hns",
+  "crates/zlayer-types",
 ]
 
 [workspace.package]

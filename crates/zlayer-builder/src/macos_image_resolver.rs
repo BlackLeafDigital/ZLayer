@@ -16,9 +16,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use zlayer_types::ImageReference;
 
 use crate::error::{BuildError, Result};
 use crate::macos_toolchain::{
@@ -96,8 +98,15 @@ pub fn rewrite_image_for_macos(image_ref: &str) -> Option<String> {
     // Strip the registry prefix (docker.io/library/, ghcr.io/foo/, etc.)
     let stripped = strip_registry_prefix(image_ref);
 
-    // Split into name and tag.
-    let (name, tag) = split_name_tag(&stripped);
+    // Split into name and tag using the canonical parser (handles host:port,
+    // digests, and missing tags correctly).
+    let (name, tag) = match ImageReference::from_str(&stripped) {
+        Ok(r) => (
+            r.repository().to_string(),
+            r.tag().unwrap_or("latest").to_string(),
+        ),
+        Err(_) => (stripped.clone(), "latest".to_string()),
+    };
     let base_name = name.rsplit('/').next().unwrap_or(&name);
 
     // Base distro images → base:latest
@@ -155,15 +164,6 @@ fn strip_registry_prefix(image_ref: &str) -> String {
         }
     }
     image_ref.to_string()
-}
-
-/// Split an image reference into (name, tag). Defaults tag to "latest".
-fn split_name_tag(image_ref: &str) -> (String, String) {
-    if let Some((name, tag)) = image_ref.rsplit_once(':') {
-        (name.to_string(), tag.to_string())
-    } else {
-        (image_ref.to_string(), "latest".to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------

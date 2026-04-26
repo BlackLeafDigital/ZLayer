@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
+use std::str::FromStr;
+use zlayer_types::ImageReference;
+
 use crate::error::{BuildError, Result};
 
 // ---------------------------------------------------------------------------
@@ -193,7 +196,16 @@ impl ToolchainSpec {
 /// the language and version.
 #[must_use]
 pub fn detect_toolchain(image_ref: &str) -> Option<ToolchainSpec> {
-    let (name, tag) = split_image_name_tag(image_ref);
+    let (name, tag) = match ImageReference::from_str(image_ref) {
+        Ok(r) => (
+            r.repository().to_string(),
+            r.tag().unwrap_or("latest").to_string(),
+        ),
+        Err(_) => {
+            // Inputs that aren't valid OCI refs (e.g. bare stage names) — fall back to the raw input.
+            (image_ref.to_string(), "latest".to_string())
+        }
+    };
 
     // Strip registry prefix: "docker.io/library/golang" → "golang"
     let base_name = name.rsplit('/').next().unwrap_or(&name);
@@ -213,15 +225,6 @@ pub fn detect_toolchain(image_ref: &str) -> Option<ToolchainSpec> {
         name if name.contains("graalvm") => Some(ToolchainSpec::graalvm(&version)),
         // Base images and unknown — no toolchain needed
         _ => None,
-    }
-}
-
-/// Split an image reference into name and tag.
-fn split_image_name_tag(image_ref: &str) -> (String, String) {
-    if let Some((name, tag)) = image_ref.rsplit_once(':') {
-        (name.to_string(), tag.to_string())
-    } else {
-        (image_ref.to_string(), "latest".to_string())
     }
 }
 

@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 
 use crate::dockerfile::{
-    AddInstruction, ArgInstruction, CopyInstruction, EnvInstruction, ExposeInstruction,
-    HealthcheckInstruction, ImageRef, Instruction, RunInstruction, RunMount, ShellOrExec, Stage,
+    AddInstruction, ArgInstruction, CopyInstruction, DockerfileFromTarget, EnvInstruction,
+    ExposeInstruction, HealthcheckInstruction, Instruction, RunInstruction, RunMount, ShellOrExec,
+    Stage,
 };
 use crate::error::{BuildError, Result};
 
@@ -94,7 +95,7 @@ fn convert_global_args(args: &HashMap<String, String>) -> Vec<ArgInstruction> {
 // ---------------------------------------------------------------------------
 
 fn convert_single_stage(zimage: &ZImage, base: &str) -> Result<Stage> {
-    let base_image = ImageRef::parse(base);
+    let base_image = DockerfileFromTarget::parse(base);
     let mut instructions = Vec::new();
 
     // env
@@ -191,9 +192,9 @@ fn convert_multi_stage(
         })?;
 
         let base_image = if stage_names.iter().any(|s| s.as_str() == base_str) {
-            ImageRef::Stage(base_str.to_string())
+            DockerfileFromTarget::Stage(base_str.to_string())
         } else {
-            ImageRef::parse(base_str)
+            DockerfileFromTarget::parse(base_str)
         };
 
         let mut instructions = Vec::new();
@@ -561,10 +562,13 @@ cmd: ["./app.sh"]
         assert!(stage.name.is_none());
 
         // base image
-        assert!(matches!(
-            &stage.base_image,
-            ImageRef::Registry { image, tag: Some(t), .. } if image == "alpine" && t == "3.19"
-        ));
+        match &stage.base_image {
+            DockerfileFromTarget::Image(r) => {
+                assert!(r.repository().contains("alpine"));
+                assert_eq!(r.tag(), Some("3.19"));
+            }
+            other => panic!("expected DockerfileFromTarget::Image, got {other:?}"),
+        }
 
         // Should contain RUN, COPY, WORKDIR, CMD
         let names: Vec<&str> = stage
@@ -737,9 +741,9 @@ stages:
 "#,
         );
 
-        // The 'derived' stage should reference 'base' as ImageRef::Stage.
+        // The 'derived' stage should reference 'base' as DockerfileFromTarget::Stage.
         let derived = &df.stages[1];
-        assert!(matches!(&derived.base_image, ImageRef::Stage(name) if name == "base"));
+        assert!(matches!(&derived.base_image, DockerfileFromTarget::Stage(name) if name == "base"));
     }
 
     // -- Step conversion tests --------------------------------------------
@@ -954,7 +958,10 @@ cmd: ["/app"]
 "#,
         );
 
-        assert!(matches!(&df.stages[0].base_image, ImageRef::Scratch));
+        assert!(matches!(
+            &df.stages[0].base_image,
+            DockerfileFromTarget::Scratch
+        ));
     }
 
     #[test]

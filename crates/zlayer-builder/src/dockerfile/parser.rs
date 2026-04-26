@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use dockerfile_parser::{Dockerfile as RawDockerfile, Instruction as RawInstruction};
 use serde::{Deserialize, Serialize};
+use zlayer_types::ImageReference;
 
 use crate::error::{BuildError, Result};
 
@@ -16,149 +18,71 @@ use super::instruction::{
     ExposeProtocol, HealthcheckInstruction, Instruction, RunInstruction, ShellOrExec,
 };
 
-/// A reference to a Docker image
+/// A Dockerfile `FROM` target.
+///
+/// `FROM` references can resolve to one of three things in a Dockerfile:
+/// an OCI image (the common case), a previous stage in a multi-stage
+/// build (e.g. `FROM builder AS final`), or the special `scratch`
+/// pseudo-image. This enum captures all three. For non-Dockerfile call
+/// sites (image registry lookups, toolchain detection, etc.) use
+/// [`zlayer_types::ImageReference`] directly — the bare OCI ref type
+/// without the Dockerfile-only variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ImageRef {
-    /// A registry image reference
-    Registry {
-        /// The full image name (e.g., "docker.io/library/alpine")
-        image: String,
-        /// Optional tag (e.g., "3.18")
-        tag: Option<String>,
-        /// Optional digest (e.g., "sha256:...")
-        digest: Option<String>,
-    },
-    /// A reference to another stage in a multi-stage build
+pub enum DockerfileFromTarget {
+    /// An OCI image reference (canonical OCI grammar).
+    Image(ImageReference),
+    /// A reference to another stage in this multi-stage build.
     Stage(String),
-    /// The special "scratch" base image
+    /// The special `scratch` pseudo-image.
     Scratch,
 }
 
-impl ImageRef {
-    /// Parse an image reference string
+impl DockerfileFromTarget {
+    /// Parse a raw `FROM` target string.
+    ///
+    /// Recognizes `scratch` (case-insensitive), then attempts an OCI
+    /// reference parse via [`ImageReference::from_str`]. If parsing
+    /// succeeds, the result is an [`Self::Image`]; otherwise the
+    /// input is treated as a [`Self::Stage`] reference.
+    ///
+    /// Note that the OCI grammar accepts bare names like `alpine` as
+    /// valid image references, so disambiguation between an image
+    /// and a multi-stage stage reference must happen post-hoc at the
+    /// call site by consulting the set of known stage names.
     #[must_use]
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
 
-        // Handle scratch special case
         if s.eq_ignore_ascii_case("scratch") {
             return Self::Scratch;
         }
 
-        // Parse image@digest or image:tag
-        if let Some((image, digest)) = s.rsplit_once('@') {
-            return Self::Registry {
-                image: image.to_string(),
-                tag: None,
-                digest: Some(digest.to_string()),
-            };
-        }
-
-        // Check for tag (but be careful with ports like localhost:5000/image)
-        let colon_count = s.matches(':').count();
-        if colon_count > 0 {
-            if let Some((prefix, suffix)) = s.rsplit_once(':') {
-                // If suffix doesn't contain '/', it's a tag
-                if !suffix.contains('/') {
-                    return Self::Registry {
-                        image: prefix.to_string(),
-                        tag: Some(suffix.to_string()),
-                        digest: None,
-                    };
-                }
-            }
-        }
-
-        // No tag or digest
-        Self::Registry {
-            image: s.to_string(),
-            tag: None,
-            digest: None,
+        match ImageReference::from_str(s) {
+            Ok(r) => Self::Image(r),
+            Err(_) => Self::Stage(s.to_string()),
         }
     }
 
-    /// Convert to a full image string
-    #[must_use]
-    pub fn to_string_ref(&self) -> String {
-        match self {
-            Self::Registry { image, tag, digest } => {
-                let mut s = image.clone();
-                if let Some(t) = tag {
-                    s.push(':');
-                    s.push_str(t);
-                }
-                if let Some(d) = digest {
-                    s.push('@');
-                    s.push_str(d);
-                }
-                s
-            }
-            Self::Stage(name) => name.clone(),
-            Self::Scratch => "scratch".to_string(),
-        }
-    }
-
-    /// Returns true if this is a reference to a build stage
+    /// Returns true if this is a stage reference.
     #[must_use]
     pub fn is_stage(&self) -> bool {
         matches!(self, Self::Stage(_))
     }
 
-    /// Returns true if this is the scratch base
+    /// Returns true if this is the `scratch` pseudo-image.
     #[must_use]
     pub fn is_scratch(&self) -> bool {
         matches!(self, Self::Scratch)
     }
-
-    /// Qualify a short image name to a fully-qualified registry reference.
-    ///
-    /// Converts short Docker image names to their fully-qualified equivalents
-    /// for systems without unqualified-search registries configured (e.g. buildah
-    /// on CI runners without `/etc/containers/registries.conf`).
-    ///
-    /// - `rust:1.90` → `docker.io/library/rust:1.90` (official image)
-    /// - `user/image:tag` → `docker.io/user/image:tag` (user image)
-    /// - `ghcr.io/org/image:tag` → unchanged (already qualified)
-    /// - `localhost:5000/image:tag` → unchanged (already qualified)
-    /// - `scratch` / stage refs → unchanged
-    #[must_use]
-    pub fn qualify(&self) -> Self {
-        match self {
-            Self::Scratch | Self::Stage(_) => self.clone(),
-            Self::Registry { image, tag, digest } => {
-                let qualified = qualify_image_name(image);
-                Self::Registry {
-                    image: qualified,
-                    tag: tag.clone(),
-                    digest: digest.clone(),
-                }
-            }
-        }
-    }
 }
 
-/// Qualify a short image name to a fully-qualified registry reference.
-///
-/// If the first path segment contains `.` or `:` or equals `localhost`,
-/// the name is already qualified and returned as-is. Otherwise:
-/// - No `/` → official Docker Hub image: `docker.io/library/{name}`
-/// - Has `/` → Docker Hub user image: `docker.io/{name}`
-fn qualify_image_name(image: &str) -> String {
-    let parts: Vec<&str> = image.split('/').collect();
-
-    if parts.is_empty() {
-        return format!("docker.io/library/{image}");
-    }
-
-    let first = parts[0];
-    if first.contains('.') || first.contains(':') || first == "localhost" {
-        return image.to_string();
-    }
-
-    if parts.len() == 1 {
-        format!("docker.io/library/{image}")
-    } else {
-        format!("docker.io/{image}")
+impl std::fmt::Display for DockerfileFromTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image(r) => write!(f, "{r}"),
+            Self::Stage(name) => f.write_str(name),
+            Self::Scratch => f.write_str("scratch"),
+        }
     }
 }
 
@@ -172,7 +96,7 @@ pub struct Stage {
     pub name: Option<String>,
 
     /// The base image for this stage
-    pub base_image: ImageRef,
+    pub base_image: DockerfileFromTarget,
 
     /// Optional platform specification (e.g., "linux/amd64")
     pub platform: Option<String>,
@@ -251,6 +175,11 @@ impl Dockerfile {
         let mut stages = Vec::new();
         let mut current_stage: Option<Stage> = None;
         let mut stage_index = 0;
+        // Track stage names declared so far so subsequent FROM lines can
+        // resolve `FROM <name>` to a stage reference even when the name
+        // is also a syntactically-valid OCI reference (e.g. `FROM builder`).
+        let mut known_stage_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for instruction in raw.instructions {
             match &instruction {
@@ -261,10 +190,26 @@ impl Dockerfile {
                     }
 
                     // Parse base image
-                    let base_image = ImageRef::parse(&from.image.content);
+                    let raw_from = from.image.content.trim().to_string();
+                    let mut base_image = DockerfileFromTarget::parse(&raw_from);
+
+                    // Post-hoc stage promotion: `DockerfileFromTarget::parse`
+                    // delegates to the OCI grammar, which accepts bare names
+                    // like `builder` as valid image refs. If the raw FROM
+                    // text matches a previously-declared stage name, swap
+                    // the parsed `Image` for a `Stage` reference.
+                    if matches!(base_image, DockerfileFromTarget::Image(_))
+                        && known_stage_names.contains(&raw_from)
+                    {
+                        base_image = DockerfileFromTarget::Stage(raw_from.clone());
+                    }
 
                     // Get alias (stage name) - the field is `alias` not `image_alias`
                     let name = from.alias.as_ref().map(|a| a.content.clone());
+
+                    if let Some(ref n) = name {
+                        known_stage_names.insert(n.clone());
+                    }
 
                     // Get platform flag
                     let platform = from
@@ -589,171 +534,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_image_ref_parse_simple() {
-        let img = ImageRef::parse("alpine");
-        assert!(matches!(
-            img,
-            ImageRef::Registry {
-                ref image,
-                tag: None,
-                digest: None
-            } if image == "alpine"
-        ));
-    }
-
-    #[test]
-    fn test_image_ref_parse_with_tag() {
-        let img = ImageRef::parse("alpine:3.18");
-        assert!(matches!(
-            img,
-            ImageRef::Registry {
-                ref image,
-                tag: Some(ref t),
-                digest: None
-            } if image == "alpine" && t == "3.18"
-        ));
-    }
-
-    #[test]
-    fn test_image_ref_parse_with_digest() {
-        let img = ImageRef::parse("alpine@sha256:abc123");
-        assert!(matches!(
-            img,
-            ImageRef::Registry {
-                ref image,
-                tag: None,
-                digest: Some(ref d)
-            } if image == "alpine" && d == "sha256:abc123"
-        ));
-    }
-
-    #[test]
-    fn test_image_ref_parse_scratch() {
-        let img = ImageRef::parse("scratch");
-        assert!(matches!(img, ImageRef::Scratch));
-
-        let img = ImageRef::parse("SCRATCH");
-        assert!(matches!(img, ImageRef::Scratch));
-    }
-
-    #[test]
-    fn test_image_ref_parse_registry_with_port() {
-        let img = ImageRef::parse("localhost:5000/myimage:latest");
-        assert!(matches!(
-            img,
-            ImageRef::Registry {
-                ref image,
-                tag: Some(ref t),
-                ..
-            } if image == "localhost:5000/myimage" && t == "latest"
-        ));
-    }
-
-    // -----------------------------------------------------------------------
-    // ImageRef::qualify() tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_qualify_official_image_no_tag() {
-        let img = ImageRef::parse("alpine");
-        let q = img.qualify();
-        assert!(matches!(
-            q,
-            ImageRef::Registry { ref image, tag: None, digest: None }
-            if image == "docker.io/library/alpine"
-        ));
-    }
-
-    #[test]
-    fn test_qualify_official_image_with_tag() {
-        let img = ImageRef::parse("rust:1.90-bookworm");
-        let q = img.qualify();
-        assert!(matches!(
-            q,
-            ImageRef::Registry { ref image, tag: Some(ref t), digest: None }
-            if image == "docker.io/library/rust" && t == "1.90-bookworm"
-        ));
-    }
-
-    #[test]
-    fn test_qualify_user_image() {
-        let img = ImageRef::parse("lukemathwalker/cargo-chef:latest-rust-1.90");
-        let q = img.qualify();
-        assert!(matches!(
-            q,
-            ImageRef::Registry { ref image, tag: Some(ref t), .. }
-            if image == "docker.io/lukemathwalker/cargo-chef" && t == "latest-rust-1.90"
-        ));
-    }
-
-    #[test]
-    fn test_qualify_already_qualified_ghcr() {
-        let img = ImageRef::parse("ghcr.io/org/image:v1");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "ghcr.io/org/image:v1");
-    }
-
-    #[test]
-    fn test_qualify_already_qualified_quay() {
-        let img = ImageRef::parse("quay.io/org/image:latest");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "quay.io/org/image:latest");
-    }
-
-    #[test]
-    fn test_qualify_already_qualified_custom_registry() {
-        let img = ImageRef::parse("registry.example.com/org/image:v2");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "registry.example.com/org/image:v2");
-    }
-
-    #[test]
-    fn test_qualify_localhost_with_port() {
-        let img = ImageRef::parse("localhost:5000/myimage:latest");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "localhost:5000/myimage:latest");
-    }
-
-    #[test]
-    fn test_qualify_localhost_without_port() {
-        let img = ImageRef::parse("localhost/myimage:v1");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "localhost/myimage:v1");
-    }
-
-    #[test]
-    fn test_qualify_with_digest() {
-        let img = ImageRef::parse("alpine@sha256:abc123def");
-        let q = img.qualify();
-        assert!(matches!(
-            q,
-            ImageRef::Registry { ref image, tag: None, digest: Some(ref d) }
-            if image == "docker.io/library/alpine" && d == "sha256:abc123def"
-        ));
-    }
-
-    #[test]
-    fn test_qualify_docker_io_explicit() {
-        let img = ImageRef::parse("docker.io/library/nginx:alpine");
-        let q = img.qualify();
-        assert_eq!(q.to_string_ref(), "docker.io/library/nginx:alpine");
-    }
-
-    #[test]
-    fn test_qualify_scratch() {
-        let img = ImageRef::parse("scratch");
-        let q = img.qualify();
-        assert!(matches!(q, ImageRef::Scratch));
-    }
-
-    #[test]
-    fn test_qualify_stage_ref() {
-        let img = ImageRef::Stage("builder".to_string());
-        let q = img.qualify();
-        assert!(matches!(q, ImageRef::Stage(ref name) if name == "builder"));
-    }
-
-    #[test]
     fn test_parse_simple_dockerfile() {
         let content = r#"
 FROM alpine:3.18
@@ -860,7 +640,10 @@ COPY --from=builder /app /app
         let final_stage = dockerfile.final_stage().unwrap();
 
         assert_eq!(final_stage.index, 1);
-        assert!(matches!(final_stage.base_image, ImageRef::Scratch));
+        assert!(matches!(
+            final_stage.base_image,
+            DockerfileFromTarget::Scratch
+        ));
     }
 
     #[test]
