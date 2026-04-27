@@ -79,6 +79,7 @@ pub struct LockedBottle {
 
 impl BottleLockfile {
     /// Build a fresh empty lockfile with the current schema and timestamp.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             schema: CURRENT_SCHEMA,
@@ -207,46 +208,17 @@ pub fn lockfile_path_for(spec_path: &Path) -> PathBuf {
     } else {
         spec_path
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     };
     dir.join(LOCKFILE_NAME)
 }
 
 /// Current UTC time in ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`). Used for the
 /// `generated_at` stamp on writes and matches the format the package-map
-/// generator emits.
+/// generator emits. Uses the workspace's `chrono` (already used in
+/// `zlayer-agent` and elsewhere) instead of hand-rolling the date math.
 fn now_iso8601() -> String {
-    // chrono is heavy; the format is simple. Use std + format!.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (y, mo, d, h, mi, s) = unix_to_ymdhms(now);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-/// Convert a Unix timestamp (seconds) to (year, month, day, hour, minute,
-/// second) in UTC. Civil-from-days using Howard Hinnant's algorithm.
-fn unix_to_ymdhms(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let days = (unix_secs / 86_400) as i64;
-    let secs_of_day = unix_secs % 86_400;
-    let h = (secs_of_day / 3600) as u32;
-    let mi = ((secs_of_day % 3600) / 60) as u32;
-    let s = (secs_of_day % 60) as u32;
-
-    // Howard Hinnant's `civil_from_days`. Days are from 1970-01-01.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y_civil = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = (if mo <= 2 { y_civil + 1 } else { y_civil }) as i32;
-    (y, mo, d, h, mi, s)
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Issue a one-shot warning when an existing lockfile is ignored. Helper kept
@@ -292,13 +264,6 @@ mod tests {
         let parsed: BottleLockfile = toml::from_str(&text).unwrap();
         assert_eq!(parsed.bottles.len(), 1);
         assert_eq!(parsed.bottles[0].deps, vec!["ca-certificates".to_string()]);
-    }
-
-    #[test]
-    fn ymdhms_known_value() {
-        // 2026-04-27T00:00:00Z = 1777593600
-        let (y, mo, d, h, mi, s) = unix_to_ymdhms(1_777_593_600);
-        assert_eq!((y, mo, d, h, mi, s), (2026, 4, 27, 0, 0, 0));
     }
 
     #[test]

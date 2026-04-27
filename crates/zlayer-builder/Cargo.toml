@@ -26,6 +26,7 @@ serde_json.workspace = true
 # Serialization
 serde_yaml.workspace = true
 toml.workspace = true
+chrono.workspace = true
 
 # Hashing
 sha2.workspace = true
