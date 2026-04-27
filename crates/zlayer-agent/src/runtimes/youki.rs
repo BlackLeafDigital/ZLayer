@@ -813,7 +813,7 @@ impl Runtime for YoukiRuntime {
     )]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let container_id = self.container_id_str(id);
-        let image = &spec.image.name;
+        let image = spec.image.name.to_string();
 
         // Clean up any stale container from a previous deploy (mirrors Docker runtime behavior)
         // See docker.rs:370-402 for the equivalent pattern
@@ -874,7 +874,7 @@ impl Runtime for YoukiRuntime {
         // that `Always` forces a manifest refresh, `IfNotPresent` serves from cache with
         // mutable-tag revalidation, and `Never` reuses cached blobs.
         let layers = self
-            .pull_image_layers(image, spec.image.pull_policy)
+            .pull_image_layers(&image, spec.image.pull_policy)
             .await?;
 
         tracing::debug!(
@@ -915,7 +915,7 @@ impl Runtime for YoukiRuntime {
         }
 
         // Get cached image config (entrypoint, cmd, env, workdir, user)
-        let img_config = self.get_image_config(image).await;
+        let img_config = self.get_image_config(&image).await;
 
         // Prepare storage volumes
         let volume_paths = self.prepare_storage_volumes(id, spec).await?;

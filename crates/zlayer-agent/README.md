@@ -168,7 +168,7 @@ async fn run_wasm_module(spec: &ServiceSpec) -> Result<i32, Box<dyn std::error::
     };
 
     // Pull WASM artifact from registry
-    runtime.pull_image(&spec.image.name).await?;
+    runtime.pull_image(&spec.image.name.to_string()).await?;
 
     // Create instance
     runtime.create_container(&id, spec).await?;

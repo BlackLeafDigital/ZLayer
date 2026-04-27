@@ -1,14 +1,18 @@
 name: Verify RepoSources
 
 # Drift detector for the macOS package-name maps published at
-# https://zachhandley.github.io/RepoSources/maps/{distro}.json. Runs daily
+# https://zachhandley.github.io/RepoSources/maps/{distro}/{shard}.json
+# (sharded by first letter; see scripts/generate-package-maps.py). Runs daily
 # (2h after the Sunday regenerator cron in update-package-maps.yml) and on
-# manual dispatch. Asserts the canonical brew formulas are returned for the
-# names ZLayer's macOS resolver actually requests (per the OVERRIDES dict in
-# scripts/generate-package-maps.py and the distro list in
+# manual dispatch.
+#
+# Asserts the canonical brew formulas are returned for the names ZLayer's
+# macOS resolver actually requests (per the OVERRIDES dict in
+# generate-package-maps.py and the distro list in
 # crates/zlayer-builder/src/sandbox_builder.rs::extract_package_install_packages).
-# Also asserts the published map is no more than 14 days old — catches a
-# stuck regenerator before it silently feeds stale data into builds.
+# Also asserts the published maps are no more than 14 days old via
+# {distro}/index.json — catches a stuck regenerator before it silently feeds
+# stale data into builds.
 
 on:
   schedule:
@@ -24,7 +28,7 @@ jobs:
       - name: Install curl + jq
         run: apk add --no-cache curl jq
 
-      - name: Verify each distro's package map
+      - name: Verify each distro's sharded package map
         run: |
           set -euo pipefail
           BASE="https://zachhandley.github.io/RepoSources/maps"
@@ -32,49 +36,78 @@ jobs:
 
           # Maximum acceptable age in seconds (14 days) — catches a stuck
           # weekly regenerator. The generator runs Sundays at 04:00 UTC, so
-          # in steady state the file should be at most 7 days old.
+          # in steady state the index should be at most 7 days old.
           MAX_AGE=$((14 * 24 * 3600))
           NOW=$(date -u +%s)
+
+          # Each known-good assertion encoded as `key=expected_brew=shard_letter`.
+          # Group by shard letter so we fetch each shard exactly once per distro.
+          ASSERTIONS="\
+            libssl-dev=openssl@3=l \
+            libssl3=openssl@3=l \
+            openssl-dev=openssl@3=o \
+            nodejs=node=n \
+            python3=python@3=p \
+            python3-dev=python@3=p \
+            default-jdk=openjdk=d"
 
           fail=0
           for d in $DISTROS; do
             echo "=== $d ==="
-            url="$BASE/$d.json"
-            tmp=$(mktemp)
-            if ! curl -fsSL "$url" -o "$tmp"; then
-              echo "  FAIL: could not fetch $url"
+
+            # Freshness check via index.json
+            tmp_index=$(mktemp)
+            if ! curl -fsSL "$BASE/$d/index.json" -o "$tmp_index"; then
+              echo "  FAIL: could not fetch $BASE/$d/index.json"
               fail=1
               continue
             fi
-
-            # Freshness
-            generated_at=$(jq -r '.metadata.generated_at' "$tmp")
+            generated_at=$(jq -r '.metadata.generated_at' "$tmp_index")
             generated_epoch=$(date -u -d "$generated_at" +%s 2>/dev/null || echo 0)
             age=$((NOW - generated_epoch))
             if [ "$generated_epoch" -eq 0 ] || [ "$age" -gt "$MAX_AGE" ]; then
-              echo "  FAIL: $d generated_at=$generated_at is older than 14 days (age=${age}s)"
+              echo "  FAIL: $d generated_at=$generated_at older than 14 days (age=${age}s)"
               fail=1
             else
               echo "  OK: generated_at=$generated_at (age=${age}s)"
             fi
 
-            # Known-good mappings from OVERRIDES — these must be present in
-            # every distro file regardless of what Repology surfaced.
-            for kv in \
-                'libssl-dev=openssl@3' \
-                'libssl3=openssl@3' \
-                'openssl-dev=openssl@3' \
-                'nodejs=node' \
-                'python3=python@3' \
-                'python3-dev=python@3' \
-                'default-jdk=openjdk'; do
+            # Fetch each unique shard once per distro
+            tmp_dir=$(mktemp -d)
+            shards_seen=""
+            for kv in $ASSERTIONS; do
+              shard="${kv##*=}"
+              # shellcheck disable=SC2076 disable=SC3010
+              case " $shards_seen " in
+                *" $shard "*) ;;
+                *)
+                  shards_seen="$shards_seen $shard"
+                  if ! curl -fsSL "$BASE/$d/$shard.json" -o "$tmp_dir/$shard.json"; then
+                    echo "  FAIL: could not fetch $BASE/$d/$shard.json"
+                    fail=1
+                  fi
+                  ;;
+              esac
+            done
+
+            # Run assertions against the per-shard files
+            for kv in $ASSERTIONS; do
+              # kv format: key=expected=shard
+              rest="${kv#*=}"
+              expected="${rest%=*}"
               key="${kv%%=*}"
-              expected="${kv##*=}"
-              actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$tmp")
+              shard="${kv##*=}"
+              shard_path="$tmp_dir/$shard.json"
+              if [ ! -f "$shard_path" ]; then
+                echo "  FAIL: $key -> shard $shard not fetched"
+                fail=1
+                continue
+              fi
+              actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$shard_path")
               if [ "$actual" = "$expected" ]; then
-                echo "  OK: $key -> $actual"
+                echo "  OK: $key -> $actual (shard $shard)"
               else
-                echo "  FAIL: $key -> $actual (expected $expected)"
+                echo "  FAIL: $key -> $actual (shard $shard, expected $expected)"
                 fail=1
               fi
             done

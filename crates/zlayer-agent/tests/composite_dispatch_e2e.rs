@@ -313,7 +313,7 @@ async fn composite_dispatches_windows_spec_to_hcs() {
 
     // `pull_image` may be slow on a cold host — skip the test (not fail) if
     // the pull fails, since that's an environment issue not a dispatch bug.
-    if let Err(e) = composite.pull_image(&spec.image.name).await {
+    if let Err(e) = composite.pull_image(&spec.image.name.to_string()).await {
         eprintln!("SKIP: pull_image({WINDOWS_IMAGE}) failed: {e}");
         return;
     }
@@ -383,7 +383,7 @@ async fn composite_dispatches_linux_spec_to_wsl2() {
 
     // Pull through the delegate; buffer-only errors (not found in registry,
     // no network) should skip rather than fail.
-    if let Err(e) = composite.pull_image(&spec.image.name).await {
+    if let Err(e) = composite.pull_image(&spec.image.name.to_string()).await {
         eprintln!("SKIP: pull_image({LINUX_IMAGE}) failed: {e}");
         return;
     }
@@ -476,7 +476,7 @@ async fn composite_falls_through_to_primary_when_no_platform_specified() {
     // than the old permissive fall-through logic.
     let spec = make_spec(WINDOWS_IMAGE, None);
 
-    if let Err(e) = composite.pull_image(&spec.image.name).await {
+    if let Err(e) = composite.pull_image(&spec.image.name.to_string()).await {
         eprintln!("SKIP: pull_image({WINDOWS_IMAGE}) failed: {e}");
         return;
     }
@@ -539,7 +539,7 @@ async fn composite_uses_image_os_cache_after_pull() {
 
     // Priming pull: the composite's pull path calls `fetch_image_os`, which
     // reads the OCI manifest's `config.os` and populates the cache.
-    if let Err(e) = composite.pull_image(&spec.image.name).await {
+    if let Err(e) = composite.pull_image(&spec.image.name.to_string()).await {
         eprintln!("SKIP: pull_image({LINUX_IMAGE}) failed: {e}");
         return;
     }
@@ -622,7 +622,7 @@ async fn composite_create_then_stop_uses_same_runtime() {
         Some(TargetPlatform::new(OsKind::Windows, ArchKind::Amd64)),
     );
 
-    if let Err(e) = composite.pull_image(&spec.image.name).await {
+    if let Err(e) = composite.pull_image(&spec.image.name.to_string()).await {
         eprintln!("SKIP: pull_image({WINDOWS_IMAGE}) failed: {e}");
         return;
     }
