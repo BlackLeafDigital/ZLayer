@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.4]
+
+### Fixed
+- **`zlayer-types` is publishable to crates.io again.** Proprietary-branch (`zlayer-zql`) config had leaked into the public manifest: `crates/zlayer-types/Cargo.toml` carried a hardcoded `version = "0.1.0"`, an `authors` line, and `publish = ["forgejo"]`, while the workspace dep alias in the root `Cargo.toml` (`zlayer-types = { path = ... }`) was missing a version requirement. As a result, `cargo publish -p zlayer-spec` failed with `dependency \`zlayer-types\` does not specify a version` mid-release. Switched `zlayer-types` to workspace inheritance (`version.workspace = true`, etc.), added `version = "0.0.0-dev"` to the workspace alias, and converted every consumer (`zlayer-agent`, `zlayer-api`, `zlayer-builder`, `zlayer-client`, `zlayer-core`) from `path = "../zlayer-types"` to `zlayer-types.workspace = true` so `sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml` in `.forgejo/workflows/release.yml` substitutes the release version uniformly. Files: `Cargo.toml`, `crates/zlayer-types/Cargo.toml`, `crates/zlayer-{agent,api,builder,client,core}/Cargo.toml`.
+
 ## [0.11.0]
 
 ### Added

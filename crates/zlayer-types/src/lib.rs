@@ -1,4 +1,4 @@
-//! Shared wire types for the ZLayer platform.
+//! Shared wire types for the `ZLayer` platform.
 //!
 //! This crate is the SDK-facing types crate: API DTOs, OCI image
 //! references, and other serde-friendly wire shapes consumed by both
@@ -26,10 +26,16 @@ pub mod image_ref_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::str::FromStr;
 
+    /// # Errors
+    ///
+    /// Returns the serializer's error if writing the string form fails.
     pub fn serialize<S: Serializer>(r: &ImageReference, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&r.to_string())
     }
 
+    /// # Errors
+    ///
+    /// Returns a deserialization error if the input is not a valid OCI image reference string.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ImageReference, D::Error> {
         let s = String::deserialize(d)?;
         ImageReference::from_str(&s).map_err(serde::de::Error::custom)
@@ -40,6 +46,9 @@ pub mod image_ref_serde {
         use serde::{Deserialize, Deserializer, Serializer};
         use std::str::FromStr;
 
+        /// # Errors
+        ///
+        /// Returns the serializer's error if writing the string form fails.
         pub fn serialize<S: Serializer>(
             r: &Option<ImageReference>,
             s: S,
@@ -50,6 +59,9 @@ pub mod image_ref_serde {
             }
         }
 
+        /// # Errors
+        ///
+        /// Returns a deserialization error if the input is not a valid OCI image reference string.
         pub fn deserialize<'de, D: Deserializer<'de>>(
             d: D,
         ) -> Result<Option<ImageReference>, D::Error> {

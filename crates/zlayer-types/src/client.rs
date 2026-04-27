@@ -1,4 +1,4 @@
-//! Client-facing wire types shared between the ZLayer daemon and SDK
+//! Client-facing wire types shared between the `ZLayer` daemon and SDK
 //! clients (CLI, `zlayer-docker`, `zlayer-py`, future language SDKs).
 //!
 //! These were originally defined in `zlayer-client`; they are pure serde

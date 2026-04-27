@@ -22,6 +22,7 @@ pub struct HealthResponse {
 ///
 /// On Linux the bundled libcontainer runtime ("youki") is preferred;
 /// on macOS the sandbox runtime is tried first; Docker is the common fallback.
+#[must_use]
 pub fn default_runtime_name() -> String {
     if cfg!(target_os = "linux") {
         "youki".to_string()
