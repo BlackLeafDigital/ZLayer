@@ -543,6 +543,7 @@ async fn run(
             no_tui,
             verbose_build,
             platform,
+            update_bottles,
         } => {
             commands::build::handle_build(
                 context.clone(),
@@ -560,6 +561,7 @@ async fn run(
                 *no_tui,
                 *verbose_build,
                 platform.clone(),
+                *update_bottles,
             )
             .await
         }

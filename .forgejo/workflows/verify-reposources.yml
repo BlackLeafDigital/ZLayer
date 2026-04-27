@@ -25,8 +25,12 @@ jobs:
     container:
       image: alpine:3.20
     steps:
-      - name: Install curl + jq
-        run: apk add --no-cache curl jq
+      - name: Install curl + jq + coreutils
+        # coreutils provides GNU `date` at /usr/bin/date (overrides BusyBox on
+        # the default PATH). BusyBox `date -d` cannot parse the ISO-8601
+        # `YYYY-MM-DDTHH:MM:SSZ` form the generator emits, which silently
+        # broke the freshness check on every run before this was added.
+        run: apk add --no-cache curl jq coreutils
 
       - name: Verify each distro's sharded package map
         run: |
@@ -40,15 +44,22 @@ jobs:
           MAX_AGE=$((14 * 24 * 3600))
           NOW=$(date -u +%s)
 
-          # Each known-good assertion encoded as `key=expected_brew=shard_letter`.
+          # Each known-good assertion encoded as `key=expected_pattern=shard_letter`.
           # Group by shard letter so we fetch each shard exactly once per distro.
+          #
+          # The `expected_pattern` is matched as a POSIX shell glob (not exact
+          # string equality) so the workflow stays correct when brew rotates
+          # its default — `python@3.14` becoming `python@3.15` next year still
+          # matches `python@3.*`. Pure-major pins like `openssl@3` and
+          # `node@*` track the dynamic resolution in
+          # scripts/generate-package-maps.py::pick_winner.
           ASSERTIONS="\
             libssl-dev=openssl@3=l \
             libssl3=openssl@3=l \
             openssl-dev=openssl@3=o \
-            nodejs=node=n \
-            python3=python@3=p \
-            python3-dev=python@3=p \
+            nodejs=node@*=n \
+            python3=python@3.*=p \
+            python3-dev=python@3.*=p \
             default-jdk=openjdk=d"
 
           fail=0
@@ -63,9 +74,20 @@ jobs:
               continue
             fi
             generated_at=$(jq -r '.metadata.generated_at' "$tmp_index")
-            generated_epoch=$(date -u -d "$generated_at" +%s 2>/dev/null || echo 0)
+            # Validate the field exists *before* feeding it to `date`, so a
+            # missing/null generated_at fails this distro cleanly instead of
+            # aborting the whole script via `set -e` on a failed date parse.
+            if [ -z "$generated_at" ] || [ "$generated_at" = "null" ]; then
+              echo "  FAIL: $d index.json missing or null generated_at"
+              fail=1
+              continue
+            fi
+            # GNU date (from coreutils) parses the ISO-8601 form. Dropped the
+            # prior `|| echo 0` swallow — a parse failure now propagates via
+            # `set -e` instead of silently looking like staleness.
+            generated_epoch=$(date -u -d "$generated_at" +%s)
             age=$((NOW - generated_epoch))
-            if [ "$generated_epoch" -eq 0 ] || [ "$age" -gt "$MAX_AGE" ]; then
+            if [ "$age" -gt "$MAX_AGE" ]; then
               echo "  FAIL: $d generated_at=$generated_at older than 14 days (age=${age}s)"
               fail=1
             else
@@ -104,12 +126,14 @@ jobs:
                 continue
               fi
               actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$shard_path")
-              if [ "$actual" = "$expected" ]; then
-                echo "  OK: $key -> $actual (shard $shard)"
-              else
-                echo "  FAIL: $key -> $actual (shard $shard, expected $expected)"
-                fail=1
-              fi
+              # `$expected` is intentionally unquoted so the shell expands
+              # glob metacharacters (`*`, `?`, `[…]`). `actual` may legitimately
+              # contain `@` and `.` — those are literal in shell globs.
+              # shellcheck disable=SC2254
+              case "$actual" in
+                $expected) echo "  OK: $key -> $actual (shard $shard, matched $expected)" ;;
+                *)         echo "  FAIL: $key -> $actual (shard $shard, expected $expected)"; fail=1 ;;
+              esac
             done
           done
 

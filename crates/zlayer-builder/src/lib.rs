@@ -184,6 +184,8 @@
 //! - `${VAR+alternate}` - Alternate if set (including empty)
 
 pub mod backend;
+#[cfg(target_os = "macos")]
+pub mod bottle_lockfile;
 pub mod buildah;
 pub mod builder;
 pub mod dockerfile;
