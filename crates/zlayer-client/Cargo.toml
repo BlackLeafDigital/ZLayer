@@ -38,7 +38,7 @@ tokio-stream = { workspace = true }
 zlayer-api.workspace = true
 
 # Shared wire DTOs (Session, BuildSpec, BuildHandle).
-zlayer-types = { path = "../zlayer-types" }
+zlayer-types.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -61,7 +61,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 zlayer-secrets.workspace = true
 zlayer-spec.workspace = true
-zlayer-types = { path = "../zlayer-types" }
+zlayer-types.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
