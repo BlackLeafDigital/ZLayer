@@ -33,8 +33,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+pub use zlayer_types::api::secrets::*;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
@@ -58,114 +57,50 @@ pub fn env_scope(env: &StoredEnvironment) -> String {
     }
 }
 
-/// Request to create or update a secret.
+/// Build a [`SecretMetadataResponse`] DTO from an owned [`SecretMetadata`].
 ///
-/// `scope` is optional and only honored on the legacy code path — when set
-/// alongside `?environment=`, the request is rejected.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateSecretRequest {
-    /// The name of the secret.
-    pub name: String,
-    /// The secret value (will be encrypted at rest).
-    pub value: String,
-    /// Optional explicit scope (legacy form). Mutually exclusive with the
-    /// `?environment=` query parameter.
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// Response containing secret metadata. Never includes the value unless
-/// the caller is on the explicit `?reveal=true` admin path, in which case
-/// `value` is populated.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SecretMetadataResponse {
-    /// The name/identifier of the secret.
-    pub name: String,
-    /// Unix timestamp when the secret was created.
-    pub created_at: i64,
-    /// Unix timestamp when the secret was last updated.
-    pub updated_at: i64,
-    /// Version number of the secret (incremented on each update).
-    pub version: u32,
-    /// Plaintext value — populated only on `?reveal=true` admin reads.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-}
-
-impl From<SecretMetadata> for SecretMetadataResponse {
-    fn from(metadata: SecretMetadata) -> Self {
-        Self {
-            name: metadata.name,
-            created_at: metadata.created_at,
-            updated_at: metadata.updated_at,
-            version: metadata.version,
-            value: None,
-        }
+/// Free function (rather than `impl From<SecretMetadata> for SecretMetadataResponse`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn secret_metadata_response_from_owned(metadata: SecretMetadata) -> SecretMetadataResponse {
+    SecretMetadataResponse {
+        name: metadata.name,
+        created_at: metadata.created_at,
+        updated_at: metadata.updated_at,
+        version: metadata.version,
+        value: None,
     }
 }
 
-impl From<&SecretMetadata> for SecretMetadataResponse {
-    fn from(metadata: &SecretMetadata) -> Self {
-        Self {
-            name: metadata.name.clone(),
-            created_at: metadata.created_at,
-            updated_at: metadata.updated_at,
-            version: metadata.version,
-            value: None,
-        }
+/// Build a [`SecretMetadataResponse`] DTO from a borrowed [`SecretMetadata`].
+///
+/// Free function (rather than `impl From<&SecretMetadata> for SecretMetadataResponse`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn secret_metadata_response_from(metadata: &SecretMetadata) -> SecretMetadataResponse {
+    SecretMetadataResponse {
+        name: metadata.name.clone(),
+        created_at: metadata.created_at,
+        updated_at: metadata.updated_at,
+        version: metadata.version,
+        value: None,
     }
 }
 
-/// Request body for secret rotation.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RotateSecretRequest {
-    /// The new secret value (will be encrypted at rest).
-    pub value: String,
-}
-
-/// Response returned by the rotate endpoint.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct RotateSecretResponse {
-    /// The secret name.
-    pub name: String,
-    /// Version prior to rotation. `None` if the secret did not exist (won't
-    /// happen today — rotate rejects missing secrets — but preserved for
-    /// forward compatibility).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_version: Option<u32>,
-    /// Version after rotation.
-    pub new_version: u32,
-}
-
-impl From<(String, RotationResult)> for RotateSecretResponse {
-    fn from((name, r): (String, RotationResult)) -> Self {
-        Self {
-            name,
-            previous_version: r.previous_version,
-            new_version: r.new_version,
-        }
+/// Build a [`RotateSecretResponse`] DTO from a name + [`RotationResult`].
+///
+/// Free function (rather than `impl From<(String, RotationResult)> for RotateSecretResponse`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn rotate_secret_response_from(name: String, r: &RotationResult) -> RotateSecretResponse {
+    RotateSecretResponse {
+        name,
+        previous_version: r.previous_version,
+        new_version: r.new_version,
     }
-}
-
-/// Response for the batch reveal endpoint — returns every secret in an env as plaintext.
-/// Admin-only for now (Phase 3 will gate this on per-env Read permission instead).
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct RevealAllSecretsResponse {
-    /// The environment id the secrets were revealed from.
-    pub environment: String,
-    /// Name → plaintext value map. Includes every secret in the scope.
-    pub secrets: std::collections::HashMap<String, String>,
-}
-
-/// Result body for `POST /api/v1/secrets/bulk-import`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct BulkImportResponse {
-    /// Number of new secrets created.
-    pub created: usize,
-    /// Number of existing secrets updated.
-    pub updated: usize,
-    /// Per-line errors. Empty when every line parsed and stored cleanly.
-    pub errors: Vec<String>,
 }
 
 /// State for secrets endpoints.
@@ -237,61 +172,26 @@ impl SecretsState {
     }
 }
 
-// ---- Query types ----
+// ---- Query helpers ----
 
-/// Query for create / list / get / delete endpoints.
-#[derive(Debug, Default, Deserialize)]
-pub struct SecretsScopeQuery {
-    /// Environment id whose namespace to operate in. Mutually exclusive
-    /// with `scope`.
-    #[serde(default)]
-    pub environment: Option<String>,
-    /// Explicit scope string (legacy). Mutually exclusive with `environment`.
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-impl SecretsScopeQuery {
-    /// Reject requests that supply both forms. Returns `Ok(())` when at
-    /// most one is set.
-    fn validate_exclusive(&self) -> Result<()> {
-        if self.environment.is_some() && self.scope.is_some() {
-            return Err(ApiError::BadRequest(
-                "Pass either ?environment= or ?scope=, not both".to_string(),
-            ));
-        }
-        Ok(())
+/// Reject scope queries that supply both `environment` and `scope`.
+fn validate_scope_exclusive(q: &SecretsScopeQuery) -> Result<()> {
+    if q.environment.is_some() && q.scope.is_some() {
+        return Err(ApiError::BadRequest(
+            "Pass either ?environment= or ?scope=, not both".to_string(),
+        ));
     }
+    Ok(())
 }
 
-/// Query for `GET /api/v1/secrets/{name}` — extends the scope query with a
-/// `reveal` flag for admin-only plaintext reads.
-#[derive(Debug, Default, Deserialize)]
-pub struct GetSecretQuery {
-    #[serde(default)]
-    pub environment: Option<String>,
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// When true, include the plaintext value. Admin only.
-    #[serde(default)]
-    pub reveal: bool,
-}
-
-impl GetSecretQuery {
-    fn validate_exclusive(&self) -> Result<()> {
-        if self.environment.is_some() && self.scope.is_some() {
-            return Err(ApiError::BadRequest(
-                "Pass either ?environment= or ?scope=, not both".to_string(),
-            ));
-        }
-        Ok(())
+/// Reject get queries that supply both `environment` and `scope`.
+fn validate_get_exclusive(q: &GetSecretQuery) -> Result<()> {
+    if q.environment.is_some() && q.scope.is_some() {
+        return Err(ApiError::BadRequest(
+            "Pass either ?environment= or ?scope=, not both".to_string(),
+        ));
     }
-}
-
-/// Query for `POST /api/v1/secrets/bulk-import` — `environment` is required.
-#[derive(Debug, Deserialize)]
-pub struct BulkImportQuery {
-    pub environment: String,
+    Ok(())
 }
 
 // ---- Helpers ----
@@ -306,7 +206,7 @@ async fn resolve_scope(
     body_scope: Option<&str>,
     query: &SecretsScopeQuery,
 ) -> Result<String> {
-    query.validate_exclusive()?;
+    validate_scope_exclusive(query)?;
     if body_scope.is_some() && query.environment.is_some() {
         return Err(ApiError::BadRequest(
             "Cannot combine body 'scope' with ?environment=; pick one".to_string(),
@@ -328,7 +228,7 @@ async fn resolve_scope(
 
 /// Resolve scope for the GET-with-reveal path.
 async fn resolve_scope_get(state: &SecretsState, query: &GetSecretQuery) -> Result<String> {
-    query.validate_exclusive()?;
+    validate_get_exclusive(query)?;
     if let Some(env_id) = query.environment.as_deref() {
         let env = state.lookup_env(env_id).await?;
         return Ok(env_scope(&env));
@@ -462,7 +362,7 @@ pub async fn create_secret(
         StatusCode::CREATED
     };
 
-    Ok((status, Json(SecretMetadataResponse::from(metadata))))
+    Ok((status, Json(secret_metadata_response_from_owned(metadata))))
 }
 
 /// List secrets in a scope.
@@ -507,7 +407,7 @@ pub async fn list_secrets(
 
     let response: Vec<SecretMetadataResponse> = metadata_list
         .iter()
-        .map(SecretMetadataResponse::from)
+        .map(secret_metadata_response_from)
         .collect();
 
     Ok(Json(response))
@@ -582,7 +482,7 @@ pub async fn get_secret_metadata(
         .find(|m| m.name == name)
         .ok_or_else(|| ApiError::NotFound(format!("Secret '{name}' not found")))?;
 
-    let mut response = SecretMetadataResponse::from(metadata);
+    let mut response = secret_metadata_response_from_owned(metadata);
 
     if reveal {
         let secret = state
@@ -716,7 +616,7 @@ pub async fn rotate_secret(
             other => ApiError::Internal(format!("Failed to rotate secret: {other}")),
         })?;
 
-    Ok(Json(RotateSecretResponse::from((name, result))))
+    Ok(Json(rotate_secret_response_from(name, &result)))
 }
 
 /// Bulk-import secrets from a dotenv-style payload (`KEY=value\n…`).
@@ -918,7 +818,7 @@ mod tests {
             version: 3,
         };
 
-        let response = SecretMetadataResponse::from(metadata);
+        let response = secret_metadata_response_from_owned(metadata);
 
         assert_eq!(response.name, "test-secret");
         assert_eq!(response.created_at, 1_234_567_890);
@@ -995,25 +895,23 @@ mod tests {
             environment: Some("e".to_string()),
             scope: Some("s".to_string()),
         };
-        let err = q.validate_exclusive().unwrap_err();
+        let err = validate_scope_exclusive(&q).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
     fn test_scope_query_allows_either() {
-        SecretsScopeQuery {
+        validate_scope_exclusive(&SecretsScopeQuery {
             environment: Some("e".to_string()),
             scope: None,
-        }
-        .validate_exclusive()
+        })
         .unwrap();
-        SecretsScopeQuery {
+        validate_scope_exclusive(&SecretsScopeQuery {
             environment: None,
             scope: Some("s".to_string()),
-        }
-        .validate_exclusive()
+        })
         .unwrap();
-        SecretsScopeQuery::default().validate_exclusive().unwrap();
+        validate_scope_exclusive(&SecretsScopeQuery::default()).unwrap();
     }
 
     #[test]
@@ -1024,7 +922,7 @@ mod tests {
             reveal: false,
         };
         assert!(matches!(
-            q.validate_exclusive().unwrap_err(),
+            validate_get_exclusive(&q).unwrap_err(),
             ApiError::BadRequest(_)
         ));
     }

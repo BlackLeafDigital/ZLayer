@@ -28,6 +28,7 @@ serde_yaml.workspace = true
 
 # Hashing
 sha2.workspace = true
+hmac.workspace = true
 hex.workspace = true
 
 # ZImagefile support
@@ -71,6 +72,9 @@ zlayer-paths.workspace = true
 # Spec types (OsKind / ArchKind / TargetPlatform) used by the HCS backend when
 # routing manifest pulls through `ImagePuller::with_platform`.
 zlayer-spec.workspace = true
+
+# Shared types (re-exports oci_client::Reference as ImageReference)
+zlayer-types = { path = "../zlayer-types" }
 
 # Windows-only dependencies for the HCS (Host Compute Service) build backend.
 # The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer

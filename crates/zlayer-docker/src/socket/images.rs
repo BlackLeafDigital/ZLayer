@@ -102,18 +102,17 @@ async fn list_images(
     let summaries: Vec<Value> = images
         .into_iter()
         .map(|img| {
+            let ref_str = img.reference.to_string();
             let id = img
                 .digest
                 .clone()
-                .unwrap_or_else(|| format!("sha256:{}", hash_ref(&img.reference)));
+                .unwrap_or_else(|| format!("sha256:{}", hash_ref(&ref_str)));
             let size = i64::try_from(img.size_bytes.unwrap_or(0)).unwrap_or(0);
-            let repo_tags = if img.reference.is_empty() {
-                vec!["<none>:<none>".to_owned()]
-            } else {
-                vec![img.reference.clone()]
-            };
+            // `Reference` is non-empty by construction (parser rejects empty input),
+            // so the legacy `is_empty()` guard is dead — always emit the real ref.
+            let repo_tags = vec![ref_str.clone()];
             let repo_digests = match &img.digest {
-                Some(d) => vec![format!("{}@{}", strip_tag(&img.reference), d)],
+                Some(d) => vec![format!("{}@{}", strip_tag(&ref_str), d)],
                 None => Vec::new(),
             };
 
@@ -157,25 +156,25 @@ async fn inspect_image(
 
     let found = images
         .into_iter()
-        .find(|img| img.reference == name || img.digest.as_deref() == Some(name.as_str()))
+        .find(|img| {
+            img.reference.to_string() == name || img.digest.as_deref() == Some(name.as_str())
+        })
         .ok_or_else(|| ApiError {
             status: StatusCode::NOT_FOUND,
             message: format!("No such image: {name}"),
         })?;
 
+    let found_ref = found.reference.to_string();
     let id = found
         .digest
         .clone()
-        .unwrap_or_else(|| format!("sha256:{}", hash_ref(&found.reference)));
+        .unwrap_or_else(|| format!("sha256:{}", hash_ref(&found_ref)));
     let size = i64::try_from(found.size_bytes.unwrap_or(0)).unwrap_or(0);
     let created = rfc3339_now();
-    let repo_tags = if found.reference.is_empty() {
-        vec!["<none>:<none>".to_owned()]
-    } else {
-        vec![found.reference.clone()]
-    };
+    // `Reference` is non-empty by construction; legacy `is_empty()` guard is dead.
+    let repo_tags = vec![found_ref.clone()];
     let repo_digests = match &found.digest {
-        Some(d) => vec![format!("{}@{}", strip_tag(&found.reference), d)],
+        Some(d) => vec![format!("{}@{}", strip_tag(&found_ref), d)],
         None => Vec::new(),
     };
 
@@ -258,10 +257,11 @@ async fn pull_image(
         .map_err(ApiError::upstream)?;
 
     // Line-delimited JSON body — Docker's streaming pull contract.
+    let ref_str = resp.reference.to_string();
     let mut body = String::new();
     body.push_str(
         &json!({
-            "status": format!("Pulling from {}", strip_tag(&resp.reference)),
+            "status": format!("Pulling from {}", strip_tag(&ref_str)),
         })
         .to_string(),
     );
@@ -277,7 +277,7 @@ async fn pull_image(
     }
     body.push_str(
         &json!({
-            "status": format!("Status: Downloaded newer image for {}", resp.reference),
+            "status": format!("Status: Downloaded newer image for {}", ref_str),
         })
         .to_string(),
     );
@@ -357,7 +357,10 @@ async fn remove_image(
         .and_then(|images| {
             images
                 .into_iter()
-                .find(|img| img.reference == name || img.digest.as_deref() == Some(name.as_str()))
+                .find(|img| {
+                    img.reference.to_string() == name
+                        || img.digest.as_deref() == Some(name.as_str())
+                })
                 .and_then(|img| img.digest)
         })
         .unwrap_or_else(|| format!("sha256:{}", hash_ref(&name)));

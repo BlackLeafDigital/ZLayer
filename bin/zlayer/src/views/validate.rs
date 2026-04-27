@@ -311,7 +311,7 @@ fn run_validation(state: &mut ValidateState, path: &std::path::Path) {
                     .map(|s| ValidateStageInfo {
                         index: s.index,
                         name: s.name.clone().unwrap_or_else(|| "(unnamed)".to_string()),
-                        base_image: s.base_image.to_string_ref(),
+                        base_image: s.base_image.to_string(),
                         instruction_count: s.instructions.len(),
                     })
                     .collect();

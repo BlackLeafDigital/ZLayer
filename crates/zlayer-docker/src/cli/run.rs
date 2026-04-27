@@ -274,7 +274,10 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
         rtype: zlayer_spec::ResourceType::Service,
         schedule: None,
         image: ImageSpec {
-            name: args.image.clone(),
+            name: args
+                .image
+                .parse()
+                .with_context(|| format!("invalid image reference '{}'", args.image))?,
             pull_policy: PullPolicy::IfNotPresent,
         },
         resources,
@@ -611,7 +614,7 @@ mod tests {
             rtype: zlayer_spec::ResourceType::Service,
             schedule: None,
             image: ImageSpec {
-                name: "nginx:alpine".to_string(),
+                name: "nginx:alpine".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
             },
             resources: zlayer_spec::ResourcesSpec::default(),

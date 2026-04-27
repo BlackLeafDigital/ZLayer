@@ -360,8 +360,9 @@ pub(crate) async fn join(
 
         // Pull image
         println!("  Pulling image: {}...", service_spec.image.name);
+        let image_str = service_spec.image.name.to_string();
         runtime
-            .pull_image(&service_spec.image.name)
+            .pull_image(&image_str)
             .await
             .context(format!("Failed to pull image for service '{service_name}'"))?;
         info!(service = %service_name, image = %service_spec.image.name, "Image pulled");
@@ -624,8 +625,9 @@ pub(crate) async fn join(
 
         // Pull image
         println!("  Pulling image: {}...", service_spec.image.name);
+        let image_str = service_spec.image.name.to_string();
         runtime
-            .pull_image(&service_spec.image.name)
+            .pull_image(&image_str)
             .await
             .context(format!("Failed to pull image for service '{service_name}'"))?;
         info!(service = %service_name, image = %service_spec.image.name, "Image pulled");

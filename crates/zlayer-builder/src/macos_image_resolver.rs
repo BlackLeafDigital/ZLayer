@@ -16,9 +16,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use zlayer_types::ImageReference;
 
 use crate::error::{BuildError, Result};
 use crate::macos_toolchain::{
@@ -34,6 +36,12 @@ const REPO_SOURCES_BASE: &str = "https://zachhandley.github.io/RepoSources/maps"
 
 /// How long a cached package-map file is considered fresh (7 days).
 const PACKAGE_MAP_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// Env var holding the shared secret used to sign POST requests to the
+/// `RepoSourceSyncer` formula-cache endpoint. Must match the value the
+/// function expects in its own `REPOSYNC_HMAC_SECRET` env var. If unset, the
+/// resolver skips the cache-warming POST entirely.
+const REPOSYNC_HMAC_SECRET_ENV: &str = "ZLAYER_REPOSYNC_HMAC_SECRET";
 
 // ---------------------------------------------------------------------------
 // Package map types (for RepoSources JSON files)
@@ -52,6 +60,10 @@ struct PackageMapMetadata {
     generated_at: String,
     source: String,
     distro: String,
+    /// Shard letter (`a`-`z` or `_misc`) for sharded files. `None` for
+    /// hand-written test fixtures or pre-sharding archives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shard: Option<String>,
     total_mappings: usize,
 }
 
@@ -86,8 +98,15 @@ pub fn rewrite_image_for_macos(image_ref: &str) -> Option<String> {
     // Strip the registry prefix (docker.io/library/, ghcr.io/foo/, etc.)
     let stripped = strip_registry_prefix(image_ref);
 
-    // Split into name and tag.
-    let (name, tag) = split_name_tag(&stripped);
+    // Split into name and tag using the canonical parser (handles host:port,
+    // digests, and missing tags correctly).
+    let (name, tag) = match ImageReference::from_str(&stripped) {
+        Ok(r) => (
+            r.repository().to_string(),
+            r.tag().unwrap_or("latest").to_string(),
+        ),
+        Err(_) => (stripped.clone(), "latest".to_string()),
+    };
     let base_name = name.rsplit('/').next().unwrap_or(&name);
 
     // Base distro images → base:latest
@@ -145,15 +164,6 @@ fn strip_registry_prefix(image_ref: &str) -> String {
         }
     }
     image_ref.to_string()
-}
-
-/// Split an image reference into (name, tag). Defaults tag to "latest".
-fn split_name_tag(image_ref: &str) -> (String, String) {
-    if let Some((name, tag)) = image_ref.rsplit_once(':') {
-        (name.to_string(), tag.to_string())
-    } else {
-        (image_ref.to_string(), "latest".to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,28 +582,35 @@ async fn resolve_package(formula: &str) -> Result<ResolvedPackage> {
                 message: format!("failed to parse Homebrew formula JSON for {formula}: {e}"),
             })?;
 
-        // Fire-and-forget POST to reposync so it gets cached
-        let formula_name = formula.to_string();
-        let body_clone = body.to_vec();
-        tokio::spawn(async move {
-            let now = utc_iso8601(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            );
-            let _ = reqwest::Client::new()
-                .post("https://reposync.blackleafdigital.com/formula")
-                .header("zlayer-repo-sync", &now)
-                .header("content-type", "application/json")
-                .body(format!(
+        // Fire-and-forget POST to reposync so it gets cached. Authenticated
+        // via HMAC-SHA256 over the request body using a shared secret. If the
+        // secret env var is unset (developer machine, CI without the
+        // credential), skip the POST — the resolver still works, the upstream
+        // cache just doesn't get warmed.
+        if let Ok(secret) = std::env::var(REPOSYNC_HMAC_SECRET_ENV) {
+            let formula_name = formula.to_string();
+            let body_clone = body.to_vec();
+            tokio::spawn(async move {
+                let payload = format!(
                     r#"{{"name":"{}","data":{}}}"#,
                     formula_name,
                     String::from_utf8_lossy(&body_clone)
-                ))
-                .send()
-                .await;
-        });
+                );
+                let signature = compute_reposync_signature(&secret, payload.as_bytes());
+                let _ = reqwest::Client::new()
+                    .post("https://reposync.blackleafdigital.com/formula")
+                    .header("x-reposync-signature", signature)
+                    .header("content-type", "application/json")
+                    .body(payload)
+                    .send()
+                    .await;
+            });
+        } else {
+            debug!(
+                "REPOSYNC_HMAC_SECRET unset; skipping reposync cache warm for {}",
+                formula
+            );
+        }
 
         return Ok(ResolvedPackage::HomebrewBottle(info));
     }
@@ -1116,9 +1133,16 @@ async fn install_homebrew_bottle(
 ///
 /// Performs a BFS traversal of the dependency tree for Homebrew bottles,
 /// installing each dependency before the formula itself. Packages that are
-/// already present in the rootfs Cellar are skipped. Failures on individual
-/// dependencies are logged as warnings but do not abort the overall
-/// installation.
+/// already present in the rootfs Cellar are skipped.
+///
+/// Failure handling distinguishes the **root** package (the caller-supplied
+/// `formula`) from **transitive** dependencies discovered during the BFS:
+///   - Resolve/install failure on the root → returns `Err`. The caller's
+///     `apt-get install foo` or equivalent must hard-fail rather than silently
+///     produce a sandbox missing `foo`.
+///   - Resolve/install failure on a transitive dep → logged as `warn!` and
+///     skipped. A missing optional dep should not kill the install of an
+///     otherwise-functional package.
 ///
 /// For non-Homebrew packages (`DirectRelease`, `Tap`, `UvPython`) the
 /// dependency walk is skipped since those sources do not expose brew-style
@@ -1126,17 +1150,19 @@ async fn install_homebrew_bottle(
 ///
 /// # Errors
 ///
-/// This function is infallible at the top level — individual formula failures
-/// are logged and skipped so that as many packages as possible are installed.
+/// Returns `Err` if the root formula cannot be resolved or installed.
 pub async fn install_with_deps(formula: &str, rootfs_dir: &Path, tmp_dir: &Path) -> Result<()> {
+    let root = formula.to_string();
     let mut installed = HashSet::new();
     let mut queue = VecDeque::new();
-    queue.push_back(formula.to_string());
+    queue.push_back(root.clone());
 
     while let Some(current) = queue.pop_front() {
         if installed.contains(&current) {
             continue;
         }
+
+        let is_root = current == root;
 
         // Check if already in rootfs (from a previous build or earlier in this build)
         let cellar = rootfs_dir.join("opt/homebrew/Cellar").join(&current);
@@ -1150,7 +1176,15 @@ pub async fn install_with_deps(formula: &str, rootfs_dir: &Path, tmp_dir: &Path)
         let package = match resolve_package(&current).await {
             Ok(pkg) => pkg,
             Err(e) => {
-                warn!("Failed to resolve package {}: {} (skipping)", current, e);
+                if is_root {
+                    return Err(BuildError::RegistryError {
+                        message: format!("failed to resolve Homebrew formula '{current}': {e}"),
+                    });
+                }
+                warn!(
+                    "Failed to resolve transitive dep {}: {} (skipping)",
+                    current, e
+                );
                 installed.insert(current);
                 continue;
             }
@@ -1181,7 +1215,15 @@ pub async fn install_with_deps(formula: &str, rootfs_dir: &Path, tmp_dir: &Path)
                 info!("Installed {} v{}", current, version_str);
             }
             Err(e) => {
-                warn!("Failed to install {}: {} (continuing)", current, e);
+                if is_root {
+                    return Err(BuildError::RegistryError {
+                        message: format!("failed to install Homebrew formula '{current}': {e}"),
+                    });
+                }
+                warn!(
+                    "Failed to install transitive dep {}: {} (continuing)",
+                    current, e
+                );
             }
         }
         installed.insert(current);
@@ -1201,19 +1243,22 @@ pub async fn install_with_deps(formula: &str, rootfs_dir: &Path, tmp_dir: &Path)
 /// 2. Name transformation heuristics (strip `-dev`, `lib` prefix, version digits)
 /// 3. Hardcoded fallback mapping
 ///
-/// Returns a vec of `(brew_formula, skipped)` tuples. `skipped` is `true` for
-/// packages that are Linux-only and have no macOS equivalent (e.g. `musl-dev`,
-/// `ca-certificates`).
+/// Returns a vec of `(linux_name, brew_formula, skipped)` tuples. `linux_name`
+/// is preserved for error reporting. `skipped` is `true` for packages that are
+/// Linux-only and have no macOS equivalent (e.g. `musl-dev`, `ca-certificates`).
 pub async fn map_linux_packages(
     packages: &[&str],
     distro: &str,
     cache_dir: &Path,
-) -> Vec<(String, bool)> {
-    let map = load_or_fetch_package_map(distro, cache_dir).await;
+) -> Vec<(String, String, bool)> {
+    let map = load_or_fetch_package_map(distro, packages, cache_dir).await;
 
     packages
         .iter()
-        .map(|&pkg| resolve_single_package(pkg, &map))
+        .map(|&pkg| {
+            let (brew, skipped) = resolve_single_package(pkg, &map);
+            (pkg.to_string(), brew, skipped)
+        })
         .collect()
 }
 
@@ -1365,70 +1410,137 @@ fn map_single_package_hardcoded(pkg: &str) -> (String, bool) {
     (brew_name.to_string(), skip)
 }
 
-/// Load the package mapping for a distro, fetching from `RepoSources` if not
-/// cached or stale.
+/// Compute the shard key for a package name.
 ///
-/// Resolution order:
-/// 1. `{cache_dir}/package-maps/{distro}.json` — if present and < 7 days old
-/// 2. Fetch from `{REPO_SOURCES_BASE}/{distro}.json` and cache to disk
-/// 3. If fetch fails, use stale cache if available
-/// 4. If nothing available, return an empty map (caller falls through to hardcoded)
-async fn load_or_fetch_package_map(distro: &str, cache_dir: &Path) -> HashMap<String, String> {
-    let map_dir = cache_dir.join("package-maps");
-    let cache_path = map_dir.join(format!("{distro}.json"));
+/// Mirrors the sharding rule used by `scripts/generate-package-maps.py`:
+/// the lowercase first ASCII letter if `a..z`, otherwise `_misc`. Empty
+/// strings also map to `_misc`.
+fn shard_key(name: &str) -> &'static str {
+    let first = name.chars().next().map(|c| c.to_ascii_lowercase());
+    match first {
+        Some(c) if c.is_ascii_lowercase() => match c {
+            'a' => "a",
+            'b' => "b",
+            'c' => "c",
+            'd' => "d",
+            'e' => "e",
+            'f' => "f",
+            'g' => "g",
+            'h' => "h",
+            'i' => "i",
+            'j' => "j",
+            'k' => "k",
+            'l' => "l",
+            'm' => "m",
+            'n' => "n",
+            'o' => "o",
+            'p' => "p",
+            'q' => "q",
+            'r' => "r",
+            's' => "s",
+            't' => "t",
+            'u' => "u",
+            'v' => "v",
+            'w' => "w",
+            'x' => "x",
+            'y' => "y",
+            'z' => "z",
+            _ => "_misc",
+        },
+        _ => "_misc",
+    }
+}
 
-    // 1. Check local cache freshness.
-    if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
-        if let Ok(modified) = meta.modified() {
-            let age = modified
-                .elapsed()
-                .unwrap_or(std::time::Duration::from_secs(u64::MAX));
-            if age.as_secs() < PACKAGE_MAP_CACHE_TTL_SECS {
+/// Load the package mappings for a distro, fetching the relevant per-letter
+/// shards from `RepoSources` if not cached or stale.
+///
+/// For each distinct shard letter implied by `packages`:
+/// 1. `{cache_dir}/package-maps/{distro}/{shard}.json` — if present and < 7 days old
+/// 2. Fetch from `{REPO_SOURCES_BASE}/{distro}/{shard}.json` and cache to disk
+/// 3. If fetch fails, use stale cache if available
+/// 4. If nothing is available for that shard, log a warning and skip it
+///
+/// All successfully loaded shards are merged into a single map and returned.
+async fn load_or_fetch_package_map(
+    distro: &str,
+    packages: &[&str],
+    cache_dir: &Path,
+) -> HashMap<String, String> {
+    let distro_cache_dir = cache_dir.join("package-maps").join(distro);
+
+    // Compute the set of shard letters needed for the requested packages.
+    let mut shards: HashSet<&'static str> = HashSet::new();
+    for pkg in packages {
+        shards.insert(shard_key(pkg));
+    }
+
+    let mut merged: HashMap<String, String> = HashMap::new();
+
+    for shard in shards {
+        let cache_path = distro_cache_dir.join(format!("{shard}.json"));
+
+        // 1. Check local cache freshness for this shard.
+        let mut used_fresh_cache = false;
+        if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
+            if let Ok(modified) = meta.modified() {
+                let age = modified
+                    .elapsed()
+                    .unwrap_or(std::time::Duration::from_secs(u64::MAX));
+                if age.as_secs() < PACKAGE_MAP_CACHE_TTL_SECS {
+                    if let Some(map) = read_cached_map(&cache_path).await {
+                        debug!(
+                            "Using cached package map for {distro}/{shard} ({} mappings, age {}s)",
+                            map.len(),
+                            age.as_secs()
+                        );
+                        merged.extend(map);
+                        used_fresh_cache = true;
+                    }
+                }
+            }
+        }
+
+        if used_fresh_cache {
+            continue;
+        }
+
+        // 2. Fetch the shard from RepoSources.
+        let url = format!("{REPO_SOURCES_BASE}/{distro}/{shard}.json");
+        debug!("Fetching package map shard from {url}");
+
+        match fetch_package_map(&url).await {
+            Ok(map_file) => {
+                info!(
+                    "Fetched {} package mappings for {distro}/{shard} from RepoSources",
+                    map_file.mappings.len()
+                );
+                // Cache to disk (best-effort).
+                if let Err(e) = write_cached_map(&distro_cache_dir, &cache_path, &map_file).await {
+                    warn!("Failed to cache package map for {distro}/{shard}: {e}");
+                }
+                merged.extend(map_file.mappings);
+            }
+            Err(e) => {
+                debug!("Failed to fetch package map for {distro}/{shard}: {e}");
+
+                // 3. Try stale cache for this shard.
                 if let Some(map) = read_cached_map(&cache_path).await {
-                    debug!(
-                        "Using cached package map for {distro} ({} mappings, age {}s)",
-                        map.len(),
-                        age.as_secs()
+                    info!(
+                        "Using stale cached package map for {distro}/{shard} ({} mappings)",
+                        map.len()
                     );
-                    return map;
+                    merged.extend(map);
+                } else {
+                    // 4. Nothing available for this shard — warn and skip.
+                    warn!(
+                        "No package map available for {distro}/{shard}, falling back to hardcoded mappings only"
+                    );
                 }
             }
         }
     }
 
-    // 2. Fetch from RepoSources.
-    let url = format!("{REPO_SOURCES_BASE}/{distro}.json");
-    debug!("Fetching package map from {url}");
-
-    match fetch_package_map(&url).await {
-        Ok(map_file) => {
-            info!(
-                "Fetched {} package mappings for {distro} from RepoSources",
-                map_file.mappings.len()
-            );
-            // Cache to disk (best-effort).
-            if let Err(e) = write_cached_map(&map_dir, &cache_path, &map_file).await {
-                warn!("Failed to cache package map for {distro}: {e}");
-            }
-            map_file.mappings
-        }
-        Err(e) => {
-            debug!("Failed to fetch package map for {distro}: {e}");
-
-            // 3. Try stale cache.
-            if let Some(map) = read_cached_map(&cache_path).await {
-                info!(
-                    "Using stale cached package map for {distro} ({} mappings)",
-                    map.len()
-                );
-                return map;
-            }
-
-            // 4. Nothing available — return empty and let hardcoded fallback handle it.
-            debug!("No package map available for {distro}, using hardcoded fallback only");
-            HashMap::new()
-        }
-    }
+    merged
 }
 
 /// Fetch a `PackageMapFile` from the given URL.
@@ -1544,50 +1656,20 @@ fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
-/// Format unix seconds as an ISO 8601 UTC timestamp string.
-fn utc_iso8601(epoch_secs: u64) -> String {
-    let sec = epoch_secs % 60;
-    let min = (epoch_secs / 60) % 60;
-    let hour = (epoch_secs / 3600) % 24;
-    let mut remaining_days = epoch_secs / 86400;
-    let mut year: u64 = 1970;
-    loop {
-        let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let days_in_year = if is_leap { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = [
-        31,
-        if is_leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0u64;
-    for days in month_days {
-        if remaining_days < days {
-            break;
-        }
-        remaining_days -= days;
-        month += 1;
-    }
-    format!(
-        "{year:04}-{:02}-{:02}T{hour:02}:{min:02}:{sec:02}.000Z",
-        month + 1,
-        remaining_days + 1,
-    )
+/// Compute the HMAC-SHA256 signature header for a `RepoSourceSyncer` POST.
+///
+/// Returns the value to send in the `x-reposync-signature` header
+/// (`sha256=<hex>`). The server recomputes the same HMAC over the raw body
+/// and compares with `crypto.timingSafeEqual` — see
+/// `BlackLeafDigital/functions/RepoSourceSyncer/src/helpers.ts`.
+fn compute_reposync_signature(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(body);
+    let bytes = mac.finalize().into_bytes();
+    format!("sha256={}", hex::encode(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,9 +1832,13 @@ mod tests {
         assert_eq!(name, "libyaml");
     }
 
+    /// Live smoke test against the published `RepoSources` JSON.
+    ///
+    /// Hits `https://zachhandley.github.io/RepoSources/maps/debian_12.json` and
+    /// asserts that the canonical Homebrew names are returned.
     #[tokio::test]
-    async fn test_map_linux_packages_with_empty_cache() {
-        let tmp = std::env::temp_dir().join("zlayer-test-pkg-map");
+    async fn test_map_linux_packages_live_reposources() {
+        let tmp = std::env::temp_dir().join("zlayer-test-pkg-map-live");
         let _ = tokio::process::Command::new("chmod")
             .args(["-R", "u+w"])
             .arg(&tmp)
@@ -1768,11 +1854,13 @@ mod tests {
             map_linux_packages(&["curl", "libssl-dev", "musl-dev"], "debian_12", &tmp).await;
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "curl");
-        assert!(!result[0].1);
-        assert_eq!(result[1].0, "openssl@3");
-        assert!(!result[1].1);
+        assert_eq!(result[0].1, "curl");
+        assert!(!result[0].2);
+        assert_eq!(result[1].0, "libssl-dev");
+        assert_eq!(result[1].1, "openssl");
+        assert!(!result[1].2);
         assert_eq!(result[2].0, "musl-dev");
-        assert!(result[2].1);
+        assert!(result[2].2);
 
         let _ = tokio::process::Command::new("chmod")
             .args(["-R", "u+w"])
@@ -1784,6 +1872,90 @@ mod tests {
             .arg(&tmp)
             .status()
             .await;
+    }
+
+    /// Hermetic test: writes per-shard fixture `PackageMapFile`s to disk, then
+    /// verifies `map_linux_packages` returns the expected
+    /// `(linux_name, brew, skipped)` triples. No network. Always runs in CI —
+    /// this is the regression guard for the sharded layout.
+    async fn write_shard(distro_dir: &Path, shard: &str, mappings: HashMap<String, String>) {
+        let fixture = PackageMapFile {
+            metadata: PackageMapMetadata {
+                generated_at: "2026-04-26T00:00:00Z".to_string(),
+                source: "test-fixture".to_string(),
+                distro: "debian_12".to_string(),
+                shard: Some(shard.to_string()),
+                total_mappings: mappings.len(),
+            },
+            mappings,
+        };
+        let json = serde_json::to_string_pretty(&fixture).expect("serialize fixture");
+        tokio::fs::write(distro_dir.join(format!("{shard}.json")), json)
+            .await
+            .expect("write shard fixture");
+    }
+
+    #[tokio::test]
+    async fn test_map_linux_packages_with_seeded_cache() {
+        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let distro_dir = cache_dir.join("package-maps").join("debian_12");
+        tokio::fs::create_dir_all(&distro_dir)
+            .await
+            .expect("create distro shard dir");
+
+        let mut c_mappings = HashMap::new();
+        c_mappings.insert("curl".to_string(), "curl".to_string());
+        write_shard(&distro_dir, "c", c_mappings).await;
+
+        let mut l_mappings = HashMap::new();
+        l_mappings.insert("libssl-dev".to_string(), "openssl".to_string());
+        write_shard(&distro_dir, "l", l_mappings).await;
+
+        let mut n_mappings = HashMap::new();
+        n_mappings.insert("nodejs".to_string(), "node".to_string());
+        write_shard(&distro_dir, "n", n_mappings).await;
+
+        let result = map_linux_packages(
+            &["curl", "libssl-dev", "musl-dev", "nodejs"],
+            "debian_12",
+            &cache_dir,
+        )
+        .await;
+
+        assert_eq!(result.len(), 4);
+
+        // curl: direct match → curl (from c.json)
+        assert_eq!(result[0].0, "curl");
+        assert_eq!(result[0].1, "curl");
+        assert!(!result[0].2);
+
+        // libssl-dev: direct match → openssl (unversioned, from l.json)
+        assert_eq!(result[1].0, "libssl-dev");
+        assert_eq!(result[1].1, "openssl");
+        assert!(!result[1].2);
+
+        // musl-dev: linux-only skip
+        assert_eq!(result[2].0, "musl-dev");
+        assert!(result[2].2);
+
+        // nodejs: direct match → node (from n.json, unversioned)
+        assert_eq!(result[3].0, "nodejs");
+        assert_eq!(result[3].1, "node");
+        assert!(!result[3].2);
+    }
+
+    // -- HMAC signature test --
+
+    #[test]
+    fn test_compute_reposync_signature_matches_node_crypto() {
+        // Reference vector — re-derive in Node with:
+        //   crypto.createHmac('sha256', 'test-secret').update('{"foo":"bar"}').digest('hex')
+        let sig = compute_reposync_signature("test-secret", br#"{"foo":"bar"}"#);
+        assert_eq!(
+            sig,
+            "sha256=9b1abf7d901bda91325d00f6b397fb0dc257937939b27d4dc67848ab9e08f6c0"
+        );
     }
 
     // -- bottle_platform_tag test --

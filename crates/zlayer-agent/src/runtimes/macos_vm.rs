@@ -681,7 +681,8 @@ impl Runtime for VmRuntime {
             })?;
 
         // Locate the base image rootfs
-        let safe_image_name = sanitize_image_name(&spec.image.name);
+        let image_name_str = spec.image.name.to_string();
+        let safe_image_name = sanitize_image_name(&image_name_str);
         let image_rootfs = {
             let images = self.image_rootfs.read().await;
             images.get(&safe_image_name).cloned()

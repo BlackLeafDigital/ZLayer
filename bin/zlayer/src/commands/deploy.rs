@@ -54,7 +54,7 @@ fn build_service_plan(name: &str, service: &zlayer_spec::ServiceSpec) -> Service
 
     ServicePlan {
         name: name.to_string(),
-        image: service.image.name.clone(),
+        image: service.image.name.to_string(),
         scale_mode,
         endpoints,
     }

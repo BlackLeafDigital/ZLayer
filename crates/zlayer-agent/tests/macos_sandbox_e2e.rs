@@ -519,7 +519,7 @@ async fn test_container_lifecycle_echo() {
         let spec = create_echo_spec();
 
         // Prepare a native rootfs with /bin/echo
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         // Setup cleanup guard
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
@@ -636,7 +636,7 @@ async fn test_container_stop_sigterm() {
         };
         let spec = create_sleep_spec(300); // Sleep 5 minutes -- will be killed
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -704,7 +704,7 @@ async fn test_wait_container_exit_code() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -739,7 +739,7 @@ async fn test_unique_port_allocation() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_sleep_spec(60);
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let mut ports = Vec::new();
         let mut ids = Vec::new();
@@ -806,7 +806,7 @@ async fn test_container_ip_is_localhost() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -846,7 +846,7 @@ async fn test_gpu_metal_compute_profile() {
         };
         let spec = create_gpu_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -909,7 +909,7 @@ async fn test_gpu_mps_only_profile() {
         };
         let spec = create_mps_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -966,7 +966,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
         // Spec requests GPU, but runtime disables it
         let spec = create_gpu_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1018,7 +1018,7 @@ async fn test_network_localhost_only_profile() {
         // Spec with endpoints -> localhost-only network
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1062,7 +1062,7 @@ async fn test_network_full_access_profile() {
         // Spec without endpoints -> full network access
         let spec = create_no_endpoints_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1109,7 +1109,7 @@ async fn test_rootfs_cloning() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_echo_spec();
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         // Create two containers from the same image
         let id1 = ContainerId {
@@ -1188,7 +1188,7 @@ async fn test_rootfs_cleanup_on_removal() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         runtime.create_container(&id, &spec).await.expect("create");
 
@@ -1233,7 +1233,7 @@ async fn test_exec_in_container() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1287,7 +1287,7 @@ async fn test_container_stats() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1341,7 +1341,7 @@ async fn test_stats_fail_before_start() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1378,7 +1378,7 @@ async fn test_memory_limited_container() {
         };
         let spec = create_memory_limited_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1569,7 +1569,7 @@ async fn test_exec_empty_command_fails() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1608,7 +1608,7 @@ async fn test_concurrent_containers() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_echo_spec();
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let container_count = 5;
         let base_name = unique_name("concurrent");
@@ -1693,7 +1693,7 @@ async fn test_stale_container_cleanup() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         // Create a stale directory manually
         let stale_dir = runtime
@@ -1746,7 +1746,7 @@ async fn test_volume_writable_dirs_in_profile() {
         };
         let spec = create_volume_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1794,7 +1794,7 @@ async fn test_get_logs_vector() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1851,7 +1851,7 @@ async fn test_seatbelt_profile_structure() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_image(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 

@@ -11,9 +11,9 @@ use anyhow::{bail, Context, Result};
 use dialoguer::Password;
 use rand::distr::Alphanumeric;
 use rand::Rng;
-use zlayer_api::handlers::auth::UserView;
-use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
-use zlayer_api::storage::UserRole;
+use zlayer_types::api::auth::UserView;
+use zlayer_types::api::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
+use zlayer_types::storage::UserRole;
 
 use zlayer_client::DaemonClient;
 

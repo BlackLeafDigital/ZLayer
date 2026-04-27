@@ -13,54 +13,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use tokio::sync::RwLock;
-use utoipa::ToSchema;
 
 use super::StorageError;
 
-/// One OIDC identity link row.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OidcIdentity {
-    /// Surrogate id (uuid).
-    pub id: String,
-    /// ZLayer user account this identity resolves to.
-    pub user_id: String,
-    /// Provider slug matching `OidcProviderConfig::name`.
-    pub provider: String,
-    /// The `sub` claim from the provider's ID token. Opaque.
-    pub subject: String,
-    /// Email returned by the provider at link time (informational only).
-    pub email_at_link: Option<String>,
-    #[schema(value_type = String, format = DateTime)]
-    pub created_at: DateTime<Utc>,
-    #[schema(value_type = String, format = DateTime)]
-    pub updated_at: DateTime<Utc>,
-}
-
-impl OidcIdentity {
-    /// Convenience constructor — fills `id`, `created_at`, `updated_at`.
-    #[must_use]
-    pub fn new(
-        user_id: impl Into<String>,
-        provider: impl Into<String>,
-        subject: impl Into<String>,
-        email_at_link: Option<String>,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            user_id: user_id.into(),
-            provider: provider.into(),
-            subject: subject.into(),
-            email_at_link,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-}
+// `OidcIdentity` (struct + `::new` constructor) now lives in
+// `zlayer_types::storage`. Re-exported here so `use ...storage::oidc_identities::OidcIdentity`
+// imports keep resolving alongside the trait/impl types defined below.
+pub use zlayer_types::storage::OidcIdentity;
 
 #[async_trait]
 pub trait OidcIdentityStorage: Send + Sync {

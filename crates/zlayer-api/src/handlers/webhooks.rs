@@ -27,15 +27,15 @@ use axum::{
     Json,
 };
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use utoipa::ToSchema;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
 use crate::storage::ProjectStorage;
 use zlayer_secrets::{Secret, SecretsStore};
+
+pub use zlayer_types::api::webhooks::{WebhookInfoResponse, WebhookPath, WebhookResponse};
 
 // ---------------------------------------------------------------------------
 // Scope / key helpers
@@ -76,31 +76,9 @@ pub struct WebhookState {
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
-
-/// Response for the public webhook receiver.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct WebhookResponse {
-    /// Operation result -- always `"ok"` on success.
-    pub status: String,
-    /// HEAD commit SHA after the pull.
-    pub sha: String,
-}
-
-/// Response for `GET /api/v1/projects/{id}/webhook`.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct WebhookInfoResponse {
-    /// Full URL to configure in the git host's webhook settings.
-    pub url: String,
-    /// The HMAC secret to paste into the git host.
-    pub secret: String,
-}
-
-/// Path parameters for the public webhook receiver.
-#[derive(Debug, Deserialize)]
-pub struct WebhookPath {
-    pub provider: String,
-    pub project_id: String,
-}
+//
+// DTOs (`WebhookResponse`, `WebhookInfoResponse`, `WebhookPath`) live in
+// `zlayer_types::api::webhooks` and are re-exported above.
 
 // ---------------------------------------------------------------------------
 // HMAC / signature verification

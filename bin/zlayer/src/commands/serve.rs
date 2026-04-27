@@ -1598,6 +1598,7 @@ impl StorageBundle {
 /// tracks network specs and attachments, but nothing happens on the
 /// container-runtime side). The `BridgeNetworkApiState` logs a single
 /// warning on the first handler call in that mode.
+#[cfg_attr(not(feature = "docker"), allow(clippy::unused_async))]
 async fn build_bridge_network_state() -> BridgeNetworkApiState {
     let state = BridgeNetworkApiState::new();
 

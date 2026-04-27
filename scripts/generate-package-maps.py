@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -20,10 +21,51 @@ sys.stderr.reconfigure(line_buffering=True)
 
 DUMP_URL = "https://dumps.repology.org/repology-database-dump-latest.sql.zst"
 HOMEBREW_REPO = "homebrew"
+HOMEBREW_FORMULA_API = "https://formulae.brew.sh/api/formula.json"
 
 OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public", "maps"
 )
+
+# Hand-curated overrides applied last, overriding anything Repology produces.
+# Use these only for entries Repology can't resolve (no effname join with
+# homebrew), or to force the unversioned canonical when Repology only surfaces
+# versioned aliases. NEVER pin to a specific version here — pinning behind the
+# user's back defeats the point of letting Homebrew (and the user's own formula
+# dependencies) drive version selection. If a caller wants e.g. `openssl@3`
+# they can ask for it explicitly; the unversioned apt input (`libssl-dev`,
+# `python3`) means "current default", which apt itself uses.
+OVERRIDES = {
+    "libssl-dev":    "openssl",
+    "libssl3":       "openssl",
+    "openssl-dev":   "openssl",
+    "python3":       "python",
+    "python3-dev":   "python",
+    "python3-devel": "python",
+    "nodejs":        "node",
+    "default-jdk":   "openjdk",
+    "default-jre":   "openjdk",
+}
+
+# Shard set used to split large per-distro maps into reviewable chunks.
+# `_misc` catches anything whose first character isn't an ASCII a-z letter
+# (digits, plus signs, etc.).
+SHARDS = [chr(c) for c in range(ord("a"), ord("z") + 1)] + ["_misc"]
+
+
+def shard_key(name: str) -> str:
+    """Return the shard letter for a Linux package name.
+
+    Lowercase first ASCII letter for `a`-`z` names; `_misc` for anything else
+    (digits, `+`, etc.). The resolver uses the same function — keep them in
+    sync.
+    """
+    if not name:
+        return "_misc"
+    first = name[0].lower()
+    if "a" <= first <= "z":
+        return first
+    return "_misc"
 
 
 def run(cmd, **kwargs):
@@ -186,6 +228,73 @@ def diagnose(tmpdir, port):
         print(f"  Available tables: {all_tables}")
 
 
+def fetch_homebrew_alias_index():
+    """Fetch the Homebrew formula API once and build an alias→canonical map.
+
+    Each entry maps a formula's `full_name`, every entry in `aliases`, and every
+    entry in `oldnames` to the formula's canonical `full_name`. This lets us
+    prefer the alias-canonical formula when Repology surfaces multiple matches
+    for the same Linux package (e.g. `openssl@3.5` vs `openssl@3`, where
+    `openssl@3.aliases` contains `openssl` and `openssl@3.6`).
+
+    On failure (network/parse error) returns an empty dict; the tiebreak then
+    degrades to the version-suffix heuristic in `pick_winner`.
+    """
+    print(f"Fetching {HOMEBREW_FORMULA_API}...")
+    try:
+        with urllib.request.urlopen(HOMEBREW_FORMULA_API, timeout=60) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"  WARN: failed to fetch homebrew API ({e}); alias-aware tiebreak disabled")
+        return {}
+
+    a2c = {}
+    for f in data:
+        canonical = f.get("full_name") or f.get("name")
+        if not canonical:
+            continue
+        a2c[canonical] = canonical
+        for alias in f.get("aliases", []) or []:
+            a2c[alias] = canonical
+        for old in f.get("oldnames", []) or []:
+            a2c[old] = canonical
+    print(f"  Indexed {len(a2c)} alias entries from {len(data)} formulas")
+    return a2c
+
+
+def pick_winner(candidates, linux_name, alias_to_canonical):
+    """Choose the best Homebrew formula for a Linux package name.
+
+    Tiebreak order:
+      1. If the Linux name is itself a known Homebrew alias and that alias's
+         canonical formula is among the candidates, use it. This catches cases
+         like `openssl → openssl@3` (since `openssl@3.aliases = ['openssl', ...]`).
+      2. Among candidates, prefer one whose name has no `@` (unversioned base
+         formula like `node` over `node@24`).
+      3. Among `@`-versioned candidates, prefer fewer dotted components
+         (`openssl@3` over `openssl@3.5` over `openssl@3.5.6`).
+      4. Lexicographic.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Rule 1: alias-canonical match
+    canonical = alias_to_canonical.get(linux_name)
+    if canonical and canonical in candidates:
+        return canonical
+
+    # Rules 2-4: version-suffix preference, then lex
+    def sort_key(name):
+        if "@" not in name:
+            return (0, len(name), name)
+        suffix = name.split("@", 1)[1]
+        return (1 + suffix.count("."), len(name), name)
+
+    return sorted(candidates, key=sort_key)[0]
+
+
 def get_all_distro_repos(tmpdir, port):
     """Get all non-homebrew repos that have packages also in homebrew."""
     result = psql(tmpdir, port, """
@@ -202,11 +311,14 @@ def get_all_distro_repos(tmpdir, port):
     return [r.strip() for r in result.split("\n") if r.strip()]
 
 
-def extract_mappings(tmpdir, port, distro_repo):
+def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
     """Extract distro→homebrew mappings for a single repo.
 
     Captures all name variants: visiblename, srcname, binname, and
-    individual entries from the binnames array.
+    individual entries from the binnames array. When a Linux package has
+    multiple Homebrew candidates (different versioned aliases sharing an
+    `effname`), uses `pick_winner` to choose the canonical one rather than
+    accepting whichever PostgreSQL emits first.
     """
     result = psql_query(tmpdir, port, f"""
         SELECT DISTINCT d_name, h.visiblename
@@ -230,43 +342,117 @@ def extract_mappings(tmpdir, port, distro_repo):
         ORDER BY d_name;
     """)
 
-    mappings = {}
+    candidates = {}
     for line in result.split("\n"):
         if "|" in line:
             parts = line.split("|", 1)
             if len(parts) == 2 and parts[0].strip() and parts[1].strip():
                 linux_name = parts[0].strip()
                 brew_name = parts[1].strip()
-                if linux_name not in mappings:
-                    mappings[linux_name] = brew_name
-    return mappings
+                bucket = candidates.setdefault(linux_name, [])
+                if brew_name not in bucket:
+                    bucket.append(brew_name)
+
+    return {
+        linux_name: pick_winner(cands, linux_name, alias_to_canonical)
+        for linux_name, cands in candidates.items()
+    }
 
 
-def write_map_file(filepath, distro_repo, mappings):
-    # Merge with existing mappings so packages only grow, never shrink
-    existing = {}
-    if os.path.exists(filepath):
-        with open(filepath) as f:
-            existing = json.load(f).get("mappings", {})
+def write_sharded_map_files(distro_dir, distro_repo, mappings, generated_at):
+    """Write per-shard JSON files under {distro_dir}/{shard}.json.
 
-    merged = {**existing, **mappings}
+    Each shard contains only the entries whose first letter belongs to that
+    shard. OVERRIDES are applied to the shard their key belongs to so the
+    final per-shard file already reflects the override.
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    Atomicity: each shard is written to `.tmp-{shard}.json` and renamed to
+    `{shard}.json`. A crash mid-loop leaves prior shards intact and at most
+    one tmp file behind, never a half-written shard.
+
+    Returns the list of shard letters that were written (i.e. had at least
+    one entry after merge with existing).
+    """
+    # Bucket new mappings by shard
+    new_buckets = {s: {} for s in SHARDS}
+    for name, brew in mappings.items():
+        new_buckets[shard_key(name)][name] = brew
+    # Apply OVERRIDES per-shard
+    for name, brew in OVERRIDES.items():
+        new_buckets[shard_key(name)][name] = brew
+
+    written = []
+    total_new = 0
+    total_after = 0
+    for shard in SHARDS:
+        shard_path = os.path.join(distro_dir, f"{shard}.json")
+
+        # Read existing entries for this shard so packages only grow, never shrink
+        existing = {}
+        if os.path.exists(shard_path):
+            with open(shard_path) as f:
+                existing = json.load(f).get("mappings", {})
+
+        new_for_shard = new_buckets[shard]
+        # Existing first, new second so new wins on conflict
+        merged = {**existing, **new_for_shard}
+        # Re-apply OVERRIDES so they always win even over existing on-disk data
+        for name, brew in OVERRIDES.items():
+            if shard_key(name) == shard:
+                merged[name] = brew
+
+        if not merged:
+            # Nothing to write; remove any pre-existing empty shard so the
+            # index reflects reality
+            continue
+
+        doc = {
+            "metadata": {
+                "generated_at": generated_at,
+                "source": "repology-dump",
+                "distro": distro_repo,
+                "shard": shard,
+                "total_mappings": len(merged),
+            },
+            "mappings": dict(sorted(merged.items())),
+        }
+
+        tmp_path = os.path.join(distro_dir, f".tmp-{shard}.json")
+        with open(tmp_path, "w") as f:
+            json.dump(doc, f, indent=2)
+        os.rename(tmp_path, shard_path)
+
+        written.append(shard)
+        total_new += len(new_for_shard)
+        total_after += len(merged)
+
+    print(
+        f"  {distro_repo}: {total_after} mappings across {len(written)} shards "
+        f"({total_new} from this run)"
+    )
+    return written, total_after
+
+
+def write_distro_index(distro_dir, distro_repo, shards_written, total_mappings, generated_at):
+    """Write {distro_dir}/index.json after all shards are in place.
+
+    Always called *after* `write_sharded_map_files` so a verifier reading
+    `index.json` sees a complete shard set or the previous run's index.
+    """
     doc = {
         "metadata": {
-            "generated_at": now,
+            "generated_at": generated_at,
             "source": "repology-dump",
             "distro": distro_repo,
-            "total_mappings": len(merged),
-        },
-        "mappings": dict(sorted(merged.items())),
+            "shards": shards_written,
+            "total_mappings": total_mappings,
+        }
     }
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w") as f:
+    index_path = os.path.join(distro_dir, "index.json")
+    tmp_path = os.path.join(distro_dir, ".tmp-index.json")
+    with open(tmp_path, "w") as f:
         json.dump(doc, f, indent=2)
-    size_kb = os.path.getsize(filepath) / 1024
-    added = len(merged) - len(existing)
-    print(f"  {distro_repo}: {len(merged)} mappings ({added:+d} new, {size_kb:.1f} KB)")
+    os.rename(tmp_path, index_path)
 
 
 def main():
@@ -282,6 +468,9 @@ def main():
             load_dump(sock_dir, port)
             diagnose(sock_dir, port)
 
+            # Fetch the Homebrew alias index once; reused across every distro.
+            alias_to_canonical = fetch_homebrew_alias_index()
+
             # Get ALL distro repos that have homebrew equivalents
             print("\nFinding all distro repos with Homebrew mappings...")
             repos = get_all_distro_repos(sock_dir, port)
@@ -295,13 +484,20 @@ def main():
             print(f"\nExtracting mappings for {len(repos)} repos...")
             os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+            generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             total = 0
             for repo in repos:
-                mappings = extract_mappings(sock_dir, port, repo)
+                mappings = extract_mappings(sock_dir, port, repo, alias_to_canonical)
                 if mappings:
-                    filepath = os.path.join(OUTPUT_DIR, f"{repo}.json")
-                    write_map_file(filepath, repo, mappings)
-                    total += len(mappings)
+                    distro_dir = os.path.join(OUTPUT_DIR, repo)
+                    os.makedirs(distro_dir, exist_ok=True)
+                    shards_written, total_after = write_sharded_map_files(
+                        distro_dir, repo, mappings, generated_at
+                    )
+                    write_distro_index(
+                        distro_dir, repo, shards_written, total_after, generated_at
+                    )
+                    total += total_after
 
             print(f"\nTotal: {total} mappings across {len(repos)} repos")
             print("Done!")

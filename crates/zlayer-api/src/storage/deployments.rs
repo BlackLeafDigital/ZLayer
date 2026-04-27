@@ -271,7 +271,7 @@ mod tests {
                 rtype: zlayer_spec::ResourceType::Service,
                 schedule: None,
                 image: ImageSpec {
-                    name: "test:latest".to_string(),
+                    name: "test:latest".parse().expect("valid image reference"),
                     pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
                 },
                 resources: zlayer_spec::ResourcesSpec::default(),

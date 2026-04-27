@@ -24,7 +24,8 @@
 //!
 //! Registry is in-memory for now; parallel agent wires this to the runtime.
 
-use std::collections::HashMap;
+pub use zlayer_types::api::container_networks::*;
+
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,15 +38,13 @@ use axum::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
-use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
-use zlayer_spec::{BridgeNetwork, BridgeNetworkAttachment, BridgeNetworkDriver};
+use zlayer_spec::{BridgeNetwork, BridgeNetworkAttachment};
 
 // ---------------------------------------------------------------------------
 // Runtime trait (seam for bollard-backed implementation)
@@ -233,81 +232,6 @@ impl Default for BridgeNetworkApiState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ---------------------------------------------------------------------------
-// Request / Response types
-// ---------------------------------------------------------------------------
-
-/// Body for `POST /api/v1/container-networks`.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct CreateBridgeNetworkRequest {
-    /// Network name (must match `^[a-z0-9][a-z0-9_-]{0,63}$`).
-    pub name: String,
-    /// Driver, defaults to `bridge`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub driver: Option<BridgeNetworkDriver>,
-    /// Subnet CIDR (e.g. `"10.240.0.0/24"`). Validated as
-    /// [`ipnetwork::IpNetwork`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subnet: Option<String>,
-    /// Arbitrary labels.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub labels: HashMap<String, String>,
-    /// Internal-only (no egress) network.
-    #[serde(default)]
-    pub internal: bool,
-}
-
-/// Response body for `GET /api/v1/container-networks/{id_or_name}`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BridgeNetworkDetails {
-    /// Core network metadata. Flattened so the JSON stays close to the
-    /// list-item shape returned by `list_container_networks`.
-    #[serde(flatten)]
-    pub network: BridgeNetwork,
-    /// Containers currently attached to the network.
-    pub attached_containers: Vec<BridgeNetworkAttachment>,
-}
-
-/// Query parameters for list/delete.
-#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
-pub struct ListBridgeNetworksQuery {
-    /// Optional label filter in `key=value` form. Only networks whose
-    /// labels contain a matching pair are returned.
-    #[serde(default)]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
-pub struct DeleteBridgeNetworkQuery {
-    /// If true, delete even if the network still has attachments.
-    #[serde(default)]
-    pub force: bool,
-}
-
-/// Body for `POST /api/v1/container-networks/{id_or_name}/connect`.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct ConnectBridgeNetworkRequest {
-    /// Container id to attach.
-    pub container_id: String,
-    /// Optional DNS aliases on this network.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    /// Optional static IPv4 to pin this container to. Validated as
-    /// [`Ipv4Addr`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv4_address: Option<String>,
-}
-
-/// Body for `POST /api/v1/container-networks/{id_or_name}/disconnect`.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct DisconnectBridgeNetworkRequest {
-    /// Container id to detach.
-    pub container_id: String,
-    /// If true, the runtime is asked to forcibly detach.
-    #[serde(default)]
-    pub force: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +660,8 @@ pub async fn disconnect_container_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use zlayer_spec::BridgeNetworkDriver;
 
     fn mk_network(name: &str) -> BridgeNetwork {
         BridgeNetwork {

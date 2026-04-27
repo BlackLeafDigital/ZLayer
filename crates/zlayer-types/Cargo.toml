@@ -1,0 +1,24 @@
+[package]
+name = "zlayer-types"
+version = "0.1.0"
+edition = "2021"
+authors = ["ZLayer contributors"]
+license = "Apache-2.0"
+description = "Shared wire types for the ZLayer platform — API DTOs, OCI image references, and related serde types."
+repository = "https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer"
+readme = "README.md"
+publish = ["forgejo"]
+
+[dependencies]
+oci-client = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+cron = { workspace = true }
+humantime = "2.3"
+regex = "1.12"
+thiserror = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+validator = { workspace = true, features = ["derive"] }

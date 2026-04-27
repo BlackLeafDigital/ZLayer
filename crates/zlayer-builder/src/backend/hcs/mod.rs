@@ -78,7 +78,7 @@ use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use crate::builder::{BuildOptions, BuiltImage, RegistryAuth};
-use crate::dockerfile::{Dockerfile, ImageRef, Instruction};
+use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction};
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 
@@ -219,11 +219,11 @@ impl BuildBackend for HcsBackend {
         // already rules out the former, and scratch is not a valid Windows
         // base in practice (no OS to run HCS processes against).
         let base_ref = match &stage.base_image {
-            ImageRef::Registry { .. } => stage.base_image.to_string_ref(),
-            ImageRef::Stage(name) => {
+            DockerfileFromTarget::Image(r) => r.to_string(),
+            DockerfileFromTarget::Stage(name) => {
                 return Err(BuildError::stage_not_found(name));
             }
-            ImageRef::Scratch => {
+            DockerfileFromTarget::Scratch => {
                 return Err(BuildError::InvalidInstruction {
                     instruction: "FROM scratch".to_string(),
                     reason: "HCS builder requires a Windows base image — `scratch` cannot run HCS \

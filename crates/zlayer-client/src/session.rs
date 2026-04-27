@@ -12,31 +12,15 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tracing::debug;
+
+// `Session` lives in `zlayer-types` so SDK crates can use it without
+// pulling in this HTTP client. Re-export so existing
+// `zlayer_client::session::Session` paths keep working.
+pub use zlayer_types::client::Session;
 
 /// Filename under `~/.zlayer/`.
 const SESSION_FILENAME: &str = "session.json";
-
-/// Persisted session record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    /// JWT access token.
-    pub token: String,
-    /// Email of the authenticated user (for `whoami` display).
-    pub email: String,
-    /// Token expiry. Used to warn the user before the token actually expires.
-    pub expires_at: DateTime<Utc>,
-}
-
-impl Session {
-    /// Whether the token is past its expiry.
-    #[must_use]
-    pub fn is_expired(&self) -> bool {
-        Utc::now() >= self.expires_at
-    }
-}
 
 /// Default session file path (`~/.zlayer/session.json`). Errors if the home
 /// directory cannot be determined.
@@ -130,7 +114,7 @@ pub fn delete_session() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
 
     fn test_session() -> Session {
         Session {

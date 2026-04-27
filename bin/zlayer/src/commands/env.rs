@@ -12,7 +12,7 @@
 
 use anyhow::{bail, Context, Result};
 use dialoguer::Confirm;
-use zlayer_api::storage::StoredEnvironment;
+use zlayer_types::storage::StoredEnvironment;
 
 use zlayer_client::DaemonClient;
 

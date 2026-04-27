@@ -2,8 +2,8 @@
 //!
 //! This module provides validators for all spec fields with proper error reporting.
 
-use crate::error::{ValidationError, ValidationErrorKind};
-use crate::types::{
+use crate::spec::error::{ValidationError, ValidationErrorKind};
+use crate::spec::types::{
     DeploymentSpec, EndpointSpec, EndpointTunnelConfig, Protocol, ResourceType, ScaleSpec,
     ServiceSpec, ServiceType, TunnelAccessConfig, TunnelDefinition,
 };
@@ -77,22 +77,6 @@ pub fn validate_deployment_name_wrapper(name: &str) -> Result<(), validator::Val
     }
 
     Ok(())
-}
-
-/// Wrapper for `validate_image_name` for use with validator crate
-///
-/// # Errors
-///
-/// Returns a validation error if the image name is empty.
-pub fn validate_image_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
-    if name.is_empty() || name.trim().is_empty() {
-        Err(make_validation_error(
-            "empty_image_name",
-            "image name cannot be empty",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 /// Wrapper for `validate_cpu` for use with validator crate
@@ -314,11 +298,11 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
 pub fn validate_env_vars(
     service_name: &str,
     env: &std::collections::HashMap<String, String>,
-) -> Result<(), crate::error::ValidationError> {
+) -> Result<(), crate::spec::error::ValidationError> {
     for (key, value) in env {
         if let Err(e) = validate_secret_reference(value) {
-            return Err(crate::error::ValidationError {
-                kind: crate::error::ValidationErrorKind::InvalidEnvVar {
+            return Err(crate::spec::error::ValidationError {
+                kind: crate::spec::error::ValidationErrorKind::InvalidEnvVar {
                     key: key.clone(),
                     reason: e
                         .message
@@ -835,7 +819,7 @@ pub fn validate_wasm_config(service_name: &str, spec: &ServiceSpec) -> Result<()
 /// Validate basic WASM config fields (memory format, instance range).
 fn validate_wasm_fields(
     service_name: &str,
-    wasm: &crate::types::WasmConfig,
+    wasm: &crate::spec::types::WasmConfig,
 ) -> Result<(), ValidationError> {
     if let Some(ref max_mem) = wasm.max_memory {
         validate_memory_format(max_mem).map_err(|_| ValidationError {
@@ -863,7 +847,7 @@ fn validate_wasm_fields(
 fn validate_wasm_capabilities(
     service_name: &str,
     spec: &ServiceSpec,
-    wasm: &crate::types::WasmConfig,
+    wasm: &crate::spec::types::WasmConfig,
 ) -> Result<(), ValidationError> {
     let Some(ref caps) = wasm.capabilities else {
         return Ok(());
@@ -920,7 +904,7 @@ fn validate_wasm_http_endpoints(
 /// Validate that WASM preopens have non-empty source and target paths.
 fn validate_wasm_preopens(
     service_name: &str,
-    wasm: &crate::types::WasmConfig,
+    wasm: &crate::spec::types::WasmConfig,
 ) -> Result<(), ValidationError> {
     for (i, preopen) in wasm.preopens.iter().enumerate() {
         if preopen.source.is_empty() {
@@ -975,7 +959,7 @@ fn validate_capability_restriction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExposeType, Protocol};
+    use crate::spec::types::{ExposeType, Protocol};
 
     // Version validation tests
     #[test]
@@ -1357,7 +1341,7 @@ mod tests {
             to: "node-b".to_string(),
             local_port: 8080,
             remote_port: 9000,
-            protocol: crate::types::TunnelProtocol::Tcp,
+            protocol: crate::spec::types::TunnelProtocol::Tcp,
             expose: ExposeType::Internal,
         };
         assert!(validate_tunnel_definition("test-tunnel", &tunnel).is_ok());
@@ -1370,7 +1354,7 @@ mod tests {
             to: "node-b".to_string(),
             local_port: 0,
             remote_port: 9000,
-            protocol: crate::types::TunnelProtocol::Tcp,
+            protocol: crate::spec::types::TunnelProtocol::Tcp,
             expose: ExposeType::Internal,
         };
         let result = validate_tunnel_definition("test-tunnel", &tunnel);
@@ -1388,7 +1372,7 @@ mod tests {
             to: "node-b".to_string(),
             local_port: 8080,
             remote_port: 0,
-            protocol: crate::types::TunnelProtocol::Tcp,
+            protocol: crate::spec::types::TunnelProtocol::Tcp,
             expose: ExposeType::Internal,
         };
         let result = validate_tunnel_definition("test-tunnel", &tunnel);

@@ -301,8 +301,9 @@ impl JobExecutor {
         );
 
         // Pull image
+        let image_str = spec.image.name.to_string();
         if let Err(e) = runtime
-            .pull_image_with_policy(&spec.image.name, spec.image.pull_policy, None)
+            .pull_image_with_policy(&image_str, spec.image.pull_policy, None)
             .await
         {
             error!(

@@ -3,8 +3,8 @@
 //! Admin-only CRUD for user groups and membership management.
 
 use anyhow::{bail, Context, Result};
-use zlayer_api::storage::StoredUserGroup;
 use zlayer_api::CreateGroupRequest;
+use zlayer_types::storage::StoredUserGroup;
 
 use zlayer_client::DaemonClient;
 

@@ -8,7 +8,7 @@
 //! (`GET/POST/DELETE /api/v1/workflows[/id[/run|runs]]`) via [`DaemonClient`].
 
 use anyhow::{Context, Result};
-use zlayer_api::storage::{StoredWorkflow, WorkflowRun};
+use zlayer_types::storage::{StoredWorkflow, WorkflowRun};
 
 use zlayer_client::DaemonClient;
 

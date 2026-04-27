@@ -305,6 +305,7 @@ impl Wsl2DelegateRuntime {
     /// distro, or when `youki` is not on `$PATH` inside the distro and no
     /// explicit path was provided — both are misconfigurations that warrant a
     /// hard fail rather than silently disabling Linux support.
+    #[allow(clippy::too_many_lines)]
     pub async fn try_new_with_config(config: Wsl2DelegateConfig) -> Result<Option<Self>> {
         // 1. Detect WSL2. Any failure of the detect call is treated as
         //    "no WSL" rather than a hard error.
@@ -898,6 +899,7 @@ impl Runtime for Wsl2DelegateRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let bundle_dir = self.bundle_dir(id);
         let rootfs_dir = format!("{bundle_dir}/rootfs");
@@ -921,24 +923,24 @@ impl Runtime for Wsl2DelegateRuntime {
         //    the caller skipped the pull step (e.g. direct `create_container`
         //    in a test) we fall through to the same pull path used by
         //    `pull_image_with_policy`.
-        let cached = match self.image_cache.read().await.get(&spec.image.name).cloned() {
-            Some(c) => c,
-            None => {
-                self.pull_image_with_policy(&spec.image.name, spec.image.pull_policy, None)
-                    .await?;
-                self.image_cache
-                    .read()
-                    .await
-                    .get(&spec.image.name)
-                    .cloned()
-                    .ok_or_else(|| AgentError::CreateFailed {
-                        id: id.to_string(),
-                        reason: format!(
-                            "image {} missing from WSL2 delegate cache after pull",
-                            spec.image.name
-                        ),
-                    })?
-            }
+        let image_name = spec.image.name.to_string();
+        let cached = if let Some(c) = self.image_cache.read().await.get(&image_name).cloned() {
+            c
+        } else {
+            self.pull_image_with_policy(&image_name, spec.image.pull_policy, None)
+                .await?;
+            self.image_cache
+                .read()
+                .await
+                .get(&image_name)
+                .cloned()
+                .ok_or_else(|| AgentError::CreateFailed {
+                    id: id.to_string(),
+                    reason: format!(
+                        "image {} missing from WSL2 delegate cache after pull",
+                        spec.image.name
+                    ),
+                })?
         };
 
         // 3. Extract every layer into <bundle_dir>/rootfs inside the distro.

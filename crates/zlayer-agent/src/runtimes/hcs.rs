@@ -813,17 +813,18 @@ impl Runtime for HcsRuntime {
     )]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let hcs_id = Self::hcs_id(id);
+        let image_name = spec.image.name.to_string();
 
         // 1. Look up (or lazy-pull) the unpacked image.
         {
             let cache = self.images.read().await;
-            if !cache.contains_key(&spec.image.name) {
+            if !cache.contains_key(&image_name) {
                 drop(cache);
-                self.do_pull(&spec.image.name, spec.image.pull_policy, None)
+                self.do_pull(&image_name, spec.image.pull_policy, None)
                     .await?;
             }
         }
-        let parent_layers = self.resolve_parent_chain(&spec.image.name).await?;
+        let parent_layers = self.resolve_parent_chain(&image_name).await?;
 
         // 2. Build a scratch layer for this container.
         let scratch_dir = self.scratch_dir(&hcs_id);

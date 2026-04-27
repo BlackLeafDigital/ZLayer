@@ -1,5 +1,7 @@
 //! Deployment endpoints
 
+pub use zlayer_types::api::deployments::*;
+
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,240 +14,15 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::Stream;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
-use utoipa::ToSchema;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
 use crate::storage::{DeploymentStatus, DeploymentStorage, StoredDeployment};
 use zlayer_agent::ServiceManager;
-
-/// Deployment summary
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct DeploymentSummary {
-    /// Deployment name
-    pub name: String,
-    /// Deployment status
-    pub status: String,
-    /// Number of services
-    pub service_count: usize,
-    /// Created timestamp
-    pub created_at: String,
-}
-
-/// Per-service health info included in deployment details
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ServiceHealthInfo {
-    /// Service name
-    pub name: String,
-    /// Running replica count
-    pub replicas_running: u32,
-    /// Desired replica count
-    pub replicas_desired: u32,
-    /// Health status ("healthy", "unhealthy", "unknown")
-    pub health: String,
-    /// Endpoint URLs for this service
-    pub endpoints: Vec<String>,
-}
-
-/// Deployment details (enhanced with per-service health and endpoints)
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct DeploymentDetails {
-    /// Deployment name
-    pub name: String,
-    /// Deployment status
-    pub status: String,
-    /// Service names (for backwards compatibility)
-    pub services: Vec<String>,
-    /// Per-service health and endpoint info
-    pub service_health: Vec<ServiceHealthInfo>,
-    /// Created timestamp
-    pub created_at: String,
-    /// Updated timestamp
-    pub updated_at: String,
-}
-
-/// Create deployment request
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateDeploymentRequest {
-    /// Deployment specification (YAML content)
-    pub spec: String,
-}
-
-// ============================================================================
-// SSE Progress Events
-// ============================================================================
-
-/// Deployment progress event sent over SSE during orchestration.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DeploymentProgressEvent {
-    /// Deployment orchestration has started
-    Started {
-        /// Deployment name
-        deployment: String,
-        /// List of services being deployed
-        services: Vec<String>,
-    },
-    /// A service was successfully registered with the service manager
-    ServiceRegistered {
-        /// Service name
-        service: String,
-    },
-    /// A service failed to register
-    ServiceRegistrationFailed {
-        /// Service name
-        service: String,
-        /// Error message
-        error: String,
-    },
-    /// Overlay network created for a service
-    OverlayCreated {
-        /// Service name
-        service: String,
-        /// Network interface name
-        interface: String,
-    },
-    /// Overlay creation failed (non-fatal)
-    OverlayFailed {
-        /// Service name
-        service: String,
-        /// Error message
-        error: String,
-    },
-    /// Proxy routes configured for a service
-    ProxyConfigured {
-        /// Service name
-        service: String,
-    },
-    /// Proxy configuration failed (non-fatal)
-    ProxyFailed {
-        /// Service name
-        service: String,
-        /// Error message
-        error: String,
-    },
-    /// Service scaling has started
-    ServiceScaling {
-        /// Service name
-        service: String,
-        /// Target replica count
-        target: u32,
-    },
-    /// Service successfully scaled
-    ServiceScaled {
-        /// Service name
-        service: String,
-        /// Number of replicas running
-        replicas: u32,
-    },
-    /// Service scaling failed
-    ServiceScaleFailed {
-        /// Service name
-        service: String,
-        /// Error message
-        error: String,
-    },
-    /// Waiting for stabilization
-    Stabilizing,
-    /// Deployment is ready and running
-    Ready,
-    /// Deployment failed
-    Failed {
-        /// Error message describing the failure
-        message: String,
-    },
-}
-
-/// Wrapper for serializing deployment progress events as SSE.
-///
-/// Converts each [`DeploymentProgressEvent`] variant into an `event_type` string
-/// and a JSON `data` payload, following the same pattern as [`super::build::BuildEventWrapper`].
-#[derive(Debug, Clone, Serialize)]
-pub struct DeploymentEventWrapper {
-    /// SSE event type (used as the `event:` field)
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// JSON data payload
-    pub data: serde_json::Value,
-}
-
-impl From<DeploymentProgressEvent> for DeploymentEventWrapper {
-    fn from(event: DeploymentProgressEvent) -> Self {
-        match event {
-            DeploymentProgressEvent::Started {
-                deployment,
-                services,
-            } => DeploymentEventWrapper {
-                event_type: "started".to_string(),
-                data: serde_json::json!({
-                    "deployment": deployment,
-                    "services": services,
-                }),
-            },
-            DeploymentProgressEvent::ServiceRegistered { service } => DeploymentEventWrapper {
-                event_type: "service_registered".to_string(),
-                data: serde_json::json!({ "service": service }),
-            },
-            DeploymentProgressEvent::ServiceRegistrationFailed { service, error } => {
-                DeploymentEventWrapper {
-                    event_type: "service_registration_failed".to_string(),
-                    data: serde_json::json!({ "service": service, "error": error }),
-                }
-            }
-            DeploymentProgressEvent::OverlayCreated { service, interface } => {
-                DeploymentEventWrapper {
-                    event_type: "overlay_created".to_string(),
-                    data: serde_json::json!({ "service": service, "interface": interface }),
-                }
-            }
-            DeploymentProgressEvent::OverlayFailed { service, error } => DeploymentEventWrapper {
-                event_type: "overlay_failed".to_string(),
-                data: serde_json::json!({ "service": service, "error": error }),
-            },
-            DeploymentProgressEvent::ProxyConfigured { service } => DeploymentEventWrapper {
-                event_type: "proxy_configured".to_string(),
-                data: serde_json::json!({ "service": service }),
-            },
-            DeploymentProgressEvent::ProxyFailed { service, error } => DeploymentEventWrapper {
-                event_type: "proxy_failed".to_string(),
-                data: serde_json::json!({ "service": service, "error": error }),
-            },
-            DeploymentProgressEvent::ServiceScaling { service, target } => DeploymentEventWrapper {
-                event_type: "service_scaling".to_string(),
-                data: serde_json::json!({ "service": service, "target": target }),
-            },
-            DeploymentProgressEvent::ServiceScaled { service, replicas } => {
-                DeploymentEventWrapper {
-                    event_type: "service_scaled".to_string(),
-                    data: serde_json::json!({ "service": service, "replicas": replicas }),
-                }
-            }
-            DeploymentProgressEvent::ServiceScaleFailed { service, error } => {
-                DeploymentEventWrapper {
-                    event_type: "service_scale_failed".to_string(),
-                    data: serde_json::json!({ "service": service, "error": error }),
-                }
-            }
-            DeploymentProgressEvent::Stabilizing => DeploymentEventWrapper {
-                event_type: "stabilizing".to_string(),
-                data: serde_json::json!({}),
-            },
-            DeploymentProgressEvent::Ready => DeploymentEventWrapper {
-                event_type: "ready".to_string(),
-                data: serde_json::json!({}),
-            },
-            DeploymentProgressEvent::Failed { message } => DeploymentEventWrapper {
-                event_type: "failed".to_string(),
-                data: serde_json::json!({ "message": message }),
-            },
-        }
-    }
-}
 
 /// Helper to send a deployment progress event on the broadcast channel.
 ///
@@ -380,76 +157,92 @@ impl DeploymentState {
     }
 }
 
-impl DeploymentDetails {
-    /// Build deployment details from stored deployment and optional live health info.
-    fn from_stored(d: &StoredDeployment, service_health: Vec<ServiceHealthInfo>) -> Self {
-        Self {
-            name: d.name.clone(),
-            status: d.status.to_string(),
-            services: d.spec.services.keys().cloned().collect(),
-            service_health,
-            created_at: d.created_at.to_rfc3339(),
-            updated_at: d.updated_at.to_rfc3339(),
-        }
+/// Build deployment details from a stored deployment and pre-computed live
+/// health info.
+///
+/// Free function (rather than `impl DeploymentDetails`) because
+/// `DeploymentDetails` is foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn deployment_details_from_stored_with_health(
+    d: &StoredDeployment,
+    service_health: Vec<ServiceHealthInfo>,
+) -> DeploymentDetails {
+    DeploymentDetails {
+        name: d.name.clone(),
+        status: d.status.to_string(),
+        services: d.spec.services.keys().cloned().collect(),
+        service_health,
+        created_at: d.created_at.to_rfc3339(),
+        updated_at: d.updated_at.to_rfc3339(),
     }
 }
 
-impl From<&StoredDeployment> for DeploymentDetails {
-    fn from(d: &StoredDeployment) -> Self {
-        // Backwards-compatible: no live health info, build from spec
-        let service_health: Vec<ServiceHealthInfo> = d
-            .spec
-            .services
-            .iter()
-            .map(|(name, svc)| {
-                let desired = match &svc.scale {
-                    zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
-                    zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
-                    zlayer_spec::ScaleSpec::Manual => 0,
-                };
-                let endpoints: Vec<String> = svc
-                    .endpoints
-                    .iter()
-                    .map(|ep| {
-                        let proto = match ep.protocol {
-                            zlayer_spec::Protocol::Http => "http",
-                            zlayer_spec::Protocol::Https => "https",
-                            zlayer_spec::Protocol::Tcp => "tcp",
-                            zlayer_spec::Protocol::Udp => "udp",
-                            zlayer_spec::Protocol::Websocket => "ws",
-                        };
-                        format!("{}://localhost:{}", proto, ep.port)
-                    })
-                    .collect();
-                ServiceHealthInfo {
-                    name: name.clone(),
-                    replicas_running: desired,
-                    replicas_desired: desired,
-                    health: "unknown".to_string(),
-                    endpoints,
-                }
-            })
-            .collect();
+/// Build deployment details from a stored deployment with no live health info,
+/// reconstructing per-service health from the spec.
+///
+/// Free function (rather than `impl From<&StoredDeployment> for DeploymentDetails`)
+/// because `DeploymentDetails` is foreign to this crate, which would violate
+/// the orphan rule.
+#[must_use]
+pub fn deployment_details_from_stored(d: &StoredDeployment) -> DeploymentDetails {
+    // Backwards-compatible: no live health info, build from spec
+    let service_health: Vec<ServiceHealthInfo> = d
+        .spec
+        .services
+        .iter()
+        .map(|(name, svc)| {
+            let desired = match &svc.scale {
+                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                zlayer_spec::ScaleSpec::Manual => 0,
+            };
+            let endpoints: Vec<String> = svc
+                .endpoints
+                .iter()
+                .map(|ep| {
+                    let proto = match ep.protocol {
+                        zlayer_spec::Protocol::Http => "http",
+                        zlayer_spec::Protocol::Https => "https",
+                        zlayer_spec::Protocol::Tcp => "tcp",
+                        zlayer_spec::Protocol::Udp => "udp",
+                        zlayer_spec::Protocol::Websocket => "ws",
+                    };
+                    format!("{}://localhost:{}", proto, ep.port)
+                })
+                .collect();
+            ServiceHealthInfo {
+                name: name.clone(),
+                replicas_running: desired,
+                replicas_desired: desired,
+                health: "unknown".to_string(),
+                endpoints,
+            }
+        })
+        .collect();
 
-        Self {
-            name: d.name.clone(),
-            status: d.status.to_string(),
-            services: d.spec.services.keys().cloned().collect(),
-            service_health,
-            created_at: d.created_at.to_rfc3339(),
-            updated_at: d.updated_at.to_rfc3339(),
-        }
+    DeploymentDetails {
+        name: d.name.clone(),
+        status: d.status.to_string(),
+        services: d.spec.services.keys().cloned().collect(),
+        service_health,
+        created_at: d.created_at.to_rfc3339(),
+        updated_at: d.updated_at.to_rfc3339(),
     }
 }
 
-impl From<&StoredDeployment> for DeploymentSummary {
-    fn from(d: &StoredDeployment) -> Self {
-        Self {
-            name: d.name.clone(),
-            status: d.status.to_string(),
-            service_count: d.spec.services.len(),
-            created_at: d.created_at.to_rfc3339(),
-        }
+/// Build a deployment summary from a stored deployment.
+///
+/// Free function (rather than `impl From<&StoredDeployment> for DeploymentSummary`)
+/// because `DeploymentSummary` is foreign to this crate, which would violate
+/// the orphan rule.
+#[must_use]
+pub fn deployment_summary_from_stored(d: &StoredDeployment) -> DeploymentSummary {
+    DeploymentSummary {
+        name: d.name.clone(),
+        status: d.status.to_string(),
+        service_count: d.spec.services.len(),
+        created_at: d.created_at.to_rfc3339(),
     }
 }
 
@@ -478,8 +271,10 @@ pub async fn list_deployments(
         .await
         .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
-    let summaries: Vec<DeploymentSummary> =
-        deployments.iter().map(DeploymentSummary::from).collect();
+    let summaries: Vec<DeploymentSummary> = deployments
+        .iter()
+        .map(deployment_summary_from_stored)
+        .collect();
     Ok(Json(summaries))
 }
 
@@ -515,7 +310,7 @@ pub async fn get_deployment(
         .ok_or_else(|| ApiError::NotFound(format!("Deployment '{name}' not found")))?;
 
     let service_health = state.build_service_health(&deployment).await;
-    Ok(Json(DeploymentDetails::from_stored(
+    Ok(Json(deployment_details_from_stored_with_health(
         &deployment,
         service_health,
     )))
@@ -573,7 +368,7 @@ pub async fn create_deployment(
             .await
             .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
-        let details = DeploymentDetails::from(&deployment);
+        let details = deployment_details_from_stored(&deployment);
 
         // Create a broadcast channel for SSE progress events
         let (event_tx, _) = broadcast::channel::<DeploymentEventWrapper>(256);
@@ -607,7 +402,7 @@ pub async fn create_deployment(
 
         Ok((
             StatusCode::CREATED,
-            Json(DeploymentDetails::from(&deployment)),
+            Json(deployment_details_from_stored(&deployment)),
         ))
     }
 }

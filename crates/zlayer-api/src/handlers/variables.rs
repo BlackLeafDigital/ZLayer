@@ -17,8 +17,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+pub use zlayer_types::api::variables::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
@@ -37,43 +36,6 @@ impl VariableState {
     pub fn new(store: Arc<dyn VariableStorage>) -> Self {
         Self { store }
     }
-}
-
-// ---- Request/response types ----
-
-/// Query for `GET /api/v1/variables`.
-///
-/// `scope` selects the namespace:
-///   - omitted -> list global variables only (`scope IS NULL`).
-///   - any other value -> list variables belonging to that project/scope id.
-#[derive(Debug, Deserialize, Default)]
-pub struct ListVariablesQuery {
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// Body for `POST /api/v1/variables`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateVariableRequest {
-    /// Variable name (e.g. `"APP_VERSION"`). Must be unique within the chosen
-    /// scope.
-    pub name: String,
-    /// Plaintext value.
-    pub value: String,
-    /// Project id scope. `None` = global variable.
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// Body for `PATCH /api/v1/variables/{id}`. All fields are optional.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateVariableRequest {
-    /// New variable name. Will be re-checked for uniqueness.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// New value.
-    #[serde(default)]
-    pub value: Option<String>,
 }
 
 // ---- Endpoints ----

@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(dockerfile.stages.len(), 1);
 
         let stage = &dockerfile.stages[0];
-        let base = stage.base_image.to_string_ref();
+        let base = stage.base_image.to_string();
         assert!(
             base.contains("nanoserver"),
             "nanoserver template must FROM an mcr nanoserver image, got {base}"
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(dockerfile.stages.len(), 1);
 
         let stage = &dockerfile.stages[0];
-        let base = stage.base_image.to_string_ref();
+        let base = stage.base_image.to_string();
         assert!(
             base.contains("servercore"),
             "servercore template must FROM an mcr servercore image, got {base}"

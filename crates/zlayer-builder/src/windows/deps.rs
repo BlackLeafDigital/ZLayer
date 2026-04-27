@@ -35,7 +35,7 @@
 
 use thiserror::Error;
 
-use crate::dockerfile::{Dockerfile, ImageRef, Instruction, ShellOrExec};
+use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction, ShellOrExec};
 
 /// Errors surfaced by the Windows dependency validator.
 #[derive(Debug, Error)]
@@ -126,12 +126,14 @@ enum WindowsBase {
 /// - `mcr.microsoft.com/windows/nanoserver:ltsc2019`
 /// - `nanoserver` (short form, sometimes used with local registries)
 /// - `my-registry.example.com/MyProject/Nanoserver:latest` (odd-casing)
-fn classify_base_image(base: &ImageRef) -> WindowsBase {
+fn classify_base_image(base: &DockerfileFromTarget) -> WindowsBase {
     let image_str = match base {
-        ImageRef::Registry { image, .. } => image.to_ascii_lowercase(),
+        DockerfileFromTarget::Image(r) => r.repository().to_ascii_lowercase(),
         // Stage refs and `scratch` are not Windows bases in their own right;
         // if a later stage copies from them, that's still fine.
-        ImageRef::Stage(_) | ImageRef::Scratch => return WindowsBase::NotWindows,
+        DockerfileFromTarget::Stage(_) | DockerfileFromTarget::Scratch => {
+            return WindowsBase::NotWindows;
+        }
     };
 
     if image_str.contains("nanoserver") {

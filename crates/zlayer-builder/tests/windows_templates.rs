@@ -48,7 +48,7 @@ fn windows_nanoserver_template_parses() {
     let stage = &dockerfile.stages[0];
 
     // FROM must be the pinned ltsc2022 nanoserver on mcr.microsoft.com.
-    let base = stage.base_image.to_string_ref();
+    let base = stage.base_image.to_string();
     assert_eq!(
         base, "mcr.microsoft.com/windows/nanoserver:ltsc2022",
         "nanoserver template must FROM the pinned ltsc2022 base, got {base}"
@@ -84,7 +84,7 @@ fn windows_servercore_template_parses() {
     );
     let stage = &dockerfile.stages[0];
 
-    let base = stage.base_image.to_string_ref();
+    let base = stage.base_image.to_string();
     assert_eq!(
         base, "mcr.microsoft.com/windows/servercore:ltsc2022",
         "servercore template must FROM the pinned ltsc2022 base, got {base}"

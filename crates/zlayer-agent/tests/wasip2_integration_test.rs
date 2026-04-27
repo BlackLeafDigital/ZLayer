@@ -128,7 +128,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         rtype: ResourceType::Service,
         schedule: None,
         image: ImageSpec {
-            name: image.to_string(),
+            name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::Never, // Using local cache
         },
         resources: ResourcesSpec::default(),
@@ -316,7 +316,7 @@ mod component_loading_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:valid-module", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:valid-module", &wasm_bytes);
 
         let id = unique_container_id("load-module");
         let spec = create_wasm_spec(&image);
@@ -349,7 +349,11 @@ mod component_loading_tests {
         );
 
         let component_bytes = make_invalid_component();
-        let image = write_wasm_to_cache(&cache_dir, "test:invalid-component", &component_bytes);
+        let image = write_wasm_to_cache(
+            &cache_dir,
+            "localhost/test:invalid-component",
+            &component_bytes,
+        );
 
         let id = unique_container_id("invalid-component");
         let spec = create_wasm_spec(&image);
@@ -436,7 +440,7 @@ mod wasi_interface_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:proc-exit", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:proc-exit", &wasm_bytes);
 
         let id = unique_container_id("proc-exit");
         let spec = create_wasm_spec(&image);
@@ -465,7 +469,7 @@ mod wasi_interface_tests {
         );
 
         let wasm_bytes = compile_wat(EXIT_42_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:exit-42", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exit-42", &wasm_bytes);
 
         let id = unique_container_id("exit-42");
         let spec = create_wasm_spec(&image);
@@ -495,7 +499,7 @@ mod wasi_interface_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:with-env", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:with-env", &wasm_bytes);
 
         let mut env = HashMap::new();
         env.insert("MY_VAR".to_string(), "my_value".to_string());
@@ -525,7 +529,7 @@ mod wasi_interface_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:with-args", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:with-args", &wasm_bytes);
 
         let args = vec!["arg1".to_string(), "arg2".to_string(), "--flag".to_string()];
 
@@ -560,7 +564,7 @@ mod component_execution_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:execute", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:execute", &wasm_bytes);
 
         let id = unique_container_id("execute");
         let spec = create_wasm_spec(&image);
@@ -596,7 +600,7 @@ mod component_execution_tests {
         );
 
         let wasm_bytes = compile_wat(EXIT_42_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:exit-code", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exit-code", &wasm_bytes);
 
         let id = unique_container_id("exit-code");
         let spec = create_wasm_spec(&image);
@@ -621,7 +625,7 @@ mod component_execution_tests {
 
         // Use a simple module - it might complete before stop, that's OK
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:stop", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:stop", &wasm_bytes);
 
         let id = unique_container_id("stop");
         let spec = create_wasm_spec(&image);
@@ -656,7 +660,7 @@ mod component_execution_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:remove", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:remove", &wasm_bytes);
 
         let id = unique_container_id("remove");
         let spec = create_wasm_spec(&image);
@@ -696,7 +700,7 @@ mod error_handling_tests {
         );
 
         let wasm_bytes = compile_wat(NO_ENTRY_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:no-entry", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:no-entry", &wasm_bytes);
 
         let id = unique_container_id("no-entry");
         let spec = create_wasm_spec(&image);
@@ -739,7 +743,7 @@ mod error_handling_tests {
 
         // Random garbage bytes
         let invalid_bytes = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let image = write_wasm_to_cache(&cache_dir, "test:garbage", &invalid_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:garbage", &invalid_bytes);
 
         let id = unique_container_id("garbage");
         let spec = create_wasm_spec(&image);
@@ -772,7 +776,7 @@ mod error_handling_tests {
 
         // Valid magic but truncated
         let truncated_bytes = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00];
-        let image = write_wasm_to_cache(&cache_dir, "test:truncated", &truncated_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:truncated", &truncated_bytes);
 
         let id = unique_container_id("truncated");
         let spec = create_wasm_spec(&image);
@@ -805,7 +809,11 @@ mod error_handling_tests {
         );
 
         let invalid_component = make_invalid_component();
-        let image = write_wasm_to_cache(&cache_dir, "test:bad-component", &invalid_component);
+        let image = write_wasm_to_cache(
+            &cache_dir,
+            "localhost/test:bad-component",
+            &invalid_component,
+        );
 
         let id = unique_container_id("bad-component");
         let spec = create_wasm_spec(&image);
@@ -876,7 +884,7 @@ mod error_handling_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:exec", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exec", &wasm_bytes);
 
         let id = unique_container_id("exec");
         let spec = create_wasm_spec(&image);
@@ -1066,7 +1074,7 @@ mod runtime_config_tests {
 
         // Should still work normally
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:no-epochs", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:no-epochs", &wasm_bytes);
 
         let id = unique_container_id("no-epochs");
         let spec = create_wasm_spec(&image);
@@ -1134,7 +1142,7 @@ mod container_stats_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:stats", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:stats", &wasm_bytes);
 
         let id = unique_container_id("stats");
         let spec = create_wasm_spec(&image);
@@ -1165,7 +1173,7 @@ mod container_stats_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:stats-after", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:stats-after", &wasm_bytes);
 
         let id = unique_container_id("stats-after");
         let spec = create_wasm_spec(&image);
@@ -1204,7 +1212,7 @@ mod logs_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:logs-before", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:logs-before", &wasm_bytes);
 
         let id = unique_container_id("logs-before");
         let spec = create_wasm_spec(&image);
@@ -1232,7 +1240,7 @@ mod logs_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:log-lines", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:log-lines", &wasm_bytes);
 
         let id = unique_container_id("log-lines");
         let spec = create_wasm_spec(&image);
@@ -1290,7 +1298,7 @@ mod concurrent_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:concurrent", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:concurrent", &wasm_bytes);
 
         // Create multiple instances
         let mut handles = Vec::new();
@@ -1340,7 +1348,7 @@ mod concurrent_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_P1_MODULE);
-        let image = write_wasm_to_cache(&cache_dir, "test:sequential", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:sequential", &wasm_bytes);
 
         // Use the same service name multiple times sequentially
         let service_name = format!("sequential-{}", std::process::id());

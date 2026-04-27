@@ -308,7 +308,10 @@ fn render_preview(area: Rect, buf: &mut Buffer, state: &DeployState) {
             ]));
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default()),
-                Span::styled(&svc.image.name, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    svc.image.name.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled(
                     format!(" | {replicas}{endpoints_str}"),
                     Style::default().fg(Color::DarkGray),

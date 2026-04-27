@@ -24,10 +24,12 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tracing::instrument;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::{PullPolicy, RegistryAuth, RegistryAuthType, ServiceSpec};
+use zlayer_types::ImageReference;
 
 /// Docker-based container runtime using bollard
 ///
@@ -98,8 +100,21 @@ impl DockerRuntime {
     /// daemon falls back to its own credential store lookup (the pre-§3.10
     /// behaviour).
     async fn do_pull(&self, image: &str, auth: Option<&RegistryAuth>) -> Result<()> {
-        // Parse image into name and tag
-        let (name, tag) = parse_image_ref(image);
+        // Parse image into name and tag using the canonical OCI reference parser.
+        // On parse failure (e.g. malformed input), fall back to the original
+        // helper's no-op shape: `(image, "latest")`.
+        //
+        // `repository()` strips the registry host, so re-prefix it with
+        // `registry()` to preserve the full `registry/repo` form. Otherwise
+        // refs like `ghcr.io/org/image:v1` would collapse to `org/image` and
+        // the daemon would try to pull from Docker Hub.
+        let (name, tag) = match ImageReference::from_str(image) {
+            Ok(r) => (
+                format!("{}/{}", r.registry(), r.repository()),
+                r.tag().unwrap_or("latest").to_string(),
+            ),
+            Err(_) => (image.to_string(), "latest".to_string()),
+        };
 
         tracing::info!(
             image = %image,
@@ -110,11 +125,11 @@ impl DockerRuntime {
         );
 
         let options = CreateImageOptions {
-            from_image: Some(name.to_string()),
+            from_image: Some(name.clone()),
             tag: if tag.is_empty() {
                 None
             } else {
-                Some(tag.to_string())
+                Some(tag.clone())
             },
             ..Default::default()
         };
@@ -231,26 +246,6 @@ fn docker_credentials_from_registry_auth(auth: &RegistryAuth) -> DockerCredentia
         password: Some(auth.password.clone()),
         ..Default::default()
     }
-}
-
-/// Parse an image reference into name and tag
-fn parse_image_ref(image: &str) -> (&str, &str) {
-    // Handle digests (image@sha256:...)
-    if image.contains('@') {
-        // For digest references, return the whole thing as the name
-        return (image, "");
-    }
-
-    // Handle tag (image:tag)
-    if let Some((name, tag)) = image.rsplit_once(':') {
-        // Make sure this isn't a port number in the registry (e.g., localhost:5000/image)
-        // If there's a '/' after the ':', it's a registry with a port
-        if !tag.contains('/') {
-            return (name, tag);
-        }
-    }
-
-    (image, "latest")
 }
 
 /// Extract the local image digest for `image` by scanning `repo_digests` for
@@ -645,8 +640,24 @@ impl Runtime for DockerRuntime {
             };
 
             // Step 2: if it's pinned by digest, local presence is sufficient.
-            let (name, tag) = parse_image_ref(image);
-            if tag.is_empty() {
+            // Parse via the canonical OCI reference parser; on parse failure,
+            // fall back to treating the input as the repository name with the
+            // default `latest` tag (matches the old helper's infallible shape).
+            let parsed = ImageReference::from_str(image).ok();
+            // `repository()` alone strips the registry host; re-prefix with
+            // `registry()` so the name matches the `registry/repo` form that
+            // appears in `repo_digests` and avoids accidentally pulling from
+            // Docker Hub for non-default registries.
+            let name = parsed.as_ref().map_or_else(
+                || image.to_string(),
+                |r| format!("{}/{}", r.registry(), r.repository()),
+            );
+            // The previous helper returned an empty tag for digest-only refs
+            // (e.g. `image@sha256:...`). Mirror that by checking whether the
+            // parsed reference has no tag — in which case it's pinned by
+            // digest and local presence is sufficient.
+            let pinned_by_digest = parsed.as_ref().is_some_and(|r| r.tag().is_none());
+            if pinned_by_digest {
                 tracing::debug!(
                     image = %image,
                     "image pinned by digest and present, skipping pull"
@@ -655,7 +666,7 @@ impl Runtime for DockerRuntime {
             }
 
             // Step 3: compare local vs remote digests.
-            let local_digest = extract_local_digest(&local_inspect, name);
+            let local_digest = extract_local_digest(&local_inspect, &name);
 
             match self.docker.inspect_registry_image(image, None).await {
                 Ok(dist) => {
@@ -830,7 +841,7 @@ impl Runtime for DockerRuntime {
         };
 
         let config = ContainerCreateBody {
-            image: Some(spec.image.name.clone()),
+            image: Some(spec.image.name.to_string()),
             hostname,
             env: if env.is_empty() { None } else { Some(env) },
             cmd,
@@ -1998,42 +2009,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_image_ref_with_tag() {
-        let (name, tag) = parse_image_ref("nginx:1.25");
-        assert_eq!(name, "nginx");
-        assert_eq!(tag, "1.25");
-    }
-
-    #[test]
-    fn test_parse_image_ref_without_tag() {
-        let (name, tag) = parse_image_ref("nginx");
-        assert_eq!(name, "nginx");
-        assert_eq!(tag, "latest");
-    }
-
-    #[test]
-    fn test_parse_image_ref_with_registry_and_tag() {
-        let (name, tag) = parse_image_ref("ghcr.io/org/image:v1.0.0");
-        assert_eq!(name, "ghcr.io/org/image");
-        assert_eq!(tag, "v1.0.0");
-    }
-
-    #[test]
-    fn test_parse_image_ref_with_registry_port_and_tag() {
-        let (name, tag) = parse_image_ref("localhost:5000/myimage:latest");
-        assert_eq!(name, "localhost:5000/myimage");
-        assert_eq!(tag, "latest");
-    }
-
-    #[test]
-    fn test_parse_image_ref_with_digest() {
-        let image = "nginx@sha256:abc123def456";
-        let (name, tag) = parse_image_ref(image);
-        assert_eq!(name, image);
-        assert_eq!(tag, "");
-    }
-
-    #[test]
     fn extract_local_digest_matches_repo() {
         let inspect = ImageInspect {
             repo_digests: Some(vec!["zachhandley/zlayer-manager@sha256:abc123".to_string()]),
@@ -2207,7 +2182,7 @@ mod tests {
             rtype: ResourceType::Service,
             schedule: None,
             image: ImageSpec {
-                name: "test:latest".to_string(),
+                name: "test:latest".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
             },
             resources: ResourcesSpec::default(),

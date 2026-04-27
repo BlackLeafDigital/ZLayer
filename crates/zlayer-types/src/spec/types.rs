@@ -651,11 +651,11 @@ impl Default for ApiSpec {
 #[serde(deny_unknown_fields)]
 pub struct DeploymentSpec {
     /// Spec version (must be "v1")
-    #[validate(custom(function = "crate::validate::validate_version_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_version_wrapper"))]
     pub version: String,
 
     /// Deployment name (used for overlays, DNS)
-    #[validate(custom(function = "crate::validate::validate_deployment_name_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_deployment_name_wrapper"))]
     pub deployment: String,
 
     /// Service definitions
@@ -799,7 +799,7 @@ pub struct ServiceSpec {
     ///   - "0 */5 * * * * *" (every 5 minutes)
     ///   - "0 0 12 * * MON-FRI *" (weekdays at noon)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = "crate::validate::validate_schedule_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_schedule_wrapper"))]
     pub schedule: Option<String>,
 
     /// Container image specification
@@ -835,7 +835,7 @@ pub struct ServiceSpec {
 
     /// Scaling configuration
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_scale_spec"))]
+    #[validate(custom(function = "crate::spec::validate::validate_scale_spec"))]
     pub scale: ScaleSpec,
 
     /// Dependency specifications
@@ -996,8 +996,8 @@ pub enum ResourceType {
 #[serde(deny_unknown_fields)]
 pub struct ImageSpec {
     /// Image name (e.g., "ghcr.io/org/api:latest")
-    #[validate(custom(function = "crate::validate::validate_image_name_wrapper"))]
-    pub name: String,
+    #[serde(with = "crate::image_ref_serde")]
+    pub name: crate::ImageReference,
 
     /// When to pull the image
     #[serde(default = "default_pull_policy")]
@@ -1105,12 +1105,12 @@ pub enum StorageSpec {
 pub struct ResourcesSpec {
     /// CPU limit (cores, e.g., 0.5, 1, 2)
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_cpu_option_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_cpu_option_wrapper"))]
     pub cpu: Option<f64>,
 
     /// Memory limit (e.g., "512Mi", "1Gi", "2Gi")
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_memory_option_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_memory_option_wrapper"))]
     pub memory: Option<String>,
 
     /// GPU resource request
@@ -1361,7 +1361,7 @@ pub struct EndpointSpec {
     pub protocol: Protocol,
 
     /// Proxy listen port (external-facing port)
-    #[validate(custom(function = "crate::validate::validate_port_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_port_wrapper"))]
     pub port: u16,
 
     /// Container port the service actually listens on.

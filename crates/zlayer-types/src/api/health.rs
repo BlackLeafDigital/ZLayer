@@ -1,0 +1,33 @@
+//! Health check API DTOs.
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// Health check response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HealthResponse {
+    /// Service status
+    pub status: String,
+    /// Service version
+    pub version: String,
+    /// Uptime in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u64>,
+    /// Container runtime name (e.g. "youki", "mac-sandbox", "docker")
+    #[serde(default = "default_runtime_name")]
+    pub runtime_name: String,
+}
+
+/// Platform-based default runtime name.
+///
+/// On Linux the bundled libcontainer runtime ("youki") is preferred;
+/// on macOS the sandbox runtime is tried first; Docker is the common fallback.
+pub fn default_runtime_name() -> String {
+    if cfg!(target_os = "linux") {
+        "youki".to_string()
+    } else if cfg!(target_os = "macos") {
+        "mac-sandbox".to_string()
+    } else {
+        "auto".to_string()
+    }
+}

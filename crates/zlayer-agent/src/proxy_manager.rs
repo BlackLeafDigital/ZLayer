@@ -732,9 +732,13 @@ services:
     }
 
     fn mock_service_spec_tcp_only() -> ServiceSpec {
+        mock_service_spec_tcp_only_port(9000)
+    }
+
+    fn mock_service_spec_tcp_only_port(port: u16) -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
-            r"
+        let yaml = format!(
+            "
 version: v1
 deployment: test
 services:
@@ -745,13 +749,27 @@ services:
     endpoints:
       - name: grpc
         protocol: tcp
-        port: 9000
-",
-        )
-        .unwrap()
-        .services
-        .remove("test")
-        .unwrap()
+        port: {port}
+"
+        );
+        serde_yaml::from_str::<DeploymentSpec>(&yaml)
+            .unwrap()
+            .services
+            .remove("test")
+            .unwrap()
+    }
+
+    /// Reserve an unused localhost TCP port by binding a listener on `:0`,
+    /// reading the assigned port, and dropping the listener.
+    ///
+    /// There is an inherent race between dropping the listener and the test
+    /// re-binding the port, but this is dramatically more reliable than
+    /// hard-coding a port (e.g., 9000) which is commonly in use on dev
+    /// machines (php-fpm, the running zlayer daemon, etc.).
+    fn reserve_free_tcp_port() -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral test port");
+        listener.local_addr().unwrap().port()
     }
 
     #[tokio::test]
@@ -967,10 +985,14 @@ services:
         let mut manager = ProxyManager::new(config, registry, None);
         manager.set_stream_registry(stream_registry.clone());
 
-        let spec = mock_service_spec_tcp_only();
+        // Use an OS-assigned free port to avoid collisions with anything
+        // listening on the dev/CI box (e.g. php-fpm or a running zlayer
+        // daemon both default to port 9000 on 127.0.0.1).
+        let port = reserve_free_tcp_port();
+        let spec = mock_service_spec_tcp_only_port(port);
 
         // Register the TCP service in the stream registry first (as ServiceManager does)
-        stream_registry.register_tcp(9000, StreamService::new("grpc-service".to_string(), vec![]));
+        stream_registry.register_tcp(port, StreamService::new("grpc-service".to_string(), vec![]));
 
         // Ensure ports -- should bind TCP listener
         let result = manager.ensure_ports_for_service(&spec, None).await;
@@ -978,7 +1000,7 @@ services:
 
         // Verify the TCP listener port is tracked
         let tcp_ports = manager.tcp_listeners.read().await;
-        assert!(tcp_ports.contains(&9000));
+        assert!(tcp_ports.contains(&port));
     }
 
     #[tokio::test]

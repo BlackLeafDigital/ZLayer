@@ -8,7 +8,7 @@
 //! (`GET/POST/DELETE /api/v1/tasks[/id[/run|runs]]`) via [`DaemonClient`].
 
 use anyhow::{Context, Result};
-use zlayer_api::storage::{StoredTask, TaskRun};
+use zlayer_types::storage::{StoredTask, TaskRun};
 
 use zlayer_client::DaemonClient;
 

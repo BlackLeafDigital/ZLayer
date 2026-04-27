@@ -54,6 +54,163 @@ jobs:
           service-type: rust
 
   # ===========================================
+  # Prepare release branch (temp/v{VERSION})
+  # ----
+  # Walk existing temp/v* in-flight release branches via check-orphan-versions.
+  # Probe PyPI / crates.io directly for each candidate; any branch whose
+  # version is already on a public registry gets DELETEd and recorded in
+  # burned-versions.txt (PyPI/crates filenames are immutable; retrying with
+  # new bytes is impossible). The first still-clean branch is the orphan
+  # to retry; otherwise we bump from the latest permanent tag, skipping
+  # any burned versions, and create a new temp/v{VERSION}.
+  #
+  # Permanent v{VERSION} tags are NOT created here — release.yml's
+  # create-forgejo-release cuts them at the temp branch HEAD only after
+  # every publish step has succeeded, then deletes the temp branch.
+  # ===========================================
+  prepare-release:
+    name: Prepare Release Branch
+    needs: [version]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev')
+      || (github.event_name == 'workflow_dispatch')
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      branch:  ${{ steps.pick.outputs.branch }}
+      sha:     ${{ steps.pushbranch.outputs.sha }}
+      reason:  ${{ steps.pick.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Probe for orphan temp/v* branches
+        id: orphan
+        uses: https://forge.blackleafdigital.com/Public/actions/check-orphan-versions@main
+        with:
+          temp-branch-prefix: temp/v
+          max-branches: '10'
+          package-name: zlayer
+          registries: pypi,cargo
+          burn-list-path: .forgejo/burned-versions.txt
+          forgejo-base-url: https://forge.blackleafdigital.com
+          repo: ${{ github.repository }}
+          forgejo-auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          default-branch: dev
+
+      - name: Resolve candidate next version
+        id: resolve
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ inputs.version }}
+          tag-prefix: v
+          bump: patch
+          service-type: rust
+
+      - name: Pick version to build
+        id: pick
+        shell: bash
+        env:
+          OVERRIDE: ${{ inputs.version }}
+          ORPHAN_VERSION: ${{ steps.orphan.outputs.orphan-version }}
+          ORPHAN_BRANCH:  ${{ steps.orphan.outputs.orphan-branch }}
+          ABANDONED:      ${{ steps.orphan.outputs.abandoned }}
+          RESOLVED:       ${{ steps.resolve.outputs.version }}
+          IS_NEW:         ${{ steps.resolve.outputs.is-new }}
+          COMMIT_MSG:     ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          # resolve-version returns bare X.Y.Z; strip any leading v from override.
+          OVR="${OVERRIDE#v}"
+
+          if [ -n "$OVR" ]; then
+            {
+              echo "version=${OVR}"
+              echo "branch=temp/v${OVR}"
+              echo "reason=override"
+            } >> "$GITHUB_OUTPUT"
+            echo "Using inputs.version override: ${OVR}"
+            exit 0
+          fi
+
+          if [ -n "$ORPHAN_VERSION" ]; then
+            {
+              echo "version=${ORPHAN_VERSION}"
+              echo "branch=${ORPHAN_BRANCH}"
+              echo "reason=orphan-retry"
+            } >> "$GITHUB_OUTPUT"
+            echo "Reusing in-flight orphan ${ORPHAN_BRANCH} (v${ORPHAN_VERSION})"
+            exit 0
+          fi
+
+          # [np] in commit message means "no publish" — skip release prep.
+          if [ "${{ github.event_name }}" = "push" ] && [[ "$COMMIT_MSG" == *"[np]"* ]]; then
+            {
+              echo "version="
+              echo "branch="
+              echo "reason=np-skipped"
+            } >> "$GITHUB_OUTPUT"
+            echo "[np] in commit message — no release this push"
+            exit 0
+          fi
+
+          # Bump past anything in burned-versions.txt + this run's abandoned.
+          # awk 'NF' is empty-file safe (always exits 0); grep -v under
+          # set -euo pipefail returns 1 on no matches and kills the script.
+          BURNED=""
+          if [ -f .forgejo/burned-versions.txt ]; then
+            BURNED=$(awk 'NF' .forgejo/burned-versions.txt | paste -sd, -)
+          fi
+          if [ -n "$ABANDONED" ]; then
+            BURNED="${BURNED:+${BURNED},}${ABANDONED}"
+          fi
+          is_burned() {
+            case ",${BURNED}," in *,$1,*) return 0 ;; *) return 1 ;; esac
+          }
+          CURRENT="$RESOLVED"
+          while is_burned "$CURRENT"; do
+            IFS='.' read -r MA MI PA <<< "$CURRENT"
+            PA=$((PA + 1))
+            CURRENT="${MA}.${MI}.${PA}"
+            IS_NEW=true
+          done
+
+          if [ "$IS_NEW" = "true" ]; then
+            {
+              echo "version=${CURRENT}"
+              echo "branch=temp/v${CURRENT}"
+              echo "reason=new-release"
+            } >> "$GITHUB_OUTPUT"
+            echo "No orphans; new release at v${CURRENT}"
+            exit 0
+          fi
+
+          {
+            echo "version="
+            echo "branch="
+            echo "reason=noop"
+          } >> "$GITHUB_OUTPUT"
+          echo "Nothing to build"
+
+      - name: Create or update temp branch at HEAD
+        id: pushbranch
+        if: steps.pick.outputs.version != ''
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          BR: ${{ steps.pick.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name  "Zach Handley"
+          git config user.email "zachhandley@gmail.com"
+          git fetch origin "${BR}" || true
+          git push origin "HEAD:refs/heads/${BR}" --force-with-lease
+          SHA=$(git rev-parse HEAD)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${SHA} to ${BR}"
+
+  # ===========================================
   # Check (fmt, clippy)
   # ===========================================
   check:
@@ -773,27 +930,35 @@ jobs:
   trigger-e2e:
     name: Trigger E2E
     runs-on: ubuntu-latest
-    needs: [version, build, build-macos, feature-tests, test-windows]
-    if: ${{ needs.build.result == 'success' }}
+    # prepare-release runs only on dev pushes / workflow_dispatch; on PR runs
+    # it's skipped, so its outputs are empty and we fall through to signal-only.
+    needs: [version, prepare-release, build, build-macos, feature-tests, test-windows]
+    if: |
+      always()
+      && needs.build.result == 'success'
+      && (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped')
     steps:
-      - name: Determine version to forward
+      - name: Determine version + ref to forward
         id: version
         env:
-          INPUT_VERSION: ${{ inputs.version }}
-          RESOLVED_VERSION: ${{ needs.version.outputs.version }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
-          REF: ${{ github.ref }}
+          PREP_VERSION: ${{ needs.prepare-release.outputs.version }}
+          PREP_BRANCH:  ${{ needs.prepare-release.outputs.branch }}
+          PREP_SHA:     ${{ needs.prepare-release.outputs.sha }}
         run: |
-          if [[ -n "$INPUT_VERSION" ]]; then
-            # Manual workflow_dispatch with an explicit version wins.
-            echo "version=$INPUT_VERSION" >> $GITHUB_OUTPUT
-          elif [[ "$REF" == "refs/heads/dev" && "$COMMIT_MSG" != *"[np]"* ]]; then
-            # Dev push without [np]: use the version resolved at the top of CI.
-            echo "version=v$RESOLVED_VERSION" >> $GITHUB_OUTPUT
+          if [ -n "$PREP_VERSION" ]; then
+            # Release path: e2e + downstream chain run on the temp branch.
+            {
+              echo "version=v${PREP_VERSION}"
+              echo "ref=refs/heads/${PREP_BRANCH}"
+              echo "sha=${PREP_SHA}"
+            } >> $GITHUB_OUTPUT
           else
-            # PR runs and [np] dev pushes: e2e still runs for signal, but
-            # no build/tag/release chain fires.
-            echo "version=" >> $GITHUB_OUTPUT
+            # PR or [np] dev push: e2e still runs for signal, no release chain.
+            {
+              echo "version="
+              echo "ref=${{ github.ref }}"
+              echo "sha=${{ github.sha }}"
+            } >> $GITHUB_OUTPUT
           fi
 
       - name: Trigger E2E workflow
@@ -802,7 +967,7 @@ jobs:
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             -H "Content-Type: application/json" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/e2e.yml/dispatches" \
-            -d '{"ref": "${{ github.ref }}", "inputs": {"version": "${{ steps.version.outputs.version }}", "sha": "${{ github.sha }}"}}'
+            -d '{"ref": "${{ steps.version.outputs.ref }}", "inputs": {"version": "${{ steps.version.outputs.version }}", "sha": "${{ steps.version.outputs.sha }}"}}'
 
   # ===========================================
   # Cache Cleanup

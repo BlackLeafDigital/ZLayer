@@ -19,7 +19,7 @@ use crate::handlers::internal::{InternalAddPeerRequest, INTERNAL_AUTH_HEADER};
 use zlayer_scheduler::{AddMemberParams, RaftCoordinator};
 
 // =============================================================================
-// Types
+// DTOs
 // =============================================================================
 
 /// Request body for `POST /api/v1/cluster/join`.
@@ -141,6 +141,35 @@ pub struct ClusterNodeSummary {
     pub registered_at: u64,
     /// Last heartbeat timestamp (Unix timestamp ms)
     pub last_heartbeat: u64,
+}
+
+/// Heartbeat request from a worker node.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HeartbeatRequest {
+    pub node_id: u64,
+    pub cpu_used: f64,
+    pub memory_used: u64,
+    pub disk_used: u64,
+    #[serde(default)]
+    pub gpu_utilization: Vec<zlayer_scheduler::raft::GpuUtilizationReport>,
+}
+
+/// Request body for force-leader operation.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ForceLeaderRequest {
+    /// Confirmation string -- must be `"CONFIRM_FORCE_LEADER"` to prevent accidents
+    pub confirm: String,
+}
+
+/// Response body for force-leader operation.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForceLeaderResponse {
+    pub success: bool,
+    pub message: String,
+    /// Number of cluster nodes whose state was preserved
+    pub preserved_nodes: usize,
+    /// Number of services whose state was preserved
+    pub preserved_services: usize,
 }
 
 // =============================================================================
@@ -570,17 +599,6 @@ pub async fn cluster_list_nodes(
     Ok(Json(nodes))
 }
 
-/// Heartbeat request from a worker node.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct HeartbeatRequest {
-    pub node_id: u64,
-    pub cpu_used: f64,
-    pub memory_used: u64,
-    pub disk_used: u64,
-    #[serde(default)]
-    pub gpu_utilization: Vec<zlayer_scheduler::raft::GpuUtilizationReport>,
-}
-
 /// Handle node heartbeat.
 ///
 /// `POST /api/v1/cluster/heartbeat`
@@ -662,26 +680,8 @@ pub async fn cluster_heartbeat(
 }
 
 // =============================================================================
-// Force-leader types and handler
+// Force-leader handler
 // =============================================================================
-
-/// Request body for force-leader operation.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ForceLeaderRequest {
-    /// Confirmation string -- must be `"CONFIRM_FORCE_LEADER"` to prevent accidents
-    pub confirm: String,
-}
-
-/// Response body for force-leader operation.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ForceLeaderResponse {
-    pub success: bool,
-    pub message: String,
-    /// Number of cluster nodes whose state was preserved
-    pub preserved_nodes: usize,
-    /// Number of services whose state was preserved
-    pub preserved_services: usize,
-}
 
 /// Force this node to become the cluster leader (disaster recovery).
 ///

@@ -93,147 +93,22 @@ pub enum ApiClientError {
 /// Result type for API client operations
 pub type Result<T> = std::result::Result<T, ApiClientError>;
 
-/// Health check response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthResponse {
-    /// Service status
-    pub status: String,
-    /// Service version
-    pub version: String,
-    /// Uptime in seconds (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uptime_secs: Option<u64>,
-    /// Container runtime name (e.g. "youki", "mac-sandbox", "docker")
-    #[serde(default = "default_runtime_name")]
-    pub runtime_name: String,
-}
+// Canonical DTOs are defined in zlayer-types. Re-export them so the manager
+// keeps its public surface (`crate::api_client::<Type>`) intact while staying
+// in lockstep with the daemon's wire format.
+pub use zlayer_types::api::build::{BuildStateEnum, BuildStatus};
+pub use zlayer_types::api::deployments::{DeploymentDetails, DeploymentSummary};
+pub use zlayer_types::api::health::HealthResponse;
+pub use zlayer_types::api::services::{
+    ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
+};
 
-/// Fallback runtime name when the API does not include the field (older servers).
-fn default_runtime_name() -> String {
-    "auto".to_string()
-}
-
-/// Deployment summary for listing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentSummary {
-    /// Deployment name
-    pub name: String,
-    /// Deployment status
-    pub status: String,
-    /// Number of services
-    pub service_count: usize,
-    /// Created timestamp (ISO 8601)
-    pub created_at: String,
-}
-
-/// Deployment details
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentDetails {
-    /// Deployment name
-    pub name: String,
-    /// Deployment status
-    pub status: String,
-    /// Service names
-    pub services: Vec<String>,
-    /// Created timestamp (ISO 8601)
-    pub created_at: String,
-    /// Updated timestamp (ISO 8601)
-    pub updated_at: String,
-}
-
-/// Service summary for listing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceSummary {
-    /// Service name
-    pub name: String,
-    /// Deployment name
-    pub deployment: String,
-    /// Service status
-    pub status: String,
-    /// Current replica count
-    pub replicas: u32,
-    /// Desired replica count
-    pub desired_replicas: u32,
-}
-
-/// Service details
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceDetails {
-    /// Service name
-    pub name: String,
-    /// Deployment name
-    pub deployment: String,
-    /// Service status
-    pub status: String,
-    /// Current replica count
-    pub replicas: u32,
-    /// Desired replica count
-    pub desired_replicas: u32,
-    /// Service endpoints
-    pub endpoints: Vec<ServiceEndpoint>,
-    /// Service metrics
-    pub metrics: ServiceMetrics,
-}
-
-/// Service endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceEndpoint {
-    /// Endpoint name
-    pub name: String,
-    /// Protocol (http, https, tcp, etc.)
-    pub protocol: String,
-    /// Port number
-    pub port: u16,
-    /// URL path (if public)
-    pub url: Option<String>,
-}
-
-/// Service metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceMetrics {
-    /// CPU usage percentage
-    pub cpu_percent: f64,
-    /// Memory usage percentage
-    pub memory_percent: f64,
-    /// Requests per second (optional)
-    pub rps: Option<f64>,
-}
-
-/// Build status enumeration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BuildStateEnum {
-    /// Build is queued
-    Pending,
-    /// Build is running
-    Running,
-    /// Build completed successfully
-    Complete,
-    /// Build failed
-    Failed,
-}
-
-/// Build status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildStatus {
-    /// Unique build ID
-    pub id: String,
-    /// Current build status
-    pub status: BuildStateEnum,
-    /// Image ID (if completed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_id: Option<String>,
-    /// Error message (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// When the build started (ISO 8601)
-    pub started_at: String,
-    /// When the build completed (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-/// Request to trigger a new build
+/// Request to trigger a new build.
+///
+/// Local because `zlayer_types::api::build::BuildRequestWithContext` is
+/// `Deserialize`-only (server-side schema) and carries extra fields the
+/// manager's UI doesn't expose. Any new field the daemon adds should be
+/// `#[serde(default)]` on its end so this slimmer request body stays valid.
 #[derive(Debug, Serialize)]
 pub struct TriggerBuildRequest {
     /// Path to the build context on the server
@@ -249,7 +124,10 @@ pub struct TriggerBuildRequest {
     pub no_cache: bool,
 }
 
-/// Response after triggering a build
+/// Response after triggering a build.
+///
+/// Local because `zlayer_types::api::build::TriggerBuildResponse` is
+/// `Serialize`-only on the daemon and the manager has to deserialize it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerBuildResponse {
     /// The build ID for tracking
@@ -262,26 +140,12 @@ pub struct TriggerBuildResponse {
 // Tunnel Types
 // =========================================================================
 
-/// Tunnel summary for listing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunnelSummary {
-    /// Unique tunnel identifier
-    pub id: String,
-    /// Name of the tunnel
-    pub name: String,
-    /// Current status (active, disconnected, expired, pending)
-    pub status: String,
-    /// Services this tunnel can expose
-    pub services: Vec<String>,
-    /// When the tunnel was created (Unix timestamp)
-    pub created_at: u64,
-    /// When the token expires (Unix timestamp)
-    pub expires_at: u64,
-    /// Last time the tunnel connected (Unix timestamp, if ever)
-    pub last_connected: Option<u64>,
-}
+pub use zlayer_types::api::tunnels::{CreateTunnelResponse, TunnelSummary};
 
-/// Request to create a tunnel
+/// Request to create a tunnel.
+///
+/// Local because `zlayer_types::api::tunnels::CreateTunnelRequest` is
+/// `Deserialize`-only and the manager needs to serialize it.
 #[derive(Debug, Serialize)]
 pub struct CreateTunnelRequest {
     /// Name for this tunnel
@@ -293,42 +157,11 @@ pub struct CreateTunnelRequest {
     pub ttl_secs: u64,
 }
 
-/// Response after creating a tunnel
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateTunnelResponse {
-    /// Unique tunnel identifier
-    pub id: String,
-    /// Name of the tunnel
-    pub name: String,
-    /// The tunnel token
-    pub token: String,
-    /// Services this tunnel can expose
-    pub services: Vec<String>,
-    /// When the token expires (Unix timestamp)
-    pub expires_at: u64,
-    /// When the tunnel was created (Unix timestamp)
-    pub created_at: u64,
-}
-
 // =========================================================================
 // Network Types
 // =========================================================================
 
-/// Summary returned when listing networks
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkSummary {
-    /// Network name
-    pub name: String,
-    /// Optional description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Number of CIDR ranges
-    pub cidr_count: usize,
-    /// Number of members
-    pub member_count: usize,
-    /// Number of access rules
-    pub rule_count: usize,
-}
+pub use zlayer_types::api::networks::NetworkSummary;
 
 /// Full network policy detail
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,20 +232,12 @@ pub struct CreateNetworkRequest {
 // Secrets Types
 // =========================================================================
 
-/// Secret metadata (value is never exposed)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretMetadata {
-    /// The name/identifier of the secret
-    pub name: String,
-    /// Unix timestamp when the secret was created
-    pub created_at: i64,
-    /// Unix timestamp when the secret was last updated
-    pub updated_at: i64,
-    /// Version number of the secret (incremented on each update)
-    pub version: u32,
-}
+pub use zlayer_types::api::secrets::SecretMetadataResponse as SecretMetadata;
 
-/// Request to create a secret
+/// Request to create a secret.
+///
+/// Local because `zlayer_types::api::secrets::CreateSecretRequest` is
+/// `Deserialize`-only and the manager needs to serialize it.
 #[derive(Debug, Serialize)]
 pub struct CreateSecretRequest {
     /// The name of the secret
@@ -425,175 +250,22 @@ pub struct CreateSecretRequest {
 // Jobs Types
 // =========================================================================
 
-/// Response after triggering a job
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerJobResponse {
-    /// Unique execution ID for tracking
-    pub execution_id: String,
-    /// Human-readable message
-    pub message: String,
-}
-
-/// Job execution status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobExecutionResponse {
-    /// Unique execution ID
-    pub id: String,
-    /// Name of the job
-    pub job_name: String,
-    /// Current status (pending, initializing, running, completed, failed, cancelled)
-    pub status: String,
-    /// When the job started (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<String>,
-    /// When the job completed (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-    /// Exit code (if completed/failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    /// Captured logs
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logs: Option<String>,
-    /// How the job was triggered
-    pub trigger: String,
-    /// Error reason (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Duration in milliseconds (if completed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-}
+pub use zlayer_types::api::jobs::{JobExecutionResponse, TriggerJobResponse};
 
 // =========================================================================
 // Cron Types
 // =========================================================================
 
-/// Response for cron job information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronJobResponse {
-    /// Job name
-    pub name: String,
-    /// Cron schedule expression
-    pub schedule: String,
-    /// Whether the job is enabled
-    pub enabled: bool,
-    /// When the job last ran (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_run: Option<String>,
-    /// Next scheduled run time (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_run: Option<String>,
-}
-
-/// Response after triggering a cron job
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerCronResponse {
-    /// Execution ID for tracking
-    pub execution_id: String,
-    /// Human-readable message
-    pub message: String,
-}
-
-/// Response for enable/disable operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronStatusResponse {
-    /// Job name
-    pub name: String,
-    /// New enabled state
-    pub enabled: bool,
-    /// Human-readable message
-    pub message: String,
-}
+pub use zlayer_types::api::cron::{CronJobResponse, CronStatusResponse, TriggerCronResponse};
 
 // =========================================================================
 // Overlay Types
 // =========================================================================
 
-/// Overlay network status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OverlayStatusResponse {
-    /// Overlay interface name
-    pub interface: String,
-    /// Whether this node is the overlay leader
-    pub is_leader: bool,
-    /// This node's IP in the overlay network
-    pub node_ip: String,
-    /// CIDR of the overlay network
-    pub cidr: String,
-    /// Overlay listen port (WireGuard protocol)
-    pub port: u16,
-    /// Total number of peers
-    pub total_peers: usize,
-    /// Number of healthy peers
-    pub healthy_peers: usize,
-    /// Number of unhealthy peers
-    pub unhealthy_peers: usize,
-    /// Unix timestamp of last health check
-    pub last_check: u64,
-}
-
-/// Peer information from the overlay network
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OverlayPeerInfo {
-    /// Overlay public key
-    pub public_key: String,
-    /// Peer's IP in the overlay network
-    pub overlay_ip: Option<String>,
-    /// Whether the peer is healthy
-    pub healthy: bool,
-    /// Seconds since last handshake
-    pub last_handshake_secs: Option<u64>,
-    /// Last ping latency in milliseconds
-    pub last_ping_ms: Option<u64>,
-    /// Number of consecutive health check failures
-    pub failure_count: u32,
-    /// Unix timestamp of last health check
-    pub last_check: u64,
-}
-
-/// Response containing list of overlay peers
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerListResponse {
-    /// Total number of peers
-    pub total: usize,
-    /// Number of healthy peers
-    pub healthy: usize,
-    /// List of peer information
-    pub peers: Vec<OverlayPeerInfo>,
-}
-
-/// IP allocation status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpAllocationResponse {
-    /// Network CIDR
-    pub cidr: String,
-    /// Total IPs available in the network
-    pub total_ips: u32,
-    /// Number of allocated IPs
-    pub allocated_count: usize,
-    /// Number of available IPs
-    pub available_count: u32,
-    /// Utilization percentage (0.0-100.0)
-    pub utilization_percent: f64,
-}
-
-/// DNS service status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsStatusResponse {
-    /// Whether DNS is enabled
-    pub enabled: bool,
-    /// DNS zone (e.g., "zlayer.local")
-    pub zone: Option<String>,
-    /// DNS server port
-    pub port: Option<u16>,
-    /// Bind address for DNS server
-    pub bind_addr: Option<String>,
-    /// Number of registered services
-    pub service_count: usize,
-    /// List of registered service names
-    pub services: Vec<String>,
-}
+pub use zlayer_types::api::overlay::{
+    DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo as OverlayPeerInfo,
+    PeerListResponse,
+};
 
 // =========================================================================
 // Proxy Types
@@ -2071,13 +1743,22 @@ mod tests {
 
     #[test]
     fn test_health_response_deserialize() {
-        // Without runtime_name -- should default to "auto"
+        // Without runtime_name -- the canonical zlayer-types default is
+        // platform-aware ("youki" on linux, "mac-sandbox" on macos, "auto"
+        // elsewhere). Just assert a non-empty platform-correct fallback.
         let json = r#"{"status":"ok","version":"0.1.0"}"#;
         let response: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status, "ok");
         assert_eq!(response.version, "0.1.0");
         assert!(response.uptime_secs.is_none());
-        assert_eq!(response.runtime_name, "auto");
+        let expected = if cfg!(target_os = "linux") {
+            "youki"
+        } else if cfg!(target_os = "macos") {
+            "mac-sandbox"
+        } else {
+            "auto"
+        };
+        assert_eq!(response.runtime_name, expected);
     }
 
     #[test]
@@ -2144,7 +1825,8 @@ mod tests {
             "deployment": "my-app",
             "status": "running",
             "replicas": 3,
-            "desired_replicas": 3
+            "desired_replicas": 3,
+            "endpoints": []
         }"#;
         let summary: ServiceSummary = serde_json::from_str(json).unwrap();
         assert_eq!(summary.name, "api");
@@ -2467,6 +2149,7 @@ mod tests {
             allocated_count: 100,
             available_count: 65434,
             utilization_percent: 0.15,
+            allocated_ips: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("192.168.0.0/16"));
@@ -2586,6 +2269,7 @@ mod tests {
             allocated_count: 50,
             available_count: 204,
             utilization_percent: 19.69,
+            allocated_ips: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: IpAllocationResponse = serde_json::from_str(&json).unwrap();
