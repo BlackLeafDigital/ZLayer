@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::UserRole;
 
 /// Body for `POST /api/v1/users`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
@@ -17,8 +16,7 @@ pub struct CreateUserRequest {
 
 /// Body for `PATCH /api/v1/users/{id}`. All fields are optional so a caller
 /// can update a single attribute without touching the others.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateUserRequest {
     #[serde(default)]
     pub display_name: Option<String>,
@@ -29,8 +27,7 @@ pub struct UpdateUserRequest {
 }
 
 /// Body for `POST /api/v1/users/{id}/password`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SetPasswordRequest {
     /// New password.
     pub new_password: String,

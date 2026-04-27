@@ -4,12 +4,10 @@
 //! load-balancer backend groups, TLS certificates, and L4 stream proxies.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Information about a single registered route.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RouteInfo {
     /// Owning service name.
     pub service: String,
@@ -33,8 +31,7 @@ pub struct RouteInfo {
 }
 
 /// Response for `GET /api/v1/proxy/routes`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RoutesResponse {
     /// Total number of routes.
     pub total: usize,
@@ -43,8 +40,7 @@ pub struct RoutesResponse {
 }
 
 /// Information about a single backend in a load-balancer group.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BackendInfo {
     /// Backend address (`ip:port`).
     pub address: String,
@@ -57,8 +53,7 @@ pub struct BackendInfo {
 }
 
 /// A load-balancer backend group for one service.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BackendGroupInfo {
     /// Service name.
     pub service: String,
@@ -73,8 +68,7 @@ pub struct BackendGroupInfo {
 }
 
 /// Response for `GET /api/v1/proxy/backends`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BackendsResponse {
     /// Total number of backend groups.
     pub total_groups: usize,
@@ -83,8 +77,7 @@ pub struct BackendsResponse {
 }
 
 /// Information about a loaded TLS certificate.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CertInfo {
     /// Domain the certificate covers.
     pub domain: String,
@@ -102,8 +95,7 @@ pub struct CertInfo {
 }
 
 /// Response for `GET /api/v1/proxy/tls`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TlsResponse {
     /// Total number of cached certificates.
     pub total: usize,
@@ -117,16 +109,14 @@ pub struct TlsResponse {
 }
 
 /// Information about a single L4 stream proxy backend.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StreamBackendInfo {
     /// Backend address (`ip:port`).
     pub address: String,
 }
 
 /// Information about a single L4 stream proxy.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StreamInfo {
     /// Listen port on this node.
     pub port: u16,
@@ -141,8 +131,7 @@ pub struct StreamInfo {
 }
 
 /// Response for `GET /api/v1/proxy/streams`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StreamsResponse {
     /// Total number of stream proxies.
     pub total: usize,

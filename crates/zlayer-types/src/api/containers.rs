@@ -7,12 +7,10 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::{IntoParams, ToSchema};
 
 /// Resource limits for a container
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ContainerResourceLimits {
     /// CPU limit in cores (e.g., 0.5, 1.0, 2.0)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,8 +25,7 @@ pub struct ContainerResourceLimits {
 /// Selects which [`zlayer_spec::StorageSpec`] variant [`VolumeMount`] is
 /// translated into by [`build_service_spec`]. When omitted on the wire,
 /// defaults to [`VolumeMountType::Bind`] (legacy behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeMountType {
     /// Host-path bind mount. `source` is an absolute host path.
@@ -47,8 +44,7 @@ pub enum VolumeMountType {
 /// - `"bind"` (default): `source` is an absolute host path.
 /// - `"volume"`: `source` is a named-volume identifier.
 /// - `"tmpfs"`: no `source`; a memory-backed mount is provisioned.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct VolumeMount {
     /// Mount kind. Omit (or `"bind"`) for legacy host-path binds.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
@@ -76,8 +72,7 @@ pub struct VolumeMount {
 /// - `type: "command"` — requires `command` (array of argv tokens; joined with
 ///   spaces and passed to `sh -c` by the health monitor, matching the existing
 ///   compose-to-ZLayer conversion in `zlayer-docker`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct HealthCheckRequest {
     /// Check variant: `"tcp"`, `"http"`, or `"command"`.
     #[serde(rename = "type")]
@@ -111,8 +106,7 @@ pub struct HealthCheckRequest {
 }
 
 /// Request to create and start a container
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateContainerRequest {
     /// OCI image reference (e.g., "nginx:latest", "ubuntu:22.04")
     pub image: String,
@@ -195,8 +189,7 @@ pub struct CreateContainerRequest {
 /// Included on [`CreateContainerRequest::networks`] so callers can wire up
 /// every attachment in a single call instead of issuing a separate connect
 /// request per network after container create.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct NetworkAttachmentRequest {
     /// Bridge-network id or name to attach to.
     pub network: String,
@@ -210,8 +203,7 @@ pub struct NetworkAttachmentRequest {
 }
 
 /// Container information returned by the API
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerInfo {
     /// Container identifier
     pub id: String,
@@ -259,8 +251,7 @@ pub struct ContainerInfo {
 /// Populated from the runtime's inspect response — mirrors the subset of
 /// bollard's `EndpointSettings` that API clients need to correlate a container
 /// with its `container_networks` entries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NetworkAttachmentInfo {
     /// Network name as reported by the runtime. Matches the `name` field on
     /// entries returned by `GET /api/v1/container-networks`.
@@ -281,8 +272,7 @@ pub struct NetworkAttachmentInfo {
 /// against user-configured health specs; for standalone containers the API
 /// reports the runtime-native status instead so images with a baked-in
 /// `HEALTHCHECK` still surface correctly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ContainerHealthInfo {
     /// One of `"none"`, `"starting"`, `"healthy"`, `"unhealthy"` (Docker
     /// `HealthStatusEnum`). Empty / missing upstream values normalise to
@@ -297,8 +287,7 @@ pub struct ContainerHealthInfo {
 }
 
 /// Query parameters for listing containers
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListContainersQuery {
     /// Filter by label (key=value format)
     #[serde(default)]
@@ -306,8 +295,7 @@ pub struct ListContainersQuery {
 }
 
 /// Query parameters for container logs
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ContainerLogQuery {
     /// Number of tail lines to return
     #[serde(default = "default_tail")]
@@ -322,8 +310,7 @@ fn default_tail() -> usize {
 }
 
 /// Exec request for running a command in a container
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ContainerExecRequest {
     /// Command and arguments to execute
     pub command: Vec<String>,
@@ -336,8 +323,7 @@ pub struct ContainerExecRequest {
 /// carrying the exit code as JSON. When `stream=false` (the default) the
 /// handler buffers the whole output and returns a single JSON
 /// [`ContainerExecResponse`] body.
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ExecQuery {
     /// Stream exec events as SSE instead of returning a buffered JSON body.
     #[serde(default)]
@@ -345,8 +331,7 @@ pub struct ExecQuery {
 }
 
 /// Exec response with command output
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerExecResponse {
     /// Exit code from the command
     pub exit_code: i32,
@@ -358,8 +343,7 @@ pub struct ContainerExecResponse {
 
 /// Request body for stopping a container. Matches the Docker-compat
 /// `POST /containers/{id}/stop` shape.
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StopContainerRequest {
     /// Graceful shutdown timeout in seconds before the runtime force-kills
     /// the container. Defaults to 30 seconds when omitted.
@@ -369,8 +353,7 @@ pub struct StopContainerRequest {
 
 /// Request body for restarting a container. Matches the Docker-compat
 /// `POST /containers/{id}/restart` shape.
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct RestartContainerRequest {
     /// Graceful shutdown timeout in seconds before the runtime force-kills
     /// the container. Defaults to 30 seconds when omitted.
@@ -380,8 +363,7 @@ pub struct RestartContainerRequest {
 
 /// Request body for killing (sending a signal to) a container. Matches the
 /// Docker-compat `POST /containers/{id}/kill` shape.
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct KillContainerRequest {
     /// Signal name to send (e.g. `"SIGTERM"`, `"SIGINT"`). Accepts both the
     /// `SIG`-prefixed and bare forms. When omitted, defaults to `SIGKILL`.
@@ -394,8 +376,7 @@ pub struct KillContainerRequest {
 ///
 /// The three optional fields (`reason`, `signal`, `finished_at`) are
 /// additive — clients that only read `exit_code` keep working unchanged.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerWaitResponse {
     /// Container identifier
     pub id: String,
@@ -419,8 +400,7 @@ pub struct ContainerWaitResponse {
 }
 
 /// Container resource statistics
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerStatsResponse {
     /// Container identifier
     pub id: String,
@@ -442,8 +422,7 @@ pub struct ContainerStatsResponse {
 /// `interval` seconds until the container exits or the client disconnects.
 ///
 /// `interval` is clamped to `[1, 60]` seconds. Default interval is `2`.
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct StatsQuery {
     /// Stream periodic samples as SSE events instead of a one-shot JSON
     /// response.

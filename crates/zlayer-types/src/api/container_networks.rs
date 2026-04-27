@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::spec::{BridgeNetwork, BridgeNetworkAttachment, BridgeNetworkDriver};
 
 /// Body for `POST /api/v1/container-networks`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct CreateBridgeNetworkRequest {
     /// Network name (must match `^[a-z0-9][a-z0-9_-]{0,63}$`).
     pub name: String,
@@ -32,8 +31,7 @@ pub struct CreateBridgeNetworkRequest {
 }
 
 /// Response body for `GET /api/v1/container-networks/{id_or_name}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BridgeNetworkDetails {
     /// Core network metadata. Flattened so the JSON stays close to the
     /// list-item shape returned by `list_container_networks`.
@@ -44,8 +42,7 @@ pub struct BridgeNetworkDetails {
 }
 
 /// Query parameters for list/delete.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
 pub struct ListBridgeNetworksQuery {
     /// Optional label filter in `key=value` form. Only networks whose
     /// labels contain a matching pair are returned.
@@ -53,8 +50,7 @@ pub struct ListBridgeNetworksQuery {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::IntoParams))]
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
 pub struct DeleteBridgeNetworkQuery {
     /// If true, delete even if the network still has attachments.
     #[serde(default)]
@@ -62,8 +58,7 @@ pub struct DeleteBridgeNetworkQuery {
 }
 
 /// Body for `POST /api/v1/container-networks/{id_or_name}/connect`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ConnectBridgeNetworkRequest {
     /// Container id to attach.
     pub container_id: String,
@@ -77,8 +72,7 @@ pub struct ConnectBridgeNetworkRequest {
 }
 
 /// Body for `POST /api/v1/container-networks/{id_or_name}/disconnect`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct DisconnectBridgeNetworkRequest {
     /// Container id to detach.
     pub container_id: String,

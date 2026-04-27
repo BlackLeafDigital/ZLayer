@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Build request for JSON API
-#[derive(Debug, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct BuildRequest {
     /// Use runtime template instead of Dockerfile
     #[serde(default)]
@@ -32,8 +31,7 @@ pub struct BuildRequest {
 }
 
 /// Build status response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BuildStatus {
     /// Unique build ID
     pub id: String,
@@ -53,8 +51,7 @@ pub struct BuildStatus {
 }
 
 /// Build state enumeration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildStateEnum {
     /// Build is queued
@@ -68,8 +65,7 @@ pub enum BuildStateEnum {
 }
 
 /// Runtime template information
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TemplateInfo {
     /// Template name (e.g., "node20")
     pub name: String,
@@ -80,8 +76,7 @@ pub struct TemplateInfo {
 }
 
 /// Trigger build response
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TriggerBuildResponse {
     /// Unique build ID for tracking
     pub build_id: String,
@@ -100,8 +95,7 @@ pub struct BuildEventWrapper {
 }
 
 /// Build request with server-side context path
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BuildRequestWithContext {
     /// Path to the build context on the server
     pub context_path: String,

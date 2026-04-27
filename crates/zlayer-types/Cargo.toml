@@ -19,10 +19,6 @@ cron = { workspace = true }
 humantime = "2.3"
 regex = "1.12"
 thiserror = { workspace = true }
-utoipa = { workspace = true, optional = true }
+utoipa = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 validator = { workspace = true, features = ["derive"] }
-
-[features]
-default = []
-utoipa = ["dep:utoipa"]

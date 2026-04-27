@@ -2,12 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "utoipa")]
 use utoipa::IntoParams;
 
 /// Service summary
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceSummary {
     /// Service name
     pub name: String,
@@ -24,8 +22,7 @@ pub struct ServiceSummary {
 }
 
 /// Service details
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceDetails {
     /// Service name
     pub name: String,
@@ -44,8 +41,7 @@ pub struct ServiceDetails {
 }
 
 /// Service endpoint
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceEndpoint {
     /// Endpoint name
     pub name: String,
@@ -58,8 +54,7 @@ pub struct ServiceEndpoint {
 }
 
 /// Service metrics
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceMetrics {
     /// CPU usage percentage
     pub cpu_percent: f64,
@@ -70,16 +65,14 @@ pub struct ServiceMetrics {
 }
 
 /// Scale request
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ScaleRequest {
     /// Target replica count
     pub replicas: u32,
 }
 
 /// Log query parameters
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct LogQuery {
     /// Number of lines to return
     #[serde(default = "default_lines")]
@@ -96,8 +89,7 @@ fn default_lines() -> u32 {
 }
 
 /// Container summary for API responses
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContainerSummary {
     /// Container identifier (service-rep-N)
     pub id: String,
@@ -114,8 +106,7 @@ pub struct ContainerSummary {
 }
 
 /// Exec request body
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ExecRequest {
     /// Command and arguments to execute
     pub command: Vec<String>,
@@ -125,8 +116,7 @@ pub struct ExecRequest {
 }
 
 /// Exec response body
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ExecResponse {
     /// Exit code from the command
     pub exit_code: i32,

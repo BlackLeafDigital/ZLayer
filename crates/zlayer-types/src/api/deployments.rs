@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Deployment summary
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeploymentSummary {
     /// Deployment name
     pub name: String,
@@ -17,8 +16,7 @@ pub struct DeploymentSummary {
 }
 
 /// Per-service health info included in deployment details
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceHealthInfo {
     /// Service name
     pub name: String,
@@ -33,8 +31,7 @@ pub struct ServiceHealthInfo {
 }
 
 /// Deployment details (enhanced with per-service health and endpoints)
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeploymentDetails {
     /// Deployment name
     pub name: String,
@@ -51,8 +48,7 @@ pub struct DeploymentDetails {
 }
 
 /// Create deployment request
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateDeploymentRequest {
     /// Deployment specification (YAML content)
     pub spec: String,

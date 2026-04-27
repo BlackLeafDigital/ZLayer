@@ -5,15 +5,13 @@
 //! only metadata is returned for listing and retrieval.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Request to create or update a secret.
 ///
 /// `scope` is optional and only honored on the legacy code path — when set
 /// alongside `?environment=`, the request is rejected.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSecretRequest {
     /// The name of the secret.
     pub name: String,
@@ -28,8 +26,7 @@ pub struct CreateSecretRequest {
 /// Response containing secret metadata. Never includes the value unless
 /// the caller is on the explicit `?reveal=true` admin path, in which case
 /// `value` is populated.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SecretMetadataResponse {
     /// The name/identifier of the secret.
     pub name: String,
@@ -45,16 +42,14 @@ pub struct SecretMetadataResponse {
 }
 
 /// Request body for secret rotation.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RotateSecretRequest {
     /// The new secret value (will be encrypted at rest).
     pub value: String,
 }
 
 /// Response returned by the rotate endpoint.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RotateSecretResponse {
     /// The secret name.
     pub name: String,
@@ -69,8 +64,7 @@ pub struct RotateSecretResponse {
 
 /// Response for the batch reveal endpoint — returns every secret in an env as plaintext.
 /// Admin-only for now (Phase 3 will gate this on per-env Read permission instead).
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RevealAllSecretsResponse {
     /// The environment id the secrets were revealed from.
     pub environment: String,
@@ -79,8 +73,7 @@ pub struct RevealAllSecretsResponse {
 }
 
 /// Result body for `POST /api/v1/secrets/bulk-import`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BulkImportResponse {
     /// Number of new secrets created.
     pub created: usize,

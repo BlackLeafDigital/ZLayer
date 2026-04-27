@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::BuildKind;
 
 /// Body for `POST /api/v1/projects`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateProjectRequest {
     /// Project name (globally unique).
     pub name: String,
@@ -47,8 +46,7 @@ pub struct CreateProjectRequest {
 }
 
 /// Body for `PATCH /api/v1/projects/{id}`. All fields are optional.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateProjectRequest {
     /// New project name.
     #[serde(default)]
@@ -90,16 +88,14 @@ pub struct UpdateProjectRequest {
 }
 
 /// Body for `POST /api/v1/projects/{id}/deployments`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LinkDeploymentRequest {
     /// Name of the deployment to link.
     pub deployment_name: String,
 }
 
 /// Response body for `POST /api/v1/projects/{id}/pull`.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ProjectPullResponse {
     /// Project id the pull was performed for.
     pub project_id: String,

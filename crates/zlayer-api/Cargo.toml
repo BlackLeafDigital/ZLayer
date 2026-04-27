@@ -24,7 +24,7 @@ zlayer-core.workspace = true
 # SDK clients can deserialize without pulling in axum/sqlx/tokio. Path-based
 # (no workspace alias) since the workspace `Cargo.toml` does not yet declare
 # `zlayer-types` under `[workspace.dependencies]`.
-zlayer-types = { version = "0.1.0", path = "../zlayer-types", features = ["utoipa"] }
+zlayer-types = { version = "0.1.0", path = "../zlayer-types" }
 oci-client.workspace = true
 zlayer-git.workspace = true
 zlayer-proxy.workspace = true

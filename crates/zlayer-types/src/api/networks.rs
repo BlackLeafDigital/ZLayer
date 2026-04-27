@@ -1,14 +1,12 @@
 //! Network management API DTOs.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 use crate::spec::NetworkPolicySpec;
 
 /// Summary returned when listing networks.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct NetworkSummary {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]

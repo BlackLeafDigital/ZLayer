@@ -1,12 +1,10 @@
 //! Health check API DTOs.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Health check response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
     /// Service status
     pub status: String,

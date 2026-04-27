@@ -1,12 +1,10 @@
 //! User group API DTOs.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Body for `POST /api/v1/groups`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGroupRequest {
     /// Group name.
     pub name: String,
@@ -16,8 +14,7 @@ pub struct CreateGroupRequest {
 }
 
 /// Body for `PATCH /api/v1/groups/{id}`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateGroupRequest {
     /// Updated name.
     #[serde(default)]
@@ -28,16 +25,14 @@ pub struct UpdateGroupRequest {
 }
 
 /// Body for `POST /api/v1/groups/{id}/members`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddMemberRequest {
     /// The user id to add.
     pub user_id: String,
 }
 
 /// Response for member list queries.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GroupMembersResponse {
     /// Group id.
     pub group_id: String,

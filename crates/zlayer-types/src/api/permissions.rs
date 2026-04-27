@@ -1,14 +1,12 @@
 //! Permission grant/revoke/list API DTOs.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::{IntoParams, ToSchema};
 
 use crate::storage::{PermissionLevel, SubjectKind};
 
 /// Query parameters for `GET /api/v1/permissions`.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPermissionsQuery {
     /// Filter by user id.
     #[serde(default)]
@@ -19,8 +17,7 @@ pub struct ListPermissionsQuery {
 }
 
 /// Query parameters for `GET /api/v1/permissions/by-resource`.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListByResourceQuery {
     /// Resource kind (e.g. `"environment"`).
     pub kind: String,
@@ -30,8 +27,7 @@ pub struct ListByResourceQuery {
 }
 
 /// Body for `POST /api/v1/permissions`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GrantPermissionRequest {
     /// Whether the subject is a user or a group.
     pub subject_kind: SubjectKind,

@@ -21,8 +21,7 @@ pub struct CallbackParams {
 /// Callback response body (returned as JSON unless the operator prefers a
 /// redirect; initial integration keeps JSON so the Manager UI can show a
 /// welcome screen post-exchange).
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OidcCallbackResponse {
     pub user: UserView,
     pub csrf_token: String,

@@ -1825,7 +1825,8 @@ mod tests {
             "deployment": "my-app",
             "status": "running",
             "replicas": 3,
-            "desired_replicas": 3
+            "desired_replicas": 3,
+            "endpoints": []
         }"#;
         let summary: ServiceSummary = serde_json::from_str(json).unwrap();
         assert_eq!(summary.name, "api");

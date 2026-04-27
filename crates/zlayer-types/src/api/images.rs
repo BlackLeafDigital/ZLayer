@@ -6,17 +6,15 @@
 //! full server stack.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::{IntoParams, ToSchema};
 
 /// Serializable wrapper for `zlayer_agent::runtime::ImageInfo` so we can
 /// attach `ToSchema` here (the underlying type in `zlayer-agent` can't
 /// depend on `utoipa`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImageInfoDto {
     /// Canonical image reference (e.g. `zachhandley/zlayer-manager:latest`).
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    #[schema(value_type = String)]
     #[serde(with = "crate::image_ref_serde")]
     pub reference: crate::ImageReference,
     /// Content-addressed digest (`sha256:...`) if known.
@@ -26,8 +24,7 @@ pub struct ImageInfoDto {
 }
 
 /// Serializable wrapper for `zlayer_agent::runtime::PruneResult`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
 pub struct PruneResultDto {
     /// Image references or digests that were removed.
     pub deleted: Vec<String>,
@@ -36,11 +33,10 @@ pub struct PruneResultDto {
 }
 
 /// Request body for the pull-image handler. Blocking pull of an OCI image.
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PullImageRequest {
     /// OCI image reference to pull, e.g. `docker.io/library/nginx:latest`.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    #[schema(value_type = String)]
     #[serde(with = "crate::image_ref_serde")]
     pub reference: crate::ImageReference,
     /// Pull policy override. Accepts `"always"`, `"if_not_present"`, or
@@ -64,11 +60,10 @@ pub struct PullImageRequest {
 /// Response body for the pull-image handler. Reports the pulled reference
 /// and, when the backend exposes it via `list_images`, the resolved digest
 /// and on-disk size.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PullImageResponse {
     /// Canonical reference that was pulled.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    #[schema(value_type = String)]
     #[serde(with = "crate::image_ref_serde")]
     pub reference: crate::ImageReference,
     /// Content-addressed digest (`sha256:...`) if the runtime reports one.
@@ -80,8 +75,7 @@ pub struct PullImageResponse {
 }
 
 /// Query parameters for the remove-image handler.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct RemoveImageQuery {
     /// Force removal even if the image is referenced by containers.
     #[serde(default)]
@@ -91,15 +85,14 @@ pub struct RemoveImageQuery {
 /// Request body for the tag-image handler. Matches Docker-compat
 /// `docker tag` semantics: create a new reference (`target`) pointing at an
 /// already-cached image (`source`).
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct TagImageRequest {
     /// Existing image reference to tag (e.g. `myapp:latest`).
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    #[schema(value_type = String)]
     #[serde(with = "crate::image_ref_serde")]
     pub source: crate::ImageReference,
     /// New reference to create (e.g. `registry.example.com/myapp:v1`).
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    #[schema(value_type = String)]
     #[serde(with = "crate::image_ref_serde")]
     pub target: crate::ImageReference,
 }

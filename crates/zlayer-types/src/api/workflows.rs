@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::WorkflowStep;
 
 /// Body for `POST /api/v1/workflows`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateWorkflowRequest {
     /// Workflow name.
     pub name: String,

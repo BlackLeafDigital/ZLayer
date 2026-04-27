@@ -6,12 +6,10 @@
 //! tokens.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Request to scale a service
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InternalScaleRequest {
     /// Service name to scale
     pub service: String,
@@ -20,8 +18,7 @@ pub struct InternalScaleRequest {
 }
 
 /// Response from internal scale operation
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct InternalScaleResponse {
     /// Whether the operation succeeded
     pub success: bool,
@@ -46,8 +43,7 @@ pub struct InternalScaleResponse {
 /// Sent by the leader to existing nodes when a new node joins the cluster,
 /// so that all nodes learn about the new peer without waiting for periodic
 /// reconciliation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InternalAddPeerRequest {
     /// New peer's `WireGuard` public key (base64)
     pub wg_public_key: String,
@@ -58,8 +54,7 @@ pub struct InternalAddPeerRequest {
 }
 
 /// Response from internal add-peer operation
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct InternalAddPeerResponse {
     /// Whether the operation succeeded
     pub success: bool,

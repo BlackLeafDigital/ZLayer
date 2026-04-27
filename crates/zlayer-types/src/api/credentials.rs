@@ -7,8 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Registry credential metadata (returned by list/create; no password).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RegistryCredentialResponse {
     /// Unique identifier.
     pub id: String,
@@ -21,8 +20,7 @@ pub struct RegistryCredentialResponse {
 }
 
 /// Authentication method for a registry credential (`OpenAPI` schema).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryAuthTypeSchema {
     /// HTTP Basic authentication (username + password).
@@ -32,8 +30,7 @@ pub enum RegistryAuthTypeSchema {
 }
 
 /// Git credential metadata (returned by list/create; no secret value).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GitCredentialResponse {
     /// Unique identifier.
     pub id: String,
@@ -44,8 +41,7 @@ pub struct GitCredentialResponse {
 }
 
 /// Kind of git credential (`OpenAPI` schema).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GitCredentialKindSchema {
     /// Personal access token.
@@ -55,8 +51,7 @@ pub enum GitCredentialKindSchema {
 }
 
 /// Body for `POST /api/v1/credentials/registry`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateRegistryCredentialRequest {
     /// Registry hostname (e.g. `"docker.io"`).
     pub registry: String,
@@ -69,8 +64,7 @@ pub struct CreateRegistryCredentialRequest {
 }
 
 /// Body for `POST /api/v1/credentials/git`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateGitCredentialRequest {
     /// Human-readable label (e.g. `"GitHub PAT for ci"`).
     pub name: String,

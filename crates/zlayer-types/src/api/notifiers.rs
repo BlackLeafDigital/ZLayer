@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::{NotifierConfig, NotifierKind};
 
 /// Body for `POST /api/v1/notifiers`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateNotifierRequest {
     /// Notifier name.
     pub name: String,
@@ -21,8 +20,7 @@ pub struct CreateNotifierRequest {
 }
 
 /// Body for `PATCH /api/v1/notifiers/{id}`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateNotifierRequest {
     /// Updated name.
     #[serde(default)]
@@ -36,8 +34,7 @@ pub struct UpdateNotifierRequest {
 }
 
 /// Response from `POST /api/v1/notifiers/{id}/test`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TestNotifierResponse {
     /// Whether the test notification was sent successfully.
     pub success: bool,

@@ -4,12 +4,10 @@
 //! response shapes consumed by both the daemon and SDK clients.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Replication detail within the storage status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ReplicationInfo {
     /// Whether replication is configured
     pub enabled: bool,
@@ -23,8 +21,7 @@ pub struct ReplicationInfo {
 }
 
 /// Storage status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StorageStatusResponse {
     /// Replication status details
     pub replication: ReplicationInfo,

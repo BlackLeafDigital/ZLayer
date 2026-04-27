@@ -2,12 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "utoipa")]
 use utoipa::IntoParams;
 
 /// Response after triggering a job
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TriggerJobResponse {
     /// Unique execution ID for tracking
     pub execution_id: String,
@@ -16,8 +14,7 @@ pub struct TriggerJobResponse {
 }
 
 /// Job execution status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct JobExecutionResponse {
     /// Unique execution ID
     pub id: String,
@@ -48,8 +45,7 @@ pub struct JobExecutionResponse {
 }
 
 /// Query parameters for listing executions
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListExecutionsQuery {
     /// Maximum number of executions to return
     #[serde(default = "default_limit")]

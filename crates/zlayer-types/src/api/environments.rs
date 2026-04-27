@@ -19,8 +19,7 @@ pub struct ListEnvironmentsQuery {
 }
 
 /// Body for `POST /api/v1/environments`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateEnvironmentRequest {
     /// Display name. Must be unique within the chosen `project_id` namespace.
     pub name: String,
@@ -33,8 +32,7 @@ pub struct CreateEnvironmentRequest {
 }
 
 /// Body for `PATCH /api/v1/environments/{id}`. All fields are optional.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateEnvironmentRequest {
     /// New display name. Will be re-checked for uniqueness.
     #[serde(default)]

@@ -14,8 +14,7 @@ pub struct ListTasksQuery {
 }
 
 /// Body for `POST /api/v1/tasks`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CreateTaskRequest {
     /// Task name.
     pub name: String,

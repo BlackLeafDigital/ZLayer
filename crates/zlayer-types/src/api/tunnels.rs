@@ -3,12 +3,10 @@
 //! Wire types for the tunnel management endpoints.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Request to create a new tunnel token
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTunnelRequest {
     /// Name for this tunnel (for identification)
     pub name: String,
@@ -25,8 +23,7 @@ fn default_ttl() -> u64 {
 }
 
 /// Response after creating a tunnel token
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateTunnelResponse {
     /// Unique tunnel identifier
     pub id: String,
@@ -43,8 +40,7 @@ pub struct CreateTunnelResponse {
 }
 
 /// Tunnel summary for list operations
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct TunnelSummary {
     /// Unique tunnel identifier
     pub id: String,
@@ -63,8 +59,7 @@ pub struct TunnelSummary {
 }
 
 /// Detailed tunnel status
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TunnelStatus {
     /// Unique tunnel identifier
     pub id: String,
@@ -89,8 +84,7 @@ pub struct TunnelStatus {
 }
 
 /// Information about a registered service in a tunnel
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RegisteredServiceInfo {
     /// Service name
     pub name: String,
@@ -107,8 +101,7 @@ pub struct RegisteredServiceInfo {
 }
 
 /// Request to create a node-to-node tunnel
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateNodeTunnelRequest {
     /// Name for this tunnel
     pub name: String,
@@ -130,8 +123,7 @@ fn default_expose() -> String {
 }
 
 /// Response after creating a node-to-node tunnel
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateNodeTunnelResponse {
     /// Tunnel name
     pub name: String,
@@ -150,8 +142,7 @@ pub struct CreateNodeTunnelResponse {
 }
 
 /// Generic success response
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SuccessResponse {
     /// Success message
     pub message: String,

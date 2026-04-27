@@ -4,12 +4,10 @@
 //! response shapes consumed by both the daemon and SDK clients.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Overlay network status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OverlayStatusResponse {
     /// Overlay interface name
     pub interface: String,
@@ -32,8 +30,7 @@ pub struct OverlayStatusResponse {
 }
 
 /// Peer information
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PeerInfo {
     /// Peer's public key
     pub public_key: String,
@@ -55,8 +52,7 @@ pub struct PeerInfo {
 }
 
 /// Peer list response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PeerListResponse {
     /// Total number of peers
     pub total: usize,
@@ -67,8 +63,7 @@ pub struct PeerListResponse {
 }
 
 /// IP allocation status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct IpAllocationResponse {
     /// Overlay network CIDR
     pub cidr: String,
@@ -86,8 +81,7 @@ pub struct IpAllocationResponse {
 }
 
 /// DNS service status response
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DnsStatusResponse {
     /// Whether DNS service is enabled
     pub enabled: bool,

@@ -24,25 +24,24 @@ use crate::spec::DeploymentSpec;
 // =========================================================================
 
 /// A stored deployment with metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredDeployment {
     /// Deployment name (unique identifier)
     pub name: String,
 
     /// The deployment specification (complex nested structure, see spec docs)
-    #[cfg_attr(feature = "utoipa", schema(value_type = Object))]
+    #[schema(value_type = Object)]
     pub spec: DeploymentSpec,
 
     /// Current deployment status
     pub status: DeploymentStatus,
 
     /// When the deployment was created
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2025-01-27T12:00:00Z"))]
+    #[schema(value_type = String, example = "2025-01-27T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the deployment was last updated
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2025-01-27T12:00:00Z"))]
+    #[schema(value_type = String, example = "2025-01-27T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -74,8 +73,7 @@ impl StoredDeployment {
 }
 
 /// Deployment lifecycle status.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeploymentStatus {
     /// Deployment created but not yet started
@@ -117,8 +115,7 @@ impl std::fmt::Display for DeploymentStatus {
 ///
 /// The password hash lives in `zlayer-secrets::CredentialStore` keyed by the
 /// email address — NOT in this record. This type only carries user metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredUser {
     /// Opaque user ID (`UUIDv4` string).
     pub id: String,
@@ -136,15 +133,15 @@ pub struct StoredUser {
     pub is_active: bool,
 
     /// When the user was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the user was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 
     /// When the user last logged in (if ever).
-    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = Option<String>, example = "2026-04-15T12:00:00Z")]
     pub last_login_at: Option<DateTime<Utc>>,
 }
 
@@ -175,8 +172,7 @@ impl StoredUser {
 
 /// User role. Admins can do everything; regular users are constrained by
 /// per-resource permissions (added in a later phase).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
     /// Full administrative access.
@@ -211,8 +207,7 @@ impl std::fmt::Display for UserRole {
 /// Each environment is an isolated namespace for secrets and, later,
 /// deployments. Optionally belongs to a `Project` (added in Phase 5) — when
 /// `project_id` is `None`, the environment is global.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredEnvironment {
     /// UUID identifier.
     pub id: String,
@@ -227,11 +222,11 @@ pub struct StoredEnvironment {
     pub description: Option<String>,
 
     /// When the environment was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the environment was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -257,8 +252,7 @@ impl StoredEnvironment {
 
 /// A project bundles a git source, build configuration, registry credential
 /// reference, linked deployments, and a default environment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredProject {
     /// UUID identifier.
     pub id: String,
@@ -314,11 +308,11 @@ pub struct StoredProject {
     pub poll_interval_secs: Option<u64>,
 
     /// When the project was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the project was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -349,8 +343,7 @@ impl StoredProject {
 }
 
 /// How a project is built.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildKind {
     /// Standard Dockerfile build.
@@ -384,8 +377,7 @@ impl std::fmt::Display for BuildKind {
 ///
 /// Variables can be global (`scope = None`) or project-scoped
 /// (`scope = Some(project_id)`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredVariable {
     /// UUID identifier.
     pub id: String,
@@ -401,11 +393,11 @@ pub struct StoredVariable {
     pub scope: Option<String>,
 
     /// When the variable was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the variable was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -434,8 +426,7 @@ impl StoredVariable {
 /// A sync points at a directory within a project's checkout that contains
 /// `ZLayer` resource YAMLs. On diff/apply the directory is scanned, compared
 /// against current API state, and reconciled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredSync {
     /// UUID identifier.
     pub id: String,
@@ -463,11 +454,11 @@ pub struct StoredSync {
     pub last_applied_sha: Option<String>,
 
     /// When the sync was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the sync was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -498,8 +489,7 @@ impl StoredSync {
 ///
 /// Tasks can be global (`project_id = None`) or project-scoped
 /// (`project_id = Some(project_id)`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredTask {
     /// UUID identifier.
     pub id: String,
@@ -517,11 +507,11 @@ pub struct StoredTask {
     pub project_id: Option<String>,
 
     /// When the task was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the task was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -548,8 +538,7 @@ impl StoredTask {
 }
 
 /// Script type for a task.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     /// A bash shell script executed via `sh -c`.
@@ -565,8 +554,7 @@ impl std::fmt::Display for TaskKind {
 }
 
 /// A recorded execution of a task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TaskRun {
     /// UUID identifier of this run.
     pub id: String,
@@ -584,11 +572,11 @@ pub struct TaskRun {
     pub stderr: String,
 
     /// When the run started.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub started_at: DateTime<Utc>,
 
     /// When the run finished (`None` if it has not finished yet).
-    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>, example = "2026-04-15T12:00:01Z"))]
+    #[schema(value_type = Option<String>, example = "2026-04-15T12:00:01Z")]
     pub finished_at: Option<DateTime<Utc>>,
 }
 
@@ -598,8 +586,7 @@ pub struct TaskRun {
 
 /// A stored workflow — a named sequence of steps forming a DAG that
 /// composes tasks, project builds, deploys, and sync applies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredWorkflow {
     /// UUID identifier.
     pub id: String,
@@ -614,11 +601,11 @@ pub struct StoredWorkflow {
     pub project_id: Option<String>,
 
     /// When the workflow was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the workflow was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -639,8 +626,7 @@ impl StoredWorkflow {
 }
 
 /// A single step in a workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WorkflowStep {
     /// Step name (display label).
     pub name: String,
@@ -654,8 +640,7 @@ pub struct WorkflowStep {
 }
 
 /// The action a workflow step performs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowAction {
     /// Execute a task by id.
@@ -681,8 +666,7 @@ pub enum WorkflowAction {
 }
 
 /// A recorded execution of a workflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WorkflowRun {
     /// UUID identifier of this run.
     pub id: String,
@@ -697,17 +681,16 @@ pub struct WorkflowRun {
     pub step_results: Vec<StepResult>,
 
     /// When the run started.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub started_at: DateTime<Utc>,
 
     /// When the run finished (`None` if still running).
-    #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>, example = "2026-04-15T12:00:01Z"))]
+    #[schema(value_type = Option<String>, example = "2026-04-15T12:00:01Z")]
     pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// Overall status of a workflow run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRunStatus {
     /// Not yet started.
@@ -732,8 +715,7 @@ impl std::fmt::Display for WorkflowRunStatus {
 }
 
 /// Result of executing a single step in a workflow run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StepResult {
     /// The step name.
     pub step_name: String,
@@ -751,8 +733,7 @@ pub struct StepResult {
 
 /// A stored notifier — a named notification channel that fires alerts to
 /// Slack, Discord, a generic webhook, or SMTP when triggered.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredNotifier {
     /// UUID identifier.
     pub id: String,
@@ -770,11 +751,11 @@ pub struct StoredNotifier {
     pub enabled: bool,
 
     /// When the notifier was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the notifier was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -796,8 +777,7 @@ impl StoredNotifier {
 }
 
 /// Notification channel type.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotifierKind {
     /// Slack incoming webhook.
@@ -822,8 +802,7 @@ impl std::fmt::Display for NotifierKind {
 }
 
 /// Channel-specific configuration for a notifier.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotifierConfig {
     /// Slack incoming webhook configuration.
@@ -869,8 +848,7 @@ pub enum NotifierConfig {
 // =========================================================================
 
 /// A stored user group for role-based access control.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredUserGroup {
     /// UUID identifier.
     pub id: String,
@@ -882,11 +860,11 @@ pub struct StoredUserGroup {
     pub description: Option<String>,
 
     /// When the group was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 
     /// When the group was last updated.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -910,8 +888,7 @@ impl StoredUserGroup {
 // =========================================================================
 
 /// Whether a permission subject is a user or a group.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubjectKind {
     /// A single user.
@@ -931,8 +908,9 @@ impl std::fmt::Display for SubjectKind {
 
 /// Access level for a resource permission, ordered from least to most
 /// privilege.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionLevel {
     /// No access.
@@ -958,8 +936,7 @@ impl std::fmt::Display for PermissionLevel {
 
 /// A stored permission grant binding a subject (user or group) to a resource
 /// with a specific access level.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredPermission {
     /// UUID identifier of this permission grant.
     pub id: String,
@@ -981,7 +958,7 @@ pub struct StoredPermission {
     pub level: PermissionLevel,
 
     /// When the permission was created.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, example = "2026-04-15T12:00:00Z"))]
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
     pub created_at: DateTime<Utc>,
 }
 
@@ -1017,8 +994,7 @@ impl StoredPermission {
 /// subsequent sign-ins look up the same row and reuse the linked `user_id`.
 /// The uniqueness constraint on `(provider, subject)` enforces the
 /// one-subject-one-user invariant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OidcIdentity {
     /// Surrogate id (uuid).
     pub id: String,
@@ -1030,9 +1006,9 @@ pub struct OidcIdentity {
     pub subject: String,
     /// Email returned by the provider at link time (informational only).
     pub email_at_link: Option<String>,
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, format = DateTime))]
+    #[schema(value_type = String, format = DateTime)]
     pub created_at: DateTime<Utc>,
-    #[cfg_attr(feature = "utoipa", schema(value_type = String, format = DateTime))]
+    #[schema(value_type = String, format = DateTime)]
     pub updated_at: DateTime<Utc>,
 }
 

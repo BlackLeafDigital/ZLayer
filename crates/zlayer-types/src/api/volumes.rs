@@ -7,12 +7,10 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Request body for `POST /api/v1/volumes`.
-#[derive(Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct CreateVolumeRequest {
     /// Volume name. Required. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`.
     pub name: String,
@@ -31,8 +29,7 @@ pub struct CreateVolumeRequest {
 
 /// Full volume response shape used by the list, inspect, and create
 /// endpoints.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VolumeInfo {
     /// Volume name (directory name).
     pub name: String,
@@ -60,8 +57,7 @@ pub struct VolumeInfo {
 /// consumers that deserialize strictly. New consumers should use
 /// [`VolumeInfo`]. `list_volumes` now returns [`VolumeInfo`] which is a
 /// strict superset of the fields in `VolumeSummary`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct VolumeSummary {
     /// Volume name (directory name).
     pub name: String,

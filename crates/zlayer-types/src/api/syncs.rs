@@ -6,12 +6,10 @@
 //! reports what would change; the apply endpoint actually reconciles.
 
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "utoipa")]
 use utoipa::ToSchema;
 
 /// Body for `POST /api/v1/syncs`.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateSyncRequest {
     /// Display name for this sync.
     pub name: String,
@@ -30,8 +28,7 @@ pub struct CreateSyncRequest {
 }
 
 /// Result of reconciling a single resource during apply.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SyncResourceResult {
     /// The source manifest path (or remote resource name for deletions).
     pub resource: String,
@@ -92,8 +89,7 @@ impl SyncResourceResult {
 /// NOTE: This is a breaking change from the previous dry-run-only
 /// `{ diff, message }` shape. Clients inspecting the apply response directly
 /// must be updated — callers that only consumed the HTTP status stay working.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SyncApplyResponse {
     /// Per-resource reconcile results.
     pub results: Vec<SyncResourceResult>,
@@ -106,8 +102,7 @@ pub struct SyncApplyResponse {
 }
 
 /// JSON-friendly wrapper around the sync diff output.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SyncDiffResponse {
     /// Resources to create.
     pub to_create: Vec<SyncResourceResponse>,
@@ -118,8 +113,7 @@ pub struct SyncDiffResponse {
 }
 
 /// A single resource in the diff output.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SyncResourceResponse {
     /// Source file name.
     pub file_path: String,

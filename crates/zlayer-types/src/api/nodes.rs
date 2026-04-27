@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Node summary for list operations
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NodeSummary {
     /// Node identifier
     pub id: u64,
@@ -23,8 +22,7 @@ pub struct NodeSummary {
 }
 
 /// Node resource information
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NodeResourceInfo {
     /// Total CPU cores
     pub cpu_total: f64,
@@ -41,8 +39,7 @@ pub struct NodeResourceInfo {
 }
 
 /// Detailed node information
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NodeDetails {
     /// Node identifier
     pub id: u64,
@@ -67,8 +64,7 @@ pub struct NodeDetails {
 }
 
 /// Request to update node labels
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateLabelsRequest {
     /// Labels to add or update
     pub labels: HashMap<String, String>,
@@ -77,16 +73,14 @@ pub struct UpdateLabelsRequest {
 }
 
 /// Response after updating labels
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateLabelsResponse {
     /// Current labels after the update
     pub labels: HashMap<String, String>,
 }
 
 /// Join token response for cluster joining
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct JoinTokenResponse {
     /// Join token for authenticating the new node
     pub token: String,

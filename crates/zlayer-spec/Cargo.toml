@@ -11,7 +11,7 @@ categories = ["config", "parsing"]
 readme = "README.md"
 
 [dependencies]
-zlayer-types = { workspace = true, features = ["utoipa"] }
+zlayer-types = { workspace = true }
 
 [lints]
 workspace = true

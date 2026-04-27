@@ -1,13 +1,11 @@
 //! Container events API DTOs.
 
 use serde::Deserialize;
-#[cfg(feature = "utoipa")]
 use utoipa::IntoParams;
 
 /// Query parameters for `GET /api/v1/events`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(IntoParams))]
-#[cfg_attr(feature = "utoipa", into_params(parameter_in = Query))]
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct EventsQuery {
     /// Follow the event stream. Default: `true`. Reserved for parity with
     /// Docker-compat tooling; this endpoint is always streaming.

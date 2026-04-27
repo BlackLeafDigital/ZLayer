@@ -8,8 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Response for the public webhook receiver.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WebhookResponse {
     /// Operation result -- always `"ok"` on success.
     pub status: String,
@@ -18,8 +17,7 @@ pub struct WebhookResponse {
 }
 
 /// Response for `GET /api/v1/projects/{id}/webhook`.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WebhookInfoResponse {
     /// Full URL to configure in the git host's webhook settings.
     pub url: String,

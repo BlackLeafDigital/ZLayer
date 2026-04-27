@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Response for cron job information
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CronJobResponse {
     /// Job name
     pub name: String,
@@ -21,8 +20,7 @@ pub struct CronJobResponse {
 }
 
 /// Response after triggering a cron job
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TriggerCronResponse {
     /// Execution ID for tracking
     pub execution_id: String,
@@ -31,8 +29,7 @@ pub struct TriggerCronResponse {
 }
 
 /// Response for enable/disable operations
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CronStatusResponse {
     /// Job name
     pub name: String,
