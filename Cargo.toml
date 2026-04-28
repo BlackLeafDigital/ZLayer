@@ -248,7 +248,7 @@ zlayer-types = { version = "0.0.0-dev", path = "crates/zlayer-types" }
 # Features chosen to cover the operations we perform: blocking HTTPS transport
 # (reqwest + rustls, no OpenSSL), HTTP credential prompting, worktree mutation
 # for clone/checkout, and revision parsing for `rev_parse_single`/`merge_base`.
-gix = { version = "0.82", default-features = false, features = [
+gix = { version = "0.83", default-features = false, features = [
   "blocking-network-client",
   "blocking-http-transport-reqwest-rust-tls",
   "credentials",
