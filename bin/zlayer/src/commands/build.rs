@@ -28,6 +28,7 @@ pub(crate) async fn handle_build(
     no_tui: bool,
     verbose_build: bool,
     platform: Option<String>,
+    update_bottles: bool,
 ) -> Result<()> {
     use std::str::FromStr;
     use zlayer_builder::{
@@ -200,6 +201,9 @@ pub(crate) async fn handle_build(
 
     // Apply pull strategy (default Newer is a no-op but harmless to set explicitly)
     builder = builder.pull(pull_mode);
+
+    // Forward --update-bottles to the macOS sandbox backend (no-op on Linux/Windows)
+    builder = builder.update_bottles(update_bottles);
 
     // Apply push
     if push {

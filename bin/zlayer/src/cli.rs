@@ -447,6 +447,13 @@ pub(crate) enum Commands {
         /// `platform:` field, falling back to Linux.
         #[arg(long, value_name = "PLATFORM")]
         platform: Option<String>,
+
+        /// Ignore any existing `zlayer-bottles.lock` next to the spec and
+        /// force fresh resolution of every macOS Homebrew bottle. The lockfile
+        /// is rewritten from scratch. Mirrors `cargo update` semantics.
+        /// On non-macOS platforms this flag is accepted but has no effect.
+        #[arg(long)]
+        update_bottles: bool,
     },
 
     /// Build multiple images from a pipeline manifest

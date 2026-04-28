@@ -70,6 +70,12 @@ impl BuildBackend for SandboxBackend {
             builder = builder.with_source_hash(hash.clone());
         }
 
+        // Forward the --update-bottles flag so the per-spec
+        // `zlayer-bottles.lock` is regenerated when requested.
+        if options.update_bottles {
+            builder = builder.with_update_bottles(true);
+        }
+
         // Run the build
         let result = builder.build(dockerfile, &options.tags).await?;
 

@@ -10,6 +10,7 @@ Requires: PostgreSQL, zstd, psql in PATH.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,23 +29,19 @@ OUTPUT_DIR = os.path.join(
 )
 
 # Hand-curated overrides applied last, overriding anything Repology produces.
-# Use these only for entries Repology can't resolve (no effname join with
-# homebrew), or to force the unversioned canonical when Repology only surfaces
-# versioned aliases. NEVER pin to a specific version here — pinning behind the
-# user's back defeats the point of letting Homebrew (and the user's own formula
-# dependencies) drive version selection. If a caller wants e.g. `openssl@3`
-# they can ask for it explicitly; the unversioned apt input (`libssl-dev`,
-# `python3`) means "current default", which apt itself uses.
+# Reserved for entries the dynamic `pick_winner` resolution genuinely cannot
+# reach: no Repology effname join, ambiguous semantics, or distro-specific
+# metapackages with no direct brew twin.
+#
+# Common version-mapping cases (libssl-dev -> openssl@3, python3 -> python@3.14,
+# nodejs -> node@22) are handled by `pick_winner` using each Linux package's
+# Repology version field plus Homebrew's formula list — DO NOT add them here.
 OVERRIDES = {
-    "libssl-dev":    "openssl",
-    "libssl3":       "openssl",
-    "openssl-dev":   "openssl",
-    "python3":       "python",
-    "python3-dev":   "python",
-    "python3-devel": "python",
-    "nodejs":        "node",
-    "default-jdk":   "openjdk",
-    "default-jre":   "openjdk",
+    # Debian metapackages that point at "the distro's chosen default JDK/JRE".
+    # Repology has no effname join for these; map by hand to brew's openjdk
+    # (which itself tracks the current default).
+    "default-jdk": "openjdk",
+    "default-jre": "openjdk",
 }
 
 # Shard set used to split large per-distro maps into reviewable chunks.
@@ -229,16 +226,23 @@ def diagnose(tmpdir, port):
 
 
 def fetch_homebrew_alias_index():
-    """Fetch the Homebrew formula API once and build an alias→canonical map.
+    """Fetch the Homebrew formula API once and build the alias index + formula set.
 
-    Each entry maps a formula's `full_name`, every entry in `aliases`, and every
-    entry in `oldnames` to the formula's canonical `full_name`. This lets us
-    prefer the alias-canonical formula when Repology surfaces multiple matches
-    for the same Linux package (e.g. `openssl@3.5` vs `openssl@3`, where
-    `openssl@3.aliases` contains `openssl` and `openssl@3.6`).
+    Returns `(alias_to_canonical, formula_set)`:
 
-    On failure (network/parse error) returns an empty dict; the tiebreak then
-    degrades to the version-suffix heuristic in `pick_winner`.
+    - `alias_to_canonical`: maps every formula's `full_name`, every `aliases`
+      entry, and every `oldnames` entry to that formula's canonical `full_name`.
+      Used by `pick_winner` Rule 2 (resolve a Linux name like `python3` to the
+      brew alias's current canonical, e.g. `python@3.14`).
+
+    - `formula_set`: the set of canonical `full_name` values — i.e. the names
+      that are *real* installable formulas, not just aliases. Used by
+      `pick_winner` Rule 1 to verify that a synthesized `<base>@<major>` name
+      actually exists in brew before emitting it (e.g. `openssl@3` is real,
+      `python@3` is alias-only and would 404 on the formula JSON endpoint).
+
+    On failure (network/parse error) returns `({}, set())`; `pick_winner`
+    degrades to the version-suffix heuristic.
     """
     print(f"Fetching {HOMEBREW_FORMULA_API}...")
     try:
@@ -246,46 +250,114 @@ def fetch_homebrew_alias_index():
             data = json.load(resp)
     except Exception as e:
         print(f"  WARN: failed to fetch homebrew API ({e}); alias-aware tiebreak disabled")
-        return {}
+        return {}, set()
 
     a2c = {}
+    formulas = set()
     for f in data:
         canonical = f.get("full_name") or f.get("name")
         if not canonical:
             continue
+        formulas.add(canonical)
         a2c[canonical] = canonical
         for alias in f.get("aliases", []) or []:
             a2c[alias] = canonical
         for old in f.get("oldnames", []) or []:
             a2c[old] = canonical
-    print(f"  Indexed {len(a2c)} alias entries from {len(data)} formulas")
-    return a2c
+    print(f"  Indexed {len(a2c)} alias entries from {len(formulas)} formulas")
+    return a2c, formulas
 
 
-def pick_winner(candidates, linux_name, alias_to_canonical):
+_LEADING_INT_RE = re.compile(r"^(\d+)")
+
+
+def parse_major(version_or_suffix):
+    """Extract the leading integer from a version string or `@`-suffix.
+
+    Examples: `'3.0.16+5'` -> 3, `'22.5.1~deb12'` -> 22, `'3.14.0'` -> 3,
+    `''`/`None`/`'foo'` -> None. Used to compare a Linux package's version
+    against a brew formula's `@MAJOR` suffix.
+    """
+    if not version_or_suffix:
+        return None
+    m = _LEADING_INT_RE.match(version_or_suffix)
+    return int(m.group(1)) if m else None
+
+
+def parse_brew_major(brew_name):
+    """Return the major from a brew name like `'openssl@3'` -> 3.
+
+    Returns None for unversioned names (`'node'`) or unparseable suffixes
+    (`'gcc@HEAD'`).
+    """
+    if "@" not in brew_name:
+        return None
+    return parse_major(brew_name.split("@", 1)[1])
+
+
+def pick_winner(candidates, linux_name, linux_version, alias_to_canonical, formula_set):
     """Choose the best Homebrew formula for a Linux package name.
 
-    Tiebreak order:
-      1. If the Linux name is itself a known Homebrew alias and that alias's
-         canonical formula is among the candidates, use it. This catches cases
-         like `openssl → openssl@3` (since `openssl@3.aliases = ['openssl', ...]`).
-      2. Among candidates, prefer one whose name has no `@` (unversioned base
-         formula like `node` over `node@24`).
-      3. Among `@`-versioned candidates, prefer fewer dotted components
-         (`openssl@3` over `openssl@3.5` over `openssl@3.5.6`).
-      4. Lexicographic.
+    Resolution order:
+      1. **Real `<base>@<linux_major>` match.** If the Linux package's version
+         starts with major `M` and any candidate is exactly `<base>@<M>`
+         where that name is in `formula_set` (a real installable formula,
+         not just an alias), return it. Example: `libssl-dev v3.0.16` →
+         `openssl@3` (real formula).
+      2. **Alias-canonical resolution.** If `linux_name` is itself a known
+         brew alias and the canonical it points at is among the candidates,
+         and (when we know the Linux major) the canonical's major matches,
+         return it. Example: `python3 v3.13.0` → `python@3.14` (alias
+         canonical of `python3`/`python@3`, major matches).
+      3. **Version-suffix heuristic.** Prefer no-`@`, then fewer dotted
+         components, then lex. Catches cases without version data or where
+         brew's naming doesn't follow the `<base>@<major>` convention.
     """
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
 
-    # Rule 1: alias-canonical match
-    canonical = alias_to_canonical.get(linux_name)
-    if canonical and canonical in candidates:
-        return canonical
+    linux_major = parse_major(linux_version)
 
-    # Rules 2-4: version-suffix preference, then lex
+    # Rule 1: real `<base>@<linux_major>` formula in candidates. Match only
+    # *pure* major pins — the suffix must be the integer with no dotted
+    # minor/patch. Otherwise `python@3.10` would match a `python3 v3.x`
+    # query (its leading int is 3) when what we actually want is the
+    # alias-canonical `python@3.14`. Pure-major pins like `openssl@3` and
+    # `node@22` match correctly.
+    if linux_major is not None:
+        for cand in candidates:
+            if "@" not in cand:
+                continue
+            suffix = cand.split("@", 1)[1]
+            if suffix.isdigit() and int(suffix) == linux_major and cand in formula_set:
+                return cand
+
+    # Rule 2: alias-canonical. The Linux name (`python3`, `openssl`) is
+    # itself a brew alias — or one of its common Linux variants
+    # (`python3-dev`, `python3-devel`). Try the name as-is, then with
+    # `-dev`/`-devel` stripped so dev packages resolve to the same canonical
+    # as their runtime counterpart. The Rust resolver only does name
+    # transforms on map *misses*, so the generator must emit the right
+    # value when the Linux name is a -dev variant.
+    alias_variants = [linux_name]
+    for suffix in ("-dev", "-devel"):
+        if linux_name.endswith(suffix):
+            alias_variants.append(linux_name[: -len(suffix)])
+
+    for variant in alias_variants:
+        canonical = alias_to_canonical.get(variant)
+        if canonical and canonical in candidates:
+            canonical_major = parse_brew_major(canonical)
+            if (
+                linux_major is None
+                or canonical_major is None
+                or canonical_major == linux_major
+            ):
+                return canonical
+
+    # Rule 3: version-suffix preference, then lex
     def sort_key(name):
         if "@" not in name:
             return (0, len(name), name)
@@ -311,28 +383,28 @@ def get_all_distro_repos(tmpdir, port):
     return [r.strip() for r in result.split("\n") if r.strip()]
 
 
-def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
+def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical, formula_set):
     """Extract distro→homebrew mappings for a single repo.
 
-    Captures all name variants: visiblename, srcname, binname, and
-    individual entries from the binnames array. When a Linux package has
-    multiple Homebrew candidates (different versioned aliases sharing an
-    `effname`), uses `pick_winner` to choose the canonical one rather than
-    accepting whichever PostgreSQL emits first.
+    Captures all name variants (visiblename, srcname, binname, binnames[])
+    along with the Linux package's `version` field — `pick_winner` uses the
+    version's major to find the matching `<base>@<major>` brew formula.
+    Per-(linux_name, brew_candidate) we keep the highest version seen (lex
+    sort over Repology versions is good enough for major-extraction).
     """
     result = psql_query(tmpdir, port, f"""
-        SELECT DISTINCT d_name, h.visiblename
+        SELECT DISTINCT d_name, d_version, h.visiblename
         FROM (
-            SELECT effname, visiblename AS d_name
+            SELECT effname, visiblename AS d_name, version AS d_version
             FROM repology.packages WHERE repo = '{distro_repo}'
             UNION
-            SELECT effname, srcname
+            SELECT effname, srcname, version
             FROM repology.packages WHERE repo = '{distro_repo}' AND srcname IS NOT NULL
             UNION
-            SELECT effname, binname
+            SELECT effname, binname, version
             FROM repology.packages WHERE repo = '{distro_repo}' AND binname IS NOT NULL
             UNION
-            SELECT effname, unnest(binnames)
+            SELECT effname, unnest(binnames), version
             FROM repology.packages WHERE repo = '{distro_repo}' AND binnames IS NOT NULL
         ) d
         JOIN repology.packages h ON d.effname = h.effname
@@ -343,18 +415,36 @@ def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
     """)
 
     candidates = {}
+    linux_versions = {}
     for line in result.split("\n"):
-        if "|" in line:
-            parts = line.split("|", 1)
-            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-                linux_name = parts[0].strip()
-                brew_name = parts[1].strip()
-                bucket = candidates.setdefault(linux_name, [])
-                if brew_name not in bucket:
-                    bucket.append(brew_name)
+        # Each row: d_name|d_version|h.visiblename. Use maxsplit so version
+        # strings containing `|` (rare but legal in Repology) don't corrupt
+        # the brew name field.
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        linux_name = parts[0].strip()
+        linux_version = parts[1].strip()
+        brew_name = parts[2].strip()
+        if not linux_name or not brew_name:
+            continue
+
+        bucket = candidates.setdefault(linux_name, [])
+        if brew_name not in bucket:
+            bucket.append(brew_name)
+
+        existing = linux_versions.get(linux_name)
+        if linux_version and (not existing or linux_version > existing):
+            linux_versions[linux_name] = linux_version
 
     return {
-        linux_name: pick_winner(cands, linux_name, alias_to_canonical)
+        linux_name: pick_winner(
+            cands,
+            linux_name,
+            linux_versions.get(linux_name, ""),
+            alias_to_canonical,
+            formula_set,
+        )
         for linux_name, cands in candidates.items()
     }
 
@@ -468,8 +558,9 @@ def main():
             load_dump(sock_dir, port)
             diagnose(sock_dir, port)
 
-            # Fetch the Homebrew alias index once; reused across every distro.
-            alias_to_canonical = fetch_homebrew_alias_index()
+            # Fetch the Homebrew alias index + formula set once; reused
+            # across every distro by `pick_winner`.
+            alias_to_canonical, formula_set = fetch_homebrew_alias_index()
 
             # Get ALL distro repos that have homebrew equivalents
             print("\nFinding all distro repos with Homebrew mappings...")
@@ -487,7 +578,9 @@ def main():
             generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             total = 0
             for repo in repos:
-                mappings = extract_mappings(sock_dir, port, repo, alias_to_canonical)
+                mappings = extract_mappings(
+                    sock_dir, port, repo, alias_to_canonical, formula_set
+                )
                 if mappings:
                     distro_dir = os.path.join(OUTPUT_DIR, repo)
                     os.makedirs(distro_dir, exist_ok=True)

@@ -391,6 +391,14 @@ pub struct BuildOptions {
     /// newer version. Set to [`PullBaseMode::Always`] for CI builds that
     /// must always refresh, or [`PullBaseMode::Never`] for offline builds.
     pub pull: PullBaseMode,
+    /// Force regeneration of `zlayer-bottles.lock` for this build.
+    ///
+    /// Only consumed by the macOS sandbox backend. When `true`, any existing
+    /// lockfile next to the spec is ignored and the live brew resolver runs
+    /// for every formula; the lockfile is then rewritten from scratch.
+    /// Mirrors `cargo update` semantics. On non-macOS backends this flag is
+    /// ignored.
+    pub update_bottles: bool,
 }
 
 impl Default for BuildOptions {
@@ -419,6 +427,7 @@ impl Default for BuildOptions {
             platform: None,
             source_hash: None,
             pull: PullBaseMode::default(),
+            update_bottles: false,
         }
     }
 }
@@ -858,6 +867,18 @@ impl ImageBuilder {
     #[must_use]
     pub fn pull(mut self, mode: PullBaseMode) -> Self {
         self.options.pull = mode;
+        self
+    }
+
+    /// Force regeneration of `zlayer-bottles.lock` for this build.
+    ///
+    /// Only consumed by the macOS sandbox backend. Mirrors `cargo update`
+    /// semantics — the existing lockfile is ignored, every formula is
+    /// resolved live, and the file is rewritten from scratch. No-op on
+    /// non-macOS backends.
+    #[must_use]
+    pub fn update_bottles(mut self, update_bottles: bool) -> Self {
+        self.options.update_bottles = update_bottles;
         self
     }
 

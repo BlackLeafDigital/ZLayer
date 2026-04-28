@@ -189,6 +189,12 @@ pub struct SandboxImageBuilder {
     /// When set (e.g. by the pipeline executor), this hash is used directly
     /// instead of computing one from the parsed Dockerfile.
     source_hash: Option<String>,
+    /// When true, ignore any existing `zlayer-bottles.lock` next to the
+    /// build context and force live `resolve_package` for every formula.
+    /// The lockfile is rewritten from scratch at end of build. Mirrors
+    /// `cargo update` semantics. Threaded down from the CLI's
+    /// `--update-bottles` flag.
+    update_bottles: bool,
     /// Local OCI registry for resolving pipeline-built base images.
     #[cfg(feature = "local-registry")]
     local_registry: Option<LocalRegistry>,
@@ -209,6 +215,7 @@ impl SandboxImageBuilder {
             build_args: HashMap::new(),
             event_tx: None,
             source_hash: None,
+            update_bottles: false,
             #[cfg(feature = "local-registry")]
             local_registry: None,
         }
@@ -236,6 +243,14 @@ impl SandboxImageBuilder {
     #[must_use]
     pub fn with_source_hash(mut self, hash: String) -> Self {
         self.source_hash = Some(hash);
+        self
+    }
+
+    /// Force regeneration of `zlayer-bottles.lock` for this build. See the
+    /// field docstring on `update_bottles` for semantics.
+    #[must_use]
+    pub fn with_update_bottles(mut self, update_bottles: bool) -> Self {
+        self.update_bottles = update_bottles;
         self
     }
 
@@ -358,6 +373,21 @@ impl SandboxImageBuilder {
         tokio::fs::create_dir_all(&rootfs_dir).await?;
         tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::create_dir_all(&home_dir).await?;
+
+        // Load the per-spec bottle lockfile once, up front. When
+        // `update_bottles` is set we deliberately skip loading so the live
+        // brew path runs and we rewrite the file from scratch. Captured
+        // bottles accumulate across every macOS-resolver call below.
+        let loaded_lockfile: Option<crate::bottle_lockfile::BottleLockfile> = if self.update_bottles
+        {
+            None
+        } else {
+            crate::bottle_lockfile::BottleLockfile::load(
+                &crate::bottle_lockfile::lockfile_path_for(&self.context),
+            )
+            .await?
+        };
+        let mut captured_bottles: Vec<crate::bottle_lockfile::LockedBottle> = Vec::new();
 
         // Track stage rootfs directories for COPY --from resolution
         let mut stage_rootfs_map: HashMap<String, PathBuf> = HashMap::new();
@@ -494,6 +524,8 @@ impl SandboxImageBuilder {
                     &mut arg_values,
                     &mut env_values,
                     &stage_rootfs_map,
+                    loaded_lockfile.as_ref(),
+                    &mut captured_bottles,
                 )
                 .await?;
 
@@ -562,6 +594,35 @@ impl SandboxImageBuilder {
 
         #[allow(clippy::cast_possible_truncation)]
         let build_time_ms = start_time.elapsed().as_millis() as u64;
+
+        // Write the bottle lockfile when this build resolved at least one
+        // Homebrew bottle, AND either no prior lockfile was loaded or the
+        // user explicitly asked for a refresh via `--update-bottles`. When
+        // not refreshing, carry forward any pins for formulas this build
+        // didn't touch so adding a new package doesn't drop unrelated
+        // entries.
+        {
+            let should_write =
+                !captured_bottles.is_empty() && (loaded_lockfile.is_none() || self.update_bottles);
+            if should_write {
+                let mut new_lock = crate::bottle_lockfile::BottleLockfile::new();
+                for entry in captured_bottles {
+                    new_lock.upsert(entry);
+                }
+                if !self.update_bottles {
+                    if let Some(prior) = loaded_lockfile {
+                        for entry in prior.bottles {
+                            if new_lock.get(&entry.formula).is_none() {
+                                new_lock.upsert(entry);
+                            }
+                        }
+                    }
+                }
+                new_lock
+                    .save(&crate::bottle_lockfile::lockfile_path_for(&self.context))
+                    .await?;
+            }
+        }
 
         self.send_event(BuildEvent::BuildComplete {
             image_id: sanitized.clone(),
@@ -1049,11 +1110,21 @@ impl SandboxImageBuilder {
         arg_values: &mut HashMap<String, String>,
         env_values: &mut HashMap<String, String>,
         stage_rootfs_map: &HashMap<String, PathBuf>,
+        lockfile: Option<&crate::bottle_lockfile::BottleLockfile>,
+        captured_bottles: &mut Vec<crate::bottle_lockfile::LockedBottle>,
     ) -> Result<()> {
         match instruction {
             Instruction::Run(run) => {
                 self.execute_run(
-                    run, rootfs_dir, tmp_dir, home_dir, config, arg_values, env_values,
+                    run,
+                    rootfs_dir,
+                    tmp_dir,
+                    home_dir,
+                    config,
+                    arg_values,
+                    env_values,
+                    lockfile,
+                    captured_bottles,
                 )
                 .await
             }
@@ -1199,6 +1270,8 @@ impl SandboxImageBuilder {
         config: &SandboxImageConfig,
         arg_values: &HashMap<String, String>,
         env_values: &HashMap<String, String>,
+        lockfile: Option<&crate::bottle_lockfile::BottleLockfile>,
+        captured_bottles: &mut Vec<crate::bottle_lockfile::LockedBottle>,
     ) -> Result<()> {
         let command_str = match &run.command {
             ShellOrExec::Shell(s) => substitute_args(s, arg_values, env_values),
@@ -1370,15 +1443,21 @@ impl SandboxImageBuilder {
                         continue;
                     }
                     info!("Installing {} ({}) via Homebrew bottle", linux_pkg, formula);
-                    crate::macos_image_resolver::install_with_deps(formula, rootfs_dir, tmp_dir)
-                        .await
-                        .map_err(|e| BuildError::RegistryError {
-                            message: format!(
-                                "Linux package '{linux_pkg}' resolved to Homebrew formula \
+                    crate::macos_image_resolver::install_with_deps(
+                        formula,
+                        rootfs_dir,
+                        tmp_dir,
+                        lockfile,
+                        captured_bottles,
+                    )
+                    .await
+                    .map_err(|e| BuildError::RegistryError {
+                        message: format!(
+                            "Linux package '{linux_pkg}' resolved to Homebrew formula \
                              '{formula}' which is not available; check RepoSources mapping \
                              for {distro}: {e}"
-                            ),
-                        })?;
+                        ),
+                    })?;
                     info!("Installed {} ({}) successfully", linux_pkg, formula);
                 }
                 // Still run the translated command (which will be "true"/no-op)

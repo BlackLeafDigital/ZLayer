@@ -2,6 +2,70 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.5] - 2026-04-27
+
+### Changed
+- macOS package resolution now derives brew formula names dynamically from
+  Repology's Linux version field plus Homebrew's formula list. The generator
+  emits `<base>@<MAJOR>` real-formula pins where the Linux name implies a
+  major version (e.g. `libssl-dev → openssl@3`, `nodejs → node@22`), and
+  alias-canonicals where brew uses an alias (e.g. `python3 → python@3.14`).
+  `OVERRIDES` in `scripts/generate-package-maps.py` is drained to
+  `{default-jdk, default-jre}` only — entries Repology genuinely cannot
+  resolve.
+- `.forgejo/workflows/verify-reposources.yml` assertions switched from exact
+  string equality to POSIX glob matching (`python@3.*`, `node@*`) so brew
+  rotating its default doesn't break the workflow.
+- The package-map cache directory bumped from `package-maps/` to
+  `package-maps-v2/`; pre-Phase-2 caches are abandoned (would otherwise
+  return alias-only names like `python@3` that 404 against the brew API).
+
+### Fixed
+- `.forgejo/workflows/verify-reposources.yml` BusyBox `date -d` could not
+  parse the ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` form the generator emits;
+  every nightly run false-failed the freshness check. Added `coreutils`
+  for GNU `date`, dropped the silent `|| echo 0` fallback that hid the
+  parse failure, and reordered the null-check before the date parse.
+- `macos_image_resolver.rs::resolve_package` Python `UvPython` special-case
+  now matches `python@3.X` patterns (was `python` / `python3` / `python@3`
+  only). The new generator emits `python@3.14`-style names for the
+  `python3` Linux package, which would otherwise have routed to a brew
+  bottle install instead of uv-managed Python.
+- `map_single_package_hardcoded` pruned to a pass-through. Its prior
+  match arms hardcoded names like `python3 → python@3` (alias-only, 404s
+  on `formulae.brew.sh/api/formula/python@3.json`) and contradicted the
+  dynamic generator output for `libssl-dev`, `openjdk-17-jdk`, etc.
+- `test_map_linux_packages_live_reposources` correctly gated `#[ignore]`
+  (CHANGELOG previously claimed this had landed; the attribute was
+  missing from source).
+
+### Added
+- `crates/zlayer-builder/src/bottle_lockfile.rs`: per-spec
+  `zlayer-bottles.lock` schema for reproducible macOS bottle installs.
+  Stand-alone module with TOML load/save and unit tests.
+- `macos_image_resolver::resolve_package` and `install_with_deps` now take
+  an optional `&BottleLockfile` and a `&mut Vec<LockedBottle>`: a hit on
+  the lockfile short-circuits the live brew API entirely; every freshly
+  resolved `HomebrewBottle` (root + transitive deps) is captured for
+  rewrite at end of build.
+- `SandboxImageBuilder` loads `<spec_dir>/zlayer-bottles.lock` once at
+  the start of `build()`, threads it through every `RUN` interception,
+  and rewrites the file post-build when at least one bottle was resolved.
+  Unrelated pins from a prior lockfile are carried forward unless the
+  user requested a full refresh.
+- `zlayer build --update-bottles` flag: ignores any existing lockfile,
+  forces live resolution for every formula, and rewrites the file from
+  scratch. Mirrors `cargo update`. Threaded through `BuildOptions`,
+  `ImageBuilder::update_bottles`, and `SandboxImageBuilder::with_update_bottles`.
+  No-op on Linux/Windows builds (flag still parses cleanly).
+- `BlackLeafDigital/functions/RepoSourceSyncer/src/modules/refresh.ts`:
+  daily Appwrite CRON pulls the full Homebrew formula list, expands
+  every formula to canonical + alias + oldname rows, and bulk-upserts
+  via `tablesDB.upsertRows` (batches of 1000). Mirrors GitHub Pages so
+  the resolver's first-step cache hits 100% for any brew-known name —
+  including alias-only names like `python@3`. New `last_seen_in_brew_at`
+  column lets us soft-keep formulas brew has removed.
+
 ## [0.11.4]
 
 ### Fixed
@@ -35,9 +99,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - **`zlayer-manager`: `test_service_summary_deserialize` now constructs valid JSON.** The `e0ad80f Add zlayer-types` + `71cdcbc Fold zlayer-spec` refactor relocated `ServiceSummary` from a local definition in `crates/zlayer-manager/src/api_client.rs` to the canonical `zlayer_types::api::services::ServiceSummary`, which carries a required `endpoints: Vec<ServiceEndpoint>` field with no `#[serde(default)]`. The hand-written test JSON literal at `crates/zlayer-manager/src/api_client.rs:1822-1830` was authored against the old local DTO and never included `endpoints`, so post-refactor the test panicked at runtime (`missing field 'endpoints' at line N column N`). Added `"endpoints": []` to the literal. Verified: the exact CI command `cargo test --package zlayer-manager --lib --features ssr` now passes 158/158 (was 157/158).
-- **macOS package resolver: `libssl-dev` no longer drifts to versioned `openssl@3.x` formulas.** `scripts/generate-package-maps.py` previously took whatever `(linux_name, brew_formula)` row PostgreSQL emitted first when an `effname` group contained multiple Homebrew formulas (`openssl@3`, `openssl@3.0`, `openssl@3.5`, `openssl@4`), so `https://zachhandley.github.io/RepoSources/maps/debian_12.json` flipped `libssl-dev → openssl@3.5` (older, version-pinned) instead of the canonical `openssl@3` (alias `openssl`, current OpenSSL 3.6.x). Same drift hit `libssl3 → openssl@3.5` and `nodejs → node@24`. The generator now fetches `https://formulae.brew.sh/api/formula.json` once per run, builds an `aliases ∪ oldnames → canonical` index, and tiebreaks SQL output by alias-canonical match first, then unversioned-base / fewer-dotted-suffix preference. A small hand-curated `OVERRIDES` dict (`libssl-dev`, `libssl3`, `openssl-dev`, `python3`, `python3-dev`, `python3-devel`, `nodejs`, `default-jdk`, `default-jre`) is applied last, covering entries Repology doesn't surface at all (no `effname` join with homebrew). Falls back to OVERRIDES-only with a warn log if `formulae.brew.sh` is unreachable; doesn't crash the cron. Files: `scripts/generate-package-maps.py`.
 - **macOS package resolver: missing/unavailable Homebrew formulas now fail the build.** `crates/zlayer-builder/src/macos_image_resolver.rs::install_with_deps` previously logged a `warn!` and continued on resolve/install failure, producing a silently-broken sandbox where the requested package wasn't actually present. The function now distinguishes the **root** formula (the one supplied by the caller) from **transitive** dependencies discovered during the BFS: failure on the root → `Err(BuildError::RegistryError)`; failure on a transitive dep → `warn!` + skip (preserves resilience to optional deps). `crates/zlayer-builder/src/sandbox_builder.rs` was updated to propagate the error with the original Linux package name + distro in the message: `Linux package 'libssl-dev' resolved to Homebrew formula 'openssl@3' which is not available; check RepoSources mapping for debian_12`. The signature of `map_linux_packages` changed from `Vec<(String, bool)>` to `Vec<(String, String, bool)>` = `(linux_name, brew_formula, skipped)` so the linux name is available at the install site for error context.
-- **macOS package resolver: package-map test no longer requires network.** `test_map_linux_packages_with_empty_cache` was renamed to `test_map_linux_packages_live_reposources` and gated behind `#[ignore]` (run manually with `cargo test -- --ignored`). A new `test_map_linux_packages_with_seeded_cache` writes a fixture `PackageMapFile` JSON to a tmpdir and asserts deterministically — runs in CI, no network. This is the regression guard.
+- **macOS package resolver: hermetic seeded-cache test added.** A new `test_map_linux_packages_with_seeded_cache` writes a fixture `PackageMapFile` JSON to a tmpdir and asserts `map_linux_packages` returns the expected `(linux_name, brew, skipped)` triples deterministically — runs in CI, no network. This is the regression guard for the sharded layout. (The pre-existing `test_map_linux_packages_live_reposources` remains a manual smoke test; its `#[ignore]` gating lands in 0.11.5.)
 - **macOS resolver → RepoSourceSyncer: HMAC-signed POST replaces shared-clock auth.** The fire-and-forget cache-warm POST to `https://reposync.blackleafdigital.com/formula` previously sent a `zlayer-repo-sync: <ISO-timestamp>` header and the server accepted any timestamp within ±5 minutes — anyone who could read a clock could forge the call. The resolver now signs the POST body with HMAC-SHA256 using a shared secret from `ZLAYER_REPOSYNC_HMAC_SECRET`, header `x-reposync-signature: sha256=<hex>`. If the env var is unset (developer machine, CI without the credential) the POST is skipped entirely with a `debug!` — the resolver still works, only the upstream cache warm is a no-op. The matching server-side validator change is in `BlackLeafDigital/functions/RepoSourceSyncer/src/helpers.ts` (constant-time compare via `crypto.timingSafeEqual`). Removed the now-unused `utc_iso8601` helper. Files: `crates/zlayer-builder/src/macos_image_resolver.rs`, `crates/zlayer-builder/Cargo.toml` (`hmac` dep added).
 - **Windows build: `zlayer-builder` HCS backend uses `oci-client` types via `zlayer-registry` re-exports.** `crates/zlayer-builder/src/backend/hcs/scratch.rs` previously imported `oci_client::secrets::RegistryAuth` (line 22) and `oci_client::manifest::OciImageManifest` (line 208) directly, but `oci-client` is declared `optional = true` in `crates/zlayer-builder/Cargo.toml` and only enabled by the `cache` feature. The HCS backend is Windows-only and does not require `cache`, so default-feature Windows builds failed with `unresolved module or unlinked crate oci_client` — every release/CI Windows job was broken. `crates/zlayer-registry/src/lib.rs` now re-exports `oci_client::manifest::OciImageManifest` next to the existing `RegistryAuth` re-export, and `scratch.rs` imports both via `zlayer_registry::{ImagePuller, OciImageManifest, RegistryAuth}`. No `Cargo.toml` change — the `cache` gating is preserved for non-Windows builds (sandbox-push code path), and the Windows build picks up `oci-client` transitively through `zlayer-registry`'s unconditional dep.
 - CI: `gix` workspace dep bumped `0.81` → `0.82` in `Cargo.toml:249`. Pre-emptive: `gix-actor 0.40.1` (released Apr 2026) silently switched its `winnow` dep from `0.7` to `1.0` without bumping its own minor, leaving it incompatible with `gix-object 0.58.0` (still on `winnow 0.7`). Our lockfile currently pins `gix-actor 0.40.0` so today's CI is green, but any `cargo update` would re-pull 0.40.1 and break all three check jobs (Linux/macOS/Windows) with three `E0308` errors in `gix-object/src/parse.rs` complaining `expected ErrMode<E>, found winnow::error::ErrMode<_>`. Bumping `gix` to `0.82` pulls the new `gix-object 0.59.0` that natively uses `winnow 1.0` and matches `gix-actor 0.40.1`. `cargo check --workspace --all-targets` clean.
