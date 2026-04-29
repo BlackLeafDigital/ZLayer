@@ -2,17 +2,20 @@ name: Verify RepoSources
 
 # Drift detector for the macOS package-name maps published at
 # https://zachhandley.github.io/RepoSources/maps/{distro}/{shard}.json
-# (sharded by first letter; see scripts/generate-package-maps.py). Runs daily
-# (2h after the Sunday regenerator cron in update-package-maps.yml) and on
-# manual dispatch.
+# (per-distro shards) and .../maps/common/{shard}.json (cross-distro
+# consensus union; see scripts/generate-package-maps.py::build_consensus).
+# Runs daily (2h after the Sunday regenerator cron in update-package-maps.yml)
+# and on manual dispatch.
 #
-# Asserts the canonical brew formulas are returned for the names ZLayer's
-# macOS resolver actually requests (per the OVERRIDES dict in
-# generate-package-maps.py and the distro list in
-# crates/zlayer-builder/src/sandbox_builder.rs::extract_package_install_packages).
-# Also asserts the published maps are no more than 14 days old via
-# {distro}/index.json — catches a stuck regenerator before it silently feeds
-# stale data into builds.
+# Two checks:
+#   1. Freshness — every per-distro index.json AND common/index.json must be
+#      < 14 days old. Catches a stuck regenerator before it silently feeds
+#      stale data into builds.
+#   2. Cross-distro consensus assertions — the canonical brew formula for
+#      each Linux name ZLayer's macOS resolver actually requests is checked
+#      against `common/<shard>.json`. The resolver does cascading lookup
+#      (per-distro first, common fallback) and `common/` is where the
+#      cross-distro invariant lives, so assertions live here too.
 
 on:
   schedule:
@@ -32,27 +35,62 @@ jobs:
         # broke the freshness check on every run before this was added.
         run: apk add --no-cache curl jq coreutils
 
-      - name: Verify each distro's sharded package map
+      - name: Verify freshness of per-distro and common indexes
         run: |
           set -euo pipefail
           BASE="https://zachhandley.github.io/RepoSources/maps"
-          DISTROS="debian_12 alpine_3_20 centos_8 fedora_42"
+          # Common is the cross-distro consensus union; per-distro shards
+          # remain the authoritative source for names that distro actually
+          # has, but cross-distro assertions target only common.
+          LABELS="debian_12 alpine_3_20 centos_8 fedora_42 common"
 
-          # Maximum acceptable age in seconds (14 days) — catches a stuck
-          # weekly regenerator. The generator runs Sundays at 04:00 UTC, so
-          # in steady state the index should be at most 7 days old.
           MAX_AGE=$((14 * 24 * 3600))
           NOW=$(date -u +%s)
 
+          fail=0
+          for label in $LABELS; do
+            tmp_index=$(mktemp)
+            if ! curl -fsSL "$BASE/$label/index.json" -o "$tmp_index"; then
+              echo "  FAIL: could not fetch $BASE/$label/index.json"
+              fail=1
+              continue
+            fi
+            generated_at=$(jq -r '.metadata.generated_at' "$tmp_index")
+            if [ -z "$generated_at" ] || [ "$generated_at" = "null" ]; then
+              echo "  FAIL: $label index.json missing or null generated_at"
+              fail=1
+              continue
+            fi
+            generated_epoch=$(date -u -d "$generated_at" +%s)
+            age=$((NOW - generated_epoch))
+            if [ "$age" -gt "$MAX_AGE" ]; then
+              echo "  FAIL: $label generated_at=$generated_at older than 14 days (age=${age}s)"
+              fail=1
+            else
+              echo "  OK: $label generated_at=$generated_at (age=${age}s)"
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "Freshness check FAILED. Re-dispatch update-package-maps.yml."
+            exit 1
+          fi
+
+      - name: Verify cross-distro assertions against common/
+        run: |
+          set -euo pipefail
+          BASE="https://zachhandley.github.io/RepoSources/maps"
+
           # Each known-good assertion encoded as `key=expected_pattern=shard_letter`.
-          # Group by shard letter so we fetch each shard exactly once per distro.
+          # Group by shard letter so we fetch each shard exactly once.
           #
-          # The `expected_pattern` is matched as a POSIX shell glob (not exact
+          # `expected_pattern` is matched as a POSIX shell glob (not exact
           # string equality) so the workflow stays correct when brew rotates
-          # its default — `python@3.14` becoming `python@3.15` next year still
-          # matches `python@3.*`. Pure-major pins like `openssl@3` and
-          # `node@*` track the dynamic resolution in
-          # scripts/generate-package-maps.py::pick_winner.
+          # its default — `python@3.14` becoming `python@3.15` next year
+          # still matches `python@3.*`, and `node@24` becoming `node@25`
+          # still matches `node@*`. The pinned `openssl@3` and bare
+          # `openjdk` are stable enough to encode literally.
           ASSERTIONS="\
             libssl-dev=openssl@3=l \
             libssl3=openssl@3=l \
@@ -62,86 +100,51 @@ jobs:
             python3-dev=python@3.*=p \
             default-jdk=openjdk=d"
 
+          tmp_dir=$(mktemp -d)
+          shards_seen=""
           fail=0
-          for d in $DISTROS; do
-            echo "=== $d ==="
+          for kv in $ASSERTIONS; do
+            shard="${kv##*=}"
+            # shellcheck disable=SC2076 disable=SC3010
+            case " $shards_seen " in
+              *" $shard "*) ;;
+              *)
+                shards_seen="$shards_seen $shard"
+                if ! curl -fsSL "$BASE/common/$shard.json" -o "$tmp_dir/$shard.json"; then
+                  echo "  FAIL: could not fetch $BASE/common/$shard.json"
+                  fail=1
+                fi
+                ;;
+            esac
+          done
 
-            # Freshness check via index.json
-            tmp_index=$(mktemp)
-            if ! curl -fsSL "$BASE/$d/index.json" -o "$tmp_index"; then
-              echo "  FAIL: could not fetch $BASE/$d/index.json"
+          for kv in $ASSERTIONS; do
+            rest="${kv#*=}"
+            expected="${rest%=*}"
+            key="${kv%%=*}"
+            shard="${kv##*=}"
+            shard_path="$tmp_dir/$shard.json"
+            if [ ! -f "$shard_path" ]; then
+              echo "  FAIL: $key -> shard $shard not fetched"
               fail=1
               continue
             fi
-            generated_at=$(jq -r '.metadata.generated_at' "$tmp_index")
-            # Validate the field exists *before* feeding it to `date`, so a
-            # missing/null generated_at fails this distro cleanly instead of
-            # aborting the whole script via `set -e` on a failed date parse.
-            if [ -z "$generated_at" ] || [ "$generated_at" = "null" ]; then
-              echo "  FAIL: $d index.json missing or null generated_at"
-              fail=1
-              continue
-            fi
-            # GNU date (from coreutils) parses the ISO-8601 form. Dropped the
-            # prior `|| echo 0` swallow — a parse failure now propagates via
-            # `set -e` instead of silently looking like staleness.
-            generated_epoch=$(date -u -d "$generated_at" +%s)
-            age=$((NOW - generated_epoch))
-            if [ "$age" -gt "$MAX_AGE" ]; then
-              echo "  FAIL: $d generated_at=$generated_at older than 14 days (age=${age}s)"
-              fail=1
-            else
-              echo "  OK: generated_at=$generated_at (age=${age}s)"
-            fi
-
-            # Fetch each unique shard once per distro
-            tmp_dir=$(mktemp -d)
-            shards_seen=""
-            for kv in $ASSERTIONS; do
-              shard="${kv##*=}"
-              # shellcheck disable=SC2076 disable=SC3010
-              case " $shards_seen " in
-                *" $shard "*) ;;
-                *)
-                  shards_seen="$shards_seen $shard"
-                  if ! curl -fsSL "$BASE/$d/$shard.json" -o "$tmp_dir/$shard.json"; then
-                    echo "  FAIL: could not fetch $BASE/$d/$shard.json"
-                    fail=1
-                  fi
-                  ;;
-              esac
-            done
-
-            # Run assertions against the per-shard files
-            for kv in $ASSERTIONS; do
-              # kv format: key=expected=shard
-              rest="${kv#*=}"
-              expected="${rest%=*}"
-              key="${kv%%=*}"
-              shard="${kv##*=}"
-              shard_path="$tmp_dir/$shard.json"
-              if [ ! -f "$shard_path" ]; then
-                echo "  FAIL: $key -> shard $shard not fetched"
-                fail=1
-                continue
-              fi
-              actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$shard_path")
-              # `$expected` is intentionally unquoted so the shell expands
-              # glob metacharacters (`*`, `?`, `[…]`). `actual` may legitimately
-              # contain `@` and `.` — those are literal in shell globs.
-              # shellcheck disable=SC2254
-              case "$actual" in
-                $expected) echo "  OK: $key -> $actual (shard $shard, matched $expected)" ;;
-                *)         echo "  FAIL: $key -> $actual (shard $shard, expected $expected)"; fail=1 ;;
-              esac
-            done
+            actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$shard_path")
+            # `$expected` is intentionally unquoted so the shell expands
+            # glob metacharacters (`*`, `?`, `[…]`). `actual` may legitimately
+            # contain `@` and `.` — those are literal in shell globs.
+            # shellcheck disable=SC2254
+            case "$actual" in
+              $expected) echo "  OK: $key -> $actual (matched $expected)" ;;
+              *)         echo "  FAIL: $key -> $actual (expected $expected)"; fail=1 ;;
+            esac
           done
 
           if [ "$fail" -ne 0 ]; then
             echo
-            echo "RepoSources verification FAILED — see assertions above."
+            echo "Cross-distro consensus assertions FAILED."
             echo "Re-dispatch update-package-maps.yml after fixing the generator."
             exit 1
           fi
           echo
-          echo "All distros verified."
+          echo "All assertions passed against common/."
