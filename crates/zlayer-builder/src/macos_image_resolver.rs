@@ -1918,7 +1918,7 @@ mod tests {
 
     /// Live smoke test against the published `RepoSources` JSON.
     ///
-    /// Hits live RepoSources (`https://zachhandley.github.io/RepoSources/maps/...`)
+    /// Hits live `RepoSources` (`https://zachhandley.github.io/RepoSources/maps/...`)
     /// and asserts the canonical Homebrew names. Stays `#[ignore]` because
     /// it's network-bound and brew rotates default majors yearly; pattern
     /// match the verify-reposources.yml globs (`openssl@3`, `node@<MAJOR>`).
