@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.9] - 2026-04-29
+
+### Fixed
+- `test_map_linux_packages_falls_back_to_common` was non-hermetic: when a
+  per-distro shard wasn't seeded, `fetch_or_load_shard` reached out to live
+  RepoSources, and the upstream's stale `centos_8/l.json`
+  (`libssl-dev → openssl`) clobbered the seeded `common/l.json`
+  (`libssl-dev → openssl@3`) because per-distro wins on conflict in the
+  merge. Test now seeds explicit empty shards for every probed
+  `(label, shard)` pair so the resolver hits the local cache only.
+- `scripts/generate-package-maps.py` Repology dump load silently produced
+  an empty database. Three concrete causes addressed:
+  - The dump references `repology.<table>` but ships no
+    `CREATE SCHEMA repology`, so every CREATE/INSERT failed against the
+    missing schema; `setup_postgres` now pre-creates it.
+  - `ON_ERROR_STOP=0` masked those errors and let psql exit 0 on a
+    half-loaded database; bumped to `ON_ERROR_STOP=1`.
+  - The shell pipeline didn't use pipefail, so a truncated curl/zstd
+    download surfaced as a successful psql run; loader now runs under
+    `sh -o pipefail` with `curl -fL --show-error` and per-stage stderr
+    capture, and `diagnose()` raises `SystemExit` if `repology.packages`
+    is missing or empty instead of continuing to "Found 0 repos".
+
+## [0.11.8] - 2026-04-29
+
+### Added
+- `scripts/generate-package-maps.py` now publishes a cross-distro consensus
+  shard set at `public/maps/common/<shard>.json` alongside the existing
+  per-distro shards. The `common/` set is the union of all per-distro
+  mappings with most-common-wins consensus (versioned-highest tiebreak),
+  and is what the verify workflow asserts against. The macOS resolver
+  performs cascading lookup: per-distro shard first, `common/<shard>`
+  fallback, distro winning on conflict — so `apt install libssl-dev`
+  resolves correctly even when the source distro's image is centos
+  (`libssl-dev` doesn't exist on centos but `common/` carries it).
+- `scripts/generate-package-maps.py --test` self-test mode covering
+  `pick_winner` and `build_consensus` against synthetic alias/formula
+  data; runs in seconds without postgres or the Repology dump.
+
+### Changed
+- `pick_winner` rewritten to a deterministic 4-step algorithm: canonicalize
+  candidates via brew's alias index + dedupe (collapses
+  `[openssl, openssl@3]` to `[openssl@3]` because brew aliases `openssl`
+  to `openssl@3`); resolve the Linux name through brew aliases with no
+  major-match veto; versioned-preference tiebreak when the canonical is
+  unversioned but `<canonical>@<MAJOR>` variants exist (`nodejs` → `node@24`);
+  versioned-highest fallback. Drops `parse_brew_major` and the per-package
+  `linux_version` plumbing — they were dead weight after the redesign.
+  No version-pin overrides; `OVERRIDES` stays scoped to the structural
+  cases brew/Repology genuinely cannot derive (debian's `default-jdk`/
+  `default-jre` metapackages).
+- `write_sharded_map_files` no longer merges with existing on-disk shards —
+  each generator run is authoritative for its own data. The cross-distro
+  consensus union preserves names that disappear from one distro's
+  Repology, so the protective intent of "packages only grow" is satisfied
+  in `common/` instead. Eliminates zombie entries from prior runs (e.g.
+  centos_8 retaining `libssl-dev: openssl` from an earlier OVERRIDES
+  shape).
+- `.forgejo/workflows/verify-reposources.yml` retargeted: cross-distro
+  consensus assertions now run once against `common/<shard>.json` instead
+  of four times against per-distro shards. Per-distro freshness checks
+  remain, plus a new freshness check for `common/index.json`.
+- `crates/zlayer-builder/src/macos_image_resolver.rs::PACKAGE_MAP_CACHE_SUBDIR`
+  bumped from `package-maps-v2` to `package-maps-v3` to invalidate caches
+  that pre-date the cross-distro layout.
+
+### Fixed
+- `verify-reposources.yml` daily failure: published shards returned
+  unversioned brew formulas (`openssl`, `python`, `node`) where the
+  resolver expects versioned (`openssl@3`, `python@3.*`, `node@*`). Root
+  cause: per-distro `pick_winner` couldn't satisfy a cross-distro
+  consistency invariant (EOL distros, distro-only names, Repology
+  candidate-list gaps); merge-with-existing kept stale entries forever.
+  The deterministic `pick_winner` + cross-distro `common/` union + clean
+  per-distro overwrite together cure all three.
+
 ## [0.11.5] - 2026-04-27
 
 ### Changed

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -122,6 +123,15 @@ def setup_postgres(tmpdir):
     run(pg_cmd(tmpdir, port, f"createdb -h {tmpdir} -p {port} -O repology repology"),
         capture_output=True)
 
+    # Pre-create the `repology` schema. The Repology dump references tables as
+    # `repology.<name>` but doesn't ship a `CREATE SCHEMA` statement, so without
+    # this every CREATE TABLE in the dump fails (silently, when ON_ERROR_STOP
+    # is off). AUTHORIZATION repology lets the dump-loading user own the
+    # objects it creates.
+    psql(tmpdir, port,
+         "CREATE SCHEMA IF NOT EXISTS repology AUTHORIZATION repology;",
+         user=superuser(), capture=False)
+
     # Set search path to include repology schema
     psql(tmpdir, port, "ALTER DATABASE repology SET search_path TO repology, public;",
          user=superuser(), capture=False)
@@ -155,117 +165,157 @@ def load_dump(tmpdir, port):
     print(f"Downloading and loading Repology dump...")
     print("  (This may take several minutes...)")
 
-    # Build the psql command — needs su-exec when running as root
+    # Build the psql command — needs su-exec when running as root.
+    # ON_ERROR_STOP=1: bail at the first SQL error rather than silently
+    # skipping the rest of the dump and producing an empty database.
     if os.getuid() == 0:
-        psql_base = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+        psql_base = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=1"
     else:
-        psql_base = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+        psql_base = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=1"
 
-    # Capture errors separately so we can diagnose failures
+    # Capture errors separately so we can diagnose failures.
     errlog = os.path.join(tmpdir, "load_errors.log")
-    # IMPORTANT: psql reads SQL from stdin, outputs results to stdout.
-    # Redirect stdout to /dev/null (we don't need CREATE TABLE output),
-    # capture stderr (errors/notices) to the log file.
-    cmd = f"curl -sL {DUMP_URL} | zstd -d | {psql_base} > /dev/null 2>{errlog}"
-    print(f"  $ {cmd[:120]}...")
-    subprocess.run(cmd, shell=True)
+    curl_errlog = os.path.join(tmpdir, "curl_errors.log")
+    zstd_errlog = os.path.join(tmpdir, "zstd_errors.log")
 
-    # Show first errors if any
-    if os.path.exists(errlog):
-        with open(errlog) as f:
-            errors = f.read().strip()
-        if errors:
-            lines = errors.split("\n")
-            # Show first 30 error lines
-            print(f"  Load errors ({len(lines)} lines, showing first 30):")
-            for line in lines[:30]:
-                print(f"    {line}")
-        else:
-            print("  No errors during load.")
+    # Run via `sh -o pipefail` so a curl/zstd failure (e.g. truncated
+    # download, 4xx HTTP, malformed zstd frame) propagates as a non-zero
+    # exit. Without pipefail the shell only reports psql's status, which
+    # is "success" when psql cleanly drains a truncated stream.
+    # busybox ash (alpine container) and bash (mac dev) both support
+    # `-o pipefail`, so `sh` works in both environments.
+    # `curl -fL --show-error`: -f turns 4xx/5xx into a non-zero exit
+    # instead of writing the HTML error body into the zstd pipe.
+    # Each command's stderr goes to its own log so we can attribute
+    # failures correctly.
+    inner = (
+        f"curl -fL --show-error {DUMP_URL} 2>{curl_errlog} "
+        f"| zstd -d 2>{zstd_errlog} "
+        f"| {psql_base} > /dev/null 2>{errlog}"
+    )
+    cmd = ["sh", "-o", "pipefail", "-c", inner]
+    print(f"  $ (pipefail) curl ... | zstd -d | psql ...")
+    result = subprocess.run(cmd)
+
+    # Print stderr from each pipeline stage so the failure is attributable.
+    for label, path in [("curl", curl_errlog), ("zstd", zstd_errlog), ("psql", errlog)]:
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            errs = f.read().strip()
+        if not errs:
+            continue
+        lines = errs.split("\n")
+        print(f"  {label} stderr ({len(lines)} lines, showing first 30):")
+        for line in lines[:30]:
+            print(f"    {line}")
+
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ERROR: dump load failed (pipefail exit {result.returncode}). "
+            f"See per-stage stderr above."
+        )
     print("  Dump loaded.")
 
 
 def diagnose(tmpdir, port):
-    """Print diagnostic info about the loaded database."""
+    """Print diagnostic info about the loaded database.
+
+    Raises SystemExit if the `packages` table is missing or empty — that's
+    always a setup bug (schema not created, dump truncated, auth failure)
+    and there's no point in continuing to "Found 0 repos".
+    """
     print("\nDiagnostics:")
+    su = superuser()
+
+    # List schemas first so missing-schema bugs are obvious.
+    schemas = psql(tmpdir, port,
+                   "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname != 'information_schema' ORDER BY nspname;",
+                   user=su)
+    print(f"  Schemas: {schemas.replace(chr(10), ', ')}")
 
     # List tables
     tables = psql(tmpdir, port,
                   "SELECT tablename FROM pg_tables WHERE schemaname='repology' ORDER BY tablename;",
-                  user=superuser())
+                  user=su)
     print(f"  Tables: {tables.replace(chr(10), ', ')}")
 
-    # Check packages table
-    if "packages" in tables:
-        count = psql(tmpdir, port, "SELECT count(*) FROM repology.packages;", user="postgres")
-        print(f"  packages row count: {count}")
-
-        cols = psql(tmpdir, port,
-                    "SELECT column_name FROM information_schema.columns WHERE table_name='packages' ORDER BY ordinal_position;",
-                    user=superuser())
-        print(f"  packages columns: {cols.replace(chr(10), ', ')}")
-
-        # Sample repos
-        repos = psql(tmpdir, port,
-                     "SELECT DISTINCT repo FROM repology.packages WHERE repo LIKE 'homebrew%' OR repo LIKE 'debian%' OR repo LIKE 'ubuntu%' OR repo LIKE 'alpine%' LIMIT 20;",
-                     user=superuser())
-        print(f"  Sample repos: {repos.replace(chr(10), ', ')}")
-
-        # Sample homebrew entries
-        sample = psql(tmpdir, port,
-                      "SELECT effname, repo, visiblename FROM repology.packages WHERE repo='homebrew' LIMIT 5;",
-                      user=superuser())
-        print(f"  Sample homebrew: {sample}")
-    else:
-        print("  WARNING: packages table not found!")
-        # Check if there's a different table
+    if "packages" not in tables:
         all_tables = psql(tmpdir, port,
-                          "SELECT tablename FROM pg_tables WHERE schemaname='repology';",
-                          user=superuser())
-        print(f"  Available tables: {all_tables}")
+                          "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY 1;",
+                          user=su)
+        print(f"  All non-system tables: {all_tables}")
+        raise SystemExit(
+            "ERROR: repology.packages table not found after dump load. "
+            "Check the per-stage stderr above (psql/zstd/curl) — a truncated "
+            "dump or missing schema is the usual cause."
+        )
+
+    count = psql(tmpdir, port, "SELECT count(*) FROM repology.packages;", user=su)
+    print(f"  packages row count: {count}")
+    try:
+        if int(count) == 0:
+            raise SystemExit("ERROR: repology.packages is empty after dump load.")
+    except ValueError:
+        raise SystemExit(f"ERROR: could not parse packages row count: {count!r}")
+
+    cols = psql(tmpdir, port,
+                "SELECT column_name FROM information_schema.columns WHERE table_name='packages' ORDER BY ordinal_position;",
+                user=su)
+    print(f"  packages columns: {cols.replace(chr(10), ', ')}")
+
+    # Sample repos
+    repos = psql(tmpdir, port,
+                 "SELECT DISTINCT repo FROM repology.packages WHERE repo LIKE 'homebrew%' OR repo LIKE 'debian%' OR repo LIKE 'ubuntu%' OR repo LIKE 'alpine%' LIMIT 20;",
+                 user=su)
+    print(f"  Sample repos: {repos.replace(chr(10), ', ')}")
+
+    # Sample homebrew entries
+    sample = psql(tmpdir, port,
+                  "SELECT effname, repo, visiblename FROM repology.packages WHERE repo='homebrew' LIMIT 5;",
+                  user=su)
+    print(f"  Sample homebrew: {sample}")
 
 
 def fetch_homebrew_alias_index():
-    """Fetch the Homebrew formula API once and build the alias index + formula set.
+    """Fetch the Homebrew formula API and build the alias→canonical index.
 
-    Returns `(alias_to_canonical, formula_set)`:
+    Returns a dict mapping every formula's `full_name`, every `aliases`
+    entry, and every `oldnames` entry to that formula's canonical
+    `full_name`. Canonical names map to themselves, so a single lookup
+    answers both "is this a known brew name" and "what's its canonical".
 
-    - `alias_to_canonical`: maps every formula's `full_name`, every `aliases`
-      entry, and every `oldnames` entry to that formula's canonical `full_name`.
-      Used by `pick_winner` Rule 2 (resolve a Linux name like `python3` to the
-      brew alias's current canonical, e.g. `python@3.14`).
+    Used by `pick_winner` to:
+      - Canonicalize candidates (collapse `[openssl, openssl@3]` to
+        `[openssl@3]` because brew aliases `openssl` to `openssl@3`).
+      - Resolve the Linux package name to its brew canonical alias
+        (e.g. `python3` → `python@3.14`).
 
-    - `formula_set`: the set of canonical `full_name` values — i.e. the names
-      that are *real* installable formulas, not just aliases. Used by
-      `pick_winner` Rule 1 to verify that a synthesized `<base>@<major>` name
-      actually exists in brew before emitting it (e.g. `openssl@3` is real,
-      `python@3` is alias-only and would 404 on the formula JSON endpoint).
-
-    On failure (network/parse error) returns `({}, set())`; `pick_winner`
-    degrades to the version-suffix heuristic.
+    On failure (network/parse error) returns `{}`; `pick_winner` degrades
+    to the lex/versioned-highest tiebreak path.
     """
     print(f"Fetching {HOMEBREW_FORMULA_API}...")
     try:
         with urllib.request.urlopen(HOMEBREW_FORMULA_API, timeout=60) as resp:
             data = json.load(resp)
     except Exception as e:
-        print(f"  WARN: failed to fetch homebrew API ({e}); alias-aware tiebreak disabled")
-        return {}, set()
+        print(f"  WARN: failed to fetch homebrew API ({e}); alias index empty")
+        return {}
 
     a2c = {}
-    formulas = set()
+    formula_count = 0
     for f in data:
         canonical = f.get("full_name") or f.get("name")
         if not canonical:
             continue
-        formulas.add(canonical)
+        formula_count += 1
         a2c[canonical] = canonical
         for alias in f.get("aliases", []) or []:
             a2c[alias] = canonical
         for old in f.get("oldnames", []) or []:
             a2c[old] = canonical
-    print(f"  Indexed {len(a2c)} alias entries from {len(formulas)} formulas")
-    return a2c, formulas
+    print(f"  Indexed {len(a2c)} alias entries from {formula_count} formulas")
+    return a2c
 
 
 _LEADING_INT_RE = re.compile(r"^(\d+)")
@@ -284,63 +334,46 @@ def parse_major(version_or_suffix):
     return int(m.group(1)) if m else None
 
 
-def parse_brew_major(brew_name):
-    """Return the major from a brew name like `'openssl@3'` -> 3.
-
-    Returns None for unversioned names (`'node'`) or unparseable suffixes
-    (`'gcc@HEAD'`).
-    """
-    if "@" not in brew_name:
-        return None
-    return parse_major(brew_name.split("@", 1)[1])
-
-
-def pick_winner(candidates, linux_name, linux_version, alias_to_canonical, formula_set):
+def pick_winner(candidates, linux_name, alias_to_canonical):
     """Choose the best Homebrew formula for a Linux package name.
 
-    Resolution order:
-      1. **Real `<base>@<linux_major>` match.** If the Linux package's version
-         starts with major `M` and any candidate is exactly `<base>@<M>`
-         where that name is in `formula_set` (a real installable formula,
-         not just an alias), return it. Example: `libssl-dev v3.0.16` →
-         `openssl@3` (real formula).
-      2. **Alias-canonical resolution.** If `linux_name` is itself a known
-         brew alias and the canonical it points at is among the candidates,
-         and (when we know the Linux major) the canonical's major matches,
-         return it. Example: `python3 v3.13.0` → `python@3.14` (alias
-         canonical of `python3`/`python@3`, major matches).
-      3. **Version-suffix heuristic.** Prefer no-`@`, then fewer dotted
-         components, then lex. Catches cases without version data or where
-         brew's naming doesn't follow the `<base>@<major>` convention.
+    Algorithm (deterministic; no version-pin overrides needed):
+
+    Step 1 — **Canonicalize candidates, dedupe.** Each brew name (alias or
+        canonical) is mapped through `alias_to_canonical` to its full_name.
+        Collapses `[openssl, openssl@3]` -> `[openssl@3]` because brew's
+        `openssl` is an alias for `openssl@3`. If a single canonical
+        remains, it's the answer.
+
+    Step 2 — **Linux name as brew alias.** If the Linux name (or its
+        `-dev`/`-devel`-stripped form) is itself a brew alias whose
+        canonical is among the canonicals, return that canonical. There is
+        NO `linux_major == canonical_major` check — brew's current is
+        what users want regardless of how outdated the source distro is.
+
+    Step 3 — **Versioned-preference tiebreaker.** Folded into Step 2: if
+        Step 2's canonical is unversioned (e.g. `nodejs` resolves to
+        `node`, but brew has both `node` AND `node@24`), prefer the
+        highest pure-`@MAJOR` variant when it's in canonicals.
+
+    Step 4 — **Final tiebreak among canonicals.** Prefer versioned
+        (highest @MAJOR) over unversioned, else lex-first.
     """
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
 
-    linux_major = parse_major(linux_version)
+    canonicals = []
+    seen = set()
+    for cand in candidates:
+        c = alias_to_canonical.get(cand, cand)
+        if c not in seen:
+            seen.add(c)
+            canonicals.append(c)
+    if len(canonicals) == 1:
+        return canonicals[0]
 
-    # Rule 1: real `<base>@<linux_major>` formula in candidates. Match only
-    # *pure* major pins — the suffix must be the integer with no dotted
-    # minor/patch. Otherwise `python@3.10` would match a `python3 v3.x`
-    # query (its leading int is 3) when what we actually want is the
-    # alias-canonical `python@3.14`. Pure-major pins like `openssl@3` and
-    # `node@22` match correctly.
-    if linux_major is not None:
-        for cand in candidates:
-            if "@" not in cand:
-                continue
-            suffix = cand.split("@", 1)[1]
-            if suffix.isdigit() and int(suffix) == linux_major and cand in formula_set:
-                return cand
-
-    # Rule 2: alias-canonical. The Linux name (`python3`, `openssl`) is
-    # itself a brew alias — or one of its common Linux variants
-    # (`python3-dev`, `python3-devel`). Try the name as-is, then with
-    # `-dev`/`-devel` stripped so dev packages resolve to the same canonical
-    # as their runtime counterpart. The Rust resolver only does name
-    # transforms on map *misses*, so the generator must emit the right
-    # value when the Linux name is a -dev variant.
     alias_variants = [linux_name]
     for suffix in ("-dev", "-devel"):
         if linux_name.endswith(suffix):
@@ -348,23 +381,25 @@ def pick_winner(candidates, linux_name, linux_version, alias_to_canonical, formu
 
     for variant in alias_variants:
         canonical = alias_to_canonical.get(variant)
-        if canonical and canonical in candidates:
-            canonical_major = parse_brew_major(canonical)
-            if (
-                linux_major is None
-                or canonical_major is None
-                or canonical_major == linux_major
-            ):
-                return canonical
+        if not canonical or canonical not in canonicals:
+            continue
+        if "@" not in canonical:
+            prefix = canonical + "@"
+            versioned = [
+                c for c in canonicals
+                if c.startswith(prefix) and c[len(prefix):].isdigit()
+            ]
+            if versioned:
+                return max(versioned, key=lambda c: int(c.rsplit("@", 1)[1]))
+        return canonical
 
-    # Rule 3: version-suffix preference, then lex
-    def sort_key(name):
-        if "@" not in name:
-            return (0, len(name), name)
-        suffix = name.split("@", 1)[1]
-        return (1 + suffix.count("."), len(name), name)
-
-    return sorted(candidates, key=sort_key)[0]
+    versioned = [c for c in canonicals if "@" in c]
+    if versioned:
+        return max(
+            versioned,
+            key=lambda c: (parse_major(c.rsplit("@", 1)[1]) or 0, c),
+        )
+    return sorted(canonicals)[0]
 
 
 def get_all_distro_repos(tmpdir, port):
@@ -383,28 +418,26 @@ def get_all_distro_repos(tmpdir, port):
     return [r.strip() for r in result.split("\n") if r.strip()]
 
 
-def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical, formula_set):
+def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
     """Extract distro→homebrew mappings for a single repo.
 
     Captures all name variants (visiblename, srcname, binname, binnames[])
-    along with the Linux package's `version` field — `pick_winner` uses the
-    version's major to find the matching `<base>@<major>` brew formula.
-    Per-(linux_name, brew_candidate) we keep the highest version seen (lex
-    sort over Repology versions is good enough for major-extraction).
+    and joins them to homebrew's effname. `pick_winner` reduces the
+    resulting candidate list to a single canonical brew formula.
     """
     result = psql_query(tmpdir, port, f"""
-        SELECT DISTINCT d_name, d_version, h.visiblename
+        SELECT DISTINCT d_name, h.visiblename
         FROM (
-            SELECT effname, visiblename AS d_name, version AS d_version
+            SELECT effname, visiblename AS d_name
             FROM repology.packages WHERE repo = '{distro_repo}'
             UNION
-            SELECT effname, srcname, version
+            SELECT effname, srcname
             FROM repology.packages WHERE repo = '{distro_repo}' AND srcname IS NOT NULL
             UNION
-            SELECT effname, binname, version
+            SELECT effname, binname
             FROM repology.packages WHERE repo = '{distro_repo}' AND binname IS NOT NULL
             UNION
-            SELECT effname, unnest(binnames), version
+            SELECT effname, unnest(binnames)
             FROM repology.packages WHERE repo = '{distro_repo}' AND binnames IS NOT NULL
         ) d
         JOIN repology.packages h ON d.effname = h.effname
@@ -415,17 +448,12 @@ def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical, formula_set)
     """)
 
     candidates = {}
-    linux_versions = {}
     for line in result.split("\n"):
-        # Each row: d_name|d_version|h.visiblename. Use maxsplit so version
-        # strings containing `|` (rare but legal in Repology) don't corrupt
-        # the brew name field.
-        parts = line.split("|", 2)
-        if len(parts) != 3:
+        parts = line.split("|", 1)
+        if len(parts) != 2:
             continue
         linux_name = parts[0].strip()
-        linux_version = parts[1].strip()
-        brew_name = parts[2].strip()
+        brew_name = parts[1].strip()
         if not linux_name or not brew_name:
             continue
 
@@ -433,18 +461,8 @@ def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical, formula_set)
         if brew_name not in bucket:
             bucket.append(brew_name)
 
-        existing = linux_versions.get(linux_name)
-        if linux_version and (not existing or linux_version > existing):
-            linux_versions[linux_name] = linux_version
-
     return {
-        linux_name: pick_winner(
-            cands,
-            linux_name,
-            linux_versions.get(linux_name, ""),
-            alias_to_canonical,
-            formula_set,
-        )
+        linux_name: pick_winner(cands, linux_name, alias_to_canonical)
         for linux_name, cands in candidates.items()
     }
 
@@ -454,46 +472,38 @@ def write_sharded_map_files(distro_dir, distro_repo, mappings, generated_at):
 
     Each shard contains only the entries whose first letter belongs to that
     shard. OVERRIDES are applied to the shard their key belongs to so the
-    final per-shard file already reflects the override.
+    final per-shard file reflects the override.
+
+    Each run authoritatively overwrites the previous run's shards — there
+    is NO merge with on-disk data. Per-distro shrinkage from one run to
+    the next is acceptable because the cross-distro `common/` consensus
+    preserves any name still produced by ANY distro. Eliminates zombie
+    entries (e.g. centos_8 retaining `libssl-dev: openssl` from when an
+    older OVERRIDES applied to all distros uniformly).
 
     Atomicity: each shard is written to `.tmp-{shard}.json` and renamed to
     `{shard}.json`. A crash mid-loop leaves prior shards intact and at most
     one tmp file behind, never a half-written shard.
 
-    Returns the list of shard letters that were written (i.e. had at least
-    one entry after merge with existing).
+    Returns `(shards_written, total_mappings)` for the caller's index.
     """
-    # Bucket new mappings by shard
     new_buckets = {s: {} for s in SHARDS}
     for name, brew in mappings.items():
         new_buckets[shard_key(name)][name] = brew
-    # Apply OVERRIDES per-shard
     for name, brew in OVERRIDES.items():
         new_buckets[shard_key(name)][name] = brew
 
     written = []
-    total_new = 0
     total_after = 0
     for shard in SHARDS:
         shard_path = os.path.join(distro_dir, f"{shard}.json")
-
-        # Read existing entries for this shard so packages only grow, never shrink
-        existing = {}
-        if os.path.exists(shard_path):
-            with open(shard_path) as f:
-                existing = json.load(f).get("mappings", {})
-
         new_for_shard = new_buckets[shard]
-        # Existing first, new second so new wins on conflict
-        merged = {**existing, **new_for_shard}
-        # Re-apply OVERRIDES so they always win even over existing on-disk data
-        for name, brew in OVERRIDES.items():
-            if shard_key(name) == shard:
-                merged[name] = brew
 
-        if not merged:
-            # Nothing to write; remove any pre-existing empty shard so the
-            # index reflects reality
+        if not new_for_shard:
+            # Authoritative empty: drop any stale on-disk file for this shard
+            # so the index reflects reality.
+            if os.path.exists(shard_path):
+                os.remove(shard_path)
             continue
 
         doc = {
@@ -502,9 +512,9 @@ def write_sharded_map_files(distro_dir, distro_repo, mappings, generated_at):
                 "source": "repology-dump",
                 "distro": distro_repo,
                 "shard": shard,
-                "total_mappings": len(merged),
+                "total_mappings": len(new_for_shard),
             },
-            "mappings": dict(sorted(merged.items())),
+            "mappings": dict(sorted(new_for_shard.items())),
         }
 
         tmp_path = os.path.join(distro_dir, f".tmp-{shard}.json")
@@ -513,12 +523,10 @@ def write_sharded_map_files(distro_dir, distro_repo, mappings, generated_at):
         os.rename(tmp_path, shard_path)
 
         written.append(shard)
-        total_new += len(new_for_shard)
-        total_after += len(merged)
+        total_after += len(new_for_shard)
 
     print(
-        f"  {distro_repo}: {total_after} mappings across {len(written)} shards "
-        f"({total_new} from this run)"
+        f"  {distro_repo}: {total_after} mappings across {len(written)} shards"
     )
     return written, total_after
 
@@ -545,6 +553,48 @@ def write_distro_index(distro_dir, distro_repo, shards_written, total_mappings, 
     os.rename(tmp_path, index_path)
 
 
+def build_consensus(per_distro):
+    """Compute the cross-distro consensus mapping from per-distro mappings.
+
+    For each Linux name seen in any distro, collect the distinct brew
+    values that distros mapped it to. The consensus rule:
+
+      - **Single value across distros:** that's the answer.
+      - **Multiple values:** most-common wins. Ties (multiple values share
+        the top vote count) are broken by versioned-highest-major, then
+        lex — same logic as `pick_winner`'s Step 4 tiebreak, so per-distro
+        and consensus selection stay consistent.
+
+    The output is the input to the `common/` shard set: the resolver
+    falls back here when a per-distro shard doesn't have a name. This is
+    how `apt install libssl-dev` (debian-only) still resolves on macOS
+    when the source distro is centos/fedora — debian produces the
+    mapping, consensus copies it, and resolver finds it via common.
+    """
+    union = {}
+    for mappings in per_distro.values():
+        for name, brew in mappings.items():
+            union.setdefault(name, []).append(brew)
+
+    consensus = {}
+    for name, values in union.items():
+        counts = Counter(values)
+        top_count = counts.most_common(1)[0][1]
+        leaders = [v for v, c in counts.items() if c == top_count]
+        if len(leaders) == 1:
+            consensus[name] = leaders[0]
+            continue
+        versioned = [c for c in leaders if "@" in c]
+        if versioned:
+            consensus[name] = max(
+                versioned,
+                key=lambda c: (parse_major(c.rsplit("@", 1)[1]) or 0, c),
+            )
+        else:
+            consensus[name] = sorted(leaders)[0]
+    return consensus
+
+
 def main():
     print("=" * 60)
     print("RepoSources - Package Map Generator (dump method)")
@@ -558,9 +608,9 @@ def main():
             load_dump(sock_dir, port)
             diagnose(sock_dir, port)
 
-            # Fetch the Homebrew alias index + formula set once; reused
-            # across every distro by `pick_winner`.
-            alias_to_canonical, formula_set = fetch_homebrew_alias_index()
+            # Fetch the Homebrew alias index once; reused across every distro
+            # by `pick_winner`.
+            alias_to_canonical = fetch_homebrew_alias_index()
 
             # Get ALL distro repos that have homebrew equivalents
             print("\nFinding all distro repos with Homebrew mappings...")
@@ -571,28 +621,54 @@ def main():
                 print("ERROR: No repos found. Check diagnostics above.")
                 sys.exit(1)
 
-            # Extract and write per-repo mapping files
-            print(f"\nExtracting mappings for {len(repos)} repos...")
             os.makedirs(OUTPUT_DIR, exist_ok=True)
-
             generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            total = 0
+
+            # Pass 1: extract per-distro mappings.
+            print(f"\nExtracting mappings for {len(repos)} repos...")
+            per_distro = {}
             for repo in repos:
                 mappings = extract_mappings(
-                    sock_dir, port, repo, alias_to_canonical, formula_set
+                    sock_dir, port, repo, alias_to_canonical
                 )
                 if mappings:
-                    distro_dir = os.path.join(OUTPUT_DIR, repo)
-                    os.makedirs(distro_dir, exist_ok=True)
-                    shards_written, total_after = write_sharded_map_files(
-                        distro_dir, repo, mappings, generated_at
-                    )
-                    write_distro_index(
-                        distro_dir, repo, shards_written, total_after, generated_at
-                    )
-                    total += total_after
+                    per_distro[repo] = mappings
 
-            print(f"\nTotal: {total} mappings across {len(repos)} repos")
+            # Pass 2: build cross-distro consensus. For each Linux name seen
+            # across distros, pick the single canonical brew formula. The
+            # `common/` shard set is the resolver's cross-distro fallback —
+            # it covers cases where one distro's source name doesn't exist on
+            # another (e.g. `libssl-dev` on debian, `openssl-devel` on centos)
+            # but the macOS resolver still wants a single answer.
+            common_mappings = build_consensus(per_distro)
+
+            # Pass 3: write per-distro shards.
+            total = 0
+            for repo, mappings in per_distro.items():
+                distro_dir = os.path.join(OUTPUT_DIR, repo)
+                os.makedirs(distro_dir, exist_ok=True)
+                shards_written, total_after = write_sharded_map_files(
+                    distro_dir, repo, mappings, generated_at
+                )
+                write_distro_index(
+                    distro_dir, repo, shards_written, total_after, generated_at
+                )
+                total += total_after
+
+            # Pass 4: write common shards.
+            common_dir = os.path.join(OUTPUT_DIR, "common")
+            os.makedirs(common_dir, exist_ok=True)
+            common_shards, common_total = write_sharded_map_files(
+                common_dir, "common", common_mappings, generated_at
+            )
+            write_distro_index(
+                common_dir, "common", common_shards, common_total, generated_at
+            )
+
+            print(
+                f"\nTotal: {total} per-distro mappings across {len(per_distro)} repos; "
+                f"{common_total} mappings in common/"
+            )
             print("Done!")
 
         finally:
@@ -600,5 +676,111 @@ def main():
             stop_postgres(tmpdir)
 
 
+def _self_test():
+    """Exercise pick_winner + build_consensus against synthetic inputs.
+
+    Run with `python3 scripts/generate-package-maps.py --test`. No network,
+    no Repology dump, no postgres. Catches regressions in the resolution
+    rules without waiting for the ~10-minute live regenerator.
+    """
+    # Synthetic alias_to_canonical: matches what the brew API actually
+    # returns today for these names (verified manually).
+    a2c = {
+        # openssl: bare alias -> versioned canonical
+        "openssl": "openssl@3",
+        "openssl@3": "openssl@3",
+        "openssl@1.1": "openssl@1.1",
+        # python: bare alias -> versioned canonical
+        "python": "python@3.14",
+        "python3": "python@3.14",
+        "python@3.14": "python@3.14",
+        "python@3.13": "python@3.13",
+        # node: bare name is ITSELF canonical (versioned variants exist alongside)
+        "node": "node",
+        "nodejs": "node",
+        "node@22": "node@22",
+        "node@24": "node@24",
+        # gcc: same shape as node
+        "gcc": "gcc",
+        "gcc@13": "gcc@13",
+        "gcc@14": "gcc@14",
+    }
+
+    cases = [
+        # Step 1 dedupe: openssl + openssl@3 -> openssl@3
+        ("libssl-dev", ["openssl", "openssl@3"], "openssl@3"),
+        # Step 2 alias-via-stripping; EOL openssl 1.0 must NOT veto openssl@3
+        ("openssl-devel", ["openssl", "openssl@3", "openssl@1.1"], "openssl@3"),
+        # Step 2 + Step 3 versioned-preference: nodejs alias -> node, node@24
+        # is in canonicals -> pick node@24
+        ("nodejs", ["node", "node@22", "node@24"], "node@24"),
+        # Step 1 dedupe via python alias chain
+        ("python3", ["python", "python@3.13", "python@3.14"], "python@3.14"),
+        # Step 2 + Step 3 versioned-preference for gcc
+        ("gcc", ["gcc", "gcc@13", "gcc@14"], "gcc@14"),
+        # Single candidate short-circuit
+        ("bash", ["bash"], "bash"),
+        # Empty candidates -> None
+        ("nonexistent", [], None),
+    ]
+
+    failures = []
+    for linux_name, candidates, expected in cases:
+        actual = pick_winner(candidates, linux_name, a2c)
+        status = "OK  " if actual == expected else "FAIL"
+        print(f"  {status} pick_winner({linux_name!r}, {candidates!r}) = {actual!r}  (expected {expected!r})")
+        if actual != expected:
+            failures.append((linux_name, candidates, expected, actual))
+
+    # build_consensus: same name produced by multiple distros, possibly with
+    # different brew values. Verifies cross-distro tie-breaking.
+    print()
+    consensus_cases = [
+        # All distros agree -> that value
+        (
+            {"debian_12": {"libssl-dev": "openssl@3"}, "alpine_3_20": {"libssl-dev": "openssl@3"}},
+            {"libssl-dev": "openssl@3"},
+        ),
+        # Single distro produces the name -> that value (no tie)
+        (
+            {"debian_12": {"libssl-dev": "openssl@3"}, "alpine_3_20": {}},
+            {"libssl-dev": "openssl@3"},
+        ),
+        # Tie broken by versioned-highest
+        (
+            {
+                "debian_12": {"python3": "python@3.14"},
+                "alpine_3_20": {"python3": "python@3.13"},
+            },
+            {"python3": "python@3.14"},
+        ),
+        # Most-common beats versioned-highest
+        (
+            {
+                "debian_12": {"node": "node@22"},
+                "alpine_3_20": {"node": "node@22"},
+                "centos_8": {"node": "node@24"},
+            },
+            {"node": "node@22"},
+        ),
+    ]
+
+    for per_distro, expected in consensus_cases:
+        actual = build_consensus(per_distro)
+        status = "OK  " if actual == expected else "FAIL"
+        print(f"  {status} build_consensus({per_distro!r}) = {actual!r}  (expected {expected!r})")
+        if actual != expected:
+            failures.append(("consensus", per_distro, expected, actual))
+
+    print()
+    if failures:
+        print(f"FAIL: {len(failures)} case(s) failed.")
+        sys.exit(1)
+    print("All self-test cases passed.")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        _self_test()
+    else:
+        main()

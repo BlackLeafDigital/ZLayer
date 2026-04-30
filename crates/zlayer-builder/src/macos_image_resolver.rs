@@ -38,10 +38,12 @@ const REPO_SOURCES_BASE: &str = "https://zachhandley.github.io/RepoSources/maps"
 const PACKAGE_MAP_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
 
 /// Subdirectory name (under the platform cache dir) where per-distro shard
-/// files are stored. Bumped from `package-maps` to invalidate caches that
-/// pre-date Phase 2's @MAJOR-aware generator (libssl-dev → openssl@3 etc.);
-/// old dirs are abandoned, not migrated.
-const PACKAGE_MAP_CACHE_SUBDIR: &str = "package-maps-v2";
+/// files are stored. Bumped from `package-maps-v2` to invalidate caches
+/// that pre-date the cross-distro `common/` shard set + zombie-purging
+/// generator overwrite — old caches still serve unversioned `openssl`,
+/// `python`, `node` for cross-distro names (e.g. centos's `libssl-dev`).
+/// Old dirs are abandoned, not migrated.
+const PACKAGE_MAP_CACHE_SUBDIR: &str = "package-maps-v3";
 
 /// Env var holding the shared secret used to sign POST requests to the
 /// `RepoSourceSyncer` formula-cache endpoint. Must match the value the
@@ -1520,93 +1522,109 @@ fn shard_key(name: &str) -> &'static str {
 /// Load the package mappings for a distro, fetching the relevant per-letter
 /// shards from `RepoSources` if not cached or stale.
 ///
-/// For each distinct shard letter implied by `packages`:
-/// 1. `{cache_dir}/package-maps-v2/{distro}/{shard}.json` — if present and < 7 days old
-/// 2. Fetch from `{REPO_SOURCES_BASE}/{distro}/{shard}.json` and cache to disk
-/// 3. If fetch fails, use stale cache if available
-/// 4. If nothing is available for that shard, log a warning and skip it
-///
-/// All successfully loaded shards are merged into a single map and returned.
+/// Cascading lookup: for each shard letter implied by `packages`, fetch
+/// both `common/<shard>.json` (cross-distro consensus) AND
+/// `<distro>/<shard>.json` (distro-specific, more authoritative). Merge
+/// with **per-distro winning** on conflict — distro-specific is a tighter
+/// answer when known; common is the fallback for names that distro
+/// doesn't have (e.g. `libssl-dev` on centos).
 async fn load_or_fetch_package_map(
     distro: &str,
     packages: &[&str],
     cache_dir: &Path,
 ) -> HashMap<String, String> {
-    let distro_cache_dir = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR).join(distro);
+    let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
+    let common_cache_dir = cache_root.join("common");
+    let distro_cache_dir = cache_root.join(distro);
 
-    // Compute the set of shard letters needed for the requested packages.
     let mut shards: HashSet<&'static str> = HashSet::new();
     for pkg in packages {
         shards.insert(shard_key(pkg));
     }
 
-    let mut merged: HashMap<String, String> = HashMap::new();
+    let mut common_merged: HashMap<String, String> = HashMap::new();
+    let mut distro_merged: HashMap<String, String> = HashMap::new();
 
     for shard in shards {
-        let cache_path = distro_cache_dir.join(format!("{shard}.json"));
-
-        // 1. Check local cache freshness for this shard.
-        let mut used_fresh_cache = false;
-        if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
-            if let Ok(modified) = meta.modified() {
-                let age = modified
-                    .elapsed()
-                    .unwrap_or(std::time::Duration::from_secs(u64::MAX));
-                if age.as_secs() < PACKAGE_MAP_CACHE_TTL_SECS {
-                    if let Some(map) = read_cached_map(&cache_path).await {
-                        debug!(
-                            "Using cached package map for {distro}/{shard} ({} mappings, age {}s)",
-                            map.len(),
-                            age.as_secs()
-                        );
-                        merged.extend(map);
-                        used_fresh_cache = true;
-                    }
-                }
-            }
+        if let Some(map) = fetch_or_load_shard("common", &common_cache_dir, shard).await {
+            common_merged.extend(map);
         }
-
-        if used_fresh_cache {
-            continue;
+        if let Some(map) = fetch_or_load_shard(distro, &distro_cache_dir, shard).await {
+            distro_merged.extend(map);
         }
+    }
 
-        // 2. Fetch the shard from RepoSources.
-        let url = format!("{REPO_SOURCES_BASE}/{distro}/{shard}.json");
-        debug!("Fetching package map shard from {url}");
+    // Per-distro values WIN over common — distro is more specific. Insertion
+    // order: common first, distro overrides on conflict.
+    let mut merged = common_merged;
+    merged.extend(distro_merged);
+    merged
+}
 
-        match fetch_package_map(&url).await {
-            Ok(map_file) => {
-                info!(
-                    "Fetched {} package mappings for {distro}/{shard} from RepoSources",
-                    map_file.mappings.len()
-                );
-                // Cache to disk (best-effort).
-                if let Err(e) = write_cached_map(&distro_cache_dir, &cache_path, &map_file).await {
-                    warn!("Failed to cache package map for {distro}/{shard}: {e}");
-                }
-                merged.extend(map_file.mappings);
-            }
-            Err(e) => {
-                debug!("Failed to fetch package map for {distro}/{shard}: {e}");
+/// Fetch one shard for a label (`<distro>` or `"common"`), with on-disk
+/// cache + stale fallback. Returns `None` only when there's no fresh
+/// fetch, no usable stale cache — i.e. truly nothing available.
+async fn fetch_or_load_shard(
+    label: &str,
+    cache_dir: &Path,
+    shard: &str,
+) -> Option<HashMap<String, String>> {
+    let cache_path = cache_dir.join(format!("{shard}.json"));
 
-                // 3. Try stale cache for this shard.
+    // 1. Fresh local cache.
+    if let Ok(meta) = tokio::fs::metadata(&cache_path).await {
+        if let Ok(modified) = meta.modified() {
+            let age = modified
+                .elapsed()
+                .unwrap_or(std::time::Duration::from_secs(u64::MAX));
+            if age.as_secs() < PACKAGE_MAP_CACHE_TTL_SECS {
                 if let Some(map) = read_cached_map(&cache_path).await {
-                    info!(
-                        "Using stale cached package map for {distro}/{shard} ({} mappings)",
-                        map.len()
+                    debug!(
+                        "Using cached package map for {label}/{shard} ({} mappings, age {}s)",
+                        map.len(),
+                        age.as_secs()
                     );
-                    merged.extend(map);
-                } else {
-                    // 4. Nothing available for this shard — warn and skip.
-                    warn!(
-                        "No package map available for {distro}/{shard}, falling back to hardcoded mappings only"
-                    );
+                    return Some(map);
                 }
             }
         }
     }
 
-    merged
+    // 2. Fetch from RepoSources.
+    let url = format!("{REPO_SOURCES_BASE}/{label}/{shard}.json");
+    debug!("Fetching package map shard from {url}");
+
+    match fetch_package_map(&url).await {
+        Ok(map_file) => {
+            info!(
+                "Fetched {} package mappings for {label}/{shard} from RepoSources",
+                map_file.mappings.len()
+            );
+            if let Err(e) = write_cached_map(cache_dir, &cache_path, &map_file).await {
+                warn!("Failed to cache package map for {label}/{shard}: {e}");
+            }
+            Some(map_file.mappings)
+        }
+        Err(e) => {
+            debug!("Failed to fetch package map for {label}/{shard}: {e}");
+
+            // 3. Stale cache fallback.
+            if let Some(map) = read_cached_map(&cache_path).await {
+                info!(
+                    "Using stale cached package map for {label}/{shard} ({} mappings)",
+                    map.len()
+                );
+                return Some(map);
+            }
+
+            // 4. Nothing — caller (load_or_fetch_package_map) will quietly
+            //    proceed with whatever's already merged. A blanket warning
+            //    here would fire for every shard miss in `common/` even
+            //    when the per-distro shard succeeds; let the resolver-level
+            //    miss path produce the user-facing message.
+            None
+        }
+    }
 }
 
 /// Fetch a `PackageMapFile` from the given URL.
@@ -1900,10 +1918,12 @@ mod tests {
 
     /// Live smoke test against the published `RepoSources` JSON.
     ///
-    /// Hits `https://zachhandley.github.io/RepoSources/maps/debian_12.json` and
-    /// asserts that the canonical Homebrew names are returned.
+    /// Hits live `RepoSources` (`https://zachhandley.github.io/RepoSources/maps/...`)
+    /// and asserts the canonical Homebrew names. Stays `#[ignore]` because
+    /// it's network-bound and brew rotates default majors yearly; pattern
+    /// match the verify-reposources.yml globs (`openssl@3`, `node@<MAJOR>`).
     #[tokio::test]
-    #[ignore = "live network test; assertions reference Phase 1 generator output and need updating after the next regenerator run"]
+    #[ignore = "live network test; runs against published RepoSources"]
     async fn test_map_linux_packages_live_reposources() {
         let tmp = std::env::temp_dir().join("zlayer-test-pkg-map-live");
         let _ = tokio::process::Command::new("chmod")
@@ -1924,7 +1944,7 @@ mod tests {
         assert_eq!(result[0].1, "curl");
         assert!(!result[0].2);
         assert_eq!(result[1].0, "libssl-dev");
-        assert_eq!(result[1].1, "openssl");
+        assert_eq!(result[1].1, "openssl@3");
         assert!(!result[1].2);
         assert_eq!(result[2].0, "musl-dev");
         assert!(result[2].2);
@@ -1945,19 +1965,27 @@ mod tests {
     /// verifies `map_linux_packages` returns the expected
     /// `(linux_name, brew, skipped)` triples. No network. Always runs in CI —
     /// this is the regression guard for the sharded layout.
-    async fn write_shard(distro_dir: &Path, shard: &str, mappings: HashMap<String, String>) {
+    async fn write_shard(
+        label_dir: &Path,
+        label: &str,
+        shard: &str,
+        mappings: HashMap<String, String>,
+    ) {
+        tokio::fs::create_dir_all(label_dir)
+            .await
+            .expect("create label dir");
         let fixture = PackageMapFile {
             metadata: PackageMapMetadata {
-                generated_at: "2026-04-26T00:00:00Z".to_string(),
+                generated_at: "2026-04-29T00:00:00Z".to_string(),
                 source: "test-fixture".to_string(),
-                distro: "debian_12".to_string(),
+                distro: label.to_string(),
                 shard: Some(shard.to_string()),
                 total_mappings: mappings.len(),
             },
             mappings,
         };
         let json = serde_json::to_string_pretty(&fixture).expect("serialize fixture");
-        tokio::fs::write(distro_dir.join(format!("{shard}.json")), json)
+        tokio::fs::write(label_dir.join(format!("{shard}.json")), json)
             .await
             .expect("write shard fixture");
     }
@@ -1966,22 +1994,20 @@ mod tests {
     async fn test_map_linux_packages_with_seeded_cache() {
         let tmp = tempfile::tempdir().expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
-        let distro_dir = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR).join("debian_12");
-        tokio::fs::create_dir_all(&distro_dir)
-            .await
-            .expect("create distro shard dir");
+        let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
+        let distro_dir = cache_root.join("debian_12");
 
         let mut c_mappings = HashMap::new();
         c_mappings.insert("curl".to_string(), "curl".to_string());
-        write_shard(&distro_dir, "c", c_mappings).await;
+        write_shard(&distro_dir, "debian_12", "c", c_mappings).await;
 
         let mut l_mappings = HashMap::new();
         l_mappings.insert("libssl-dev".to_string(), "openssl@3".to_string());
-        write_shard(&distro_dir, "l", l_mappings).await;
+        write_shard(&distro_dir, "debian_12", "l", l_mappings).await;
 
         let mut n_mappings = HashMap::new();
         n_mappings.insert("nodejs".to_string(), "node@24".to_string());
-        write_shard(&distro_dir, "n", n_mappings).await;
+        write_shard(&distro_dir, "debian_12", "n", n_mappings).await;
 
         let result = map_linux_packages(
             &["curl", "libssl-dev", "musl-dev", "nodejs"],
@@ -1991,25 +2017,91 @@ mod tests {
         .await;
 
         assert_eq!(result.len(), 4);
-
-        // curl: direct match → curl (from c.json)
         assert_eq!(result[0].0, "curl");
         assert_eq!(result[0].1, "curl");
         assert!(!result[0].2);
-
-        // libssl-dev: direct match → openssl@3 (Phase 2 @MAJOR pin, from l.json)
         assert_eq!(result[1].0, "libssl-dev");
         assert_eq!(result[1].1, "openssl@3");
         assert!(!result[1].2);
-
-        // musl-dev: linux-only skip
         assert_eq!(result[2].0, "musl-dev");
         assert!(result[2].2);
-
-        // nodejs: direct match → node@24 (Phase 2 @MAJOR pin, from n.json)
         assert_eq!(result[3].0, "nodejs");
         assert_eq!(result[3].1, "node@24");
         assert!(!result[3].2);
+    }
+
+    /// Cascading lookup: a name absent from the per-distro shard but
+    /// present in `common/` should resolve via the common fallback.
+    /// Models the real-world case where centos's `l.json` doesn't list
+    /// `libssl-dev` (debian-only name) but `common/l.json` does.
+    #[tokio::test]
+    async fn test_map_linux_packages_falls_back_to_common() {
+        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
+        let distro_dir = cache_root.join("centos_8");
+        let common_dir = cache_root.join("common");
+
+        // centos_8 has its own openssl-devel mapping but NOT libssl-dev.
+        let mut distro_o = HashMap::new();
+        distro_o.insert("openssl-devel".to_string(), "openssl@3".to_string());
+        write_shard(&distro_dir, "centos_8", "o", distro_o).await;
+
+        // common/l.json carries the cross-distro libssl-dev mapping, sourced
+        // from debian's view.
+        let mut common_l = HashMap::new();
+        common_l.insert("libssl-dev".to_string(), "openssl@3".to_string());
+        write_shard(&common_dir, "common", "l", common_l).await;
+
+        // Hermetic guards: seed empty shards for every (label, shard) pair the
+        // resolver will probe but isn't deliberately populated above. Without
+        // these, fetch_or_load_shard falls through to a live RepoSources HTTP
+        // request whose response can clobber the seeded values (per-distro
+        // wins on conflict in the merge). Probed shards: o (openssl-devel)
+        // and l (libssl-dev) for both common/ and centos_8/.
+        write_shard(&common_dir, "common", "o", HashMap::new()).await;
+        write_shard(&distro_dir, "centos_8", "l", HashMap::new()).await;
+
+        let result =
+            map_linux_packages(&["openssl-devel", "libssl-dev"], "centos_8", &cache_dir).await;
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "openssl-devel");
+        assert_eq!(result[0].1, "openssl@3");
+        assert!(!result[0].2);
+        // libssl-dev resolves via common, even though centos_8's `l` shard
+        // wasn't seeded.
+        assert_eq!(result[1].0, "libssl-dev");
+        assert_eq!(result[1].1, "openssl@3");
+        assert!(!result[1].2);
+    }
+
+    /// Cascading lookup: when both per-distro AND `common/` define the
+    /// same name with different values, per-distro wins. Per-distro is
+    /// the more-specific source of truth for that distro.
+    #[tokio::test]
+    async fn test_map_linux_packages_distro_overrides_common() {
+        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
+        let distro_dir = cache_root.join("alpine_3_20");
+        let common_dir = cache_root.join("common");
+
+        let mut distro_p = HashMap::new();
+        distro_p.insert("python3".to_string(), "python@3.13".to_string());
+        write_shard(&distro_dir, "alpine_3_20", "p", distro_p).await;
+
+        let mut common_p = HashMap::new();
+        common_p.insert("python3".to_string(), "python@3.14".to_string());
+        write_shard(&common_dir, "common", "p", common_p).await;
+
+        let result = map_linux_packages(&["python3"], "alpine_3_20", &cache_dir).await;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "python3");
+        // Per-distro wins (3.13), not common's 3.14.
+        assert_eq!(result[0].1, "python@3.13");
+        assert!(!result[0].2);
     }
 
     // -- HMAC signature test --
