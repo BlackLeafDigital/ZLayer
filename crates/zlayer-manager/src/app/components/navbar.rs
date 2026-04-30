@@ -7,30 +7,51 @@ use leptos::task::spawn_local;
 
 use crate::app::server_fns::{get_runtime_name, manager_logout, manager_me};
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const THEME_STORAGE_KEY: &str = "zlm-theme";
 const THEME_DARK: &str = "dark";
 const THEME_LIGHT: &str = "zlayer";
 
 /// Apply a theme to the `<html>` element and persist it to localStorage.
+///
+/// SSR: no-op. Themes are applied during client-side hydration; the server-rendered
+/// HTML uses whatever `data-theme` is in the `<html>` template (or none).
 fn apply_theme(theme: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Some(doc) = window.document() {
-            if let Some(html) = doc.document_element() {
-                let _ = html.set_attribute("data-theme", theme);
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            if let Some(doc) = window.document() {
+                if let Some(html) = doc.document_element() {
+                    let _ = html.set_attribute("data-theme", theme);
+                }
+            }
+            if let Ok(Some(storage)) = window.local_storage() {
+                let _ = storage.set_item(THEME_STORAGE_KEY, theme);
             }
         }
-        if let Ok(Some(storage)) = window.local_storage() {
-            let _ = storage.set_item(THEME_STORAGE_KEY, theme);
-        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = theme;
     }
 }
 
 /// Read the saved theme from localStorage, falling back to `"dark"`.
+///
+/// SSR: always returns `THEME_DARK` — the browser will re-read localStorage during
+/// hydration and apply the user's actual preference.
 fn read_saved_theme() -> String {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(THEME_STORAGE_KEY).ok().flatten())
-        .unwrap_or_else(|| THEME_DARK.to_string())
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(THEME_STORAGE_KEY).ok().flatten())
+            .unwrap_or_else(|| THEME_DARK.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        THEME_DARK.to_string()
+    }
 }
 
 /// Navbar component for ZLayer Manager
@@ -43,8 +64,11 @@ pub fn Navbar() -> impl IntoView {
     let on_logout = move |_| {
         spawn_local(async move {
             let _ = manager_logout().await;
-            if let Some(w) = web_sys::window() {
-                let _ = w.location().set_href("/login");
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.location().set_href("/login");
+                }
             }
         });
     };
@@ -203,5 +227,21 @@ pub fn Navbar() -> impl IntoView {
                 </Suspense>
             </div>
         </div>
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_saved_theme_returns_dark_on_ssr() {
+        assert_eq!(read_saved_theme(), THEME_DARK);
+    }
+
+    #[test]
+    fn apply_theme_is_a_noop_on_ssr() {
+        apply_theme(THEME_LIGHT);
+        apply_theme(THEME_DARK);
     }
 }

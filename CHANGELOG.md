@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [0.11.9] - 2026-04-29
 
 ### Fixed
+- `zlayer-manager` SSR panicked on the first request with `js-sys` "cannot
+  access imported statics on non-wasm targets". The Navbar component called
+  `web_sys::window()` from inside `apply_theme`, `read_saved_theme`, and the
+  `on_logout` closure with no cfg gate, so the bodies were codegen'd into the
+  native server binary even though the surrounding `Effect::new` /
+  `spawn_local` only fire on the client. Gated all three sites behind
+  `#[cfg(target_arch = "wasm32")]` to match the pattern already used in
+  `settings.rs` and `secrets.rs`; SSR `read_saved_theme` now returns `"dark"`
+  and the browser re-applies the persisted theme during hydration.
 - `test_map_linux_packages_falls_back_to_common` was non-hermetic: when a
   per-distro shard wasn't seeded, `fetch_or_load_shard` reached out to live
   RepoSources, and the upstream's stale `centos_8/l.json`
