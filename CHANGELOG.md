@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.9] - 2026-04-29
+
+### Fixed
+- `test_map_linux_packages_falls_back_to_common` was non-hermetic: when a
+  per-distro shard wasn't seeded, `fetch_or_load_shard` reached out to live
+  RepoSources, and the upstream's stale `centos_8/l.json`
+  (`libssl-dev → openssl`) clobbered the seeded `common/l.json`
+  (`libssl-dev → openssl@3`) because per-distro wins on conflict in the
+  merge. Test now seeds explicit empty shards for every probed
+  `(label, shard)` pair so the resolver hits the local cache only.
+- `scripts/generate-package-maps.py` Repology dump load silently produced
+  an empty database. Three concrete causes addressed:
+  - The dump references `repology.<table>` but ships no
+    `CREATE SCHEMA repology`, so every CREATE/INSERT failed against the
+    missing schema; `setup_postgres` now pre-creates it.
+  - `ON_ERROR_STOP=0` masked those errors and let psql exit 0 on a
+    half-loaded database; bumped to `ON_ERROR_STOP=1`.
+  - The shell pipeline didn't use pipefail, so a truncated curl/zstd
+    download surfaced as a successful psql run; loader now runs under
+    `sh -o pipefail` with `curl -fL --show-error` and per-stage stderr
+    capture, and `diagnose()` raises `SystemExit` if `repology.packages`
+    is missing or empty instead of continuing to "Found 0 repos".
+
 ## [0.11.8] - 2026-04-29
 
 ### Added

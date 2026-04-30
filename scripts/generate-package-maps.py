@@ -123,6 +123,15 @@ def setup_postgres(tmpdir):
     run(pg_cmd(tmpdir, port, f"createdb -h {tmpdir} -p {port} -O repology repology"),
         capture_output=True)
 
+    # Pre-create the `repology` schema. The Repology dump references tables as
+    # `repology.<name>` but doesn't ship a `CREATE SCHEMA` statement, so without
+    # this every CREATE TABLE in the dump fails (silently, when ON_ERROR_STOP
+    # is off). AUTHORIZATION repology lets the dump-loading user own the
+    # objects it creates.
+    psql(tmpdir, port,
+         "CREATE SCHEMA IF NOT EXISTS repology AUTHORIZATION repology;",
+         user=superuser(), capture=False)
+
     # Set search path to include repology schema
     psql(tmpdir, port, "ALTER DATABASE repology SET search_path TO repology, public;",
          user=superuser(), capture=False)
@@ -156,74 +165,116 @@ def load_dump(tmpdir, port):
     print(f"Downloading and loading Repology dump...")
     print("  (This may take several minutes...)")
 
-    # Build the psql command — needs su-exec when running as root
+    # Build the psql command — needs su-exec when running as root.
+    # ON_ERROR_STOP=1: bail at the first SQL error rather than silently
+    # skipping the rest of the dump and producing an empty database.
     if os.getuid() == 0:
-        psql_base = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+        psql_base = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=1"
     else:
-        psql_base = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+        psql_base = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=1"
 
-    # Capture errors separately so we can diagnose failures
+    # Capture errors separately so we can diagnose failures.
     errlog = os.path.join(tmpdir, "load_errors.log")
-    # IMPORTANT: psql reads SQL from stdin, outputs results to stdout.
-    # Redirect stdout to /dev/null (we don't need CREATE TABLE output),
-    # capture stderr (errors/notices) to the log file.
-    cmd = f"curl -sL {DUMP_URL} | zstd -d | {psql_base} > /dev/null 2>{errlog}"
-    print(f"  $ {cmd[:120]}...")
-    subprocess.run(cmd, shell=True)
+    curl_errlog = os.path.join(tmpdir, "curl_errors.log")
+    zstd_errlog = os.path.join(tmpdir, "zstd_errors.log")
 
-    # Show first errors if any
-    if os.path.exists(errlog):
-        with open(errlog) as f:
-            errors = f.read().strip()
-        if errors:
-            lines = errors.split("\n")
-            # Show first 30 error lines
-            print(f"  Load errors ({len(lines)} lines, showing first 30):")
-            for line in lines[:30]:
-                print(f"    {line}")
-        else:
-            print("  No errors during load.")
+    # Run via `sh -o pipefail` so a curl/zstd failure (e.g. truncated
+    # download, 4xx HTTP, malformed zstd frame) propagates as a non-zero
+    # exit. Without pipefail the shell only reports psql's status, which
+    # is "success" when psql cleanly drains a truncated stream.
+    # busybox ash (alpine container) and bash (mac dev) both support
+    # `-o pipefail`, so `sh` works in both environments.
+    # `curl -fL --show-error`: -f turns 4xx/5xx into a non-zero exit
+    # instead of writing the HTML error body into the zstd pipe.
+    # Each command's stderr goes to its own log so we can attribute
+    # failures correctly.
+    inner = (
+        f"curl -fL --show-error {DUMP_URL} 2>{curl_errlog} "
+        f"| zstd -d 2>{zstd_errlog} "
+        f"| {psql_base} > /dev/null 2>{errlog}"
+    )
+    cmd = ["sh", "-o", "pipefail", "-c", inner]
+    print(f"  $ (pipefail) curl ... | zstd -d | psql ...")
+    result = subprocess.run(cmd)
+
+    # Print stderr from each pipeline stage so the failure is attributable.
+    for label, path in [("curl", curl_errlog), ("zstd", zstd_errlog), ("psql", errlog)]:
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            errs = f.read().strip()
+        if not errs:
+            continue
+        lines = errs.split("\n")
+        print(f"  {label} stderr ({len(lines)} lines, showing first 30):")
+        for line in lines[:30]:
+            print(f"    {line}")
+
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ERROR: dump load failed (pipefail exit {result.returncode}). "
+            f"See per-stage stderr above."
+        )
     print("  Dump loaded.")
 
 
 def diagnose(tmpdir, port):
-    """Print diagnostic info about the loaded database."""
+    """Print diagnostic info about the loaded database.
+
+    Raises SystemExit if the `packages` table is missing or empty — that's
+    always a setup bug (schema not created, dump truncated, auth failure)
+    and there's no point in continuing to "Found 0 repos".
+    """
     print("\nDiagnostics:")
+    su = superuser()
+
+    # List schemas first so missing-schema bugs are obvious.
+    schemas = psql(tmpdir, port,
+                   "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname != 'information_schema' ORDER BY nspname;",
+                   user=su)
+    print(f"  Schemas: {schemas.replace(chr(10), ', ')}")
 
     # List tables
     tables = psql(tmpdir, port,
                   "SELECT tablename FROM pg_tables WHERE schemaname='repology' ORDER BY tablename;",
-                  user=superuser())
+                  user=su)
     print(f"  Tables: {tables.replace(chr(10), ', ')}")
 
-    # Check packages table
-    if "packages" in tables:
-        count = psql(tmpdir, port, "SELECT count(*) FROM repology.packages;", user="postgres")
-        print(f"  packages row count: {count}")
-
-        cols = psql(tmpdir, port,
-                    "SELECT column_name FROM information_schema.columns WHERE table_name='packages' ORDER BY ordinal_position;",
-                    user=superuser())
-        print(f"  packages columns: {cols.replace(chr(10), ', ')}")
-
-        # Sample repos
-        repos = psql(tmpdir, port,
-                     "SELECT DISTINCT repo FROM repology.packages WHERE repo LIKE 'homebrew%' OR repo LIKE 'debian%' OR repo LIKE 'ubuntu%' OR repo LIKE 'alpine%' LIMIT 20;",
-                     user=superuser())
-        print(f"  Sample repos: {repos.replace(chr(10), ', ')}")
-
-        # Sample homebrew entries
-        sample = psql(tmpdir, port,
-                      "SELECT effname, repo, visiblename FROM repology.packages WHERE repo='homebrew' LIMIT 5;",
-                      user=superuser())
-        print(f"  Sample homebrew: {sample}")
-    else:
-        print("  WARNING: packages table not found!")
-        # Check if there's a different table
+    if "packages" not in tables:
         all_tables = psql(tmpdir, port,
-                          "SELECT tablename FROM pg_tables WHERE schemaname='repology';",
-                          user=superuser())
-        print(f"  Available tables: {all_tables}")
+                          "SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY 1;",
+                          user=su)
+        print(f"  All non-system tables: {all_tables}")
+        raise SystemExit(
+            "ERROR: repology.packages table not found after dump load. "
+            "Check the per-stage stderr above (psql/zstd/curl) — a truncated "
+            "dump or missing schema is the usual cause."
+        )
+
+    count = psql(tmpdir, port, "SELECT count(*) FROM repology.packages;", user=su)
+    print(f"  packages row count: {count}")
+    try:
+        if int(count) == 0:
+            raise SystemExit("ERROR: repology.packages is empty after dump load.")
+    except ValueError:
+        raise SystemExit(f"ERROR: could not parse packages row count: {count!r}")
+
+    cols = psql(tmpdir, port,
+                "SELECT column_name FROM information_schema.columns WHERE table_name='packages' ORDER BY ordinal_position;",
+                user=su)
+    print(f"  packages columns: {cols.replace(chr(10), ', ')}")
+
+    # Sample repos
+    repos = psql(tmpdir, port,
+                 "SELECT DISTINCT repo FROM repology.packages WHERE repo LIKE 'homebrew%' OR repo LIKE 'debian%' OR repo LIKE 'ubuntu%' OR repo LIKE 'alpine%' LIMIT 20;",
+                 user=su)
+    print(f"  Sample repos: {repos.replace(chr(10), ', ')}")
+
+    # Sample homebrew entries
+    sample = psql(tmpdir, port,
+                  "SELECT effname, repo, visiblename FROM repology.packages WHERE repo='homebrew' LIMIT 5;",
+                  user=su)
+    print(f"  Sample homebrew: {sample}")
 
 
 def fetch_homebrew_alias_index():

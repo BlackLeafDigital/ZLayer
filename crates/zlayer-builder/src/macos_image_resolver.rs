@@ -2053,6 +2053,15 @@ mod tests {
         common_l.insert("libssl-dev".to_string(), "openssl@3".to_string());
         write_shard(&common_dir, "common", "l", common_l).await;
 
+        // Hermetic guards: seed empty shards for every (label, shard) pair the
+        // resolver will probe but isn't deliberately populated above. Without
+        // these, fetch_or_load_shard falls through to a live RepoSources HTTP
+        // request whose response can clobber the seeded values (per-distro
+        // wins on conflict in the merge). Probed shards: o (openssl-devel)
+        // and l (libssl-dev) for both common/ and centos_8/.
+        write_shard(&common_dir, "common", "o", HashMap::new()).await;
+        write_shard(&distro_dir, "centos_8", "l", HashMap::new()).await;
+
         let result =
             map_linux_packages(&["openssl-devel", "libssl-dev"], "centos_8", &cache_dir).await;
 
