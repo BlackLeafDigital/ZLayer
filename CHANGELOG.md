@@ -21,6 +21,13 @@ All notable changes to this project will be documented in this file.
   (`libssl-dev → openssl@3`) because per-distro wins on conflict in the
   merge. Test now seeds explicit empty shards for every probed
   `(label, shard)` pair so the resolver hits the local cache only.
+- `scripts/generate-package-maps.py` dump load failed with `cannot drop
+  schema repology because other objects depend on it` (pg_trgm, libversion).
+  The Repology dump now starts with a non-CASCADE `DROP SCHEMA repology`,
+  and our pre-installed extensions had been created in that schema by
+  default (first writable entry in `search_path = repology, public`).
+  Extensions now created with explicit `SCHEMA public`, so they survive
+  the dump's schema reset.
 - `scripts/generate-package-maps.py` Repology dump load silently produced
   an empty database. Three concrete causes addressed:
   - The dump references `repology.<table>` but ships no

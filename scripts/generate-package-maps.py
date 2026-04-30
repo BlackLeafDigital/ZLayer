@@ -136,14 +136,18 @@ def setup_postgres(tmpdir):
     psql(tmpdir, port, "ALTER DATABASE repology SET search_path TO repology, public;",
          user=superuser(), capture=False)
 
-    # Extensions (run as superuser)
+    # Extensions (run as superuser). Install into `public` rather than the
+    # default first-in-search_path (`repology`): the Repology dump now starts
+    # with `DROP SCHEMA repology` (without CASCADE), and PostgreSQL refuses
+    # the drop if extensions live inside that schema. Putting the extensions
+    # in `public` lets the dump reset its own schema cleanly.
     su = superuser()
-    psql(tmpdir, port, "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+    psql(tmpdir, port, "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public;",
          user=su, capture=False)
 
     try:
         run(pg_cmd(tmpdir, port,
-                   f'psql -h {tmpdir} -p {port} -U {su} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"'),
+                   f'psql -h {tmpdir} -p {port} -U {su} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion SCHEMA public;"'),
             capture_output=True)
         print("  libversion extension loaded")
     except subprocess.CalledProcessError:
