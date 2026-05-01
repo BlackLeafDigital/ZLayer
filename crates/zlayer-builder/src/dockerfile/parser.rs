@@ -585,6 +585,45 @@ CMD ["/app"]
     }
 
     #[test]
+    fn test_parse_copy_from_external_image_reference() {
+        // `COPY --from=<external-image>` must capture the full registry-
+        // qualified reference in `CopyInstruction.from` so the buildah
+        // backend can pull and forward it to `buildah copy --from=...`.
+        let content = r#"
+FROM alpine:3.18
+COPY --from=ghcr.io/astral-sh/uv:0.5.0 /uv /usr/local/bin/uv
+RUN /usr/local/bin/uv --version
+"#;
+
+        let dockerfile = Dockerfile::parse(content).unwrap();
+        assert_eq!(dockerfile.stages.len(), 1);
+
+        let copy = dockerfile.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| {
+                if let Instruction::Copy(c) = i {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .expect("COPY instruction present");
+
+        assert_eq!(
+            copy.from,
+            Some("ghcr.io/astral-sh/uv:0.5.0".to_string()),
+            "external image ref must be preserved verbatim in CopyInstruction.from",
+        );
+        assert_eq!(copy.sources, vec!["/uv".to_string()]);
+        assert_eq!(copy.destination, "/usr/local/bin/uv".to_string());
+
+        // The parser must NOT treat the external ref as a stage; only the
+        // top-level `FROM alpine:3.18` should appear in the stage list.
+        assert!(dockerfile.get_stage("ghcr.io/astral-sh/uv:0.5.0").is_none());
+    }
+
+    #[test]
     fn test_parse_global_args() {
         let content = r#"
 ARG BASE_IMAGE=alpine:3.18

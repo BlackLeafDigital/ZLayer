@@ -452,6 +452,12 @@ async fn orchestrate_deployment(
 
     for (name, service_spec) in &spec.services {
         // 1. Register the service with ServiceManager
+        emit_progress(
+            event_tx.as_ref(),
+            DeploymentProgressEvent::ServiceRegistrationStarted {
+                service: name.clone(),
+            },
+        );
         {
             let mgr = mgr_lock.read().await;
             if let Err(e) = mgr.upsert_service(name.clone(), service_spec.clone()).await {
@@ -477,6 +483,12 @@ async fn orchestrate_deployment(
 
         // 2. Set up service overlay network (non-fatal if unavailable)
         if let Some(om) = &state.overlay {
+            emit_progress(
+                event_tx.as_ref(),
+                DeploymentProgressEvent::OverlaySetupStarted {
+                    service: name.clone(),
+                },
+            );
             let om_guard = om.read().await;
             match om_guard.setup_service_overlay(name).await {
                 Ok(iface) => {
@@ -514,6 +526,12 @@ async fn orchestrate_deployment(
 
         // 3. Register proxy routes and ensure listening ports
         if let Some(proxy) = &state.proxy {
+            emit_progress(
+                event_tx.as_ref(),
+                DeploymentProgressEvent::ProxySetupStarted {
+                    service: name.clone(),
+                },
+            );
             let overlay_ip: Option<std::net::IpAddr> = if let Some(om) = &state.overlay {
                 om.read().await.node_ip()
             } else {
@@ -605,9 +623,55 @@ async fn orchestrate_deployment(
     let final_status = if errors.is_empty() {
         let stabilization_timeout = Duration::from_secs(30);
         let mgr = mgr_lock.read().await;
-        let result =
-            zlayer_agent::stabilization::wait_for_stabilization(&mgr, &spec, stabilization_timeout)
-                .await;
+
+        // Run stabilization wait alongside a periodic progress emitter so the
+        // TUI sees per-iteration replica updates instead of a long silent gap
+        // between `Stabilizing` and `Ready`/`Failed`. The pinned future is
+        // scoped inside this block so its borrow on `mgr` ends before the
+        // explicit `drop(mgr)` below.
+        let result = {
+            let stabilize_fut = zlayer_agent::stabilization::wait_for_stabilization(
+                &mgr,
+                &spec,
+                stabilization_timeout,
+            );
+            tokio::pin!(stabilize_fut);
+
+            let mut progress_tick = tokio::time::interval(Duration::from_millis(500));
+            // Skip the immediate first tick so we don't double-emit right
+            // after the existing `Stabilizing` event.
+            progress_tick.tick().await;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    res = &mut stabilize_fut => break res,
+                    _ = progress_tick.tick() => {
+                        // Emit per-service progress for the current poll cycle.
+                        for (svc_name, service_spec) in &spec.services {
+                            let target = match &service_spec.scale {
+                                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                                zlayer_spec::ScaleSpec::Manual => 0,
+                            };
+                            #[allow(clippy::cast_possible_truncation)]
+                            let running = mgr
+                                .service_replica_count(svc_name)
+                                .await
+                                .unwrap_or(0) as u32;
+                            emit_progress(
+                                event_tx.as_ref(),
+                                DeploymentProgressEvent::StabilizationProgress {
+                                    service: svc_name.clone(),
+                                    replicas_running: running,
+                                    target,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        };
         drop(mgr);
 
         match result.outcome {

@@ -291,6 +291,35 @@ impl BuildahBackend {
         Ok(())
     }
 
+    /// Pull an external image referenced by `COPY --from=<image-ref>` so that
+    /// buildah's local image store contains it before the copy runs.
+    ///
+    /// Buildah's `copy --from=<image>` does not auto-pull from a remote
+    /// registry; it resolves the reference against the configured local
+    /// storage only. We therefore have to issue a `buildah pull` ourselves.
+    /// The pull lands in the same `--root` / `--runroot` configured on the
+    /// executor, so subsequent `copy --from=<image-ref>` invocations will
+    /// resolve it correctly.
+    ///
+    /// `pull_mode` is the same `--pull` policy we use for the stage base
+    /// image, so external `--from` images obey the user-selected freshness
+    /// policy (`Newer` / `Always` / `Never`).
+    async fn pull_external_image(&self, image: &str, pull_mode: PullBaseMode) -> Result<()> {
+        let policy = match pull_mode {
+            PullBaseMode::Newer => Some("newer"),
+            PullBaseMode::Always => Some("always"),
+            // `Never` means "use whatever is in local storage". Skip the pull
+            // entirely; if the image isn't already cached the downstream
+            // `buildah copy --from=...` will fail with a clear error.
+            PullBaseMode::Never => return Ok(()),
+        };
+
+        let cmd = BuildahCommand::pull(image, policy);
+        debug!("Pulling external COPY --from image: {}", image);
+        self.executor.execute_checked(&cmd).await?;
+        Ok(())
+    }
+
     /// Send an event to the TUI (if configured).
     fn send_event(event_tx: Option<&mpsc::Sender<BuildEvent>>, event: BuildEvent) {
         if let Some(tx) = event_tx {
@@ -339,6 +368,11 @@ impl BuildBackend for BuildahBackend {
         // Track the final WORKDIR for each committed stage, used to resolve
         // relative source paths in COPY --from instructions.
         let mut stage_workdirs: HashMap<String, String> = HashMap::new();
+        // Track external images we have already pulled this build, so a
+        // multi-line `COPY --from=ghcr.io/...:tag` sequence doesn't re-pull
+        // the same image once per instruction.
+        let mut pulled_external_images: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut final_container: Option<String> = None;
         let mut total_instructions = 0;
 
@@ -398,12 +432,28 @@ impl BuildBackend for BuildahBackend {
                 let instruction_cache_key = instruction.cache_key();
                 let instruction_start = std::time::Instant::now();
 
-                // Resolve COPY --from references to actual committed image names,
-                // and resolve relative source paths using the source stage's WORKDIR.
+                // Resolve COPY --from references.
+                //
+                // There are three cases:
+                //
+                // 1. `from` matches a previously-committed stage in this build
+                //    (by name or numeric index). Replace the reference with the
+                //    committed intermediate image name, and rewrite relative
+                //    source paths using the source stage's WORKDIR.
+                //
+                // 2. `from` is an external image reference (e.g.
+                //    `ghcr.io/astral-sh/uv:0.5.0` or `docker.io/library/alpine`).
+                //    Buildah's `copy --from=<image>` does not auto-pull, so we
+                //    explicitly `buildah pull` the image into local storage
+                //    once per build, then leave the `--from` value untouched
+                //    so buildah resolves it against the now-populated store.
+                //
+                // 3. No `from` at all — pass the instruction through verbatim.
                 let resolved_instruction;
                 let instruction_ref = if let Instruction::Copy(copy) = instruction {
                     if let Some(ref from) = copy.from {
                         if let Some(image_name) = stage_images.get(from) {
+                            // Case 1: known stage.
                             let mut resolved_copy = copy.clone();
                             resolved_copy.from = Some(image_name.clone());
 
@@ -427,9 +477,17 @@ impl BuildBackend for BuildahBackend {
                             resolved_instruction = Instruction::Copy(resolved_copy);
                             &resolved_instruction
                         } else {
+                            // Case 2: external image reference. Pull it into
+                            // local storage so buildah's downstream `copy
+                            // --from=<image>` can resolve it.
+                            if !pulled_external_images.contains(from) {
+                                self.pull_external_image(from, options.pull).await?;
+                                pulled_external_images.insert(from.clone());
+                            }
                             instruction
                         }
                     } else {
+                        // Case 3.
                         instruction
                     }
                 } else {

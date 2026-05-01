@@ -61,12 +61,18 @@ pub struct ServiceState {
     pub name: String,
     /// Current deployment phase
     pub phase: ServiceDeployPhase,
+    /// Active sub-phase (in-flight pre-scale step), if any
+    pub sub_phase: ServiceSubPhase,
     /// Target replica count
     pub target_replicas: u32,
     /// Current running replica count
     pub current_replicas: u32,
     /// Health status
     pub health: ServiceHealth,
+    /// Re-deploy outcome (if any) — `Skipped` when service is up-to-date,
+    /// `Recreating` when digest drift was detected and the service is being
+    /// rebuilt with a new image.
+    pub redeploy: RedeployState,
 }
 
 /// Deployment phase of a single service
@@ -86,6 +92,52 @@ pub enum ServiceDeployPhase {
     Stopping,
     /// Fully stopped
     Stopped,
+}
+
+/// In-flight sub-phase for a service during the pre-scale lifecycle.
+///
+/// These are emitted as `*Started` events from the daemon and cleared when
+/// the corresponding `*Created`/`*Configured`/registered event arrives. The
+/// TUI uses them to show a "progressing" spinner on the row while the work
+/// is in flight, and reverts to the regular phase indicator on completion.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServiceSubPhase {
+    /// No sub-phase in flight
+    #[default]
+    Idle,
+    /// Service registration is in progress
+    Registering,
+    /// Overlay network is being configured
+    OverlaySetup,
+    /// Proxy is being configured
+    ProxySetup,
+}
+
+/// Per-service re-deploy outcome tracking.
+///
+/// This is set when the daemon emits `service_up_to_date` (no digest drift,
+/// service skipped) or `service_recreating` (digest drift detected, service
+/// being rebuilt). It is purely informational for the TUI and does not
+/// affect the main `ServiceDeployPhase` machine.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RedeployState {
+    /// No re-deploy decision yet (fresh deploy or pre-decision)
+    #[default]
+    None,
+    /// Service was up-to-date — nothing to do. Holds the digest currently
+    /// running so the TUI can show `up-to-date (sha256:abc...)`.
+    UpToDate {
+        /// Image digest that is currently running
+        digest: String,
+    },
+    /// Service is being recreated with a new image. Holds both digests so the
+    /// TUI can render `sha256:abc... -> sha256:def...  recreating`.
+    Recreating {
+        /// Previous image digest
+        old_digest: String,
+        /// New image digest
+        new_digest: String,
+    },
 }
 
 /// Full deployment state tracked by the TUI
@@ -112,6 +164,25 @@ pub struct DeployState {
     pub log_scroll_offset: usize,
     /// Running service summary from `DeploymentRunning` event
     pub running_services: Vec<(String, u32)>,
+    /// Active image pulls (image -> in-flight). When a pull completes, the
+    /// digest is captured here for display next to the image reference.
+    pub image_pulls: Vec<ImagePullStatus>,
+}
+
+/// Per-image pull progress tracker.
+///
+/// The TUI renders these as a top-of-screen "Pulling images" line when one or
+/// more images are still pulling. Once a pull completes, the digest is stored
+/// (truncated by the renderer) and the entry stays around so the user can
+/// confirm what was pulled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePullStatus {
+    /// Image reference (e.g. `nginx:latest`)
+    pub image: String,
+    /// Resolved digest, populated on completion
+    pub digest: Option<String>,
+    /// Whether the pull is still in flight
+    pub in_flight: bool,
 }
 
 impl DeployState {
@@ -134,6 +205,7 @@ impl DeployState {
             log_entries: Vec::new(),
             log_scroll_offset: 0,
             running_services: Vec::new(),
+            image_pulls: Vec::new(),
         }
     }
 
@@ -186,16 +258,43 @@ impl DeployState {
                     self.services.push(ServiceState {
                         name: name.clone(),
                         phase: ServiceDeployPhase::Pending,
+                        sub_phase: ServiceSubPhase::Idle,
                         target_replicas: 0,
                         current_replicas: 0,
                         health: ServiceHealth::Unknown,
+                        redeploy: RedeployState::None,
                     });
+                }
+            }
+
+            DeployEvent::ServiceRegistrationStarted { name } => {
+                self.ensure_service(name);
+                if let Some(svc) = self.find_service_mut(name) {
+                    svc.sub_phase = ServiceSubPhase::Registering;
                 }
             }
 
             DeployEvent::ServiceRegistered { name } => {
                 if let Some(svc) = self.find_service_mut(name) {
                     svc.phase = ServiceDeployPhase::Registering;
+                    // Clear the registration sub-phase now that it's done
+                    if svc.sub_phase == ServiceSubPhase::Registering {
+                        svc.sub_phase = ServiceSubPhase::Idle;
+                    }
+                }
+            }
+
+            DeployEvent::ServiceOverlaySetupStarted { name } => {
+                self.ensure_service(name);
+                if let Some(svc) = self.find_service_mut(name) {
+                    svc.sub_phase = ServiceSubPhase::OverlaySetup;
+                }
+            }
+
+            DeployEvent::ServiceProxySetupStarted { name } => {
+                self.ensure_service(name);
+                if let Some(svc) = self.find_service_mut(name) {
+                    svc.sub_phase = ServiceSubPhase::ProxySetup;
                 }
             }
 
@@ -205,11 +304,68 @@ impl DeployState {
             } => {
                 if let Some(svc) = self.find_service_mut(name) {
                     svc.phase = ServiceDeployPhase::Scaling;
+                    svc.sub_phase = ServiceSubPhase::Idle;
                     svc.target_replicas = *target_replicas;
                 }
                 // Transition to Stabilizing when scaling starts during Deploying phase
                 if self.phase == DeployPhase::Deploying {
                     self.phase = DeployPhase::Stabilizing;
+                }
+            }
+
+            DeployEvent::ImagePullStarted { image } => {
+                if let Some(existing) = self.image_pulls.iter_mut().find(|p| p.image == *image) {
+                    existing.in_flight = true;
+                } else {
+                    self.image_pulls.push(ImagePullStatus {
+                        image: image.clone(),
+                        digest: None,
+                        in_flight: true,
+                    });
+                }
+            }
+
+            DeployEvent::ImagePullComplete { image, digest } => {
+                if let Some(existing) = self.image_pulls.iter_mut().find(|p| p.image == *image) {
+                    existing.digest = Some(digest.clone());
+                    existing.in_flight = false;
+                } else {
+                    self.image_pulls.push(ImagePullStatus {
+                        image: image.clone(),
+                        digest: Some(digest.clone()),
+                        in_flight: false,
+                    });
+                }
+            }
+
+            DeployEvent::ServiceUpToDate { name, digest } => {
+                self.ensure_service(name);
+                if let Some(svc) = self.find_service_mut(name) {
+                    svc.redeploy = RedeployState::UpToDate {
+                        digest: digest.clone(),
+                    };
+                    // Treat up-to-date as already-running so the deployed
+                    // counter and visual state line up with reality.
+                    svc.phase = ServiceDeployPhase::Running;
+                    svc.sub_phase = ServiceSubPhase::Idle;
+                    svc.health = ServiceHealth::Healthy;
+                    if svc.target_replicas == 0 {
+                        svc.target_replicas = svc.current_replicas;
+                    }
+                }
+            }
+
+            DeployEvent::ServiceRecreating {
+                name,
+                old_digest,
+                new_digest,
+            } => {
+                self.ensure_service(name);
+                if let Some(svc) = self.find_service_mut(name) {
+                    svc.redeploy = RedeployState::Recreating {
+                        old_digest: old_digest.clone(),
+                        new_digest: new_digest.clone(),
+                    };
                 }
             }
 
@@ -231,6 +387,7 @@ impl DeployState {
             DeployEvent::ServiceDeployComplete { name, replicas } => {
                 if let Some(svc) = self.find_service_mut(name) {
                     svc.phase = ServiceDeployPhase::Running;
+                    svc.sub_phase = ServiceSubPhase::Idle;
                     svc.current_replicas = *replicas;
                     svc.target_replicas = *replicas;
                     svc.health = ServiceHealth::Healthy;
@@ -240,6 +397,7 @@ impl DeployState {
             DeployEvent::ServiceDeployFailed { name, error } => {
                 if let Some(svc) = self.find_service_mut(name) {
                     svc.phase = ServiceDeployPhase::Failed(error.clone());
+                    svc.sub_phase = ServiceSubPhase::Idle;
                     svc.health = ServiceHealth::Unhealthy;
                 }
             }
@@ -335,6 +493,24 @@ impl DeployState {
     /// Find a mutable reference to a service state by name
     fn find_service_mut(&mut self, name: &str) -> Option<&mut ServiceState> {
         self.services.iter_mut().find(|s| s.name == name)
+    }
+
+    /// Ensure a service entry exists by name, creating a default `Pending`
+    /// entry if not. This lets sub-phase events (`ServiceRegistrationStarted`
+    /// etc.) work even when they arrive before the explicit
+    /// `ServiceDeployStarted` (e.g. fast paths that skip the started event).
+    fn ensure_service(&mut self, name: &str) {
+        if !self.services.iter().any(|s| s.name == name) {
+            self.services.push(ServiceState {
+                name: name.to_string(),
+                phase: ServiceDeployPhase::Pending,
+                sub_phase: ServiceSubPhase::Idle,
+                target_replicas: 0,
+                current_replicas: 0,
+                health: ServiceHealth::Unknown,
+                redeploy: RedeployState::None,
+            });
+        }
     }
 }
 
@@ -704,5 +880,114 @@ mod tests {
         state.apply_event(&DeployEvent::ShutdownStarted);
         state.apply_event(&DeployEvent::ShutdownComplete);
         assert_eq!(state.phase, DeployPhase::Complete);
+    }
+
+    #[test]
+    fn test_sub_phase_lifecycle() {
+        let mut state = DeployState::new();
+
+        // Pre-register Started -> sub_phase becomes Registering
+        state.apply_event(&DeployEvent::ServiceRegistrationStarted {
+            name: "web".to_string(),
+        });
+        assert_eq!(state.services.len(), 1);
+        assert_eq!(state.services[0].sub_phase, ServiceSubPhase::Registering);
+
+        // Registered clears sub_phase and sets phase
+        state.apply_event(&DeployEvent::ServiceRegistered {
+            name: "web".to_string(),
+        });
+        assert_eq!(state.services[0].sub_phase, ServiceSubPhase::Idle);
+        assert_eq!(state.services[0].phase, ServiceDeployPhase::Registering);
+
+        // Overlay started -> sub_phase
+        state.apply_event(&DeployEvent::ServiceOverlaySetupStarted {
+            name: "web".to_string(),
+        });
+        assert_eq!(state.services[0].sub_phase, ServiceSubPhase::OverlaySetup);
+
+        // Proxy started -> sub_phase (overrides overlay)
+        state.apply_event(&DeployEvent::ServiceProxySetupStarted {
+            name: "web".to_string(),
+        });
+        assert_eq!(state.services[0].sub_phase, ServiceSubPhase::ProxySetup);
+
+        // Scaling clears sub_phase
+        state.apply_event(&DeployEvent::ServiceScaling {
+            name: "web".to_string(),
+            target_replicas: 2,
+        });
+        assert_eq!(state.services[0].sub_phase, ServiceSubPhase::Idle);
+    }
+
+    #[test]
+    fn test_image_pull_lifecycle() {
+        let mut state = DeployState::new();
+
+        state.apply_event(&DeployEvent::ImagePullStarted {
+            image: "nginx:latest".to_string(),
+        });
+        assert_eq!(state.image_pulls.len(), 1);
+        assert!(state.image_pulls[0].in_flight);
+        assert!(state.image_pulls[0].digest.is_none());
+
+        state.apply_event(&DeployEvent::ImagePullComplete {
+            image: "nginx:latest".to_string(),
+            digest: "sha256:abcdef0123456789".to_string(),
+        });
+        assert_eq!(state.image_pulls.len(), 1);
+        assert!(!state.image_pulls[0].in_flight);
+        assert_eq!(
+            state.image_pulls[0].digest.as_deref(),
+            Some("sha256:abcdef0123456789")
+        );
+
+        // A complete event for a never-started image still records it
+        state.apply_event(&DeployEvent::ImagePullComplete {
+            image: "alpine:3.20".to_string(),
+            digest: "sha256:fedcba".to_string(),
+        });
+        assert_eq!(state.image_pulls.len(), 2);
+    }
+
+    #[test]
+    fn test_service_up_to_date() {
+        let mut state = DeployState::new();
+
+        state.apply_event(&DeployEvent::ServiceUpToDate {
+            name: "api".to_string(),
+            digest: "sha256:abc".to_string(),
+        });
+
+        assert_eq!(state.services.len(), 1);
+        assert_eq!(state.services[0].phase, ServiceDeployPhase::Running);
+        assert_eq!(state.services[0].health, ServiceHealth::Healthy);
+        match &state.services[0].redeploy {
+            RedeployState::UpToDate { digest } => assert_eq!(digest, "sha256:abc"),
+            other => panic!("expected UpToDate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_service_recreating() {
+        let mut state = DeployState::new();
+
+        state.apply_event(&DeployEvent::ServiceRecreating {
+            name: "api".to_string(),
+            old_digest: "sha256:111".to_string(),
+            new_digest: "sha256:222".to_string(),
+        });
+
+        assert_eq!(state.services.len(), 1);
+        match &state.services[0].redeploy {
+            RedeployState::Recreating {
+                old_digest,
+                new_digest,
+            } => {
+                assert_eq!(old_digest, "sha256:111");
+                assert_eq!(new_digest, "sha256:222");
+            }
+            other => panic!("expected Recreating, got {other:?}"),
+        }
     }
 }

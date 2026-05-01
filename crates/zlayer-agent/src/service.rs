@@ -20,7 +20,10 @@ use tokio::sync::{RwLock, Semaphore};
 use zlayer_observability::logs::LogEntry;
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::{StreamRegistry, StreamService};
-use zlayer_spec::{DependsSpec, HealthCheck, Protocol, ResourceType, ServiceSpec};
+use zlayer_spec::{
+    effective_pull_policy, DependsSpec, HealthCheck, Protocol, PullPolicy, ResourceType,
+    ServiceSpec,
+};
 
 /// Service instance manages a single service's containers
 pub struct ServiceInstance {
@@ -36,6 +39,11 @@ pub struct ServiceInstance {
     dns_server: Option<Arc<DnsServer>>,
     /// Shared health states map so callbacks can update ServiceManager-level health
     health_states: Option<Arc<RwLock<HashMap<String, HealthState>>>>,
+    /// Most recently observed image digest after a successful pull. Used by
+    /// `upsert_service` to detect drift on `:latest`/`Newer` redeploys without
+    /// requiring callers to track digest state externally. Wrapped in a
+    /// `RwLock` so `&self` methods (`scale_to`) can update it.
+    last_pulled_digest: tokio::sync::RwLock<Option<String>>,
 }
 
 impl ServiceInstance {
@@ -55,6 +63,7 @@ impl ServiceInstance {
             proxy_manager: None,
             dns_server: None,
             health_states: None,
+            last_pulled_digest: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -75,6 +84,7 @@ impl ServiceInstance {
             proxy_manager: Some(proxy_manager),
             dns_server: None,
             health_states: None,
+            last_pulled_digest: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -100,6 +110,63 @@ impl ServiceInstance {
         self.health_states = Some(states);
     }
 
+    /// Get the last observed image digest (after the most recent successful
+    /// pull). Returns `None` when no pull has happened yet, when the runtime
+    /// does not expose digests, or when no matching `ImageInfo` was found.
+    pub async fn last_pulled_digest(&self) -> Option<String> {
+        self.last_pulled_digest.read().await.clone()
+    }
+
+    /// Pull the service image using `effective_pull_policy` (so a default
+    /// `IfNotPresent` on a `:latest` tag auto-upgrades to `Newer`) and refresh
+    /// the cached digest from `Runtime::list_images` when the runtime exposes
+    /// it. Returns the digest observed after the pull, when known.
+    ///
+    /// `Never` skips the pull entirely; the cached digest is returned
+    /// unchanged.
+    async fn pull_and_refresh_digest(&self) -> Result<Option<String>> {
+        let image_str = self.spec.image.name.to_string();
+        let effective = effective_pull_policy(&self.spec.image.name, self.spec.image.pull_policy);
+
+        if matches!(effective, PullPolicy::Never) {
+            return Ok(self.last_pulled_digest.read().await.clone());
+        }
+
+        self.runtime
+            .pull_image_with_policy(&image_str, effective, None)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: self.spec.image.name.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Best-effort: try to discover the resolved digest via list_images.
+        // Runtimes that don't support introspection (Unsupported) leave the
+        // cached digest unchanged; drift detection then falls back to "always
+        // recreate on PullPolicy::Always, never recreate on PullPolicy::Newer
+        // when no digests are known".
+        let new_digest = match self.runtime.list_images().await {
+            Ok(images) => images
+                .into_iter()
+                .find(|info| info.reference == image_str)
+                .and_then(|info| info.digest),
+            Err(e) => {
+                tracing::debug!(
+                    image = %image_str,
+                    error = %e,
+                    "list_images unavailable; cannot record post-pull digest"
+                );
+                None
+            }
+        };
+
+        if let Some(ref digest) = new_digest {
+            *self.last_pulled_digest.write().await = Some(digest.clone());
+        }
+
+        Ok(new_digest)
+    }
+
     /// Scale to the desired number of replicas
     ///
     /// This method uses short-lived locks to avoid blocking concurrent operations.
@@ -113,18 +180,18 @@ impl ServiceInstance {
         // Phase 1: Determine current state (short read lock)
         let current_replicas = { self.containers.read().await.len() as u32 }; // Lock released here
 
+        // Phase 1b: Pull image up front so a redeploy on `:latest` (which lands
+        // here with replicas == current_replicas in the steady state) actually
+        // refreshes the cached digest. We skip the pull when scaling strictly
+        // down (no new containers needed) and when policy is `Never`. Cached
+        // layers make this cheap when nothing changed.
+        let effective = effective_pull_policy(&self.spec.image.name, self.spec.image.pull_policy);
+        if replicas >= current_replicas && !matches!(effective, PullPolicy::Never) {
+            let _ = self.pull_and_refresh_digest().await?;
+        }
+
         // Phase 2: Scale up - create new containers (no lock held during I/O)
         if replicas > current_replicas {
-            // Pull image ONCE before creating any replicas (cached layers are reused)
-            let image_str = self.spec.image.name.to_string();
-            self.runtime
-                .pull_image_with_policy(&image_str, self.spec.image.pull_policy, None)
-                .await
-                .map_err(|e| AgentError::PullFailed {
-                    image: self.spec.image.name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
             for i in current_replicas..replicas {
                 let id = ContainerId {
                     service: self.service_name.clone(),
@@ -1289,12 +1356,91 @@ impl ServiceManager {
                 let mut services = self.services.write().await;
 
                 if let Some(instance) = services.get_mut(&name) {
-                    // Update existing service
-                    instance.spec = spec;
-                    // Update DNS server if configured
+                    // Update existing service. We need to:
+                    //   1. Update the in-memory spec (so future scale-ups use the new image).
+                    //   2. Honour the effective pull policy. For Never/IfNotPresent (after
+                    //      effective resolution) we noop. For Always/Newer we pull, compare
+                    //      digests, and trigger a rolling recreate when drift is observed.
+                    instance.spec = spec.clone();
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
                     }
+
+                    let effective = effective_pull_policy(&spec.image.name, spec.image.pull_policy);
+                    let old_digest = instance.last_pulled_digest().await;
+                    let current_replicas = instance.replica_count().await as u32;
+                    drop(services); // Release write lock before pull / scale (which take their own locks).
+
+                    match effective {
+                        PullPolicy::Never | PullPolicy::IfNotPresent => {
+                            // No pull, no recreate. Drift is silently ignored when the
+                            // user has explicitly opted into "do not refresh" semantics.
+                            tracing::debug!(
+                                service = %name,
+                                policy = ?effective,
+                                "service unchanged on re-deploy (effective pull policy skips refresh)"
+                            );
+                        }
+                        PullPolicy::Always | PullPolicy::Newer => {
+                            // Pull (this updates the cached digest as a side-effect).
+                            // We need a read guard to keep the instance alive while
+                            // calling its &self method.
+                            let services_ro = self.services.read().await;
+                            let new_digest = if let Some(inst) = services_ro.get(&name) {
+                                inst.pull_and_refresh_digest().await?
+                            } else {
+                                // The service vanished between our write-lock release
+                                // and read-lock acquisition (race with remove_service).
+                                // Treat this as a no-op; the caller will see the removal.
+                                tracing::warn!(
+                                    service = %name,
+                                    "service removed during upsert; skipping drift recreate"
+                                );
+                                return Ok(());
+                            };
+                            drop(services_ro);
+
+                            // Decide whether to recreate. Always forces a recreate.
+                            // Newer recreates only when the digest actually changed.
+                            // When digests are unknown (runtime doesn't expose them),
+                            // we can't observe drift safely under Newer, so no-op.
+                            let should_recreate = match effective {
+                                PullPolicy::Always => true,
+                                PullPolicy::Newer => match (&old_digest, &new_digest) {
+                                    (Some(old), Some(new)) => old != new,
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+
+                            if should_recreate && current_replicas > 0 {
+                                tracing::info!(
+                                    service = %name,
+                                    policy = ?effective,
+                                    old_digest = ?old_digest,
+                                    new_digest = ?new_digest,
+                                    replicas = current_replicas,
+                                    "image drift detected; performing rolling recreate"
+                                );
+                                self.scale_service(&name, 0).await?;
+                                self.scale_service(&name, current_replicas).await?;
+                                tracing::info!(
+                                    service = %name,
+                                    new_digest = ?new_digest,
+                                    "service recreated with refreshed image"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    service = %name,
+                                    policy = ?effective,
+                                    old_digest = ?old_digest,
+                                    new_digest = ?new_digest,
+                                    "service up to date; no recreate required"
+                                );
+                            }
+                        }
+                    }
+                    return Ok(());
                 } else {
                     // Create new service with proxy manager for health-aware load balancing
                     let overlay = self.overlay_manager.as_ref().map(Arc::clone);

@@ -665,7 +665,7 @@ impl ImagePuller {
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
         let cache_key = format!("manifest:{image}");
-        let digest_key = format!("manifest-digest:{image}");
+        let digest_key = format!("manifest:digest-{image}");
 
         // 1. Blob cache hit?
         if let Some(hit) = self
@@ -777,7 +777,7 @@ impl ImagePuller {
     ) -> Result<(OciImageManifest, String)> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest-digest:{image}");
+            let digest_key = format!("manifest:digest-{image}");
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,
@@ -880,7 +880,7 @@ impl ImagePuller {
     ) -> Result<ImageConfig> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest-digest:{image}");
+            let digest_key = format!("manifest:digest-{image}");
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,
@@ -1141,7 +1141,7 @@ impl ImagePuller {
     ) -> Result<Vec<(Vec<u8>, String)>> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest-digest:{image}");
+            let digest_key = format!("manifest:digest-{image}");
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,

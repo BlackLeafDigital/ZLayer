@@ -8,6 +8,18 @@ use super::DeployEvent;
 use zlayer_tui::palette::ansi;
 use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
+/// Truncate a digest like `sha256:abcdef0123456789...` to its algorithm prefix
+/// plus the first 12 hex characters.
+fn short_digest(digest: &str) -> String {
+    let (algo, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
+    let truncated: String = hex.chars().take(12).collect();
+    if truncated.is_empty() {
+        digest.to_string()
+    } else {
+        format!("{algo}:{truncated}")
+    }
+}
+
 /// Plain-text deployment logger for non-interactive output
 ///
 /// Processes `DeployEvent`s and prints structured, human-readable output
@@ -123,9 +135,24 @@ impl PlainDeployLogger {
                 println!("{}", self.colorize(&line, ansi::CYAN));
             }
 
+            DeployEvent::ServiceRegistrationStarted { name } => {
+                println!("  {} {name} registering...", self.colorize("~", ansi::DIM));
+            }
+
             DeployEvent::ServiceRegistered { name } => {
                 let check = self.colorize("v", ansi::GREEN);
                 println!("  {check} {name} registered");
+            }
+
+            DeployEvent::ServiceOverlaySetupStarted { name } => {
+                println!(
+                    "  {} {name} overlay setup...",
+                    self.colorize("~", ansi::DIM)
+                );
+            }
+
+            DeployEvent::ServiceProxySetupStarted { name } => {
+                println!("  {} {name} proxy setup...", self.colorize("~", ansi::DIM));
             }
 
             DeployEvent::ServiceScaling {
@@ -137,6 +164,38 @@ impl PlainDeployLogger {
                     self.colorize("->", ansi::DIM),
                     name,
                     target_replicas
+                );
+            }
+
+            DeployEvent::ImagePullStarted { image } => {
+                println!(
+                    "  {} Pulling image {image}...",
+                    self.colorize("~", ansi::DIM)
+                );
+            }
+
+            DeployEvent::ImagePullComplete { image, digest } => {
+                let check = self.colorize("v", ansi::GREEN);
+                println!("  {check} Pulled {image} ({})", short_digest(digest));
+            }
+
+            DeployEvent::ServiceUpToDate { name, digest } => {
+                let check = self.colorize("v", ansi::GREEN);
+                let msg = format!("  {check} {name} up-to-date ({})", short_digest(digest));
+                println!("{}", self.colorize(&msg, ansi::GREEN));
+            }
+
+            DeployEvent::ServiceRecreating {
+                name,
+                old_digest,
+                new_digest,
+            } => {
+                let arrow = self.colorize("->", ansi::YELLOW);
+                println!(
+                    "  {} {} {arrow} {}  recreating {name}",
+                    self.colorize("~", ansi::YELLOW),
+                    short_digest(old_digest),
+                    short_digest(new_digest),
                 );
             }
 
@@ -385,6 +444,46 @@ mod tests {
             level: LogLevel::Error,
             message: "error message".to_string(),
         });
+    }
+
+    #[test]
+    fn test_handle_new_variants_no_panic() {
+        let logger = PlainDeployLogger::with_color(false);
+
+        logger.handle_event(&DeployEvent::ServiceRegistrationStarted {
+            name: "web".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ServiceOverlaySetupStarted {
+            name: "web".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ServiceProxySetupStarted {
+            name: "web".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ImagePullStarted {
+            image: "nginx:latest".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ImagePullComplete {
+            image: "nginx:latest".to_string(),
+            digest: "sha256:abcdef0123456789".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ServiceUpToDate {
+            name: "api".to_string(),
+            digest: "sha256:abc".to_string(),
+        });
+        logger.handle_event(&DeployEvent::ServiceRecreating {
+            name: "api".to_string(),
+            old_digest: "sha256:111".to_string(),
+            new_digest: "sha256:222".to_string(),
+        });
+    }
+
+    #[test]
+    fn test_short_digest_truncates_hex() {
+        assert_eq!(
+            short_digest("sha256:abcdef0123456789xyz"),
+            "sha256:abcdef012345"
+        );
+        assert_eq!(short_digest("plainstring"), "sha256:plainstring");
     }
 
     #[test]

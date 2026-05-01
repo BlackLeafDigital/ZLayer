@@ -2,9 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.11.9] - 2026-04-29
+## [0.11.9] - 2026-05-01
+
+### Added
+- `zlayer up --pull` and `--no-pull` flags (mutually exclusive) to override
+  per-service `pull_policy` for a single deploy.
+- `-d` short alias for `--detach` global flag.
+- `zlayer pull` with no arguments now auto-discovers the spec and pulls every
+  distinct image referenced by services.
+- Spec auto-discovery now matches `zlayer.<name>.yml` / `zlayer.<name>.yaml`
+  (prefix form) in addition to the existing `<name>.zlayer.yml` (dot form).
+- `PullPolicy::Newer` variant — resolves remote digest and recreates
+  containers on drift; auto-applied as the default for `:latest` / untagged
+  images via `effective_pull_policy()`.
+- Fine-grained deploy progress events for the TUI:
+  `ServiceRegistrationStarted`, `OverlaySetupStarted`, `ProxySetupStarted`,
+  `StabilizationProgress`, `ImagePullStarted`, `ImagePullComplete`,
+  `ServiceUpToDate`, `ServiceRecreating`. The deploy TUI now renders
+  per-service phase progress instead of long silent gaps.
+- `scripts/check-all.sh` cross-target workspace check (native, wasm32,
+  x86_64-pc-windows-msvc, aarch64-apple-darwin) with optional `--with-tests`
+  flag.
+- ZImagefile/Dockerfile `COPY --from=<external-image-ref>` now works for
+  arbitrary registry images (e.g.
+  `COPY --from=ghcr.io/astral-sh/uv:0.5.0 /uv /usr/local/bin/uv`). The
+  buildah backend pulls the external image once into the build's storage
+  and forwards the reference to buildah's native COPY.
+
+### Changed
+- `zlayer up` re-deploy reconciles image-digest drift on existing services.
+  With `pull_policy=Newer` (the default for `:latest`), the daemon resolves
+  the remote digest, compares to the running container's digest, and
+  rolling-recreates when they differ. Previously, re-running `zlayer up` on
+  the same spec was a silent no-op even when `:latest` had been re-pushed.
+- Daemon emits per-service "started" events around each orchestration phase
+  (registration, overlay, proxy, image pull) instead of only on completion,
+  eliminating the multi-second TUI freezes the user observed during deploys.
 
 ### Fixed
+- Registry pull no longer logs `failed to delete stale manifest digest cache
+  entry` warning. The cache key prefix was renamed from `manifest-digest:`
+  to `manifest:digest-` so it satisfies the `manifest:` validator branch.
+- Package map verifier (`verify-reposources.yml`) no longer pins
+  `openssl@3` literally — now wildcards `openssl@*` so the assertion
+  survives upstream major bumps (OpenSSL 4 already shipped).
 - `zlayer-manager` SSR panicked on the first request with `js-sys` "cannot
   access imported statics on non-wasm targets". The Navbar component called
   `web_sys::window()` from inside `apply_theme`, `read_saved_theme`, and the

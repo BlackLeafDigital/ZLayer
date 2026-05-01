@@ -212,6 +212,23 @@ impl BuildahCommand {
         Self::new("rmi").arg(image)
     }
 
+    /// Pull an image from a registry into local storage.
+    ///
+    /// `buildah pull [--policy <policy>] <image>`
+    ///
+    /// `policy` controls when the registry is consulted: `"newer"` only pulls
+    /// when the upstream is newer than the local copy, `"always"` forces a
+    /// fresh pull, and `"never"` (or `"missing"`) is useful for offline builds.
+    /// When `policy` is `None`, buildah's default policy applies.
+    #[must_use]
+    pub fn pull(image: &str, policy: Option<&str>) -> Self {
+        let mut cmd = Self::new("pull");
+        if let Some(p) = policy {
+            cmd = cmd.arg("--policy").arg(p);
+        }
+        cmd.arg(image)
+    }
+
     /// Push an image to a registry
     ///
     /// `buildah push <image>`
@@ -1001,6 +1018,22 @@ mod tests {
     }
 
     #[test]
+    fn test_pull_no_policy() {
+        let cmd = BuildahCommand::pull("ghcr.io/astral-sh/uv:0.5.0", None);
+        assert_eq!(cmd.program, "buildah");
+        assert_eq!(cmd.args, vec!["pull", "ghcr.io/astral-sh/uv:0.5.0"]);
+    }
+
+    #[test]
+    fn test_pull_with_policy() {
+        let cmd = BuildahCommand::pull("ghcr.io/astral-sh/uv:0.5.0", Some("newer"));
+        assert_eq!(
+            cmd.args,
+            vec!["pull", "--policy", "newer", "ghcr.io/astral-sh/uv:0.5.0"]
+        );
+    }
+
+    #[test]
     fn test_run_shell() {
         let cmd = BuildahCommand::run_shell("container-1", "apt-get update");
         assert_eq!(
@@ -1040,6 +1073,46 @@ mod tests {
         assert_eq!(
             cmd.args,
             vec!["copy", "--from", "builder", "container-1", "/app", "/app"]
+        );
+    }
+
+    #[test]
+    fn test_copy_from_external_image_reference_is_preserved() {
+        // `COPY --from=ghcr.io/astral-sh/uv:0.5.0 /uv /usr/local/bin/uv`
+        // — when the buildah backend hands an external image reference to
+        // the translator, the registry-qualified ref must reach buildah
+        // verbatim. Buildah resolves it against the local image store; the
+        // backend is responsible for pulling the image first.
+        use crate::dockerfile::CopyInstruction;
+
+        let copy = CopyInstruction {
+            sources: vec!["/uv".to_string()],
+            destination: "/usr/local/bin/uv".to_string(),
+            from: Some("ghcr.io/astral-sh/uv:0.5.0".to_string()),
+            chown: None,
+            chmod: None,
+            link: false,
+            exclude: Vec::new(),
+        };
+        let instruction = Instruction::Copy(copy);
+        let cmds = BuildahCommand::from_instruction("container-1", &instruction);
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "COPY translates to a single buildah copy command"
+        );
+        assert_eq!(
+            cmds[0].args,
+            vec![
+                "copy",
+                "--from",
+                "ghcr.io/astral-sh/uv:0.5.0",
+                "container-1",
+                "/uv",
+                "/usr/local/bin/uv",
+            ],
+            "external image reference must be passed through to buildah unchanged",
         );
     }
 
