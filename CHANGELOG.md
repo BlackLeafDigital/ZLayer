@@ -46,6 +46,21 @@ All notable changes to this project will be documented in this file.
 - Package map verifier (`verify-reposources.yml`) no longer pins
   `openssl@3` literally — now wildcards `openssl@*` so the assertion
   survives upstream major bumps (OpenSSL 4 already shipped).
+- `zlayer-manager` SSR panicked on the first request with
+  `js-sys-0.3.91/src/lib.rs:13087: cannot access imported statics on
+  non-wasm targets`. Root cause was the locked transitive
+  `wasm-bindgen 0.2.114 / js-sys 0.3.91` pair, which leptos→tachys exercises
+  on SSR codepaths with extern statics that panic-on-call on non-wasm
+  targets in that release line. Bumped via
+  `cargo update -p wasm-bindgen-futures -p web-sys -p wasm-bindgen -p js-sys`
+  onto the `0.2.120 / 0.3.97` line where the extern-statics no longer
+  panic. Reverted the over-aggressive `optional = true` /
+  `default-features = false` changes on
+  `leptos`/`leptos_meta`/`leptos_router`/`leptos-chartistry` in
+  `crates/zlayer-manager/Cargo.toml` — those were a guess that broke the
+  `#[component]` macro's doc-comment-on-params handling on
+  `cargo test --workspace --lib --bins` (CI builds the manager with no
+  features, so `dep:leptos` was inactive and the proc-macro never ran).
 - `zlayer-manager` SSR panicked on the first request with `js-sys` "cannot
   access imported statics on non-wasm targets". The Navbar component called
   `web_sys::window()` from inside `apply_theme`, `read_saved_theme`, and the
