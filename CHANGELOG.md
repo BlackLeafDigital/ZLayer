@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.10] - 2026-05-02
+
+### Fixed
+- macOS sandbox and VM runtimes (`pull_image_with_policy`) no longer fail to
+  compile after the `PullPolicy::Newer` variant was added; `Newer` is now
+  handled at the runtime layer like `Always` (always re-pull), with drift
+  detection remaining at the service layer.
+
 ## [0.11.9] - 2026-05-01
 
 ### Added
