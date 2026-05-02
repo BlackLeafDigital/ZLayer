@@ -561,7 +561,9 @@ impl Runtime for VmRuntime {
         let rootfs_dir = image_dir.join("rootfs");
 
         match policy {
-            zlayer_spec::PullPolicy::Always => { /* always re-pull */ }
+            zlayer_spec::PullPolicy::Always | zlayer_spec::PullPolicy::Newer => {
+                /* always re-pull; drift detection happens at the service layer */
+            }
             zlayer_spec::PullPolicy::IfNotPresent => {
                 if rootfs_dir.exists() {
                     tracing::debug!(image = %image, "Image already present, skipping pull");

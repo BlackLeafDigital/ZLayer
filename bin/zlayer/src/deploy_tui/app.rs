@@ -32,8 +32,21 @@ use zlayer_tui::palette::ansi;
 use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
 use super::deploy_view::DeployView;
-use super::state::{DeployPhase, DeployState, ServiceDeployPhase};
+use super::state::{DeployPhase, DeployState, RedeployState, ServiceDeployPhase};
 use super::{DeployEvent, ServiceHealth};
+
+/// Truncate a digest like `sha256:abcdef0123456789...` to its algorithm prefix
+/// plus the first 12 hex characters. Used by the final summary so digests
+/// printed after the alternate screen tear-down stay readable.
+fn short_digest(digest: &str) -> String {
+    let (algo, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
+    let truncated: String = hex.chars().take(12).collect();
+    if truncated.is_empty() {
+        digest.to_string()
+    } else {
+        format!("{algo}:{truncated}")
+    }
+}
 
 /// Main TUI application for deployment progress visualization
 ///
@@ -258,6 +271,7 @@ impl DeployTui {
     /// This is called after the alternate screen is dismissed so the output
     /// persists in the user's terminal scrollback -- the same UX pattern
     /// used by `docker compose up -d`.
+    #[allow(clippy::too_many_lines)]
     fn print_final_summary(&self) {
         let is_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let c = |text: &str, color: &str| -> String {
@@ -314,9 +328,39 @@ impl DeployTui {
                     ServiceHealth::Unknown => c("[unknown]", ansi::DIM),
                 };
 
+                let redeploy_suffix = match &svc.redeploy {
+                    RedeployState::UpToDate { digest } => format!(
+                        " {}",
+                        c(
+                            &format!("up-to-date ({})", short_digest(digest)),
+                            ansi::GREEN
+                        )
+                    ),
+                    RedeployState::Recreating {
+                        old_digest,
+                        new_digest,
+                    } => format!(
+                        " {}",
+                        c(
+                            &format!(
+                                "{} -> {} recreating",
+                                short_digest(old_digest),
+                                short_digest(new_digest)
+                            ),
+                            ansi::YELLOW
+                        )
+                    ),
+                    RedeployState::None => String::new(),
+                };
+
                 println!(
-                    "  {} {} {}/{} replicas {}",
-                    icon, svc.name, svc.current_replicas, svc.target_replicas, health_str,
+                    "  {} {} {}/{} replicas {}{}",
+                    icon,
+                    svc.name,
+                    svc.current_replicas,
+                    svc.target_replicas,
+                    health_str,
+                    redeploy_suffix,
                 );
             }
         } else if !self.state.running_services.is_empty() {
@@ -325,6 +369,24 @@ impl DeployTui {
             for (name, replicas) in &self.state.running_services {
                 let check = c("\u{2713}", ansi::GREEN);
                 println!("  {check} {name} ({replicas} replicas)");
+            }
+        }
+
+        // Image pulls summary (if any were observed during the deployment)
+        if !self.state.image_pulls.is_empty() {
+            println!("Images:");
+            for pull in &self.state.image_pulls {
+                let (icon, detail) = if pull.in_flight {
+                    (c("..", ansi::YELLOW), "pulling...".to_string())
+                } else {
+                    let digest_str = pull
+                        .digest
+                        .as_deref()
+                        .map(short_digest)
+                        .map_or_else(|| "pulled".to_string(), |d| format!("({d})"));
+                    (c("\u{2713}", ansi::GREEN), digest_str)
+                };
+                println!("  {icon} {} {detail}", pull.image);
             }
         }
 

@@ -91,7 +91,7 @@ pub(crate) struct Cli {
     /// Shows full deployment progress, waits for services to stabilize,
     /// then automatically exits without waiting for Ctrl+C.
     /// Unlike -b/--background, this waits for services to be confirmed running.
-    #[arg(long = "detach", global = true)]
+    #[arg(short = 'd', long = "detach", global = true)]
     pub(crate) detach: bool,
 
     /// Disable interactive TUI (use plain text output)
@@ -216,15 +216,28 @@ pub(crate) enum Commands {
     /// Auto-discovers *.zlayer.yml in current directory if no spec path given.
     /// Runs in foreground by default, streaming logs and waiting for Ctrl+C.
     /// Use -b/--background to deploy and return immediately.
+    /// Use -d/--detach to wait for services to stabilize, then exit.
+    /// Use --pull to force-pull all images, or --no-pull to skip pulling entirely.
     ///
     /// Examples:
     ///   zlayer up
     ///   zlayer up myapp.zlayer.yml
     ///   zlayer up -b
+    ///   zlayer up -d
+    ///   zlayer up --pull
+    ///   zlayer up --no-pull
     #[command(verbatim_doc_comment, display_order = 1)]
     Up {
         /// Path to deployment spec (auto-discovers *.zlayer.yml if not given)
         spec_path: Option<PathBuf>,
+
+        /// Force pull all images before deploying (overrides per-service `pull_policy`)
+        #[arg(long, conflicts_with = "no_pull")]
+        pull: bool,
+
+        /// Skip pulling images even if a per-tag default would pull
+        #[arg(long = "no-pull", conflicts_with = "pull")]
+        no_pull: bool,
     },
 
     /// Stop all services in a deployment (like docker compose down)
@@ -512,8 +525,8 @@ pub(crate) enum Commands {
     ///   zlayer pull ghcr.io/blackleafdigital/zlayer-manager:0.9.6
     #[command(verbatim_doc_comment, display_order = 20)]
     Pull {
-        /// Image reference (e.g., zachhandley/zlayer-node:latest)
-        image: String,
+        /// Image reference. If omitted, pulls every image from the auto-discovered spec.
+        image: Option<String>,
     },
 
     /// Export an image to a tar file (OCI Image Layout)
@@ -3462,7 +3475,7 @@ mod tests {
         let cli = Cli::try_parse_from(["zlayer", "up"]).unwrap();
 
         match cli.command {
-            Some(Commands::Up { spec_path }) => {
+            Some(Commands::Up { spec_path, .. }) => {
                 assert!(spec_path.is_none());
             }
             _ => panic!("Expected Up command"),

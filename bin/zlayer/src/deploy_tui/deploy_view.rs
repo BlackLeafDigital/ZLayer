@@ -34,7 +34,7 @@ use zlayer_tui::palette::color;
 use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
 
 use super::state::{DeployPhase, DeployState};
-use super::widgets::{InfraProgress, ServiceTable};
+use super::widgets::{ImagePullProgress, InfraProgress, ServiceTable};
 
 /// Main deploy progress view widget
 ///
@@ -54,42 +54,69 @@ impl<'a> DeployView<'a> {
         Self { state, frame }
     }
 
+    /// Compute the height for the image-pull box: borders (2) + one line per
+    /// pull, capped at 5 to keep the layout sane when many pulls are in
+    /// flight. Returns 0 when there are no pulls so the section disappears.
+    #[allow(clippy::cast_possible_truncation)]
+    fn image_pull_height(&self) -> u16 {
+        let count = self.state.image_pulls.len();
+        if count == 0 {
+            0
+        } else {
+            (count.min(5) as u16) + 2
+        }
+    }
+
     /// Calculate the layout regions based on current deploy phase
     fn layout(&self, area: Rect) -> ViewLayout {
+        let image_height = self.image_pull_height();
+
         if self.state.phase == DeployPhase::Running {
             // In Running mode, collapse the infra section
             let chunks = Layout::vertical([
-                Constraint::Length(3), // Header
-                Constraint::Min(6),    // Services (dashboard mode)
-                Constraint::Min(4),    // Logs
-                Constraint::Length(1), // Footer
+                Constraint::Length(3),            // Header
+                Constraint::Length(image_height), // Image pulls (0 when none)
+                Constraint::Min(6),               // Services (dashboard mode)
+                Constraint::Min(4),               // Logs
+                Constraint::Length(1),            // Footer
             ])
             .split(area);
 
             ViewLayout {
                 header: chunks[0],
+                image_pulls: if image_height == 0 {
+                    None
+                } else {
+                    Some(chunks[1])
+                },
                 infra: None,
-                services: chunks[1],
-                logs: chunks[2],
-                footer: chunks[3],
+                services: chunks[2],
+                logs: chunks[3],
+                footer: chunks[4],
             }
         } else {
             // Full layout with all sections
             let chunks = Layout::vertical([
-                Constraint::Length(3), // Header
-                Constraint::Length(5), // Infrastructure phases
-                Constraint::Min(6),    // Services
-                Constraint::Min(4),    // Logs
-                Constraint::Length(1), // Footer
+                Constraint::Length(3),            // Header
+                Constraint::Length(image_height), // Image pulls (0 when none)
+                Constraint::Length(5),            // Infrastructure phases
+                Constraint::Min(6),               // Services
+                Constraint::Min(4),               // Logs
+                Constraint::Length(1),            // Footer
             ])
             .split(area);
 
             ViewLayout {
                 header: chunks[0],
-                infra: Some(chunks[1]),
-                services: chunks[2],
-                logs: chunks[3],
-                footer: chunks[4],
+                image_pulls: if image_height == 0 {
+                    None
+                } else {
+                    Some(chunks[1])
+                },
+                infra: Some(chunks[2]),
+                services: chunks[3],
+                logs: chunks[4],
+                footer: chunks[5],
             }
         }
     }
@@ -98,6 +125,7 @@ impl<'a> DeployView<'a> {
 /// Regions of the view layout
 struct ViewLayout {
     header: Rect,
+    image_pulls: Option<Rect>,
     infra: Option<Rect>,
     services: Rect,
     logs: Rect,
@@ -109,6 +137,10 @@ impl Widget for DeployView<'_> {
         let layout = self.layout(area);
 
         self.render_header(layout.header, buf);
+
+        if let Some(image_area) = layout.image_pulls {
+            self.render_image_pulls(image_area, buf);
+        }
 
         if let Some(infra_area) = layout.infra {
             self.render_infra(infra_area, buf);
@@ -210,6 +242,17 @@ impl DeployView<'_> {
         }
     }
 
+    // ---- Image Pulls ----
+
+    /// Render the image-pull progress section by delegating to [`ImagePullProgress`]
+    fn render_image_pulls(&self, area: Rect, buf: &mut Buffer) {
+        let widget = ImagePullProgress {
+            pulls: &self.state.image_pulls,
+            tick: self.frame,
+        };
+        widget.render(area, buf);
+    }
+
     // ---- Infrastructure ----
 
     /// Render the infrastructure phases by delegating to [`InfraProgress`]
@@ -228,6 +271,7 @@ impl DeployView<'_> {
         let widget = ServiceTable {
             services: &self.state.services,
             deployed_count: self.state.services_deployed_count(),
+            tick: self.frame,
         };
         widget.render(area, buf);
     }

@@ -132,9 +132,57 @@ pub(crate) async fn handle_import(
     Ok(())
 }
 
-/// Handle pull command - pull an image from a remote registry to local cache
+/// Handle pull command - pull an image from a remote registry to local cache.
+///
+/// When `image` is `Some`, pulls that single image. When `None`, auto-discovers
+/// the deployment spec in the current directory and pulls every distinct image
+/// referenced by services declared in the spec.
+pub(crate) async fn handle_pull(image: Option<&str>, cli_data_dir: &std::path::Path) -> Result<()> {
+    match image {
+        Some(img) => handle_pull_single(img, cli_data_dir).await,
+        None => handle_pull_from_spec(cli_data_dir).await,
+    }
+}
+
+async fn handle_pull_from_spec(cli_data_dir: &std::path::Path) -> Result<()> {
+    use crate::util::{discover_spec_path, parse_spec};
+    use std::collections::BTreeSet;
+
+    let spec_path = discover_spec_path(None)?;
+    let spec = parse_spec(&spec_path)?;
+
+    // Collect distinct image references across all services. `services` is a
+    // HashMap<String, ServiceSpec>, so iterate values. `image.name` is an
+    // `ImageReference` (oci_spec `Reference`); `.whole()` yields the full
+    // canonical reference string suitable for pulling.
+    let images: BTreeSet<String> = spec
+        .services
+        .values()
+        .map(|svc| svc.image.name.whole())
+        .collect();
+
+    if images.is_empty() {
+        anyhow::bail!(
+            "Spec {} declares no services with images",
+            spec_path.display()
+        );
+    }
+
+    println!(
+        "Pulling {} image(s) from {}",
+        images.len(),
+        spec_path.display()
+    );
+    for img in &images {
+        handle_pull_single(img, cli_data_dir).await?;
+    }
+    println!("Pulled {} image(s).", images.len());
+    Ok(())
+}
+
+/// Pull a single image reference from a remote registry into the local cache.
 #[allow(clippy::cast_precision_loss)]
-pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
+async fn handle_pull_single(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 
     info!(image = %image, "Pulling image from registry");

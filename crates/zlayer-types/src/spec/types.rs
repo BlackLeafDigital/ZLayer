@@ -1012,12 +1012,47 @@ fn default_pull_policy() -> PullPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PullPolicy {
-    /// Always pull the image
+    /// Always pull the image, even if cached
     Always,
+    /// Resolve remote digest; pull and recreate when it differs from local/running
+    Newer,
     /// Pull only if not present locally
     IfNotPresent,
     /// Never pull, use local image only
     Never,
+}
+
+/// Resolve the effective pull policy for a deploy/scale operation.
+///
+/// The serde default for `pull_policy` is `IfNotPresent` (preserved for
+/// backwards compatibility). When the user has not opted out (i.e. the policy
+/// is the default `IfNotPresent`) AND the image tag is `:latest` or unspecified,
+/// we auto-upgrade to `Newer` so freshly-pushed `:latest` images get picked up
+/// on redeploy. Users who explicitly want immutable behaviour on a `:latest`
+/// tag can set `pull_policy: never`.
+#[must_use]
+pub fn effective_pull_policy(image: &crate::ImageReference, spec_policy: PullPolicy) -> PullPolicy {
+    match spec_policy {
+        PullPolicy::Always | PullPolicy::Never | PullPolicy::Newer => spec_policy,
+        PullPolicy::IfNotPresent => {
+            // Auto-upgrade IfNotPresent to Newer for :latest / no-tag images
+            if image_is_latest_or_untagged(image) {
+                PullPolicy::Newer
+            } else {
+                PullPolicy::IfNotPresent
+            }
+        }
+    }
+}
+
+fn image_is_latest_or_untagged(image: &crate::ImageReference) -> bool {
+    // `ImageReference` is `oci_spec::distribution::Reference`, which exposes a
+    // clean `tag()` accessor returning `Option<&str>`. No tag, or tag "latest",
+    // is treated as the rolling case.
+    match image.tag() {
+        None => true,
+        Some(tag) => tag == "latest",
+    }
 }
 
 /// Device passthrough specification

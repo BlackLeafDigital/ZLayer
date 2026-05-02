@@ -617,7 +617,7 @@ async fn run(
             .await
         }
         Commands::Pull { image } => {
-            commands::registry::handle_pull(image, &cli.effective_data_dir()).await
+            commands::registry::handle_pull(image.as_deref(), &cli.effective_data_dir()).await
         }
 
         // =================================================================
@@ -738,9 +738,13 @@ async fn run(
             )
             .await
         }
-        Commands::Up { spec_path } => {
+        Commands::Up {
+            spec_path,
+            pull,
+            no_pull,
+        } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
-            commands::deploy::up(&cli, &path).await
+            commands::deploy::up(&cli, &path, *pull, *no_pull).await
         }
         Commands::Down { deployment } => commands::deploy::down(deployment.clone()).await,
         Commands::Token(token_cmd) => commands::token::handle_token(token_cmd),

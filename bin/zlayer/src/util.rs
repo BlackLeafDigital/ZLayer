@@ -57,7 +57,12 @@ fn discover_spec_path_in_dir(explicit: Option<&Path>, dir: &Path) -> Result<Path
     }
 }
 
-/// Scan `dir` for files matching `*.zlayer.yml` or `*.zlayer.yaml`.
+/// Scan `dir` for files matching `*.zlayer.yml`, `*.zlayer.yaml`,
+/// `zlayer.*.yml`, or `zlayer.*.yaml`.
+///
+/// The bare `zlayer.yml` and `zlayer.yaml` filenames are excluded here because
+/// they are already handled by the exact-name candidates list in
+/// [`discover_spec_path_in_dir`].
 ///
 /// Returns a sorted vec of matching paths (sorted for deterministic output).
 fn find_zlayer_specs_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>> {
@@ -71,9 +76,13 @@ fn find_zlayer_specs_in_dir<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>> {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
 
-        if (name.ends_with(".zlayer.yml") || name.ends_with(".zlayer.yaml"))
-            && entry.file_type()?.is_file()
-        {
+        let is_dot_form = name.ends_with(".zlayer.yml") || name.ends_with(".zlayer.yaml");
+        let is_prefix_form = name.starts_with("zlayer.")
+            && (name.ends_with(".yml") || name.ends_with(".yaml"))
+            && name != "zlayer.yml"
+            && name != "zlayer.yaml";
+
+        if (is_dot_form || is_prefix_form) && entry.file_type()?.is_file() {
             matches.push(entry.path());
         }
     }
@@ -240,6 +249,28 @@ mod tests {
 
         let result = discover_spec_path_in_dir(None, &dir).unwrap();
         assert_eq!(result, dir.join("myservice.zlayer.yaml"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn single_glob_match_prefix_form_yml_is_found() {
+        let dir = make_temp_dir("single_glob_prefix_yml");
+        touch(&dir, "zlayer.manager.yml");
+
+        let result = discover_spec_path_in_dir(None, &dir).unwrap();
+        assert_eq!(result, dir.join("zlayer.manager.yml"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn single_glob_match_prefix_form_yaml_is_found() {
+        let dir = make_temp_dir("single_glob_prefix_yaml");
+        touch(&dir, "zlayer.foo.yaml");
+
+        let result = discover_spec_path_in_dir(None, &dir).unwrap();
+        assert_eq!(result, dir.join("zlayer.foo.yaml"));
 
         cleanup(&dir);
     }

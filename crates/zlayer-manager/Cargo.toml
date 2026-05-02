@@ -33,8 +33,9 @@ tower = { workspace = true, optional = true }
 tower-http = { workspace = true, features = ["fs", "trace", "compression-br", "cors"], optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
-wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Storage", "MediaQueryList", "Location"] }
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Storage", "MediaQueryList", "Location"], optional = true }
+
 zlayer-agent = { workspace = true, optional = true }
 zlayer-api = { workspace = true, optional = true }
 zlayer-spec = { workspace = true, optional = true }
@@ -87,6 +88,8 @@ ssr = [
 # Hydrate feature for client-side hydration (WASM binary)
 hydrate = [
     "leptos/hydrate",
+    "dep:wasm-bindgen",
+    "dep:web-sys",
     "dep:console_error_panic_hook",
     "dep:gloo-timers",
 ]

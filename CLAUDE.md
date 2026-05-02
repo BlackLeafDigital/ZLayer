@@ -161,14 +161,27 @@ cargo run -p zlayer -- build . -t myapp:latest
 
 **CRITICAL: `cargo fmt --all` MUST be run after EVERY code change. No exceptions. Ever. Do it before clippy, before tests, before commits. If code is not formatted, it is not done.**
 
-**CRITICAL: ALWAYS lint the ENTIRE workspace, not individual crates.** Never use `-p <crate>` for clippy. Always use `--workspace`.
+**CRITICAL: ALWAYS check the ENTIRE workspace, not individual crates.** Never use `-p <crate>` for fmt, clippy, build, or test. Always use `--workspace` (or `--all` for fmt).
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace        # or: cargo check --workspace
 ```
 
-After ANY code change, run BOTH commands above on the full workspace before considering the work done. `cargo fmt --all` FIRST, then clippy. No exceptions.
+**ALL FOUR commands above must ring GREEN across the ENTIRE workspace before any task is considered complete.** Run them in that order: fmt FIRST, then clippy, then test, then build/check. No exceptions.
+
+### ALL CHECKS GREEN — EVERY CRATE, NO EXCEPTIONS
+
+Every failure anywhere in the workspace is your responsibility, even in crates you did not directly touch. If your change breaks `zlayer-manager` while you were editing `zlayer-agent`, that is YOUR breakage and YOU must fix it before the task is done.
+
+- Do NOT commit with any crate failing fmt/clippy/test/build.
+- Do NOT declare a task complete with any crate failing fmt/clippy/test/build.
+- Do NOT punt failures as "pre-existing," "out of scope," "separate issue," or "I didn't touch that crate."
+- The ONLY exception is when the user explicitly states which checks/crates are allowed to fail for this specific task. Otherwise: green across the entire workspace, or not done.
+
+This rule exists because past sessions repeatedly shipped commits that compiled the edited crate but broke other crates in the workspace, forcing the user to commit follow-up fixes. That pattern is unacceptable.
 
 ### Pre-commit Hook
 

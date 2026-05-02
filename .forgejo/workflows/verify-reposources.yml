@@ -88,13 +88,14 @@ jobs:
           # `expected_pattern` is matched as a POSIX shell glob (not exact
           # string equality) so the workflow stays correct when brew rotates
           # its default — `python@3.14` becoming `python@3.15` next year
-          # still matches `python@3.*`, and `node@24` becoming `node@25`
-          # still matches `node@*`. The pinned `openssl@3` and bare
-          # `openjdk` are stable enough to encode literally.
+          # still matches `python@3.*`, `node@24` becoming `node@25` still
+          # matches `node@*`, and `openssl@3` becoming `openssl@4` (which
+          # already happened) still matches `openssl@*`. All version
+          # suffixes are wildcarded to survive upstream major bumps.
           ASSERTIONS="\
-            libssl-dev=openssl@3=l \
-            libssl3=openssl@3=l \
-            openssl-dev=openssl@3=o \
+            libssl-dev=openssl@*=l \
+            libssl3=openssl@*=l \
+            openssl-dev=openssl@*=o \
             nodejs=node@*=n \
             python3=python@3.*=p \
             python3-dev=python@3.*=p \

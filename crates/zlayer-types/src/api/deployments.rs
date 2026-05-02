@@ -126,6 +126,58 @@ pub enum DeploymentProgressEvent {
     },
     /// Waiting for stabilization
     Stabilizing,
+    /// Service registration is about to begin
+    ServiceRegistrationStarted {
+        /// Service name
+        service: String,
+    },
+    /// Overlay network setup is about to begin
+    OverlaySetupStarted {
+        /// Service name
+        service: String,
+    },
+    /// Proxy setup is about to begin
+    ProxySetupStarted {
+        /// Service name
+        service: String,
+    },
+    /// Periodic stabilization progress update
+    StabilizationProgress {
+        /// Service name
+        service: String,
+        /// Number of replicas currently running
+        replicas_running: u32,
+        /// Target replica count
+        target: u32,
+    },
+    /// Image pull is about to begin
+    ImagePullStarted {
+        /// Image reference
+        image: String,
+    },
+    /// Image pull completed
+    ImagePullComplete {
+        /// Image reference
+        image: String,
+        /// Resolved image digest
+        digest: String,
+    },
+    /// Re-deploy detected no digest drift; service is up-to-date and skipped
+    ServiceUpToDate {
+        /// Service name
+        service: String,
+        /// Image digest
+        digest: String,
+    },
+    /// Re-deploy detected drift; service is being recreated
+    ServiceRecreating {
+        /// Service name
+        service: String,
+        /// Previous image digest
+        old_digest: String,
+        /// New image digest
+        new_digest: String,
+    },
     /// Deployment is ready and running
     Ready,
     /// Deployment failed
@@ -149,6 +201,7 @@ pub struct DeploymentEventWrapper {
 }
 
 impl From<DeploymentProgressEvent> for DeploymentEventWrapper {
+    #[allow(clippy::too_many_lines)]
     fn from(event: DeploymentProgressEvent) -> Self {
         match event {
             DeploymentProgressEvent::Started {
@@ -208,6 +261,60 @@ impl From<DeploymentProgressEvent> for DeploymentEventWrapper {
             DeploymentProgressEvent::Stabilizing => DeploymentEventWrapper {
                 event_type: "stabilizing".to_string(),
                 data: serde_json::json!({}),
+            },
+            DeploymentProgressEvent::ServiceRegistrationStarted { service } => {
+                DeploymentEventWrapper {
+                    event_type: "service_registration_started".to_string(),
+                    data: serde_json::json!({ "service": service }),
+                }
+            }
+            DeploymentProgressEvent::OverlaySetupStarted { service } => DeploymentEventWrapper {
+                event_type: "overlay_setup_started".to_string(),
+                data: serde_json::json!({ "service": service }),
+            },
+            DeploymentProgressEvent::ProxySetupStarted { service } => DeploymentEventWrapper {
+                event_type: "proxy_setup_started".to_string(),
+                data: serde_json::json!({ "service": service }),
+            },
+            DeploymentProgressEvent::StabilizationProgress {
+                service,
+                replicas_running,
+                target,
+            } => DeploymentEventWrapper {
+                event_type: "stabilization_progress".to_string(),
+                data: serde_json::json!({
+                    "service": service,
+                    "replicas_running": replicas_running,
+                    "target": target,
+                }),
+            },
+            DeploymentProgressEvent::ImagePullStarted { image } => DeploymentEventWrapper {
+                event_type: "image_pull_started".to_string(),
+                data: serde_json::json!({ "image": image }),
+            },
+            DeploymentProgressEvent::ImagePullComplete { image, digest } => {
+                DeploymentEventWrapper {
+                    event_type: "image_pull_complete".to_string(),
+                    data: serde_json::json!({ "image": image, "digest": digest }),
+                }
+            }
+            DeploymentProgressEvent::ServiceUpToDate { service, digest } => {
+                DeploymentEventWrapper {
+                    event_type: "service_up_to_date".to_string(),
+                    data: serde_json::json!({ "service": service, "digest": digest }),
+                }
+            }
+            DeploymentProgressEvent::ServiceRecreating {
+                service,
+                old_digest,
+                new_digest,
+            } => DeploymentEventWrapper {
+                event_type: "service_recreating".to_string(),
+                data: serde_json::json!({
+                    "service": service,
+                    "old_digest": old_digest,
+                    "new_digest": new_digest,
+                }),
             },
             DeploymentProgressEvent::Ready => DeploymentEventWrapper {
                 event_type: "ready".to_string(),

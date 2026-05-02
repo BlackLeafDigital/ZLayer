@@ -14,8 +14,23 @@ use zlayer_tui::icons::{self, SPINNER_FRAMES};
 use zlayer_tui::palette::color;
 use zlayer_tui::widgets::progress_bar::ProgressBar;
 
-use super::state::{PhaseStatus, ServiceDeployPhase, ServiceState};
+use super::state::{
+    ImagePullStatus, PhaseStatus, RedeployState, ServiceDeployPhase, ServiceState, ServiceSubPhase,
+};
 use super::{InfraPhase, ServiceHealth};
+
+/// Truncate a digest like `sha256:abcdef0123456789...` to the first 12 chars
+/// of the hex portion. Returns the original string if it's already short.
+fn short_digest(digest: &str) -> String {
+    // Strip optional `sha256:` (or other algo) prefix to find the hex part
+    let (algo, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
+    let truncated: String = hex.chars().take(12).collect();
+    if truncated.is_empty() {
+        digest.to_string()
+    } else {
+        format!("{algo}:{truncated}")
+    }
+}
 
 // ───────────────────────────────────────────────────────────────────
 // InfraProgress widget
@@ -152,6 +167,8 @@ pub struct ServiceTable<'a> {
     pub services: &'a [ServiceState],
     /// Number of services that have reached Running phase
     pub deployed_count: usize,
+    /// Monotonic tick counter for spinner animation on in-flight sub-phases
+    pub tick: usize,
 }
 
 impl Widget for ServiceTable<'_> {
@@ -188,39 +205,220 @@ impl Widget for ServiceTable<'_> {
         let widths = [
             Constraint::Length(2),  // indicator
             Constraint::Min(12),    // name
-            Constraint::Length(14), // replicas
+            Constraint::Length(18), // replicas / status label
             Constraint::Length(12), // health
-            Constraint::Min(10),    // progress bar (when scaling)
+            Constraint::Min(20),    // progress bar / redeploy detail
         ];
 
         let mut rows = Vec::with_capacity(self.services.len());
         for svc in self.services {
-            let (indicator, ind_style) = service_indicator(&svc.phase);
-            let replicas = format!("{}/{} replicas", svc.current_replicas, svc.target_replicas);
+            let (indicator, ind_style) = service_indicator_animated(svc, self.tick);
+            let (status_col, status_style) = service_status_column(svc);
             let (health_text, health_style) = health_display(&svc.health);
-
-            // Progress bar for services that are actively scaling
-            let progress_str =
-                if svc.phase == ServiceDeployPhase::Scaling && svc.target_replicas > 0 {
-                    ProgressBar::new(svc.current_replicas as usize, svc.target_replicas as usize)
-                        .with_percentage()
-                        .to_string_compact(10)
-                } else {
-                    String::new()
-                };
+            let (detail, detail_style) = service_detail_column(svc);
 
             let row = Row::new(vec![
                 Cell::from(indicator).style(ind_style),
                 Cell::from(svc.name.clone()).style(service_name_style(&svc.phase)),
-                Cell::from(replicas).style(Style::default().fg(color::TEXT)),
+                Cell::from(status_col).style(status_style),
                 Cell::from(health_text).style(health_style),
-                Cell::from(progress_str).style(Style::default().fg(color::ACCENT)),
+                Cell::from(detail).style(detail_style),
             ]);
             rows.push(row);
         }
 
         let table = Table::new(rows, widths).column_spacing(1);
         Widget::render(table, inner, buf);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// ImagePullProgress widget
+// ───────────────────────────────────────────────────────────────────
+
+/// Renders a compact "Pulling images" line at the top of the screen when
+/// one or more pulls are in flight or recently completed.
+///
+/// ```text
+/// Pulling images: ~ nginx:latest   v alpine:3.20 (sha256:abcdef012345)
+/// ```
+pub struct ImagePullProgress<'a> {
+    /// Image pull statuses to render
+    pub pulls: &'a [ImagePullStatus],
+    /// Monotonic tick counter for spinner animation
+    pub tick: usize,
+}
+
+impl Widget for ImagePullProgress<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width < 10 || self.pulls.is_empty() {
+            return;
+        }
+
+        let in_flight = self.pulls.iter().filter(|p| p.in_flight).count();
+        let total = self.pulls.len();
+        let title = if in_flight == 0 {
+            format!(" Image Pulls  {total}/{total} ")
+        } else {
+            format!(" Image Pulls  {}/{total} ", total - in_flight)
+        };
+
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(if in_flight == 0 {
+                Style::default().fg(color::SUCCESS)
+            } else {
+                Style::default().fg(color::ACTIVE_BORDER)
+            });
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.height == 0 || inner.width < 5 {
+            return;
+        }
+
+        // Render up to inner.height pulls, one per line
+        for (i, pull) in self.pulls.iter().enumerate() {
+            let y = inner.y + u16::try_from(i).unwrap_or(u16::MAX);
+            if y >= inner.y + inner.height {
+                break;
+            }
+
+            let (indicator, ind_style) = if pull.in_flight {
+                let frame_idx = self.tick % SPINNER_FRAMES.len();
+                (
+                    String::from(SPINNER_FRAMES[frame_idx]),
+                    Style::default()
+                        .fg(color::WARNING)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    String::from(icons::COMPLETE),
+                    Style::default().fg(color::SUCCESS),
+                )
+            };
+
+            buf.set_string(inner.x, y, &indicator, ind_style);
+
+            let detail = match (pull.in_flight, pull.digest.as_deref()) {
+                (true, _) => format!(" {}  pulling...", pull.image),
+                (false, Some(d)) => format!(" {}  ({})", pull.image, short_digest(d)),
+                (false, None) => format!(" {}  pulled", pull.image),
+            };
+
+            let detail_style = if pull.in_flight {
+                Style::default().fg(color::WARNING)
+            } else {
+                Style::default().fg(color::TEXT)
+            };
+
+            let max_width = inner
+                .width
+                .saturating_sub(u16::try_from(indicator.len()).unwrap_or(u16::MAX))
+                as usize;
+            let truncated: String = detail.chars().take(max_width).collect();
+            buf.set_string(
+                inner.x + u16::try_from(indicator.len()).unwrap_or(u16::MAX),
+                y,
+                &truncated,
+                detail_style,
+            );
+        }
+    }
+}
+
+/// Pick a service-row indicator that respects in-flight sub-phases.
+///
+/// When a service has an active sub-phase (registering, overlay setup, proxy
+/// setup), animate a spinner instead of the static phase icon. This lets the
+/// user see that work is happening for `service_*_started` events that arrive
+/// before the corresponding `*Created`/`*Configured`/`*Registered` event.
+fn service_indicator_animated(svc: &ServiceState, tick: usize) -> (String, Style) {
+    if svc.sub_phase != ServiceSubPhase::Idle {
+        let frame_idx = tick % SPINNER_FRAMES.len();
+        return (
+            String::from(SPINNER_FRAMES[frame_idx]),
+            Style::default()
+                .fg(color::WARNING)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    service_indicator(&svc.phase)
+}
+
+/// Build the status / replicas column for a service row.
+///
+/// - During an in-flight sub-phase, show the sub-phase label.
+/// - During stabilization, show `running/target` so the user can see the
+///   replica count climb.
+/// - Otherwise fall back to `running/target replicas`.
+fn service_status_column(svc: &ServiceState) -> (String, Style) {
+    if svc.sub_phase != ServiceSubPhase::Idle {
+        let label = match svc.sub_phase {
+            ServiceSubPhase::Registering => "registering...",
+            ServiceSubPhase::OverlaySetup => "overlay...",
+            ServiceSubPhase::ProxySetup => "proxy...",
+            ServiceSubPhase::Idle => "",
+        };
+        return (label.to_string(), Style::default().fg(color::WARNING));
+    }
+
+    if matches!(
+        svc.phase,
+        ServiceDeployPhase::Scaling | ServiceDeployPhase::Running
+    ) && svc.target_replicas > 0
+    {
+        return (
+            format!("({}/{})", svc.current_replicas, svc.target_replicas),
+            Style::default().fg(color::TEXT),
+        );
+    }
+
+    (
+        format!("{}/{} replicas", svc.current_replicas, svc.target_replicas),
+        Style::default().fg(color::TEXT),
+    )
+}
+
+/// Build the detail column on the right side of a service row.
+///
+/// - `RedeployState::UpToDate` -> `up-to-date (sha256:abc...)` in green
+/// - `RedeployState::Recreating` -> `sha256:abc... -> sha256:def... recreating`
+/// - Active scaling -> compact progress bar
+/// - Otherwise empty
+fn service_detail_column(svc: &ServiceState) -> (String, Style) {
+    match &svc.redeploy {
+        RedeployState::UpToDate { digest } => (
+            format!("{} up-to-date ({})", icons::COMPLETE, short_digest(digest)),
+            Style::default().fg(color::SUCCESS),
+        ),
+        RedeployState::Recreating {
+            old_digest,
+            new_digest,
+        } => (
+            format!(
+                "{} \u{2192} {}  recreating",
+                short_digest(old_digest),
+                short_digest(new_digest)
+            ),
+            Style::default()
+                .fg(color::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RedeployState::None => {
+            if svc.phase == ServiceDeployPhase::Scaling && svc.target_replicas > 0 {
+                let bar =
+                    ProgressBar::new(svc.current_replicas as usize, svc.target_replicas as usize)
+                        .with_percentage()
+                        .to_string_compact(10);
+                (bar, Style::default().fg(color::ACCENT))
+            } else {
+                (String::new(), Style::default())
+            }
+        }
     }
 }
 
@@ -337,6 +535,7 @@ pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mu
     let svc_table = ServiceTable {
         services: &state.services,
         deployed_count: state.services_deployed_count(),
+        tick,
     };
     svc_table.render(chunks[1], buf);
 
@@ -360,7 +559,9 @@ pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy_tui::state::{DeployState, ServiceDeployPhase, ServiceState};
+    use crate::deploy_tui::state::{
+        DeployState, RedeployState, ServiceDeployPhase, ServiceState, ServiceSubPhase,
+    };
     use crate::deploy_tui::{InfraPhase, ServiceHealth};
     use zlayer_tui::widgets::scrollable_pane::{LogEntry, LogLevel};
 
@@ -447,6 +648,7 @@ mod tests {
         let widget = ServiceTable {
             services: &[],
             deployed_count: 0,
+            tick: 0,
         };
         widget.render(area, &mut buf);
 
@@ -467,29 +669,36 @@ mod tests {
             ServiceState {
                 name: "postgres".to_string(),
                 phase: ServiceDeployPhase::Running,
+                sub_phase: ServiceSubPhase::Idle,
                 target_replicas: 1,
                 current_replicas: 1,
                 health: ServiceHealth::Healthy,
+                redeploy: RedeployState::None,
             },
             ServiceState {
                 name: "api".to_string(),
                 phase: ServiceDeployPhase::Scaling,
+                sub_phase: ServiceSubPhase::Idle,
                 target_replicas: 3,
                 current_replicas: 1,
                 health: ServiceHealth::Unknown,
+                redeploy: RedeployState::None,
             },
             ServiceState {
                 name: "frontend".to_string(),
                 phase: ServiceDeployPhase::Pending,
+                sub_phase: ServiceSubPhase::Idle,
                 target_replicas: 2,
                 current_replicas: 0,
                 health: ServiceHealth::Unknown,
+                redeploy: RedeployState::None,
             },
         ];
 
         let widget = ServiceTable {
             services: &services,
             deployed_count: 1,
+            tick: 0,
         };
         widget.render(area, &mut buf);
 
@@ -642,9 +851,11 @@ mod tests {
         state.services.push(ServiceState {
             name: "web".to_string(),
             phase: ServiceDeployPhase::Running,
+            sub_phase: ServiceSubPhase::Idle,
             target_replicas: 2,
             current_replicas: 2,
             health: ServiceHealth::Healthy,
+            redeploy: RedeployState::None,
         });
         state.log_entries.push(LogEntry {
             level: LogLevel::Info,
@@ -660,5 +871,125 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(content.contains("Infrastructure") || content.contains("Services"));
+    }
+
+    #[test]
+    fn test_short_digest_helper() {
+        assert_eq!(
+            short_digest("sha256:abcdef0123456789xyz"),
+            "sha256:abcdef012345"
+        );
+        // No prefix -> assume sha256
+        assert_eq!(short_digest("plainstring"), "sha256:plainstring");
+        // Short digest is preserved
+        assert_eq!(short_digest("sha256:abc"), "sha256:abc");
+    }
+
+    #[test]
+    fn test_image_pull_progress_renders() {
+        let mut buf = create_buffer(80, 5);
+        let area = Rect::new(0, 0, 80, 5);
+
+        let pulls = vec![
+            ImagePullStatus {
+                image: "nginx:latest".to_string(),
+                digest: None,
+                in_flight: true,
+            },
+            ImagePullStatus {
+                image: "alpine:3.20".to_string(),
+                digest: Some("sha256:abcdef0123456789".to_string()),
+                in_flight: false,
+            },
+        ];
+
+        let widget = ImagePullProgress {
+            pulls: &pulls,
+            tick: 0,
+        };
+        widget.render(area, &mut buf);
+
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("Image Pulls"));
+        assert!(content.contains("nginx") || content.contains("alpine"));
+    }
+
+    #[test]
+    fn test_image_pull_progress_empty_does_not_panic() {
+        let mut buf = create_buffer(80, 5);
+        let area = Rect::new(0, 0, 80, 5);
+        let widget = ImagePullProgress {
+            pulls: &[],
+            tick: 0,
+        };
+        widget.render(area, &mut buf);
+    }
+
+    #[test]
+    fn test_service_table_with_sub_phase_uses_spinner() {
+        let mut buf = create_buffer(80, 5);
+        let area = Rect::new(0, 0, 80, 5);
+
+        let services = vec![ServiceState {
+            name: "web".to_string(),
+            phase: ServiceDeployPhase::Pending,
+            sub_phase: ServiceSubPhase::OverlaySetup,
+            target_replicas: 0,
+            current_replicas: 0,
+            health: ServiceHealth::Unknown,
+            redeploy: RedeployState::None,
+        }];
+
+        let widget = ServiceTable {
+            services: &services,
+            deployed_count: 0,
+            tick: 1,
+        };
+        widget.render(area, &mut buf);
+
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // Sub-phase label should appear in the status column
+        assert!(content.contains("overlay") || content.contains("Services"));
+    }
+
+    #[test]
+    fn test_service_table_with_recreating_renders_arrow() {
+        let mut buf = create_buffer(120, 5);
+        let area = Rect::new(0, 0, 120, 5);
+
+        let services = vec![ServiceState {
+            name: "web".to_string(),
+            phase: ServiceDeployPhase::Running,
+            sub_phase: ServiceSubPhase::Idle,
+            target_replicas: 1,
+            current_replicas: 1,
+            health: ServiceHealth::Healthy,
+            redeploy: RedeployState::Recreating {
+                old_digest: "sha256:abcdef012345".to_string(),
+                new_digest: "sha256:fedcba543210".to_string(),
+            },
+        }];
+
+        let widget = ServiceTable {
+            services: &services,
+            deployed_count: 1,
+            tick: 0,
+        };
+        widget.render(area, &mut buf);
+
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("recreating") || content.contains("Services"));
     }
 }

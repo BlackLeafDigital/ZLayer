@@ -111,13 +111,58 @@ fn setup_tui_channel(
 /// service registration, scaling and health-checking.  This function polls
 /// `GET /api/v1/deployments/{name}` until the deployment reaches a terminal
 /// state (running / failed) or a timeout is hit.
+pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
+    deploy_core(cli, spec_path, dry_run, false, false).await
+}
+
+/// Deploy variant for `up` that supports `--pull` / `--no-pull` overrides.
+///
+/// Behaves like [`deploy`] but, before submitting the spec to the daemon,
+/// rewrites every service's `pull_policy` according to the override flags:
+///
+/// * `pull = true` -> `PullPolicy::Always`
+/// * `no_pull = true` -> `PullPolicy::Never`
+///
+/// Clap's `conflicts_with` ensures the two flags can't both be set, so we
+/// don't bother validating that here.
+pub(crate) async fn deploy_with_pull_overrides(
+    cli: &Cli,
+    spec_path: &Path,
+    dry_run: bool,
+    pull: bool,
+    no_pull: bool,
+) -> Result<()> {
+    deploy_core(cli, spec_path, dry_run, pull, no_pull).await
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::assigning_clones,
     clippy::cast_possible_truncation
 )]
-pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
-    let spec = parse_spec(spec_path)?;
+async fn deploy_core(
+    cli: &Cli,
+    spec_path: &Path,
+    dry_run: bool,
+    pull: bool,
+    no_pull: bool,
+) -> Result<()> {
+    let mut spec = parse_spec(spec_path)?;
+
+    // Apply --pull / --no-pull overrides up-front so both the dry-run plan
+    // display and the YAML sent to the daemon reflect the user's choice.
+    // Clap enforces that `pull` and `no_pull` are mutually exclusive.
+    let pull_override_applied = pull || no_pull;
+    if pull {
+        for service in spec.services.values_mut() {
+            service.image.pull_policy = zlayer_spec::PullPolicy::Always;
+        }
+    }
+    if no_pull {
+        for service in spec.services.values_mut() {
+            service.image.pull_policy = zlayer_spec::PullPolicy::Never;
+        }
+    }
 
     // ------------------------------------------------------------------
     // Dry-run: validate + display plan, no daemon needed
@@ -144,8 +189,17 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
     // ------------------------------------------------------------------
     // Live deploy via daemon
     // ------------------------------------------------------------------
-    let spec_yaml = std::fs::read_to_string(spec_path)
-        .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
+    // When a pull override is in effect we re-serialize the (mutated) spec so
+    // the daemon receives the overridden policies. Otherwise we forward the
+    // user's original YAML verbatim to preserve formatting / comments / fields
+    // we may not round-trip.
+    let spec_yaml = if pull_override_applied {
+        serde_yaml::to_string(&spec)
+            .context("Failed to re-serialize spec after applying pull-policy override")?
+    } else {
+        std::fs::read_to_string(spec_path)
+            .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?
+    };
 
     // Decide between TUI and plain logger. TUI is the default when stdout is
     // a TTY and --no-tui wasn't passed; detach/background still use the TUI so
@@ -457,7 +511,23 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                 .unwrap_or_else(|| "Unknown failure".to_string());
                         }
                         other => {
-                            debug!(event = other, "Unrecognized SSE deployment event");
+                            // Try the deploy_tui SSE→DeployEvent translator for the
+                            // newer fine-grained variants (service_registration_started,
+                            // overlay_setup_started, proxy_setup_started,
+                            // stabilization_progress, image_pull_started/complete,
+                            // service_up_to_date, service_recreating). Returns an empty
+                            // Vec for unknown event types, so we fall back to debug-log.
+                            let parsed_data: serde_json::Value =
+                                serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+                            let translated =
+                                crate::deploy_tui::sse_to_deploy_events(other, &parsed_data);
+                            if translated.is_empty() {
+                                debug!(event = other, "Unrecognized SSE deployment event");
+                            } else {
+                                for ev in translated {
+                                    emit(&tx, ev);
+                                }
+                            }
                         }
                     }
                 }
@@ -618,8 +688,8 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
 /// Resolves the deployment mode from CLI flags, then delegates to `deploy()`.
 /// The daemon handles all infrastructure; this is a thin wrapper that decides
 /// whether to stay attached after the deployment reaches a running state.
-pub(crate) async fn up(cli: &Cli, spec_path: &Path) -> Result<()> {
-    deploy(cli, spec_path, false).await
+pub(crate) async fn up(cli: &Cli, spec_path: &Path, pull: bool, no_pull: bool) -> Result<()> {
+    deploy_with_pull_overrides(cli, spec_path, false, pull, no_pull).await
 }
 
 // ---------------------------------------------------------------------------
