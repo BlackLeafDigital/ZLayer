@@ -1030,6 +1030,7 @@ pub enum PullPolicy {
 /// we auto-upgrade to `Newer` so freshly-pushed `:latest` images get picked up
 /// on redeploy. Users who explicitly want immutable behaviour on a `:latest`
 /// tag can set `pull_policy: never`.
+#[must_use]
 pub fn effective_pull_policy(image: &crate::ImageReference, spec_policy: PullPolicy) -> PullPolicy {
     match spec_policy {
         PullPolicy::Always | PullPolicy::Never | PullPolicy::Newer => spec_policy,

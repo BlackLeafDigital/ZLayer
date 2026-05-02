@@ -281,7 +281,7 @@ impl Widget for ImagePullProgress<'_> {
 
         // Render up to inner.height pulls, one per line
         for (i, pull) in self.pulls.iter().enumerate() {
-            let y = inner.y + i as u16;
+            let y = inner.y + u16::try_from(i).unwrap_or(u16::MAX);
             if y >= inner.y + inner.height {
                 break;
             }
@@ -315,10 +315,13 @@ impl Widget for ImagePullProgress<'_> {
                 Style::default().fg(color::TEXT)
             };
 
-            let max_width = inner.width.saturating_sub(indicator.len() as u16) as usize;
+            let max_width = inner
+                .width
+                .saturating_sub(u16::try_from(indicator.len()).unwrap_or(u16::MAX))
+                as usize;
             let truncated: String = detail.chars().take(max_width).collect();
             buf.set_string(
-                inner.x + indicator.len() as u16,
+                inner.x + u16::try_from(indicator.len()).unwrap_or(u16::MAX),
                 y,
                 &truncated,
                 detail_style,

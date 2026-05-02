@@ -381,7 +381,12 @@ pub async fn create_deployment(
         let spec_clone = spec.clone();
         let deploy_name_clone = deployment_name.clone();
         tokio::spawn(async move {
-            orchestrate_deployment(state_clone.clone(), spec_clone, Some(event_tx)).await;
+            Box::pin(orchestrate_deployment(
+                state_clone.clone(),
+                spec_clone,
+                Some(event_tx),
+            ))
+            .await;
             // Clean up the event channel once orchestration is done (sender dropped
             // by the function, so subscribers see the stream end).
             state_clone.event_channels.remove(&deploy_name_clone);

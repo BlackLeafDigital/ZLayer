@@ -300,20 +300,14 @@ pub fn sse_to_deploy_events(event_type: &str, data: &serde_json::Value) -> Vec<D
             .unwrap_or_default(),
         "stabilization_progress" => {
             let Some(name) = svc() else { return Vec::new() };
-            let current = data
-                .get("replicas_running")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .min(u64::from(u32::MAX)) as u32;
-            let target = data
-                .get("target")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .min(u64::from(u32::MAX)) as u32;
+            let u32_field = |k: &str| {
+                u32::try_from(data.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0))
+                    .unwrap_or(u32::MAX)
+            };
             vec![DeployEvent::ServiceReplicaUpdate {
                 name,
-                current,
-                target,
+                current: u32_field("replicas_running"),
+                target: u32_field("target"),
             }]
         }
         "image_pull_started" => data

@@ -231,7 +231,7 @@ pub(crate) enum Commands {
         /// Path to deployment spec (auto-discovers *.zlayer.yml if not given)
         spec_path: Option<PathBuf>,
 
-        /// Force pull all images before deploying (overrides per-service pull_policy)
+        /// Force pull all images before deploying (overrides per-service `pull_policy`)
         #[arg(long, conflicts_with = "no_pull")]
         pull: bool,
 
@@ -3475,7 +3475,7 @@ mod tests {
         let cli = Cli::try_parse_from(["zlayer", "up"]).unwrap();
 
         match cli.command {
-            Some(Commands::Up { spec_path }) => {
+            Some(Commands::Up { spec_path, .. }) => {
                 assert!(spec_path.is_none());
             }
             _ => panic!("Expected Up command"),

@@ -1349,6 +1349,7 @@ impl ServiceManager {
     ///
     /// # Errors
     /// Returns an error if service creation, scaling, or cron registration fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn upsert_service(&self, name: String, spec: ServiceSpec) -> Result<()> {
         match spec.rtype {
             ResourceType::Service => {
@@ -1368,7 +1369,8 @@ impl ServiceManager {
 
                     let effective = effective_pull_policy(&spec.image.name, spec.image.pull_policy);
                     let old_digest = instance.last_pulled_digest().await;
-                    let current_replicas = instance.replica_count().await as u32;
+                    let current_replicas =
+                        u32::try_from(instance.replica_count().await).unwrap_or(u32::MAX);
                     drop(services); // Release write lock before pull / scale (which take their own locks).
 
                     match effective {
@@ -1441,60 +1443,59 @@ impl ServiceManager {
                         }
                     }
                     return Ok(());
+                }
+                // Create new service with proxy manager for health-aware load balancing
+                let overlay = self.overlay_manager.as_ref().map(Arc::clone);
+                let mut instance = if let Some(proxy) = &self.proxy_manager {
+                    ServiceInstance::with_proxy(
+                        name.clone(),
+                        spec,
+                        self.runtime.clone(),
+                        overlay,
+                        Arc::clone(proxy),
+                    )
                 } else {
-                    // Create new service with proxy manager for health-aware load balancing
-                    let overlay = self.overlay_manager.as_ref().map(Arc::clone);
-                    let mut instance = if let Some(proxy) = &self.proxy_manager {
-                        ServiceInstance::with_proxy(
+                    ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
+                };
+                // Set DNS server if configured
+                if let Some(dns) = &self.dns_server {
+                    instance.set_dns_server(Arc::clone(dns));
+                }
+                // Wire shared health states so callbacks bridge back to ServiceManager
+                instance.set_health_states(Arc::clone(&self.health_states));
+                // Register HTTP routes via proxy manager
+                if let Some(proxy) = &self.proxy_manager {
+                    proxy.add_service(&name, &instance.spec).await;
+                }
+                // Register TCP/UDP endpoints in stream registry
+                if let Some(stream_registry) = &self.stream_registry {
+                    for endpoint in &instance.spec.endpoints {
+                        let svc = StreamService::new(
                             name.clone(),
-                            spec,
-                            self.runtime.clone(),
-                            overlay,
-                            Arc::clone(proxy),
-                        )
-                    } else {
-                        ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
-                    };
-                    // Set DNS server if configured
-                    if let Some(dns) = &self.dns_server {
-                        instance.set_dns_server(Arc::clone(dns));
-                    }
-                    // Wire shared health states so callbacks bridge back to ServiceManager
-                    instance.set_health_states(Arc::clone(&self.health_states));
-                    // Register HTTP routes via proxy manager
-                    if let Some(proxy) = &self.proxy_manager {
-                        proxy.add_service(&name, &instance.spec).await;
-                    }
-                    // Register TCP/UDP endpoints in stream registry
-                    if let Some(stream_registry) = &self.stream_registry {
-                        for endpoint in &instance.spec.endpoints {
-                            let svc = StreamService::new(
-                                name.clone(),
-                                Vec::new(), // No backends yet; added on scale-up
-                            );
-                            match endpoint.protocol {
-                                Protocol::Tcp => {
-                                    stream_registry.register_tcp(endpoint.port, svc);
-                                    tracing::debug!(
-                                        service = %name,
-                                        port = endpoint.port,
-                                        "Registered TCP stream route"
-                                    );
-                                }
-                                Protocol::Udp => {
-                                    stream_registry.register_udp(endpoint.port, svc);
-                                    tracing::debug!(
-                                        service = %name,
-                                        port = endpoint.port,
-                                        "Registered UDP stream route"
-                                    );
-                                }
-                                _ => {} // HTTP routes handled by proxy manager
+                            Vec::new(), // No backends yet; added on scale-up
+                        );
+                        match endpoint.protocol {
+                            Protocol::Tcp => {
+                                stream_registry.register_tcp(endpoint.port, svc);
+                                tracing::debug!(
+                                    service = %name,
+                                    port = endpoint.port,
+                                    "Registered TCP stream route"
+                                );
                             }
+                            Protocol::Udp => {
+                                stream_registry.register_udp(endpoint.port, svc);
+                                tracing::debug!(
+                                    service = %name,
+                                    port = endpoint.port,
+                                    "Registered UDP stream route"
+                                );
+                            }
+                            _ => {} // HTTP routes handled by proxy manager
                         }
                     }
-                    services.insert(name, instance);
                 }
+                services.insert(name, instance);
             }
             ResourceType::Job => {
                 // Job: Just store the spec for later triggering

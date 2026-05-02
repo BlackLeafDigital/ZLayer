@@ -201,6 +201,7 @@ pub struct DeploymentEventWrapper {
 }
 
 impl From<DeploymentProgressEvent> for DeploymentEventWrapper {
+    #[allow(clippy::too_many_lines)]
     fn from(event: DeploymentProgressEvent) -> Self {
         match event {
             DeploymentProgressEvent::Started {

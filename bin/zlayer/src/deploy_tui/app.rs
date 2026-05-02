@@ -271,6 +271,7 @@ impl DeployTui {
     /// This is called after the alternate screen is dismissed so the output
     /// persists in the user's terminal scrollback -- the same UX pattern
     /// used by `docker compose up -d`.
+    #[allow(clippy::too_many_lines)]
     fn print_final_summary(&self) {
         let is_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
         let c = |text: &str, color: &str| -> String {
@@ -382,8 +383,7 @@ impl DeployTui {
                         .digest
                         .as_deref()
                         .map(short_digest)
-                        .map(|d| format!("({d})"))
-                        .unwrap_or_else(|| "pulled".to_string());
+                        .map_or_else(|| "pulled".to_string(), |d| format!("({d})"));
                     (c("\u{2713}", ansi::GREEN), digest_str)
                 };
                 println!("  {icon} {} {detail}", pull.image);

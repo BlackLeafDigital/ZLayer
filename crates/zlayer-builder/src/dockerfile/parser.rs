@@ -589,11 +589,11 @@ CMD ["/app"]
         // `COPY --from=<external-image>` must capture the full registry-
         // qualified reference in `CopyInstruction.from` so the buildah
         // backend can pull and forward it to `buildah copy --from=...`.
-        let content = r#"
+        let content = r"
 FROM alpine:3.18
 COPY --from=ghcr.io/astral-sh/uv:0.5.0 /uv /usr/local/bin/uv
 RUN /usr/local/bin/uv --version
-"#;
+";
 
         let dockerfile = Dockerfile::parse(content).unwrap();
         assert_eq!(dockerfile.stages.len(), 1);
