@@ -174,7 +174,7 @@ impl ListenerManager {
         timeout: Duration,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let port = listener.local_addr().map_or(0, |a| a.port());
 
         loop {
             tokio::select! {
@@ -348,7 +348,7 @@ impl ListenerManager {
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
         let mut buf = vec![0u8; 65535];
-        let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let port = socket.local_addr().map_or(0, |a| a.port());
 
         loop {
             tokio::select! {

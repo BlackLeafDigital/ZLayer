@@ -35,8 +35,7 @@ pub type TokenValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 fn current_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis())
         .min(u128::from(u64::MAX)) as u64
 }
 

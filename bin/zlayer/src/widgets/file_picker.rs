@@ -90,8 +90,8 @@ impl FilePickerState {
             }
 
             // Sort alphabetically
-            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            dirs.sort_by_key(|e| e.name.to_lowercase());
+            files.sort_by_key(|e| e.name.to_lowercase());
 
             self.entries.extend(dirs);
             self.entries.extend(files);

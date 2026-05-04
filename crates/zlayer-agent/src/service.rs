@@ -2321,7 +2321,9 @@ services:
         services.insert("b".to_string(), mock_spec());
 
         // Should deploy both without issue
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         // Both services should be registered
         let service_list = manager.list_services().await;
@@ -2357,7 +2359,9 @@ services:
         );
 
         // Should deploy in order: c, b, a
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         // All services should be registered
         let service_list = manager.list_services().await;
@@ -2391,7 +2395,7 @@ services:
         );
 
         // Should fail with cycle detection
-        let result = manager.deploy_with_dependencies(services).await;
+        let result = Box::pin(manager.deploy_with_dependencies(services)).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Cyclic dependency"));
@@ -2417,7 +2421,9 @@ services:
         );
 
         // Should deploy both despite timeout
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         let service_list = manager.list_services().await;
         assert_eq!(service_list.len(), 2);
@@ -2443,7 +2449,9 @@ services:
         );
 
         // Should deploy both despite timeout (with warning)
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         let service_list = manager.list_services().await;
         assert_eq!(service_list.len(), 2);
@@ -2469,7 +2477,7 @@ services:
         );
 
         // Should fail after B is started but doesn't become healthy
-        let result = manager.deploy_with_dependencies(services).await;
+        let result = Box::pin(manager.deploy_with_dependencies(services)).await;
         assert!(result.is_err());
 
         // B should be started (it has no deps), but A should fail

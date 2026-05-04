@@ -122,7 +122,7 @@ impl AuditStorage for InMemoryAuditStore {
             .collect();
 
         // Most recent first.
-        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.sort_by_key(|r| std::cmp::Reverse(r.created_at));
 
         result.truncate(filter.limit);
         Ok(result)

@@ -691,7 +691,7 @@ max_reconnect_interval = "1000ms"
 "#;
         let config: TunnelClientConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(config.reconnect_interval, Duration::from_millis(500));
-        assert_eq!(config.max_reconnect_interval, Duration::from_millis(1000));
+        assert_eq!(config.max_reconnect_interval, Duration::from_secs(1));
 
         // Test hours
         let toml_str = r#"

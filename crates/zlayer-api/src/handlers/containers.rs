@@ -6,28 +6,40 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
+    http::{header, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     Json,
 };
+use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info};
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
 use crate::event_bus::{ContainerEvent, ContainerEventBus};
+use crate::handlers::container_id_map::{compute_hex, ContainerIdMap, ZLAYER_CONTAINER_ID_LABEL};
 use crate::handlers::container_networks::BridgeNetworkApiState;
+use crate::handlers::exec_instances::ExecInstances;
+use crate::storage::{
+    ComposeProjectStorage, InMemoryComposeProjectStorage, InMemoryStandaloneContainerStorage,
+    StandaloneContainerStorage,
+};
 use zlayer_agent::runtime::{
-    ContainerId, ContainerInspectDetails, ContainerState, ExecEvent, HealthDetail,
-    NetworkAttachmentDetail, Runtime,
+    ArchivePutOptions, ContainerId, ContainerInspectDetails, ContainerState, ExecEvent,
+    HealthDetail, LogChannel, LogChunk, LogsStreamOptions, NetworkAttachmentDetail, PathStat,
+    Runtime, StatsSample,
 };
 use zlayer_spec::BridgeNetworkAttachment;
 
@@ -70,6 +82,46 @@ pub struct ContainerApiState {
     pub registry_store: Option<
         Arc<zlayer_secrets::RegistryCredentialStore<Arc<zlayer_secrets::PersistentSecretsStore>>>,
     >,
+    /// Bidirectional map between Docker-shaped 64-char hex container IDs and
+    /// the native [`ContainerId { service, replica }`] handles. Populated by
+    /// the create handler and consulted by [`resolve_container_id`] so that
+    /// REST clients (and the Docker compat layer) can address containers by
+    /// their hex IDs while internal storage keeps using the service-name key.
+    pub id_map: Arc<ContainerIdMap>,
+    /// Persistent backing store for standalone-container metadata. Every
+    /// create / delete on the in-memory `containers` cache is mirrored here
+    /// first so the daemon can repopulate the cache from disk on restart.
+    /// Defaults to an [`InMemoryStandaloneContainerStorage`] when constructed
+    /// via [`Self::new`] / [`Self::with_daemon_uuid`] / [`Self::with_event_bus`];
+    /// production daemons swap in a `SqliteStandaloneContainerStorage` via
+    /// [`Self::with_standalone_storage`].
+    pub standalone_storage: Arc<dyn StandaloneContainerStorage>,
+    /// Persistent backing store for compose-project metadata recorded by
+    /// `zlayer compose up`. Survives daemon restarts so a later
+    /// `compose down` / `compose ls` can recover the project's identity
+    /// (working directory, layered compose files, active profiles, env files,
+    /// service set, and the concrete container ids spawned).
+    ///
+    /// Defaults to an [`InMemoryComposeProjectStorage`] when constructed via
+    /// [`Self::new`] / [`Self::with_daemon_uuid`] / [`Self::with_event_bus`];
+    /// production daemons swap in a `SqliteComposeProjectStorage` via
+    /// [`Self::with_compose_storage`].
+    pub compose_storage: Arc<dyn ComposeProjectStorage>,
+    /// In-memory registry of pending/running exec instances, keyed by their
+    /// 64-char hex exec ID. Populated by `POST /containers/{id}/exec` and
+    /// consumed by `POST /exec/{id}/start`, `GET /exec/{id}/json`, and
+    /// `DELETE /exec/{id}`. Defaults to a fresh empty registry; daemons
+    /// share a single instance across `ContainerApiState` clones via
+    /// `Arc::clone`.
+    pub exec_instances: Arc<ExecInstances>,
+    /// Active PTY resize senders for the *main* container processes (not
+    /// exec'd ones), keyed by [`ContainerId`]. Populated when a container is
+    /// started with TTY enabled and the runtime hands back a resize sender;
+    /// consulted by `POST /api/v1/containers/{id}/resize` to forward
+    /// terminal-size hints. Currently only populated for containers that the
+    /// daemon attached interactively — non-TTY containers have no entry, and
+    /// the resize endpoint returns `400` for those.
+    pub container_pty_resizers: Arc<DashMap<ContainerId, mpsc::Sender<(u16, u16)>>>,
 }
 
 /// Metadata for a standalone container (not managed by a deployment)
@@ -85,17 +137,54 @@ pub struct StandaloneContainer {
     pub labels: HashMap<String, String>,
     /// When the container was created
     pub created_at: String,
+    /// Mirror of [`zlayer_spec::LifecycleSpec::delete_on_exit`] from the
+    /// originating create request (Docker `--rm` / `HostConfig.AutoRemove`).
+    /// Consulted by the daemon-side auto-remove subscriber
+    /// ([`auto_remove::start_auto_remove_subscriber`]) on every
+    /// `container.die` event: when `true` the corresponding container record
+    /// is stopped, removed, and dropped from the cache; when `false` the
+    /// record is retained so the container can be inspected post-mortem.
+    pub delete_on_exit: bool,
 }
 
 impl ContainerApiState {
     /// Create a new container API state with a runtime and a fresh event bus.
+    ///
+    /// The container-id map is seeded with a freshly-generated daemon UUID;
+    /// production callers should use [`Self::with_daemon_uuid`] (or attach a
+    /// pre-built map via [`Self::with_id_map`]) so the same hash space is
+    /// shared across daemon restarts.
     pub fn new(runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
+        let daemon_uuid = uuid::Uuid::new_v4().as_simple().to_string();
         Self {
             runtime,
             containers: Arc::new(RwLock::new(HashMap::new())),
             event_bus: ContainerEventBus::new(),
             bridge_networks: None,
             registry_store: None,
+            id_map: Arc::new(ContainerIdMap::new(daemon_uuid)),
+            standalone_storage: Arc::new(InMemoryStandaloneContainerStorage::new()),
+            compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
+            exec_instances: Arc::new(ExecInstances::new()),
+            container_pty_resizers: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Create a new container API state with a runtime, a fresh event bus,
+    /// and an explicit daemon UUID. Used by the daemon entrypoint so the
+    /// hex-id hash space is stable across restarts.
+    pub fn with_daemon_uuid(runtime: Arc<dyn Runtime + Send + Sync>, daemon_uuid: String) -> Self {
+        Self {
+            runtime,
+            containers: Arc::new(RwLock::new(HashMap::new())),
+            event_bus: ContainerEventBus::new(),
+            bridge_networks: None,
+            registry_store: None,
+            id_map: Arc::new(ContainerIdMap::new(daemon_uuid)),
+            standalone_storage: Arc::new(InMemoryStandaloneContainerStorage::new()),
+            compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
+            exec_instances: Arc::new(ExecInstances::new()),
+            container_pty_resizers: Arc::new(DashMap::new()),
         }
     }
 
@@ -106,13 +195,38 @@ impl ContainerApiState {
         runtime: Arc<dyn Runtime + Send + Sync>,
         event_bus: ContainerEventBus,
     ) -> Self {
+        let daemon_uuid = uuid::Uuid::new_v4().as_simple().to_string();
         Self {
             runtime,
             containers: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
             bridge_networks: None,
             registry_store: None,
+            id_map: Arc::new(ContainerIdMap::new(daemon_uuid)),
+            standalone_storage: Arc::new(InMemoryStandaloneContainerStorage::new()),
+            compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
+            exec_instances: Arc::new(ExecInstances::new()),
+            container_pty_resizers: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Replace the [`ContainerIdMap`] on this state with the supplied
+    /// instance. Useful for daemons that share a single map across multiple
+    /// `ContainerApiState` clones (e.g. event subscribers).
+    #[must_use]
+    pub fn with_id_map(mut self, id_map: Arc<ContainerIdMap>) -> Self {
+        self.id_map = id_map;
+        self
+    }
+
+    /// Replace the event bus on this state. Used by the daemon entrypoint to
+    /// share a single [`ContainerEventBus`] (`DaemonEventBus`) across the
+    /// container, image, network, and volume states so all four resource
+    /// families publish on the same broadcast channel.
+    #[must_use]
+    pub fn with_shared_event_bus(mut self, event_bus: ContainerEventBus) -> Self {
+        self.event_bus = event_bus;
+        self
     }
 
     /// Attach the bridge-network registry so the container create handler
@@ -139,6 +253,53 @@ impl ContainerApiState {
     ) -> Self {
         self.registry_store = Some(registry_store);
         self
+    }
+
+    /// Replace the standalone-container storage backend on this state.
+    /// Production daemons attach a `SqliteStandaloneContainerStorage` here so
+    /// create/delete on `/api/v1/containers` survives daemon restarts; tests
+    /// keep the default in-memory backend.
+    #[must_use]
+    pub fn with_standalone_storage(
+        mut self,
+        standalone_storage: Arc<dyn StandaloneContainerStorage>,
+    ) -> Self {
+        self.standalone_storage = standalone_storage;
+        self
+    }
+
+    /// Replace the compose-project storage backend on this state.
+    /// Production daemons attach a `SqliteComposeProjectStorage` here so
+    /// `zlayer compose up` records survive daemon restarts; tests keep the
+    /// default in-memory backend.
+    #[must_use]
+    pub fn with_compose_storage(mut self, compose_storage: Arc<dyn ComposeProjectStorage>) -> Self {
+        self.compose_storage = compose_storage;
+        self
+    }
+
+    /// Repopulate the in-memory `containers` cache from
+    /// [`Self::standalone_storage`]. The cache is keyed by
+    /// [`ContainerId::service`] (matching what `create_container` writes), so
+    /// the storage list is normalised to that key here as well.
+    ///
+    /// Called once at daemon startup — after the storage handle is attached
+    /// via [`Self::with_standalone_storage`] — to make previously-created
+    /// standalone containers visible to list/inspect/delete handlers without
+    /// requiring a fresh API call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage layer's [`StorageError`](crate::storage::StorageError)
+    /// if listing fails. The cache is left untouched on error.
+    pub async fn repopulate_cache_from_storage(&self) -> Result<()> {
+        let entries = self.standalone_storage.list().await?;
+        let mut cache = self.containers.write().await;
+        for entry in entries {
+            let key = entry.container_id.service.clone();
+            cache.insert(key, entry);
+        }
+        Ok(())
     }
 }
 
@@ -356,15 +517,6 @@ pub fn container_health_info_from_detail(d: HealthDetail) -> ContainerHealthInfo
     }
 }
 
-/// Clamp the requested interval into `[1, 60]` seconds, defaulting to 2.
-///
-/// Free function (rather than `impl StatsQuery`) because `StatsQuery` is
-/// foreign to this crate, which would violate the orphan rule.
-fn stats_query_clamped_interval(query: &StatsQuery) -> Duration {
-    let secs = query.interval.unwrap_or(2).clamp(1, 60);
-    Duration::from_secs(u64::from(secs))
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -382,6 +534,90 @@ fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
         replica: 0,
     };
     (service_name, cid)
+}
+
+/// Resolution outcome from [`resolve_container_lookup`]: the underlying
+/// [`ContainerId`] plus the storage key (service-name string) used to look up
+/// the container in [`ContainerApiState::containers`].
+pub(crate) struct ResolvedContainer {
+    pub(crate) container_id: ContainerId,
+    pub(crate) storage_key: String,
+}
+
+/// Resolve a raw URL-supplied container identifier into the canonical
+/// [`ContainerId`] used by the runtime, plus the storage-map key.
+///
+/// Accepts:
+/// 1. A 64-character lowercase hex hash registered in the [`ContainerIdMap`].
+/// 2. A 12+ character hex prefix that uniquely matches one registered hex.
+/// 3. The legacy service-name string used as the storage key (e.g.
+///    `"standalone-myapp"`).
+///
+/// Returns `None` when the identifier matches none of the above.
+pub(crate) async fn resolve_container_lookup(
+    state: &ContainerApiState,
+    raw: &str,
+) -> Option<ResolvedContainer> {
+    let is_hex = !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+
+    // Full 64-char hex: direct lookup.
+    if is_hex && raw.len() == 64 {
+        if let Some(cid) = state.id_map.lookup_hex(raw) {
+            let storage_key = cid.service.clone();
+            return Some(ResolvedContainer {
+                container_id: cid,
+                storage_key,
+            });
+        }
+    }
+
+    // Short hex prefix: scan registered entries for a unique match. The
+    // standalone-container set is expected to stay small; a linear scan over
+    // the in-memory `containers` map (which we keyed by service-name) plus a
+    // hex recompute via `compute_hex` avoids exposing the internals of
+    // `ContainerIdMap` just for this lookup.
+    if is_hex && raw.len() >= 12 && raw.len() < 64 {
+        let snapshot: Vec<(String, ContainerId)> = {
+            let g = state.containers.read().await;
+            g.iter()
+                .map(|(k, v)| (k.clone(), v.container_id.clone()))
+                .collect()
+        };
+        let mut matches = snapshot.into_iter().filter_map(|(key, cid)| {
+            let hex = state.id_map.lookup_container(&cid).unwrap_or_else(|| {
+                crate::handlers::container_id_map::compute_hex(state.id_map.daemon_uuid(), &cid)
+            });
+            if hex.starts_with(raw) {
+                Some(ResolvedContainer {
+                    container_id: cid,
+                    storage_key: key,
+                })
+            } else {
+                None
+            }
+        });
+        if let Some(first) = matches.next() {
+            // Reject ambiguous matches.
+            if matches.next().is_none() {
+                return Some(first);
+            }
+        }
+    }
+
+    // Fall-back: legacy service-name lookup. The storage map is keyed by
+    // the service-name string, so a present entry means the raw identifier
+    // is itself a valid storage key.
+    let g = state.containers.read().await;
+    if let Some(meta) = g.get(raw) {
+        return Some(ResolvedContainer {
+            container_id: meta.container_id.clone(),
+            storage_key: raw.to_string(),
+        });
+    }
+    None
 }
 
 /// Build a minimal `ServiceSpec` from the create request.
@@ -430,13 +666,19 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         }
     };
 
-    let resources = match &request.resources {
-        Some(r) => ResourcesSpec {
-            cpu: r.cpu,
-            memory: r.memory.clone(),
-            gpu: None,
-        },
-        None => ResourcesSpec::default(),
+    let resources = ResourcesSpec {
+        cpu: request.resources.as_ref().and_then(|r| r.cpu),
+        memory: request.resources.as_ref().and_then(|r| r.memory.clone()),
+        gpu: None,
+        pids_limit: request.pids_limit,
+        cpuset: request.cpuset.clone(),
+        cpu_shares: request.cpu_shares,
+        memory_swap: request.memory_swap.clone(),
+        memory_reservation: request.memory_reservation.clone(),
+        memory_swappiness: request.memory_swappiness,
+        oom_score_adj: request.oom_score_adj,
+        oom_kill_disable: request.oom_kill_disable,
+        blkio_weight: request.blkio_weight,
     };
 
     let storage: Vec<StorageSpec> = request
@@ -537,22 +779,45 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         health,
         init: InitSpec::default(),
         errors: ErrorsSpec::default(),
-        devices: Vec::new(),
+        lifecycle: request.lifecycle.clone(),
+        devices: request.devices.clone(),
         storage,
         port_mappings: request.ports.clone(),
-        capabilities: Vec::new(),
-        privileged: false,
+        capabilities: request.cap_add.clone(),
+        cap_drop: request.cap_drop.clone(),
+        privileged: request.privileged.unwrap_or(false),
         node_mode: NodeMode::default(),
         node_selector: None,
         platform: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,
-        host_network: false,
+        host_network: matches!(request.network_mode, Some(zlayer_spec::NetworkMode::Host)),
         hostname: request.hostname.clone(),
         dns: request.dns.clone(),
         extra_hosts: request.extra_hosts.clone(),
         restart_policy: request.restart_policy.clone(),
+        labels: request.labels.clone(),
+        user: request.user.clone(),
+        stop_signal: request.stop_signal.clone(),
+        stop_grace_period: request.stop_grace_period,
+        sysctls: request.sysctls.clone(),
+        ulimits: request.ulimits.clone(),
+        security_opt: request.security_opt.clone(),
+        pid_mode: request.pid_mode.clone(),
+        ipc_mode: request.ipc_mode.clone(),
+        network_mode: request
+            .network_mode
+            .clone()
+            .unwrap_or(zlayer_spec::NetworkMode::Default),
+        extra_groups: request.extra_groups.clone(),
+        read_only_root_fs: request.read_only_root_fs,
+        init_container: request.init_container,
+        tty: false,
+        stdin_open: false,
+        userns_mode: None,
+        cgroup_parent: None,
+        expose: Vec::new(),
     })
 }
 
@@ -953,7 +1218,16 @@ pub async fn create_container(
     }
 
     let (id_str, container_id) = generate_container_id(request.name.as_deref());
-    let spec = build_service_spec(&request)?;
+    let mut spec = build_service_spec(&request)?;
+
+    // Stamp the reserved `com.zlayer.container_id` label onto the spec so the
+    // runtime forwards it into `Config.Labels`. The hex is the same value the
+    // id-map will register below (and is what we surface as the public ID),
+    // so reconciliation logic can identify ZLayer-managed containers from a
+    // foreign Docker daemon listing without consulting the id-map.
+    let hex_id = compute_hex(state.id_map.daemon_uuid(), &container_id);
+    spec.labels
+        .insert(ZLAYER_CONTAINER_ID_LABEL.to_string(), hex_id.clone());
 
     info!(
         container_id = %container_id,
@@ -1031,14 +1305,20 @@ pub async fn create_container(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Track the container
+    // Track the container. Persist to the storage backend FIRST so a daemon
+    // crash between the persist and the cache write leaves the next restart
+    // with a recoverable record; the in-memory cache is then updated only
+    // after the persistent write succeeded.
     let standalone = StandaloneContainer {
         container_id: container_id.clone(),
         image: request.image.clone(),
         name: request.name.clone(),
         labels: request.labels.clone(),
         created_at: now.clone(),
+        delete_on_exit: request.lifecycle.delete_on_exit,
     };
+
+    state.standalone_storage.insert(standalone.clone()).await?;
 
     state
         .containers
@@ -1046,14 +1326,29 @@ pub async fn create_container(
         .await
         .insert(id_str.clone(), standalone);
 
+    // Register the container in the id-map so REST and Docker compat clients
+    // can address it by its 64-char hex form. The daemon UUID stamped onto the
+    // map is used as the salt; the resulting hex is what we surface in the
+    // response and in subsequent list/inspect output.
+    //
+    // We already computed `hex_id` up-front (so we could stamp the
+    // `com.zlayer.container_id` label onto the spec before the runtime call);
+    // `register` is idempotent and deterministic, so calling it here just
+    // populates the bidirectional map without recomputing the hash. The
+    // returned hex is identical to the one we computed earlier; we discard it
+    // and continue using the value we already have.
+    let _ = state
+        .id_map
+        .register(state.id_map.daemon_uuid(), &container_id);
+
     // Emit container.start event on the daemon-wide bus.
     state.event_bus.publish(ContainerEvent::start(
-        id_str.clone(),
+        hex_id.clone(),
         request.labels.clone(),
     ));
 
     let info = ContainerInfo {
-        id: id_str,
+        id: hex_id,
         name: request.name,
         image: request.image,
         state: "running".to_string(),
@@ -1108,7 +1403,7 @@ pub async fn list_containers(
 
     let mut results = Vec::with_capacity(containers.len());
 
-    for (id_str, meta) in containers.iter() {
+    for (_id_str, meta) in containers.iter() {
         // Apply label filter
         if let Some((ref key, ref value)) = label_filter {
             match meta.labels.get(key) {
@@ -1143,8 +1438,20 @@ pub async fn list_containers(
             .unwrap_or_default()
             .into();
 
+        // Surface the hex container id so REST + Docker compat clients see
+        // a stable 64-char identifier rather than the internal service-name
+        // storage key.
+        let hex_id = state
+            .id_map
+            .lookup_container(&meta.container_id)
+            .unwrap_or_else(|| {
+                state
+                    .id_map
+                    .register(state.id_map.daemon_uuid(), &meta.container_id)
+            });
+
         results.push(ContainerInfo {
-            id: id_str.clone(),
+            id: hex_id,
             name: meta.name.clone(),
             image: meta.image.clone(),
             state: state_to_string(&runtime_state),
@@ -1186,9 +1493,13 @@ pub async fn get_container(
     State(state): State<ContainerApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<ContainerInfo>> {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+
     let containers = state.containers.read().await;
     let meta = containers
-        .get(&id)
+        .get(&resolved.storage_key)
         .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
 
     let runtime_state = state
@@ -1216,8 +1527,19 @@ pub async fn get_container(
         .unwrap_or_default()
         .into();
 
+    // Always emit the hex form so clients see a stable identifier whether
+    // they addressed the container by hex, hex prefix, or service-name.
+    let hex_id = state
+        .id_map
+        .lookup_container(&resolved.container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &resolved.container_id)
+        });
+
     Ok(Json(ContainerInfo {
-        id: id.clone(),
+        id: hex_id,
         name: meta.name.clone(),
         image: meta.image.clone(),
         state: state_to_string(&runtime_state),
@@ -1262,44 +1584,114 @@ pub async fn delete_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let container_id = resolved.container_id.clone();
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     info!(container_id = %container_id, "Stopping and removing standalone container");
 
-    // Stop with 30s timeout (ignore errors if container is already stopped)
-    let stop_result = state
-        .runtime
-        .stop_container(&container_id, Duration::from_secs(30))
-        .await;
-    if let Err(ref e) = stop_result {
-        debug!(error = %e, "Stop returned error (container may already be stopped)");
-    }
-
-    // Remove the container
-    state
-        .runtime
-        .remove_container(&container_id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to remove container: {e}")))?;
-
-    // Remove from tracking
-    state.containers.write().await.remove(&id);
+    delete_standalone_container(&state, &container_id, &resolved.storage_key, true).await?;
 
     // Emit container.die event after successful stop+remove.
     state.event_bus.publish(ContainerEvent::die(
-        id.clone(),
+        hex_id,
         labels,
         None,
         Some("deleted".to_string()),
     ));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Stop+remove a standalone container and drop its bookkeeping.
+///
+/// This is the shared core of the `DELETE /api/v1/containers/{id}` REST path
+/// and the daemon-side auto-remove subscriber
+/// ([`super::auto_remove::start_auto_remove_subscriber`]). It performs, in
+/// order:
+///
+/// 1. Best-effort `runtime.stop_container` (ignored if already stopped).
+/// 2. `runtime.remove_container` — fatal on error when `expect_present` is
+///    `true`; treated as already-gone (returns `Ok`) when `false`.
+/// 3. Persistent-storage delete.
+/// 4. Cache eviction.
+/// 5. `id_map` unregister so a future container with the same service-name
+///    doesn't collide with a stale hex entry.
+///
+/// The caller is responsible for any event-bus emission. Splitting that out
+/// is deliberate: the REST path emits a synthetic `container.die` to mark the
+/// administrative deletion, while the auto-remove subscriber is reacting to a
+/// real `container.die` and must not republish one.
+///
+/// `expect_present` controls how aggressive the runtime-remove failure is:
+/// the REST path passes `true` (the user just looked the record up), the
+/// auto-remove subscriber passes `false` so a race with another deleter — or
+/// a runtime that has already cleaned up the bundle — is silently absorbed.
+///
+/// # Errors
+///
+/// Returns the storage layer's error if the persistent delete fails, or an
+/// `Internal` error wrapping the runtime-remove failure when
+/// `expect_present == true`.
+pub(super) async fn delete_standalone_container(
+    state: &ContainerApiState,
+    container_id: &ContainerId,
+    storage_key: &str,
+    expect_present: bool,
+) -> Result<()> {
+    // Stop with 30s timeout (ignore errors if container is already stopped)
+    let stop_result = state
+        .runtime
+        .stop_container(container_id, Duration::from_secs(30))
+        .await;
+    if let Err(ref e) = stop_result {
+        debug!(error = %e, "Stop returned error (container may already be stopped)");
+    }
+
+    // Remove the container.
+    if let Err(e) = state.runtime.remove_container(container_id).await {
+        if expect_present {
+            return Err(ApiError::Internal(format!(
+                "Failed to remove container: {e}"
+            )));
+        }
+        debug!(error = %e, "Remove returned error (container may already be gone)");
+    }
+
+    // Remove from persistent storage first, then drop the cache entry. As
+    // with create, the persist step happens before the cache mutation so a
+    // crash between the two leaves the next restart's repopulate step in
+    // sync with disk rather than re-introducing a ghost entry.
+    state
+        .standalone_storage
+        .delete(&container_id.to_string())
+        .await?;
+
+    // Remove from tracking
+    state.containers.write().await.remove(storage_key);
+
+    // Drop the hex<->ContainerId mapping so a future container with the same
+    // service-name doesn't collide with a stale entry.
+    state.id_map.unregister_by_container(container_id);
+
+    Ok(())
 }
 
 /// Stop a running container.
@@ -1338,13 +1730,25 @@ pub async fn stop_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     let timeout = Duration::from_secs(request.timeout.unwrap_or(30));
 
@@ -1363,7 +1767,7 @@ pub async fn stop_container(
 
     // Emit container.die event after successful stop.
     state.event_bus.publish(ContainerEvent::die(
-        id.clone(),
+        hex_id,
         labels,
         None,
         Some("stopped".to_string()),
@@ -1404,13 +1808,25 @@ pub async fn start_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     info!(container_id = %container_id, "Starting standalone container");
 
@@ -1428,7 +1844,7 @@ pub async fn start_container(
     // Emit container.start event after successful start.
     state
         .event_bus
-        .publish(ContainerEvent::start(id.clone(), labels));
+        .publish(ContainerEvent::start(hex_id, labels));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1468,13 +1884,25 @@ pub async fn restart_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     let timeout = Duration::from_secs(request.timeout.unwrap_or(30));
 
@@ -1489,7 +1917,7 @@ pub async fn restart_container(
     if stop_ok {
         // Emit container.die event for the stop half of the restart.
         state.event_bus.publish(ContainerEvent::die(
-            id.clone(),
+            hex_id.clone(),
             labels.clone(),
             None,
             Some("restarting".to_string()),
@@ -1514,7 +1942,7 @@ pub async fn restart_container(
     // Emit container.start event for the start half of the restart.
     state
         .event_bus
-        .publish(ContainerEvent::start(id.clone(), labels));
+        .publish(ContainerEvent::start(hex_id, labels));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1558,13 +1986,25 @@ pub async fn kill_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     info!(
         container_id = %container_id,
@@ -1597,19 +2037,796 @@ pub async fn kill_container(
         .map_or_else(|| "killed".to_string(), |s| format!("killed:{s}"));
     state
         .event_bus
-        .publish(ContainerEvent::die(id.clone(), labels, None, Some(reason)));
+        .publish(ContainerEvent::die(hex_id, labels, None, Some(reason)));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Get container logs.
+// ---------------------------------------------------------------------------
+// Pause / Unpause / Top / Changes / Port / Prune (tasks 5.5.1–5.5.6)
+// ---------------------------------------------------------------------------
+
+/// Pause a running container by freezing its cgroup.
 ///
-/// Returns the last N lines of container logs as plain text, or streams
-/// logs as Server-Sent Events when `follow=true`.
+/// Mirrors Docker-compat `POST /containers/{id}/pause`. Returns 204 on
+/// success, 404 if the container isn't found, 501 if the runtime cannot
+/// pause containers, and 500 for other runtime errors.
 ///
 /// # Errors
 ///
-/// Returns an error if the container is not found or log retrieval fails.
+/// Returns an error if authentication fails, the container is missing, the
+/// runtime doesn't support pause, or the underlying call fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/pause",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 204, description = "Container paused"),
+        (status = 400, description = "Container not in a pausable state"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support pause"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn pause_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    info!(container_id = %container_id, "Pausing standalone container");
+
+    state
+        .runtime
+        .pause_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to pause container: {other}")),
+        })?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Resume a previously-paused container.
+///
+/// Mirrors Docker-compat `POST /containers/{id}/unpause`. Returns 204 on
+/// success.
+///
+/// # Errors
+///
+/// Returns the same error envelope as [`pause_container`].
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/unpause",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 204, description = "Container unpaused"),
+        (status = 400, description = "Container not in a resumable state"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support unpause"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn unpause_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    info!(container_id = %container_id, "Unpausing standalone container");
+
+    state
+        .runtime
+        .unpause_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to unpause container: {other}")),
+        })?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// List the processes running inside a container.
+///
+/// Mirrors Docker-compat `GET /containers/{id}/top?ps_args=`. Returns the
+/// runtime's process listing as `Titles` + `Processes` matrix.
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime
+/// doesn't expose process listings, and 500 for other failures.
+#[utoipa::path(
+    get,
+    path = "/api/v1/containers/{id}/top",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        ContainerTopQuery,
+    ),
+    responses(
+        (status = 200, description = "Process listing", body = ContainerTopResponse),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Runtime does not support top"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn top_container(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ContainerTopQuery>,
+) -> Result<Json<ContainerTopResponse>> {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    // Split the optional ps_args string on whitespace; an empty / missing
+    // value yields an empty slice that the runtime interprets as "use
+    // defaults".
+    let ps_args: Vec<String> = q
+        .ps_args
+        .as_deref()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let output = state
+        .runtime
+        .top_container(&container_id, &ps_args)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to list container processes: {other}")),
+        })?;
+
+    Ok(Json(ContainerTopResponse {
+        titles: output.titles,
+        processes: output.processes,
+    }))
+}
+
+/// Report changes to the container's filesystem.
+///
+/// Mirrors Docker-compat `GET /containers/{id}/changes`. Returns one
+/// `ContainerChangeEntry` per added / modified / deleted path in the
+/// container's writable layer. Runtimes without a layered filesystem
+/// (e.g. youki) return 501.
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime
+/// doesn't compute layer diffs.
+#[utoipa::path(
+    get,
+    path = "/api/v1/containers/{id}/changes",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 200, description = "Filesystem changes", body = Vec<ContainerChangeEntry>),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Runtime does not support filesystem diffs"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn changes_container(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ContainerChangeEntry>>> {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    let entries = state
+        .runtime
+        .changes_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to fetch changes: {other}")),
+        })?;
+
+    let docker_entries: Vec<ContainerChangeEntry> = entries
+        .into_iter()
+        .map(|e| ContainerChangeEntry {
+            path: e.path,
+            kind: e.kind.as_docker_kind(),
+        })
+        .collect();
+    Ok(Json(docker_entries))
+}
+
+/// Report the published port mappings for a container.
+///
+/// Mirrors Docker-compat `GET /containers/{id}/port`. Groups the runtime's
+/// port-binding entries by `<container_port>/<protocol>` so the wire shape
+/// matches Docker's `{"Ports": {"80/tcp": [...]}}` body.
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime
+/// doesn't expose port bindings.
+#[utoipa::path(
+    get,
+    path = "/api/v1/containers/{id}/port",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 200, description = "Port mappings", body = ContainerPortResponse),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Runtime does not support port-mapping inspection"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn port_container(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ContainerPortResponse>> {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    let entries = state
+        .runtime
+        .port_mappings_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to fetch port mappings: {other}")),
+        })?;
+
+    // Group bindings by `"{container_port}/{protocol}"` key. Entries with no
+    // host binding yield `Some(empty Vec)` so consumers can distinguish
+    // "exposed but unpublished" from "key missing entirely".
+    let mut grouped: HashMap<String, Option<Vec<ContainerPortBinding>>> = HashMap::new();
+    for entry in entries {
+        let key = format!("{}/{}", entry.container_port, entry.protocol);
+        let bucket = grouped.entry(key).or_insert_with(|| Some(Vec::new()));
+        match (entry.host_ip.as_deref(), entry.host_port) {
+            (None, None) => {
+                // exposed-only entry: the bucket already has a Vec; nothing
+                // to push, since Docker's wire form distinguishes "exposed"
+                // by *empty Vec*.
+            }
+            _ => {
+                if let Some(bindings) = bucket {
+                    bindings.push(ContainerPortBinding {
+                        host_ip: entry.host_ip,
+                        host_port: entry.host_port.map(|p| p.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(Json(ContainerPortResponse { ports: grouped }))
+}
+
+// ---------------------------------------------------------------------------
+// Archive (docker cp / TAR)
+// ---------------------------------------------------------------------------
+
+/// Query parameters for `GET|HEAD /api/v1/containers/{id}/archive`.
+///
+/// Mirrors Docker's `path=` query parameter. The `path` is the absolute path
+/// inside the container that should be archived (or stat'd).
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ArchivePathQuery {
+    /// Container-side path to archive or stat.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Query parameters for `PUT /api/v1/containers/{id}/archive`.
+///
+/// Mirrors Docker's `path=` plus `noOverwriteDirNonDir=` and `copyUIDGID=`.
+/// Both flags accept the literal `"1"` / `"true"` to enable, anything else
+/// (or missing) is treated as disabled.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ArchivePutQuery {
+    /// Container-side path to extract the TAR archive into.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Reject the put when an entry would replace a directory with a
+    /// non-directory (or vice versa). `"1"` / `"true"` enables.
+    #[serde(default, rename = "noOverwriteDirNonDir")]
+    pub no_overwrite_dir_non_dir: Option<String>,
+    /// Preserve UID/GID of files in the archive verbatim. `"1"` / `"true"`
+    /// enables.
+    #[serde(default, rename = "copyUIDGID")]
+    pub copy_uid_gid: Option<String>,
+}
+
+/// Parse a Docker-style boolean query parameter (`"1"` / `"true"` enables).
+fn parse_bool_flag(s: Option<&str>) -> bool {
+    matches!(
+        s.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+/// Build the `X-Docker-Container-Path-Stat` header value from a [`PathStat`].
+///
+/// Returns the base64-encoded JSON expected by Docker clients on the wire.
+fn encode_path_stat_header(stat: &PathStat) -> Result<String> {
+    use base64::Engine;
+    // Wire shape uses Docker's PascalCase field names so existing Docker
+    // CLIs decode it without translation.
+    let payload = serde_json::json!({
+        "name": stat.name,
+        "size": stat.size,
+        "mode": stat.mode,
+        "mtime": stat.mtime,
+        "linkTarget": stat.link_target,
+    });
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize path stat: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Map a runtime archive error onto the matching `ApiError` variant.
+fn map_archive_error(e: zlayer_agent::AgentError, ctx: &str) -> ApiError {
+    match e {
+        zlayer_agent::AgentError::NotFound { reason, .. } => {
+            ApiError::NotFound(format!("{ctx}: {reason}"))
+        }
+        zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+        zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+        other => ApiError::Internal(format!("{ctx}: {other}")),
+    }
+}
+
+/// `GET /api/v1/containers/{id}/archive?path=<...>` — stream a TAR archive
+/// of the requested file or directory inside the container.
+///
+/// Returns `application/x-tar` bytes. The `X-Docker-Container-Path-Stat`
+/// header is also emitted (matching Docker's behaviour) so callers can
+/// inspect the path's metadata without a separate HEAD round-trip.
+///
+/// # Errors
+///
+/// * `400 Bad Request` when the `path` query parameter is missing.
+/// * `404 Not Found` when the container or path does not exist.
+/// * `501 Not Implemented` when the runtime cannot produce a TAR archive.
+#[utoipa::path(
+    get,
+    path = "/api/v1/containers/{id}/archive",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        ("path" = String, Query, description = "Container-side path to archive"),
+    ),
+    responses(
+        (status = 200, description = "TAR archive (application/x-tar)"),
+        (status = 400, description = "Missing path query parameter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container or path not found"),
+        (status = 501, description = "Runtime does not support archive download"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn archive_get(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ArchivePathQuery>,
+) -> Result<Response> {
+    let path = q
+        .path
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing required 'path' query parameter".into()))?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    // Probe with HEAD first so the path-stat header always reflects the
+    // archive about to be streamed.
+    let stat = state
+        .runtime
+        .archive_head(&container_id, &path)
+        .await
+        .map_err(|e| map_archive_error(e, "archive_head"))?;
+    let header_value = encode_path_stat_header(&stat)?;
+
+    let stream = state
+        .runtime
+        .archive_get(&container_id, &path)
+        .await
+        .map_err(|e| map_archive_error(e, "archive_get"))?;
+
+    let mapped = stream.map(|item| -> std::result::Result<Bytes, Infallible> {
+        match item {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                debug!(error = %e, "archive_get stream error; truncating body");
+                Ok(Bytes::new())
+            }
+        }
+    });
+
+    let body = Body::from_stream(mapped);
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-tar"),
+    );
+    response.headers_mut().insert(
+        "X-Docker-Container-Path-Stat",
+        HeaderValue::from_str(&header_value).map_err(|e| {
+            ApiError::Internal(format!(
+                "failed to encode X-Docker-Container-Path-Stat: {e}"
+            ))
+        })?,
+    );
+    Ok(response)
+}
+
+/// `PUT /api/v1/containers/{id}/archive?path=<...>` — extract a TAR
+/// archive into the container at the given path.
+///
+/// Accepts an `application/x-tar` body. Honours Docker's
+/// `noOverwriteDirNonDir` and `copyUIDGID` query parameters.
+///
+/// # Errors
+///
+/// * `400 Bad Request` when the `path` query parameter is missing or the
+///   archive payload is malformed.
+/// * `404 Not Found` when the container or destination path does not exist.
+/// * `501 Not Implemented` when the runtime cannot extract archives.
+#[utoipa::path(
+    put,
+    path = "/api/v1/containers/{id}/archive",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        ("path" = String, Query, description = "Container-side path to extract into"),
+    ),
+    request_body(
+        content = Vec<u8>,
+        content_type = "application/x-tar",
+        description = "Uncompressed TAR archive to extract into the container",
+    ),
+    responses(
+        (status = 200, description = "Archive extracted"),
+        (status = 400, description = "Missing path or invalid archive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 404, description = "Container or destination not found"),
+        (status = 501, description = "Runtime does not support archive upload"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn archive_put(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ArchivePutQuery>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let path = q
+        .path
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing required 'path' query parameter".into()))?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    let opts = ArchivePutOptions {
+        no_overwrite_dir_non_dir: parse_bool_flag(q.no_overwrite_dir_non_dir.as_deref()),
+        copy_uid_gid: parse_bool_flag(q.copy_uid_gid.as_deref()),
+    };
+
+    state
+        .runtime
+        .archive_put(&container_id, &path, body, opts)
+        .await
+        .map_err(|e| map_archive_error(e, "archive_put"))?;
+
+    Ok(StatusCode::OK)
+}
+
+/// `HEAD /api/v1/containers/{id}/archive?path=<...>` — return path-stat
+/// metadata in the `X-Docker-Container-Path-Stat` header without
+/// materializing the TAR archive.
+///
+/// # Errors
+///
+/// * `400 Bad Request` when the `path` query parameter is missing.
+/// * `404 Not Found` when the container or path does not exist.
+/// * `501 Not Implemented` when the runtime cannot stat container paths.
+#[utoipa::path(
+    head,
+    path = "/api/v1/containers/{id}/archive",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        ("path" = String, Query, description = "Container-side path to stat"),
+    ),
+    responses(
+        (status = 200, description = "Path stat header set"),
+        (status = 400, description = "Missing path query parameter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container or path not found"),
+        (status = 501, description = "Runtime does not support archive head"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn archive_head(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ArchivePathQuery>,
+) -> Result<Response> {
+    let path = q
+        .path
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("missing required 'path' query parameter".into()))?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    let stat = state
+        .runtime
+        .archive_head(&container_id, &path)
+        .await
+        .map_err(|e| map_archive_error(e, "archive_head"))?;
+    let header_value = encode_path_stat_header(&stat)?;
+
+    let mut response = Response::new(Body::empty());
+    response.headers_mut().insert(
+        "X-Docker-Container-Path-Stat",
+        HeaderValue::from_str(&header_value).map_err(|e| {
+            ApiError::Internal(format!(
+                "failed to encode X-Docker-Container-Path-Stat: {e}"
+            ))
+        })?,
+    );
+    Ok(response)
+}
+
+/// Prune stopped containers from the runtime.
+///
+/// Mirrors Docker-compat `POST /containers/prune`. Returns the IDs of
+/// containers that were removed plus the bytes reclaimed.
+///
+/// # Errors
+///
+/// Returns 501 when the runtime doesn't support a global prune sweep.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/prune",
+    responses(
+        (status = 200, description = "Prune result", body = ContainerPruneResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support container prune"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn prune_containers(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+) -> Result<Json<ContainerPruneResponse>> {
+    user.require_role("operator")?;
+
+    info!("Pruning stopped containers");
+
+    let result = state
+        .runtime
+        .prune_containers()
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to prune containers: {other}")),
+        })?;
+
+    Ok(Json(ContainerPruneResponse {
+        containers_deleted: result.deleted,
+        space_reclaimed: result.space_reclaimed,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Logs streaming
+// ---------------------------------------------------------------------------
+
+/// Build a [`LogsStreamOptions`] from the parsed query string. Implements the
+/// "neither stdout nor stderr explicitly set" Docker default: both are
+/// streamed.
+fn logs_stream_options_from_query(query: &ContainerLogQuery) -> LogsStreamOptions {
+    let stdout = query.stdout.unwrap_or(true);
+    let stderr = query.stderr.unwrap_or(true);
+    // If a caller explicitly sends `stdout=false&stderr=false`, the Docker
+    // contract is "include both" rather than "include nothing" (sending no
+    // stream is a useless request). Mirror that.
+    let (stdout, stderr) = if !stdout && !stderr {
+        (true, true)
+    } else {
+        (stdout, stderr)
+    };
+    let tail = match query.tail {
+        0 => None,
+        n => Some(n as u64),
+    };
+    LogsStreamOptions {
+        follow: query.follow,
+        tail,
+        since: query.since,
+        until: query.until,
+        timestamps: query.timestamps,
+        stdout,
+        stderr,
+    }
+}
+
+/// Encode a `LogChunk` as Docker's multiplexed stdcopy frame.
+///
+/// `zlayer-docker` already exposes
+/// [`zlayer_docker::socket::streaming::log_frame::encode_frame`], but
+/// `zlayer-docker` depends on `zlayer-api` (the Docker compat shim re-uses
+/// API state types) — adding the reverse dep would create a cycle. The
+/// header is fixed and trivial (8 bytes: 1 stream id, 3 zero-padding, 4
+/// big-endian length), so we mirror it locally and keep the canonical
+/// encoder in `zlayer-docker` as the single source of truth for the
+/// compat shim.
+fn encode_docker_log_frame(channel: LogChannel, payload: &[u8]) -> Bytes {
+    use bytes::{BufMut, BytesMut};
+    let stream_id: u8 = match channel {
+        LogChannel::Stdin => 0,
+        LogChannel::Stdout => 1,
+        LogChannel::Stderr => 2,
+    };
+    // Truncate any payload that overflows a `u32` length field; Docker's
+    // wire format leaves no other choice and runtime chunks are far below
+    // this in practice.
+    let len_u32 = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let len_usize = len_u32 as usize;
+    let mut buf = BytesMut::with_capacity(8 + len_usize);
+    buf.put_u8(stream_id);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u8(0);
+    buf.put_u32(len_u32);
+    buf.extend_from_slice(&payload[..len_usize]);
+    buf.freeze()
+}
+
+/// Boxed NDJSON / raw-frame stream returned to `axum::body::Body::from_stream`
+/// by both [`get_container_logs`] and [`get_container_stats`]. Aliased so
+/// the handler signatures don't trip `clippy::type_complexity`.
+type StreamingBody = Pin<Box<dyn Stream<Item = std::result::Result<Bytes, Infallible>> + Send>>;
+
+/// Render one [`LogChunk`] as a single NDJSON line (including the trailing
+/// newline). Bytes that aren't valid UTF-8 are base64-encoded and emitted
+/// under `data_b64` so the stream remains a well-formed JSON document.
+fn ndjson_line_for_chunk(chunk: &LogChunk) -> Bytes {
+    use base64::Engine as _;
+    let stream_str = match chunk.stream {
+        LogChannel::Stdin => "stdin",
+        LogChannel::Stdout => "stdout",
+        LogChannel::Stderr => "stderr",
+    };
+    let timestamp = chunk.timestamp.map(|ts| ts.to_rfc3339());
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "stream".to_string(),
+        serde_json::Value::String(stream_str.to_string()),
+    );
+    if let Some(ts) = timestamp {
+        payload.insert("timestamp".to_string(), serde_json::Value::String(ts));
+    }
+    if let Ok(s) = std::str::from_utf8(&chunk.bytes) {
+        payload.insert("data".to_string(), serde_json::Value::String(s.to_string()));
+    } else {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&chunk.bytes);
+        payload.insert("data_b64".to_string(), serde_json::Value::String(encoded));
+    }
+    let mut bytes =
+        serde_json::to_vec(&serde_json::Value::Object(payload)).unwrap_or_else(|_| b"{}".to_vec());
+    bytes.push(b'\n');
+    Bytes::from(bytes)
+}
+
+/// Encode a stream-error (the `Err(AgentError)` arm of a `LogsStream` item)
+/// as a final JSON line so clients learn why their stream stopped instead of
+/// seeing a silent connection close.
+fn ndjson_line_for_error(err: &zlayer_agent::AgentError) -> Bytes {
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "error": err.to_string(),
+    }))
+    .unwrap_or_else(|_| b"{\"error\":\"unknown\"}".to_vec());
+    bytes.push(b'\n');
+    Bytes::from(bytes)
+}
+
+/// Stream container logs.
+///
+/// Backed by [`Runtime::logs_stream`]. Two wire formats are supported:
+///
+/// * `format=json` (the default) — emit one NDJSON `LogChunk` per line:
+///   `{"stream":"stdout|stderr","timestamp":"...","data":"<utf8>"}` (or
+///   `data_b64` when the bytes aren't valid UTF-8). `Content-Type:
+///   application/json`.
+///
+/// * `format=raw` — emit Docker's multiplexed stdcopy framing
+///   (`application/vnd.docker.raw-stream`). Consumed by the Docker compat
+///   shim in `zlayer-docker`.
+///
+/// `follow=true` keeps the stream open until the runtime reports EOF or the
+/// client disconnects. Stream errors mid-flight are emitted as a final
+/// `{"error": "..."}` line (json mode) or simply terminate the body (raw
+/// mode) — Docker's raw framing has no in-band error escape.
+///
+/// # Errors
+///
+/// Returns `404` when the container can't be resolved, `500` on a runtime
+/// failure to open the stream.
 #[utoipa::path(
     get,
     path = "/api/v1/containers/{id}/logs",
@@ -1618,7 +2835,7 @@ pub async fn kill_container(
         ContainerLogQuery,
     ),
     responses(
-        (status = 200, description = "Container logs (plain text or SSE stream)", body = String),
+        (status = 200, description = "Container logs (NDJSON when format=json, Docker stdcopy frames when format=raw)", body = String),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -1631,159 +2848,67 @@ pub async fn get_container_logs(
     Path(id): Path<String>,
     Query(query): Query<ContainerLogQuery>,
 ) -> Result<Response> {
-    let container_id = {
-        let containers = state.containers.read().await;
-        let meta = containers
-            .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        meta.container_id.clone()
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id;
+
+    let opts = logs_stream_options_from_query(&query);
+    let format = query.format.unwrap_or_default();
+
+    let log_stream = state
+        .runtime
+        .logs_stream(&container_id, opts)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            other => ApiError::Internal(format!("Failed to start log stream: {other}")),
+        })?;
+
+    let (content_type, body_stream): (&'static str, StreamingBody) = match format {
+        ContainerLogFormat::Json => {
+            let mapped = log_stream.map(|item| -> std::result::Result<Bytes, Infallible> {
+                match item {
+                    Ok(chunk) => Ok(ndjson_line_for_chunk(&chunk)),
+                    Err(err) => Ok(ndjson_line_for_error(&err)),
+                }
+            });
+            ("application/json", Box::pin(mapped))
+        }
+        ContainerLogFormat::Raw => {
+            let mapped = log_stream.filter_map(|item| async move {
+                match item {
+                    Ok(chunk) => Some(Ok::<Bytes, Infallible>(encode_docker_log_frame(
+                        chunk.stream,
+                        &chunk.bytes,
+                    ))),
+                    Err(err) => {
+                        // Raw stdcopy has no error frame; surface mid-stream
+                        // failures via tracing and end the body.
+                        debug!(error = %err, "log stream error in raw mode; ending body");
+                        None
+                    }
+                }
+            });
+            ("application/vnd.docker.raw-stream", Box::pin(mapped))
+        }
     };
 
-    if query.follow {
-        // SSE streaming mode
-        let stream = container_log_follow_stream(state.runtime.clone(), container_id, query.tail);
-        let sse = Sse::new(stream).keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        );
-        Ok(sse.into_response())
-    } else {
-        // Plain text mode
-        let entries = state
-            .runtime
-            .container_logs(&container_id, query.tail)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to get logs: {e}")))?;
-        let logs: String = entries
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(logs.into_response())
-    }
-}
-
-/// Internal state for the container log-follow polling stream.
-struct ContainerLogFollowState {
-    runtime: Arc<dyn Runtime + Send + Sync>,
-    container_id: ContainerId,
-    tail: usize,
-    seen_line_count: usize,
-    initial: bool,
-    poll_interval: Duration,
-    poll_counter: u64,
-    terminated: bool,
-}
-
-/// Build an SSE stream that polls for new log output.
-fn container_log_follow_stream(
-    runtime: Arc<dyn Runtime + Send + Sync>,
-    container_id: ContainerId,
-    tail: usize,
-) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
-    futures_util::stream::unfold(
-        ContainerLogFollowState {
-            runtime,
-            container_id,
-            tail,
-            seen_line_count: 0,
-            initial: true,
-            poll_interval: Duration::from_millis(500),
-            poll_counter: 0,
-            terminated: false,
-        },
-        |mut state| async move {
-            // Once terminated on a previous iteration, close the stream.
-            if state.terminated {
-                return None;
-            }
-
-            if !state.initial {
-                tokio::time::sleep(state.poll_interval).await;
-            }
-
-            let fetch_tail = if state.initial { state.tail } else { 10_000 };
-
-            let entries = state
-                .runtime
-                .container_logs(&state.container_id, fetch_tail)
-                .await
-                .unwrap_or_default();
-
-            let all_lines: Vec<String> = entries.iter().map(ToString::to_string).collect();
-            let total = all_lines.len();
-
-            let was_initial = state.initial;
-            let new_lines = if state.initial {
-                state.initial = false;
-                state.seen_line_count = total;
-                all_lines
-            } else if total > state.seen_line_count {
-                let new = all_lines[state.seen_line_count..].to_vec();
-                state.seen_line_count = total;
-                new
-            } else {
-                vec![]
-            };
-
-            let mut events: Vec<std::result::Result<Event, Infallible>> = new_lines
-                .into_iter()
-                .map(|line| Ok(Event::default().data(line)))
-                .collect();
-
-            // Decide whether to poll container state this tick. Always check on
-            // the first iteration (catches already-exited containers); after
-            // that, check every fourth poll to keep overhead low.
-            let should_check = was_initial || state.poll_counter % 4 == 0;
-            state.poll_counter = state.poll_counter.wrapping_add(1);
-
-            if should_check {
-                let exit_observed = matches!(
-                    state.runtime.container_state(&state.container_id).await,
-                    Ok(ContainerState::Exited { .. } | ContainerState::Failed { .. })
-                );
-
-                if exit_observed {
-                    // Final log drain: fetch a large tail and append any lines
-                    // we haven't already emitted to the current batch.
-                    let final_entries = state
-                        .runtime
-                        .container_logs(&state.container_id, 10_000)
-                        .await
-                        .unwrap_or_default();
-                    let all: Vec<String> = final_entries.iter().map(ToString::to_string).collect();
-                    if all.len() > state.seen_line_count {
-                        for line in &all[state.seen_line_count..] {
-                            events.push(Ok(Event::default().data(line.clone())));
-                        }
-                        state.seen_line_count = all.len();
-                    }
-
-                    state.terminated = true;
-
-                    debug!(
-                        container_id = %state.container_id,
-                        new_events = events.len(),
-                        total_seen = state.seen_line_count,
-                        "container log follow terminating after exit"
-                    );
-
-                    return Some((futures_util::stream::iter(events), state));
-                }
-            }
-
-            debug!(
-                container_id = %state.container_id,
-                new_events = events.len(),
-                total_seen = state.seen_line_count,
-                "container log follow poll"
-            );
-
-            Some((futures_util::stream::iter(events), state))
-        },
-    )
-    .flatten()
+    let body = Body::from_stream(body_stream);
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    Ok(response)
 }
 
 /// Execute a command in a running container.
@@ -1829,13 +2954,10 @@ pub async fn exec_in_container(
         return Err(ApiError::BadRequest("Command cannot be empty".to_string()));
     }
 
-    let container_id = {
-        let containers = state.containers.read().await;
-        let meta = containers
-            .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        meta.container_id.clone()
-    };
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id;
 
     if query.stream {
         let events = state
@@ -1887,6 +3009,91 @@ pub async fn exec_in_container(
     .into_response())
 }
 
+/// Query parameters for `POST /api/v1/containers/{id}/resize`.
+///
+/// Mirrors Docker's `POST /containers/{id}/resize?h=<rows>&w=<cols>` so the
+/// Docker compatibility shim can pass them through verbatim.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ResizeQuery {
+    /// New PTY height in rows.
+    #[serde(default)]
+    pub h: Option<u16>,
+    /// New PTY width in columns.
+    #[serde(default)]
+    pub w: Option<u16>,
+}
+
+/// Resize the main PTY of a running container.
+///
+/// Forwards `(rows, cols)` to the runtime-side resize sender registered when
+/// the container was started with TTY enabled. Returns:
+///
+/// * `400 Bad Request` when the container has no main PTY (i.e. it wasn't
+///   started with TTY) or when `h`/`w` are missing.
+/// * `404 Not Found` when the container can't be resolved.
+/// * `409 Conflict` when the runtime's resize channel has been closed (the
+///   container's PTY is gone).
+/// * `200 OK` on success.
+///
+/// # Errors
+///
+/// See the status codes above. Resize hints are best-effort: if the bounded
+/// channel is full, the oldest hint is dropped server-side and the call still
+/// returns `200`.
+pub async fn resize_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ResizeQuery>,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id;
+
+    let (Some(rows), Some(cols)) = (query.h, query.w) else {
+        return Err(ApiError::BadRequest(
+            "resize requires both 'h' (rows) and 'w' (cols) query parameters".to_string(),
+        ));
+    };
+
+    let sender = state
+        .container_pty_resizers
+        .get(&container_id)
+        .map(|s| s.clone())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Container '{id}' has no main PTY; resize requires the container \
+                 to have been started with TTY enabled"
+            ))
+        })?;
+
+    match sender.try_send((rows, cols)) {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Best-effort: drop the hint and return success. The resize
+            // channel is bounded and a full channel just means we're getting
+            // resize events faster than the runtime can apply them.
+            debug!(
+                container_id = %container_id,
+                "container PTY resize channel full; dropping oldest hint"
+            );
+            Ok(StatusCode::OK)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Channel closed: the runtime side has dropped the receiver,
+            // which means the PTY is no longer alive. Drop the stale entry
+            // so subsequent calls return the cleaner "no PTY" 400.
+            state.container_pty_resizers.remove(&container_id);
+            Err(ApiError::Conflict(format!(
+                "Container '{id}' PTY is no longer active"
+            )))
+        }
+    }
+}
+
 /// Wait for a container to exit and return its exit code.
 ///
 /// This endpoint blocks until the container exits. Useful for CI runners
@@ -1914,13 +3121,25 @@ pub async fn wait_container(
     State(state): State<ContainerApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<ContainerWaitResponse>> {
-    let (container_id, labels) = {
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
         let containers = state.containers.read().await;
         let meta = containers
-            .get(&id)
+            .get(&resolved.storage_key)
             .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        (meta.container_id.clone(), meta.labels.clone())
+        meta.labels.clone()
     };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
     let outcome = state
         .runtime
@@ -1944,14 +3163,14 @@ pub async fn wait_container(
     // When the runtime reports an OOM kill, also emit a `container.oom`
     // event so subscribers of that channel see it too.
     state.event_bus.publish(ContainerEvent::die(
-        id.clone(),
+        hex_id.clone(),
         labels.clone(),
         Some(outcome.exit_code),
         reason_wire.clone(),
     ));
     if outcome.reason == zlayer_agent::runtime::WaitReason::OomKilled {
         state.event_bus.publish(ContainerEvent::oom(
-            id.clone(),
+            hex_id.clone(),
             labels,
             Some(outcome.exit_code),
             Some("oom_killed".to_string()),
@@ -1959,7 +3178,7 @@ pub async fn wait_container(
     }
 
     Ok(Json(ContainerWaitResponse {
-        id,
+        id: hex_id,
         exit_code: outcome.exit_code,
         reason: reason_wire,
         signal: outcome.signal,
@@ -1967,19 +3186,342 @@ pub async fn wait_container(
     }))
 }
 
-/// Get container resource statistics.
+/// Wait for a container to exit and return Docker-shaped JSON.
 ///
-/// Returns CPU and memory usage statistics for the specified container.
-/// By default this is a one-shot JSON response. When the query string
-/// contains `stream=true`, the handler switches to Server-Sent Events and
-/// emits one `ContainerStatsResponse` sample every `interval` seconds
-/// (default 2, clamped to `[1, 60]`). The stream ends with a final
-/// `event: close` when the container exits or the runtime reports an
-/// unrecoverable error.
+/// Mirrors Docker Engine's `POST /containers/{id}/wait?condition=` 1:1.
+/// Used by the `zlayer-docker` compatibility shim and any SDK callers
+/// that consume the Docker shape directly. The legacy
+/// `GET /api/v1/containers/{id}/wait` returns a richer
+/// [`ContainerWaitResponse`] for clients that need extended classification
+/// fields (`reason`, `signal`, `finished_at`).
+///
+/// `condition` is one of:
+/// * `"not-running"` (default) — block until the container is no longer running.
+/// * `"next-exit"` — wait for the next observed exit.
+/// * `"removed"` — wait until the container is removed.
 ///
 /// # Errors
 ///
-/// Returns an error if the container is not found or stats retrieval fails.
+/// Returns `400` for an unknown condition, `404` when the container can't
+/// be resolved, and `500` if the runtime fails the wait.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/wait",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        WaitContainerQuery,
+    ),
+    responses(
+        (status = 200, description = "Container reached the requested condition", body = ContainerWaitDockerResponse),
+        (status = 400, description = "Invalid condition"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn wait_container_post(
+    _user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<WaitContainerQuery>,
+) -> Result<Json<ContainerWaitDockerResponse>> {
+    let condition = match q.condition.as_deref() {
+        None | Some("") => zlayer_agent::runtime::WaitCondition::NotRunning,
+        Some(other) => zlayer_agent::runtime::WaitCondition::from_wire_str(other)
+            .ok_or_else(|| ApiError::BadRequest(format!("invalid wait condition '{other}'")))?,
+    };
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let labels = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&resolved.storage_key)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.labels.clone()
+    };
+    let hex_id = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
+
+    match state
+        .runtime
+        .wait_outcome_with_condition(&container_id, condition)
+        .await
+    {
+        Ok(outcome) => {
+            // Emit container.die so subscribers see the lifecycle transition.
+            let reason_wire = serde_json::to_value(outcome.reason)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned));
+            state.event_bus.publish(ContainerEvent::die(
+                hex_id,
+                labels,
+                Some(outcome.exit_code),
+                reason_wire,
+            ));
+            Ok(Json(ContainerWaitDockerResponse {
+                status_code: i64::from(outcome.exit_code),
+                error: None,
+            }))
+        }
+        Err(zlayer_agent::AgentError::NotFound { reason, .. }) => {
+            Err(ApiError::NotFound(format!("Container not found: {reason}")))
+        }
+        Err(other) => Ok(Json(ContainerWaitDockerResponse {
+            status_code: -1,
+            error: Some(ContainerWaitDockerError {
+                message: format!("{other}"),
+            }),
+        })),
+    }
+}
+
+/// Rename a standalone container.
+///
+/// Mirrors Docker Engine's `POST /containers/{id}/rename?name=<new>`
+/// endpoint: the container's stored display name is updated to `name`,
+/// and the underlying runtime is asked to apply the rename so external
+/// tooling (e.g. `docker ps`) sees the new name.
+///
+/// # Errors
+///
+/// * `400` if the `name` query parameter is missing or empty.
+/// * `404` if the container cannot be resolved.
+/// * `409` if the runtime rejects the rename (e.g. name already in use).
+/// * `500` for other runtime failures.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/rename",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+        RenameContainerQuery,
+    ),
+    responses(
+        (status = 204, description = "Container renamed"),
+        (status = 400, description = "Missing or empty `name` query parameter"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn rename_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<RenameContainerQuery>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+
+    let new_name = q.name.unwrap_or_default();
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "missing or empty `name` query parameter".to_string(),
+        ));
+    }
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    let storage_key = resolved.storage_key.clone();
+
+    info!(
+        container_id = %container_id,
+        new_name = %new_name,
+        "Renaming standalone container"
+    );
+
+    // Try the runtime first; if the runtime can't rename (e.g. Youki returns
+    // `Unsupported`), surface the error rather than silently updating the
+    // metadata cache.
+    state
+        .runtime
+        .rename_container(&container_id, new_name)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::Unsupported(reason) => {
+                ApiError::Internal(format!("Runtime does not support rename: {reason}"))
+            }
+            other => {
+                let msg = format!("{other}");
+                if msg.to_ascii_lowercase().contains("already")
+                    && msg.to_ascii_lowercase().contains("use")
+                {
+                    ApiError::Conflict(format!("Container name '{new_name}' already in use"))
+                } else {
+                    ApiError::Internal(format!("Failed to rename container: {other}"))
+                }
+            }
+        })?;
+
+    // Update the in-memory metadata so subsequent `inspect` calls reflect
+    // the new name. The persistent store mirrors the cache on container
+    // create / delete; rename is intentionally cache-only because the
+    // hex id (and storage key) remain unchanged.
+    {
+        let mut containers = state.containers.write().await;
+        if let Some(meta) = containers.get_mut(&storage_key) {
+            meta.name = Some(new_name.to_string());
+        }
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Update a standalone container's resource limits and/or restart policy.
+///
+/// Mirrors Docker Engine's `POST /containers/{id}/update`. The request body
+/// matches Docker's wire shape (`CpuShares`, `Memory`, `RestartPolicy`,
+/// ...) so the `zlayer-docker` compatibility shim can pass it through
+/// unchanged. Returns Docker's `{"Warnings": [...]}` response on success;
+/// the warnings vector is always present (possibly empty) so clients that
+/// match on field presence don't break.
+///
+/// # Errors
+///
+/// * `404` if the container cannot be resolved.
+/// * `400` if the runtime rejects a field as invalid.
+/// * `501` if the runtime does not support resource updates (the trait
+///   default returns `Unsupported`).
+/// * `500` for other runtime failures.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/update",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body = ContainerUpdateRequest,
+    responses(
+        (status = 200, description = "Update applied", body = ContainerUpdateResponse),
+        (status = 400, description = "Invalid update field"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support update"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn update_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ContainerUpdateRequest>,
+) -> Result<Json<ContainerUpdateResponse>> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    info!(container_id = %container_id, "Updating standalone container resources");
+
+    let restart_policy = body.restart_policy.as_ref().map(|rp| {
+        zlayer_agent::runtime::ContainerRestartPolicyUpdate {
+            name: rp.name.clone(),
+            maximum_retry_count: rp.maximum_retry_count,
+        }
+    });
+
+    let update = zlayer_agent::runtime::ContainerResourceUpdate {
+        cpu_shares: body.cpu_shares,
+        memory: body.memory,
+        cpu_period: body.cpu_period,
+        cpu_quota: body.cpu_quota,
+        cpu_realtime_period: body.cpu_realtime_period,
+        cpu_realtime_runtime: body.cpu_realtime_runtime,
+        cpuset_cpus: body.cpuset_cpus.clone(),
+        cpuset_mems: body.cpuset_mems.clone(),
+        memory_reservation: body.memory_reservation,
+        memory_swap: body.memory_swap,
+        kernel_memory: body.kernel_memory,
+        blkio_weight: body.blkio_weight,
+        pids_limit: body.pids_limit,
+        restart_policy,
+    };
+
+    let outcome = state
+        .runtime
+        .update_container_resources(&container_id, &update)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+            zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(reason),
+            other => ApiError::Internal(format!("Failed to update container: {other}")),
+        })?;
+
+    Ok(Json(ContainerUpdateResponse {
+        warnings: outcome.warnings,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Stats streaming
+// ---------------------------------------------------------------------------
+
+/// Render one [`StatsSample`] as a single NDJSON line, terminated with `\n`.
+fn ndjson_line_for_stats(sample: &StatsSample) -> Bytes {
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "cpu_total_ns": sample.cpu_total_ns,
+        "cpu_system_ns": sample.cpu_system_ns,
+        "online_cpus": sample.online_cpus,
+        "mem_used_bytes": sample.mem_used_bytes,
+        "mem_limit_bytes": sample.mem_limit_bytes,
+        "net_rx_bytes": sample.net_rx_bytes,
+        "net_tx_bytes": sample.net_tx_bytes,
+        "blkio_read_bytes": sample.blkio_read_bytes,
+        "blkio_write_bytes": sample.blkio_write_bytes,
+        "pids_current": sample.pids_current,
+        "pids_limit": sample.pids_limit,
+        "timestamp": sample.timestamp.to_rfc3339(),
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    bytes.push(b'\n');
+    Bytes::from(bytes)
+}
+
+/// Stream container resource statistics.
+///
+/// Backed by [`Runtime::stats_stream`]. The handler always advertises
+/// `Content-Type: application/json` and ships one [`StatsSample`] per NDJSON
+/// line.
+///
+/// * `stream=false` (the default — Docker parity) — await the first
+///   `StatsSample` and close the body. Returns `200` with a single line.
+/// * `stream=true` — keep the body open, forwarding samples as they arrive
+///   until the runtime reports EOF or the client disconnects.
+///
+/// Mid-stream errors are emitted as a final `{"error":"..."}` line and end
+/// the body. The legacy `interval` query parameter is accepted for
+/// backwards-compatibility but ignored: pacing is now driven by the
+/// runtime's own sampling cadence.
+///
+/// # Errors
+///
+/// `404` when the container can't be resolved, `500` if the runtime fails
+/// to open the stream.
 #[utoipa::path(
     get,
     path = "/api/v1/containers/{id}/stats",
@@ -1988,7 +3530,7 @@ pub async fn wait_container(
         StatsQuery,
     ),
     responses(
-        (status = 200, description = "Container statistics (JSON one-shot or SSE stream)", body = ContainerStatsResponse),
+        (status = 200, description = "Container statistics (NDJSON; one sample when stream=false, continuous when stream=true)", body = ContainerStatsResponse),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -2001,143 +3543,71 @@ pub async fn get_container_stats(
     Path(id): Path<String>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Response> {
-    let container_id = {
-        let containers = state.containers.read().await;
-        let meta = containers
-            .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
-        meta.container_id.clone()
-    };
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+    // Pre-register the hex id so it is allocated before we start streaming.
+    // Even though we don't (yet) put the hex id on each `StatsSample` line,
+    // the side-effect matches the previous handler so callers that exec a
+    // subsequent /containers/{hex} lookup keep working.
+    let _ = state
+        .id_map
+        .lookup_container(&container_id)
+        .unwrap_or_else(|| {
+            state
+                .id_map
+                .register(state.id_map.daemon_uuid(), &container_id)
+        });
 
-    if query.stream {
-        // SSE streaming mode: emit one sample per tick until the container
-        // exits or the runtime returns an error.
-        let interval = stats_query_clamped_interval(&query);
-        let stream =
-            container_stats_follow_stream(state.runtime.clone(), container_id, id, interval);
-        let sse = Sse::new(stream).keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        );
-        return Ok(sse.into_response());
-    }
-
-    let cstats = state
+    let stats_stream = state
         .runtime
-        .get_container_stats(&container_id)
+        .stats_stream(&container_id)
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { reason, .. } => {
                 ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Failed to get stats: {other}")),
+            other => ApiError::Internal(format!("Failed to start stats stream: {other}")),
         })?;
 
-    Ok(Json(ContainerStatsResponse {
-        id,
-        cpu_usage_usec: cstats.cpu_usage_usec,
-        memory_bytes: cstats.memory_bytes,
-        memory_limit: cstats.memory_limit,
-        memory_percent: cstats.memory_percent(),
-    })
-    .into_response())
-}
-
-/// Internal state for the stats SSE follow stream.
-struct ContainerStatsFollowState {
-    runtime: Arc<dyn Runtime + Send + Sync>,
-    container_id: ContainerId,
-    /// Public-facing container id (the key clients use in the URL).
-    public_id: String,
-    tick: tokio::time::Interval,
-    terminated: bool,
-}
-
-/// Build an SSE stream that emits a fresh `ContainerStatsResponse` on a
-/// fixed cadence. The stream terminates when the runtime returns a fatal
-/// error (the container is gone / exited), emitting a final
-/// `event: close` with a small JSON reason payload.
-fn container_stats_follow_stream(
-    runtime: Arc<dyn Runtime + Send + Sync>,
-    container_id: ContainerId,
-    public_id: String,
-    interval: Duration,
-) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
-    // `MissedTickBehavior::Delay` means if we fall behind (slow subscriber)
-    // we just resume ticking from now rather than replaying a backlog of
-    // samples. This is the graceful "drop slow subscribers" behavior.
-    let mut tick = tokio::time::interval(interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    futures_util::stream::unfold(
-        ContainerStatsFollowState {
-            runtime,
-            container_id,
-            public_id,
-            tick,
-            terminated: false,
-        },
-        |mut state| async move {
-            if state.terminated {
-                return None;
+    let body_stream: StreamingBody = if query.stream {
+        let mapped = stats_stream.map(|item| -> std::result::Result<Bytes, Infallible> {
+            match item {
+                Ok(sample) => Ok(ndjson_line_for_stats(&sample)),
+                Err(err) => Ok(ndjson_line_for_error(&err)),
             }
-
-            // First tick on a `tokio::time::interval` fires immediately so
-            // the client gets a sample right away; subsequent ticks wait
-            // for the full interval.
-            state.tick.tick().await;
-
-            match state.runtime.get_container_stats(&state.container_id).await {
-                Ok(cstats) => {
-                    let sample = ContainerStatsResponse {
-                        id: state.public_id.clone(),
-                        cpu_usage_usec: cstats.cpu_usage_usec,
-                        memory_bytes: cstats.memory_bytes,
-                        memory_limit: cstats.memory_limit,
-                        memory_percent: cstats.memory_percent(),
-                    };
-
-                    let event = match serde_json::to_string(&sample) {
-                        Ok(data) => Event::default().event("stats").data(data),
-                        Err(err) => {
-                            debug!(
-                                container_id = %state.container_id,
-                                error = %err,
-                                "failed to serialize stats sample; closing stream"
-                            );
-                            state.terminated = true;
-                            Event::default()
-                                .event("close")
-                                .data(r#"{"reason":"serialize_error"}"#)
-                        }
-                    };
-
-                    Some((Ok(event), state))
-                }
-                Err(err) => {
-                    // Detect "container is gone" vs a transient failure so
-                    // we can surface a specific reason. Either way we stop
-                    // streaming — the container won't be producing stats
-                    // again on this id.
-                    let reason = match &err {
-                        zlayer_agent::AgentError::NotFound { .. } => "exited",
-                        _ => "runtime_error",
-                    };
-                    debug!(
-                        container_id = %state.container_id,
-                        error = %err,
-                        reason,
-                        "container stats follow terminating"
-                    );
-                    state.terminated = true;
-                    let payload = format!(r#"{{"reason":"{reason}"}}"#);
-                    let event = Event::default().event("close").data(payload);
-                    Some((Ok(event), state))
-                }
+        });
+        Box::pin(mapped)
+    } else {
+        // One-shot Docker-compat mode: take exactly the first sample (or
+        // error) the runtime produces and close. The handler still uses
+        // `take(1)` semantics under the hood, but routing through a `StreamExt`
+        // adapter keeps both branches' types identical.
+        let first = stats_stream.take(1);
+        let mapped = first.map(|item| -> std::result::Result<Bytes, Infallible> {
+            match item {
+                Ok(sample) => Ok(ndjson_line_for_stats(&sample)),
+                Err(err) => Ok(ndjson_line_for_error(&err)),
             }
-        },
-    )
+        });
+        Box::pin(mapped)
+    };
+
+    let body = Body::from_stream(body_stream);
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -2485,45 +3955,26 @@ mod tests {
 
     #[test]
     fn test_stats_query_defaults() {
-        // Empty query -> one-shot mode, default 2s cadence once clamped.
+        // Empty query -> one-shot mode (legacy `interval` field is now
+        // ignored by the streaming-backed handler but still parses for
+        // backwards-compat with older clients).
         let query: StatsQuery = serde_json::from_str("{}").unwrap();
         assert!(!query.stream);
         assert!(query.interval.is_none());
-        assert_eq!(stats_query_clamped_interval(&query), Duration::from_secs(2));
     }
 
     #[test]
     fn test_stats_query_parses_stream_and_interval() {
-        // `stream=true` + explicit `interval`.
+        // `stream=true` + explicit `interval`. Both alias forms still parse.
         let query: StatsQuery =
             serde_json::from_str(r#"{"stream": true, "interval": 5}"#).expect("parse stats query");
         assert!(query.stream);
         assert_eq!(query.interval, Some(5));
-        assert_eq!(stats_query_clamped_interval(&query), Duration::from_secs(5));
 
-        // Legacy `interval_seconds` alias is honored by serde.
         let alias: StatsQuery = serde_json::from_str(r#"{"stream": true, "interval_seconds": 7}"#)
             .expect("parse stats query alias");
         assert!(alias.stream);
         assert_eq!(alias.interval, Some(7));
-        assert_eq!(stats_query_clamped_interval(&alias), Duration::from_secs(7));
-    }
-
-    #[test]
-    fn test_stats_query_clamps_interval() {
-        // Below the floor clamps up to 1s.
-        let low = StatsQuery {
-            stream: true,
-            interval: Some(0),
-        };
-        assert_eq!(stats_query_clamped_interval(&low), Duration::from_secs(1));
-
-        // Above the ceiling clamps down to 60s.
-        let high = StatsQuery {
-            stream: true,
-            interval: Some(9_999),
-        };
-        assert_eq!(stats_query_clamped_interval(&high), Duration::from_secs(60));
     }
 
     #[test]
@@ -2553,23 +4004,8 @@ mod tests {
 
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
             ports: ports.clone(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("spec should build");
         assert_eq!(spec.port_mappings, ports);
@@ -2579,23 +4015,7 @@ mod tests {
     fn test_build_service_spec_minimal() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("minimal spec should build");
         assert_eq!(spec.image.name.whole(), "docker.io/library/alpine:latest");
@@ -2613,7 +4033,6 @@ mod tests {
         let request = CreateContainerRequest {
             image: "node:20".to_string(),
             name: Some("build-runner".to_string()),
-            pull_policy: None,
             env: HashMap::from([("NODE_ENV".to_string(), "production".to_string())]),
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
             labels: HashMap::from([("ci".to_string(), "true".to_string())]),
@@ -2627,16 +4046,8 @@ mod tests {
                 target: "/app".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
             work_dir: Some("/app".to_string()),
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("full spec should build");
         assert_eq!(spec.image.name.whole(), "docker.io/library/node:20");
@@ -2852,202 +4263,1022 @@ mod tests {
         assert!(Arc::strong_count(&state.containers) >= 1);
     }
 
-    // -----------------------------------------------------------------------
-    // Log-follow stream: termination-on-exit test
-    // -----------------------------------------------------------------------
+    /// 1.4.3 — proves `with_standalone_storage` + `repopulate_cache_from_storage`
+    /// actually round-trip records out of the storage trait into the in-memory
+    /// `containers` cache, keyed by `ContainerId::service` (the same key
+    /// `create_container` writes with). This is the contract the daemon
+    /// startup path depends on.
+    #[tokio::test]
+    async fn repopulate_cache_loads_records_from_storage() {
+        use crate::storage::InMemoryStandaloneContainerStorage;
 
-    /// State backing `MockStateRuntime`.
-    struct MockState {
-        logs: Vec<zlayer_observability::logs::LogEntry>,
-        state: ContainerState,
-        state_calls: u32,
+        let storage = Arc::new(InMemoryStandaloneContainerStorage::new());
+
+        // Seed the storage with two records — one "named" container and one
+        // anonymous — that the cache should pick up on repopulate.
+        let alpha = StandaloneContainer {
+            container_id: ContainerId {
+                service: "standalone-alpha".to_string(),
+                replica: 0,
+            },
+            image: "alpine:latest".to_string(),
+            name: Some("alpha".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        let beta = StandaloneContainer {
+            container_id: ContainerId {
+                service: "standalone-beta".to_string(),
+                replica: 0,
+            },
+            image: "alpine:3.20".to_string(),
+            name: None,
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:01Z".to_string(),
+            delete_on_exit: false,
+        };
+        storage.insert(alpha.clone()).await.unwrap();
+        storage.insert(beta.clone()).await.unwrap();
+
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::new(runtime).with_standalone_storage(storage.clone());
+
+        // Cache is empty before repopulate.
+        assert_eq!(state.containers.read().await.len(), 0);
+
+        state.repopulate_cache_from_storage().await.unwrap();
+
+        let cache = state.containers.read().await;
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.contains_key("standalone-alpha"),
+            "cache must be keyed by ContainerId::service, not by the full \
+             '{{service}}-rep-{{replica}}' storage key"
+        );
+        assert!(cache.contains_key("standalone-beta"));
+        assert_eq!(cache["standalone-alpha"].image, "alpine:latest");
+        assert_eq!(cache["standalone-beta"].image, "alpine:3.20");
     }
 
-    /// Minimal runtime used exclusively by
-    /// `container_log_follow_stream_terminates_on_exit`. Only `container_state`
-    /// and `container_logs` are ever called; every other method traps.
-    struct MockStateRuntime {
-        inner: std::sync::Arc<std::sync::Mutex<MockState>>,
+    // -----------------------------------------------------------------------
+    // Phase 1 §1.3.3 — `resolve_container_lookup` accepts hex, hex prefix,
+    // and the legacy service-name storage key.
+    // -----------------------------------------------------------------------
+
+    /// Build a `ContainerApiState` with a fixed daemon UUID and a single
+    /// pre-registered container so the helper has something to find. The
+    /// state is keyed by the service-name string the way `create_container`
+    /// keys it in production.
+    async fn make_state_with_container(
+        service: &str,
+        replica: u32,
+        daemon_uuid: &str,
+    ) -> (ContainerApiState, ContainerId, String) {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.to_string());
+        let cid = ContainerId {
+            service: service.to_string(),
+            replica,
+        };
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some(service.to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert(service.to_string(), standalone);
+        (state, cid, hex)
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_accepts_hex() {
+        let (state, cid, hex) =
+            make_state_with_container("standalone-demo", 0, "test-daemon-uuid").await;
+        let resolved = resolve_container_lookup(&state, &hex)
+            .await
+            .expect("full hex must resolve");
+        assert_eq!(resolved.container_id, cid);
+        assert_eq!(resolved.storage_key, "standalone-demo");
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_accepts_short_hex() {
+        let (state, cid, hex) =
+            make_state_with_container("standalone-demo", 0, "test-daemon-uuid").await;
+        let prefix: String = hex.chars().take(12).collect();
+        let resolved = resolve_container_lookup(&state, &prefix)
+            .await
+            .expect("12-char hex prefix must resolve uniquely");
+        assert_eq!(resolved.container_id, cid);
+        assert_eq!(resolved.storage_key, "standalone-demo");
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_falls_back_to_name() {
+        let (state, cid, _hex) =
+            make_state_with_container("standalone-demo", 0, "test-daemon-uuid").await;
+        let resolved = resolve_container_lookup(&state, "standalone-demo")
+            .await
+            .expect("legacy service-name lookup must still work");
+        assert_eq!(resolved.container_id, cid);
+        assert_eq!(resolved.storage_key, "standalone-demo");
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_returns_none_for_unknown() {
+        let (state, _cid, _hex) =
+            make_state_with_container("standalone-demo", 0, "test-daemon-uuid").await;
+        assert!(resolve_container_lookup(&state, "no-such-container")
+            .await
+            .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks 5.1.1-3 / 5.2.1-4 — POST /wait?condition= and /rename?name=
+    //
+    // These tests exercise the daemon-side handlers directly with a
+    // MockRuntime-backed `ContainerApiState`. The MockRuntime's default
+    // `wait_outcome_with_condition` falls through to `wait_outcome` →
+    // `wait_container` (which returns 0), so the wait test pins the
+    // exit-code-zero path through the Docker-shaped response. The rename
+    // test uses a tiny custom runtime that records the call.
+    // -----------------------------------------------------------------------
+
+    /// `POST /api/v1/containers/{id}/wait` happy path: a known container,
+    /// no `condition` param, `MockRuntime` returns 0 → response carries
+    /// `status_code: 0` and no `error` envelope.
+    /// Lightweight runtime override used by the wait/rename handler tests.
+    /// Delegates everything to `MockRuntime` except `wait_outcome` /
+    /// `wait_outcome_with_condition`, which return a fixed exit code so
+    /// the test can pin the response shape without seeding the runtime's
+    /// internal container map.
+    #[derive(Default)]
+    struct FixedExitRuntime {
+        inner: zlayer_agent::MockRuntime,
+        exit_code: i32,
     }
 
     #[async_trait::async_trait]
-    impl zlayer_agent::runtime::Runtime for MockStateRuntime {
-        async fn pull_image(&self, _image: &str) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+    impl Runtime for FixedExitRuntime {
+        async fn pull_image(&self, image: &str) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image(image).await
         }
-
         async fn pull_image_with_policy(
             &self,
-            _image: &str,
-            _policy: zlayer_spec::PullPolicy,
-            _auth: Option<&zlayer_spec::RegistryAuth>,
+            image: &str,
+            policy: zlayer_spec::PullPolicy,
+            auth: Option<&zlayer_spec::RegistryAuth>,
         ) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+            self.inner.pull_image_with_policy(image, policy, auth).await
         }
-
         async fn create_container(
             &self,
-            _id: &ContainerId,
-            _spec: &zlayer_spec::ServiceSpec,
+            id: &ContainerId,
+            spec: &zlayer_spec::ServiceSpec,
         ) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+            self.inner.create_container(id, spec).await
         }
-
-        async fn start_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+        async fn start_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.start_container(id).await
         }
-
         async fn stop_container(
             &self,
-            _id: &ContainerId,
-            _timeout: Duration,
+            id: &ContainerId,
+            t: std::time::Duration,
         ) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+            self.inner.stop_container(id, t).await
         }
-
-        async fn remove_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<()> {
-            unimplemented!()
+        async fn remove_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.remove_container(id).await
         }
-
         async fn container_state(
             &self,
-            _id: &ContainerId,
-        ) -> zlayer_agent::error::Result<ContainerState> {
-            let mut guard = self.inner.lock().expect("mock state mutex poisoned");
-            guard.state_calls += 1;
-            // First 5 calls: Running. Sixth call: append a post-exit log line
-            // and flip to Exited. Subsequent calls (if any) see the already-
-            // flipped Exited state.
-            if guard.state_calls == 6 {
-                guard.logs.push(zlayer_observability::logs::LogEntry {
-                    timestamp: chrono::Utc::now(),
-                    stream: zlayer_observability::logs::LogStream::Stdout,
-                    message: "post-exit line".to_string(),
-                    source: zlayer_observability::logs::LogSource::Container("mock".to_string()),
-                    service: None,
-                    deployment: None,
-                });
-                guard.state = ContainerState::Exited { code: 0 };
-            }
-            Ok(guard.state.clone())
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ContainerState> {
+            self.inner.container_state(id).await
         }
-
         async fn container_logs(
             &self,
-            _id: &ContainerId,
+            id: &ContainerId,
             tail: usize,
         ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
-            let guard = self.inner.lock().expect("mock state mutex poisoned");
-            let skip = guard.logs.len().saturating_sub(tail);
-            Ok(guard.logs.iter().skip(skip).cloned().collect())
+            self.inner.container_logs(id, tail).await
         }
-
         async fn exec(
             &self,
-            _id: &ContainerId,
-            _cmd: &[String],
+            id: &ContainerId,
+            cmd: &[String],
         ) -> zlayer_agent::error::Result<(i32, String, String)> {
-            unimplemented!()
+            self.inner.exec(id, cmd).await
         }
-
         async fn get_container_stats(
             &self,
-            _id: &ContainerId,
+            id: &ContainerId,
         ) -> zlayer_agent::error::Result<zlayer_agent::cgroups_stats::ContainerStats> {
-            unimplemented!()
+            self.inner.get_container_stats(id).await
         }
-
         async fn wait_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<i32> {
-            unimplemented!()
+            Ok(self.exit_code)
         }
-
         async fn get_logs(
             &self,
-            _id: &ContainerId,
+            id: &ContainerId,
         ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
-            unimplemented!()
+            self.inner.get_logs(id).await
         }
-
         async fn get_container_pid(
             &self,
-            _id: &ContainerId,
+            id: &ContainerId,
         ) -> zlayer_agent::error::Result<Option<u32>> {
-            unimplemented!()
+            self.inner.get_container_pid(id).await
         }
-
         async fn get_container_ip(
             &self,
-            _id: &ContainerId,
+            id: &ContainerId,
         ) -> zlayer_agent::error::Result<Option<std::net::IpAddr>> {
-            unimplemented!()
+            self.inner.get_container_ip(id).await
         }
     }
 
-    fn make_log_entry(message: &str) -> zlayer_observability::logs::LogEntry {
-        zlayer_observability::logs::LogEntry {
-            timestamp: chrono::Utc::now(),
-            stream: zlayer_observability::logs::LogStream::Stdout,
-            message: message.to_string(),
-            source: zlayer_observability::logs::LogSource::Container("mock".to_string()),
-            service: None,
-            deployment: None,
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn container_log_follow_stream_terminates_on_exit() {
-        use futures_util::StreamExt;
-
-        let mock_state = std::sync::Arc::new(std::sync::Mutex::new(MockState {
-            logs: vec![
-                make_log_entry("line 1"),
-                make_log_entry("line 2"),
-                make_log_entry("line 3"),
-            ],
-            state: ContainerState::Running,
-            state_calls: 0,
-        }));
-
-        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockStateRuntime {
-            inner: mock_state.clone(),
+    /// Helper: build a `ContainerApiState` backed by a `FixedExitRuntime`
+    /// whose `wait_container` always returns `exit_code`. Mirrors
+    /// `make_state_with_container` but swaps the runtime so we don't have
+    /// to thread a real `ServiceSpec` through `MockRuntime::create_container`.
+    async fn make_wait_state(
+        service: &str,
+        exit_code: i32,
+    ) -> (ContainerApiState, ContainerId, String) {
+        let runtime = Arc::new(FixedExitRuntime {
+            exit_code,
+            ..FixedExitRuntime::default()
         });
-
-        let container_id = ContainerId {
-            service: "test".to_string(),
+        let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime;
+        let state = ContainerApiState::with_daemon_uuid(runtime_dyn, "wait-fixed-uuid".to_string());
+        let cid = ContainerId {
+            service: service.to_string(),
             replica: 0,
         };
-
-        let stream = container_log_follow_stream(runtime, container_id, 100);
-
-        // With `start_paused = true`, tokio auto-advances time when the
-        // runtime is otherwise idle, so the 500ms poll sleeps collapse. Wrap
-        // in a wall-clock timeout so a regression that fails to terminate
-        // surfaces as a test failure instead of a hang.
-        let collected = tokio::time::timeout(Duration::from_secs(30), stream.collect::<Vec<_>>())
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some(service.to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
             .await
-            .expect("stream should terminate within timeout");
+            .insert(service.to_string(), standalone);
+        (state, cid, hex)
+    }
 
-        // 3 initial lines + 1 post-exit line = at least 4 events.
-        assert!(
-            collected.len() >= 4,
-            "expected at least 4 events, got {}",
-            collected.len()
-        );
+    #[tokio::test]
+    async fn wait_container_post_returns_status_code_for_known_container() {
+        use crate::auth::Claims;
+        use std::time::Duration as StdDuration;
 
-        // Every element is Ok since `Event`'s error type is Infallible.
-        let payloads: Vec<String> = collected
-            .into_iter()
-            .map(|r| r.expect("Infallible"))
-            .map(|e| format!("{e:?}"))
-            .collect();
-        let joined = payloads.join("\n");
-        assert!(joined.contains("line 1"), "missing 'line 1' in {joined}");
-        assert!(joined.contains("line 2"), "missing 'line 2' in {joined}");
-        assert!(joined.contains("line 3"), "missing 'line 3' in {joined}");
+        let (state, _cid, hex) = make_wait_state("standalone-wait", 137).await;
+
+        let user = AuthUser {
+            claims: Claims::new("test", StdDuration::from_secs(60), vec![], None),
+        };
+
+        let resp = wait_container_post(
+            user,
+            State(state),
+            Path(hex),
+            Query(WaitContainerQuery { condition: None }),
+        )
+        .await
+        .expect("wait must succeed");
+
+        // `FixedExitRuntime` returns `exit_code = 137`; the handler must
+        // forward it onto the Docker `StatusCode` field exactly.
+        assert_eq!(resp.0.status_code, 137);
+        assert!(resp.0.error.is_none());
+    }
+
+    /// `POST /api/v1/containers/{id}/wait` with an invalid condition string
+    /// must reject with 400 `BadRequest`, never reaching the runtime. This is
+    /// the contract that the docker-compat shim relies on for the
+    /// `condition=` translation.
+    #[tokio::test]
+    async fn wait_container_post_rejects_invalid_condition() {
+        use crate::auth::Claims;
+        use std::time::Duration as StdDuration;
+
+        let (state, _cid, hex) = make_wait_state("standalone-bad", 0).await;
+        let user = AuthUser {
+            claims: Claims::new("test", StdDuration::from_secs(60), vec![], None),
+        };
+
+        let err = wait_container_post(
+            user,
+            State(state),
+            Path(hex),
+            Query(WaitContainerQuery {
+                condition: Some("not-a-real-condition".to_string()),
+            }),
+        )
+        .await
+        .expect_err("invalid condition must be rejected");
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// `POST /api/v1/containers/{id}/rename?name=<new>` must update the
+    /// in-memory container metadata so the next `inspect` sees the new name
+    /// AND must invoke the runtime's `rename_container`. We use a custom
+    /// runtime that records the call so we can verify both ends.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn rename_container_updates_metadata_and_calls_runtime() {
+        use crate::auth::Claims;
+        use std::sync::Mutex;
+        use std::time::Duration as StdDuration;
+        use zlayer_agent::error::Result as AgentResult;
+
+        // Custom runtime that captures rename_container calls so the test
+        // can assert both the daemon-side metadata mutation and the
+        // runtime forwarding.
+        #[derive(Default)]
+        struct RecordingRuntime {
+            inner: zlayer_agent::MockRuntime,
+            renames: Mutex<Vec<(ContainerId, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Runtime for RecordingRuntime {
+            // Every required method delegates to MockRuntime.
+            async fn pull_image(&self, image: &str) -> AgentResult<()> {
+                self.inner.pull_image(image).await
+            }
+            async fn pull_image_with_policy(
+                &self,
+                image: &str,
+                policy: zlayer_spec::PullPolicy,
+                auth: Option<&zlayer_spec::RegistryAuth>,
+            ) -> AgentResult<()> {
+                self.inner.pull_image_with_policy(image, policy, auth).await
+            }
+            async fn create_container(
+                &self,
+                id: &ContainerId,
+                spec: &zlayer_spec::ServiceSpec,
+            ) -> AgentResult<()> {
+                self.inner.create_container(id, spec).await
+            }
+            async fn start_container(&self, id: &ContainerId) -> AgentResult<()> {
+                self.inner.start_container(id).await
+            }
+            async fn stop_container(
+                &self,
+                id: &ContainerId,
+                t: std::time::Duration,
+            ) -> AgentResult<()> {
+                self.inner.stop_container(id, t).await
+            }
+            async fn remove_container(&self, id: &ContainerId) -> AgentResult<()> {
+                self.inner.remove_container(id).await
+            }
+            async fn container_state(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<zlayer_agent::runtime::ContainerState> {
+                self.inner.container_state(id).await
+            }
+            async fn container_logs(
+                &self,
+                id: &ContainerId,
+                tail: usize,
+            ) -> AgentResult<Vec<zlayer_observability::logs::LogEntry>> {
+                self.inner.container_logs(id, tail).await
+            }
+            async fn exec(
+                &self,
+                id: &ContainerId,
+                cmd: &[String],
+            ) -> AgentResult<(i32, String, String)> {
+                self.inner.exec(id, cmd).await
+            }
+            async fn get_container_stats(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<zlayer_agent::cgroups_stats::ContainerStats> {
+                self.inner.get_container_stats(id).await
+            }
+            async fn wait_container(&self, id: &ContainerId) -> AgentResult<i32> {
+                self.inner.wait_container(id).await
+            }
+            async fn get_logs(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<Vec<zlayer_observability::logs::LogEntry>> {
+                self.inner.get_logs(id).await
+            }
+            async fn get_container_pid(&self, id: &ContainerId) -> AgentResult<Option<u32>> {
+                self.inner.get_container_pid(id).await
+            }
+            async fn get_container_ip(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<Option<std::net::IpAddr>> {
+                self.inner.get_container_ip(id).await
+            }
+            async fn rename_container(&self, id: &ContainerId, new_name: &str) -> AgentResult<()> {
+                self.renames
+                    .lock()
+                    .unwrap()
+                    .push((id.clone(), new_name.to_string()));
+                Ok(())
+            }
+        }
+
+        let runtime: Arc<RecordingRuntime> = Arc::new(RecordingRuntime::default());
+        let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
+        let state =
+            ContainerApiState::with_daemon_uuid(runtime_dyn, "rename-test-uuid".to_string());
+        let cid = ContainerId {
+            service: "standalone-rename".to_string(),
+            replica: 0,
+        };
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("standalone-rename".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-rename".to_string(), standalone);
+
+        // Caller must have the operator role.
+        let user = AuthUser {
+            claims: Claims::new(
+                "test",
+                StdDuration::from_secs(60),
+                vec!["operator".to_string()],
+                None,
+            ),
+        };
+
+        let status = rename_container(
+            user,
+            State(state.clone()),
+            Path(hex),
+            Query(RenameContainerQuery {
+                name: Some("renamed-display".to_string()),
+            }),
+        )
+        .await
+        .expect("rename must succeed");
+
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        // Runtime call recorded.
+        let recorded = {
+            let renames = runtime.renames.lock().unwrap();
+            renames.clone()
+        };
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, cid);
+        assert_eq!(recorded[0].1, "renamed-display");
+
+        // In-memory metadata updated.
+        let g = state.containers.read().await;
+        let meta = g
+            .get("standalone-rename")
+            .expect("container meta should remain in cache after rename");
+        assert_eq!(meta.name.as_deref(), Some("renamed-display"));
+    }
+
+    /// Tasks 5.3.1-4: `POST /api/v1/containers/{id}/update` happy path.
+    ///
+    /// Pins three contracts at once:
+    ///
+    /// 1. The handler resolves the container by its 64-char hex id
+    ///    (registered in the id map) before talking to the runtime.
+    /// 2. The handler builds a [`ContainerResourceUpdate`] from the
+    ///    request body and forwards it to
+    ///    `Runtime::update_container_resources` verbatim.
+    /// 3. The handler returns Docker's `{"Warnings": [...]}` shape so
+    ///    `zlayer-docker` can pass the body through unchanged.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn update_container_forwards_to_runtime_and_returns_warnings() {
+        use crate::auth::Claims;
+        use std::sync::Mutex;
+        use std::time::Duration as StdDuration;
+        use zlayer_agent::error::Result as AgentResult;
+        use zlayer_agent::runtime::{ContainerResourceUpdate, ContainerUpdateOutcome};
+        use zlayer_types::api::containers::{ContainerUpdateRequest, ContainerUpdateRestartPolicy};
+
+        // Custom runtime that captures every `update_container_resources`
+        // call so the test can assert both that the handler called it
+        // and that every body field threaded through unchanged.
+        #[derive(Default)]
+        struct UpdateRecordingRuntime {
+            inner: zlayer_agent::MockRuntime,
+            updates: Mutex<Vec<(ContainerId, ContainerResourceUpdate)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Runtime for UpdateRecordingRuntime {
+            async fn pull_image(&self, image: &str) -> AgentResult<()> {
+                self.inner.pull_image(image).await
+            }
+            async fn pull_image_with_policy(
+                &self,
+                image: &str,
+                policy: zlayer_spec::PullPolicy,
+                auth: Option<&zlayer_spec::RegistryAuth>,
+            ) -> AgentResult<()> {
+                self.inner.pull_image_with_policy(image, policy, auth).await
+            }
+            async fn create_container(
+                &self,
+                id: &ContainerId,
+                spec: &zlayer_spec::ServiceSpec,
+            ) -> AgentResult<()> {
+                self.inner.create_container(id, spec).await
+            }
+            async fn start_container(&self, id: &ContainerId) -> AgentResult<()> {
+                self.inner.start_container(id).await
+            }
+            async fn stop_container(
+                &self,
+                id: &ContainerId,
+                t: std::time::Duration,
+            ) -> AgentResult<()> {
+                self.inner.stop_container(id, t).await
+            }
+            async fn remove_container(&self, id: &ContainerId) -> AgentResult<()> {
+                self.inner.remove_container(id).await
+            }
+            async fn container_state(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<zlayer_agent::runtime::ContainerState> {
+                self.inner.container_state(id).await
+            }
+            async fn container_logs(
+                &self,
+                id: &ContainerId,
+                tail: usize,
+            ) -> AgentResult<Vec<zlayer_observability::logs::LogEntry>> {
+                self.inner.container_logs(id, tail).await
+            }
+            async fn exec(
+                &self,
+                id: &ContainerId,
+                cmd: &[String],
+            ) -> AgentResult<(i32, String, String)> {
+                self.inner.exec(id, cmd).await
+            }
+            async fn get_container_stats(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<zlayer_agent::cgroups_stats::ContainerStats> {
+                self.inner.get_container_stats(id).await
+            }
+            async fn wait_container(&self, id: &ContainerId) -> AgentResult<i32> {
+                self.inner.wait_container(id).await
+            }
+            async fn get_logs(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<Vec<zlayer_observability::logs::LogEntry>> {
+                self.inner.get_logs(id).await
+            }
+            async fn get_container_pid(&self, id: &ContainerId) -> AgentResult<Option<u32>> {
+                self.inner.get_container_pid(id).await
+            }
+            async fn get_container_ip(
+                &self,
+                id: &ContainerId,
+            ) -> AgentResult<Option<std::net::IpAddr>> {
+                self.inner.get_container_ip(id).await
+            }
+            async fn update_container_resources(
+                &self,
+                id: &ContainerId,
+                update: &ContainerResourceUpdate,
+            ) -> AgentResult<ContainerUpdateOutcome> {
+                self.updates
+                    .lock()
+                    .unwrap()
+                    .push((id.clone(), update.clone()));
+                Ok(ContainerUpdateOutcome {
+                    warnings: vec!["test-warning".to_string()],
+                })
+            }
+        }
+
+        let runtime: Arc<UpdateRecordingRuntime> = Arc::new(UpdateRecordingRuntime::default());
+        let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
+        let state =
+            ContainerApiState::with_daemon_uuid(runtime_dyn, "update-test-uuid".to_string());
+        let cid = ContainerId {
+            service: "standalone-update".to_string(),
+            replica: 0,
+        };
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("standalone-update".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-update".to_string(), standalone);
+
+        let user = AuthUser {
+            claims: Claims::new(
+                "test",
+                StdDuration::from_secs(60),
+                vec!["operator".to_string()],
+                None,
+            ),
+        };
+
+        let body = ContainerUpdateRequest {
+            cpu_shares: Some(512),
+            memory: Some(536_870_912),
+            cpu_period: Some(100_000),
+            cpu_quota: Some(50_000),
+            cpuset_cpus: Some("0-3".to_string()),
+            memory_swap: Some(1_073_741_824),
+            blkio_weight: Some(500),
+            pids_limit: Some(2048),
+            restart_policy: Some(ContainerUpdateRestartPolicy {
+                name: Some("on-failure".to_string()),
+                maximum_retry_count: Some(5),
+            }),
+            ..Default::default()
+        };
+
+        let resp = update_container(user, State(state.clone()), Path(hex), Json(body))
+            .await
+            .expect("update must succeed");
+
+        // Response body propagated from the runtime outcome.
+        assert_eq!(resp.0.warnings, vec!["test-warning".to_string()]);
+
+        let recorded = runtime.updates.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let (rec_cid, rec_update) = &recorded[0];
+        assert_eq!(rec_cid, &cid);
+
+        // Every body field must have threaded through to the runtime
+        // ContainerResourceUpdate unchanged. This is the contract the
+        // Docker compat shim relies on.
+        assert_eq!(rec_update.cpu_shares, Some(512));
+        assert_eq!(rec_update.memory, Some(536_870_912));
+        assert_eq!(rec_update.cpu_period, Some(100_000));
+        assert_eq!(rec_update.cpu_quota, Some(50_000));
+        assert_eq!(rec_update.cpuset_cpus.as_deref(), Some("0-3"));
+        assert_eq!(rec_update.memory_swap, Some(1_073_741_824));
+        assert_eq!(rec_update.blkio_weight, Some(500));
+        assert_eq!(rec_update.pids_limit, Some(2048));
+        let rp = rec_update.restart_policy.as_ref().expect("restart_policy");
+        assert_eq!(rp.name.as_deref(), Some("on-failure"));
+        assert_eq!(rp.maximum_retry_count, Some(5));
+    }
+
+    /// `POST /api/v1/containers/{id}/update` against a runtime that
+    /// returns `Unsupported` must surface a `501 Not Implemented` to
+    /// the caller — not a `500`. This is the contract Docker clients
+    /// rely on to detect when a backend cannot honour the call.
+    #[tokio::test]
+    async fn update_container_maps_unsupported_runtime_to_501() {
+        use crate::auth::Claims;
+        use std::time::Duration as StdDuration;
+        use zlayer_types::api::containers::ContainerUpdateRequest;
+
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state =
+            ContainerApiState::with_daemon_uuid(runtime, "update-unsupported-uuid".to_string());
+        let cid = ContainerId {
+            service: "standalone-unsupported".to_string(),
+            replica: 0,
+        };
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+
+        let standalone = StandaloneContainer {
+            container_id: cid,
+            image: "alpine:latest".to_string(),
+            name: None,
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-unsupported".to_string(), standalone);
+
+        let user = AuthUser {
+            claims: Claims::new(
+                "test",
+                StdDuration::from_secs(60),
+                vec!["operator".to_string()],
+                None,
+            ),
+        };
+
+        let body = ContainerUpdateRequest {
+            cpu_shares: Some(256),
+            ..Default::default()
+        };
+
+        let err = update_container(user, State(state), Path(hex), Json(body))
+            .await
+            .expect_err("MockRuntime returns Unsupported by default");
         assert!(
-            joined.contains("post-exit line"),
-            "missing 'post-exit line' in {joined}"
+            matches!(err, ApiError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_container_returns_hex_id_via_id_map() {
+        // `create_container` itself is integration-heavy (pulls images,
+        // attaches to networks). The contract this test pins is narrower:
+        // when `ContainerApiState::id_map.register` is called with the
+        // ContainerId minted by `generate_container_id`, the resulting
+        // string is a 64-char lowercase hex stamped with the daemon UUID.
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::with_daemon_uuid(runtime, "deterministic-uuid".to_string());
+        let (_id_str, cid) = generate_container_id(Some("demo"));
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        assert_eq!(hex.len(), 64);
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // The hex form must equal the canonical `compute_hex` output so
+        // Docker compat layer clients can predict the value.
+        let expected =
+            crate::handlers::container_id_map::compute_hex(state.id_map.daemon_uuid(), &cid);
+        assert_eq!(hex, expected);
+
+        // And the round-trip lookup must return the same ContainerId.
+        assert_eq!(state.id_map.lookup_hex(&hex), Some(cid));
+    }
+
+    // -----------------------------------------------------------------------
+    // §3.2.2 / §3.3.2 — REST `/logs` and `/stats` streaming handlers backed
+    // by `Runtime::logs_stream` and `Runtime::stats_stream`.
+    // -----------------------------------------------------------------------
+
+    /// `logs` namespace fixture: build a `LogsStreamOptions` from a
+    /// representative `ContainerLogQuery` and assert each field maps to the
+    /// expected runtime option. Pins the "neither stdout nor stderr set ->
+    /// both default to true" default and the `tail==0 -> None` mapping.
+    mod logs {
+        use super::*;
+        use bytes::Bytes;
+        use chrono::TimeZone;
+        use futures_util::StreamExt;
+        use zlayer_agent::runtime::{LogChannel, LogChunk, MockRuntime, Runtime};
+
+        #[test]
+        fn handler_builds_logs_stream_options_from_query() {
+            // Empty query: stdout/stderr both default to true; follow off.
+            let empty: ContainerLogQuery = serde_json::from_str("{}").unwrap();
+            let opts = logs_stream_options_from_query(&empty);
+            assert!(!opts.follow);
+            assert!(opts.stdout);
+            assert!(opts.stderr);
+            assert_eq!(opts.tail, Some(100));
+            assert!(opts.since.is_none());
+            assert!(opts.until.is_none());
+            assert!(!opts.timestamps);
+
+            // Fully-populated query: every field is plumbed through.
+            let full: ContainerLogQuery = serde_json::from_str(
+                r#"{
+                    "tail": 25,
+                    "follow": true,
+                    "since": 1700000000,
+                    "until": 1700001000,
+                    "timestamps": true,
+                    "stdout": false,
+                    "stderr": true
+                }"#,
+            )
+            .unwrap();
+            let opts = logs_stream_options_from_query(&full);
+            assert!(opts.follow);
+            assert!(!opts.stdout);
+            assert!(opts.stderr);
+            assert_eq!(opts.tail, Some(25));
+            assert_eq!(opts.since, Some(1_700_000_000));
+            assert_eq!(opts.until, Some(1_700_001_000));
+            assert!(opts.timestamps);
+
+            // tail=0 maps to "all logs" (`None`).
+            let no_tail: ContainerLogQuery = serde_json::from_str(r#"{"tail": 0}"#).unwrap();
+            assert!(logs_stream_options_from_query(&no_tail).tail.is_none());
+
+            // Both explicitly-false collapses to "include both" rather than
+            // "stream nothing".
+            let both_false: ContainerLogQuery =
+                serde_json::from_str(r#"{"stdout": false, "stderr": false}"#).unwrap();
+            let opts = logs_stream_options_from_query(&both_false);
+            assert!(opts.stdout);
+            assert!(opts.stderr);
+        }
+
+        /// `format=json` (the default) emits one NDJSON line per `LogChunk`
+        /// with the documented shape. Drives the format converter directly
+        /// via `ndjson_line_for_chunk` so the test is independent of axum
+        /// routing.
+        #[tokio::test]
+        async fn json_format_emits_ndjson_per_chunk() {
+            let runtime = MockRuntime::new();
+            let id = ContainerId {
+                service: "logs-json".to_string(),
+                replica: 0,
+            };
+            // Pre-script three chunks: one stdout (UTF-8), one stderr (with
+            // timestamp), and one stdout containing non-UTF8 bytes that must
+            // be base64-encoded.
+            let ts = chrono::Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap();
+            runtime
+                .enqueue_log_chunk(
+                    &id,
+                    LogChunk {
+                        stream: LogChannel::Stdout,
+                        bytes: Bytes::from_static(b"hello\n"),
+                        timestamp: None,
+                    },
+                )
+                .await;
+            runtime
+                .enqueue_log_chunk(
+                    &id,
+                    LogChunk {
+                        stream: LogChannel::Stderr,
+                        bytes: Bytes::from_static(b"oops\n"),
+                        timestamp: Some(ts),
+                    },
+                )
+                .await;
+            runtime
+                .enqueue_log_chunk(
+                    &id,
+                    LogChunk {
+                        stream: LogChannel::Stdout,
+                        bytes: Bytes::from_static(&[0xFF, 0xFE, 0xFD]),
+                        timestamp: None,
+                    },
+                )
+                .await;
+
+            let mut stream = runtime
+                .logs_stream(&id, LogsStreamOptions::default())
+                .await
+                .expect("logs_stream succeeds");
+
+            let mut chunks = Vec::new();
+            while let Some(item) = stream.next().await {
+                chunks.push(item.expect("MockRuntime queue items are Ok"));
+            }
+            assert_eq!(chunks.len(), 3);
+
+            let l1 = ndjson_line_for_chunk(&chunks[0]);
+            let s1 = std::str::from_utf8(&l1).unwrap();
+            assert!(s1.ends_with('\n'));
+            let v1: serde_json::Value = serde_json::from_str(s1.trim_end()).unwrap();
+            assert_eq!(v1["stream"], "stdout");
+            assert_eq!(v1["data"], "hello\n");
+            assert!(v1.get("timestamp").is_none());
+            assert!(v1.get("data_b64").is_none());
+
+            let l2 = ndjson_line_for_chunk(&chunks[1]);
+            let v2: serde_json::Value =
+                serde_json::from_str(std::str::from_utf8(&l2).unwrap().trim_end()).unwrap();
+            assert_eq!(v2["stream"], "stderr");
+            assert_eq!(v2["data"], "oops\n");
+            assert!(v2["timestamp"].as_str().is_some());
+
+            let l3 = ndjson_line_for_chunk(&chunks[2]);
+            let v3: serde_json::Value =
+                serde_json::from_str(std::str::from_utf8(&l3).unwrap().trim_end()).unwrap();
+            assert_eq!(v3["stream"], "stdout");
+            // Non-UTF8 bytes -> base64-encoded under `data_b64` instead of
+            // `data` so the line stays valid JSON.
+            assert!(v3.get("data").is_none());
+            assert!(v3["data_b64"].as_str().is_some());
+        }
+    }
+
+    /// `stats` namespace fixture: drives the `Runtime::stats_stream`-backed
+    /// handler through the streaming branches via the `MockRuntime` queue.
+    mod stats {
+        use super::*;
+        use chrono::TimeZone;
+        use futures_util::StreamExt;
+        use zlayer_agent::runtime::{MockRuntime, Runtime, StatsSample};
+
+        fn sample(cpu_total_ns: u64) -> StatsSample {
+            StatsSample {
+                cpu_total_ns,
+                cpu_system_ns: 0,
+                online_cpus: 1,
+                mem_used_bytes: 0,
+                mem_limit_bytes: 0,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
+                blkio_read_bytes: 0,
+                blkio_write_bytes: 0,
+                pids_current: 0,
+                pids_limit: None,
+                timestamp: chrono::Utc.with_ymd_and_hms(2026, 5, 3, 12, 0, 0).unwrap(),
+            }
+        }
+
+        /// `stream=false` (Docker default): the body must contain exactly one
+        /// `StatsSample` line, regardless of how many samples the runtime
+        /// produced. Drives the same `take(1)` logic the handler uses.
+        #[tokio::test]
+        async fn stream_false_emits_exactly_one_sample() {
+            let runtime = MockRuntime::new();
+            let id = ContainerId {
+                service: "stats-once".to_string(),
+                replica: 0,
+            };
+            // Enqueue three samples; only the first must reach the body.
+            runtime.enqueue_stats_sample(&id, sample(1)).await;
+            runtime.enqueue_stats_sample(&id, sample(2)).await;
+            runtime.enqueue_stats_sample(&id, sample(3)).await;
+
+            let stream = runtime.stats_stream(&id).await.expect("stats_stream ok");
+            let body: Vec<_> = stream.take(1).collect().await;
+            assert_eq!(body.len(), 1);
+            let s = body
+                .into_iter()
+                .next()
+                .unwrap()
+                .expect("queued samples are Ok");
+            let line = ndjson_line_for_stats(&s);
+            let text = std::str::from_utf8(&line).unwrap();
+            assert!(text.ends_with('\n'));
+            let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+            assert_eq!(v["cpu_total_ns"], 1);
+        }
+
+        /// `stream=true`: the runtime's full sample sequence must be visible
+        /// to the consumer, in order.
+        #[tokio::test]
+        async fn stream_true_emits_multiple_samples() {
+            let runtime = MockRuntime::new();
+            let id = ContainerId {
+                service: "stats-many".to_string(),
+                replica: 0,
+            };
+            for n in 1u64..=4 {
+                runtime.enqueue_stats_sample(&id, sample(n)).await;
+            }
+
+            let mut stream = runtime.stats_stream(&id).await.expect("stats_stream ok");
+            let mut seen = Vec::new();
+            while let Some(item) = stream.next().await {
+                let s = item.expect("queued samples are Ok");
+                let line = ndjson_line_for_stats(&s);
+                let v: serde_json::Value =
+                    serde_json::from_str(std::str::from_utf8(&line).unwrap().trim_end()).unwrap();
+                seen.push(v["cpu_total_ns"].as_u64().unwrap());
+            }
+            assert_eq!(seen, vec![1, 2, 3, 4]);
+        }
     }
 
     #[test]
@@ -3085,23 +5316,10 @@ mod tests {
     fn build_service_spec_threads_hostname_dns_extra_hosts() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
             hostname: Some("my-host".to_string()),
             dns: vec!["8.8.8.8".to_string()],
             extra_hosts: vec!["host.docker.internal:host-gateway".to_string()],
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("valid spec");
         assert_eq!(spec.hostname.as_deref(), Some("my-host"));
@@ -3117,28 +5335,13 @@ mod tests {
         // `mount_type: None` means legacy behavior: a host-path bind mount.
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: None,
                 source: Some("/srv/data".to_string()),
                 target: "/data".to_string(),
                 readonly: true,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("bind default should build");
         assert_eq!(spec.storage.len(), 1);
@@ -3160,28 +5363,13 @@ mod tests {
     fn volume_mount_bind_rejects_relative_source() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: Some(VolumeMountType::Bind),
                 source: Some("relative/path".to_string()),
                 target: "/data".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         assert!(build_service_spec(&request).is_err());
     }
@@ -3190,28 +5378,13 @@ mod tests {
     fn volume_mount_volume_translates_to_storage_named() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: Some(VolumeMountType::Volume),
                 source: Some("pg-data".to_string()),
                 target: "/var/lib/postgresql".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("volume should build");
         assert_eq!(spec.storage.len(), 1);
@@ -3234,28 +5407,13 @@ mod tests {
     fn volume_mount_volume_rejects_invalid_name() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: Some(VolumeMountType::Volume),
                 source: Some("Bad Name!".to_string()),
                 target: "/data".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         assert!(build_service_spec(&request).is_err());
     }
@@ -3264,28 +5422,13 @@ mod tests {
     fn volume_mount_tmpfs_translates_to_storage_tmpfs() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: Some(VolumeMountType::Tmpfs),
                 source: None,
                 target: "/tmp-mem".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("tmpfs should build");
         assert_eq!(spec.storage.len(), 1);
@@ -3301,28 +5444,13 @@ mod tests {
     fn volume_mount_tmpfs_rejects_source() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
             volumes: vec![VolumeMount {
                 mount_type: Some(VolumeMountType::Tmpfs),
                 source: Some("/something".to_string()),
                 target: "/tmp-mem".to_string(),
                 readonly: false,
             }],
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         assert!(build_service_spec(&request).is_err());
     }
@@ -3331,23 +5459,8 @@ mod tests {
     fn build_service_spec_rejects_bad_dns() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
             dns: vec!["not-an-ip".to_string()],
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         assert!(build_service_spec(&request).is_err());
     }
@@ -3363,23 +5476,8 @@ mod tests {
         };
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
             restart_policy: Some(policy.clone()),
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let spec = build_service_spec(&request).expect("valid restart policy");
         assert_eq!(spec.restart_policy, Some(policy));
@@ -3389,27 +5487,12 @@ mod tests {
     fn build_service_spec_rejects_bad_restart_delay() {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
-            name: None,
-            pull_policy: None,
-            env: HashMap::new(),
-            command: None,
-            labels: HashMap::new(),
-            resources: None,
-            volumes: Vec::new(),
-            ports: Vec::new(),
-            work_dir: None,
-            health_check: None,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
             restart_policy: Some(zlayer_spec::ContainerRestartPolicy {
                 kind: zlayer_spec::ContainerRestartKind::Always,
                 max_attempts: None,
                 delay: Some("not-a-duration".to_string()),
             }),
-            registry_credential_id: None,
-            registry_auth: None,
-            networks: Vec::new(),
+            ..CreateContainerRequest::default()
         };
         let err = build_service_spec(&request).expect_err("must reject bad delay");
         assert!(
@@ -3855,5 +5938,478 @@ mod tests {
         assert_eq!(stopped, vec!["svc-rep-0".to_string()]);
         let removed = tracing_concrete.removed.lock().unwrap().clone();
         assert_eq!(removed, vec!["svc-rep-0".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks 5.5.1–5.5.6: pause / unpause / top / changes / port / prune
+    //
+    // Each test pins one endpoint by driving the handler with a
+    // `LifecycleRuntime` mock that records the runtime call and returns a
+    // pre-canned response. The mocks delegate every other Runtime method to
+    // the inner `MockRuntime` so we don't have to reimplement the whole
+    // trait.
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct LifecycleRuntime {
+        inner: zlayer_agent::MockRuntime,
+        pause_calls: std::sync::Mutex<Vec<ContainerId>>,
+        unpause_calls: std::sync::Mutex<Vec<ContainerId>>,
+        top_calls: std::sync::Mutex<Vec<(ContainerId, Vec<String>)>>,
+        changes_calls: std::sync::Mutex<Vec<ContainerId>>,
+        port_calls: std::sync::Mutex<Vec<ContainerId>>,
+        prune_calls: std::sync::Mutex<u32>,
+        // Archive endpoints (Tasks 5.4.1-6) — record calls + return canned bytes.
+        archive_get_calls: std::sync::Mutex<Vec<(ContainerId, String)>>,
+        archive_put_calls:
+            std::sync::Mutex<Vec<(ContainerId, String, bytes::Bytes, ArchivePutOptions)>>,
+        archive_head_calls: std::sync::Mutex<Vec<(ContainerId, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for LifecycleRuntime {
+        async fn pull_image(&self, image: &str) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image(image).await
+        }
+        async fn pull_image_with_policy(
+            &self,
+            image: &str,
+            policy: zlayer_spec::PullPolicy,
+            auth: Option<&zlayer_spec::RegistryAuth>,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image_with_policy(image, policy, auth).await
+        }
+        async fn create_container(
+            &self,
+            id: &ContainerId,
+            spec: &zlayer_spec::ServiceSpec,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.create_container(id, spec).await
+        }
+        async fn start_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.start_container(id).await
+        }
+        async fn stop_container(
+            &self,
+            id: &ContainerId,
+            t: std::time::Duration,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.stop_container(id, t).await
+        }
+        async fn remove_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.remove_container(id).await
+        }
+        async fn container_state(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<ContainerState> {
+            self.inner.container_state(id).await
+        }
+        async fn container_logs(
+            &self,
+            id: &ContainerId,
+            tail: usize,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.container_logs(id, tail).await
+        }
+        async fn exec(
+            &self,
+            id: &ContainerId,
+            cmd: &[String],
+        ) -> zlayer_agent::error::Result<(i32, String, String)> {
+            self.inner.exec(id, cmd).await
+        }
+        async fn get_container_stats(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::cgroups_stats::ContainerStats> {
+            self.inner.get_container_stats(id).await
+        }
+        async fn wait_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<i32> {
+            self.inner.wait_container(id).await
+        }
+        async fn get_logs(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.get_logs(id).await
+        }
+        async fn get_container_pid(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<u32>> {
+            self.inner.get_container_pid(id).await
+        }
+        async fn get_container_ip(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<std::net::IpAddr>> {
+            self.inner.get_container_ip(id).await
+        }
+
+        async fn pause_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.pause_calls.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+        async fn unpause_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.unpause_calls.lock().unwrap().push(id.clone());
+            Ok(())
+        }
+        async fn top_container(
+            &self,
+            id: &ContainerId,
+            ps_args: &[String],
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ContainerTopOutput> {
+            self.top_calls
+                .lock()
+                .unwrap()
+                .push((id.clone(), ps_args.to_vec()));
+            Ok(zlayer_agent::runtime::ContainerTopOutput {
+                titles: vec!["UID".to_string(), "PID".to_string(), "CMD".to_string()],
+                processes: vec![vec![
+                    "0".to_string(),
+                    "1234".to_string(),
+                    "/bin/sleep 1000".to_string(),
+                ]],
+            })
+        }
+        async fn changes_container(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_agent::runtime::FilesystemChangeEntry>>
+        {
+            self.changes_calls.lock().unwrap().push(id.clone());
+            Ok(vec![
+                zlayer_agent::runtime::FilesystemChangeEntry {
+                    path: "/etc/hosts".to_string(),
+                    kind: zlayer_agent::runtime::FilesystemChangeKind::Modified,
+                },
+                zlayer_agent::runtime::FilesystemChangeEntry {
+                    path: "/tmp/new".to_string(),
+                    kind: zlayer_agent::runtime::FilesystemChangeKind::Added,
+                },
+            ])
+        }
+        async fn port_mappings_container(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_agent::runtime::PortMappingEntry>> {
+            self.port_calls.lock().unwrap().push(id.clone());
+            Ok(vec![zlayer_agent::runtime::PortMappingEntry {
+                container_port: 80,
+                protocol: "tcp".to_string(),
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(8080),
+            }])
+        }
+        async fn prune_containers(
+            &self,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ContainerPruneResult> {
+            *self.prune_calls.lock().unwrap() += 1;
+            Ok(zlayer_agent::runtime::ContainerPruneResult {
+                deleted: vec!["abc".to_string(), "def".to_string()],
+                space_reclaimed: 1024,
+            })
+        }
+        async fn archive_get(
+            &self,
+            id: &ContainerId,
+            path: &str,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ArchiveStream> {
+            self.archive_get_calls
+                .lock()
+                .unwrap()
+                .push((id.clone(), path.to_string()));
+            // Return a deterministic 4-byte chunk so the test can assert
+            // that the streaming body actually delivers it.
+            let chunks = vec![Ok(bytes::Bytes::from_static(b"TAR1"))];
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+        async fn archive_put(
+            &self,
+            id: &ContainerId,
+            path: &str,
+            tar_bytes: bytes::Bytes,
+            opts: zlayer_agent::runtime::ArchivePutOptions,
+        ) -> zlayer_agent::error::Result<()> {
+            self.archive_put_calls.lock().unwrap().push((
+                id.clone(),
+                path.to_string(),
+                tar_bytes,
+                opts,
+            ));
+            Ok(())
+        }
+        async fn archive_head(
+            &self,
+            id: &ContainerId,
+            path: &str,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::PathStat> {
+            self.archive_head_calls
+                .lock()
+                .unwrap()
+                .push((id.clone(), path.to_string()));
+            Ok(zlayer_agent::runtime::PathStat {
+                name: "etc".to_string(),
+                size: 4096,
+                mode: 0o040_755,
+                mtime: Some("2026-05-03T00:00:00Z".to_string()),
+                link_target: String::new(),
+            })
+        }
+    }
+
+    /// Build a test state pre-loaded with one standalone container backed
+    /// by a `LifecycleRuntime` so the lifecycle handlers (pause / top /
+    /// changes / port) have something to resolve against. Returns the state
+    /// plus the container's hex id and the runtime handle for assertions.
+    async fn make_lifecycle_state() -> (ContainerApiState, String, Arc<LifecycleRuntime>) {
+        let runtime: Arc<LifecycleRuntime> = Arc::new(LifecycleRuntime::default());
+        let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
+        let state =
+            ContainerApiState::with_daemon_uuid(runtime_dyn, "lifecycle-test-uuid".to_string());
+        let cid = ContainerId {
+            service: "standalone-life".to_string(),
+            replica: 0,
+        };
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("standalone-life".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-05-03T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-life".to_string(), standalone);
+        (state, hex, runtime)
+    }
+
+    fn operator_user() -> AuthUser {
+        use crate::auth::Claims;
+        use std::time::Duration as StdDuration;
+        AuthUser {
+            claims: Claims::new(
+                "test",
+                StdDuration::from_secs(60),
+                vec!["operator".to_string()],
+                None,
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_container_handler_invokes_runtime_and_returns_204() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let status = pause_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("pause must succeed");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        let calls = runtime.pause_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].service, "standalone-life");
+    }
+
+    #[tokio::test]
+    async fn unpause_container_handler_invokes_runtime_and_returns_204() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let status = unpause_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("unpause must succeed");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        let calls = runtime.unpause_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn top_container_handler_returns_runtime_output() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let resp = top_container(
+            operator_user(),
+            State(state),
+            Path(hex),
+            Query(ContainerTopQuery {
+                ps_args: Some("aux".to_string()),
+            }),
+        )
+        .await
+        .expect("top must succeed");
+        let body = resp.0;
+        assert_eq!(body.titles, vec!["UID", "PID", "CMD"]);
+        assert_eq!(body.processes.len(), 1);
+        assert_eq!(body.processes[0][1], "1234");
+
+        let calls = runtime.top_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec!["aux".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn changes_container_handler_returns_docker_kind_integers() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let resp = changes_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("changes must succeed");
+        let body = resp.0;
+        assert_eq!(body.len(), 2);
+        // Modified == 0, Added == 1
+        assert_eq!(body[0].path, "/etc/hosts");
+        assert_eq!(body[0].kind, 0);
+        assert_eq!(body[1].path, "/tmp/new");
+        assert_eq!(body[1].kind, 1);
+
+        assert_eq!(runtime.changes_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn port_container_handler_groups_bindings_by_port_protocol_key() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let resp = port_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("port must succeed");
+        let body = resp.0;
+        let bucket = body
+            .ports
+            .get("80/tcp")
+            .expect("80/tcp key must be present")
+            .as_ref()
+            .expect("bucket must contain bindings");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0].host_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(bucket[0].host_port.as_deref(), Some("8080"));
+
+        assert_eq!(runtime.port_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_containers_handler_returns_docker_shape() {
+        let runtime: Arc<LifecycleRuntime> = Arc::new(LifecycleRuntime::default());
+        let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
+        let state = ContainerApiState::with_daemon_uuid(runtime_dyn, "prune-test-uuid".to_string());
+
+        let resp = prune_containers(operator_user(), State(state))
+            .await
+            .expect("prune must succeed");
+        let body = resp.0;
+        assert_eq!(body.containers_deleted, vec!["abc", "def"]);
+        assert_eq!(body.space_reclaimed, 1024);
+        assert_eq!(*runtime.prune_calls.lock().unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tasks 5.4.1-6 — container archive endpoints (`docker cp`)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn archive_get_handler_streams_runtime_bytes_with_path_stat_header() {
+        use axum::body::to_bytes;
+        use base64::Engine;
+
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let resp = archive_get(
+            operator_user(),
+            State(state),
+            Path(hex),
+            Query(ArchivePathQuery {
+                path: Some("/etc".to_string()),
+            }),
+        )
+        .await
+        .expect("archive_get must succeed");
+
+        // Header should be base64-encoded JSON describing /etc.
+        let header = resp
+            .headers()
+            .get("X-Docker-Container-Path-Stat")
+            .expect("path-stat header must be present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&header)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(v["name"], "etc");
+        assert_eq!(v["size"], 4096);
+        assert_eq!(v["mode"], 0o040_755);
+
+        // Body must include the canned bytes from the runtime.
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(body.as_ref(), b"TAR1");
+
+        // Both archive_head (for the header) and archive_get (for the body)
+        // must have been called once each.
+        assert_eq!(runtime.archive_head_calls.lock().unwrap().len(), 1);
+        let get_calls = runtime.archive_get_calls.lock().unwrap();
+        assert_eq!(get_calls.len(), 1);
+        assert_eq!(get_calls[0].1, "/etc");
+    }
+
+    #[tokio::test]
+    async fn archive_put_handler_forwards_body_and_options() {
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let body = bytes::Bytes::from_static(&[0u8, 1, 2, 3]);
+        let status = archive_put(
+            operator_user(),
+            State(state),
+            Path(hex),
+            Query(ArchivePutQuery {
+                path: Some("/tmp".to_string()),
+                no_overwrite_dir_non_dir: Some("1".to_string()),
+                copy_uid_gid: Some("true".to_string()),
+            }),
+            body.clone(),
+        )
+        .await
+        .expect("archive_put must succeed");
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let calls = runtime.archive_put_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "/tmp");
+        assert_eq!(calls[0].2, body);
+        assert!(calls[0].3.no_overwrite_dir_non_dir);
+        assert!(calls[0].3.copy_uid_gid);
+    }
+
+    #[tokio::test]
+    async fn archive_head_handler_only_returns_path_stat_header() {
+        use axum::body::to_bytes;
+
+        let (state, hex, runtime) = make_lifecycle_state().await;
+        let resp = archive_head(
+            operator_user(),
+            State(state),
+            Path(hex),
+            Query(ArchivePathQuery {
+                path: Some("/etc".to_string()),
+            }),
+        )
+        .await
+        .expect("archive_head must succeed");
+
+        // Body must be empty.
+        let body = to_bytes(resp.into_body(), 16).await.unwrap();
+        assert!(body.is_empty());
+
+        assert_eq!(runtime.archive_head_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn archive_get_handler_rejects_missing_path() {
+        let (state, hex, _runtime) = make_lifecycle_state().await;
+        let err = archive_get(
+            operator_user(),
+            State(state),
+            Path(hex),
+            Query(ArchivePathQuery { path: None }),
+        )
+        .await
+        .expect_err("missing path must yield BadRequest");
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

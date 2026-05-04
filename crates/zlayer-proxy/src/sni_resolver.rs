@@ -210,10 +210,7 @@ impl SniCertResolver {
     /// Check if a default/fallback certificate is configured
     #[must_use]
     pub fn has_default_cert(&self) -> bool {
-        self.default_cert
-            .read()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.default_cert.read().is_ok_and(|guard| guard.is_some())
     }
 
     /// Internal method to resolve a certificate for a given server name

@@ -1284,8 +1284,7 @@ async fn rotate_structured_logs(log_dir: &std::path::Path) -> Result<()> {
             // already handle here)
             if tokio::fs::symlink_metadata(&path)
                 .await
-                .map(|m| m.is_symlink())
-                .unwrap_or(false)
+                .is_ok_and(|m| m.is_symlink())
             {
                 continue;
             }

@@ -390,6 +390,10 @@ mod blocking {
     /// For anonymous/SSH auth the closure returns `Ok(None)` so that gix
     /// falls back to its defaults (or, for SSH, just lets the transport
     /// handle auth via `GIT_SSH_COMMAND`).
+    #[allow(
+        clippy::result_large_err,
+        reason = "Error type comes from the gix credentials API; we cannot change its size."
+    )]
     fn credentials_for(
         auth: &GitAuth,
     ) -> Option<

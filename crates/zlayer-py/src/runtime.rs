@@ -207,11 +207,13 @@ impl Runtime {
             inner
                 .service_manager
                 .set_deployment_name(spec.deployment.clone());
-            inner
-                .service_manager
-                .deploy_with_dependencies(spec.services)
-                .await
-                .map_err(ZLayerError::from)?;
+            Box::pin(
+                inner
+                    .service_manager
+                    .deploy_with_dependencies(spec.services),
+            )
+            .await
+            .map_err(ZLayerError::from)?;
 
             to_py_result(Ok(()))
         })
@@ -243,11 +245,13 @@ impl Runtime {
             inner
                 .service_manager
                 .set_deployment_name(spec.deployment.clone());
-            inner
-                .service_manager
-                .deploy_with_dependencies(spec.services)
-                .await
-                .map_err(ZLayerError::from)?;
+            Box::pin(
+                inner
+                    .service_manager
+                    .deploy_with_dependencies(spec.services),
+            )
+            .await
+            .map_err(ZLayerError::from)?;
 
             to_py_result(Ok(()))
         })

@@ -5,15 +5,24 @@
 //! Docker extension, CI systems, and other Docker-aware tools to interact
 //! with `ZLayer`.
 
+pub mod auth;
+mod build;
+mod buildkit;
 mod containers;
 mod images;
 #[cfg(unix)]
 mod listener_unix;
 #[cfg(windows)]
 mod listener_windows;
+mod manifest;
 mod networks;
+pub mod streaming;
+mod swarm;
 mod system;
+mod translate;
+mod trust;
 mod types;
+mod version_middleware;
 mod volumes;
 
 use std::path::Path;
@@ -63,11 +72,25 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Build the Docker Engine API router.
+///
+/// The first seven `merge` calls register real, state-bearing handler
+/// modules (`/containers`, `/images`, `/build`, `/volumes`, `/networks`,
+/// `/system`, and `/swarm` -- the last bridges to `ZLayer`'s native
+/// cluster primitives). The trailing three (`buildkit`, `manifest`,
+/// `trust`) register stub routers that answer with a Docker-shape 501 /
+/// 503 so Docker clients see a clean error instead of a 404. Each stub
+/// module documents what a real implementation would need.
 fn router(state: SocketState) -> Router {
     Router::new()
         .merge(containers::routes(state.clone()))
-        .merge(images::routes(state))
-        .merge(volumes::routes())
-        .merge(networks::routes())
-        .merge(system::routes())
+        .merge(images::routes(state.clone()))
+        .merge(build::routes(state.clone()))
+        .merge(volumes::routes(state.clone()))
+        .merge(networks::routes(state.clone()))
+        .merge(system::routes(state.clone()))
+        .merge(buildkit::routes())
+        .merge(swarm::routes(state))
+        .merge(manifest::routes())
+        .merge(trust::routes())
+        .layer(axum::middleware::from_fn(version_middleware::strip_version))
 }

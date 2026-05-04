@@ -215,7 +215,7 @@ mod tests {
         );
 
         let mut candidates = [relay_v6, host_v4, host_v6];
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         // Both hosts (priority 100) should come before relay (priority 10)
         assert_eq!(candidates[0].candidate_type, CandidateType::Host);

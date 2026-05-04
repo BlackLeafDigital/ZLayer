@@ -21,10 +21,13 @@ use crate::handlers::container_networks::{
     DisconnectBridgeNetworkRequest,
 };
 use crate::handlers::containers::{
-    ContainerExecRequest, ContainerExecResponse, ContainerHealthInfo, ContainerInfo,
-    ContainerResourceLimits, ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest,
-    HealthCheckRequest, KillContainerRequest, NetworkAttachmentInfo, NetworkAttachmentRequest,
-    RestartContainerRequest, StopContainerRequest, VolumeMount, VolumeMountType,
+    ContainerChangeEntry, ContainerExecRequest, ContainerExecResponse, ContainerHealthInfo,
+    ContainerInfo, ContainerPortBinding, ContainerPortResponse, ContainerPruneResponse,
+    ContainerResourceLimits, ContainerStatsResponse, ContainerTopResponse, ContainerUpdateRequest,
+    ContainerUpdateResponse, ContainerUpdateRestartPolicy, ContainerWaitDockerError,
+    ContainerWaitDockerResponse, ContainerWaitResponse, CreateContainerRequest, HealthCheckRequest,
+    KillContainerRequest, NetworkAttachmentInfo, NetworkAttachmentRequest, RestartContainerRequest,
+    StopContainerRequest, VolumeMount, VolumeMountType,
 };
 use crate::handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, GitCredentialKindSchema,
@@ -34,7 +37,10 @@ use crate::handlers::cron::{CronJobResponse, CronStatusResponse, TriggerCronResp
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::environments::{CreateEnvironmentRequest, UpdateEnvironmentRequest};
 
-use crate::event_bus::{ContainerEvent, ContainerEventKind};
+use crate::event_bus::{
+    ContainerEvent, ContainerEventKind, DaemonEvent, ImageEvent, ImageEventKind, NetworkEvent,
+    NetworkEventKind, VolumeEvent, VolumeEventKind,
+};
 use crate::handlers::groups::{
     AddMemberRequest, CreateGroupRequest, GroupMembersResponse, UpdateGroupRequest,
 };
@@ -109,10 +115,13 @@ use crate::handlers::container_networks::{
     __path_get_container_network, __path_list_container_networks,
 };
 use crate::handlers::containers::{
+    __path_archive_get, __path_archive_head, __path_archive_put, __path_changes_container,
     __path_create_container, __path_delete_container, __path_exec_in_container,
     __path_get_container, __path_get_container_logs, __path_get_container_stats,
-    __path_kill_container, __path_list_containers, __path_restart_container,
-    __path_start_container, __path_stop_container, __path_wait_container,
+    __path_kill_container, __path_list_containers, __path_pause_container, __path_port_container,
+    __path_prune_containers, __path_rename_container, __path_restart_container,
+    __path_start_container, __path_stop_container, __path_top_container, __path_unpause_container,
+    __path_update_container, __path_wait_container, __path_wait_container_post,
 };
 use crate::handlers::credentials::{
     __path_create_git_credential, __path_create_registry_credential, __path_delete_git_credential,
@@ -125,7 +134,7 @@ use crate::handlers::cron::{
 };
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
-    __path_list_deployments,
+    __path_get_deployment_spec, __path_list_deployments,
 };
 use crate::handlers::environments::{
     __path_create_environment, __path_delete_environment, __path_get_environment,
@@ -270,6 +279,7 @@ impl Modify for SecurityAddon {
         // Deployments
         list_deployments,
         get_deployment,
+        get_deployment_spec,
         create_deployment,
         delete_deployment,
         // Services
@@ -293,11 +303,23 @@ impl Modify for SecurityAddon {
         get_container_logs,
         exec_in_container,
         wait_container,
+        wait_container_post,
+        rename_container,
+        update_container,
         get_container_stats,
         stop_container,
         start_container,
         restart_container,
         kill_container,
+        pause_container,
+        unpause_container,
+        top_container,
+        changes_container,
+        port_container,
+        archive_get,
+        archive_put,
+        archive_head,
+        prune_containers,
         // Images
         list_images_handler,
         remove_image_handler,
@@ -469,6 +491,7 @@ impl Modify for SecurityAddon {
             DeploymentSummary,
             DeploymentDetails,
             CreateDeploymentRequest,
+            crate::storage::StoredDeployment,
             ServiceSummary,
             ServiceDetails,
             ServiceEndpoint,
@@ -499,10 +522,20 @@ impl Modify for SecurityAddon {
             ContainerExecRequest,
             ContainerExecResponse,
             ContainerWaitResponse,
+            ContainerWaitDockerResponse,
+            ContainerWaitDockerError,
             ContainerStatsResponse,
+            ContainerTopResponse,
+            ContainerChangeEntry,
+            ContainerPortResponse,
+            ContainerPortBinding,
+            ContainerPruneResponse,
             StopContainerRequest,
             RestartContainerRequest,
             KillContainerRequest,
+            ContainerUpdateRequest,
+            ContainerUpdateResponse,
+            ContainerUpdateRestartPolicy,
             NetworkAttachmentRequest,
             // §3.10: inline registry auth on CreateContainerRequest / PullImageRequest
             zlayer_spec::RegistryAuth,
@@ -524,9 +557,17 @@ impl Modify for SecurityAddon {
             crate::storage::StoredEnvironment,
             CreateEnvironmentRequest,
             UpdateEnvironmentRequest,
-            // Events schemas (daemon-wide container lifecycle)
+            // Events schemas (daemon-wide lifecycle: containers, images,
+            // networks, volumes)
             ContainerEvent,
             ContainerEventKind,
+            ImageEvent,
+            ImageEventKind,
+            NetworkEvent,
+            NetworkEventKind,
+            VolumeEvent,
+            VolumeEventKind,
+            DaemonEvent,
             // Projects schemas
             crate::storage::StoredProject,
             crate::storage::BuildKind,

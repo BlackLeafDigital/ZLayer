@@ -36,7 +36,6 @@ wasm = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
     "dep:wasmtime-wasi-http",
-    "dep:bytes",
     "dep:http",
     "dep:http-body-util",
     "dep:hyper",
@@ -100,8 +99,11 @@ wasmtime = { version = "41", default-features = false, features = ["async", "cra
 wasmtime-wasi = { version = "41", optional = true }
 wasmtime-wasi-http = { version = "41", optional = true }
 
-# HTTP types for WASM HTTP handler support (enabled with wasm feature)
-bytes = { version = "1", optional = true }
+# Always-on `bytes` dep — used by the streaming runtime types
+# (`LogChunk::bytes` in `runtime.rs`). The wasm feature gate previously made
+# this optional; promoted to mandatory because the trait itself now references
+# `bytes::Bytes`.
+bytes = "1"
 http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
@@ -119,6 +121,9 @@ rtnetlink = "0.14"
 # Must match the version used internally by rtnetlink 0.14 so
 # RouteScope and other route-message types line up across crate boundaries.
 netlink-packet-route = "0.19"
+# Used by the youki backend's archive_get/archive_put implementations to
+# stream and unpack TAR archives in/out of a container's bundle rootfs.
+tar = { workspace = true }
 
 # macOS-specific dependencies for sandbox and VM runtimes
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -23,6 +23,7 @@ use tracing::info;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
+use crate::event_bus::DaemonEventBus;
 
 pub use zlayer_types::api::volumes::*;
 
@@ -77,15 +78,22 @@ pub struct VolumeApiState {
     /// Optional source for `in_use_by` computation. When `None`, responses
     /// always report an empty `in_use_by` list.
     pub usage_source: Option<Arc<dyn VolumeUsageSource>>,
+    /// Daemon-wide event bus. Volume create/delete handlers publish lifecycle
+    /// events here so subscribers of `GET /api/v1/events` see volume
+    /// transitions. Defaults to a fresh, unattached bus when not explicitly
+    /// supplied.
+    pub event_bus: DaemonEventBus,
 }
 
 impl VolumeApiState {
-    /// Create a new volume API state with no usage source wired.
+    /// Create a new volume API state with no usage source wired and a fresh
+    /// (unattached) event bus.
     #[must_use]
     pub fn new(volume_dir: PathBuf) -> Self {
         Self {
             volume_dir,
             usage_source: None,
+            event_bus: DaemonEventBus::new(),
         }
     }
 
@@ -93,6 +101,15 @@ impl VolumeApiState {
     #[must_use]
     pub fn with_usage_source(mut self, source: Arc<dyn VolumeUsageSource>) -> Self {
         self.usage_source = Some(source);
+        self
+    }
+
+    /// Attach a shared event bus so this state's handlers publish volume
+    /// lifecycle events on the same channel as `GET /api/v1/events`
+    /// subscribers.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: DaemonEventBus) -> Self {
+        self.event_bus = bus;
         self
     }
 }
@@ -405,6 +422,9 @@ pub async fn create_volume(
     .map_err(|e| ApiError::Internal(format!("volume create task join error: {e}")))??;
 
     info!(volume = %info.name, path = %path.display(), "Created volume");
+    state
+        .event_bus
+        .publish_volume_created(info.name.clone(), "local");
     Ok((StatusCode::CREATED, Json(info)))
 }
 
@@ -606,6 +626,7 @@ pub async fn delete_volume(
     .map_err(|e| ApiError::Internal(format!("failed to delete volume: {e}")))??;
 
     info!(volume = %name, "Deleted volume");
+    state.event_bus.publish_volume_deleted(name);
     Ok(StatusCode::NO_CONTENT)
 }
 

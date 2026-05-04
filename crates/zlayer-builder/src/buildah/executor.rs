@@ -354,10 +354,7 @@ impl BuildahExecutor {
     /// Check if buildah is available
     pub async fn is_available(&self) -> bool {
         let cmd = BuildahCommand::new("version");
-        self.execute(&cmd)
-            .await
-            .map(|o| o.success())
-            .unwrap_or(false)
+        self.execute(&cmd).await.is_ok_and(|o| o.success())
     }
 
     /// Get buildah version information

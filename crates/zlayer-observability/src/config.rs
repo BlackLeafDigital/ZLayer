@@ -313,9 +313,7 @@ impl TracingConfig {
     #[must_use]
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("OTEL_TRACES_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            enabled: std::env::var("OTEL_TRACES_ENABLED").is_ok_and(|v| v == "true" || v == "1"),
             otlp_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             service_name: std::env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "zlayer".to_string()),
@@ -326,8 +324,7 @@ impl TracingConfig {
             environment: std::env::var("DEPLOYMENT_ENVIRONMENT").ok(),
             batch: BatchConfig::default(),
             use_grpc: std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
-                .map(|v| v != "http/protobuf")
-                .unwrap_or(true),
+                .map_or(true, |v| v != "http/protobuf"),
         }
     }
 }

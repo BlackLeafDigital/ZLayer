@@ -2,8 +2,10 @@
 
 pub mod audit;
 pub mod auth;
+pub mod auto_remove;
 pub mod build;
 pub mod cluster;
+pub mod container_id_map;
 pub mod container_networks;
 #[cfg(feature = "docker")]
 pub mod container_networks_docker;
@@ -13,6 +15,7 @@ pub mod cron;
 pub mod deployments;
 pub mod environments;
 pub mod events;
+pub mod exec_instances;
 pub mod groups;
 pub mod health;
 pub mod images;
@@ -28,6 +31,7 @@ pub mod projects;
 pub mod proxy;
 pub mod secrets;
 pub mod services;
+pub mod standalone_reconcile;
 pub mod storage;
 pub mod syncs;
 pub mod tasks;
@@ -39,6 +43,7 @@ pub mod webhooks;
 pub mod workflows;
 
 pub use auth::*;
+pub use auto_remove::start_auto_remove_subscriber;
 pub use build::*;
 pub use cluster::*;
 pub use containers::ContainerApiState;
@@ -53,6 +58,7 @@ pub use overlay::*;
 pub use proxy::*;
 pub use secrets::*;
 pub use services::*;
+pub use standalone_reconcile::{reconcile_standalone_containers, ReconcileReport};
 pub use storage::*;
 pub use tunnels::*;
 pub use volumes::*;

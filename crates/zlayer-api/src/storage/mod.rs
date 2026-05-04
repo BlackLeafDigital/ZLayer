@@ -22,6 +22,7 @@
 //! ```
 
 mod audit;
+pub mod compose_projects;
 mod deployments;
 mod environments;
 mod groups;
@@ -30,6 +31,7 @@ mod oidc_identities;
 mod permissions;
 mod projects;
 mod sqlx_json;
+pub mod standalone_container;
 mod syncs;
 mod tasks;
 mod users;
@@ -37,6 +39,10 @@ mod variables;
 mod workflows;
 
 pub use audit::{AuditFilter, AuditStorage, InMemoryAuditStore, SqlxAuditStore};
+pub use compose_projects::{
+    ComposeProject, ComposeProjectStorage, InMemoryComposeProjectStorage,
+    SqliteComposeProjectStorage,
+};
 pub use deployments::{DeploymentStorage, InMemoryStorage, SqlxStorage, StorageError};
 pub use environments::{EnvironmentStorage, InMemoryEnvironmentStore, SqlxEnvironmentStore};
 pub use groups::{GroupStorage, InMemoryGroupStore, SqlxGroupStore};
@@ -45,6 +51,10 @@ pub use oidc_identities::{InMemoryOidcIdentityStore, OidcIdentityStorage, SqlxOi
 pub use permissions::{InMemoryPermissionStore, PermissionStorage, SqlxPermissionStore};
 pub use projects::{InMemoryProjectStore, ProjectStorage, SqlxProjectStore};
 pub use sqlx_json::{IndexSpec, JsonTable, SqlxJsonStore};
+pub use standalone_container::{
+    InMemoryStandaloneContainerStorage, SqliteStandaloneContainerStorage,
+    StandaloneContainerStorage,
+};
 pub use syncs::{InMemorySyncStore, SqlxSyncStore, SyncStorage};
 pub use tasks::{InMemoryTaskStore, SqlxTaskStore, TaskStorage};
 pub use users::{InMemoryUserStore, SqlxUserStore, UserStorage};
@@ -166,10 +176,12 @@ mod tests {
                 },
                 init: zlayer_spec::InitSpec::default(),
                 errors: zlayer_spec::ErrorsSpec::default(),
+                lifecycle: zlayer_spec::LifecycleSpec::default(),
                 devices: vec![],
                 storage: vec![],
                 port_mappings: vec![],
                 capabilities: vec![],
+                cap_drop: vec![],
                 privileged: false,
                 node_mode: zlayer_spec::NodeMode::default(),
                 node_selector: None,
@@ -182,6 +194,24 @@ mod tests {
                 dns: Vec::new(),
                 extra_hosts: Vec::new(),
                 restart_policy: None,
+                labels: std::collections::HashMap::new(),
+                user: None,
+                stop_signal: None,
+                stop_grace_period: None,
+                sysctls: std::collections::HashMap::new(),
+                ulimits: std::collections::HashMap::new(),
+                security_opt: Vec::new(),
+                pid_mode: None,
+                ipc_mode: None,
+                network_mode: zlayer_spec::NetworkMode::default(),
+                extra_groups: Vec::new(),
+                read_only_root_fs: false,
+                init_container: None,
+                tty: false,
+                stdin_open: false,
+                userns_mode: None,
+                cgroup_parent: None,
+                expose: Vec::new(),
             },
         );
 

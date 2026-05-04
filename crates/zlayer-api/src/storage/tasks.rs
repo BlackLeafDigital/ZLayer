@@ -149,7 +149,7 @@ impl TaskStorage for InMemoryTaskStore {
             .filter(|r| r.task_id == task_id)
             .cloned()
             .collect();
-        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        filtered.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(filtered)
     }
 }

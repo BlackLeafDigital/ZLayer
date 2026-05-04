@@ -11,6 +11,7 @@ use zlayer_api::handlers::build::build_routes;
 use zlayer_api::handlers::cluster::ClusterApiState;
 use zlayer_api::handlers::nodes::NodeApiState;
 use zlayer_api::handlers::overlay::OverlayApiState;
+use zlayer_api::handlers::{reconcile_standalone_containers, start_auto_remove_subscriber};
 use zlayer_api::router::{
     build_cluster_routes, build_container_network_routes, build_container_routes,
     build_cron_routes, build_event_routes, build_job_routes, build_network_routes,
@@ -690,7 +691,7 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     // 2b. Restore previously-persisted deployments
     // -----------------------------------------------------------------------
-    if let Err(e) = restore_deployments(&state).await {
+    if let Err(e) = Box::pin(restore_deployments(&state)).await {
         warn!(error = %e, "Deployment restoration encountered errors (non-fatal)");
     }
 
@@ -803,6 +804,64 @@ pub(crate) async fn serve_with_external_shutdown(
         }
 
         secret
+    };
+
+    // -----------------------------------------------------------------------
+    // 3b'. Load (or generate + persist) the daemon UUID. This stamps every
+    // hex container ID minted via `ContainerIdMap::compute_hex` so the same
+    // container hashes to the same id across restarts.
+    // -----------------------------------------------------------------------
+    let daemon_uuid = {
+        let daemon_uuid_path = config.data_dir.join("daemon_uuid");
+        // The `Ok` arm is intentionally larger than the `Err` arm (it has to
+        // distinguish empty-file from valid-content recovery), so clippy's
+        // `single_match_else` lint pushes us toward `if let Ok(...) else`.
+        // That refactor would force duplicating the whole regenerate-and-write
+        // block; the `match` is materially clearer here.
+        #[allow(clippy::single_match_else)]
+        match tokio::fs::read_to_string(&daemon_uuid_path).await {
+            Ok(contents) => {
+                let trimmed = contents.trim().to_string();
+                if trimmed.is_empty() {
+                    let fresh = uuid::Uuid::new_v4().as_simple().to_string();
+                    if let Err(e) = tokio::fs::write(&daemon_uuid_path, &fresh).await {
+                        warn!(
+                            path = %daemon_uuid_path.display(),
+                            error = %e,
+                            "Failed to persist regenerated daemon_uuid (hex container IDs will not be stable across restarts)"
+                        );
+                    } else {
+                        info!(
+                            path = %daemon_uuid_path.display(),
+                            "daemon_uuid was empty; regenerated and persisted"
+                        );
+                    }
+                    fresh
+                } else {
+                    info!(
+                        path = %daemon_uuid_path.display(),
+                        "Loaded existing daemon UUID"
+                    );
+                    trimmed
+                }
+            }
+            Err(_) => {
+                let fresh = uuid::Uuid::new_v4().as_simple().to_string();
+                if let Err(e) = tokio::fs::write(&daemon_uuid_path, &fresh).await {
+                    warn!(
+                        path = %daemon_uuid_path.display(),
+                        error = %e,
+                        "Failed to persist daemon_uuid (hex container IDs will not be stable across restarts)"
+                    );
+                } else {
+                    info!(
+                        path = %daemon_uuid_path.display(),
+                        "Generated and persisted new daemon UUID"
+                    );
+                }
+                fresh
+            }
+        }
     };
 
     // -----------------------------------------------------------------------
@@ -1067,8 +1126,16 @@ pub(crate) async fn serve_with_external_shutdown(
     let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
     router = router.nest("/api/v1/storage", storage_routes);
 
+    // Construct the daemon-wide event bus early so all resource states
+    // (image, container, network, volume) publish lifecycle events on the
+    // same broadcast channel. Subscribers of `GET /api/v1/events` then see
+    // every transition regardless of which handler emitted it.
+    let event_bus = zlayer_api::DaemonEventBus::new();
+
     // Merge image management routes (list / rm / system prune)
-    let image_routes = zlayer_api::build_image_routes(runtime.clone());
+    let image_state =
+        zlayer_api::ImageState::new(runtime.clone()).with_event_bus(event_bus.clone());
+    let image_routes = zlayer_api::build_image_routes_with_state(image_state);
     router = router.nest("/api/v1", image_routes);
 
     // Merge cluster routes (join, node listing)
@@ -1214,7 +1281,9 @@ pub(crate) async fn serve_with_external_shutdown(
     // `POST /api/v1/container-networks` actually creates real Docker
     // networks; otherwise the state stays in metadata-only mode and a
     // warning is logged the first time a handler would need the runtime.
-    let bridge_network_state = build_bridge_network_state().await;
+    let bridge_network_state = build_bridge_network_state()
+        .await
+        .with_event_bus(event_bus.clone());
     let container_network_routes = build_container_network_routes(bridge_network_state.clone());
     router = router.nest("/api/v1/container-networks", container_network_routes);
 
@@ -1223,8 +1292,48 @@ pub(crate) async fn serve_with_external_shutdown(
     // handlers and event subscribers share the broadcast bus. The
     // bridge-network state is threaded in so `CreateContainerRequest.networks`
     // can attach freshly-created containers to user-defined networks.
-    let container_state =
-        ContainerApiState::new(runtime).with_bridge_networks(bridge_network_state);
+    let container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
+        .with_shared_event_bus(event_bus.clone())
+        .with_bridge_networks(bridge_network_state)
+        .with_standalone_storage(bundle.standalone_containers.clone())
+        .with_compose_storage(bundle.compose_projects.clone());
+
+    // Repopulate the in-memory standalone-container cache from disk so
+    // create / list / inspect / delete handlers see records that survived a
+    // daemon restart. A failure here is fatal — running with a half-empty
+    // cache would let a follow-up `delete` succeed at the runtime layer
+    // while a stale row sat in the database.
+    container_state
+        .repopulate_cache_from_storage()
+        .await
+        .context("Failed to repopulate standalone-container cache from storage")?;
+
+    // Reconcile the standalone-container storage against the runtime listing
+    // exactly once at boot. This re-registers ContainerIdMap rows for entries
+    // that survived restart and prunes rows whose runtime bundles have been
+    // removed out-of-band. Failures here are non-fatal — log and continue —
+    // because a transient runtime hiccup at boot must not stop the daemon
+    // from serving (the next reconcile or REST call will re-surface issues).
+    match reconcile_standalone_containers(&container_state).await {
+        Ok(report) => {
+            info!(
+                matched = report.matched,
+                pruned = report.pruned,
+                orphans_seen = report.orphans_seen,
+                "standalone-container reconcile complete",
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "standalone-container reconcile failed; continuing boot");
+        }
+    }
+
+    // Spawn the daemon-side `--rm` (auto-remove) subscriber. The returned
+    // JoinHandle is held for the lifetime of the daemon — dropping it would
+    // cancel the task and leak `--rm` containers on exit. The handle is
+    // aborted explicitly during the post-shutdown cleanup phase below.
+    let auto_remove_handle = start_auto_remove_subscriber(container_state.clone());
+
     let container_routes = build_container_routes(container_state.clone());
     router = router.nest("/api/v1/containers", container_routes);
 
@@ -1233,7 +1342,7 @@ pub(crate) async fn serve_with_external_shutdown(
 
     // Merge volume management routes
     let volume_dir = config.data_dir.join("volumes");
-    let volume_state = VolumeApiState::new(volume_dir);
+    let volume_state = VolumeApiState::new(volume_dir).with_event_bus(event_bus.clone());
     let volume_routes = build_volume_routes(volume_state);
     router = router.nest("/api/v1/volumes", volume_routes);
 
@@ -1353,6 +1462,14 @@ pub(crate) async fn serve_with_external_shutdown(
     }
     info!("Heartbeat / dead-node detection stopped");
 
+    // Stop the standalone `--rm` auto-remove subscriber. It would otherwise
+    // exit on its own when the event bus is dropped, but aborting + awaiting
+    // here ties its lifetime cleanly to the shutdown path so we don't leave a
+    // task running while later cleanup steps tear down shared state.
+    auto_remove_handle.abort();
+    let _ = auto_remove_handle.await;
+    info!("Auto-remove subscriber stopped");
+
     // Stop Raft RPC server
     if let Some(handle) = raft_server_handle {
         handle.abort();
@@ -1452,6 +1569,8 @@ pub(crate) struct StorageBundle {
     pub audit: std::sync::Arc<dyn zlayer_api::AuditStorage>,
     pub syncs: std::sync::Arc<dyn zlayer_api::SyncStorage>,
     pub oidc_identities: std::sync::Arc<dyn zlayer_api::OidcIdentityStorage>,
+    pub standalone_containers: std::sync::Arc<dyn zlayer_api::StandaloneContainerStorage>,
+    pub compose_projects: std::sync::Arc<dyn zlayer_api::ComposeProjectStorage>,
 }
 
 impl StorageBundle {
@@ -1507,10 +1626,19 @@ impl StorageBundle {
                 zlayer_api::SqlxOidcIdentityStore::open(dir.join("oidc_identities.db"))
                     .await
                     .context("Failed to open oidc_identities.db")?;
+            let standalone_containers = zlayer_api::SqliteStandaloneContainerStorage::open(
+                dir.join("standalone_containers.sqlite"),
+            )
+            .await
+            .context("Failed to open standalone_containers.sqlite")?;
+            let compose_projects =
+                zlayer_api::SqliteComposeProjectStorage::open(dir.join("compose_projects.sqlite"))
+                    .await
+                    .context("Failed to open compose_projects.sqlite")?;
 
             info!(
                 dir = %dir.display(),
-                "Opened persistent API stores (12 databases)"
+                "Opened persistent API stores (14 databases)"
             );
 
             Ok(Self {
@@ -1526,6 +1654,8 @@ impl StorageBundle {
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
                 oidc_identities: std::sync::Arc::new(oidc_identities),
+                standalone_containers: std::sync::Arc::new(standalone_containers),
+                compose_projects: std::sync::Arc::new(compose_projects),
             })
         } else {
             let users = zlayer_api::SqlxUserStore::in_memory()
@@ -1564,6 +1694,12 @@ impl StorageBundle {
             let oidc_identities = zlayer_api::SqlxOidcIdentityStore::in_memory()
                 .await
                 .context("Failed to create in-memory oidc_identities store")?;
+            let standalone_containers = zlayer_api::SqliteStandaloneContainerStorage::in_memory()
+                .await
+                .context("Failed to create in-memory standalone_containers store")?;
+            let compose_projects = zlayer_api::SqliteComposeProjectStorage::in_memory()
+                .await
+                .context("Failed to create in-memory compose_projects store")?;
 
             info!("Opened in-memory API stores (ephemeral / test mode)");
 
@@ -1580,6 +1716,8 @@ impl StorageBundle {
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
                 oidc_identities: std::sync::Arc::new(oidc_identities),
+                standalone_containers: std::sync::Arc::new(standalone_containers),
+                compose_projects: std::sync::Arc::new(compose_projects),
             })
         }
     }
