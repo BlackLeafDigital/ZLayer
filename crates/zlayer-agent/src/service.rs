@@ -1238,8 +1238,7 @@ impl ServiceManager {
 
             // Register and start service
             tracing::info!(service = %service_name, "Starting service");
-            self.upsert_service(service_name.clone(), service_spec.clone())
-                .await?;
+            Box::pin(self.upsert_service(service_name.clone(), service_spec.clone())).await?;
 
             // Get the desired replica count from scale config
             let replicas = match &service_spec.scale {
