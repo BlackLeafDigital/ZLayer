@@ -617,8 +617,7 @@ services:
         );
 
         // Register service
-        manager
-            .upsert_service("api".to_string(), mock_spec())
+        Box::pin(manager.upsert_service("api".to_string(), mock_spec()))
             .await
             .unwrap();
         manager.scale_service("api", 2).await.unwrap();

@@ -511,7 +511,7 @@ async fn run(
         let Some(Commands::Docker(docker_cmd)) = cli.command.take() else {
             unreachable!()
         };
-        return zlayer_docker::handle_docker_command(*docker_cmd).await;
+        return Box::pin(zlayer_docker::handle_docker_command(*docker_cmd)).await;
     }
 
     // command is guaranteed to be Some at this point (TUI handled earlier)

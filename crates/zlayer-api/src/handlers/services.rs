@@ -310,8 +310,7 @@ pub async fn scale_service(
     // If not, we need to upsert it first
     if manager.service_replica_count(&service).await.is_err() {
         // Service not yet registered, upsert it
-        manager
-            .upsert_service(service.clone(), spec.clone())
+        Box::pin(manager.upsert_service(service.clone(), spec.clone()))
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to register service: {e}")))?;
     }

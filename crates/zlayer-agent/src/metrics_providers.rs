@@ -191,8 +191,7 @@ services:
         let manager = Arc::new(ServiceManager::new(runtime));
 
         // Add and scale a service
-        manager
-            .upsert_service("api".to_string(), mock_spec())
+        Box::pin(manager.upsert_service("api".to_string(), mock_spec()))
             .await
             .unwrap();
         manager.scale_service("api", 3).await.unwrap();
@@ -223,8 +222,7 @@ services:
         let manager = Arc::new(ServiceManager::new(runtime.clone()));
 
         // Add and scale a service
-        manager
-            .upsert_service("test".to_string(), mock_spec())
+        Box::pin(manager.upsert_service("test".to_string(), mock_spec()))
             .await
             .unwrap();
         manager.scale_service("test", 1).await.unwrap();

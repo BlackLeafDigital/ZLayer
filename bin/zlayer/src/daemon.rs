@@ -1446,7 +1446,7 @@ pub async fn restore_deployments(state: &DaemonState) -> Result<()> {
     let mut failed: u32 = 0;
 
     for stored in &active {
-        match restore_single_deployment(state, stored).await {
+        match Box::pin(restore_single_deployment(state, stored)).await {
             Ok(()) => {
                 // Mark as Running in storage
                 let mut updated = (*stored).clone();
@@ -1512,10 +1512,12 @@ async fn restore_single_deployment(state: &DaemonState, stored: &StoredDeploymen
 
     for (name, service_spec) in &spec.services {
         // 1. Register the service with ServiceManager
-        if let Err(e) = state
-            .manager
-            .upsert_service(name.clone(), service_spec.clone())
-            .await
+        if let Err(e) = Box::pin(
+            state
+                .manager
+                .upsert_service(name.clone(), service_spec.clone()),
+        )
+        .await
         {
             let msg = format!("{name}: failed to register service: {e}");
             warn!(deployment = %deployment_name, service = %name, error = %e, "Failed to register service during restore");

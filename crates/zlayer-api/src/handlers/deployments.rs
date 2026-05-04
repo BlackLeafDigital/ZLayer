@@ -504,7 +504,7 @@ async fn orchestrate_deployment(
         );
         {
             let mgr = mgr_lock.read().await;
-            if let Err(e) = mgr.upsert_service(name.clone(), service_spec.clone()).await {
+            if let Err(e) = Box::pin(mgr.upsert_service(name.clone(), service_spec.clone())).await {
                 let msg = format!("{name}: failed to register: {e}");
                 warn!(deployment = %deployment_name, service = %name, error = %e, "Service registration failed");
                 emit_progress(
