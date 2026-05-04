@@ -154,9 +154,7 @@ impl PersistentSecretsStore {
 
     /// Parse ISO 8601 timestamp to Unix timestamp.
     fn parse_timestamp(s: &str) -> i64 {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.timestamp())
-            .unwrap_or(0)
+        chrono::DateTime::parse_from_rfc3339(s).map_or(0, |dt| dt.timestamp())
     }
 }
 

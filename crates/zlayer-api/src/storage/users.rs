@@ -292,7 +292,7 @@ impl UserStorage for InMemoryUserStore {
     async fn list(&self) -> Result<Vec<StoredUser>, StorageError> {
         let users = self.users.read().await;
         let mut list: Vec<_> = users.values().cloned().collect();
-        list.sort_by(|a, b| a.email.to_lowercase().cmp(&b.email.to_lowercase()));
+        list.sort_by_key(|u| u.email.to_lowercase());
         Ok(list)
     }
 

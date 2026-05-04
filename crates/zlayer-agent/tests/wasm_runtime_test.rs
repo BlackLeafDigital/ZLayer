@@ -231,10 +231,12 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         },
         init: InitSpec::default(),
         errors: ErrorsSpec::default(),
+        lifecycle: zlayer_spec::LifecycleSpec::default(),
         devices: vec![],
         storage: vec![],
         port_mappings: vec![],
         capabilities: vec![],
+        cap_drop: vec![],
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
@@ -247,6 +249,24 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         extra_hosts: Vec::new(),
         restart_policy: None,
         platform: None,
+        labels: std::collections::HashMap::new(),
+        user: None,
+        stop_signal: None,
+        stop_grace_period: None,
+        sysctls: std::collections::HashMap::new(),
+        ulimits: std::collections::HashMap::new(),
+        security_opt: Vec::new(),
+        pid_mode: None,
+        ipc_mode: None,
+        network_mode: zlayer_spec::NetworkMode::default(),
+        extra_groups: Vec::new(),
+        read_only_root_fs: false,
+        init_container: None,
+        tty: false,
+        stdin_open: false,
+        userns_mode: None,
+        cgroup_parent: None,
+        expose: Vec::new(),
     }
 }
 
@@ -392,7 +412,7 @@ mod runtime_creation_tests {
         let config = create_test_config(&cache_dir);
 
         let runtime = WasmRuntime::new(config, None).await;
-        assert!(runtime.is_ok(), "Failed to create WasmRuntime: {runtime:?}",);
+        assert!(runtime.is_ok(), "Failed to create WasmRuntime: {runtime:?}");
 
         let runtime = runtime.unwrap();
         println!("WasmRuntime created successfully: {runtime:?}");
@@ -464,7 +484,7 @@ mod lifecycle_tests {
 
         // Create instance
         let result = runtime.create_container(&id, &spec).await;
-        assert!(result.is_ok(), "Failed to create WASM instance: {result:?}",);
+        assert!(result.is_ok(), "Failed to create WASM instance: {result:?}");
 
         // Verify state is Pending
         let state = runtime.container_state(&id).await;
@@ -499,7 +519,7 @@ mod lifecycle_tests {
             .await
             .expect("Failed to create");
         let result = runtime.start_container(&id).await;
-        assert!(result.is_ok(), "Failed to start WASM instance: {result:?}",);
+        assert!(result.is_ok(), "Failed to start WASM instance: {result:?}");
 
         println!("WASM instance started successfully");
     }
@@ -562,7 +582,7 @@ mod lifecycle_tests {
 
         // Remove instance
         let result = runtime.remove_container(&id).await;
-        assert!(result.is_ok(), "Failed to remove WASM instance: {result:?}",);
+        assert!(result.is_ok(), "Failed to remove WASM instance: {result:?}");
 
         // Verify instance is gone
         let state = runtime.container_state(&id).await;

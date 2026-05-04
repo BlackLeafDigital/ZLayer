@@ -6,6 +6,7 @@ use zlayer_client::{default_socket_path, DaemonClient};
 
 /// Arguments for `docker ps`.
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PsArgs {
     /// Show all containers (default shows just running)
     #[clap(short, long)]
@@ -16,12 +17,28 @@ pub struct PsArgs {
     pub quiet: bool,
 
     /// Filter output based on conditions provided
-    #[clap(long)]
+    #[clap(short = 'f', long)]
     pub filter: Vec<String>,
 
     /// Format output using a custom template
     #[clap(long)]
     pub format: Option<String>,
+
+    /// Show n last created containers (includes all states)
+    #[clap(short = 'n', long, value_name = "N")]
+    pub last: Option<i32>,
+
+    /// Show the latest created container (includes all states)
+    #[clap(short = 'l', long)]
+    pub latest: bool,
+
+    /// Don't truncate output
+    #[clap(long = "no-trunc")]
+    pub no_trunc: bool,
+
+    /// Display total file sizes
+    #[clap(short, long)]
+    pub size: bool,
 }
 
 /// Arguments for `docker stop`.
@@ -121,16 +138,25 @@ pub struct LogsArgs {
     pub follow: bool,
 
     /// Number of lines to show from the end of the logs
-    #[clap(long)]
+    /// (also the Docker `-n` short form).
+    #[clap(short = 'n', long)]
     pub tail: Option<String>,
 
     /// Show logs since timestamp or relative duration
     #[clap(long)]
     pub since: Option<String>,
 
-    /// Show timestamps
+    /// Show logs before a timestamp or relative duration
     #[clap(long)]
+    pub until: Option<String>,
+
+    /// Show timestamps (Docker `-t` short form).
+    #[clap(short = 't', long)]
     pub timestamps: bool,
+
+    /// Show extra details provided to logs
+    #[clap(long)]
+    pub details: bool,
 }
 
 /// Arguments for `docker inspect`.
@@ -139,19 +165,17 @@ pub struct InspectArgs {
     /// Container or image name(s) or ID(s)
     pub names: Vec<String>,
 
-    /// Format output using a custom template
-    #[clap(long)]
+    /// Format output using a custom template (Docker `-f` short form).
+    #[clap(short = 'f', long)]
     pub format: Option<String>,
-}
 
-/// Arguments for `docker cp`.
-#[derive(Debug, Parser)]
-pub struct CpArgs {
-    /// Source path (container:path or local path)
-    pub source: String,
+    /// Type to inspect (`image` | `container`)
+    #[clap(long = "type", value_name = "TYPE")]
+    pub kind: Option<String>,
 
-    /// Destination path (container:path or local path)
-    pub destination: String,
+    /// Display total file sizes if the type is container
+    #[clap(short, long)]
+    pub size: bool,
 }
 
 /// Arguments for `docker stats`.
@@ -167,6 +191,14 @@ pub struct StatsArgs {
     /// Disable streaming stats and only pull the first result
     #[clap(long)]
     pub no_stream: bool,
+
+    /// Do not truncate output
+    #[clap(long = "no-trunc")]
+    pub no_trunc: bool,
+
+    /// Format output using a Go template
+    #[clap(long)]
+    pub format: Option<String>,
 }
 
 /// Handle the `docker ps` command.
@@ -634,17 +666,7 @@ pub async fn handle_inspect(args: InspectArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle the `docker cp` command.
-///
-/// # Errors
-///
-/// Always returns an error; this command is not yet implemented.
-#[allow(clippy::unused_async)]
-pub async fn handle_cp(args: CpArgs) -> anyhow::Result<()> {
-    tracing::info!("docker cp: {} -> {}", args.source, args.destination);
-    println!("zlayer docker cp: {} -> {}", args.source, args.destination);
-    anyhow::bail!("docker cp is not yet implemented — use 'zlayer cp'")
-}
+// `docker cp` lives in its own module; see `cli::cp`.
 
 /// Handle the `docker stats` command.
 ///

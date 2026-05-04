@@ -1440,8 +1440,10 @@ impl ImageBuilder {
             // behind the `zlayer-registry/local` feature, matching the other
             // push-to-registry sites in this crate.
             #[cfg(feature = "local-registry")]
-            if oci_path.is_some() && self.options.push && !self.options.tags.is_empty() {
-                let oci_dir = oci_path.as_ref().expect("checked oci_path.is_some() above");
+            if let Some(oci_dir) = oci_path
+                .as_ref()
+                .filter(|_| self.options.push && !self.options.tags.is_empty())
+            {
                 self.push_wasm_oci(&wasm_path, oci_dir).await?;
             }
 

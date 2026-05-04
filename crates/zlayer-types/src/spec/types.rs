@@ -784,9 +784,132 @@ impl Default for LogsConfig {
     }
 }
 
+/// Network mode for a service container.
+///
+/// Mirrors Docker's `HostConfig.NetworkMode` semantics. Accepts both an
+/// enum-tagged form (e.g. `network_mode: { bridge: { name: my-net } }`) and a
+/// string form (e.g. `"host"`, `"bridge:my-net"`, `"container:abc123"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    /// Default networking (overlay / bridge as configured by the platform).
+    #[default]
+    Default,
+    /// Share the host network namespace (Docker `--network host`).
+    Host,
+    /// Disable networking entirely (Docker `--network none`).
+    None,
+    /// Attach to a Docker bridge network. When `name` is `None`, uses the
+    /// default `bridge` network.
+    Bridge {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Attach to another container's network namespace
+    /// (Docker `--network container:<id>`).
+    Container { id: String },
+}
+
+/// String-or-enum deserializer for [`NetworkMode`].
+///
+/// Accepts the same strings Docker accepts on `HostConfig.NetworkMode`:
+/// `"default"`, `"host"`, `"none"`, `"bridge"`, `"bridge:<name>"`, and
+/// `"container:<id>"`. Also accepts the enum-tagged YAML/JSON form produced by
+/// the derived [`Serialize`] impl (e.g. `bridge: { name: my-net }`).
+fn deserialize_network_mode<'de, D>(deserializer: D) -> Result<NetworkMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    /// Inline mirror of [`NetworkMode`] used purely for the "object" form.
+    /// We re-deserialize the captured YAML/JSON value into this and then map
+    /// it back, which correctly drives `deserialize_enum` even when the input
+    /// originally came from a `deserialize_any` path.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Inner {
+        Default,
+        Host,
+        None,
+        Bridge {
+            #[serde(default)]
+            name: Option<String>,
+        },
+        Container {
+            id: String,
+        },
+    }
+
+    impl From<Inner> for NetworkMode {
+        fn from(i: Inner) -> Self {
+            match i {
+                Inner::Default => Self::Default,
+                Inner::Host => Self::Host,
+                Inner::None => Self::None,
+                Inner::Bridge { name } => Self::Bridge { name },
+                Inner::Container { id } => Self::Container { id },
+            }
+        }
+    }
+
+    // Capture the input as a self-describing serde value so we can branch
+    // on whether it is a string (Docker-style) or an externally-tagged
+    // enum (`{ bridge: { name } }`-style).
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+
+    if let Some(s) = value.as_str() {
+        return match s {
+            "default" => Ok(NetworkMode::Default),
+            "host" => Ok(NetworkMode::Host),
+            "none" => Ok(NetworkMode::None),
+            "bridge" => Ok(NetworkMode::Bridge { name: None }),
+            _ => {
+                if let Some(rest) = s.strip_prefix("bridge:") {
+                    if rest.is_empty() {
+                        Ok(NetworkMode::Bridge { name: None })
+                    } else {
+                        Ok(NetworkMode::Bridge {
+                            name: Some(rest.to_string()),
+                        })
+                    }
+                } else if let Some(rest) = s.strip_prefix("container:") {
+                    if rest.is_empty() {
+                        Err(D::Error::custom(
+                            "network mode \"container:<id>\" requires a non-empty id",
+                        ))
+                    } else {
+                        Ok(NetworkMode::Container {
+                            id: rest.to_string(),
+                        })
+                    }
+                } else {
+                    Err(D::Error::custom(format!("unknown network mode: {s}")))
+                }
+            }
+        };
+    }
+
+    let inner: Inner = serde_yaml::from_value(value).map_err(D::Error::custom)?;
+    Ok(NetworkMode::from(inner))
+}
+
+/// Per-process resource limit (Docker `--ulimit` style).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UlimitSpec {
+    /// Soft limit.
+    #[serde(default)]
+    pub soft: i64,
+    /// Hard limit.
+    #[serde(default)]
+    pub hard: i64,
+}
+
 /// Per-service specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "ServiceSpecCompat")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ServiceSpec {
     /// Resource type (service, job, cron)
     #[serde(default = "default_resource_type")]
@@ -854,6 +977,14 @@ pub struct ServiceSpec {
     #[serde(default)]
     pub errors: ErrorsSpec,
 
+    /// Container lifecycle policy (e.g., delete-on-exit).
+    ///
+    /// Purely declarative on this type; downstream layers (agent / API /
+    /// scheduler) read this field to decide whether to clean up the
+    /// container record after termination.
+    #[serde(default)]
+    pub lifecycle: LifecycleSpec,
+
     /// Device passthrough (e.g., /dev/kvm for VMs)
     #[serde(default)]
     pub devices: Vec<DeviceSpec>,
@@ -869,9 +1000,15 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_mappings: Vec<PortMapping>,
 
-    /// Linux capabilities to add (e.g., `SYS_ADMIN`, `NET_ADMIN`)
-    #[serde(default)]
+    /// Linux capabilities to add (e.g., `SYS_ADMIN`, `NET_ADMIN`).
+    ///
+    /// Also accepts the Docker-compatible alias `cap_add` on input.
+    #[serde(default, alias = "cap_add", skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+
+    /// Linux capabilities to drop (Docker `--cap-drop`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
 
     /// Run container in privileged mode (all capabilities + all devices)
     #[serde(default)]
@@ -946,6 +1083,279 @@ pub struct ServiceSpec {
     /// restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<ContainerRestartPolicy>,
+
+    /// Free-form key/value labels attached to the container
+    /// (Docker `--label`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+
+    /// User and group override for the container's main process
+    /// (Docker `--user uid:gid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Signal sent to the container's main process to request a graceful
+    /// shutdown (Docker `--stop-signal`). Accepts e.g. `"SIGTERM"` or `"15"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+
+    /// Grace period to wait between the stop signal and a forced kill
+    /// (Docker `--stop-timeout`).
+    #[serde(
+        default,
+        with = "duration::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop_grace_period: Option<std::time::Duration>,
+
+    /// Kernel sysctl overrides (Docker `--sysctl`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sysctls: HashMap<String, String>,
+
+    /// Per-process ulimits (Docker `--ulimit`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ulimits: HashMap<String, UlimitSpec>,
+
+    /// Security options such as `apparmor=...`, `seccomp=...`,
+    /// `no-new-privileges:true` (Docker `--security-opt`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_opt: Vec<String>,
+
+    /// PID namespace mode (Docker `--pid`). Accepts e.g. `"host"` or
+    /// `"container:<id>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_mode: Option<String>,
+
+    /// IPC namespace mode (Docker `--ipc`). Accepts e.g. `"host"`,
+    /// `"shareable"`, `"private"`, or `"container:<id>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_mode: Option<String>,
+
+    /// Network mode (Docker `--network`). Accepts both the enum-tagged form
+    /// and the Docker-style strings (`"host"`, `"none"`, `"bridge"`,
+    /// `"bridge:<name>"`, `"container:<id>"`).
+    #[serde(default, deserialize_with = "deserialize_network_mode")]
+    pub network_mode: NetworkMode,
+
+    /// Additional groups to add to the container process
+    /// (Docker `--group-add`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_groups: Vec<String>,
+
+    /// Mount the container's root filesystem read-only (Docker `--read-only`).
+    #[serde(default)]
+    pub read_only_root_fs: bool,
+
+    /// Run a Docker-supplied init process (PID 1) inside the container
+    /// (Docker `--init`). Distinct from [`ServiceSpec::init`] which controls
+    /// `ZLayer`'s pre-start init actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_container: Option<bool>,
+
+    /// Allocate a TTY for the container's main process (Docker `--tty`,
+    /// compose `tty: true`).
+    #[serde(default)]
+    pub tty: bool,
+
+    /// Keep STDIN open even when nothing is attached (Docker `--interactive`,
+    /// compose `stdin_open: true`).
+    #[serde(default)]
+    pub stdin_open: bool,
+
+    /// User namespace mode (Docker `--userns`). Accepts e.g. `"host"` or
+    /// a remap-spec name configured on the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userns_mode: Option<String>,
+
+    /// Cgroup parent path (Docker `--cgroup-parent`). When set, the runtime
+    /// places the container under the given cgroup hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_parent: Option<String>,
+
+    /// Container ports exposed but not published to the host (compose
+    /// `expose:`). Each entry is a port string, optionally `port/proto`
+    /// (e.g. `"3000"`, `"8080/tcp"`). Treated as documentation by the
+    /// runtime; downstream networking layers may use this list to allow
+    /// inter-service traffic without publishing to the host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+}
+
+/// Deserialization shim for [`ServiceSpec`].
+///
+/// Mirrors `ServiceSpec`'s field shape so that the derived `Deserialize` impl
+/// can pick up the YAML/JSON value, then [`From::from`] folds the deprecated
+/// `host_network: bool` flag into the typed [`NetworkMode`] before handing the
+/// finalized struct back to the caller.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+struct ServiceSpecCompat {
+    #[serde(default = "default_resource_type")]
+    rtype: ResourceType,
+    #[serde(default)]
+    schedule: Option<String>,
+    image: ImageSpec,
+    #[serde(default)]
+    resources: ResourcesSpec,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    command: CommandSpec,
+    #[serde(default)]
+    network: ServiceNetworkSpec,
+    #[serde(default)]
+    endpoints: Vec<EndpointSpec>,
+    #[serde(default)]
+    scale: ScaleSpec,
+    #[serde(default)]
+    depends: Vec<DependsSpec>,
+    #[serde(default = "default_health")]
+    health: HealthSpec,
+    #[serde(default)]
+    init: InitSpec,
+    #[serde(default)]
+    errors: ErrorsSpec,
+    #[serde(default)]
+    lifecycle: LifecycleSpec,
+    #[serde(default)]
+    devices: Vec<DeviceSpec>,
+    #[serde(default)]
+    storage: Vec<StorageSpec>,
+    #[serde(default)]
+    port_mappings: Vec<PortMapping>,
+    #[serde(default, alias = "cap_add")]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    cap_drop: Vec<String>,
+    #[serde(default)]
+    privileged: bool,
+    #[serde(default)]
+    node_mode: NodeMode,
+    #[serde(default)]
+    node_selector: Option<NodeSelector>,
+    #[serde(default)]
+    platform: Option<TargetPlatform>,
+    #[serde(default)]
+    service_type: ServiceType,
+    #[serde(default, alias = "wasm_http")]
+    wasm: Option<WasmConfig>,
+    #[serde(default)]
+    logs: Option<LogsConfig>,
+    /// Backwards-compat shim: when `host_network: true` is present in the input,
+    /// it is folded into `network_mode = NetworkMode::Host` during conversion.
+    #[serde(default)]
+    host_network: Option<bool>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    dns: Vec<String>,
+    #[serde(default)]
+    extra_hosts: Vec<String>,
+    #[serde(default)]
+    restart_policy: Option<ContainerRestartPolicy>,
+    #[serde(default)]
+    labels: HashMap<String, String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    stop_signal: Option<String>,
+    #[serde(default, with = "duration::option")]
+    stop_grace_period: Option<std::time::Duration>,
+    #[serde(default)]
+    sysctls: HashMap<String, String>,
+    #[serde(default)]
+    ulimits: HashMap<String, UlimitSpec>,
+    #[serde(default)]
+    security_opt: Vec<String>,
+    #[serde(default)]
+    pid_mode: Option<String>,
+    #[serde(default)]
+    ipc_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_network_mode")]
+    network_mode: NetworkMode,
+    #[serde(default)]
+    extra_groups: Vec<String>,
+    #[serde(default)]
+    read_only_root_fs: bool,
+    #[serde(default)]
+    init_container: Option<bool>,
+    #[serde(default)]
+    tty: bool,
+    #[serde(default)]
+    stdin_open: bool,
+    #[serde(default)]
+    userns_mode: Option<String>,
+    #[serde(default)]
+    cgroup_parent: Option<String>,
+    #[serde(default)]
+    expose: Vec<String>,
+}
+
+impl From<ServiceSpecCompat> for ServiceSpec {
+    fn from(c: ServiceSpecCompat) -> Self {
+        // If the deprecated `host_network: true` flag is set, fold it into
+        // the typed network mode unless the caller already supplied a
+        // non-default value. This keeps existing in-process callers and
+        // any legacy YAML that still emits `host_network: true` working.
+        let network_mode = match (c.host_network, &c.network_mode) {
+            (Some(true), NetworkMode::Default) => NetworkMode::Host,
+            _ => c.network_mode,
+        };
+        let host_network = c.host_network.unwrap_or(false) || network_mode == NetworkMode::Host;
+
+        Self {
+            rtype: c.rtype,
+            schedule: c.schedule,
+            image: c.image,
+            resources: c.resources,
+            env: c.env,
+            command: c.command,
+            network: c.network,
+            endpoints: c.endpoints,
+            scale: c.scale,
+            depends: c.depends,
+            health: c.health,
+            init: c.init,
+            errors: c.errors,
+            lifecycle: c.lifecycle,
+            devices: c.devices,
+            storage: c.storage,
+            port_mappings: c.port_mappings,
+            capabilities: c.capabilities,
+            cap_drop: c.cap_drop,
+            privileged: c.privileged,
+            node_mode: c.node_mode,
+            node_selector: c.node_selector,
+            platform: c.platform,
+            service_type: c.service_type,
+            wasm: c.wasm,
+            logs: c.logs,
+            host_network,
+            hostname: c.hostname,
+            dns: c.dns,
+            extra_hosts: c.extra_hosts,
+            restart_policy: c.restart_policy,
+            labels: c.labels,
+            user: c.user,
+            stop_signal: c.stop_signal,
+            stop_grace_period: c.stop_grace_period,
+            sysctls: c.sysctls,
+            ulimits: c.ulimits,
+            security_opt: c.security_opt,
+            pid_mode: c.pid_mode,
+            ipc_mode: c.ipc_mode,
+            network_mode,
+            extra_groups: c.extra_groups,
+            read_only_root_fs: c.read_only_root_fs,
+            init_container: c.init_container,
+            tty: c.tty,
+            stdin_open: c.stdin_open,
+            userns_mode: c.userns_mode,
+            cgroup_parent: c.cgroup_parent,
+            expose: c.expose,
+        }
+    }
 }
 
 /// Command override specification (Section 5.5)
@@ -1056,7 +1466,7 @@ fn image_is_latest_or_untagged(image: &crate::ImageReference) -> bool {
 }
 
 /// Device passthrough specification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceSpec {
     /// Host device path (e.g., /dev/kvm, /dev/net/tun)
@@ -1151,6 +1561,43 @@ pub struct ResourcesSpec {
     /// GPU resource request
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuSpec>,
+
+    /// Maximum number of processes the container may spawn
+    /// (Docker `--pids-limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<i64>,
+
+    /// CPUs that the container is allowed to execute on (Docker `--cpuset-cpus`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpuset: Option<String>,
+
+    /// Relative CPU shares (Docker `--cpu-shares`). Default weight is 1024.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_shares: Option<u32>,
+
+    /// Total memory limit including swap (Docker `--memory-swap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swap: Option<String>,
+
+    /// Soft memory limit (Docker `--memory-reservation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_reservation: Option<String>,
+
+    /// Container memory swappiness, 0-100 (Docker `--memory-swappiness`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_swappiness: Option<u8>,
+
+    /// OOM-killer score adjustment (Docker `--oom-score-adj`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_score_adj: Option<i32>,
+
+    /// Disable the OOM killer for the container (Docker `--oom-kill-disable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_kill_disable: Option<bool>,
+
+    /// Block IO weight, 10-1000 (Docker `--blkio-weight`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blkio_weight: Option<u16>,
 }
 
 /// Scheduling policy for GPU workloads
@@ -1723,6 +2170,22 @@ pub struct InitSpec {
     /// Init steps to run before container starts
     #[serde(default)]
     pub steps: Vec<InitStep>,
+}
+
+/// Lifecycle policy for service / job / cron containers.
+///
+/// Currently exposes a single `delete_on_exit` knob that, when `true`,
+/// instructs higher layers to remove the container record (and its bundle)
+/// once it has terminated. Other layers consume this field; this type is
+/// purely descriptive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleSpec {
+    /// When true, terminated containers (and their bundles) are removed
+    /// automatically rather than retained for inspection. Defaults to
+    /// `false`, preserving the historical retain-on-exit behavior.
+    #[serde(default)]
+    pub delete_on_exit: bool,
 }
 
 /// Init action step
@@ -3222,5 +3685,206 @@ services:
         let p =
             TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).with_os_version("10.0.26100.1");
         assert_eq!(format!("{p}"), "windows/amd64");
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 1 Task 1.1: Docker-compat ServiceSpec/ResourcesSpec extensions.
+    // ----------------------------------------------------------------------
+
+    /// Build a minimal-but-valid `ServiceSpec` for round-trip tests.
+    fn fixture_service_spec_full() -> ServiceSpec {
+        let yaml = r"
+version: v1
+deployment: phase1-task1
+services:
+  hello:
+    rtype: service
+    image:
+      name: hello-world:latest
+";
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).expect("parse fixture");
+        spec.services.get("hello").expect("hello service").clone()
+    }
+
+    #[test]
+    fn service_spec_round_trip_with_all_new_fields() {
+        let mut spec = fixture_service_spec_full();
+        spec.labels
+            .insert("zlayer.team".to_string(), "platform".to_string());
+        spec.user = Some("1000:1000".to_string());
+        spec.stop_signal = Some("SIGTERM".to_string());
+        spec.stop_grace_period = Some(std::time::Duration::from_secs(30));
+        spec.sysctls
+            .insert("net.core.somaxconn".to_string(), "1024".to_string());
+        spec.ulimits.insert(
+            "nofile".to_string(),
+            UlimitSpec {
+                soft: 65_536,
+                hard: 65_536,
+            },
+        );
+        spec.security_opt.push("no-new-privileges:true".to_string());
+        spec.pid_mode = Some("host".to_string());
+        spec.ipc_mode = Some("private".to_string());
+        spec.network_mode = NetworkMode::Bridge {
+            name: Some("custom-net".to_string()),
+        };
+        spec.cap_drop.push("NET_RAW".to_string());
+        spec.extra_groups.push("docker".to_string());
+        spec.read_only_root_fs = true;
+        spec.init_container = Some(true);
+        spec.resources.pids_limit = Some(2048);
+        spec.resources.cpuset = Some("0-3".to_string());
+        spec.resources.cpu_shares = Some(1024);
+        spec.resources.memory_swap = Some("2Gi".to_string());
+        spec.resources.memory_reservation = Some("256Mi".to_string());
+        spec.resources.memory_swappiness = Some(10);
+        spec.resources.oom_score_adj = Some(-500);
+        spec.resources.oom_kill_disable = Some(false);
+        spec.resources.blkio_weight = Some(500);
+
+        let yaml = serde_yaml::to_string(&spec).expect("serialize");
+        let round: ServiceSpec = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(spec, round, "round-trip mismatch:\n{yaml}");
+    }
+
+    #[test]
+    fn network_mode_string_form_round_trip() {
+        let cases: &[(&str, NetworkMode)] = &[
+            ("default", NetworkMode::Default),
+            ("host", NetworkMode::Host),
+            ("none", NetworkMode::None),
+            ("bridge", NetworkMode::Bridge { name: None }),
+            (
+                "bridge:custom",
+                NetworkMode::Bridge {
+                    name: Some("custom".to_string()),
+                },
+            ),
+            (
+                "container:abc123",
+                NetworkMode::Container {
+                    id: "abc123".to_string(),
+                },
+            ),
+        ];
+
+        for (input, expected) in cases {
+            #[derive(Deserialize)]
+            struct Wrap {
+                #[serde(deserialize_with = "deserialize_network_mode")]
+                m: NetworkMode,
+            }
+            let yaml = format!("m: \"{input}\"\n");
+            let parsed: Wrap = serde_yaml::from_str(&yaml).expect("parse network mode");
+            assert_eq!(&parsed.m, expected, "mismatch for {input}");
+        }
+    }
+
+    #[test]
+    fn ulimit_spec_round_trip() {
+        let u = UlimitSpec {
+            soft: 1024,
+            hard: 65_536,
+        };
+        let yaml = serde_yaml::to_string(&u).expect("serialize");
+        let parsed: UlimitSpec = serde_yaml::from_str(&yaml).expect("parse");
+        assert_eq!(u, parsed);
+    }
+
+    #[test]
+    fn host_network_true_yaml_promotes_to_network_mode_host() {
+        let yaml = r"
+version: v1
+deployment: bc-test
+services:
+  hello:
+    rtype: service
+    image:
+      name: hello-world:latest
+    host_network: true
+";
+        let dep: DeploymentSpec = serde_yaml::from_str(yaml).expect("parse");
+        let svc = dep.services.get("hello").expect("hello service");
+        assert_eq!(svc.network_mode, NetworkMode::Host);
+        // The legacy bool stays mirrored so in-process callers that still
+        // read `host_network` continue to work.
+        assert!(svc.host_network);
+    }
+
+    #[test]
+    fn capabilities_yaml_alias_cap_add_round_trip() {
+        // Forward-compat: ZLayer keeps the field named `capabilities`, but the
+        // Docker-style key `cap_add` must also deserialize into it.
+        let yaml = r"
+version: v1
+deployment: cap-test
+services:
+  hello:
+    rtype: service
+    image:
+      name: hello-world:latest
+    cap_add:
+      - NET_ADMIN
+      - SYS_PTRACE
+";
+        let dep: DeploymentSpec = serde_yaml::from_str(yaml).expect("parse cap_add alias");
+        let svc = dep.services.get("hello").expect("hello service");
+        assert_eq!(
+            svc.capabilities,
+            vec!["NET_ADMIN".to_string(), "SYS_PTRACE".to_string()]
+        );
+    }
+
+    #[test]
+    fn lifecycle_omitted_defaults_to_false() {
+        // When `lifecycle` is absent from the YAML/JSON entirely, the
+        // deserialized service must fall back to `LifecycleSpec::default()`,
+        // i.e. `delete_on_exit: false` — the historical retain-on-exit
+        // behavior. This guards against accidental policy flips when the
+        // field is added to existing specs.
+        let yaml = r"
+version: v1
+deployment: lifecycle-default-test
+services:
+  app:
+    rtype: service
+    image:
+      name: hello-world:latest
+";
+        let dep: DeploymentSpec = serde_yaml::from_str(yaml).expect("parse spec without lifecycle");
+        let svc = dep.services.get("app").expect("app service");
+        assert_eq!(svc.lifecycle, LifecycleSpec::default());
+        assert!(!svc.lifecycle.delete_on_exit);
+    }
+
+    #[test]
+    fn lifecycle_delete_on_exit_round_trips() {
+        // `lifecycle.delete_on_exit: true` must survive a full YAML
+        // deserialize → serialize → deserialize cycle, and the explicit
+        // value must propagate into the parsed `ServiceSpec`.
+        let yaml = r"
+version: v1
+deployment: lifecycle-delete-test
+services:
+  app:
+    rtype: service
+    image:
+      name: hello-world:latest
+    lifecycle:
+      delete_on_exit: true
+";
+        let dep: DeploymentSpec = serde_yaml::from_str(yaml).expect("parse spec with lifecycle");
+        let svc = dep.services.get("app").expect("app service");
+        assert!(svc.lifecycle.delete_on_exit);
+
+        // Round-trip via YAML to confirm Serialize emits the field and
+        // Deserialize folds it back identically.
+        let dumped = serde_yaml::to_string(&dep).expect("serialize spec with lifecycle");
+        let reparsed: DeploymentSpec =
+            serde_yaml::from_str(&dumped).expect("reparse round-tripped spec");
+        let reparsed_svc = reparsed.services.get("app").expect("app service after rt");
+        assert!(reparsed_svc.lifecycle.delete_on_exit);
+        assert_eq!(svc.lifecycle, reparsed_svc.lifecycle);
     }
 }

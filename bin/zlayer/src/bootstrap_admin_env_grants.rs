@@ -255,7 +255,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert!(ok, "admin {} should have Write on env {}", admin.id, env.id,);
+                assert!(ok, "admin {} should have Write on env {}", admin.id, env.id);
             }
         }
 

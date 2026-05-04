@@ -134,7 +134,7 @@ impl NatTraversal {
         candidates.dedup_by_key(|c| c.address);
 
         // Sort by priority descending (highest priority first)
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         self.local_candidates.clone_from(&candidates);
 
@@ -235,7 +235,7 @@ impl NatTraversal {
 
         // Sort candidates by priority descending, limited to max_candidate_pairs
         let mut sorted: Vec<&Candidate> = peer_candidates.iter().collect();
-        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.priority));
         sorted.truncate(self.config.max_candidate_pairs);
 
         let timeout = Duration::from_secs(self.config.hole_punch_timeout_secs);
@@ -348,7 +348,7 @@ impl NatTraversal {
             }
 
             candidates.dedup_by_key(|c| c.address);
-            candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+            candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
             self.local_candidates = candidates;
         } else {
             self.reflexive_addresses = new_addrs;
@@ -400,7 +400,7 @@ impl NatTraversal {
             return Ok(None);
         }
 
-        upgrade_candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        upgrade_candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
         upgrade_candidates.truncate(self.config.max_candidate_pairs);
 
         for candidate in &upgrade_candidates {
@@ -568,7 +568,7 @@ mod tests {
         );
 
         let mut candidates = [relay, host, reflexive];
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         assert_eq!(candidates[0].candidate_type, CandidateType::Host);
         assert_eq!(candidates[1].candidate_type, CandidateType::ServerReflexive);
@@ -701,7 +701,7 @@ mod tests {
         );
 
         let mut candidates = [reflexive_v6, host_v4, host_v6];
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
 
         // Hosts (100) before ServerReflexive (50)
         assert_eq!(candidates[0].candidate_type, CandidateType::Host);

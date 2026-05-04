@@ -47,7 +47,7 @@ use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{
     ContainerId, ContainerInspectDetails, ContainerState, ExecEventStream, ImageInfo, PruneResult,
-    Runtime, WaitOutcome,
+    Runtime, WaitCondition, WaitOutcome,
 };
 
 /// Which underlying runtime a given container was dispatched to.
@@ -370,6 +370,20 @@ impl Runtime for CompositeRuntime {
     async fn wait_outcome(&self, id: &ContainerId) -> Result<WaitOutcome> {
         let rt = self.lookup(id).await?;
         rt.wait_outcome(id).await
+    }
+
+    async fn wait_outcome_with_condition(
+        &self,
+        id: &ContainerId,
+        condition: WaitCondition,
+    ) -> Result<WaitOutcome> {
+        let rt = self.lookup(id).await?;
+        rt.wait_outcome_with_condition(id, condition).await
+    }
+
+    async fn rename_container(&self, id: &ContainerId, new_name: &str) -> Result<()> {
+        let rt = self.lookup(id).await?;
+        rt.rename_container(id, new_name).await
     }
 
     async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {

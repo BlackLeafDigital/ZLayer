@@ -240,11 +240,9 @@ pub fn handle_key(key: KeyEvent, state: &mut ValidateState) {
 
     // Manual path input mode
     match key.code {
-        KeyCode::Enter => {
-            if !state.path_input.is_empty() {
-                let path = std::path::PathBuf::from(&state.path_input);
-                run_validation(state, &path);
-            }
+        KeyCode::Enter if !state.path_input.is_empty() => {
+            let path = std::path::PathBuf::from(&state.path_input);
+            run_validation(state, &path);
         }
         KeyCode::Char(c) => {
             state.path_input.push(c);

@@ -404,7 +404,7 @@ async fn test_service_scaling() {
         let manager = ServiceManager::new(runtime.clone());
 
         // Add service
-        let upsert_result = manager.upsert_service(service_name.clone(), spec).await;
+        let upsert_result = Box::pin(manager.upsert_service(service_name.clone(), spec)).await;
         assert!(
             upsert_result.is_ok(),
             "Failed to upsert service: {upsert_result:?}"
@@ -1593,8 +1593,7 @@ async fn test_service_manager_full_integration() {
 
         // Add service via manager - this should register proxy routes
         proxy.add_service(&service_name, &spec).await;
-        manager
-            .upsert_service(service_name.clone(), spec)
+        Box::pin(manager.upsert_service(service_name.clone(), spec))
             .await
             .expect("upsert_service failed");
 

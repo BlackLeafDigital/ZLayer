@@ -36,6 +36,7 @@ zlayer-paths.workspace = true
 # Web framework
 axum.workspace = true
 axum-extra.workspace = true
+bytes.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true

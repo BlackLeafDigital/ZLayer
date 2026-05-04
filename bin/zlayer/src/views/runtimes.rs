@@ -189,10 +189,10 @@ pub fn handle_key(key: KeyEvent, state: &mut RuntimeBrowserState) {
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if template_count > 0 && state.selected < template_count - 1 {
-                state.selected += 1;
-            }
+        KeyCode::Down | KeyCode::Char('j')
+            if template_count > 0 && state.selected < template_count - 1 =>
+        {
+            state.selected += 1;
         }
         KeyCode::Enter => {
             state.show_detail = !state.show_detail;

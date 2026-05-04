@@ -1,11 +1,14 @@
-//! Docker Engine API v1.43 JSON response types.
+//! Wire-format types for the Docker Engine API compatibility socket.
 //!
-//! These types match Docker's actual JSON responses so that Docker-aware
-//! tools (VS Code Docker extension, CI systems, etc.) can parse them.
+//! These mirror Docker's exact JSON shapes (mostly `camelCase`, sometimes
+//! `PascalCase` per Docker's conventions) and are translated into `ZLayer`'s
+//! native DTOs by `super::translate`.
 
 use std::collections::HashMap;
 
 use serde::Serialize;
+
+pub mod container_create;
 
 /// Container summary for `GET /containers/json`.
 #[derive(Debug, Serialize)]
@@ -35,13 +38,10 @@ pub struct PortBinding {
     pub port_type: String,
 }
 
-/// Container create response for `POST /containers/create`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct ContainerCreateResponse {
-    pub id: String,
-    pub warnings: Vec<String>,
-}
+// Note: `POST /containers/create`'s response shape is built inline in
+// `super::containers::create_container` via `serde_json::json!`, since the
+// daemon's `CreateContainerResponse` is what we ultimately translate back
+// to Docker's `{Id, Warnings}` payload. No standalone struct needed.
 
 /// Image summary for `GET /images/json`.
 #[derive(Debug, Serialize)]
@@ -88,50 +88,11 @@ pub struct VersionInfo {
     pub go_version: String,
 }
 
-/// Volume summary.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct VolumeSummary {
-    pub name: String,
-    pub driver: String,
-    pub mountpoint: String,
-    pub labels: HashMap<String, String>,
-    pub scope: String,
-}
-
-/// Volume list response for `GET /volumes`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct VolumeListResponse {
-    pub volumes: Vec<VolumeSummary>,
-    pub warnings: Vec<String>,
-}
-
-/// Network summary for `GET /networks`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct NetworkSummary {
-    pub id: String,
-    pub name: String,
-    pub driver: String,
-    pub scope: String,
-    #[serde(rename = "IPAM")]
-    pub ipam: IpamConfig,
-    pub labels: HashMap<String, String>,
-}
-
-/// IPAM configuration for a network.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct IpamConfig {
-    pub driver: String,
-    pub config: Vec<IpamPool>,
-}
-
-/// IPAM address pool.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct IpamPool {
-    pub subnet: String,
-    pub gateway: String,
-}
+// Note: the strongly-typed `VolumeSummary` / `VolumeListResponse` /
+// `NetworkSummary` / `IpamConfig` / `IpamPool` shells that previously
+// lived here have been retired. The volumes and networks handlers now
+// emit Docker's wire format directly via `serde_json::Value` so the
+// PascalCase keys (`Status`, `Options`, `UsageData { Size, RefCount }`,
+// `IPAM.Config[].Subnet`, ...) match Docker's exact 1.43 shape without
+// requiring per-handler newtype wrappers. See
+// `crates/zlayer-docker/src/socket/{volumes,networks}.rs`.

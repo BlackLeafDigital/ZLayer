@@ -84,7 +84,13 @@ fn roundtrip_nginx() {
 fn roundtrip_api() {
     let spec = load_and_convert();
     let api = &spec.services["api"];
-    assert_eq!(api.image.name.to_string(), "docker.io/library/api:latest");
+    // `api:` ships a `build:` directive without an explicit `image:`, so
+    // the converter assigns the Compose-style `<project>-<service>:latest`
+    // tag (matching what `compose build` will emit for this service).
+    assert_eq!(
+        api.image.name.to_string(),
+        "docker.io/library/example-webapp-api:latest",
+    );
     assert_eq!(api.endpoints.len(), 1);
     assert_eq!(api.endpoints[0].port, 3000);
     assert_eq!(api.endpoints[0].target_port, Some(3000));

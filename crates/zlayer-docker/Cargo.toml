@@ -14,11 +14,16 @@ zlayer-spec.workspace = true
 zlayer-core.workspace = true
 zlayer-client.workspace = true
 zlayer-paths.workspace = true
+zlayer-types.workspace = true
+zlayer-api.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
+
+# Time (for Docker network response shapes)
+chrono.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -34,18 +39,42 @@ clap.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true
+bytes.workspace = true
 
 # Web/HTTP
 axum.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
+http = "1"
+base64.workspace = true
+sha2.workspace = true
+
+# TAR archive support for `docker cp` semantics (`cli::cp`) and for
+# `POST /build` (decoding the build context tarball uploaded by Docker
+# clients).
+tar = { workspace = true }
+
+# Gzip decoding for `POST /build` request bodies (Docker clients optionally
+# gzip-compress the tarball before upload).
+flate2.workspace = true
+
+# Temp directories for `POST /build` to materialise the uploaded tar
+# context on disk before invoking the buildah-based image builder.
+tempfile = "3"
+
+# Permissive query-string parser for `POST /build`, where keys like `t`
+# repeat (one per tag).
+url.workspace = true
 
 # System info
 num_cpus.workspace = true
 
 # Interactive prompts (docker install sock_symlink)
 dialoguer = { version = "0.11", default-features = false }
+
+# Terminal raw-mode handling for `docker run -it` attach.
+crossterm = "0.28"
 
 # Optional dependencies
 zlayer-builder = { workspace = true, optional = true }

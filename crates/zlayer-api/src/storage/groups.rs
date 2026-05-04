@@ -132,7 +132,7 @@ impl GroupStorage for InMemoryGroupStore {
     async fn list(&self) -> Result<Vec<StoredUserGroup>, StorageError> {
         let groups = self.groups.read().await;
         let mut list: Vec<_> = groups.values().cloned().collect();
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.sort_by_key(|g| g.name.to_lowercase());
         Ok(list)
     }
 
@@ -307,7 +307,7 @@ impl GroupStorage for SqlxGroupStore {
         // The adapter orders by `id`; the trait contract sorts by
         // lower-cased name to match the in-memory backend.
         let mut list = self.inner.list().await?;
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.sort_by_key(|g| g.name.to_lowercase());
         Ok(list)
     }
 

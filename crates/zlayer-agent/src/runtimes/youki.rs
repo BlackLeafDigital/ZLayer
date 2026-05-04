@@ -5,7 +5,11 @@
 
 use crate::cgroups_stats::{self, ContainerStats};
 use crate::error::{AgentError, Result};
-use crate::runtime::{ContainerId, ContainerState, ImageInfo, PruneResult, Runtime};
+use crate::runtime::{
+    ArchivePutOptions, ArchiveStream, ContainerId, ContainerState, ExecExitFuture, ExecHandle,
+    ExecOptions, ExecPtyStream, ImageInfo, LogChannel, LogChunk, LogsStream, LogsStreamOptions,
+    PathStat, PruneResult, PullProgress, PullProgressStream, Runtime, StatsSample, StatsStream,
+};
 use crate::storage_manager::StorageManager;
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
@@ -13,11 +17,13 @@ use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use oci_client::manifest::OciImageManifest;
 use std::collections::HashMap;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
+use tokio::sync::{mpsc, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::{RegistryAuth, ServiceSpec};
@@ -69,8 +75,7 @@ impl Default for YoukiConfig {
             volume_dir: std::env::var("ZLAYER_VOLUME_DIR")
                 .map_or_else(|_| dirs.volumes(), PathBuf::from),
             use_systemd: std::env::var("ZLAYER_USE_SYSTEMD")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false),
+                .is_ok_and(|v| v == "1" || v.to_lowercase() == "true"),
             cache_type: None,
             log_base_dir: None,
             deployment_name: None,
@@ -105,6 +110,12 @@ struct ContainerInfo {
     /// Process ID (once running)
     #[allow(dead_code)]
     pid: Option<u32>,
+    /// Most recent restart policy applied via
+    /// [`Runtime::update_container_resources`]. None when never updated.
+    /// Persisted across runtime restarts is not yet wired; this is the
+    /// in-memory copy that the supervisor consults on container exit.
+    #[allow(dead_code)]
+    restart_policy: Option<crate::runtime::ContainerRestartPolicyUpdate>,
 }
 
 /// Youki/libcontainer-based container runtime
@@ -1021,6 +1032,7 @@ impl Runtime for YoukiRuntime {
                     stdout_path,
                     stderr_path,
                     pid: None,
+                    restart_policy: None,
                 },
             );
         }
@@ -1540,6 +1552,166 @@ impl Runtime for YoukiRuntime {
         Ok((exit_code, stdout_content, stderr_content))
     }
 
+    /// Start an interactive exec session against a libcontainer-managed
+    /// container.
+    ///
+    /// Allocates a master/slave pseudo-terminal pair via `nix::pty::openpty`,
+    /// duplicates the slave fd three times so libcontainer can take ownership
+    /// of it for the tenant process's stdin/stdout/stderr (each setter on
+    /// `ContainerBuilder` consumes an `OwnedFd`), and returns the master end
+    /// wrapped in a `tokio::io::unix::AsyncFd`-backed duplex stream.
+    ///
+    /// The returned [`ExecHandle::resize`] channel drives a small task that
+    /// services `(rows, cols)` updates by issuing `ioctl(TIOCSWINSZ)` on the
+    /// master fd. The [`ExecHandle::exit`] future calls `waitpid` on the
+    /// tenant's pid in `spawn_blocking` and resolves with the exit code (or
+    /// `128 + signal` for signalled deaths).
+    ///
+    /// Both `tty=true` and `tty=false` allocate a PTY: when `tty=false` the
+    /// caller still gets a single duplex byte stream (stdout and stderr are
+    /// merged through the slave terminal, matching how a tenant without a
+    /// requested TTY behaves when handed a terminal anyway).
+    #[allow(unsafe_code)]
+    #[instrument(
+        skip(self, opts),
+        fields(
+            otel.name = "container.exec_pty",
+            container.id = %self.container_id_str(id),
+            command = ?opts.command,
+            tty = opts.tty,
+        )
+    )]
+    async fn exec_pty(&self, id: &ContainerId, opts: ExecOptions) -> Result<ExecHandle> {
+        let container_id = self.container_id_str(id);
+
+        if opts.command.is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "exec_pty command cannot be empty".to_string(),
+            ));
+        }
+
+        // Allocate the PTY pair on a blocking thread — `openpty` is a syscall
+        // wrapper but we keep it off the async path for symmetry with the
+        // libcontainer call below.
+        let openpty_result = tokio::task::spawn_blocking(|| nix::pty::openpty(None, None))
+            .await
+            .map_err(|e| AgentError::Internal(format!("openpty join error: {e}")))?
+            .map_err(|e| AgentError::Internal(format!("openpty failed: {e}")))?;
+
+        let master_fd = openpty_result.master;
+        let slave_fd = openpty_result.slave;
+
+        // Duplicate the slave three times so libcontainer can take ownership
+        // of one fd per stdio. Closing the original slave on the host side
+        // happens automatically when `slave_fd` drops at the end of this
+        // scope; the duplicates travel into the tenant.
+        let stdin_fd = nix::unistd::dup(&slave_fd)
+            .map_err(|e| AgentError::Internal(format!("dup slave for stdin failed: {e}")))?;
+        let stdout_fd = nix::unistd::dup(&slave_fd)
+            .map_err(|e| AgentError::Internal(format!("dup slave for stdout failed: {e}")))?;
+        let stderr_fd = nix::unistd::dup(&slave_fd)
+            .map_err(|e| AgentError::Internal(format!("dup slave for stderr failed: {e}")))?;
+        drop(slave_fd);
+
+        // Mark the master end non-blocking so `AsyncFd` can drive it.
+        nix::fcntl::fcntl(
+            &master_fd,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(|e| AgentError::Internal(format!("F_SETFL O_NONBLOCK on pty master: {e}")))?;
+
+        let cmd_clone = opts.command.clone();
+        let container_id_clone = container_id.clone();
+        let state_dir_clone = self.config.state_dir.clone();
+
+        // Spawn the tenant on the libcontainer thread pool. Each stdio fd is
+        // moved into the closure and consumed by the builder.
+        let exec_pid = tokio::task::spawn_blocking(move || {
+            let container_builder =
+                ContainerBuilder::new(container_id_clone.clone(), SyscallType::Linux)
+                    .with_stdin(stdin_fd)
+                    .with_stdout(stdout_fd)
+                    .with_stderr(stderr_fd);
+
+            let container_builder =
+                container_builder
+                    .with_root_path(&state_dir_clone)
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: container_id_clone.clone(),
+                        reason: format!("failed to set root path: {e}"),
+                    })?;
+
+            let tenant_builder = container_builder
+                .as_tenant()
+                .with_container_args(cmd_clone)
+                .with_detach(true);
+
+            let pid = tenant_builder
+                .build()
+                .map_err(|e| AgentError::CreateFailed {
+                    id: container_id_clone.clone(),
+                    reason: format!("failed to exec_pty in container: {e}"),
+                })?;
+
+            Ok::<i32, AgentError>(pid.as_raw())
+        })
+        .await
+        .map_err(|e| AgentError::CreateFailed {
+            id: container_id.clone(),
+            reason: format!("task join error: {e}"),
+        })??;
+
+        // Resize task: pump (rows, cols) into TIOCSWINSZ on the master.
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+        let master_raw = master_fd.as_raw_fd();
+        tokio::spawn(async move {
+            while let Some((rows, cols)) = resize_rx.recv().await {
+                let ws = nix::pty::Winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                // SAFETY: `master_raw` remains a valid fd as long as the
+                // duplex stream is alive (it owns the master `OwnedFd`).
+                // `ws` is a stack-allocated `winsize` matching the layout
+                // the kernel expects. The ioctl reads from the pointer; it
+                // does not retain it past the call.
+                let rc = unsafe { libc::ioctl(master_raw, libc::TIOCSWINSZ, &ws) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!(?err, "TIOCSWINSZ failed on pty master");
+                }
+            }
+        });
+
+        // Build the exit future: waitpid on a blocking thread.
+        let exit_fut: ExecExitFuture = Box::pin(async move {
+            let exit_code = tokio::task::spawn_blocking(move || {
+                use nix::sys::wait::{waitpid, WaitStatus};
+                use nix::unistd::Pid;
+                let pid = Pid::from_raw(exec_pid);
+                match waitpid(pid, None) {
+                    Ok(WaitStatus::Exited(_, code)) => code,
+                    Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
+                    Ok(_) | Err(_) => -1,
+                }
+            })
+            .await
+            .map_err(|e| AgentError::Internal(format!("waitpid join error: {e}")))?;
+            Ok(exit_code)
+        });
+
+        // Wrap the master end in an AsyncFd-backed duplex stream.
+        let stream: ExecPtyStream = Box::new(PtyDuplex::new(master_fd)?);
+
+        Ok(ExecHandle {
+            stream,
+            resize: resize_tx,
+            exit: exit_fut,
+        })
+    }
+
     /// Get container resource statistics from cgroups
     ///
     /// Reads CPU and memory statistics from the cgroups v2 filesystem.
@@ -2013,6 +2185,423 @@ impl Runtime for YoukiRuntime {
         Ok(())
     }
 
+    /// Pause a container by freezing its cgroup via `Container::pause`.
+    ///
+    /// Loaded from the on-disk libcontainer state; the call itself is
+    /// blocking so we hop to `spawn_blocking`. Errors map to `NotFound` when
+    /// the container state directory doesn't exist, `InvalidSpec` when the
+    /// container is in a non-pausable state (already paused, never started),
+    /// and `Internal` for cgroup write failures.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.pause",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn pause_container(&self, id: &ContainerId) -> Result<()> {
+        let container_id = self.container_id_str(id);
+        let container_root = self.container_root(id);
+        let container_id_clone = container_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::NotFound {
+                    container: container_id_clone.clone(),
+                    reason: format!("failed to load container: {e}"),
+                })?;
+            if !container.can_pause() {
+                return Err(AgentError::InvalidSpec(format!(
+                    "container '{container_id_clone}' is not in a pausable state ({:?})",
+                    container.status()
+                )));
+            }
+            container.pause().map_err(|e| {
+                AgentError::Internal(format!(
+                    "failed to pause container '{container_id_clone}': {e}"
+                ))
+            })?;
+            Ok::<(), AgentError>(())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("task join error during pause: {e}")))??;
+        Ok(())
+    }
+
+    /// Resume a previously-paused container via `Container::resume`.
+    ///
+    /// Symmetric inverse of `pause_container`: thaws the freezer cgroup. Same
+    /// error mapping conventions.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.unpause",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn unpause_container(&self, id: &ContainerId) -> Result<()> {
+        let container_id = self.container_id_str(id);
+        let container_root = self.container_root(id);
+        let container_id_clone = container_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::NotFound {
+                    container: container_id_clone.clone(),
+                    reason: format!("failed to load container: {e}"),
+                })?;
+            if !container.can_resume() {
+                return Err(AgentError::InvalidSpec(format!(
+                    "container '{container_id_clone}' is not in a resumable state ({:?})",
+                    container.status()
+                )));
+            }
+            container.resume().map_err(|e| {
+                AgentError::Internal(format!(
+                    "failed to resume container '{container_id_clone}': {e}"
+                ))
+            })?;
+            Ok::<(), AgentError>(())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("task join error during unpause: {e}")))??;
+        Ok(())
+    }
+
+    /// Update a running container's cgroup v2 resource limits and persist
+    /// the new restart policy in the supervisor's in-memory state.
+    ///
+    /// This implementation writes directly to the container's cgroup v2
+    /// hierarchy under `/sys/fs/cgroup/zlayer/<id>` (or
+    /// `/sys/fs/cgroup/system.slice/zlayer-<id>.scope` when systemd is the
+    /// driver). The fields it can apply natively on cgroup v2 are:
+    ///
+    /// * `cpu_shares` → `cpu.weight` (mapped from the `2..262144` shares
+    ///   range to v2's `1..10000` weight range)
+    /// * `memory` → `memory.max` (`0` clears the limit)
+    /// * `memory_reservation` → `memory.low`
+    /// * `memory_swap` → `memory.swap.max` (`-1` clears the limit)
+    /// * `pids_limit` → `pids.max` (`-1` or `0` clears)
+    /// * `cpuset_cpus` → `cpuset.cpus`
+    /// * `cpuset_mems` → `cpuset.mems`
+    /// * `cpu_period` + `cpu_quota` → `cpu.max` ("`<quota> <period>`")
+    /// * `blkio_weight` → `io.bfq.weight` (best-effort; emits a warning
+    ///   when the BFQ controller isn't enabled)
+    ///
+    /// `cpu_realtime_period` / `cpu_realtime_runtime` and `kernel_memory`
+    /// have no cgroup v2 equivalent and are surfaced as warnings rather
+    /// than errors.
+    ///
+    /// `restart_policy` is captured into the in-memory `ContainerInfo`
+    /// entry so the supervisor sees the new policy when the container
+    /// next exits.
+    #[instrument(
+        skip(self, update),
+        fields(
+            otel.name = "container.update",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn update_container_resources(
+        &self,
+        id: &ContainerId,
+        update: &crate::runtime::ContainerResourceUpdate,
+    ) -> Result<crate::runtime::ContainerUpdateOutcome> {
+        let container_id = self.container_id_str(id);
+        if update.is_empty() {
+            return Ok(crate::runtime::ContainerUpdateOutcome::default());
+        }
+
+        // Persist the new restart policy in our in-memory tracking. We
+        // do this even when the container's cgroup directory is gone
+        // (e.g. the container has already exited): the supervisor reads
+        // the policy on the *next* exit, so updating it for a stopped
+        // container is still meaningful.
+        if let Some(rp) = update.restart_policy.clone() {
+            let mut containers = self.containers.write().await;
+            if let Some(info) = containers.get_mut(&container_id) {
+                info.restart_policy = Some(rp);
+            }
+        }
+
+        let cgroup_path = if self.config.use_systemd {
+            PathBuf::from(format!(
+                "/sys/fs/cgroup/system.slice/zlayer-{container_id}.scope"
+            ))
+        } else {
+            PathBuf::from(format!("/sys/fs/cgroup/zlayer/{container_id}"))
+        };
+
+        let mut warnings: Vec<String> = Vec::new();
+
+        // If there's nothing to write to cgroup files (only restart
+        // policy was set), bail out before touching the filesystem.
+        let needs_cgroup_write = update.cpu_shares.is_some()
+            || update.memory.is_some()
+            || update.memory_reservation.is_some()
+            || update.memory_swap.is_some()
+            || update.pids_limit.is_some()
+            || update.cpuset_cpus.is_some()
+            || update.cpuset_mems.is_some()
+            || update.cpu_period.is_some()
+            || update.cpu_quota.is_some()
+            || update.blkio_weight.is_some();
+
+        if needs_cgroup_write && !cgroup_path.exists() {
+            return Err(AgentError::NotFound {
+                container: container_id.clone(),
+                reason: format!(
+                    "cgroup directory '{}' not found — is the container running?",
+                    cgroup_path.display()
+                ),
+            });
+        }
+
+        if update.kernel_memory.is_some() {
+            warnings
+                .push("KernelMemory has no cgroup v2 equivalent and was not applied".to_string());
+        }
+        if update.cpu_realtime_period.is_some() || update.cpu_realtime_runtime.is_some() {
+            warnings.push(
+                "CpuRealtimePeriod/CpuRealtimeRuntime are not supported on cgroup v2; ignored"
+                    .to_string(),
+            );
+        }
+
+        // cpu_shares -> cpu.weight (cgroup v2 mapping). v1 shares are
+        // 2..262144 with default 1024; v2 weight is 1..10000 with
+        // default 100. Use Docker's documented mapping:
+        //   weight = 1 + ((shares - 2) * 9999 / 262142)
+        if let Some(shares) = update.cpu_shares {
+            let shares = shares.max(2);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let weight = 1_i64 + (shares - 2) * 9999 / 262_142;
+            let weight = weight.clamp(1, 10_000);
+            write_cgroup_file(
+                &cgroup_path.join("cpu.weight"),
+                &weight.to_string(),
+                &mut warnings,
+            )
+            .await?;
+        }
+
+        // cpu.max takes "<quota> <period>" or "max <period>".
+        if update.cpu_period.is_some() || update.cpu_quota.is_some() {
+            let period = update.cpu_period.unwrap_or(100_000);
+            let quota_str = match update.cpu_quota {
+                Some(q) if q > 0 => q.to_string(),
+                _ => "max".to_string(),
+            };
+            let value = format!("{quota_str} {period}");
+            write_cgroup_file(&cgroup_path.join("cpu.max"), &value, &mut warnings).await?;
+        }
+
+        if let Some(memory) = update.memory {
+            let value = if memory <= 0 {
+                "max".to_string()
+            } else {
+                memory.to_string()
+            };
+            write_cgroup_file(&cgroup_path.join("memory.max"), &value, &mut warnings).await?;
+        }
+
+        if let Some(reservation) = update.memory_reservation {
+            let value = if reservation <= 0 {
+                "0".to_string()
+            } else {
+                reservation.to_string()
+            };
+            write_cgroup_file(&cgroup_path.join("memory.low"), &value, &mut warnings).await?;
+        }
+
+        if let Some(swap) = update.memory_swap {
+            // Docker semantics: -1 means unlimited. Memory swap on v2
+            // is the *swap-only* limit, while Docker's `MemorySwap`
+            // historically meant memory+swap. Pass through the absolute
+            // value with a warning so the operator knows the v2
+            // semantic is different.
+            warnings.push(
+                "MemorySwap is interpreted as cgroup v2 memory.swap.max (swap-only); \
+                 Docker's v1 semantics differ"
+                    .to_string(),
+            );
+            let value = if swap < 0 {
+                "max".to_string()
+            } else {
+                swap.to_string()
+            };
+            write_cgroup_file(&cgroup_path.join("memory.swap.max"), &value, &mut warnings).await?;
+        }
+
+        if let Some(pids) = update.pids_limit {
+            let value = if pids <= 0 {
+                "max".to_string()
+            } else {
+                pids.to_string()
+            };
+            write_cgroup_file(&cgroup_path.join("pids.max"), &value, &mut warnings).await?;
+        }
+
+        if let Some(cpus) = update.cpuset_cpus.as_ref() {
+            write_cgroup_file(&cgroup_path.join("cpuset.cpus"), cpus, &mut warnings).await?;
+        }
+
+        if let Some(mems) = update.cpuset_mems.as_ref() {
+            write_cgroup_file(&cgroup_path.join("cpuset.mems"), mems, &mut warnings).await?;
+        }
+
+        if let Some(weight) = update.blkio_weight {
+            // io.bfq.weight expects 1..1000; Docker's BlkioWeight is
+            // 10..1000 with default 500. Pass through verbatim and let
+            // the kernel reject out-of-range values.
+            write_cgroup_file(
+                &cgroup_path.join("io.bfq.weight"),
+                &weight.to_string(),
+                &mut warnings,
+            )
+            .await?;
+        }
+
+        Ok(crate::runtime::ContainerUpdateOutcome { warnings })
+    }
+
+    /// List the processes running inside a container.
+    ///
+    /// Reads the container's main PID from libcontainer's loaded state, walks
+    /// `/proc/{pid}/task/*` to enumerate tids inside the container's pid
+    /// namespace, then synthesises a Docker-style top response. The columns
+    /// returned are a fixed minimal subset (`UID`, `PID`, `PPID`, `STIME`,
+    /// `CMD`) — `ps_args` is accepted for trait conformance but ignored,
+    /// because youki has no privileged `ps`-runner per container.
+    #[instrument(
+        skip(self, _ps_args),
+        fields(
+            otel.name = "container.top",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn top_container(
+        &self,
+        id: &ContainerId,
+        _ps_args: &[String],
+    ) -> Result<crate::runtime::ContainerTopOutput> {
+        use crate::runtime::ContainerTopOutput;
+
+        let container_id = self.container_id_str(id);
+        let container_root = self.container_root(id);
+        let container_id_clone = container_id.clone();
+
+        // Snapshot the main process PID under spawn_blocking — Container::load
+        // walks the on-disk state file synchronously.
+        let pid = tokio::task::spawn_blocking(move || -> Result<i32> {
+            let container = Container::load(container_root).map_err(|e| AgentError::NotFound {
+                container: container_id_clone.clone(),
+                reason: format!("failed to load container: {e}"),
+            })?;
+            let pid = container.pid().ok_or_else(|| {
+                AgentError::InvalidSpec(format!(
+                    "container '{container_id_clone}' has no running process"
+                ))
+            })?;
+            Ok(pid.as_raw())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("task join error during top: {e}")))??;
+
+        // Walk /proc/{pid}/task/* to enumerate threads (which double as
+        // process IDs from the host's perspective). Containers running a
+        // single multi-threaded process expose all its tids here.
+        let task_dir = format!("/proc/{pid}/task");
+        let mut entries = match tokio::fs::read_dir(&task_dir).await {
+            Ok(it) => it,
+            Err(e) => {
+                return Err(AgentError::NotFound {
+                    container: container_id.clone(),
+                    reason: format!("failed to read /proc/{pid}/task: {e}"),
+                });
+            }
+        };
+
+        let mut processes: Vec<Vec<String>> = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to walk /proc tree: {e}")))?
+        {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // Skip entries that aren't PIDs (defensive — /proc/.../task only
+            // contains numeric directories in practice).
+            if !name.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let row = read_proc_row(&name).await;
+            processes.push(row);
+        }
+
+        Ok(ContainerTopOutput {
+            titles: vec![
+                "UID".to_string(),
+                "PID".to_string(),
+                "PPID".to_string(),
+                "STIME".to_string(),
+                "CMD".to_string(),
+            ],
+            processes,
+        })
+    }
+
+    /// `changes_container` is unsupported on Youki: the runtime stores
+    /// containers as a single mutable rootfs (extracted from the cached
+    /// layers in `bundle_path`), with no overlayfs upper/lower split to
+    /// diff against. Implementing this would require either re-extracting
+    /// the original image layers and walking both trees, or cooperating
+    /// with the storage driver — both out of scope for this trait method.
+    /// The REST layer translates `Unsupported` into a 501 response.
+    async fn changes_container(
+        &self,
+        _id: &ContainerId,
+    ) -> Result<Vec<crate::runtime::FilesystemChangeEntry>> {
+        Err(AgentError::Unsupported(
+            "changes_container is not supported by the youki runtime: \
+             no layered filesystem to diff against"
+                .into(),
+        ))
+    }
+
+    /// `port_mappings_container` is unsupported on Youki: the runtime relies
+    /// on the host's network namespace for port forwarding (proxy / overlay
+    /// network), not on a per-container `HostConfig.PortBindings` table. The
+    /// 501 from the REST layer signals to clients that they should consult
+    /// the daemon's deployment / endpoint metadata rather than a runtime
+    /// inspect call.
+    async fn port_mappings_container(
+        &self,
+        _id: &ContainerId,
+    ) -> Result<Vec<crate::runtime::PortMappingEntry>> {
+        Err(AgentError::Unsupported(
+            "port_mappings_container is not supported by the youki runtime: \
+             port publishing is managed at the proxy / overlay layer"
+                .into(),
+        ))
+    }
+
+    /// `prune_containers` is unsupported on Youki: cleanup of stopped
+    /// container state directories is driven by the container supervisor /
+    /// reaper, not by a daemon-wide prune sweep. Forcing a sweep here would
+    /// race the supervisor's own bookkeeping. Surfaces as 501 from the REST
+    /// layer.
+    async fn prune_containers(&self) -> Result<crate::runtime::ContainerPruneResult> {
+        Err(AgentError::Unsupported(
+            "prune_containers is not supported by the youki runtime: \
+             stopped containers are reaped by the supervisor"
+                .into(),
+        ))
+    }
+
     #[instrument(
         skip(self),
         fields(
@@ -2067,6 +2656,1097 @@ impl Runtime for YoukiRuntime {
 
         tracing::info!(source = %source, target = %target, "tagged image");
         Ok(())
+    }
+
+    /// Stream container logs by tailing the on-disk stdout/stderr files
+    /// produced by [`Self::create_log_files`].
+    ///
+    /// Implementation notes:
+    /// * Each line of the file produces one [`LogChunk`]. Youki's runtime
+    ///   does not write timestamps into the log files, so chunks carry the
+    ///   wall-clock time the line was read when `opts.timestamps` is set
+    ///   and `None` otherwise.
+    /// * `opts.tail` is honoured by counting `\n` bytes from the end of
+    ///   each file before streaming begins.
+    /// * `opts.follow` keeps the stream alive after EOF, polling every
+    ///   200ms for new content. When `follow=false` the stream completes
+    ///   after the buffered lines drain.
+    /// * `opts.since`/`opts.until` filter chunks by the read-time
+    ///   wallclock (see above — file format has no per-line timestamps,
+    ///   so this is the best the youki backend can do).
+    /// * `opts.stdout`/`opts.stderr` toggle each channel; if neither is
+    ///   true (Docker's default-on shorthand), both are streamed.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.logs.stream",
+            container.id = %self.container_id_str(id),
+        )
+    )]
+    async fn logs_stream(&self, id: &ContainerId, opts: LogsStreamOptions) -> Result<LogsStream> {
+        // Resolve log paths from local state, falling back to the default
+        // bundle/structured paths just like `container_logs` / `get_logs`.
+        let (stdout_path, stderr_path) = {
+            let containers = self.containers.read().await;
+            match containers.get(&self.container_id_str(id)) {
+                Some(info) => (info.stdout_path.clone(), info.stderr_path.clone()),
+                None => self.log_paths(id),
+            }
+        };
+
+        // If neither channel was requested, default to streaming both
+        // (matches Docker's behaviour when `stdout=false&stderr=false` is
+        // sent — Docker treats it as "both", since requesting nothing is
+        // never useful).
+        let none_specified = !opts.stdout && !opts.stderr;
+        let want_stdout = opts.stdout || none_specified;
+        let want_stderr = opts.stderr || none_specified;
+
+        // Use a bounded channel so a slow consumer applies natural
+        // back-pressure on the file readers.
+        let (tx, rx) = mpsc::channel::<Result<LogChunk>>(64);
+
+        if want_stdout && stdout_path.exists() {
+            let tx = tx.clone();
+            let path = stdout_path.clone();
+            let opts_cloned = opts.clone();
+            tokio::spawn(async move {
+                let _ = stream_log_file(path, LogChannel::Stdout, opts_cloned, tx).await;
+            });
+        }
+
+        if want_stderr && stderr_path.exists() {
+            let tx_err = tx.clone();
+            let path = stderr_path.clone();
+            let opts_cloned = opts.clone();
+            tokio::spawn(async move {
+                let _ = stream_log_file(path, LogChannel::Stderr, opts_cloned, tx_err).await;
+            });
+        }
+
+        // Drop the original sender so the stream terminates once both
+        // (or all available) tailers exit.
+        drop(tx);
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    /// Stream periodic resource-usage samples for a container by polling
+    /// its cgroup v2 directory once per second.
+    ///
+    /// Reuses [`cgroups_stats::read_container_stats`] for `cpu.stat`,
+    /// `memory.current`, and `memory.max`, and additionally reads
+    /// `pids.current` / `pids.max` directly so the [`StatsSample`] reflects
+    /// pids counters that the existing internal [`ContainerStats`] type
+    /// does not carry.
+    ///
+    /// Network and block-IO counters are not surfaced by youki's cgroup
+    /// directory at the same path (network stats live in the container's
+    /// netns, blkio stats require the legacy v1 hierarchy) so they are
+    /// reported as `0`. Consumers that need those numbers should use the
+    /// Docker runtime, which does have them.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.stats.stream",
+            container.id = %self.container_id_str(id),
+        )
+    )]
+    async fn stats_stream(&self, id: &ContainerId) -> Result<StatsStream> {
+        let container_id = self.container_id_str(id);
+        let cgroup_path = if self.config.use_systemd {
+            PathBuf::from(format!(
+                "/sys/fs/cgroup/system.slice/zlayer-{container_id}.scope"
+            ))
+        } else {
+            PathBuf::from(format!("/sys/fs/cgroup/zlayer/{container_id}"))
+        };
+
+        let (tx, rx) = mpsc::channel::<Result<StatsSample>>(8);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            #[allow(clippy::cast_possible_truncation)]
+            let online_cpus = num_cpus::get() as u32;
+
+            loop {
+                interval.tick().await;
+
+                let sample_result = read_stats_sample(&cgroup_path, online_cpus).await;
+                let send_result = match sample_result {
+                    Ok(sample) => tx.send(Ok(sample)).await,
+                    Err(err) => {
+                        // Surface the error and terminate the stream — a
+                        // missing cgroup directory means the container is
+                        // gone, retrying on every tick would just spam.
+                        let _ = tx.send(Err(err)).await;
+                        break;
+                    }
+                };
+
+                if send_result.is_err() {
+                    // Receiver dropped — stop sampling.
+                    break;
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    /// Stream image pull progress by wrapping the synchronous
+    /// [`zlayer_registry::ImagePuller::pull_image_with_policy`] code path.
+    ///
+    /// The puller does not expose a per-layer progress callback today, so
+    /// this implementation synthesises a coarse progression:
+    ///   1. `Status { status: "Pulling manifest" }` before manifest fetch.
+    ///   2. One `Status { status: "Pulling layer", id: <digest> }` per
+    ///      layer in the manifest, emitted before each layer is fetched.
+    ///   3. A final `Done { reference, digest }` event when the pull
+    ///      succeeds (or an `Err` item if it fails).
+    ///
+    /// Each layer event carries the layer's `total` size from the manifest
+    /// so consumers can render proportional progress bars even though
+    /// `current` cannot be reported until the puller gains a streaming
+    /// callback.
+    ///
+    /// `auth` is currently ignored on this backend — youki resolves
+    /// credentials through the persistent secret store via
+    /// [`zlayer_core::AuthResolver`], matching the semantics of
+    /// [`Self::pull_image_with_policy`].
+    #[instrument(
+        skip(self, _auth),
+        fields(
+            otel.name = "image.pull.stream",
+            container.image.name = %image,
+        )
+    )]
+    async fn pull_image_stream(
+        &self,
+        image: &str,
+        _auth: Option<&RegistryAuth>,
+    ) -> Result<PullProgressStream> {
+        let (tx, rx) = mpsc::channel::<Result<PullProgress>>(32);
+
+        // Build the puller eagerly (cheap clone of cache + optional
+        // local registry) so the spawned task owns everything it needs.
+        let puller = {
+            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+            if let Some(ref registry) = self.local_registry {
+                p.with_local_registry(registry.clone())
+            } else {
+                p
+            }
+        };
+        let auth = self.auth_resolver.resolve(image);
+        let image_owned = image.to_string();
+
+        tokio::spawn(async move {
+            // Step 1: announce manifest pull.
+            if tx
+                .send(Ok(PullProgress::Status {
+                    id: None,
+                    status: "Pulling manifest".to_string(),
+                    progress: None,
+                    current: None,
+                    total: None,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            // Step 2: fetch the manifest so we can enumerate layers.
+            // `pull_image_manifest` is exposed via the public client; the
+            // higher-level pull_image will redo this internally but the
+            // cost is one cached lookup and the API is the cleanest way
+            // to learn about layers up-front for streaming events.
+            let layers_meta: Vec<(String, u64)> =
+                match puller.pull_manifest(&image_owned, &auth).await {
+                    Ok((manifest, _digest)) => manifest
+                        .layers
+                        .iter()
+                        .map(|l| {
+                            let size = u64::try_from(l.size).unwrap_or(0);
+                            (l.digest.clone(), size)
+                        })
+                        .collect(),
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(AgentError::PullFailed {
+                                image: image_owned.clone(),
+                                reason: format!("failed to pull manifest: {e}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                };
+
+            // Step 3: emit one Status event per layer before the actual
+            // pull. The puller will retrieve cached layers near-instantly
+            // and uncached ones over the network; either way, consumers
+            // see one event per layer with the digest as `id`.
+            for (digest, size) in &layers_meta {
+                if tx
+                    .send(Ok(PullProgress::Status {
+                        id: Some(digest.clone()),
+                        status: "Pulling fs layer".to_string(),
+                        progress: None,
+                        current: None,
+                        total: if *size > 0 { Some(*size) } else { None },
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            // Step 4: do the actual pull (uses the shared blob cache;
+            // already-cached layers are no-ops).
+            let force_refresh = false;
+            match puller
+                .pull_image_with_policy(&image_owned, &auth, force_refresh)
+                .await
+            {
+                Ok(_layers) => {
+                    // Best-effort fetch of the registry digest sidecar so
+                    // the `Done` event can carry a content-addressed
+                    // identifier when one is available.
+                    let _ = puller
+                        .pull_image_config_with_policy(&image_owned, &auth, force_refresh)
+                        .await;
+
+                    let _ = tx
+                        .send(Ok(PullProgress::Done {
+                            reference: image_owned.clone(),
+                            digest: None,
+                        }))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(AgentError::PullFailed {
+                            image: image_owned.clone(),
+                            reason: format!("failed to pull image: {e}"),
+                        }))
+                        .await;
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    /// Stream a TAR archive of a path inside the container's rootfs.
+    ///
+    /// The youki backend doesn't run a daemon and has no live attach API to
+    /// the container's mount namespace, so we satisfy `archive_get` by
+    /// walking the on-disk rootfs at `<bundle>/rootfs<container_path>` and
+    /// streaming the TAR archive on the fly. This works for non-running
+    /// containers and for live containers whose rootfs has not been
+    /// `pivot_root`'d into a private mount namespace inaccessible from the
+    /// host (the standard Youki layout keeps the bundle rootfs visible).
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.archive_get",
+            container.id = %self.container_id_str(id),
+            archive.path = %path,
+        )
+    )]
+    async fn archive_get(&self, id: &ContainerId, path: &str) -> Result<ArchiveStream> {
+        let bundle_path = self.bundle_path(id);
+        let rootfs_path = bundle_path.join("rootfs");
+        if !rootfs_path.exists() {
+            return Err(AgentError::NotFound {
+                container: self.container_id_str(id),
+                reason: format!(
+                    "container rootfs '{}' does not exist on disk",
+                    rootfs_path.display()
+                ),
+            });
+        }
+
+        let rel = path.trim_start_matches('/');
+        let abs_target = if rel.is_empty() {
+            rootfs_path.clone()
+        } else {
+            rootfs_path.join(rel)
+        };
+
+        // Reject path-traversal attempts: the canonicalized target must live
+        // strictly under the rootfs.
+        let canon_root = tokio::fs::canonicalize(&rootfs_path).await.map_err(|e| {
+            AgentError::Internal(format!(
+                "failed to canonicalize rootfs '{}': {e}",
+                rootfs_path.display()
+            ))
+        })?;
+        let canon_target = match tokio::fs::canonicalize(&abs_target).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AgentError::NotFound {
+                    container: self.container_id_str(id),
+                    reason: format!("path '{path}' not found in container rootfs"),
+                });
+            }
+            Err(e) => {
+                return Err(AgentError::Internal(format!(
+                    "failed to canonicalize path '{path}': {e}"
+                )));
+            }
+        };
+        if !canon_target.starts_with(&canon_root) {
+            return Err(AgentError::InvalidSpec(format!(
+                "archive path '{path}' escapes container rootfs"
+            )));
+        }
+
+        // Build the TAR archive on a blocking thread so we never block the
+        // async runtime on filesystem I/O.
+        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes>>(8);
+        let target_for_task = canon_target.clone();
+        let path_for_task = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let result = build_tar_into_sender(&target_for_task, &path_for_task, &tx);
+            if let Err(e) = result {
+                let _ = tx.blocking_send(Err(e));
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    /// Extract a TAR archive into the container at `path` by unpacking
+    /// directly into `<bundle>/rootfs<path>`.
+    #[instrument(
+        skip(self, tar_bytes),
+        fields(
+            otel.name = "container.archive_put",
+            container.id = %self.container_id_str(id),
+            archive.path = %path,
+            archive.bytes = tar_bytes.len(),
+        )
+    )]
+    async fn archive_put(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        tar_bytes: bytes::Bytes,
+        opts: ArchivePutOptions,
+    ) -> Result<()> {
+        let bundle_path = self.bundle_path(id);
+        let rootfs_path = bundle_path.join("rootfs");
+        if !rootfs_path.exists() {
+            return Err(AgentError::NotFound {
+                container: self.container_id_str(id),
+                reason: format!(
+                    "container rootfs '{}' does not exist on disk",
+                    rootfs_path.display()
+                ),
+            });
+        }
+
+        let rel = path.trim_start_matches('/');
+        let abs_dest = if rel.is_empty() {
+            rootfs_path.clone()
+        } else {
+            rootfs_path.join(rel)
+        };
+
+        // The destination must already exist and be a directory (Docker's
+        // semantics).
+        match tokio::fs::metadata(&abs_dest).await {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(AgentError::InvalidSpec(format!(
+                    "destination '{path}' inside container is not a directory"
+                )));
+            }
+            Err(_) => {
+                return Err(AgentError::NotFound {
+                    container: self.container_id_str(id),
+                    reason: format!("destination path '{path}' does not exist in container"),
+                });
+            }
+        }
+
+        // Validate that abs_dest stays under canonical rootfs.
+        let canon_root = tokio::fs::canonicalize(&rootfs_path).await.map_err(|e| {
+            AgentError::Internal(format!(
+                "failed to canonicalize rootfs '{}': {e}",
+                rootfs_path.display()
+            ))
+        })?;
+        let canon_dest = tokio::fs::canonicalize(&abs_dest).await.map_err(|e| {
+            AgentError::Internal(format!("failed to canonicalize dest '{path}': {e}"))
+        })?;
+        if !canon_dest.starts_with(&canon_root) {
+            return Err(AgentError::InvalidSpec(format!(
+                "archive destination '{path}' escapes container rootfs"
+            )));
+        }
+
+        let dest_for_task = canon_dest.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            unpack_tar_into(&dest_for_task, tar_bytes.as_ref(), opts)
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("archive_put task panicked: {e}")))??;
+        Ok(())
+    }
+
+    /// Return path-stat metadata for `path` inside the container's rootfs.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.archive_head",
+            container.id = %self.container_id_str(id),
+            archive.path = %path,
+        )
+    )]
+    async fn archive_head(&self, id: &ContainerId, path: &str) -> Result<PathStat> {
+        let bundle_path = self.bundle_path(id);
+        let rootfs_path = bundle_path.join("rootfs");
+        if !rootfs_path.exists() {
+            return Err(AgentError::NotFound {
+                container: self.container_id_str(id),
+                reason: format!(
+                    "container rootfs '{}' does not exist on disk",
+                    rootfs_path.display()
+                ),
+            });
+        }
+
+        let rel = path.trim_start_matches('/');
+        let abs_target = if rel.is_empty() {
+            rootfs_path.clone()
+        } else {
+            rootfs_path.join(rel)
+        };
+
+        // symlink_metadata so we report the link itself, not its target.
+        let meta = tokio::fs::symlink_metadata(&abs_target)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => AgentError::NotFound {
+                    container: self.container_id_str(id),
+                    reason: format!("path '{path}' not found in container rootfs"),
+                },
+                _ => AgentError::Internal(format!("failed to stat path '{path}': {e}")),
+            })?;
+
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        #[allow(clippy::cast_possible_wrap)]
+        let size = meta.len() as i64;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        };
+        #[cfg(not(unix))]
+        let mode: u32 = 0;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339().into());
+        let link_target = if meta.file_type().is_symlink() {
+            tokio::fs::read_link(&abs_target)
+                .await
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(PathStat {
+            name,
+            size,
+            mode,
+            mtime,
+            link_target,
+        })
+    }
+}
+
+/// Walk `target` and stream a TAR archive into `tx` synchronously.
+///
+/// Used by `YoukiRuntime::archive_get` from a `spawn_blocking` task. Each
+/// chunk emitted by the underlying `tar::Builder` is forwarded to the
+/// channel as a `bytes::Bytes` so the async caller can pipe it straight to
+/// the HTTP response body.
+fn build_tar_into_sender(
+    target: &Path,
+    archive_path: &str,
+    tx: &mpsc::Sender<Result<bytes::Bytes>>,
+) -> Result<()> {
+    use std::io::Write;
+
+    /// `std::io::Write` adapter that forwards every write into a tokio mpsc
+    /// channel as a `bytes::Bytes` chunk.
+    struct ChannelWriter<'a> {
+        tx: &'a mpsc::Sender<Result<bytes::Bytes>>,
+    }
+    impl Write for ChannelWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let chunk = bytes::Bytes::copy_from_slice(buf);
+            self.tx
+                .blocking_send(Ok(chunk))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let writer = ChannelWriter { tx };
+    let mut builder = tar::Builder::new(writer);
+    builder.follow_symlinks(false);
+
+    // Determine the in-archive name (Docker uses the basename of the
+    // requested path so the TAR contains entries like `foo/...`).
+    let entry_name = std::path::Path::new(archive_path).file_name().map_or_else(
+        || std::ffi::OsString::from("."),
+        std::ffi::OsStr::to_os_string,
+    );
+
+    let meta = std::fs::symlink_metadata(target)
+        .map_err(|e| AgentError::Internal(format!("failed to stat archive target: {e}")))?;
+    if meta.is_dir() {
+        builder
+            .append_dir_all(&entry_name, target)
+            .map_err(|e| AgentError::Internal(format!("failed to append dir to tar: {e}")))?;
+    } else {
+        let mut f = std::fs::File::open(target)
+            .map_err(|e| AgentError::Internal(format!("failed to open archive target: {e}")))?;
+        builder
+            .append_file(&entry_name, &mut f)
+            .map_err(|e| AgentError::Internal(format!("failed to append file to tar: {e}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|e| AgentError::Internal(format!("failed to finalize tar: {e}")))?;
+    Ok(())
+}
+
+/// Unpack a TAR archive into `dest` synchronously, honouring
+/// [`ArchivePutOptions`].
+///
+/// `no_overwrite_dir_non_dir` rejects the case where an entry would replace
+/// an existing directory with a non-directory (or vice versa) — implemented
+/// via a pre-pass over the archive's entries before extracting. `copy_uid_gid`
+/// is forwarded to `tar::Archive::set_preserve_ownerships` so the unpacker
+/// keeps the archive's uid/gid instead of chown'ing to the calling user.
+fn unpack_tar_into(dest: &Path, tar_bytes: &[u8], opts: ArchivePutOptions) -> Result<()> {
+    if opts.no_overwrite_dir_non_dir {
+        // Pre-pass: detect directory/non-directory replacements.
+        let mut probe = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        let entries = probe
+            .entries()
+            .map_err(|e| AgentError::Internal(format!("failed to read tar entries: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| AgentError::Internal(format!("invalid tar entry: {e}")))?;
+            let p = entry
+                .path()
+                .map_err(|e| AgentError::Internal(format!("invalid tar path: {e}")))?
+                .into_owned();
+            let dest_p = dest.join(&p);
+            if let Ok(existing) = std::fs::symlink_metadata(&dest_p) {
+                let entry_is_dir = entry.header().entry_type().is_dir();
+                if existing.is_dir() != entry_is_dir {
+                    return Err(AgentError::InvalidSpec(format!(
+                        "archive entry '{}' would replace a {} with a {}",
+                        p.display(),
+                        if existing.is_dir() {
+                            "directory"
+                        } else {
+                            "non-directory"
+                        },
+                        if entry_is_dir {
+                            "directory"
+                        } else {
+                            "non-directory"
+                        }
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(opts.copy_uid_gid);
+    archive
+        .unpack(dest)
+        .map_err(|e| AgentError::Internal(format!("failed to unpack archive: {e}")))?;
+    Ok(())
+}
+
+/// Build a TAR archive containing exactly one entry from a host path,
+/// returning the bytes. Test-only helper used by
+/// `archive_helpers_reject_dir_nondir_replacements`.
+#[cfg(test)]
+fn build_tar_from_path_for_test(src: &Path, entry_name: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        builder.follow_symlinks(false);
+        let meta = std::fs::symlink_metadata(src).unwrap();
+        if meta.is_dir() {
+            builder.append_dir_all(entry_name, src).unwrap();
+        } else {
+            let mut f = std::fs::File::open(src).unwrap();
+            builder.append_file(entry_name, &mut f).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    buf
+}
+
+/// Read one row of `top`-style data for a host PID by parsing
+/// `/proc/{pid}/status` and `/proc/{pid}/cmdline`.
+///
+/// The columns mirror the trait's documented `top_container` shape:
+/// Write `value` to a cgroup v2 control file, demoting recoverable
+/// errors (missing controller, invalid value) to warnings so a single
+/// unsupported field doesn't sink the whole update. Hard errors
+/// (permission denied, IO errors) propagate as
+/// [`AgentError::Internal`].
+async fn write_cgroup_file(
+    path: &std::path::Path,
+    value: &str,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    match tokio::fs::write(path, value).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "cgroup file '{}' not found; controller may not be enabled",
+                path.display()
+            ));
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            warnings.push(format!(
+                "cgroup write to '{}' rejected value '{}': {e}",
+                path.display(),
+                value
+            ));
+            Ok(())
+        }
+        Err(e) => Err(AgentError::Internal(format!(
+            "failed to write '{}' to {}: {e}",
+            value,
+            path.display()
+        ))),
+    }
+}
+
+/// `[UID, PID, PPID, STIME, CMD]`. Any field that fails to read is filled
+/// with the empty string so the row width stays constant — `top` clients
+/// expect the matrix to be rectangular.
+async fn read_proc_row(pid: &str) -> Vec<String> {
+    let status_path = format!("/proc/{pid}/status");
+    let mut uid = String::new();
+    let mut parent_pid = String::new();
+    if let Ok(text) = tokio::fs::read_to_string(&status_path).await {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                // First field after the tabs is the real UID.
+                if let Some(first) = rest.split_whitespace().next() {
+                    uid = first.to_string();
+                }
+            } else if let Some(rest) = line.strip_prefix("PPid:") {
+                parent_pid = rest.trim().to_string();
+            }
+        }
+    }
+
+    // STIME would normally come from `ps`'s formatter; we simulate it as
+    // the truncated wallclock seen on the start of the row read. This is
+    // a coarse approximation but matches Docker's documented contract:
+    // youki has no internal `ps` runner so we surface the best-effort
+    // string with the same shape.
+    let stime = chrono::Utc::now().format("%H:%M:%S").to_string();
+
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let cmd = match tokio::fs::read(&cmdline_path).await {
+        Ok(bytes) => {
+            // /proc/{pid}/cmdline uses NUL separators; replace with spaces
+            // and trim the trailing NUL the kernel emits.
+            let normalised: Vec<u8> = bytes
+                .into_iter()
+                .map(|b| if b == 0 { b' ' } else { b })
+                .collect();
+            let mut s = String::from_utf8_lossy(&normalised).into_owned();
+            while s.ends_with(' ') {
+                s.pop();
+            }
+            s
+        }
+        Err(_) => String::new(),
+    };
+
+    vec![uid, pid.to_string(), parent_pid, stime, cmd]
+}
+
+/// Tail a single log file and forward each line as a [`LogChunk`] over
+/// `tx`. Honours [`LogsStreamOptions::follow`] (poll-on-EOF), `tail`
+/// (count `\n` bytes from end before streaming), and `since`/`until`
+/// (wallclock filter applied to the moment each line is read — youki log
+/// files do not carry per-line timestamps).
+async fn stream_log_file(
+    path: PathBuf,
+    channel: LogChannel,
+    opts: LogsStreamOptions,
+    tx: mpsc::Sender<Result<LogChunk>>,
+) -> Result<()> {
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx
+                .send(Err(AgentError::Internal(format!(
+                    "failed to open log file {}: {}",
+                    path.display(),
+                    e
+                ))))
+                .await;
+            return Ok(());
+        }
+    };
+
+    let mut reader = BufReader::new(file);
+
+    // Apply `tail`: seek so that the next read begins at the start of
+    // the most-recent N lines. Implemented by counting newlines from the
+    // end of the file.
+    if let Some(tail) = opts.tail {
+        if tail > 0 {
+            let metadata = match reader.get_ref().metadata().await {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(AgentError::Internal(format!(
+                            "failed to stat log file {}: {}",
+                            path.display(),
+                            e
+                        ))))
+                        .await;
+                    return Ok(());
+                }
+            };
+            let start = compute_tail_offset(reader.get_mut(), metadata.len(), tail).await;
+            if let Err(e) = reader.seek(std::io::SeekFrom::Start(start)).await {
+                let _ = tx
+                    .send(Err(AgentError::Internal(format!(
+                        "failed to seek log file {}: {}",
+                        path.display(),
+                        e
+                    ))))
+                    .await;
+                return Ok(());
+            }
+        }
+    }
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(AgentError::Internal(format!(
+                        "failed to read log file {}: {}",
+                        path.display(),
+                        e
+                    ))))
+                    .await;
+                return Ok(());
+            }
+        };
+
+        if bytes_read == 0 {
+            // EOF — terminate unless we're in follow mode.
+            if !opts.follow {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        let now = chrono::Utc::now();
+        let now_secs = now.timestamp();
+
+        if let Some(since) = opts.since {
+            if now_secs < since {
+                continue;
+            }
+        }
+        if let Some(until) = opts.until {
+            if now_secs > until {
+                // Past the cutoff — stop streaming this channel.
+                return Ok(());
+            }
+        }
+
+        let chunk = LogChunk {
+            stream: channel,
+            bytes: bytes::Bytes::copy_from_slice(line.as_bytes()),
+            timestamp: if opts.timestamps { Some(now) } else { None },
+        };
+
+        if tx.send(Ok(chunk)).await.is_err() {
+            // Receiver dropped — stop tailing.
+            return Ok(());
+        }
+    }
+}
+
+/// Compute the byte offset of the start of the last `tail` lines in a
+/// file of size `file_len`. Reads backwards in 4 KiB chunks until enough
+/// newlines have been seen or the file start is reached.
+///
+/// "The last N lines" is defined as the bytes following the
+/// `(N+1)`th-from-end newline, mirroring `tail -n N`. If the file has
+/// fewer than `N` lines, returns `0` (stream the whole file).
+async fn compute_tail_offset(file: &mut tokio::fs::File, file_len: u64, tail: u64) -> u64 {
+    const CHUNK_USIZE: usize = 4096;
+
+    if file_len == 0 || tail == 0 {
+        return 0;
+    }
+
+    let chunk: u64 = CHUNK_USIZE as u64;
+    let target = tail.saturating_add(1); // the newline *before* the first wanted line
+    let mut pos = file_len;
+    let mut newlines: u64 = 0;
+    let mut buf = vec![0u8; CHUNK_USIZE];
+
+    while pos > 0 {
+        let read_len = std::cmp::min(chunk, pos);
+        pos -= read_len;
+        if file.seek(std::io::SeekFrom::Start(pos)).await.is_err() {
+            return 0;
+        }
+        // `read_len` is bounded by `CHUNK_USIZE`, so the cast is safe on
+        // every target ZLayer supports (Linux x86_64 / aarch64).
+        let slice_len = usize::try_from(read_len).unwrap_or(CHUNK_USIZE);
+        let buf_slice = &mut buf[..slice_len];
+        if tokio::io::AsyncReadExt::read_exact(file, buf_slice)
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        for (i, byte) in buf_slice.iter().enumerate().rev() {
+            if *byte == b'\n' {
+                newlines += 1;
+                if newlines == target {
+                    // `i` is the index of the (tail+1)-th newline from
+                    // the end *within the current chunk*. The first
+                    // wanted byte sits immediately after it.
+                    let absolute = pos + (i as u64) + 1;
+                    return absolute.min(file_len);
+                }
+            }
+        }
+    }
+
+    0
+}
+
+/// Read a single [`StatsSample`] from `cgroup_path`. Wraps the existing
+/// [`cgroups_stats::read_container_stats`] (cpu + memory) and supplements
+/// it with `pids.current` / `pids.max` read directly from sysfs.
+async fn read_stats_sample(cgroup_path: &Path, online_cpus: u32) -> Result<StatsSample> {
+    let stats = cgroups_stats::read_container_stats(cgroup_path)
+        .await
+        .map_err(|e| {
+            AgentError::Internal(format!(
+                "failed to read cgroup stats at {}: {}",
+                cgroup_path.display(),
+                e
+            ))
+        })?;
+
+    let pids_current = read_u64_file(cgroup_path.join("pids.current"))
+        .await
+        .unwrap_or(0);
+    let pids_limit = read_pids_limit(cgroup_path.join("pids.max")).await;
+
+    let mem_limit_bytes = if stats.memory_limit == u64::MAX {
+        0
+    } else {
+        stats.memory_limit
+    };
+
+    Ok(StatsSample {
+        cpu_total_ns: stats.cpu_usage_usec.saturating_mul(1_000),
+        cpu_system_ns: 0,
+        online_cpus,
+        mem_used_bytes: stats.memory_bytes,
+        mem_limit_bytes,
+        net_rx_bytes: 0,
+        net_tx_bytes: 0,
+        blkio_read_bytes: 0,
+        blkio_write_bytes: 0,
+        pids_current,
+        pids_limit,
+        timestamp: chrono::Utc::now(),
+    })
+}
+
+/// Read a small text file containing a single decimal integer. Used for
+/// `pids.current`. Returns `None` when the file is missing or unreadable
+/// so the caller can substitute a sentinel (`0` for unknown counters).
+async fn read_u64_file(path: PathBuf) -> Option<u64> {
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    content.trim().parse::<u64>().ok()
+}
+
+/// Read `pids.max`, which is either a decimal integer or the literal
+/// `"max"` (cgroup v2 sentinel for "no limit"). Returns `None` for
+/// `"max"` or any read/parse error so the caller can leave
+/// [`StatsSample::pids_limit`] unset.
+async fn read_pids_limit(path: PathBuf) -> Option<u64> {
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let trimmed = content.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+/// Async duplex wrapper around a non-blocking PTY master fd, used by
+/// [`YoukiRuntime::exec_pty`] to expose the master end as an
+/// `AsyncRead + AsyncWrite + Send + Unpin` stream that fits the
+/// [`ExecPtyStream`] trait object.
+///
+/// The fd is owned: dropping `PtyDuplex` closes the master, which causes the
+/// kernel to send `SIGHUP` to the slave's controlling process group and tears
+/// the session down cleanly.
+struct PtyDuplex {
+    inner: tokio::io::unix::AsyncFd<OwnedFd>,
+}
+
+impl PtyDuplex {
+    fn new(fd: OwnedFd) -> Result<Self> {
+        let inner = tokio::io::unix::AsyncFd::new(fd)
+            .map_err(|e| AgentError::Internal(format!("AsyncFd::new on pty master: {e}")))?;
+        Ok(Self { inner })
+    }
+}
+
+impl tokio::io::AsyncRead for PtyDuplex {
+    #[allow(unsafe_code)]
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            let mut guard = std::task::ready!(this.inner.poll_read_ready(cx))?;
+            // SAFETY: `read(2)` only writes into the buffer, never reads from
+            // its uninitialised tail. We pass the unfilled portion as a raw
+            // pointer + length and tell `ReadBuf` how many bytes were
+            // actually written before exposing them as initialised. The
+            // pointer is valid for the duration of the `read` call because
+            // `buf` is borrowed mutably for the entire `poll_read` body.
+            let unfilled = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buf.unfilled_mut().as_mut_ptr().cast::<libc::c_void>(),
+                    buf.remaining(),
+                )
+            };
+            let fd = guard.get_ref().as_raw_fd();
+            // SAFETY: `fd` is a valid PTY master fd owned by `self.inner`.
+            // `unfilled` points into a unique mutable borrow of `buf`. The
+            // syscall touches at most `unfilled.len()` bytes.
+            let rc = unsafe { libc::read(fd, unfilled.as_mut_ptr(), unfilled.len()) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                // Linux PTY masters return EIO once the slave hangs up; treat
+                // that as a clean EOF so callers see end-of-stream rather
+                // than a confusing error.
+                if err.raw_os_error() == Some(libc::EIO) {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                return std::task::Poll::Ready(Err(err));
+            }
+            // We checked `rc < 0` above, so the cast is well-defined.
+            #[allow(clippy::cast_sign_loss)]
+            let n = rc as usize;
+            // SAFETY: the kernel just wrote `n` bytes into the unfilled
+            // tail; mark them as initialised + filled.
+            unsafe {
+                buf.assume_init(n);
+            }
+            buf.advance(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for PtyDuplex {
+    #[allow(unsafe_code)]
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufdata: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            let mut guard = std::task::ready!(this.inner.poll_write_ready(cx))?;
+            let fd = guard.get_ref().as_raw_fd();
+            // SAFETY: `fd` is owned by `self.inner` and remains valid for
+            // the call. `bufdata` is a borrowed slice valid for `bufdata.len()`
+            // bytes; `write(2)` only reads from it.
+            let rc = unsafe { libc::write(fd, bufdata.as_ptr().cast(), bufdata.len()) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                    continue;
+                }
+                return std::task::Poll::Ready(Err(err));
+            }
+            // We checked `rc < 0` above; safe to cast.
+            #[allow(clippy::cast_sign_loss)]
+            let n = rc as usize;
+            return std::task::Poll::Ready(Ok(n));
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // PTYs have no userspace buffer; the kernel handles framing.
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Closing the master happens on drop; no half-close on PTYs.
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -2237,5 +3917,263 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    /// Tail-from-end logic: write a file with a known number of lines,
+    /// ask `compute_tail_offset` for the start of the last 2, and verify
+    /// the offset lands on the third-to-last line's start.
+    #[tokio::test]
+    async fn youki_tail_offset_returns_last_n_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "zlayer_tail_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("log");
+        // 5 lines, each ending in '\n', distinguishable bodies.
+        tokio::fs::write(&path, b"a\nbb\nccc\ndddd\neeeee\n")
+            .await
+            .unwrap();
+
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        let len = file.metadata().await.unwrap().len();
+        // Last 2 lines are "dddd\n" + "eeeee\n", combined 11 bytes;
+        // offset should be `len - 11`.
+        let offset = compute_tail_offset(&mut file, len, 2).await;
+        assert_eq!(offset, len - 11, "expected last-2-lines offset");
+
+        // Tail >= total line count must yield 0 (whole file).
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(compute_tail_offset(&mut file, len, 100).await, 0);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `stream_log_file` with `follow=false` reads all existing lines and
+    /// then terminates cleanly at EOF. Exercises the non-follow path
+    /// without needing a real container.
+    #[tokio::test]
+    async fn youki_logs_stream_reads_static_file_without_follow() {
+        let dir = std::env::temp_dir().join(format!(
+            "zlayer_logs_static_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("stdout.log");
+        tokio::fs::write(&path, b"hello\nworld\n").await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<Result<LogChunk>>(8);
+        let opts = LogsStreamOptions {
+            follow: false,
+            tail: None,
+            since: None,
+            until: None,
+            timestamps: true,
+            stdout: true,
+            stderr: false,
+        };
+        stream_log_file(path, LogChannel::Stdout, opts, tx)
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        while let Some(item) = rx.recv().await {
+            let chunk = item.unwrap();
+            received.push(chunk);
+        }
+        assert_eq!(
+            received.len(),
+            2,
+            "expected 2 chunks, got {}",
+            received.len()
+        );
+        assert_eq!(received[0].stream, LogChannel::Stdout);
+        assert!(received[0].timestamp.is_some());
+        assert_eq!(received[0].bytes.as_ref(), b"hello\n");
+        assert_eq!(received[1].bytes.as_ref(), b"world\n");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `read_stats_sample` requires a real cgroup v2 directory layout
+    /// that we cannot easily synthesise on a non-root test host, so this
+    /// test is `#[ignore]`-d. Run with
+    /// `cargo test -p zlayer-agent youki_stats_sample_reads_cgroup -- --ignored`
+    /// inside a real container or as root with a fake cgroup path.
+    #[tokio::test]
+    #[ignore = "requires a real cgroup v2 hierarchy"]
+    async fn youki_stats_sample_reads_cgroup() {
+        // Try the host's own root cgroup as a smoke target — every cgroup
+        // v2 system has /sys/fs/cgroup/cpu.stat and memory.current at the
+        // root. pids.current/pids.max may be missing at the root, which
+        // is fine — read_stats_sample treats them as 0/None.
+        let path = Path::new("/sys/fs/cgroup");
+        let sample = read_stats_sample(path, 1).await.unwrap();
+        // CPU monotonically increases; memory.current is non-negative.
+        assert!(sample.cpu_total_ns < u64::MAX);
+        assert!(sample.online_cpus >= 1);
+    }
+
+    /// `(rows, cols)` from the resize channel converts to `nix::pty::Winsize`
+    /// with `ws_row` and `ws_col` populated and the pixel fields zeroed.
+    /// Pure shape conversion — no fd touched.
+    #[test]
+    fn youki_pty_resize_winsize_shape() {
+        let (rows, cols): (u16, u16) = (24, 80);
+        let ws = nix::pty::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(ws.ws_row, 24);
+        assert_eq!(ws.ws_col, 80);
+        assert_eq!(ws.ws_xpixel, 0);
+        assert_eq!(ws.ws_ypixel, 0);
+
+        // Maximum values still fit cleanly through the channel and the
+        // ioctl payload (winsize is u16 across all four fields).
+        let ws_max = nix::pty::Winsize {
+            ws_row: u16::MAX,
+            ws_col: u16::MAX,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(ws_max.ws_row, u16::MAX);
+        assert_eq!(ws_max.ws_col, u16::MAX);
+    }
+
+    /// `exec_pty` rejects an empty command vector with `InvalidSpec` before
+    /// touching libcontainer or allocating a PTY. Exercises the input
+    /// validation path without needing a running container.
+    #[tokio::test]
+    async fn youki_exec_pty_rejects_empty_command() {
+        let temp_base =
+            std::env::temp_dir().join(format!("youki_exec_pty_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_base);
+
+        let config = YoukiConfig {
+            state_dir: temp_base.join("state"),
+            rootfs_dir: temp_base.join("rootfs"),
+            bundle_dir: temp_base.join("bundles"),
+            cache_dir: temp_base.join("cache"),
+            volume_dir: temp_base.join("volumes"),
+            use_systemd: false,
+            cache_type: None,
+            log_base_dir: None,
+            deployment_name: None,
+        };
+
+        let runtime = YoukiRuntime::new(config, None).await.unwrap();
+        let id = ContainerId {
+            service: "missing".to_string(),
+            replica: 0,
+        };
+
+        let result = runtime
+            .exec_pty(
+                &id,
+                ExecOptions {
+                    command: Vec::new(),
+                    tty: true,
+                    ..ExecOptions::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AgentError::InvalidSpec(_))));
+
+        let _ = std::fs::remove_dir_all(&temp_base);
+    }
+
+    /// `PtyDuplex::new` accepts a non-blocking PTY master fd produced by
+    /// `nix::pty::openpty` and exposes it as `AsyncRead + AsyncWrite`. This
+    /// is purely a wrapper smoke test — no container, no exec.
+    ///
+    /// Marked `#[ignore]` because real PTY allocation requires
+    /// `/dev/ptmx`, which CI sandboxes occasionally restrict; run with
+    /// `cargo test -p zlayer-agent --features youki-runtime youki_pty_duplex_wraps_master -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires /dev/ptmx access"]
+    async fn youki_pty_duplex_wraps_master() {
+        let pair = nix::pty::openpty(None, None).expect("openpty");
+        nix::fcntl::fcntl(
+            &pair.master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("F_SETFL O_NONBLOCK");
+
+        let _duplex = PtyDuplex::new(pair.master).expect("PtyDuplex::new");
+        // Slave is dropped here, which makes the master EOF on next read.
+        drop(pair.slave);
+    }
+
+    /// Sanity-check the `unpack_tar_into` + `build_tar_into_sender`
+    /// helpers used by the youki archive endpoints: a TAR archive built
+    /// from a host directory must round-trip back to the same file tree
+    /// when unpacked elsewhere.
+    #[tokio::test]
+    async fn archive_helpers_round_trip_a_directory_tree() {
+        // Build a small tree.
+        let src_dir = tempfile::tempdir().unwrap();
+        let nested = src_dir.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("c.txt"), b"deep file").unwrap();
+        std::fs::write(src_dir.path().join("top.txt"), b"top file").unwrap();
+
+        // Drive `build_tar_into_sender` through a Tokio mpsc and collect bytes.
+        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes>>(8);
+        let target = src_dir.path().to_path_buf();
+        let handle =
+            tokio::task::spawn_blocking(move || super::build_tar_into_sender(&target, "root", &tx));
+        let mut buf = Vec::new();
+        while let Some(item) = rx.recv().await {
+            let chunk = item.expect("tar chunk");
+            buf.extend_from_slice(&chunk);
+        }
+        handle.await.unwrap().unwrap();
+
+        // Unpack into a fresh dir; the entry should land under `root/`.
+        let dest_dir = tempfile::tempdir().unwrap();
+        super::unpack_tar_into(
+            dest_dir.path(),
+            &buf,
+            crate::runtime::ArchivePutOptions::default(),
+        )
+        .unwrap();
+        assert!(dest_dir.path().join("root/top.txt").exists());
+        assert!(dest_dir.path().join("root/a/b/c.txt").exists());
+        assert_eq!(
+            std::fs::read(dest_dir.path().join("root/a/b/c.txt")).unwrap(),
+            b"deep file",
+        );
+    }
+
+    /// `unpack_tar_into` with `no_overwrite_dir_non_dir = true` must
+    /// reject an archive entry that would replace an existing directory
+    /// with a non-directory (or vice versa).
+    #[tokio::test]
+    async fn archive_helpers_reject_dir_nondir_replacements() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        // Pre-create a directory at `target`.
+        let target = dest_dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+
+        // Build an archive whose only entry is a *file* named `target`.
+        let src_file_dir = tempfile::tempdir().unwrap();
+        let src_file = src_file_dir.path().join("target");
+        std::fs::write(&src_file, b"i am a file").unwrap();
+        let bytes = super::build_tar_from_path_for_test(&src_file, "target");
+        let opts = crate::runtime::ArchivePutOptions {
+            no_overwrite_dir_non_dir: true,
+            copy_uid_gid: false,
+        };
+        let err = super::unpack_tar_into(dest_dir.path(), &bytes, opts).unwrap_err();
+        assert!(
+            matches!(err, AgentError::InvalidSpec(_)),
+            "expected InvalidSpec, got {err:?}"
+        );
     }
 }

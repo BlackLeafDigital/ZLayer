@@ -245,14 +245,14 @@ impl JobExecutor {
         let max_log_size = self.config.max_log_size;
 
         tokio::spawn(async move {
-            Self::run_job(
+            Box::pin(Self::run_job(
                 runtime,
                 executions,
                 exec_id_clone,
                 &job_name,
                 spec,
                 max_log_size,
-            )
+            ))
             .await;
         });
 

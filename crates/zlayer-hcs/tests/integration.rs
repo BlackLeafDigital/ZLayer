@@ -70,7 +70,7 @@ fn skip_if_not_elevated(test_name: &str) -> bool {
 }
 
 /// True when the current process runs in Windows services session 0 (where
-/// LocalSystem and every other service account lives — including the Forgejo
+/// `LocalSystem` and every other service account lives — including the Forgejo
 /// runner when installed as a service). HCS FFI behavior with null/invalid
 /// handles differs in session 0 versus interactive sessions, so tests that
 /// poke those edges should skip here rather than crash the test process.

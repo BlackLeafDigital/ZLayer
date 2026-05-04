@@ -2,7 +2,7 @@
 
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post, put, MethodFilter},
     Extension, Router,
 };
 use std::sync::Arc;
@@ -159,6 +159,10 @@ pub fn build_router_with_storage(
         .route("/", post(handlers::deployments::create_deployment))
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{name}/spec",
+            get(handlers::deployments::get_deployment_spec),
+        )
         .route(
             "/{name}/events",
             get(handlers::deployments::stream_deployment_events),
@@ -398,6 +402,10 @@ pub fn build_router_with_services(
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
         .route(
+            "/{name}/spec",
+            get(handlers::deployments::get_deployment_spec),
+        )
+        .route(
             "/{name}/events",
             get(handlers::deployments::stream_deployment_events),
         )
@@ -512,6 +520,10 @@ pub fn build_router_with_deployment_state(
         .route("/", post(handlers::deployments::create_deployment))
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{name}/spec",
+            get(handlers::deployments::get_deployment_spec),
+        )
         .route(
             "/{name}/events",
             get(handlers::deployments::stream_deployment_events),
@@ -663,11 +675,27 @@ pub fn build_router_with_internal(
 ///
 /// # Returns
 /// A `Router` with `/images`, `/images/{image}`, and `/system/prune` routes.
+///
+/// Convenience constructor: builds an `ImageState` with a fresh, unattached
+/// event bus. Callers that want image lifecycle events on the daemon-wide
+/// `/api/v1/events` stream should call [`build_image_routes_with_state`]
+/// instead and pass an `ImageState` whose `event_bus` is shared with the
+/// container/network/volume states.
 pub fn build_image_routes(
     runtime: Arc<dyn zlayer_agent::runtime::Runtime + Send + Sync>,
 ) -> Router<()> {
-    use crate::handlers::images::{image_routes, ImageState};
-    image_routes().with_state(ImageState::new(runtime))
+    use crate::handlers::images::ImageState;
+    build_image_routes_with_state(ImageState::new(runtime))
+}
+
+/// Build image-management routes with an explicit [`ImageState`].
+///
+/// Used by the daemon to wire the shared [`crate::DaemonEventBus`] so
+/// image lifecycle events fan out on the same broadcast channel as
+/// container, network, and volume events.
+pub fn build_image_routes_with_state(state: crate::handlers::images::ImageState) -> Router<()> {
+    use crate::handlers::images::image_routes;
+    image_routes().with_state(state)
 }
 
 /// Build routes for secrets management
@@ -1270,8 +1298,19 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         .route("/{id}", get(handlers::containers::get_container))
         .route("/{id}", delete(handlers::containers::delete_container))
         .route("/{id}/logs", get(handlers::containers::get_container_logs))
-        .route("/{id}/exec", post(handlers::containers::exec_in_container))
+        // Native exec (Task 4.1.5): create an exec instance, return its id.
+        // The buffered/SSE [`exec_in_container`] handler is still defined for
+        // tests and the Docker compat shim's translation layer; the active
+        // wire shape on this path is now the create-exec one.
+        .route("/{id}/exec", post(handlers::exec_instances::create_exec))
+        .route("/{id}/resize", post(handlers::containers::resize_container))
         .route("/{id}/wait", get(handlers::containers::wait_container))
+        .route(
+            "/{id}/wait",
+            post(handlers::containers::wait_container_post),
+        )
+        .route("/{id}/rename", post(handlers::containers::rename_container))
+        .route("/{id}/update", post(handlers::containers::update_container))
         .route(
             "/{id}/stats",
             get(handlers::containers::get_container_stats),
@@ -1283,6 +1322,47 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
             post(handlers::containers::restart_container),
         )
         .route("/{id}/kill", post(handlers::containers::kill_container))
+        .route("/{id}/pause", post(handlers::containers::pause_container))
+        .route(
+            "/{id}/unpause",
+            post(handlers::containers::unpause_container),
+        )
+        .route("/{id}/top", get(handlers::containers::top_container))
+        .route(
+            "/{id}/changes",
+            get(handlers::containers::changes_container),
+        )
+        .route("/{id}/port", get(handlers::containers::port_container))
+        // `docker cp` archive endpoints (GET / PUT / HEAD on the same path).
+        .route(
+            "/{id}/archive",
+            get(handlers::containers::archive_get)
+                .put(handlers::containers::archive_put)
+                .on(MethodFilter::HEAD, handlers::containers::archive_head),
+        )
+        .route("/prune", post(handlers::containers::prune_containers))
+        .with_state(container_state)
+}
+
+/// Build the daemon's exec-management routes mounted at `/api/v1/exec`.
+///
+/// Task 4.1.5: native exec API. Returns the per-exec endpoints
+/// (`/{id}/start`, `/{id}/resize`, `/{id}/json`) keyed off the exec ids
+/// minted by [`handlers::exec_instances::create_exec`]. Shares
+/// [`ContainerApiState`] with the container routes so the same
+/// [`crate::handlers::exec_instances::ExecInstances`] backs both.
+pub fn build_exec_routes(container_state: ContainerApiState) -> Router<()> {
+    // `start` is registered as GET because axum's `WebSocketUpgrade`
+    // extractor enforces `Method::GET` on HTTP/1.1 (RFC 6455 §4.1). The
+    // task spec described it as `POST` to mirror Docker's hijacked-stream
+    // shape, but Docker's `/exec/{id}/start` is *not* a real WebSocket —
+    // it's a raw HTTP/1.1 connection-hijack. Real RFC-6455 WebSocket
+    // upgrades require GET, and the daemon's native exec API uses real
+    // WebSockets.
+    Router::new()
+        .route("/{id}/start", get(handlers::exec_instances::start_exec))
+        .route("/{id}/resize", post(handlers::exec_instances::resize_exec))
+        .route("/{id}/json", get(handlers::exec_instances::inspect_exec))
         .with_state(container_state)
 }
 
@@ -1393,14 +1473,17 @@ pub fn build_router_with_containers(
     // Create container state (carries the shared event bus)
     let container_state = ContainerApiState::new(runtime);
 
-    // Build container + event routes from the same state so both sides see
-    // the same event bus. The state type is `Clone`, so this is cheap.
+    // Build container + event + exec routes from the same state so all three
+    // sides see the same event bus and `ExecInstances`. The state type is
+    // `Clone`, so this is cheap.
     let container_routes = build_container_routes(container_state.clone());
-    let event_routes = build_event_routes(container_state);
+    let event_routes = build_event_routes(container_state.clone());
+    let exec_routes = build_exec_routes(container_state);
 
     base_router
         .nest("/api/v1/containers", container_routes)
         .nest("/api/v1/events", event_routes)
+        .nest("/api/v1/exec", exec_routes)
 }
 
 /// Build the sync routes sub-router.

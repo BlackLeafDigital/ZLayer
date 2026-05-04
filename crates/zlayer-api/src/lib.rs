@@ -41,7 +41,11 @@ pub use auth::{
 };
 pub use config::ApiConfig;
 pub use error::{ApiError, Result};
-pub use event_bus::{ContainerEvent, ContainerEventBus, ContainerEventKind, EVENT_BUS_CAPACITY};
+pub use event_bus::{
+    ContainerEvent, ContainerEventBus, ContainerEventKind, DaemonEvent, DaemonEventBus, ImageEvent,
+    ImageEventKind, NetworkEvent, NetworkEventKind, VolumeEvent, VolumeEventKind,
+    EVENT_BUS_CAPACITY,
+};
 pub use identity::{IdentityError, IdentityManager};
 pub use openapi::ApiDoc;
 pub use poller::GitPoller;
@@ -52,11 +56,11 @@ pub use ratelimit::{
 pub use router::{
     build_audit_routes, build_cluster_routes, build_container_network_routes,
     build_container_routes, build_credential_routes, build_cron_routes, build_environment_routes,
-    build_event_routes, build_group_routes, build_image_routes, build_internal_routes,
-    build_job_routes, build_network_routes, build_notifier_routes, build_permission_routes,
-    build_project_routes, build_project_webhook_routes, build_proxy_routes, build_router,
-    build_router_full, build_router_with_builds, build_router_with_containers,
-    build_router_with_deployment_state, build_router_with_internal,
+    build_event_routes, build_group_routes, build_image_routes, build_image_routes_with_state,
+    build_internal_routes, build_job_routes, build_network_routes, build_notifier_routes,
+    build_permission_routes, build_project_routes, build_project_webhook_routes,
+    build_proxy_routes, build_router, build_router_full, build_router_with_builds,
+    build_router_with_containers, build_router_with_deployment_state, build_router_with_internal,
     build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
     build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
     build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_sync_routes,
@@ -94,6 +98,7 @@ pub use handlers::environments::{
 pub use handlers::groups::{
     AddMemberRequest, CreateGroupRequest, GroupMembersResponse, GroupsState, UpdateGroupRequest,
 };
+pub use handlers::images::ImageState;
 pub use handlers::internal::{
     InternalAddPeerRequest, InternalAddPeerResponse, InternalScaleRequest, InternalScaleResponse,
     InternalState, INTERNAL_AUTH_HEADER,
@@ -136,17 +141,20 @@ pub use middleware::audit::{audit_middleware, AuditStoreExtension};
 
 // Re-export storage types
 pub use storage::{
-    AuditEntry, AuditFilter, AuditStorage, BuildKind, DeploymentStatus, DeploymentStorage,
-    EnvironmentStorage, GroupStorage, InMemoryAuditStore, InMemoryEnvironmentStore,
-    InMemoryGroupStore, InMemoryNotifierStore, InMemoryOidcIdentityStore, InMemoryPermissionStore,
-    InMemoryProjectStore, InMemoryStorage, InMemorySyncStore, InMemoryTaskStore, InMemoryUserStore,
-    InMemoryVariableStore, InMemoryWorkflowStore, NotifierConfig, NotifierKind, NotifierStorage,
-    OidcIdentity, OidcIdentityStorage, PermissionLevel, PermissionStorage, ProjectStorage,
-    SqlxAuditStore, SqlxEnvironmentStore, SqlxGroupStore, SqlxNotifierStore, SqlxOidcIdentityStore,
-    SqlxPermissionStore, SqlxProjectStore, SqlxStorage, SqlxSyncStore, SqlxTaskStore,
-    SqlxUserStore, SqlxVariableStore, SqlxWorkflowStore, StepResult, StorageError,
-    StoredDeployment, StoredEnvironment, StoredNotifier, StoredPermission, StoredProject,
-    StoredSync, StoredTask, StoredUser, StoredUserGroup, StoredVariable, StoredWorkflow,
-    SubjectKind, SyncStorage, TaskKind, TaskRun, TaskStorage, UserRole, UserStorage,
-    VariableStorage, WorkflowAction, WorkflowRun, WorkflowRunStatus, WorkflowStep, WorkflowStorage,
+    AuditEntry, AuditFilter, AuditStorage, BuildKind, ComposeProject, ComposeProjectStorage,
+    DeploymentStatus, DeploymentStorage, EnvironmentStorage, GroupStorage, InMemoryAuditStore,
+    InMemoryComposeProjectStorage, InMemoryEnvironmentStore, InMemoryGroupStore,
+    InMemoryNotifierStore, InMemoryOidcIdentityStore, InMemoryPermissionStore,
+    InMemoryProjectStore, InMemoryStandaloneContainerStorage, InMemoryStorage, InMemorySyncStore,
+    InMemoryTaskStore, InMemoryUserStore, InMemoryVariableStore, InMemoryWorkflowStore,
+    NotifierConfig, NotifierKind, NotifierStorage, OidcIdentity, OidcIdentityStorage,
+    PermissionLevel, PermissionStorage, ProjectStorage, SqliteComposeProjectStorage,
+    SqliteStandaloneContainerStorage, SqlxAuditStore, SqlxEnvironmentStore, SqlxGroupStore,
+    SqlxNotifierStore, SqlxOidcIdentityStore, SqlxPermissionStore, SqlxProjectStore, SqlxStorage,
+    SqlxSyncStore, SqlxTaskStore, SqlxUserStore, SqlxVariableStore, SqlxWorkflowStore,
+    StandaloneContainerStorage, StepResult, StorageError, StoredDeployment, StoredEnvironment,
+    StoredNotifier, StoredPermission, StoredProject, StoredSync, StoredTask, StoredUser,
+    StoredUserGroup, StoredVariable, StoredWorkflow, SubjectKind, SyncStorage, TaskKind, TaskRun,
+    TaskStorage, UserRole, UserStorage, VariableStorage, WorkflowAction, WorkflowRun,
+    WorkflowRunStatus, WorkflowStep, WorkflowStorage,
 };

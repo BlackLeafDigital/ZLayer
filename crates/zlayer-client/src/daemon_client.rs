@@ -34,8 +34,13 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 use zlayer_types::api::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
-use zlayer_types::api::containers::ContainerExecResponse;
-use zlayer_types::api::images::{ImageInfoDto, PruneResultDto, PullImageResponse};
+use zlayer_types::api::containers::{
+    ContainerExecResponse, ContainerUpdateRequest, ContainerUpdateResponse, CreateContainerRequest,
+};
+use zlayer_types::api::images::{
+    CommitContainerRequest, CommitContainerResponse, ImageHistoryEntryDto, ImageInfoDto,
+    ImageSearchResultDto, ImportImageResponse, PruneResultDto, PullImageResponse,
+};
 use zlayer_types::api::secrets::{
     RevealAllSecretsResponse, RotateSecretResponse, SecretMetadataResponse,
 };
@@ -143,6 +148,425 @@ fn read_local_bearer() -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public response types
+// ---------------------------------------------------------------------------
+
+/// Response body returned by the daemon's `POST /api/v1/containers` endpoint.
+///
+/// The daemon currently replies with a [`zlayer_types::api::containers::ContainerInfo`]
+/// — this struct accepts the subset of those fields the Docker-compat shim
+/// needs (`id`, `name`) plus an additive `warnings` array that the daemon may
+/// surface in the future. Both `warnings` and `name` are tolerant defaults so
+/// older daemon builds (which never emit them) continue to deserialize.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateContainerResponse {
+    /// Identifier of the newly-created container, as assigned by the daemon.
+    pub id: String,
+    /// Non-fatal warnings raised during container creation. Always present on
+    /// the wire as an array; defaults to empty when the daemon omits the field.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Human-readable name, when the request supplied one.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Response body returned by the daemon's
+/// `POST /api/v1/containers/{id}/wait` Docker-compat endpoint.
+///
+/// The shape mirrors Docker's `/containers/{id}/wait`: a numeric exit
+/// `status_code` plus an optional nested `error` carrying a textual message
+/// when the wait itself failed (e.g. the container was removed before
+/// reaching the requested condition).
+///
+/// Wired in this crate so SDK consumers can deserialize the response without
+/// pulling in `zlayer-api`'s richer
+/// [`zlayer_types::api::containers::ContainerWaitResponse`] (which describes
+/// the native `GET /wait` endpoint and carries additional classification
+/// fields).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WaitContainerResponse {
+    /// Container exit code, or `0` when the container exited cleanly. When
+    /// the container was killed by signal `N`, this is typically `128 + N`,
+    /// matching Docker's convention.
+    pub status_code: i64,
+    /// Optional error envelope surfaced when the wait itself failed. Absent
+    /// on a normal exit; present when the daemon could not honour the
+    /// requested wait condition (for example, the container was removed
+    /// before it reached `not-running`).
+    #[serde(default)]
+    pub error: Option<WaitContainerError>,
+}
+
+/// Error envelope nested inside [`WaitContainerResponse::error`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WaitContainerError {
+    /// Human-readable description of why the wait failed.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Streaming wire DTOs (logs / stats / image pull)
+// ---------------------------------------------------------------------------
+//
+// These mirror the equivalent runtime types defined in
+// `zlayer_agent::runtime` (`LogChunk`, `LogChannel`, `LogsStreamOptions`,
+// `StatsSample`, `PullProgress`) but live here so SDK consumers can use the
+// streaming `DaemonClient::stream_*` methods without taking a direct
+// dependency on the heavy `zlayer-agent` crate (which drags in libcontainer,
+// youki, oci-client, etc.).
+//
+// Wire shape is intentionally JSON-friendly: every field is serde-derived
+// and the `PullProgress` enum uses an internal `type` tag so a decoder can
+// distinguish `Status` from `Done` without out-of-band context. The shapes
+// match what the daemon's NDJSON streaming endpoints
+// (`GET /api/v1/containers/{id}/stats?stream=true`,
+//  `POST /api/v1/images/pull?stream=true`) emit.
+
+/// Which standard stream a [`LogChunk`] originated from.
+///
+/// Mirrors `zlayer_agent::runtime::LogChannel`. Re-exported at the crate
+/// root so SDK callers can deserialize log NDJSON lines without depending
+/// on `zlayer-agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogChannel {
+    /// Standard input (rarely emitted; included for completeness with
+    /// Docker's stdcopy framing).
+    Stdin,
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// One chunk of container log output, as it appears on the wire when
+/// `format=json` is requested from the daemon's logs endpoint.
+///
+/// Mirrors `zlayer_agent::runtime::LogChunk`. `bytes` is encoded as a UTF-8
+/// `String` rather than raw `bytes::Bytes` because JSON has no native
+/// binary type and most container output is human-readable text.
+/// Consumers that need binary-safe access should call
+/// [`DaemonClient::stream_container_logs`] with `format_raw = true` and
+/// parse the underlying byte stream themselves.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LogChunk {
+    /// Which standard stream produced this chunk.
+    pub channel: LogChannel,
+    /// Decoded UTF-8 payload. Backends that emit non-UTF-8 bytes should
+    /// produce them lossy or escape them.
+    pub bytes: String,
+    /// When the runtime reported this chunk, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Options accepted by [`DaemonClient::stream_container_logs`].
+///
+/// Mirrors `zlayer_agent::runtime::LogsStreamOptions`. Re-exported from the
+/// client so callers can construct request parameters with the same shape
+/// the daemon trait method accepts on the server side.
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // mirrors Docker's logs query params 1:1
+pub struct LogsStreamOptions {
+    /// Continue streaming after the current end-of-log marker.
+    pub follow: bool,
+    /// Tail the last N lines before starting to stream.
+    pub tail: Option<u64>,
+    /// Earliest timestamp (Unix seconds) to include.
+    pub since: Option<i64>,
+    /// Latest timestamp (Unix seconds) to include.
+    pub until: Option<i64>,
+    /// Include per-chunk timestamps in the response.
+    pub timestamps: bool,
+    /// Include stdout in the stream.
+    pub stdout: bool,
+    /// Include stderr in the stream.
+    pub stderr: bool,
+}
+
+/// One periodic resource-usage sample returned by
+/// [`DaemonClient::stream_container_stats`].
+///
+/// Mirrors `zlayer_agent::runtime::StatsSample`. Field names match the
+/// `snake_case` JSON shape emitted by the daemon's streaming stats endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StatsSample {
+    /// Cumulative container CPU time consumed, in nanoseconds.
+    pub cpu_total_ns: u64,
+    /// Cumulative system CPU time observed at the same moment, in
+    /// nanoseconds.
+    pub cpu_system_ns: u64,
+    /// Number of CPUs currently online for this container.
+    pub online_cpus: u32,
+    /// Resident memory currently in use, in bytes.
+    pub mem_used_bytes: u64,
+    /// Memory limit configured on the container, in bytes. `0` when no
+    /// limit is set.
+    pub mem_limit_bytes: u64,
+    /// Cumulative bytes received across all attached network interfaces.
+    pub net_rx_bytes: u64,
+    /// Cumulative bytes transmitted across all attached network interfaces.
+    pub net_tx_bytes: u64,
+    /// Cumulative bytes read from block devices.
+    pub blkio_read_bytes: u64,
+    /// Cumulative bytes written to block devices.
+    pub blkio_write_bytes: u64,
+    /// Number of process IDs currently running inside the container's pid
+    /// namespace.
+    pub pids_current: u64,
+    /// Configured pids limit, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_limit: Option<u64>,
+    /// Wallclock time the sample was taken.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// One progress event emitted by [`DaemonClient::stream_image_pull`].
+///
+/// Mirrors `zlayer_agent::runtime::PullProgress`. Uses serde's internally-
+/// tagged enum representation (`{"type":"status",...}` vs
+/// `{"type":"done",...}`) so a single NDJSON parser can distinguish the
+/// two variants without out-of-band context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PullProgress {
+    /// Progress update for an in-flight layer or stage.
+    Status {
+        /// Layer ID or other backend-specific identifier, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Human-readable status text.
+        status: String,
+        /// Pre-formatted progress bar, when emitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<String>,
+        /// Bytes transferred so far for this layer, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<u64>,
+        /// Expected total bytes for this layer, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+    },
+    /// Pull completed successfully.
+    Done {
+        /// Resolved canonical image reference.
+        reference: String,
+        /// Content-addressed digest, when the backend reports one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Exec wire DTOs
+// ---------------------------------------------------------------------------
+//
+// These mirror the agent-side types defined in `zlayer_agent::runtime`
+// (`ExecOptions`, `ExecHandle`) and the daemon-side `ExecInstance`
+// registry struct in `zlayer_api::handlers::exec_instances`. They live in
+// `zlayer-client` so SDK consumers can drive the Docker-style exec flow
+// (create -> start -> resize -> inspect) without taking a direct
+// dependency on the heavy `zlayer-agent` crate.
+//
+// The shapes match the daemon's request/response bodies for the new
+// `POST /api/v1/containers/{id}/exec`, `GET /api/v1/exec/{id}/json`,
+// `POST /api/v1/exec/{id}/resize`, `POST /api/v1/exec/{id}/start`, and
+// `POST /api/v1/containers/{id}/resize` endpoints.
+
+/// Configuration for a new exec instance, sent as the JSON body of
+/// `POST /api/v1/containers/{id}/exec`.
+///
+/// Mirrors `zlayer_agent::runtime::ExecOptions` field-for-field. The agent
+/// struct does not derive `serde`, so this client-side copy is the canonical
+/// wire shape: keep the two in sync when fields are added.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // mirrors Docker's `ExecConfig` 1:1
+pub struct ExecOptions {
+    /// The argv vector for the exec'd process (`command[0]` is the binary).
+    pub command: Vec<String>,
+    /// Extra environment variables, in `KEY=VALUE` form. Merged into the
+    /// container's existing env on the runtime side.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Optional working directory inside the container. `None` keeps the
+    /// container's default `WORKDIR`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Optional `user[:group]` override. `None` keeps the container's
+    /// configured user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Run the exec with privileged capabilities (Docker `Privileged`).
+    #[serde(default)]
+    pub privileged: bool,
+    /// Allocate a TTY for the exec'd process (Docker `Tty`).
+    #[serde(default)]
+    pub tty: bool,
+    /// Attach stdin so the caller can write to the process (Docker `AttachStdin`).
+    #[serde(default)]
+    pub attach_stdin: bool,
+    /// Attach stdout so the caller receives the process's stdout on the
+    /// readable half of the duplex stream (Docker `AttachStdout`).
+    #[serde(default)]
+    pub attach_stdout: bool,
+    /// Attach stderr so the caller receives the process's stderr on the
+    /// readable half of the duplex stream (Docker `AttachStderr`).
+    #[serde(default)]
+    pub attach_stderr: bool,
+}
+
+/// Native [`zlayer_agent::runtime::ContainerId`] flavoured for the wire.
+///
+/// We re-spell the struct here so the client doesn't pull in `zlayer-agent`
+/// just to deserialize an exec inspect body. Field names match the
+/// `serde::Serialize` / `serde::Deserialize` derive on the agent's
+/// `ContainerId`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecContainerRef {
+    /// Logical service name (deployment-scoped) the exec is bound to.
+    pub service: String,
+    /// Replica index within the service.
+    pub replica: u32,
+}
+
+/// Wire shape returned by `GET /api/v1/exec/{id}/json`, matching the
+/// `ExecInstance` struct in `zlayer_api::handlers::exec_instances`.
+///
+/// All timestamp fields are RFC 3339 UTC strings; pre-start fields
+/// (`started_at`, `finished_at`, `exit_code`) are `None` until the exec
+/// has progressed through the corresponding lifecycle step.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExecInstanceJson {
+    /// 64-char lowercase hex ID. Matches Docker's exec-ID shape.
+    pub id: String,
+    /// Container the exec was created against.
+    pub container_id: ExecContainerRef,
+    /// The planned exec configuration captured at create time.
+    pub options: ExecOptions,
+    /// When the instance was created (always set).
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the runtime accepted the exec start. `None` until the exec has
+    /// been started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the exec'd process exited. `None` until the exec has finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Exit code reported by the runtime. `None` until the exec has
+    /// finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// Response body of `POST /api/v1/containers/{id}/exec`.
+///
+/// The daemon uses Docker's response convention (a single `Id` field) but
+/// also accepts lowercase `id` for forward compatibility with non-Docker
+/// callers. Both keys deserialize to the same field via `serde(alias)`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CreateExecResponse {
+    /// 64-char lowercase hex exec ID.
+    #[serde(alias = "Id")]
+    pub id: String,
+}
+
+/// Bidirectional connection returned by [`DaemonClient::start_exec_pty`].
+///
+/// Bundles the four pieces a long-lived interactive exec session needs:
+///
+/// 1. The readable half of the WebSocket as an async stream of binary
+///    payloads (`stdout` / `stderr`). The caller pumps this on one task to
+///    forward output to the user's terminal.
+/// 2. The writable half of the WebSocket, exposed via the [`ExecPtyWriter`]
+///    handle. Calling [`ExecPtyWriter::send_stdin`] queues a binary frame;
+///    [`ExecPtyWriter::close`] sends a normal-closure frame. The caller
+///    typically pumps stdin on a second task.
+/// 3. A bounded `mpsc::Sender<(rows, cols)>` so a SIGWINCH handler can
+///    forward terminal-resize hints. The session loop translates each
+///    `(rows, cols)` pair into a `{"resize":{"rows":..,"cols":..}}` JSON
+///    text frame.
+/// 4. A boxed exit future that resolves once the daemon sends a normal
+///    close frame, with the exit code parsed from the close frame's
+///    `reason` field.
+///
+/// `ExecPtyConnection` deliberately does not implement `Debug` / `Clone`
+/// because every field holds either a trait object or an owned channel.
+pub struct ExecPtyConnection {
+    /// Stream of binary frames read from the daemon (stdout / stderr,
+    /// already framed by the daemon when `tty=false`). Each `Bytes` item is
+    /// one binary WebSocket frame; non-binary frames (text/ping/pong) are
+    /// filtered upstream and never surface here.
+    pub reader: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send>>,
+    /// Writable handle for queuing stdin payloads onto the WebSocket. Calls
+    /// to [`ExecPtyWriter::send_stdin`] are forwarded to the WebSocket as
+    /// binary frames; the underlying channel is bounded so a stuck daemon
+    /// can't make the caller buffer unbounded stdin.
+    pub writer: ExecPtyWriter,
+    /// Sender for `(rows, cols)` PTY-resize events. Closed once the
+    /// session ends.
+    pub resize: tokio::sync::mpsc::Sender<(u16, u16)>,
+    /// Future that resolves with the exit code parsed from the daemon's
+    /// close frame. Resolves with `None` when the daemon closes without
+    /// surfacing an exit code (e.g. transport-level termination).
+    pub exit: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i32>>> + Send>>,
+}
+
+/// Owned writable side of an [`ExecPtyConnection`].
+///
+/// Wraps the bounded `mpsc::Sender` that the session loop drains to produce
+/// outbound WebSocket binary frames. Constructed exclusively by
+/// [`DaemonClient::start_exec_pty`]; clones share the same channel.
+#[derive(Clone)]
+pub struct ExecPtyWriter {
+    tx: tokio::sync::mpsc::Sender<ExecPtyOutbound>,
+}
+
+impl ExecPtyWriter {
+    /// Queue `data` as a binary WebSocket frame to the daemon's stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` once the underlying session loop has shut down (for
+    /// example because the daemon closed the connection, or the caller
+    /// already called [`Self::close`]).
+    pub async fn send_stdin(&self, data: Bytes) -> Result<()> {
+        self.tx
+            .send(ExecPtyOutbound::Stdin(data))
+            .await
+            .map_err(|_| anyhow::anyhow!("exec PTY session closed"))
+    }
+
+    /// Send a normal-closure (1000) close frame to the daemon and shut the
+    /// session down. Idempotent: subsequent calls return an error because
+    /// the channel will have been dropped on the session-loop side.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the session loop has already shut down (e.g. a
+    /// previous `close` call ran, or the daemon closed the connection).
+    pub async fn close(&self) -> Result<()> {
+        self.tx
+            .send(ExecPtyOutbound::Close)
+            .await
+            .map_err(|_| anyhow::anyhow!("exec PTY session already closed"))
+    }
+}
+
+/// Internal commands sent from the public [`ExecPtyWriter`] /
+/// [`ExecPtyConnection::resize`] handles to the session loop that owns the
+/// underlying `WebSocketStream`.
+#[derive(Debug)]
+enum ExecPtyOutbound {
+    /// Forward `data` as a binary WebSocket frame.
+    Stdin(Bytes),
+    /// Forward a `{"resize":{"rows":r,"cols":c}}` text frame.
+    Resize { rows: u16, cols: u16 },
+    /// Send a 1000 close frame and end the session.
+    Close,
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +1123,95 @@ impl DaemonClient {
         Ok((status, body))
     }
 
+    /// Send a POST request with an arbitrary `Content-Type` and raw byte
+    /// body. Used by image-load / image-import where the payload is a tar
+    /// archive, not JSON.
+    async fn post_bytes(
+        &self,
+        path: &str,
+        content_type: &'static str,
+        body: Bytes,
+    ) -> Result<(hyper::StatusCode, Bytes)> {
+        let uri = self.uri(path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", content_type);
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(body))
+            .context("Failed to build POST request")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("POST {path} (bytes) failed"))?;
+
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+        Ok((status, body))
+    }
+
+    /// Send a GET request and stream the response body as raw bytes.
+    /// Used by image-save / container-export where the payload is a tar
+    /// archive that must not be buffered fully in memory.
+    async fn get_stream(
+        &self,
+        path: &str,
+    ) -> Result<(
+        hyper::StatusCode,
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send>>,
+    )> {
+        use futures_util::StreamExt;
+        use http_body_util::BodyStream;
+
+        let uri = self.uri(path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET (stream) request")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} (stream) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+        let status = parts.status;
+        if !status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read error body")?
+                .to_bytes();
+            Self::check_status(status, &collected)?;
+            unreachable!();
+        }
+
+        let frames = BodyStream::new(body);
+        let mapped = frames.filter_map(|res| async move {
+            match res {
+                Ok(frame) => frame.into_data().ok().map(Ok),
+                Err(e) => Some(Err(anyhow::anyhow!("stream error: {e}"))),
+            }
+        });
+        Ok((status, Box::pin(mapped)))
+    }
+
     /// Send a POST request with a plain-text body and return the response.
     ///
     /// Used for endpoints whose body is not JSON (e.g. dotenv bulk imports).
@@ -730,6 +1243,67 @@ impl DaemonClient {
             .to_bytes();
 
         Ok((status, body))
+    }
+
+    /// Send a PUT request with a raw byte body and a custom content type.
+    ///
+    /// Used by the container-archive endpoints, which speak `application/x-tar`
+    /// directly rather than going through the JSON wrapper helpers.
+    async fn put_bytes(
+        &self,
+        path: &str,
+        body: Bytes,
+        content_type: &str,
+    ) -> Result<(hyper::StatusCode, Bytes)> {
+        let uri = self.uri(path)?;
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::PUT)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", content_type);
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(body))
+            .context("Failed to build PUT request")?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("PUT {path} failed"))?;
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+        Ok((status, body))
+    }
+
+    /// Send a HEAD request and return the response status plus the response
+    /// headers we care about (currently `X-Docker-Container-Path-Stat`).
+    async fn head(&self, path: &str) -> Result<(hyper::StatusCode, Option<String>)> {
+        let uri = self.uri(path)?;
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::HEAD)
+            .uri(uri)
+            .header("Host", "localhost");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build HEAD request")?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("HEAD {path} failed"))?;
+        let status = resp.status();
+        let header = resp
+            .headers()
+            .get("X-Docker-Container-Path-Stat")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        Ok((status, header))
     }
 
     /// Send a PATCH request with a JSON body and return the response.
@@ -850,6 +1424,21 @@ impl DaemonClient {
     /// `GET /api/v1/deployments/{name}`
     pub async fn get_deployment(&self, name: &str) -> Result<serde_json::Value> {
         let path = format!("/api/v1/deployments/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get the stored deployment, including the full `DeploymentSpec`.
+    ///
+    /// `GET /api/v1/deployments/{name}/spec`
+    ///
+    /// Unlike [`Self::get_deployment`], which returns the projection used by
+    /// the management UI, this fetches the raw stored representation so
+    /// callers (notably the Docker Engine API compatibility shim) can read
+    /// the original spec — image, command, env, scale, etc. — back out.
+    pub async fn get_deployment_stored(&self, name: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/deployments/{}/spec", urlencoding(name));
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
@@ -1368,6 +1957,133 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Inspect an image and return Docker-shaped metadata.
+    ///
+    /// `GET /api/v1/images/{image}/inspect`.
+    pub async fn inspect_image_native(&self, image: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/images/{}/inspect", urlencoding(image));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Return the parent-layer history for an image.
+    ///
+    /// `GET /api/v1/images/{image}/history`.
+    pub async fn image_history(&self, image: &str) -> Result<Vec<ImageHistoryEntryDto>> {
+        let path = format!("/api/v1/images/{}/history", urlencoding(image));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Search the configured registry for images matching `term`.
+    ///
+    /// `GET /api/v1/images/search?term=&limit=`.
+    pub async fn search_images(&self, term: &str, limit: u32) -> Result<Vec<ImageSearchResultDto>> {
+        let path = format!(
+            "/api/v1/images/search?term={}&limit={}",
+            urlencoding(term),
+            limit
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Save one or more images to a tar archive, streamed.
+    ///
+    /// `GET /api/v1/images/save?names=...`. Returns a stream of TAR bytes.
+    pub async fn save_images(
+        &self,
+        names: &[String],
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send>>> {
+        if names.is_empty() {
+            anyhow::bail!("save_images requires at least one image name");
+        }
+        let mut path = String::from("/api/v1/images/save?");
+        let mut first = true;
+        for name in names {
+            if !first {
+                path.push('&');
+            }
+            first = false;
+            path.push_str("names=");
+            path.push_str(&urlencoding(name));
+        }
+        let (_status, stream) = self.get_stream(&path).await?;
+        Ok(stream)
+    }
+
+    /// Load images from a tar archive.
+    ///
+    /// `POST /api/v1/images/load?quiet=BOOL`. Returns the response body
+    /// as concatenated NDJSON `LoadProgress` events.
+    pub async fn load_images(&self, tar_bytes: Bytes, quiet: bool) -> Result<Bytes> {
+        let path = format!("/api/v1/images/load?quiet={quiet}");
+        let (status, body) = self
+            .post_bytes(&path, "application/x-tar", tar_bytes)
+            .await?;
+        Self::check_status(status, &body)?;
+        Ok(body)
+    }
+
+    /// Import an image from a tar root filesystem.
+    ///
+    /// `POST /api/v1/images/import?repo=&tag=`.
+    pub async fn import_image(
+        &self,
+        tar_bytes: Bytes,
+        repo: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<ImportImageResponse> {
+        let mut path = String::from("/api/v1/images/import?");
+        let mut first = true;
+        if let Some(repo) = repo {
+            path.push_str("repo=");
+            path.push_str(&urlencoding(repo));
+            first = false;
+        }
+        if let Some(tag) = tag {
+            if !first {
+                path.push('&');
+            }
+            path.push_str("tag=");
+            path.push_str(&urlencoding(tag));
+        }
+        let (status, body) = self
+            .post_bytes(&path, "application/x-tar", tar_bytes)
+            .await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Stream a tar of a container's filesystem.
+    ///
+    /// `GET /api/v1/container-export/{id}`.
+    pub async fn export_container(
+        &self,
+        container_id: &str,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send>>> {
+        let path = format!("/api/v1/container-export/{}", urlencoding(container_id));
+        let (_status, stream) = self.get_stream(&path).await?;
+        Ok(stream)
+    }
+
+    /// Commit a running container to a new image.
+    ///
+    /// `POST /api/v1/commit`.
+    pub async fn commit_container_image(
+        &self,
+        req: &CommitContainerRequest,
+    ) -> Result<CommitContainerResponse> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialise CommitContainerRequest")?;
+        let (status, resp) = self.post_json("/api/v1/commit", &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
     // ------------------------------------------------------------------
     // Container management
     // ------------------------------------------------------------------
@@ -1379,6 +2095,30 @@ impl DaemonClient {
         let (status, body) = self.get("/api/v1/containers").await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
+    }
+
+    /// Create (and start) a standalone container from a typed request body.
+    ///
+    /// `POST /api/v1/containers` with the JSON-serialized
+    /// [`CreateContainerRequest`]. Returns a [`CreateContainerResponse`] with
+    /// the daemon-assigned container id (and any non-fatal warnings).
+    ///
+    /// The daemon currently replies with the full
+    /// [`zlayer_types::api::containers::ContainerInfo`] document on success;
+    /// only the fields named on [`CreateContainerResponse`] are read here, the
+    /// rest are ignored. `201 Created` is the expected success status.
+    pub async fn create_container(
+        &self,
+        request: CreateContainerRequest,
+    ) -> Result<CreateContainerResponse> {
+        let body = serde_json::to_string(&request)
+            .context("Failed to serialize CreateContainerRequest")?;
+        let (status, resp) = self.post_json("/api/v1/containers", &body).await?;
+        // 201 Created is the expected success code.
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
     }
 
     /// Get detailed information about a single container.
@@ -1512,6 +2252,258 @@ impl DaemonClient {
         let (status, body) = self.post_json(&path, &payload.to_string()).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
+    }
+
+    /// Wait for a container to reach a terminal state, Docker-style.
+    ///
+    /// Hits `POST /api/v1/containers/{id}/wait[?condition=<...>]` and returns
+    /// the daemon's [`WaitContainerResponse`] (`status_code` + optional
+    /// `error.message`).
+    ///
+    /// `condition` is one of `"not-running"` (default), `"next-exit"`, or
+    /// `"removed"` — matching Docker's `/containers/{id}/wait` semantics. When
+    /// `None`, the parameter is omitted and the daemon applies its default.
+    ///
+    /// This client method targets the Docker-compat shape that the
+    /// `zlayer-docker` shim drives. The native daemon's
+    /// `GET /api/v1/containers/{id}/wait` endpoint (added under §3.12 of the
+    /// SDK-fixes spec) returns a richer
+    /// [`zlayer_types::api::containers::ContainerWaitResponse`]; a follow-up
+    /// daemon sub-task wires the `POST` form alongside it.
+    pub async fn wait_container(
+        &self,
+        id: &str,
+        condition: Option<&str>,
+    ) -> Result<WaitContainerResponse> {
+        let mut path = format!("/api/v1/containers/{}/wait", urlencoding(id));
+        if let Some(c) = condition {
+            use std::fmt::Write;
+            let _ = write!(path, "?condition={}", urlencoding(c));
+        }
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Rename a standalone container.
+    ///
+    /// Hits `POST /api/v1/containers/{id}/rename?name=<new>` and returns
+    /// `Ok(())` on the daemon's `204 No Content`.
+    ///
+    /// Mirrors Docker Engine's `/containers/{id}/rename` endpoint shape so
+    /// the `zlayer-docker` compatibility shim can forward the call directly,
+    /// and the SDK can expose a Docker-equivalent helper.
+    pub async fn rename_container(&self, id: &str, new_name: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/containers/{}/rename?name={}",
+            urlencoding(id),
+            urlencoding(new_name)
+        );
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Update a standalone container's resource limits and/or restart
+    /// policy.
+    ///
+    /// Hits `POST /api/v1/containers/{id}/update` with the Docker-shaped
+    /// JSON body (`CpuShares`, `Memory`, `RestartPolicy`, ...). Returns
+    /// the daemon's [`ContainerUpdateResponse`] (`{"Warnings": [...]}`).
+    ///
+    /// Mirrors Docker Engine's `POST /containers/{id}/update` shape so the
+    /// `zlayer-docker` compatibility shim can forward the call directly.
+    pub async fn update_container(
+        &self,
+        id: &str,
+        update: &ContainerUpdateRequest,
+    ) -> Result<ContainerUpdateResponse> {
+        let path = format!("/api/v1/containers/{}/update", urlencoding(id));
+        let body =
+            serde_json::to_string(update).context("failed to serialize ContainerUpdateRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Pause a running standalone container.
+    ///
+    /// `POST /api/v1/containers/{id}/pause`. Returns `Ok(())` on 204.
+    pub async fn pause_container(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/pause", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Resume a previously-paused standalone container.
+    ///
+    /// `POST /api/v1/containers/{id}/unpause`. Returns `Ok(())` on 204.
+    pub async fn unpause_container(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/unpause", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// List the processes running inside a standalone container.
+    ///
+    /// `GET /api/v1/containers/{id}/top?ps_args=<...>`. Returns the daemon's
+    /// `ContainerTopResponse` JSON body verbatim. `ps_args` is forwarded as
+    /// a single query string when supplied; pass `None` to use the runtime's
+    /// default columns.
+    pub async fn top_container(
+        &self,
+        id: &str,
+        ps_args: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut path = format!("/api/v1/containers/{}/top", urlencoding(id));
+        if let Some(args) = ps_args {
+            use std::fmt::Write;
+            let _ = write!(path, "?ps_args={}", urlencoding(args));
+        }
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Report changes to a container's filesystem.
+    ///
+    /// `GET /api/v1/containers/{id}/changes`. Returns the daemon's
+    /// `Vec<ContainerChangeEntry>` body (Docker-shaped `Path`/`Kind`).
+    pub async fn container_changes(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/containers/{}/changes", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Report the published port mappings for a container.
+    ///
+    /// `GET /api/v1/containers/{id}/port`. Returns the daemon's
+    /// `ContainerPortResponse` body (Docker-shaped `{"Ports": ...}`).
+    pub async fn container_port(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/containers/{}/port", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Prune stopped containers from the runtime.
+    ///
+    /// `POST /api/v1/containers/prune`. Returns the daemon's
+    /// `ContainerPruneResponse` body (`ContainersDeleted` + `SpaceReclaimed`).
+    pub async fn prune_standalone_containers(&self) -> Result<serde_json::Value> {
+        let path = "/api/v1/containers/prune";
+        let (status, body) = self.post_json(path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Download a TAR archive of a path inside a container.
+    ///
+    /// Hits `GET /api/v1/containers/{id}/archive?path=<container_path>` and
+    /// returns the raw `application/x-tar` response body. The full archive
+    /// is buffered in memory; for large copies callers should pipe the bytes
+    /// straight to disk.
+    ///
+    /// Returns the raw archive bytes plus the optional
+    /// `X-Docker-Container-Path-Stat` header value (base64-encoded JSON
+    /// describing the archived path).
+    pub async fn archive_get(
+        &self,
+        id: &str,
+        container_path: &str,
+    ) -> Result<(Bytes, Option<String>)> {
+        let path = format!(
+            "/api/v1/containers/{}/archive?path={}",
+            urlencoding(id),
+            urlencoding(container_path)
+        );
+        // The lightweight `get()` helper drops response headers, so build the
+        // request inline here and capture the path-stat header in addition to
+        // the body.
+        let uri = self.uri(&path)?;
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET request")?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} failed"))?;
+        let status = resp.status();
+        let stat_header = resp
+            .headers()
+            .get("X-Docker-Container-Path-Stat")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+        Self::check_status(status, &body)?;
+        Ok((body, stat_header))
+    }
+
+    /// Upload (extract) a TAR archive into a container at a given path.
+    ///
+    /// Hits `PUT /api/v1/containers/{id}/archive?path=<container_path>` with
+    /// the supplied uncompressed TAR bytes. `no_overwrite_dir_non_dir` and
+    /// `copy_uid_gid` mirror Docker's `noOverwriteDirNonDir` /
+    /// `copyUIDGID` query parameters.
+    pub async fn archive_put(
+        &self,
+        id: &str,
+        container_path: &str,
+        tar_bytes: Bytes,
+        no_overwrite_dir_non_dir: bool,
+        copy_uid_gid: bool,
+    ) -> Result<()> {
+        use std::fmt::Write;
+        let mut path = format!(
+            "/api/v1/containers/{}/archive?path={}",
+            urlencoding(id),
+            urlencoding(container_path)
+        );
+        if no_overwrite_dir_non_dir {
+            let _ = write!(path, "&noOverwriteDirNonDir=1");
+        }
+        if copy_uid_gid {
+            let _ = write!(path, "&copyUIDGID=1");
+        }
+        let (status, body) = self
+            .put_bytes(&path, tar_bytes, "application/x-tar")
+            .await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Stat a path inside a container without materializing its TAR archive.
+    ///
+    /// Hits `HEAD /api/v1/containers/{id}/archive?path=<container_path>` and
+    /// returns the base64-encoded JSON contents of the
+    /// `X-Docker-Container-Path-Stat` response header. Returns `None` when
+    /// the daemon omits the header (older daemons / transports that strip
+    /// custom headers).
+    pub async fn archive_head(&self, id: &str, container_path: &str) -> Result<Option<String>> {
+        let path = format!(
+            "/api/v1/containers/{}/archive?path={}",
+            urlencoding(id),
+            urlencoding(container_path)
+        );
+        let (status, header) = self.head(&path).await?;
+        if !status.is_success() {
+            bail!("HEAD {path} returned {status}");
+        }
+        Ok(header)
     }
 
     // ------------------------------------------------------------------
@@ -1693,13 +2685,193 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// Inspect a single volume by name.
+    ///
+    /// `GET /api/v1/volumes/{name}`. Returns `Ok(None)` when the daemon
+    /// reports `404 Not Found`; any other non-success status is bubbled up as
+    /// an error. The returned [`VolumeInfo`] matches the daemon-side handler
+    /// shape (`zlayer_types::api::volumes::VolumeInfo`).
+    pub async fn inspect_volume(
+        &self,
+        name: &str,
+    ) -> Result<Option<zlayer_types::api::volumes::VolumeInfo>> {
+        let path = format!("/api/v1/volumes/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body).map(Some)
+    }
+
+    /// Create a new volume.
+    ///
+    /// `POST /api/v1/volumes` with the JSON-serialized
+    /// [`zlayer_types::api::volumes::CreateVolumeRequest`]. Returns the
+    /// freshly-created [`VolumeInfo`] document on `201 Created`.
+    ///
+    /// When the daemon reports `409 Conflict` (a volume with this name
+    /// already exists), the method follows up with
+    /// [`Self::inspect_volume`] and returns the existing volume. This
+    /// mirrors Docker's idempotent `volume create` semantics, which the
+    /// `zlayer-docker` compat shim relies on.
+    pub async fn create_volume(
+        &self,
+        request: zlayer_types::api::volumes::CreateVolumeRequest,
+    ) -> Result<zlayer_types::api::volumes::VolumeInfo> {
+        let name = request.name.clone();
+        let body =
+            serde_json::to_string(&request).context("Failed to serialize CreateVolumeRequest")?;
+        let (status, resp) = self.post_json("/api/v1/volumes", &body).await?;
+        if status == hyper::StatusCode::CONFLICT {
+            return self.inspect_volume(&name).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Daemon reported volume '{name}' already exists, but inspect returned 404"
+                )
+            });
+        }
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
     /// Delete a volume by name.
     ///
     /// `DELETE /api/v1/volumes/{name}?force={force}` -- returns 204 No Content on success.
     pub async fn delete_volume(&self, name: &str, force: bool) -> Result<()> {
-        let path = format!("/api/v1/volumes/{}?force={}", urlencoding(name), force,);
+        let path = format!("/api/v1/volumes/{}?force={}", urlencoding(name), force);
         let (status, body) = self.delete(&path).await?;
         Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Bridge / overlay container networks (`/api/v1/container-networks`)
+    // ------------------------------------------------------------------
+
+    /// List all user-defined bridge / overlay networks.
+    ///
+    /// `GET /api/v1/container-networks`. Returns the daemon's
+    /// `Vec<BridgeNetwork>` ordered by `created_at` then `name`.
+    pub async fn list_bridge_networks(&self) -> Result<Vec<zlayer_types::spec::BridgeNetwork>> {
+        let (status, body) = self.get("/api/v1/container-networks").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new bridge / overlay network.
+    ///
+    /// `POST /api/v1/container-networks` with the JSON-serialized
+    /// [`zlayer_types::api::container_networks::CreateBridgeNetworkRequest`].
+    /// Returns the daemon-assigned [`BridgeNetwork`] on `201 Created`.
+    pub async fn create_bridge_network(
+        &self,
+        request: zlayer_types::api::container_networks::CreateBridgeNetworkRequest,
+    ) -> Result<zlayer_types::spec::BridgeNetwork> {
+        let body = serde_json::to_string(&request)
+            .context("Failed to serialize CreateBridgeNetworkRequest")?;
+        let (status, resp) = self.post_json("/api/v1/container-networks", &body).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Inspect a single bridge / overlay network by id or name.
+    ///
+    /// `GET /api/v1/container-networks/{id_or_name}`. Returns `Ok(None)` for
+    /// `404 Not Found`. The daemon emits a `BridgeNetworkDetails` document
+    /// (flattened `BridgeNetwork` + `attached_containers`); this method
+    /// deserializes only the [`BridgeNetwork`] portion, matching the shape
+    /// callers asked for. Inspect plus attachments lives under a separate
+    /// future helper if needed.
+    pub async fn get_bridge_network(
+        &self,
+        id: &str,
+    ) -> Result<Option<zlayer_types::spec::BridgeNetwork>> {
+        let path = format!("/api/v1/container-networks/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body).map(Some)
+    }
+
+    /// Delete a bridge / overlay network by id or name.
+    ///
+    /// `DELETE /api/v1/container-networks/{id_or_name}`. Returns `Ok(true)`
+    /// on `204 No Content`, `Ok(false)` on `404 Not Found`, and an error for
+    /// any other non-success status. The daemon refuses deletion when the
+    /// network still has attached containers — pass `force=true` (not
+    /// supported by this helper) via a direct request if that override is
+    /// required.
+    pub async fn delete_bridge_network(&self, id: &str) -> Result<bool> {
+        let path = format!("/api/v1/container-networks/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        Self::check_status(status, &body)?;
+        Ok(true)
+    }
+
+    /// Attach a container to a bridge / overlay network.
+    ///
+    /// `POST /api/v1/container-networks/{network}/connect` with the JSON
+    /// body `{"container_id": "<id>", "aliases": [...]}`. Returns `Ok(())`
+    /// on `204 No Content`. The optional `ipv4_address` field of
+    /// [`ConnectBridgeNetworkRequest`] is intentionally not exposed by this
+    /// helper — callers that need static IP assignment should drop down to
+    /// `post_json` directly.
+    pub async fn connect_container_to_bridge_network(
+        &self,
+        network: &str,
+        container: &str,
+        aliases: Vec<String>,
+    ) -> Result<()> {
+        let path = format!(
+            "/api/v1/container-networks/{}/connect",
+            urlencoding(network)
+        );
+        let request = zlayer_types::api::container_networks::ConnectBridgeNetworkRequest {
+            container_id: container.to_string(),
+            aliases,
+            ipv4_address: None,
+        };
+        let body = serde_json::to_string(&request)
+            .context("Failed to serialize ConnectBridgeNetworkRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Detach a container from a bridge / overlay network.
+    ///
+    /// `POST /api/v1/container-networks/{network}/disconnect` with the JSON
+    /// body `{"container_id": "<id>", "force": <bool>}`. When `force` is
+    /// `true`, the daemon silently no-ops on the registry side if the
+    /// container was not attached; otherwise an unknown attachment surfaces
+    /// as a `404 Not Found`.
+    pub async fn disconnect_container_from_bridge_network(
+        &self,
+        network: &str,
+        container: &str,
+        force: bool,
+    ) -> Result<()> {
+        let path = format!(
+            "/api/v1/container-networks/{}/disconnect",
+            urlencoding(network)
+        );
+        let request = zlayer_types::api::container_networks::DisconnectBridgeNetworkRequest {
+            container_id: container.to_string(),
+            force,
+        };
+        let body = serde_json::to_string(&request)
+            .context("Failed to serialize DisconnectBridgeNetworkRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
         Ok(())
     }
 
@@ -2876,6 +4048,1218 @@ impl DaemonClient {
         Self::check_status(status, &resp)?;
         Self::parse_json(&resp)
     }
+
+    /// Stream daemon lifecycle events from `GET /api/v1/events`.
+    ///
+    /// The endpoint returns NDJSON: one [`zlayer_api::DaemonEvent`] JSON
+    /// object per line, terminated by `\n`. This method opens the stream,
+    /// validates the response status, and returns an async stream that
+    /// yields one parsed event per line.
+    ///
+    /// `follow` maps to the daemon's `?follow=<bool>` query parameter:
+    /// `true` (default for the daemon) keeps the stream open until the
+    /// connection drops or the daemon ends the response (e.g. terminal
+    /// `close` line on subscriber lag); `false` makes the daemon emit an
+    /// empty body and close immediately.
+    ///
+    /// Each `(k, v)` pair in `label_filters` is appended as a `label=k=v`
+    /// query parameter (URL-encoded) and the daemon applies AND-semantics
+    /// (an event passes only if every filter matches). Pass an empty slice
+    /// for no filtering.
+    ///
+    /// # Stream semantics
+    ///
+    /// - Empty lines are skipped.
+    /// - A line that fails to deserialize as `DaemonEvent` is logged at
+    ///   `warn` and yielded as `Err`; the stream continues with the next
+    ///   line rather than terminating on a single malformed entry.
+    /// - An IO error on the underlying body terminates the stream after
+    ///   yielding one `Err`.
+    /// - On EOF the trailing partial line (no terminating newline) is
+    ///   flushed and parsed before the stream ends.
+    ///
+    /// Caller is responsible for reconnecting if the stream ends and they
+    /// want to resume.
+    pub async fn events_stream(
+        &self,
+        follow: bool,
+        label_filters: &[(String, String)],
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<zlayer_api::DaemonEvent>> + Send>>,
+    > {
+        let path = build_events_path(follow, label_filters);
+        let uri = self.uri(&path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Accept", "application/json");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET request for events stream")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} (events) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+        if !parts.status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read events error body")?
+                .to_bytes();
+            Self::check_status(parts.status, &collected)?;
+            unreachable!();
+        }
+
+        Ok(Box::pin(parse_ndjson_event_stream(body)))
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming endpoints (logs / stats / image pull)
+    // ------------------------------------------------------------------
+
+    /// Stream container logs from `GET /api/v1/containers/{id}/logs`.
+    ///
+    /// Returns the response body as an async stream of [`Bytes`] chunks
+    /// exactly as the daemon emits them. The shape of each chunk depends on
+    /// the `format_raw` flag:
+    ///
+    /// - `format_raw = true`: raw chunks of Docker's stdcopy framing
+    ///   (`[stream, 0,0,0, BE_u32(len)] + payload`). Suitable for callers
+    ///   that already speak the framed protocol (e.g. the Docker-compat
+    ///   `/containers/{id}/logs` shim) and want byte-exact passthrough.
+    /// - `format_raw = false`: NDJSON of [`LogChunk`] objects, one per
+    ///   line. This method does **not** parse the lines — callers receive
+    ///   raw chunked bytes and run their own NDJSON parser if they need
+    ///   structured log records. Keeping the method format-agnostic lets
+    ///   the same call site serve both the raw-binary and JSON cases
+    ///   without two near-duplicate implementations.
+    ///
+    /// `follow=true` keeps the connection open until the daemon closes it;
+    /// `follow=false` streams only the currently-buffered tail and ends.
+    /// `tail` / `since` / `until` map directly to the matching query
+    /// parameters on the daemon side. `timestamps`, `stdout`, `stderr`
+    /// toggle the corresponding query flags.
+    ///
+    /// The argument list intentionally mirrors `LogsStreamOptions` 1:1
+    /// rather than taking that struct, so callers can pass query
+    /// parameters positionally without constructing an options builder.
+    /// We accept the resulting many-args / many-bools clippy lints
+    /// because a wrapper struct would not improve call-site readability
+    /// for a method that already has a precedent (Docker SDK clients ship
+    /// the same shape).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        clippy::similar_names
+    )]
+    pub async fn stream_container_logs(
+        &self,
+        id: &str,
+        follow: bool,
+        tail: Option<u64>,
+        since: Option<i64>,
+        until: Option<i64>,
+        timestamps: bool,
+        stdout: bool,
+        stderr: bool,
+        format_raw: bool,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send>>> {
+        use std::fmt::Write as _;
+
+        let mut path = format!(
+            "/api/v1/containers/{}/logs?follow={}&timestamps={}&stdout={}&stderr={}",
+            urlencoding(id),
+            follow,
+            timestamps,
+            stdout,
+            stderr,
+        );
+        if let Some(t) = tail {
+            let _ = write!(path, "&tail={t}");
+        }
+        if let Some(s) = since {
+            let _ = write!(path, "&since={s}");
+        }
+        if let Some(u) = until {
+            let _ = write!(path, "&until={u}");
+        }
+        if format_raw {
+            path.push_str("&format=raw");
+        }
+
+        let uri = self.uri(&path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost");
+        // `format_raw` requests an octet-stream body; otherwise the daemon
+        // emits NDJSON. Set the matching `Accept` so middleware (compression,
+        // logging) can branch correctly.
+        let builder = if format_raw {
+            builder.header("Accept", "application/octet-stream")
+        } else {
+            builder.header("Accept", "application/x-ndjson")
+        };
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET request for logs stream")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} (logs) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+        if !parts.status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read logs error body")?
+                .to_bytes();
+            Self::check_status(parts.status, &collected)?;
+            unreachable!();
+        }
+
+        Ok(Box::pin(raw_body_stream(body)))
+    }
+
+    /// Stream container stats samples from
+    /// `GET /api/v1/containers/{id}/stats?stream={stream}`.
+    ///
+    /// When `stream = true` the daemon keeps the connection open and emits
+    /// one NDJSON [`StatsSample`] per sampling tick (cadence is
+    /// backend-defined; bollard's default is 1 Hz). When `stream = false`
+    /// the daemon emits exactly one sample and closes.
+    ///
+    /// Each NDJSON line is deserialized into a [`StatsSample`]. Empty lines
+    /// are skipped silently. A line that fails to deserialize is logged
+    /// at `warn` and yielded as `Err`; the parser keeps reading subsequent
+    /// lines so a single malformed sample doesn't end the subscription.
+    /// IO errors on the underlying body terminate the stream after one
+    /// `Err` item.
+    pub async fn stream_container_stats(
+        &self,
+        id: &str,
+        stream: bool,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<StatsSample>> + Send>>>
+    {
+        let path = format!(
+            "/api/v1/containers/{}/stats?stream={}",
+            urlencoding(id),
+            stream,
+        );
+        let uri = self.uri(&path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Accept", "application/x-ndjson");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET request for stats stream")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} (stats) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+        if !parts.status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read stats error body")?
+                .to_bytes();
+            Self::check_status(parts.status, &collected)?;
+            unreachable!();
+        }
+
+        Ok(Box::pin(parse_ndjson_typed_stream::<_, StatsSample>(
+            body, "stats",
+        )))
+    }
+
+    /// Stream image-pull progress from
+    /// `POST /api/v1/images/pull?stream=true`.
+    ///
+    /// Body: `{"reference": "<image>", "registry_auth": <auth or null>}`,
+    /// matching the field names used by the existing blocking
+    /// `POST /api/v1/images/pull` endpoint (see
+    /// [`zlayer_types::api::images::PullImageRequest`]). The daemon
+    /// upgrades to NDJSON when `?stream=true` is set on the query string,
+    /// emitting one [`PullProgress`] per layer/status tick followed by
+    /// exactly one terminal `Done` event on success.
+    ///
+    /// As with [`Self::stream_container_stats`], NDJSON parse failures
+    /// surface as `Err` items but do not end the stream — only an
+    /// underlying IO error terminates iteration.
+    pub async fn stream_image_pull(
+        &self,
+        image: &str,
+        auth: Option<zlayer_types::spec::RegistryAuth>,
+    ) -> Result<std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<PullProgress>> + Send>>>
+    {
+        let body_json = serde_json::to_string(&serde_json::json!({
+            "reference": image,
+            "registry_auth": auth,
+        }))
+        .context("Failed to serialize image pull request body")?;
+
+        let path = "/api/v1/images/pull?stream=true";
+        let uri = self.uri(path)?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/x-ndjson");
+        let builder = self.apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::from(body_json)))
+            .context("Failed to build POST request for image pull stream")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("POST {path} (pull stream) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+        if !parts.status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read pull error body")?
+                .to_bytes();
+            Self::check_status(parts.status, &collected)?;
+            unreachable!();
+        }
+
+        Ok(Box::pin(parse_ndjson_typed_stream::<_, PullProgress>(
+            body, "pull",
+        )))
+    }
+
+    // ------------------------------------------------------------------
+    // Exec instances (Docker-shaped create/start/inspect/resize flow)
+    // ------------------------------------------------------------------
+
+    /// Create a new exec instance against the named container.
+    ///
+    /// `POST /api/v1/containers/{id}/exec` with a JSON [`ExecOptions`]
+    /// body. The daemon allocates a 64-char lowercase hex exec ID and
+    /// returns it inside a [`CreateExecResponse`]. The exec is *not*
+    /// started by this call — pass the returned ID to
+    /// [`DaemonClient::start_exec_pty`] (interactive) or other start
+    /// endpoints to begin execution.
+    pub async fn create_exec(&self, container_id: &str, opts: ExecOptions) -> Result<String> {
+        let path = format!("/api/v1/containers/{}/exec", urlencoding(container_id));
+        let body = serde_json::to_string(&opts).context("Failed to serialize ExecOptions")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        let parsed: CreateExecResponse = Self::parse_json(&resp)?;
+        Ok(parsed.id)
+    }
+
+    /// Inspect a previously-created exec instance.
+    ///
+    /// `GET /api/v1/exec/{id}/json` returning the full [`ExecInstanceJson`]
+    /// record (id, container ref, planned options, lifecycle timestamps,
+    /// exit code).
+    pub async fn inspect_exec(&self, exec_id: &str) -> Result<ExecInstanceJson> {
+        let path = format!("/api/v1/exec/{}/json", urlencoding(exec_id));
+        let (status, resp) = self.get(&path).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Resize the PTY allocated to an exec instance.
+    ///
+    /// `POST /api/v1/exec/{id}/resize` with a JSON `{rows, cols}` body.
+    /// No-op when the exec was created with `tty=false`; the daemon still
+    /// returns 204 in that case so callers don't have to special-case it.
+    pub async fn resize_exec(&self, exec_id: &str, rows: u16, cols: u16) -> Result<()> {
+        let path = format!("/api/v1/exec/{}/resize", urlencoding(exec_id));
+        let body = serde_json::json!({ "rows": rows, "cols": cols }).to_string();
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Resize the PTY allocated to a running container.
+    ///
+    /// `POST /api/v1/containers/{id}/resize` with a JSON `{rows, cols}`
+    /// body. Equivalent to the Docker `POST /containers/{id}/resize`
+    /// endpoint and used by interactive `attach` sessions.
+    pub async fn resize_container(&self, container_id: &str, rows: u16, cols: u16) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/resize", urlencoding(container_id));
+        let body = serde_json::json!({ "rows": rows, "cols": cols }).to_string();
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Start an exec instance interactively, returning a duplex
+    /// WebSocket-backed [`ExecPtyConnection`].
+    ///
+    /// Opens a WebSocket to `POST /api/v1/exec/{id}/start` over the same
+    /// transport [`DaemonClient`] uses for HTTP (Unix-domain socket on Unix,
+    /// TCP loopback on Windows). The connection follows this protocol:
+    ///
+    /// - **Binary frames**: shuttle stdin (client -> daemon) and stdout /
+    ///   stderr (daemon -> client). When `tty=false` the daemon emits the
+    ///   stdcopy framing Docker uses; when `tty=true` it emits raw PTY
+    ///   bytes. Either way `ExecPtyConnection::reader` surfaces each
+    ///   binary frame as a single [`Bytes`] item.
+    /// - **JSON text frames**: `{"resize":{"rows":R,"cols":C}}` carries
+    ///   PTY-resize hints from client to daemon. Generated automatically
+    ///   from `(rows, cols)` items sent on the returned `resize` channel.
+    /// - **Close frame**: code 1000 with the exit code formatted as
+    ///   decimal in the close-frame `reason` text. The exit future
+    ///   resolves once such a close frame arrives (or with `Ok(None)` on
+    ///   a transport-level close that didn't include an exit code).
+    pub async fn start_exec_pty(&self, exec_id: &str, tty: bool) -> Result<ExecPtyConnection> {
+        let path = format!("/api/v1/exec/{}/start?tty={}", urlencoding(exec_id), tty);
+        let stream = self.connect_websocket_stream(&path).await?;
+
+        // 64-message bound on every channel: high enough that interactive
+        // typing and SIGWINCH bursts don't block, low enough that a stuck
+        // peer can't make us buffer unbounded data.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ExecPtyOutbound>(64);
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(64);
+        let (read_tx, read_rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(64);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Result<Option<i32>>>();
+
+        // Forward `(rows, cols)` items from the public resize channel onto
+        // the unified outbound channel as `Resize` commands. Lives on its
+        // own task so the session loop only has to drain a single channel.
+        let resize_forward_tx = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some((rows, cols)) = resize_rx.recv().await {
+                if resize_forward_tx
+                    .send(ExecPtyOutbound::Resize { rows, cols })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        tokio::spawn(run_exec_pty_session(stream, out_rx, read_tx, exit_tx));
+
+        let reader = Box::pin(tokio_stream::wrappers::ReceiverStream::new(read_rx));
+        let writer = ExecPtyWriter { tx: out_tx };
+        let exit = Box::pin(async move {
+            match exit_rx.await {
+                Ok(res) => res,
+                Err(_) => Ok(None),
+            }
+        });
+
+        Ok(ExecPtyConnection {
+            reader,
+            writer,
+            resize: resize_tx,
+            exit,
+        })
+    }
+
+    /// Open a raw WebSocket to the daemon at `path`.
+    ///
+    /// Bridges the platform-specific transport (`UnixStream` on Unix,
+    /// `TcpStream` on Windows) into `tokio_tungstenite::client_async`.
+    /// The session-level auth header is attached when a session token is
+    /// available; on Unix the daemon's peer-credential middleware handles
+    /// local-admin auth out of band, matching the regular HTTP path.
+    async fn connect_websocket_stream(
+        &self,
+        path: &str,
+    ) -> Result<tokio_tungstenite::WebSocketStream<DaemonStreamForExec>> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+
+        let stream = self.dial_raw_stream().await?;
+
+        // Build a minimal WebSocket handshake request. We have to use
+        // `IntoClientRequest` so tokio-tungstenite recognises the URL
+        // shape, then layer the upgrade headers on top because
+        // `client_async` does not generate them automatically.
+        #[cfg(unix)]
+        let url = format!("ws://localhost{path}");
+        #[cfg(windows)]
+        let url = format!("ws://{}{path}", self.endpoint);
+
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .with_context(|| format!("invalid websocket URL {url:?}"))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("Upgrade"),
+        );
+        headers.insert(
+            hyper::header::UPGRADE,
+            hyper::header::HeaderValue::from_static("websocket"),
+        );
+        headers.insert(
+            hyper::header::SEC_WEBSOCKET_VERSION,
+            hyper::header::HeaderValue::from_static("13"),
+        );
+        let key = generate_key();
+        headers.insert(
+            hyper::header::SEC_WEBSOCKET_KEY,
+            hyper::header::HeaderValue::from_str(&key)
+                .context("websocket key was not valid header value")?,
+        );
+
+        if let Some(auth) = self.bearer_auth_header() {
+            headers.insert(
+                hyper::header::AUTHORIZATION,
+                hyper::header::HeaderValue::from_str(&auth)
+                    .context("Authorization header value was not valid")?,
+            );
+        }
+
+        let (ws, _resp) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .with_context(|| format!("websocket handshake at {path} failed"))?;
+
+        Ok(ws)
+    }
+
+    /// Build a `Bearer <token>` header value to attach to the WebSocket
+    /// upgrade request, when a session token (or, on Windows, a persisted
+    /// admin bearer) is available. Returns `None` when no auth applies.
+    #[cfg_attr(unix, allow(clippy::unused_self))]
+    fn bearer_auth_header(&self) -> Option<String> {
+        if let Ok(Some(session)) = crate::session::read_session() {
+            if !session.is_expired() {
+                return Some(format!("Bearer {}", session.token));
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(bearer) = self.bearer.as_deref() {
+                return Some(format!("Bearer {bearer}"));
+            }
+        }
+        None
+    }
+
+    /// Open a raw transport stream to the daemon. Used as the foundation
+    /// for the WebSocket upgrade; the regular HTTP methods reuse the
+    /// hyper client and never hit this path.
+    #[cfg(unix)]
+    async fn dial_raw_stream(&self) -> Result<DaemonStreamForExec> {
+        let stream = tokio::net::UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to dial daemon socket at {} for websocket",
+                    self.socket_path.display()
+                )
+            })?;
+        Ok(stream)
+    }
+
+    #[cfg(windows)]
+    async fn dial_raw_stream(&self) -> Result<DaemonStreamForExec> {
+        let stream = tokio::net::TcpStream::connect(self.endpoint)
+            .await
+            .with_context(|| {
+                format!("Failed to dial daemon TCP {} for websocket", self.endpoint)
+            })?;
+        Ok(stream)
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster / nodes (typed)
+    //
+    // Thin wrappers over the daemon's `/api/v1/cluster/*` and
+    // `/api/v1/nodes/*` endpoints. Used by the upcoming Docker-compat Swarm
+    // bridge; SDK consumers can also reach these directly without
+    // hand-rolling JSON.
+    // ------------------------------------------------------------------
+
+    /// List every cluster node visible in Raft state.
+    ///
+    /// `GET /api/v1/cluster/nodes` -- response shape is
+    /// [`zlayer_api::ClusterNodeSummary`] (the canonical type lives in the
+    /// API crate; the client crate already depends on `zlayer-api`, so no
+    /// re-export was necessary).
+    pub async fn cluster_nodes(&self) -> Result<Vec<zlayer_api::ClusterNodeSummary>> {
+        let (status, body) = self.get("/api/v1/cluster/nodes").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Inspect a single node by id.
+    ///
+    /// `GET /api/v1/nodes/{id}`. The daemon serves the richer
+    /// [`zlayer_types::api::nodes::NodeDetails`] DTO (resources + service
+    /// list), not just a [`zlayer_api::ClusterNodeSummary`], so this method
+    /// returns the richer document. The Swarm bridge maps it to
+    /// `Node{ID,Description,Status,...}` on the wire.
+    pub async fn node_inspect(&self, id: &str) -> Result<zlayer_types::api::nodes::NodeDetails> {
+        let path = format!("/api/v1/nodes/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Replace the labels on a node.
+    ///
+    /// `POST /api/v1/nodes/{id}/labels` with a JSON body matching the
+    /// daemon's [`zlayer_types::api::nodes::UpdateLabelsRequest`] (a
+    /// `labels` map plus a `remove` list of keys to drop). This helper
+    /// always sends an empty `remove` list because the Docker-compat
+    /// caller's spec only supplies the desired final label set; if you
+    /// need to drop specific keys, drop down to `post_json` directly.
+    pub async fn node_set_labels(
+        &self,
+        id: &str,
+        labels: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        // The daemon-side `UpdateLabelsRequest` (mirrored in
+        // `zlayer_types::api::nodes`) only derives `Deserialize`, so we
+        // build the JSON body inline rather than re-derive `Serialize` on
+        // a public DTO whose stability promise is one-way.
+        let path = format!("/api/v1/nodes/{}/labels", urlencoding(id));
+        let empty_remove: [&str; 0] = [];
+        let payload = serde_json::json!({
+            "labels": labels,
+            "remove": empty_remove,
+        });
+        let (status, resp) = self.post_json(&path, &payload.to_string()).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Forward a cluster-join request to the local daemon.
+    ///
+    /// `POST /api/v1/cluster/join`. The body is constructed by the caller
+    /// (typically the Docker-compat `/swarm/join` shim) so this helper does
+    /// not enforce any one DTO -- the daemon's
+    /// [`zlayer_api::ClusterJoinRequest`] only derives `Deserialize`, so a
+    /// `serde_json::Value` is the cheapest interchange format that does not
+    /// drag a new `Serialize` impl across the API boundary.
+    ///
+    /// Returns the raw response body as JSON on 2xx; on non-success the
+    /// daemon's error envelope is propagated via [`Self::check_status`].
+    pub async fn cluster_join(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/join", &body.to_string())
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    // ------------------------------------------------------------------
+    // Overlay (typed)
+    // ------------------------------------------------------------------
+
+    /// Typed overlay status.
+    ///
+    /// `GET /api/v1/overlay/status`. Sibling of the legacy
+    /// [`Self::get_overlay_status`] which returns a raw
+    /// `serde_json::Value`; this one deserializes into the strongly-typed
+    /// [`zlayer_types::api::overlay::OverlayStatusResponse`] used by the
+    /// Docker-compat shim.
+    pub async fn overlay_status(
+        &self,
+    ) -> Result<zlayer_types::api::overlay::OverlayStatusResponse> {
+        let (status, body) = self.get("/api/v1/overlay/status").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Secrets (typed)
+    //
+    // Sibling helpers to [`Self::list_secrets`] / [`Self::create_secret`] /
+    // [`Self::delete_secret`] which all return `serde_json::Value`. These
+    // versions deserialize into
+    // [`zlayer_types::api::secrets::SecretMetadataResponse`] (and friends)
+    // and accept an optional scope query parameter.
+    // ------------------------------------------------------------------
+
+    /// List secret metadata in a scope.
+    ///
+    /// `GET /api/v1/secrets[?scope=<scope>]`. When `scope` is `None` the
+    /// daemon falls back to the literal `"default"` scope (legacy path);
+    /// pass `Some("...")` for project / env-style namespacing.
+    pub async fn secrets_list(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Vec<zlayer_types::api::secrets::SecretMetadataResponse>> {
+        let path = match scope {
+            Some(s) => format!("/api/v1/secrets?scope={}", urlencoding(s)),
+            None => "/api/v1/secrets".to_string(),
+        };
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create or update a secret.
+    ///
+    /// `POST /api/v1/secrets[?scope=<scope>]` with a JSON body matching
+    /// [`zlayer_types::api::secrets::CreateSecretRequest`]. The optional
+    /// `scope` is sent as a query parameter (the body's `scope` field is
+    /// left unset, since the daemon rejects requests that mix the body and
+    /// query forms).
+    pub async fn secrets_create(
+        &self,
+        name: &str,
+        value: &str,
+        scope: Option<&str>,
+    ) -> Result<zlayer_types::api::secrets::SecretMetadataResponse> {
+        let path = match scope {
+            Some(s) => format!("/api/v1/secrets?scope={}", urlencoding(s)),
+            None => "/api/v1/secrets".to_string(),
+        };
+        let payload = serde_json::json!({ "name": name, "value": value });
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Delete a secret by name.
+    ///
+    /// `DELETE /api/v1/secrets/{name}[?scope=<scope>]` -- returns 204 on
+    /// success.
+    pub async fn secrets_delete(&self, name: &str, scope: Option<&str>) -> Result<()> {
+        let path = match scope {
+            Some(s) => format!(
+                "/api/v1/secrets/{}?scope={}",
+                urlencoding(name),
+                urlencoding(s),
+            ),
+            None => format!("/api/v1/secrets/{}", urlencoding(name)),
+        };
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Rotate a secret -- overwrite with a new value, returning the
+    /// previous and new versions.
+    ///
+    /// `POST /api/v1/secrets/{name}/rotate[?scope=<scope>]` with a JSON
+    /// body matching [`zlayer_types::api::secrets::RotateSecretRequest`].
+    /// The handler returns
+    /// [`zlayer_types::api::secrets::RotateSecretResponse`] (richer than
+    /// the spec's `SecretMeta` -- it carries `previous_version` and
+    /// `new_version` rather than the full metadata document).
+    pub async fn secrets_rotate(
+        &self,
+        name: &str,
+        value: &str,
+        scope: Option<&str>,
+    ) -> Result<zlayer_types::api::secrets::RotateSecretResponse> {
+        let path = match scope {
+            Some(s) => format!(
+                "/api/v1/secrets/{}/rotate?scope={}",
+                urlencoding(name),
+                urlencoding(s),
+            ),
+            None => format!("/api/v1/secrets/{}/rotate", urlencoding(name)),
+        };
+        let payload = serde_json::json!({ "value": value });
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Variables (typed)
+    // ------------------------------------------------------------------
+
+    /// List every global variable.
+    ///
+    /// `GET /api/v1/variables`. The daemon's contract: with no `scope`
+    /// query param it returns variables whose `scope IS NULL` (globals
+    /// only). To list project-scoped variables, drop down to `get` with
+    /// `?scope={project_id}` directly.
+    pub async fn variables_list(&self) -> Result<Vec<StoredVariable>> {
+        let (status, body) = self.get("/api/v1/variables").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new variable.
+    ///
+    /// `POST /api/v1/variables` with a JSON body matching
+    /// [`zlayer_types::api::variables::CreateVariableRequest`]. The
+    /// optional `env_id` is forwarded as the body's `scope` field --
+    /// matching the daemon's project / env scope convention.
+    pub async fn variables_create(
+        &self,
+        name: &str,
+        value: &str,
+        env_id: Option<&str>,
+    ) -> Result<StoredVariable> {
+        let payload = serde_json::json!({
+            "name": name,
+            "value": value,
+            "scope": env_id,
+        });
+        let (status, body) = self
+            .post_json("/api/v1/variables", &payload.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Update a variable's value.
+    ///
+    /// `PATCH /api/v1/variables/{id}` with a JSON body matching
+    /// [`zlayer_types::api::variables::UpdateVariableRequest`]. Only the
+    /// `value` field is sent; rename-by-PATCH is intentionally not exposed
+    /// here.
+    pub async fn variables_patch(&self, id: &str, value: &str) -> Result<StoredVariable> {
+        let path = format!("/api/v1/variables/{}", urlencoding(id));
+        let payload = serde_json::json!({ "value": value });
+        let (status, body) = self.patch_json(&path, &payload.to_string()).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a variable by id.
+    ///
+    /// `DELETE /api/v1/variables/{id}` -- returns 204 on success.
+    pub async fn variables_delete(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/variables/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Service replicas (typed) -- used by the Docker-compat `/tasks` shim.
+    // ------------------------------------------------------------------
+
+    /// List the running container replicas of a service inside a deployment.
+    ///
+    /// `GET /api/v1/deployments/{deployment}/services/{service}/containers`.
+    /// Sibling of [`Self::list_containers`] (which returns
+    /// `Vec<serde_json::Value>`); this version deserializes into the typed
+    /// [`zlayer_types::api::services::ContainerSummary`] DTO.
+    pub async fn deployment_replicas(
+        &self,
+        deployment: &str,
+        service: &str,
+    ) -> Result<Vec<zlayer_types::api::services::ContainerSummary>> {
+        let path = format!(
+            "/api/v1/deployments/{}/services/{}/containers",
+            urlencoding(deployment),
+            urlencoding(service),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+}
+
+/// Concrete platform-specific stream type used as the WebSocket transport
+/// for [`DaemonClient::start_exec_pty`]. On Unix this is a Unix-domain
+/// socket; on Windows it is a TCP loopback stream.
+#[cfg(unix)]
+type DaemonStreamForExec = tokio::net::UnixStream;
+#[cfg(windows)]
+type DaemonStreamForExec = tokio::net::TcpStream;
+
+/// Drive the WebSocket session for one [`DaemonClient::start_exec_pty`]
+/// connection.
+///
+/// Runs on its own tokio task. Three concurrent jobs:
+///
+/// - Drain `out_rx` and forward each [`ExecPtyOutbound`] command as the
+///   matching WebSocket frame (binary / text / close).
+/// - Read incoming frames and forward binary payloads on `read_tx`. Pings
+///   are auto-replied with pongs by `tokio_tungstenite` and never surface.
+///   Text frames are ignored (the daemon only sends them for resize echo
+///   in the future).
+/// - On a close frame, parse the exit code from the `reason` field and
+///   resolve `exit_tx`. Any unparsable reason resolves to `Ok(None)` so
+///   callers can still detect "session ended" without crashing.
+async fn run_exec_pty_session<S>(
+    stream: tokio_tungstenite::WebSocketStream<S>,
+    mut out_rx: tokio::sync::mpsc::Receiver<ExecPtyOutbound>,
+    read_tx: tokio::sync::mpsc::Sender<Result<Bytes>>,
+    exit_tx: tokio::sync::oneshot::Sender<Result<Option<i32>>>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let (mut sink, mut source) = stream.split();
+    let mut exit_tx = Some(exit_tx);
+    let mut exit_code_seen: Option<i32> = None;
+
+    loop {
+        tokio::select! {
+            // Outbound: pump caller commands onto the wire. `biased`-free
+            // select is fine: starvation isn't a concern because the
+            // inbound side is bounded by the daemon's send cadence.
+            cmd = out_rx.recv() => {
+                let Some(cmd) = cmd else { break; };
+                match cmd {
+                    ExecPtyOutbound::Stdin(data) => {
+                        if let Err(e) = sink.send(WsMessage::Binary(data)).await {
+                            let _ = read_tx.send(Err(anyhow::anyhow!(
+                                "exec PTY stdin send failed: {e}"
+                            ))).await;
+                            break;
+                        }
+                    }
+                    ExecPtyOutbound::Resize { rows, cols } => {
+                        let payload = serde_json::json!({
+                            "resize": { "rows": rows, "cols": cols }
+                        })
+                        .to_string();
+                        if let Err(e) = sink.send(WsMessage::text(payload)).await {
+                            let _ = read_tx.send(Err(anyhow::anyhow!(
+                                "exec PTY resize send failed: {e}"
+                            ))).await;
+                            break;
+                        }
+                    }
+                    ExecPtyOutbound::Close => {
+                        let _ = sink.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+
+            // Inbound: forward stdout/stderr to the caller, watch for the
+            // close frame so we can resolve `exit_tx`.
+            msg = source.next() => {
+                match msg {
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        // `WsMessage::Binary` is already `bytes::Bytes`;
+                        // forward the buffer verbatim.
+                        if read_tx.send(Ok(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        // Parse the exit code out of the close-frame reason.
+                        // Empty / non-numeric reasons resolve to `None` so
+                        // the caller still detects "session ended".
+                        if let Some(frame) = frame {
+                            let reason: &str = frame.reason.as_ref();
+                            exit_code_seen = reason.trim().parse::<i32>().ok();
+                        }
+                        // Send a courtesy close back; ignore failures.
+                        let _ = sink.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                    Some(Ok(WsMessage::Text(_) | _)) => {
+                        // Text frames are reserved for control messages
+                        // (currently only the client -> daemon resize hint),
+                        // and Ping / Pong / Frame are handled internally by
+                        // tokio-tungstenite. Drop both silently.
+                    }
+                    Some(Err(e)) => {
+                        let _ = read_tx.send(Err(anyhow::anyhow!(
+                            "exec PTY websocket read failed: {e}"
+                        ))).await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if let Some(tx) = exit_tx.take() {
+        let _ = tx.send(Ok(exit_code_seen));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NDJSON event-stream helpers
+// ---------------------------------------------------------------------------
+
+/// Build the `/api/v1/events` path with `follow=<bool>` plus zero or more
+/// URL-encoded `label=k=v` filters appended as repeated query parameters.
+fn build_events_path(follow: bool, label_filters: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    let mut path = format!("/api/v1/events?follow={follow}");
+    for (k, v) in label_filters {
+        // The handler splits on the first `=`, so we URL-encode the key
+        // and the value separately and join them with a literal `=`.
+        let _ = write!(&mut path, "&label={}={}", urlencoding(k), urlencoding(v));
+    }
+    path
+}
+
+/// Convert a hyper response body into an async stream of parsed
+/// [`zlayer_api::DaemonEvent`] items, one per NDJSON line.
+///
+/// Behaviour:
+///   * Empty lines are skipped.
+///   * A line that fails JSON-parsing is logged at `warn` and yielded as
+///     `Err`; the stream continues with the next line.
+///   * An IO error on the body is yielded as `Err` and terminates the
+///     stream.
+///   * On EOF, any trailing bytes without a terminating newline are
+///     parsed as one final line.
+///
+/// Extracted from [`DaemonClient::events_stream`] so the parse loop is
+/// testable without a live daemon.
+fn parse_ndjson_event_stream<B>(
+    body: B,
+) -> impl futures_util::Stream<Item = Result<zlayer_api::DaemonEvent>> + Send
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures_util::stream::{self, StreamExt as _};
+    use http_body_util::BodyStream;
+
+    stream::unfold(
+        (BodyStream::new(body), Vec::<u8>::new(), false),
+        |(mut body_stream, mut buf, mut done)| async move {
+            loop {
+                // Drain any complete lines already in the buffer.
+                if let Some(idx) = buf.iter().position(|b| *b == b'\n') {
+                    let mut line: Vec<u8> = buf.drain(..=idx).collect();
+                    // Strip the trailing `\n` (and tolerate `\r\n`).
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parsed = serde_json::from_slice::<zlayer_api::DaemonEvent>(&line)
+                        .with_context(|| {
+                            format!(
+                                "failed to parse NDJSON event line: {}",
+                                String::from_utf8_lossy(&line)
+                            )
+                        });
+                    if let Err(ref e) = parsed {
+                        tracing::warn!(
+                            error = %e,
+                            "skipping malformed NDJSON event line"
+                        );
+                    }
+                    return Some((parsed, (body_stream, buf, done)));
+                }
+
+                if done {
+                    // Flush any trailing partial line on EOF before ending.
+                    if !buf.is_empty() {
+                        let line: Vec<u8> = std::mem::take(&mut buf);
+                        let parsed = serde_json::from_slice::<zlayer_api::DaemonEvent>(&line)
+                            .with_context(|| {
+                                format!(
+                                    "failed to parse trailing NDJSON event line: {}",
+                                    String::from_utf8_lossy(&line)
+                                )
+                            });
+                        if let Err(ref e) = parsed {
+                            tracing::warn!(
+                                error = %e,
+                                "skipping malformed trailing NDJSON event line"
+                            );
+                        }
+                        return Some((parsed, (body_stream, buf, true)));
+                    }
+                    return None;
+                }
+
+                match body_stream.next().await {
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            buf.extend_from_slice(data);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Some((
+                            Err(anyhow::anyhow!("events body stream error: {e}")),
+                            (body_stream, buf, true),
+                        ));
+                    }
+                    None => {
+                        done = true;
+                    }
+                }
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Streaming-body helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a hyper response body into an async stream of raw [`Bytes`]
+/// chunks, one per body data frame.
+///
+/// Used by [`DaemonClient::stream_container_logs`] to surface the daemon's
+/// response verbatim — no NDJSON parsing, no buffering across frames — so
+/// callers receive the same byte sequence the daemon emitted (Docker
+/// stdcopy frames in raw mode, NDJSON in JSON mode). Trailers and empty
+/// frames are ignored. Body errors are mapped to `anyhow::Error` and
+/// terminate the stream.
+fn raw_body_stream<B>(body: B) -> impl futures_util::Stream<Item = Result<Bytes>> + Send
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures_util::stream::{self, StreamExt as _};
+    use http_body_util::BodyStream;
+
+    stream::unfold(BodyStream::new(body), |mut body_stream| async move {
+        loop {
+            match body_stream.next().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        if data.is_empty() {
+                            // Empty data frame — keep polling for the next
+                            // one (could be a trailers-only frame).
+                            continue;
+                        }
+                        return Some((Ok(data.clone()), body_stream));
+                    }
+                    // Non-data frame (trailers): fall through to next loop
+                    // iteration without producing an item.
+                }
+                Some(Err(e)) => {
+                    return Some((
+                        Err(anyhow::anyhow!("logs body stream error: {e}")),
+                        body_stream,
+                    ));
+                }
+                None => return None,
+            }
+        }
+    })
+}
+
+/// Convert a hyper response body into an async stream of values of type
+/// `T`, one per NDJSON line. Generic version of
+/// [`parse_ndjson_event_stream`] used by the typed streaming endpoints
+/// (`stream_container_stats`, `stream_image_pull`).
+///
+/// Behaviour:
+///   * Empty lines are skipped.
+///   * A line that fails JSON-parsing is logged at `warn` (with `kind` as
+///     the diagnostic prefix, e.g. `"stats"` / `"pull"`) and yielded as
+///     `Err`; the stream continues with the next line.
+///   * An IO error on the body is yielded as `Err` and terminates the
+///     stream.
+///   * On EOF, any trailing bytes without a terminating newline are
+///     parsed as one final line.
+fn parse_ndjson_typed_stream<B, T>(
+    body: B,
+    kind: &'static str,
+) -> impl futures_util::Stream<Item = Result<T>> + Send
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    use futures_util::stream::{self, StreamExt as _};
+    use http_body_util::BodyStream;
+
+    stream::unfold(
+        (BodyStream::new(body), Vec::<u8>::new(), false),
+        move |(mut body_stream, mut buf, mut done)| async move {
+            loop {
+                if let Some(idx) = buf.iter().position(|b| *b == b'\n') {
+                    let mut line: Vec<u8> = buf.drain(..=idx).collect();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parsed = serde_json::from_slice::<T>(&line).with_context(|| {
+                        format!(
+                            "failed to parse NDJSON {kind} line: {}",
+                            String::from_utf8_lossy(&line)
+                        )
+                    });
+                    if let Err(ref e) = parsed {
+                        tracing::warn!(
+                            error = %e,
+                            kind = kind,
+                            "skipping malformed NDJSON line"
+                        );
+                    }
+                    return Some((parsed, (body_stream, buf, done)));
+                }
+
+                if done {
+                    if !buf.is_empty() {
+                        let line: Vec<u8> = std::mem::take(&mut buf);
+                        let parsed = serde_json::from_slice::<T>(&line).with_context(|| {
+                            format!(
+                                "failed to parse trailing NDJSON {kind} line: {}",
+                                String::from_utf8_lossy(&line)
+                            )
+                        });
+                        if let Err(ref e) = parsed {
+                            tracing::warn!(
+                                error = %e,
+                                kind = kind,
+                                "skipping malformed trailing NDJSON line"
+                            );
+                        }
+                        return Some((parsed, (body_stream, buf, true)));
+                    }
+                    return None;
+                }
+
+                match body_stream.next().await {
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            buf.extend_from_slice(data);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Some((
+                            Err(anyhow::anyhow!("{kind} body stream error: {e}")),
+                            (body_stream, buf, true),
+                        ));
+                    }
+                    None => {
+                        done = true;
+                    }
+                }
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2998,5 +5382,976 @@ mod tests {
         // current_exe() should always succeed in a test runner.
         let result = DaemonClient::find_self_binary();
         assert!(result.is_ok());
+    }
+
+    /// Round-trip the wire shape exercised by [`DaemonClient::create_container`]:
+    ///
+    /// 1. Serialize a populated [`CreateContainerRequest`] the way the method
+    ///    serializes its body before `POST /api/v1/containers` — this verifies
+    ///    the request struct's `Serialize` impl reaches every field the
+    ///    Docker-compat shim cares about (image, name, env, command, labels,
+    ///    ports).
+    /// 2. Parse a sample daemon response — modelled after the
+    ///    `ContainerInfo`-shaped body the handler returns on `201 Created`,
+    ///    plus an optional `warnings` array that future daemon builds may
+    ///    surface — through [`DaemonClient::parse_json`], the same path the
+    ///    method itself takes after `post_json` returns.
+    ///
+    /// We exercise [`DaemonClient::parse_json`] (the static helper the
+    /// method delegates to) rather than spinning up a Unix-socket-backed mock
+    /// server, because [`DaemonClient`]'s connector is hard-wired to UDS on
+    /// Unix / TCP-loopback on Windows and does not accept arbitrary base URLs
+    /// — wiremock-style tests here would require a UDS-bound HTTP server,
+    /// which is far out of scope for this additive client method.
+    #[test]
+    fn create_container_serializes_request_and_parses_response() {
+        use std::collections::HashMap;
+        use zlayer_types::api::containers::CreateContainerRequest;
+        use zlayer_types::spec::PortMapping;
+
+        // 1) Request serialization — what the method puts on the wire.
+        let mut env = HashMap::new();
+        env.insert("RUST_LOG".to_string(), "info".to_string());
+
+        let mut labels = HashMap::new();
+        labels.insert("com.docker.compose.project".to_string(), "demo".to_string());
+
+        let request = CreateContainerRequest {
+            image: "nginx:1.25".to_string(),
+            name: Some("web-1".to_string()),
+            pull_policy: Some("if_not_present".to_string()),
+            env,
+            command: Some(vec!["nginx".into(), "-g".into(), "daemon off;".into()]),
+            labels,
+            ports: vec![PortMapping {
+                container_port: 80,
+                host_port: Some(8080),
+                protocol: zlayer_types::spec::PortProtocol::Tcp,
+                host_ip: String::new(),
+            }],
+            ..CreateContainerRequest::default()
+        };
+
+        let body = serde_json::to_string(&request).expect("CreateContainerRequest must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["image"], "nginx:1.25");
+        assert_eq!(parsed["name"], "web-1");
+        assert_eq!(parsed["pull_policy"], "if_not_present");
+        assert_eq!(parsed["env"]["RUST_LOG"], "info");
+        assert_eq!(parsed["command"][0], "nginx");
+        assert_eq!(parsed["ports"][0]["container_port"], 80);
+        assert_eq!(parsed["ports"][0]["host_port"], 8080);
+
+        // 2) Response parsing — what the method reads off `post_json`'s body.
+        // The daemon returns the full `ContainerInfo` document; only the
+        // fields on `CreateContainerResponse` should be required.
+        let daemon_body = br#"{
+            "id": "ctr_abc123",
+            "name": "web-1",
+            "image": "nginx:1.25",
+            "state": "running",
+            "labels": {},
+            "created_at": "2026-05-03T12:00:00Z",
+            "warnings": ["image pulled with cached digest"]
+        }"#;
+        let resp: CreateContainerResponse =
+            DaemonClient::parse_json(daemon_body).expect("daemon ContainerInfo must parse");
+        assert_eq!(resp.id, "ctr_abc123");
+        assert_eq!(resp.name.as_deref(), Some("web-1"));
+        assert_eq!(resp.warnings, vec!["image pulled with cached digest"]);
+
+        // The shape older daemon builds emit (no `warnings` field) must also
+        // parse — `warnings` defaults to an empty Vec, `name` to None.
+        let legacy_body = br#"{
+            "id": "ctr_xyz",
+            "image": "nginx:1.25",
+            "state": "running",
+            "labels": {},
+            "created_at": "2026-05-03T12:00:00Z"
+        }"#;
+        let legacy: CreateContainerResponse =
+            DaemonClient::parse_json(legacy_body).expect("legacy ContainerInfo must parse");
+        assert_eq!(legacy.id, "ctr_xyz");
+        assert!(legacy.warnings.is_empty());
+        assert!(legacy.name.is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // Volume / bridge-network / wait helpers — wire-shape round-trips.
+    //
+    // These mirror the [`create_container_serializes_request_and_parses_response`]
+    // test pattern: each asserts that the request struct serializes to the
+    // exact JSON the daemon expects, and that a hand-written sample of the
+    // daemon's response document parses through [`DaemonClient::parse_json`]
+    // — the same static helper the live methods delegate to.
+    //
+    // We do NOT spin up a wiremock server: [`DaemonClient`]'s connector is
+    // hard-wired to UDS on Unix / TCP-loopback on Windows and does not accept
+    // arbitrary base URLs, so a mock-server test would need a UDS-bound HTTP
+    // server. That infrastructure does not exist in this crate today, so we
+    // exercise the same parse/serialize seams the wire path uses.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn inspect_volume_round_trip() {
+        // Response-only path: GET /api/v1/volumes/{name} returns a
+        // VolumeInfo document; the helper unwraps it through parse_json.
+        let daemon_body = br#"{
+            "name": "pg-data",
+            "path": "/var/lib/zlayer/volumes/pg-data",
+            "size_bytes": 4096,
+            "labels": {"app": "postgres"},
+            "created_at": "2026-05-03T12:00:00Z",
+            "in_use_by": ["ctr_abc"]
+        }"#;
+        let info: zlayer_types::api::volumes::VolumeInfo =
+            DaemonClient::parse_json(daemon_body).expect("VolumeInfo must parse");
+        assert_eq!(info.name, "pg-data");
+        assert_eq!(info.path, "/var/lib/zlayer/volumes/pg-data");
+        assert_eq!(info.size_bytes, Some(4096));
+        assert_eq!(info.labels.get("app").map(String::as_str), Some("postgres"));
+        assert_eq!(info.created_at, "2026-05-03T12:00:00Z");
+        assert_eq!(info.in_use_by, vec!["ctr_abc".to_string()]);
+    }
+
+    #[test]
+    fn create_volume_round_trip() {
+        use std::collections::HashMap;
+        use zlayer_types::api::volumes::{CreateVolumeRequest, VolumeInfo};
+
+        // 1) Request serialization.
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+        let request = CreateVolumeRequest {
+            name: "pg-data".to_string(),
+            size: Some("10Gi".to_string()),
+            tier: Some("local".to_string()),
+            labels: Some(labels),
+        };
+        let body = serde_json::to_string(&request).expect("CreateVolumeRequest must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["name"], "pg-data");
+        assert_eq!(parsed["size"], "10Gi");
+        assert_eq!(parsed["tier"], "local");
+        assert_eq!(parsed["labels"]["env"], "prod");
+
+        // 2) Response parsing — what `POST /api/v1/volumes` returns on 201.
+        let daemon_body = br#"{
+            "name": "pg-data",
+            "path": "/var/lib/zlayer/volumes/pg-data",
+            "size_bytes": 0,
+            "labels": {"env": "prod"},
+            "created_at": "2026-05-03T12:00:00Z"
+        }"#;
+        let info: VolumeInfo =
+            DaemonClient::parse_json(daemon_body).expect("created VolumeInfo must parse");
+        assert_eq!(info.name, "pg-data");
+        assert_eq!(info.size_bytes, Some(0));
+        assert!(info.in_use_by.is_empty());
+    }
+
+    #[test]
+    fn list_bridge_networks_round_trip() {
+        // GET /api/v1/container-networks returns Vec<BridgeNetwork>. The
+        // wire shape uses chrono's RFC3339 default for `created_at`.
+        let daemon_body = br#"[
+            {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "alpha",
+                "driver": "bridge",
+                "subnet": "10.240.0.0/24",
+                "labels": {"env": "dev"},
+                "internal": false,
+                "created_at": "2026-05-03T12:00:00Z"
+            },
+            {
+                "id": "22222222-2222-4222-8222-222222222222",
+                "name": "beta",
+                "driver": "overlay",
+                "labels": {},
+                "internal": true,
+                "created_at": "2026-05-03T12:01:00Z"
+            }
+        ]"#;
+        let nets: Vec<zlayer_types::spec::BridgeNetwork> =
+            DaemonClient::parse_json(daemon_body).expect("Vec<BridgeNetwork> must parse");
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0].name, "alpha");
+        assert_eq!(
+            nets[0].driver,
+            zlayer_types::spec::BridgeNetworkDriver::Bridge
+        );
+        assert_eq!(nets[0].subnet.as_deref(), Some("10.240.0.0/24"));
+        assert!(!nets[0].internal);
+        assert_eq!(nets[1].name, "beta");
+        assert_eq!(
+            nets[1].driver,
+            zlayer_types::spec::BridgeNetworkDriver::Overlay
+        );
+        assert!(nets[1].internal);
+    }
+
+    #[test]
+    fn create_bridge_network_round_trip() {
+        use std::collections::HashMap;
+        use zlayer_types::api::container_networks::CreateBridgeNetworkRequest;
+        use zlayer_types::spec::{BridgeNetwork, BridgeNetworkDriver};
+
+        // 1) Request serialization.
+        let labels = HashMap::from([("env".to_string(), "prod".to_string())]);
+        let request = CreateBridgeNetworkRequest {
+            name: "edge".to_string(),
+            driver: Some(BridgeNetworkDriver::Bridge),
+            subnet: Some("10.241.0.0/24".to_string()),
+            labels,
+            internal: false,
+        };
+        let body =
+            serde_json::to_string(&request).expect("CreateBridgeNetworkRequest must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["name"], "edge");
+        assert_eq!(parsed["driver"], "bridge");
+        assert_eq!(parsed["subnet"], "10.241.0.0/24");
+        assert_eq!(parsed["labels"]["env"], "prod");
+        assert_eq!(parsed["internal"], false);
+
+        // 2) Response parsing — what `POST /api/v1/container-networks`
+        //    returns on 201.
+        let daemon_body = br#"{
+            "id": "33333333-3333-4333-8333-333333333333",
+            "name": "edge",
+            "driver": "bridge",
+            "subnet": "10.241.0.0/24",
+            "labels": {"env": "prod"},
+            "internal": false,
+            "created_at": "2026-05-03T12:00:00Z"
+        }"#;
+        let net: BridgeNetwork =
+            DaemonClient::parse_json(daemon_body).expect("created BridgeNetwork must parse");
+        assert_eq!(net.name, "edge");
+        assert_eq!(net.driver, BridgeNetworkDriver::Bridge);
+        assert_eq!(net.subnet.as_deref(), Some("10.241.0.0/24"));
+        assert!(!net.internal);
+    }
+
+    #[test]
+    fn get_bridge_network_round_trip() {
+        // GET /api/v1/container-networks/{id_or_name} returns
+        // BridgeNetworkDetails (a flattened BridgeNetwork plus
+        // attached_containers). The helper deserializes only into
+        // BridgeNetwork; the extra `attached_containers` field is ignored
+        // by serde.
+        let daemon_body = br#"{
+            "id": "44444444-4444-4444-8444-444444444444",
+            "name": "edge",
+            "driver": "bridge",
+            "labels": {},
+            "internal": false,
+            "created_at": "2026-05-03T12:00:00Z",
+            "attached_containers": [
+                {
+                    "container_id": "ctr_abc",
+                    "container_name": "web",
+                    "aliases": ["web", "frontend"],
+                    "ipv4": "10.241.0.5"
+                }
+            ]
+        }"#;
+        let net: zlayer_types::spec::BridgeNetwork =
+            DaemonClient::parse_json(daemon_body).expect("BridgeNetwork must parse");
+        assert_eq!(net.name, "edge");
+        assert_eq!(net.driver, zlayer_types::spec::BridgeNetworkDriver::Bridge);
+        // attached_containers is not on BridgeNetwork — it's on
+        // BridgeNetworkDetails — so it's silently ignored by this parser.
+    }
+
+    #[test]
+    fn delete_bridge_network_round_trip() {
+        // The delete helper inspects only the HTTP status, so we exercise
+        // the only piece of body parsing it does: the 4xx error path.
+        // 204 -> Ok(true); 404 -> Ok(false); other 4xx/5xx -> Err.
+        let body = br#"{"error":"Bridge network 'foo' has 1 attached container(s); pass ?force=true to delete anyway"}"#;
+        let err = DaemonClient::check_status(hyper::StatusCode::CONFLICT, body)
+            .expect_err("409 must surface an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("409"),
+            "expected status code in message: {msg}"
+        );
+        assert!(msg.contains("attached"), "expected error context: {msg}");
+    }
+
+    #[test]
+    fn connect_container_to_bridge_network_round_trip() {
+        use zlayer_types::api::container_networks::ConnectBridgeNetworkRequest;
+
+        // The helper builds a `ConnectBridgeNetworkRequest` with the given
+        // container id and aliases, leaves `ipv4_address` unset, and POSTs
+        // it. Verify the JSON body matches what the daemon's
+        // `connect_container_network` handler expects.
+        let request = ConnectBridgeNetworkRequest {
+            container_id: "ctr_abc".to_string(),
+            aliases: vec!["web".to_string(), "frontend".to_string()],
+            ipv4_address: None,
+        };
+        let body =
+            serde_json::to_string(&request).expect("ConnectBridgeNetworkRequest must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["container_id"], "ctr_abc");
+        assert_eq!(parsed["aliases"][0], "web");
+        assert_eq!(parsed["aliases"][1], "frontend");
+        assert!(
+            parsed.get("ipv4_address").is_none(),
+            "ipv4_address must be skipped when None: {body}"
+        );
+    }
+
+    #[test]
+    fn disconnect_container_from_bridge_network_round_trip() {
+        use zlayer_types::api::container_networks::DisconnectBridgeNetworkRequest;
+
+        let request = DisconnectBridgeNetworkRequest {
+            container_id: "ctr_abc".to_string(),
+            force: true,
+        };
+        let body =
+            serde_json::to_string(&request).expect("DisconnectBridgeNetworkRequest must serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["container_id"], "ctr_abc");
+        assert_eq!(parsed["force"], true);
+    }
+
+    #[test]
+    fn wait_container_round_trip() {
+        // Response parsing — Docker's wait shape: status_code + optional
+        // error envelope. Both the success (no error) and failure (error
+        // populated) shapes must round-trip through parse_json.
+        let success_body = br#"{"status_code": 0}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(success_body).expect("clean wait response must parse");
+        assert_eq!(resp.status_code, 0);
+        assert!(resp.error.is_none());
+
+        let signal_body = br#"{"status_code": 137}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(signal_body).expect("signal-killed wait response must parse");
+        assert_eq!(resp.status_code, 137);
+        assert!(resp.error.is_none());
+
+        let error_body = br#"{
+            "status_code": -1,
+            "error": {"message": "container removed before reaching not-running"}
+        }"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(error_body).expect("errored wait response must parse");
+        assert_eq!(resp.status_code, -1);
+        let err = resp.error.expect("error envelope must be present");
+        assert_eq!(err.message, "container removed before reaching not-running");
+    }
+
+    // ----------------------------------------------------------------------
+    // events_stream — URL building + NDJSON parse loop.
+    //
+    // These tests exercise the real NDJSON parser used by
+    // `DaemonClient::events_stream`. We feed it a hyper `Body`-shaped
+    // input ("an in-memory server returning two NDJSON lines") and assert
+    // the stream yields two parsed `DaemonEvent`s, plus exercise the
+    // skip-malformed-line path so a single bad line doesn't kill the
+    // whole subscription. Spinning up a UDS-backed daemon would re-test
+    // hyper's transport rather than this method's logic.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn events_path_no_filters() {
+        let path = build_events_path(true, &[]);
+        assert_eq!(path, "/api/v1/events?follow=true");
+
+        let path = build_events_path(false, &[]);
+        assert_eq!(path, "/api/v1/events?follow=false");
+    }
+
+    #[test]
+    fn events_path_with_label_filters_url_encoded() {
+        let filters = vec![
+            ("app".to_string(), "web".to_string()),
+            ("env".to_string(), "prod".to_string()),
+        ];
+        let path = build_events_path(true, &filters);
+        assert_eq!(
+            path,
+            "/api/v1/events?follow=true&label=app=web&label=env=prod"
+        );
+
+        // Spaces and slashes in keys/values must be percent-encoded so the
+        // query string remains a single hop.
+        let filters = vec![("com.example/team".to_string(), "platform infra".to_string())];
+        let path = build_events_path(false, &filters);
+        assert_eq!(
+            path,
+            "/api/v1/events?follow=false&label=com.example%2Fteam=platform%20infra"
+        );
+    }
+
+    /// In-memory body adapter used by [`events_stream_yields_two_parsed_events`].
+    ///
+    /// Wraps a `Vec<Bytes>` queue as a hyper `Body` so we can feed the
+    /// NDJSON parser exactly the chunks an `axum::Body::from_stream` body
+    /// would deliver — including chunk boundaries that split a single
+    /// line — without binding a real socket.
+    struct ChunkedBody {
+        chunks: std::collections::VecDeque<Bytes>,
+    }
+
+    impl ChunkedBody {
+        fn new<I: IntoIterator<Item = Bytes>>(chunks: I) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+            }
+        }
+    }
+
+    impl hyper::body::Body for ChunkedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+        {
+            match self.chunks.pop_front() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(b)))),
+                None => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn events_stream_yields_two_parsed_events() {
+        use futures_util::StreamExt as _;
+
+        // Two valid NDJSON DaemonEvent lines, mirroring what the
+        // `GET /api/v1/events` handler emits via `ndjson_line`. Split
+        // across three chunks so we also exercise mid-line buffering.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(
+                b"{\"resource\":\"container\",\"kind\":\"start\",\"id\":\"c1\",\"at\":\"2026-05-03T12:00:00Z\"}\n",
+            ),
+            Bytes::from_static(b"{\"resource\":\"image\",\"kind\":\"pull\","),
+            Bytes::from_static(
+                b"\"reference\":\"nginx:latest\",\"at\":\"2026-05-03T12:00:01Z\"}\n",
+            ),
+        ]);
+
+        let mut stream = Box::pin(parse_ndjson_event_stream(body));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first event present")
+            .expect("first event parses");
+        match first {
+            zlayer_api::DaemonEvent::Container(c) => {
+                assert_eq!(c.id, "c1");
+                assert_eq!(c.kind, zlayer_api::ContainerEventKind::Start);
+            }
+            other => panic!("expected container event, got {other:?}"),
+        }
+
+        let second = stream
+            .next()
+            .await
+            .expect("second event present")
+            .expect("second event parses");
+        match second {
+            zlayer_api::DaemonEvent::Image(i) => {
+                assert_eq!(i.reference, "nginx:latest");
+                assert_eq!(i.kind, zlayer_api::ImageEventKind::Pull);
+            }
+            other => panic!("expected image event, got {other:?}"),
+        }
+
+        // Stream ends cleanly after the body is exhausted.
+        assert!(stream.next().await.is_none(), "stream should end on EOF");
+    }
+
+    #[tokio::test]
+    async fn events_stream_skips_malformed_line_without_terminating() {
+        use futures_util::StreamExt as _;
+
+        // A bad line wedged between two valid ones must surface as an
+        // `Err` item but the parser must keep reading the next line.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(
+                b"{\"resource\":\"container\",\"kind\":\"start\",\"id\":\"c1\",\"at\":\"2026-05-03T12:00:00Z\"}\n",
+            ),
+            Bytes::from_static(b"this is not json\n"),
+            Bytes::from_static(
+                b"{\"resource\":\"image\",\"kind\":\"pull\",\"reference\":\"alpine:3\",\"at\":\"2026-05-03T12:00:01Z\"}\n",
+            ),
+        ]);
+
+        let mut stream = Box::pin(parse_ndjson_event_stream(body));
+
+        let first = stream.next().await.expect("first item present");
+        first.expect("first line parses cleanly");
+
+        let bad = stream.next().await.expect("bad line surfaces");
+        assert!(bad.is_err(), "malformed line must yield Err");
+
+        let third = stream.next().await.expect("third item present");
+        let ev = third.expect("recovery line parses cleanly");
+        match ev {
+            zlayer_api::DaemonEvent::Image(i) => assert_eq!(i.reference, "alpine:3"),
+            other => panic!("expected image event after recovery, got {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // stream_container_logs / stream_container_stats / stream_image_pull —
+    // wire-format parsing.
+    //
+    // These tests exercise the helpers used by the streaming methods
+    // (`raw_body_stream`, `parse_ndjson_typed_stream`) against the same
+    // `ChunkedBody` mock used by the events_stream tests above. We don't
+    // bind a UDS-backed mock daemon — that would re-test hyper's transport
+    // layer rather than the parsing logic this PR adds — so the public
+    // `DaemonClient::stream_*` methods are covered indirectly through
+    // their underlying helpers, which is the only logic the client owns.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stream_container_logs_yields_raw_body_chunks_unchanged() {
+        use futures_util::StreamExt as _;
+
+        // Three data frames mirroring what the `?format=raw` Docker-compat
+        // path emits (stdcopy-framed bytes). The helper must surface each
+        // frame as a single `Bytes` item without re-buffering or parsing.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(b"\x01\x00\x00\x00\x00\x00\x00\x05hello"),
+            Bytes::from_static(b"\x02\x00\x00\x00\x00\x00\x00\x05world"),
+            Bytes::from_static(b"\x01\x00\x00\x00\x00\x00\x00\x03end"),
+        ]);
+
+        let mut stream = Box::pin(raw_body_stream(body));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first chunk present")
+            .expect("first chunk ok");
+        assert_eq!(first.as_ref(), b"\x01\x00\x00\x00\x00\x00\x00\x05hello");
+
+        let second = stream
+            .next()
+            .await
+            .expect("second chunk present")
+            .expect("second chunk ok");
+        assert_eq!(second.as_ref(), b"\x02\x00\x00\x00\x00\x00\x00\x05world");
+
+        let third = stream
+            .next()
+            .await
+            .expect("third chunk present")
+            .expect("third chunk ok");
+        assert_eq!(third.as_ref(), b"\x01\x00\x00\x00\x00\x00\x00\x03end");
+
+        assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    #[tokio::test]
+    async fn stream_container_stats_parses_two_ndjson_samples() {
+        use futures_util::StreamExt as _;
+
+        // Two valid NDJSON StatsSample lines split mid-line across three
+        // chunks so we also exercise the buffering path.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(
+                b"{\"cpu_total_ns\":100,\"cpu_system_ns\":1000,\"online_cpus\":2,\
+                  \"mem_used_bytes\":1024,\"mem_limit_bytes\":2048,\
+                  \"net_rx_bytes\":10,\"net_tx_bytes\":20,\
+                  \"blkio_read_bytes\":30,\"blkio_write_bytes\":40,\
+                  \"pids_current\":5,\"pids_limit\":100,\
+                  \"timestamp\":\"2026-05-03T12:00:00Z\"}\n",
+            ),
+            Bytes::from_static(
+                b"{\"cpu_total_ns\":200,\"cpu_system_ns\":2000,\"online_cpus\":2,\
+                  \"mem_used_bytes\":2048,\"mem_limit_bytes\":2048,\
+                  \"net_rx_bytes\":11,\"net_tx_bytes\":21,",
+            ),
+            Bytes::from_static(
+                b"\"blkio_read_bytes\":31,\"blkio_write_bytes\":41,\
+                  \"pids_current\":6,\
+                  \"timestamp\":\"2026-05-03T12:00:01Z\"}\n",
+            ),
+        ]);
+
+        let mut stream = Box::pin(parse_ndjson_typed_stream::<_, StatsSample>(body, "stats"));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first sample present")
+            .expect("first sample parses");
+        assert_eq!(first.cpu_total_ns, 100);
+        assert_eq!(first.online_cpus, 2);
+        assert_eq!(first.mem_used_bytes, 1024);
+        assert_eq!(first.pids_limit, Some(100));
+
+        let second = stream
+            .next()
+            .await
+            .expect("second sample present")
+            .expect("second sample parses");
+        assert_eq!(second.cpu_total_ns, 200);
+        assert_eq!(second.mem_used_bytes, 2048);
+        // `pids_limit` is missing on this line; default skip means `None`.
+        assert_eq!(second.pids_limit, None);
+
+        assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    #[tokio::test]
+    async fn stream_container_stats_skips_blank_and_recovers_from_bad_line() {
+        use futures_util::StreamExt as _;
+
+        // One blank line + one malformed line wedged between two valid
+        // samples. The blank line must be skipped silently; the malformed
+        // line must yield an `Err` item without ending the stream.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(b"\n"),
+            Bytes::from_static(
+                b"{\"cpu_total_ns\":1,\"cpu_system_ns\":2,\"online_cpus\":1,\
+                  \"mem_used_bytes\":3,\"mem_limit_bytes\":4,\
+                  \"net_rx_bytes\":0,\"net_tx_bytes\":0,\
+                  \"blkio_read_bytes\":0,\"blkio_write_bytes\":0,\
+                  \"pids_current\":1,\
+                  \"timestamp\":\"2026-05-03T12:00:00Z\"}\n",
+            ),
+            Bytes::from_static(b"this is not json\n"),
+            Bytes::from_static(
+                b"{\"cpu_total_ns\":9,\"cpu_system_ns\":99,\"online_cpus\":1,\
+                  \"mem_used_bytes\":3,\"mem_limit_bytes\":4,\
+                  \"net_rx_bytes\":0,\"net_tx_bytes\":0,\
+                  \"blkio_read_bytes\":0,\"blkio_write_bytes\":0,\
+                  \"pids_current\":1,\
+                  \"timestamp\":\"2026-05-03T12:00:01Z\"}\n",
+            ),
+        ]);
+
+        let mut stream = Box::pin(parse_ndjson_typed_stream::<_, StatsSample>(body, "stats"));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first sample present")
+            .expect("first sample parses");
+        assert_eq!(first.cpu_total_ns, 1);
+
+        let bad = stream.next().await.expect("bad line surfaces");
+        assert!(bad.is_err(), "malformed line must yield Err");
+
+        let third = stream
+            .next()
+            .await
+            .expect("recovery sample present")
+            .expect("recovery sample parses");
+        assert_eq!(third.cpu_total_ns, 9);
+
+        assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    #[tokio::test]
+    async fn stream_image_pull_parses_status_and_done_variants() {
+        use futures_util::StreamExt as _;
+
+        // One Status line for an in-flight layer + one terminal Done line.
+        // Verifies the `tag = "type"` enum representation deserializes both
+        // variants from a single NDJSON parser.
+        let body = ChunkedBody::new(vec![
+            Bytes::from_static(
+                b"{\"type\":\"status\",\"id\":\"sha256:abc\",\
+                  \"status\":\"Downloading\",\
+                  \"progress\":\"[==>      ] 1.2MB/4.0MB\",\
+                  \"current\":1200000,\"total\":4000000}\n",
+            ),
+            Bytes::from_static(
+                b"{\"type\":\"done\",\"reference\":\"docker.io/library/alpine:3\",\
+                  \"digest\":\"sha256:deadbeef\"}\n",
+            ),
+        ]);
+
+        let mut stream = Box::pin(parse_ndjson_typed_stream::<_, PullProgress>(body, "pull"));
+
+        let first = stream
+            .next()
+            .await
+            .expect("first event present")
+            .expect("first event parses");
+        match first {
+            PullProgress::Status {
+                id,
+                status,
+                progress,
+                current,
+                total,
+            } => {
+                assert_eq!(id.as_deref(), Some("sha256:abc"));
+                assert_eq!(status, "Downloading");
+                assert!(progress.is_some());
+                assert_eq!(current, Some(1_200_000));
+                assert_eq!(total, Some(4_000_000));
+            }
+            PullProgress::Done { .. } => panic!("expected Status, got Done"),
+        }
+
+        let second = stream
+            .next()
+            .await
+            .expect("second event present")
+            .expect("second event parses");
+        match second {
+            PullProgress::Done { reference, digest } => {
+                assert_eq!(reference, "docker.io/library/alpine:3");
+                assert_eq!(digest.as_deref(), Some("sha256:deadbeef"));
+            }
+            PullProgress::Status { .. } => panic!("expected Done, got Status"),
+        }
+
+        assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    // ----------------------------------------------------------------------
+    // Exec instances — wire shapes + WebSocket session loop.
+    //
+    // The HTTP CRUD methods (`create_exec`, `inspect_exec`, `resize_exec`,
+    // `resize_container`) reuse the existing `post_json` / `get` helpers,
+    // so testing them end-to-end would re-exercise the same code paths the
+    // earlier `check_status` / `parse_json` tests cover. We instead pin
+    // down the wire shapes (round-trip the JSON bodies the daemon
+    // produces / consumes) and exercise the only piece of bespoke logic
+    // this PR adds — the `run_exec_pty_session` loop driving the
+    // bidirectional WebSocket — against an in-process mock server built
+    // on `tokio::io::duplex`.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn exec_options_serializes_with_snake_case_fields() {
+        let opts = ExecOptions {
+            command: vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            env: vec!["FOO=bar".to_string()],
+            working_dir: Some("/srv".to_string()),
+            user: Some("nobody".to_string()),
+            privileged: false,
+            tty: true,
+            attach_stdin: true,
+            attach_stdout: true,
+            attach_stderr: false,
+        };
+        let json = serde_json::to_value(&opts).expect("serialize ExecOptions");
+        assert_eq!(json["command"], serde_json::json!(["sh", "-c", "echo hi"]));
+        assert_eq!(json["env"], serde_json::json!(["FOO=bar"]));
+        assert_eq!(json["working_dir"], "/srv");
+        assert_eq!(json["user"], "nobody");
+        assert_eq!(json["privileged"], false);
+        assert_eq!(json["tty"], true);
+        assert_eq!(json["attach_stdin"], true);
+        assert_eq!(json["attach_stdout"], true);
+        assert_eq!(json["attach_stderr"], false);
+
+        // Round-trip: deserializing the produced JSON yields the same
+        // struct, with `Option`s preserved.
+        let back: ExecOptions = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, opts);
+
+        // Optional fields elide on the wire when `None`.
+        let minimal = ExecOptions {
+            command: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&minimal).expect("serialize minimal");
+        assert!(v.get("working_dir").is_none(), "None working_dir omitted");
+        assert!(v.get("user").is_none(), "None user omitted");
+    }
+
+    #[test]
+    fn exec_instance_json_deserializes_daemon_wire_shape() {
+        // Mirrors the JSON shape `ExecInstance` would produce if serialized
+        // verbatim from the daemon's storage layer
+        // (`crates/zlayer-api/src/handlers/exec_instances.rs::ExecInstance`).
+        // Lifecycle fields are present-but-null pre-start; absent fields
+        // also deserialize cleanly thanks to the `serde(default)` attrs.
+        let body = serde_json::json!({
+            "id": "0".repeat(64),
+            "container_id": { "service": "web", "replica": 1 },
+            "options": {
+                "command": ["sh"],
+                "env": [],
+                "working_dir": null,
+                "user": null,
+                "privileged": false,
+                "tty": true,
+                "attach_stdin": true,
+                "attach_stdout": true,
+                "attach_stderr": true,
+            },
+            "created_at": "2026-05-03T12:00:00Z",
+            "started_at": null,
+            "finished_at": null,
+            "exit_code": null,
+        });
+        let parsed: ExecInstanceJson =
+            serde_json::from_value(body).expect("ExecInstanceJson parse");
+        assert_eq!(parsed.id.len(), 64);
+        assert_eq!(parsed.container_id.service, "web");
+        assert_eq!(parsed.container_id.replica, 1);
+        assert!(parsed.options.tty);
+        assert!(parsed.started_at.is_none());
+        assert!(parsed.exit_code.is_none());
+
+        // A finished exec carries timestamps + an exit code; verify the
+        // optional fields populate.
+        let finished = serde_json::json!({
+            "id": "a".repeat(64),
+            "container_id": { "service": "svc", "replica": 0 },
+            "options": { "command": ["true"] },
+            "created_at": "2026-05-03T12:00:00Z",
+            "started_at": "2026-05-03T12:00:01Z",
+            "finished_at": "2026-05-03T12:00:02Z",
+            "exit_code": 7,
+        });
+        let parsed2: ExecInstanceJson = serde_json::from_value(finished).expect("finished parse");
+        assert_eq!(parsed2.exit_code, Some(7));
+        assert!(parsed2.started_at.is_some());
+        assert!(parsed2.finished_at.is_some());
+    }
+
+    #[test]
+    fn create_exec_response_accepts_id_and_capital_id_alias() {
+        let lower: CreateExecResponse =
+            serde_json::from_value(serde_json::json!({ "id": "deadbeef" })).expect("lowercase");
+        assert_eq!(lower.id, "deadbeef");
+
+        let docker: CreateExecResponse =
+            serde_json::from_value(serde_json::json!({ "Id": "cafef00d" })).expect("Docker case");
+        assert_eq!(docker.id, "cafef00d");
+    }
+
+    /// Drive `run_exec_pty_session` end-to-end against an in-process WS
+    /// peer talking over a `tokio::io::duplex()` pipe. Asserts:
+    ///
+    /// 1. Binary stdout frames from the server flow through
+    ///    `ExecPtyConnection::reader` unchanged.
+    /// 2. Stdin payloads sent on `ExecPtyWriter::send_stdin` arrive on the
+    ///    server as binary frames.
+    /// 3. Resize hints sent on the resize channel arrive on the server as
+    ///    a JSON `{"resize":{"rows":..,"cols":..}}` text frame.
+    /// 4. A normal-closure (1000) close frame with a numeric reason
+    ///    resolves the exit future to that integer.
+    #[tokio::test]
+    async fn exec_pty_session_round_trips_binary_resize_and_exit_code() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        // 64 KiB duplex buffer is plenty for a few-frame test exchange.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        // Server side: drive `accept_async` directly on the duplex half.
+        // This skips HTTP-upgrade handshake validation but keeps the WS
+        // framing identical to the real server.
+        let server_task = tokio::spawn(async move {
+            let mut server = tokio_tungstenite::accept_async(server_io)
+                .await
+                .expect("server handshake");
+            // Push one binary frame the client must surface unchanged.
+            server
+                .send(WsMessage::Binary(Bytes::from_static(b"hello")))
+                .await
+                .expect("server send stdout");
+
+            // Receive one stdin binary frame + one resize text frame from
+            // the client and stash them for the assertions below.
+            let stdin = server
+                .next()
+                .await
+                .expect("server got msg")
+                .expect("server msg ok");
+            let resize = server
+                .next()
+                .await
+                .expect("server got resize")
+                .expect("server resize ok");
+
+            // Send a normal-close with the exit code in the reason field.
+            server
+                .send(WsMessage::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "42".into(),
+                })))
+                .await
+                .expect("server send close");
+
+            (stdin, resize)
+        });
+
+        // Client side: handshake against the duplex peer, then wire the
+        // resulting WebSocketStream into `run_exec_pty_session` with the
+        // same channels `start_exec_pty` would have built.
+        let (client, _resp) =
+            tokio_tungstenite::client_async("ws://localhost/api/v1/exec/abc/start", client_io)
+                .await
+                .expect("client handshake");
+
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ExecPtyOutbound>(8);
+        let (read_tx, read_rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(8);
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<Result<Option<i32>>>();
+        tokio::spawn(super::run_exec_pty_session(
+            client, out_rx, read_tx, exit_tx,
+        ));
+
+        // 1. Binary frame: forwarded as-is.
+        let mut reader = tokio_stream::wrappers::ReceiverStream::new(read_rx);
+        let first = reader
+            .next()
+            .await
+            .expect("first chunk")
+            .expect("first chunk ok");
+        assert_eq!(first.as_ref(), b"hello");
+
+        // 2. Stdin: client writes "input" -> server should see binary frame.
+        out_tx
+            .send(ExecPtyOutbound::Stdin(Bytes::from_static(b"input")))
+            .await
+            .expect("queue stdin");
+
+        // 3. Resize: client sends (24, 80) -> server should see a JSON
+        //    text frame matching the documented control shape.
+        out_tx
+            .send(ExecPtyOutbound::Resize { rows: 24, cols: 80 })
+            .await
+            .expect("queue resize");
+
+        let (stdin_msg, resize_msg) = server_task.await.expect("server task joined");
+        match stdin_msg {
+            WsMessage::Binary(b) => {
+                assert_eq!(b.as_ref(), b"input");
+            }
+            other => panic!("expected binary stdin frame, got {other:?}"),
+        }
+        match resize_msg {
+            WsMessage::Text(t) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(t.as_str()).expect("resize is JSON");
+                assert_eq!(parsed["resize"]["rows"], 24);
+                assert_eq!(parsed["resize"]["cols"], 80);
+            }
+            other => panic!("expected text resize frame, got {other:?}"),
+        }
+
+        // 4. Close-frame exit code surfaces on the exit future.
+        let exit = exit_rx.await.expect("exit_tx delivered");
+        let exit = exit.expect("exit future Ok");
+        assert_eq!(exit, Some(42));
     }
 }

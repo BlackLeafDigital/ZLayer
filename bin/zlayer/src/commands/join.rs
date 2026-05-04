@@ -395,8 +395,7 @@ pub(crate) async fn join(
         }
 
         // Register service
-        manager
-            .upsert_service(service_name.clone(), service_spec.clone())
+        Box::pin(manager.upsert_service(service_name.clone(), service_spec.clone()))
             .await
             .context(format!("Failed to register service '{service_name}'"))?;
         info!(service = %service_name, "Service registered");
@@ -660,8 +659,7 @@ pub(crate) async fn join(
         }
 
         // Register service
-        manager
-            .upsert_service(service_name.clone(), service_spec.clone())
+        Box::pin(manager.upsert_service(service_name.clone(), service_spec.clone()))
             .await
             .context(format!("Failed to register service '{service_name}'"))?;
         info!(service = %service_name, "Service registered");

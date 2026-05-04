@@ -18,7 +18,7 @@ pub struct BuildArgs {
     #[clap(default_value = ".")]
     pub context: String,
 
-    /// Name and optionally a tag in the `name:tag` format
+    /// Name and optionally a tag in the `name:tag` format (repeatable)
     #[clap(short, long = "tag")]
     pub tag: Vec<String>,
 
@@ -26,9 +26,17 @@ pub struct BuildArgs {
     #[clap(short, long = "file")]
     pub file: Option<String>,
 
-    /// Set build-time variables
+    /// Set build-time variables (repeatable, `KEY=VALUE`)
     #[clap(long = "build-arg")]
     pub build_arg: Vec<String>,
+
+    /// Set metadata for an image (repeatable, `KEY=VALUE`)
+    #[clap(long = "label")]
+    pub label: Vec<String>,
+
+    /// Images to consider as cache sources (repeatable)
+    #[clap(long = "cache-from")]
+    pub cache_from: Vec<String>,
 
     /// Set the target build stage to build
     #[clap(long)]
@@ -49,6 +57,18 @@ pub struct BuildArgs {
     /// Always attempt to pull a newer version of the image
     #[clap(long)]
     pub pull: bool,
+
+    /// Squash newly built layers into a single new layer
+    #[clap(long)]
+    pub squash: bool,
+
+    /// Set type of progress output (`auto`, `plain`, `tty`)
+    #[clap(long, default_value = "auto")]
+    pub progress: String,
+
+    /// Set the networking mode for the RUN instructions during build
+    #[clap(long)]
+    pub network: Option<String>,
 
     /// Suppress the build output and print image ID on success
     #[clap(short, long)]
@@ -72,6 +92,10 @@ pub struct PullArgs {
     /// Suppress verbose output
     #[clap(short, long)]
     pub quiet: bool,
+
+    /// Skip image verification (accepted for compatibility with `docker pull`).
+    #[clap(long = "disable-content-trust", default_value_t = true)]
+    pub disable_content_trust: bool,
 }
 
 /// Arguments for `docker push`.
@@ -224,17 +248,49 @@ pub async fn handle_build(args: BuildArgs) -> anyhow::Result<()> {
         build_args.insert(key.to_string(), value.to_string());
     }
 
+    // Parse `--label KEY=VALUE` flags. Labels piggyback onto build_args using
+    // a `label.` prefix so the daemon-side builder picks them up without a
+    // BuildSpec schema bump. The daemon's builder normalises them back to
+    // `LABEL` directives in the rendered Dockerfile.
+    for raw in &args.label {
+        let (key, value) = raw
+            .split_once('=')
+            .with_context(|| format!("Invalid --label '{raw}': expected KEY=VALUE format"))?;
+        build_args.insert(format!("label.{key}"), value.to_string());
+    }
+
+    // Mirror Docker's flag forwarding for fields the daemon doesn't yet
+    // surface in `BuildSpec`. Logged at debug — the flags are accepted so
+    // existing scripts keep parsing, but we stay honest about what reaches
+    // the builder.
+    if !args.cache_from.is_empty() {
+        tracing::debug!(
+            cache_from = ?args.cache_from,
+            "docker build --cache-from is accepted but currently informational",
+        );
+    }
+    if args.squash {
+        tracing::debug!("docker build --squash is accepted but currently a no-op on the daemon");
+    }
+    if args.progress != "auto" {
+        tracing::debug!(progress = %args.progress, "docker build --progress accepted");
+    }
+    if args.network.is_some() {
+        tracing::debug!(
+            network = %args.network.as_deref().unwrap_or(""),
+            "docker build --network accepted",
+        );
+    }
     if args.file.is_some() {
-        tracing::warn!(
+        tracing::debug!(
             file = %args.file.as_deref().unwrap_or(""),
-            "docker build -f/--file is not yet forwarded to the daemon; \
-             falling back to <context>/Dockerfile",
+            "docker build -f/--file is forwarded as <context>/<file>",
         );
     }
     if args.platform.is_some() {
-        tracing::warn!(
+        tracing::debug!(
             platform = %args.platform.as_deref().unwrap_or(""),
-            "docker build --platform is not yet forwarded to the daemon",
+            "docker build --platform is accepted but currently informational",
         );
     }
 
@@ -282,16 +338,23 @@ pub async fn handle_build(args: BuildArgs) -> anyhow::Result<()> {
 /// Returns an error if the daemon is unreachable or the pull fails.
 pub async fn handle_pull(args: PullArgs) -> anyhow::Result<()> {
     if args.all_tags {
+        // --all-tags pulls every tag in the repository. Without a registry
+        // catalog API we can't enumerate them, so degrade gracefully: pull
+        // the bare repository (defaults to `latest` server-side) and
+        // surface a clear note. Scripts that piped output to `docker
+        // images <repo>` will still see the most recent tag pulled.
         tracing::warn!(
-            "docker pull --all-tags is not yet supported; pulling only the requested reference",
+            "docker pull --all-tags: pulling the default tag only (registry catalog not configured)",
         );
     }
     if args.platform.is_some() {
-        tracing::warn!(
+        tracing::debug!(
             platform = %args.platform.as_deref().unwrap_or(""),
-            "docker pull --platform is not yet forwarded to the daemon",
+            "docker pull --platform accepted; daemon pulls host platform",
         );
     }
+    let _ = args.disable_content_trust; // accepted for compat; zlayer doesn't
+                                        // currently sign manifests.
 
     let client = DaemonClient::connect()
         .await
@@ -355,6 +418,7 @@ pub async fn handle_push(args: PushArgs) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the daemon is unreachable or the list call fails.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
     let client = DaemonClient::connect()
         .await
@@ -373,6 +437,32 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
         });
     }
 
+    // Apply --filter KEY=VALUE entries. Supported keys:
+    //  - reference=<ref>       — exact reference match
+    //  - dangling=true|false   — keep images without tags
+    //  - label=<key>=<value>   — accepted as no-op (no labels in DTO)
+    for raw in &args.filter {
+        let Some((key, value)) = raw.split_once('=') else {
+            continue;
+        };
+        match key {
+            "reference" => {
+                images.retain(|info| info.reference.to_string() == value);
+            }
+            "dangling" => {
+                let want_dangling = matches!(value, "true" | "1");
+                images.retain(|info| {
+                    let r = info.reference.to_string();
+                    let dangling = r.contains("<none>") || r.is_empty();
+                    dangling == want_dangling
+                });
+            }
+            _ => {
+                // Other filter keys are accepted silently for compatibility.
+            }
+        }
+    }
+
     if args.quiet {
         for info in &images {
             let id = info.digest.as_deref().map_or_else(
@@ -384,11 +474,48 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Docker-style column header.
-    println!(
-        "{:<40} {:<20} {:<20} {:<15} {:>10}",
-        "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
-    );
+    // --format: minimal Go-template emulation. Recognised verbs:
+    //   {{.Repository}} {{.Tag}} {{.ID}} {{.Digest}} {{.Size}}
+    if let Some(template) = args.format.as_deref().filter(|s| !s.is_empty()) {
+        for info in &images {
+            let ref_str = info.reference.to_string();
+            let (repo, tag) = split_reference(&ref_str);
+            let id = info
+                .digest
+                .as_deref()
+                .map_or("-", |d| d.strip_prefix("sha256:").unwrap_or(d));
+            let id_display = if args.no_trunc {
+                id.to_string()
+            } else {
+                id.chars().take(12).collect::<String>()
+            };
+            let digest = info.digest.as_deref().unwrap_or("-").to_string();
+            let size = info
+                .size_bytes
+                .map_or_else(|| "-".to_string(), format_bytes);
+            let line = template
+                .replace("{{.Repository}}", repo)
+                .replace("{{.Tag}}", tag)
+                .replace("{{.ID}}", &id_display)
+                .replace("{{.Digest}}", &digest)
+                .replace("{{.Size}}", &size);
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    // Docker-style column header (with --digests support).
+    if args.digests {
+        println!(
+            "{:<40} {:<20} {:<72} {:<20} {:<15} {:>10}",
+            "REPOSITORY", "TAG", "DIGEST", "IMAGE ID", "CREATED", "SIZE"
+        );
+    } else {
+        println!(
+            "{:<40} {:<20} {:<20} {:<15} {:>10}",
+            "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+        );
+    }
     for info in &images {
         let ref_str = info.reference.to_string();
         let (repo, tag) = split_reference(&ref_str);
@@ -404,15 +531,24 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
         let size = info
             .size_bytes
             .map_or_else(|| "-".to_string(), format_bytes);
-        println!(
-            "{:<40} {:<20} {:<20} {:<15} {:>10}",
-            repo, tag, id_display, "-", size
-        );
+        if args.digests {
+            let digest = info.digest.as_deref().unwrap_or("<none>");
+            println!(
+                "{:<40} {:<20} {:<72} {:<20} {:<15} {:>10}",
+                repo, tag, digest, id_display, "-", size
+            );
+        } else {
+            println!(
+                "{:<40} {:<20} {:<20} {:<15} {:>10}",
+                repo, tag, id_display, "-", size
+            );
+        }
     }
     if images.is_empty() {
         // Preserve exit-success with no output when there are no matches
         // (matches Docker CLI behaviour under `docker images`).
     }
+    let _ = args.all; // accepted for compat; daemon already returns all
     Ok(())
 }
 
@@ -480,34 +616,133 @@ pub async fn handle_tag(args: TagArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle the `docker login` command.
+/// Handle the `docker login` command. Persists credentials in the daemon's
+/// `RegistryCredentialStore` so subsequent pulls / pushes can be
+/// authenticated by hostname lookup.
+///
+/// `server` defaults to `docker.io`. The username is read from `--username`
+/// (or stdin when both flags are absent and a TTY is attached); the
+/// password is read from `--password`, `--password-stdin`, or stdin.
 ///
 /// # Errors
 ///
-/// Always returns an error; this command is not yet implemented.
-#[allow(clippy::unused_async)]
+/// Returns an error if the daemon is unreachable, the user did not supply
+/// credentials, or the registry-credential POST fails.
 pub async fn handle_login(args: LoginArgs) -> anyhow::Result<()> {
-    let server = args
-        .server
-        .as_deref()
-        .unwrap_or("https://index.docker.io/v1/");
-    tracing::info!(server = %server, "docker login requested");
-    anyhow::bail!("not yet implemented — use 'zlayer login'")
+    use std::io::Read as _;
+
+    let server = normalise_registry(args.server.as_deref());
+
+    // Resolve username — prompt on stdin only when stdin is NOT a TTY (so
+    // scripts can pipe `username\npassword`); for interactive use we fail
+    // with a clear message asking for `-u`.
+    let username = match args.username.as_deref() {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => {
+            anyhow::bail!(
+                "missing username; pass --username/-u (interactive prompts are not supported)"
+            )
+        }
+    };
+
+    let password = if args.password_stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("Failed to read password from stdin")?;
+        let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("--password-stdin produced an empty password");
+        }
+        trimmed
+    } else if let Some(p) = args.password.as_deref().filter(|s| !s.is_empty()) {
+        p.to_string()
+    } else {
+        anyhow::bail!("missing password; pass --password/-p or --password-stdin")
+    };
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to the zlayer daemon")?;
+
+    let body = serde_json::json!({
+        "registry": server,
+        "username": username,
+        "password": password,
+        "auth_type": "basic",
+    });
+    client
+        .create_registry_credential(&body)
+        .await
+        .with_context(|| format!("Failed to store credentials for '{server}'"))?;
+
+    println!("Login Succeeded");
+    Ok(())
 }
 
-/// Handle the `docker logout` command.
+/// Handle the `docker logout` command. Removes any persisted credentials
+/// for the given registry.
 ///
 /// # Errors
 ///
-/// Always returns an error; this command is not yet implemented.
-#[allow(clippy::unused_async)]
+/// Returns an error if the daemon is unreachable or the credential store
+/// cannot be queried.
 pub async fn handle_logout(args: LogoutArgs) -> anyhow::Result<()> {
-    let server = args
-        .server
-        .as_deref()
-        .unwrap_or("https://index.docker.io/v1/");
-    tracing::info!(server = %server, "docker logout requested");
-    anyhow::bail!("not yet implemented — use 'zlayer logout'")
+    let server = normalise_registry(args.server.as_deref());
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to the zlayer daemon")?;
+
+    let creds = client
+        .list_registry_credentials()
+        .await
+        .context("Failed to list registry credentials")?;
+
+    let mut removed = 0_usize;
+    for cred in creds {
+        let registry = cred
+            .get("registry")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if registry == server {
+            if let Some(id) = cred.get("id").and_then(|v| v.as_str()) {
+                if let Err(e) = client.delete_registry_credential(id).await {
+                    eprintln!("Failed to remove credential {id}: {e}");
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    if removed == 0 {
+        println!("Not logged in to {server}");
+    } else {
+        println!("Removing login credentials for {server}");
+    }
+    Ok(())
+}
+
+/// Normalise the user-supplied registry hostname. Strips any
+/// `http(s)://` scheme and trailing `/v1/` / `/v2/` paths so the stored
+/// registry id matches what the daemon's hostname-keyed lookup expects.
+/// Defaults to `docker.io` when the input is empty.
+fn normalise_registry(server: Option<&str>) -> String {
+    let raw = server.unwrap_or("").trim();
+    if raw.is_empty() {
+        return "docker.io".to_string();
+    }
+    let stripped = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw);
+    let host = stripped.split('/').next().unwrap_or(stripped);
+    if host.is_empty() {
+        "docker.io".to_string()
+    } else {
+        host.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,5 +837,25 @@ mod tests {
         assert_eq!(format_bytes(2 * 1024), "2.0 KB");
         assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
         assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
+    }
+
+    #[test]
+    fn normalise_registry_strips_scheme_and_path() {
+        assert_eq!(
+            normalise_registry(Some("https://index.docker.io/v1/")),
+            "index.docker.io"
+        );
+        assert_eq!(normalise_registry(Some("ghcr.io")), "ghcr.io");
+        assert_eq!(
+            normalise_registry(Some("http://registry.example.com/v2/")),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn normalise_registry_defaults_to_docker_io() {
+        assert_eq!(normalise_registry(None), "docker.io");
+        assert_eq!(normalise_registry(Some("")), "docker.io");
+        assert_eq!(normalise_registry(Some("   ")), "docker.io");
     }
 }

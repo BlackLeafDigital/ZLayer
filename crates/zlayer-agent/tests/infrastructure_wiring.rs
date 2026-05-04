@@ -128,8 +128,7 @@ async fn test_upsert_passes_overlay_manager_to_service_instance() {
     manager.set_deployment_name("test".to_string());
 
     let spec = mock_http_spec();
-    manager
-        .upsert_service("web".to_string(), spec)
+    Box::pin(manager.upsert_service("web".to_string(), spec))
         .await
         .unwrap();
 
@@ -146,8 +145,7 @@ async fn test_upsert_without_overlay_gives_none_to_instance() {
     let manager = ServiceManager::new(runtime);
 
     let spec = mock_http_spec();
-    manager
-        .upsert_service("web".to_string(), spec)
+    Box::pin(manager.upsert_service("web".to_string(), spec))
         .await
         .unwrap();
 
@@ -175,8 +173,7 @@ async fn test_upsert_passes_proxy_manager_to_service_instance() {
     manager.set_deployment_name("test".to_string());
 
     let spec = mock_http_spec();
-    manager
-        .upsert_service("api".to_string(), spec)
+    Box::pin(manager.upsert_service("api".to_string(), spec))
         .await
         .unwrap();
 
@@ -217,8 +214,7 @@ async fn test_upsert_passes_dns_server_to_service_instance() {
     manager.set_deployment_name("test".to_string());
 
     let spec = mock_http_spec();
-    manager
-        .upsert_service("svc".to_string(), spec)
+    Box::pin(manager.upsert_service("svc".to_string(), spec))
         .await
         .unwrap();
 
@@ -292,8 +288,7 @@ async fn test_service_manager_full_infrastructure_wiring() {
     );
 
     let spec = mock_mixed_endpoints_spec();
-    manager
-        .upsert_service("app".to_string(), spec)
+    Box::pin(manager.upsert_service("app".to_string(), spec))
         .await
         .unwrap();
 
@@ -338,13 +333,11 @@ async fn test_upsert_update_preserves_dns_server() {
     manager.set_deployment_name("test".to_string());
 
     let spec = mock_http_spec();
-    manager
-        .upsert_service("svc".to_string(), spec.clone())
+    Box::pin(manager.upsert_service("svc".to_string(), spec.clone()))
         .await
         .unwrap();
 
-    manager
-        .upsert_service("svc".to_string(), spec)
+    Box::pin(manager.upsert_service("svc".to_string(), spec))
         .await
         .unwrap();
 

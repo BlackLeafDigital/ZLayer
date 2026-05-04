@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.12] - 2026-05-04
+
+### Added
+- Docker compat: Swarm endpoints (`/swarm`, `/services`, `/tasks`, `/nodes`, `/secrets`, `/configs`) now bridge to ZLayer's native cluster primitives (deployments, cluster nodes, replicas, secrets, variables) instead of returning empty arrays. Tools like `docker stack ps`, Portainer, and `docker service ls` now see ZLayer's real cluster state.
+- Docker compat: `/info` Swarm field now reports ZLayer cluster topology (NodeID, NodeAddr, LocalNodeState, ControlAvailable, RemoteManagers, Cluster.ID).
+- Docker compat: CLI redirects added for `docker swarm|node|service|secret|config` — these print a hint pointing users at the native `zlayer cluster|deploy|secret|variable` commands.
+
+### Changed
+- Docker compat: `crates/zlayer-docker/src/socket/swarm.rs` refactored into a `swarm/` submodule with one file per resource family (shape, swarm, nodes, services, tasks, secrets, configs).
+
+## [0.11.11] - 2026-05-03
+
+### Added
+- `ServiceSpec` gained `tty`, `stdin_open`, `userns_mode`, `cgroup_parent`,
+  and `expose` fields so the Docker Compose converter can plumb them through
+  end-to-end.
+- Compose-to-deployment conversion now honours every previously silent-dropped
+  service field: `labels`, `user`, `read_only`, `init`, `tty`, `stdin_open`,
+  `stop_signal`, `stop_grace_period`, `sysctls`, `ulimits`, `security_opt`,
+  `pid`, `ipc`, `cgroup_parent`, `devices` (parsed into `DeviceSpec`),
+  `deploy.resources.reservations.devices` GPU requests (folded into
+  `resources.gpu`), `cap_drop`, top-level `restart` and Swarm-style
+  `deploy.restart_policy`, `network_mode`, `expose:` port lists,
+  `pull_policy`, `platform`, healthcheck `CMD-SHELL` arrays,
+  healthcheck `retries: 0` and `start_interval`, and
+  `deploy.resources.reservations` (cpu/memory).
+
+### Changed
+- `convert_resources` now folds `deploy.resources.reservations.cpus` into
+  `ResourcesSpec.cpu_shares` (using the standard 1024-per-core weight) and
+  `reservations.memory` into `ResourcesSpec.memory_reservation`.
+
 ## [0.11.10] - 2026-05-02
 
 ### Fixed

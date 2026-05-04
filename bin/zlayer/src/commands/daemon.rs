@@ -572,13 +572,12 @@ async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
             .args(["-nG", user])
             .output()
             .await
-            .map(|out| {
+            .is_ok_and(|out| {
                 out.status.success()
                     && String::from_utf8_lossy(&out.stdout)
                         .split_whitespace()
                         .any(|g| g == "zlayer")
-            })
-            .unwrap_or(false);
+            });
 
         if !already_member {
             match Command::new("usermod")

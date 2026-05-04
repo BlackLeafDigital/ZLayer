@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
+use crate::event_bus::DaemonEventBus;
 use zlayer_spec::{BridgeNetwork, BridgeNetworkAttachment};
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,10 @@ pub struct BridgeNetworkApiState {
     pub attachments: Arc<DashMap<String, DashMap<String, BridgeNetworkAttachment>>>,
     /// Runtime backend. `None` means metadata-only mode.
     pub runtime: Option<Arc<dyn BridgeNetworkRuntime>>,
+    /// Daemon-wide event bus. Network create/delete/connect/disconnect
+    /// handlers publish lifecycle events here. Defaults to a fresh,
+    /// unattached bus when not explicitly supplied.
+    pub event_bus: DaemonEventBus,
     /// Flag so we only log the metadata-only warning once.
     warned: Arc<AtomicBool>,
 }
@@ -132,6 +137,7 @@ impl BridgeNetworkApiState {
             networks: Arc::new(DashMap::new()),
             attachments: Arc::new(DashMap::new()),
             runtime: None,
+            event_bus: DaemonEventBus::new(),
             warned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -141,6 +147,15 @@ impl BridgeNetworkApiState {
     #[must_use]
     pub fn with_runtime(mut self, runtime: Arc<dyn BridgeNetworkRuntime>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Attach a shared event bus so this state's handlers publish network
+    /// lifecycle events on the same channel as `GET /api/v1/events`
+    /// subscribers.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: DaemonEventBus) -> Self {
+        self.event_bus = bus;
         self
     }
 
@@ -363,6 +378,14 @@ pub async fn create_container_network(
     state.networks.insert(network.id.clone(), network.clone());
     state.attachments.insert(network.id.clone(), DashMap::new());
 
+    let driver_name = match network.driver {
+        zlayer_spec::BridgeNetworkDriver::Bridge => "bridge",
+        zlayer_spec::BridgeNetworkDriver::Overlay => "overlay",
+    };
+    state
+        .event_bus
+        .publish_network_created(network.id.clone(), network.name.clone(), driver_name);
+
     Ok((StatusCode::CREATED, Json(network)))
 }
 
@@ -505,6 +528,13 @@ pub async fn delete_container_network(
         )));
     }
 
+    // Capture the canonical name before deletion so the event payload
+    // carries it (the path parameter may be either id or name).
+    let network_name = state
+        .networks
+        .get(&id)
+        .map_or_else(|| id_or_name.clone(), |entry| entry.value().name.clone());
+
     if let Some(runtime) = state.runtime.as_ref() {
         runtime.delete(&id).await?;
     } else {
@@ -514,6 +544,8 @@ pub async fn delete_container_network(
     info!(id = %id, name = %id_or_name, "Deleting bridge network");
     state.networks.remove(&id);
     state.attachments.remove(&id);
+
+    state.event_bus.publish_network_deleted(id, network_name);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -573,7 +605,15 @@ pub async fn connect_container_network(
         state.warn_metadata_only();
     }
 
+    let network_name = state
+        .networks
+        .get(&id)
+        .map_or_else(|| id_or_name.clone(), |entry| entry.value().name.clone());
+
     info!(network = %id, container = %req.container_id, "Connecting container to network");
+    state
+        .event_bus
+        .publish_network_connected(id.clone(), network_name, req.container_id.clone());
     let entry = state.attachments.entry(id).or_insert_with(DashMap::new);
     entry.insert(req.container_id, attachment);
 
@@ -640,6 +680,11 @@ pub async fn disconnect_container_network(
         state.warn_metadata_only();
     }
 
+    let network_name = state
+        .networks
+        .get(&id)
+        .map_or_else(|| id_or_name.clone(), |entry| entry.value().name.clone());
+
     info!(
         network = %id,
         container = %req.container_id,
@@ -649,6 +694,10 @@ pub async fn disconnect_container_network(
     if let Some(attached) = state.attachments.get(&id) {
         attached.remove(&req.container_id);
     }
+
+    state
+        .event_bus
+        .publish_network_disconnected(id, network_name, req.container_id);
 
     Ok(StatusCode::NO_CONTENT)
 }

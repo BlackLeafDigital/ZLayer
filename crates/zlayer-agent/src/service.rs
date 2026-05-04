@@ -1238,8 +1238,7 @@ impl ServiceManager {
 
             // Register and start service
             tracing::info!(service = %service_name, "Starting service");
-            self.upsert_service(service_name.clone(), service_spec.clone())
-                .await?;
+            Box::pin(self.upsert_service(service_name.clone(), service_spec.clone())).await?;
 
             // Get the desired replica count from scale config
             let replicas = match &service_spec.scale {
@@ -2191,8 +2190,7 @@ mod tests {
 
         // Add service
         let spec = mock_spec();
-        manager
-            .upsert_service("test".to_string(), spec)
+        Box::pin(manager.upsert_service("test".to_string(), spec))
             .await
             .unwrap();
 
@@ -2215,8 +2213,7 @@ mod tests {
 
         // Add service with HTTP endpoint
         let spec = mock_spec();
-        manager
-            .upsert_service("api".to_string(), spec)
+        Box::pin(manager.upsert_service("api".to_string(), spec))
             .await
             .unwrap();
 
@@ -2253,8 +2250,7 @@ mod tests {
 
         // Add service
         let spec = mock_spec();
-        manager
-            .upsert_service("web".to_string(), spec)
+        Box::pin(manager.upsert_service("web".to_string(), spec))
             .await
             .unwrap();
 
@@ -2321,7 +2317,9 @@ services:
         services.insert("b".to_string(), mock_spec());
 
         // Should deploy both without issue
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         // Both services should be registered
         let service_list = manager.list_services().await;
@@ -2357,7 +2355,9 @@ services:
         );
 
         // Should deploy in order: c, b, a
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         // All services should be registered
         let service_list = manager.list_services().await;
@@ -2391,7 +2391,7 @@ services:
         );
 
         // Should fail with cycle detection
-        let result = manager.deploy_with_dependencies(services).await;
+        let result = Box::pin(manager.deploy_with_dependencies(services)).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Cyclic dependency"));
@@ -2417,7 +2417,9 @@ services:
         );
 
         // Should deploy both despite timeout
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         let service_list = manager.list_services().await;
         assert_eq!(service_list.len(), 2);
@@ -2443,7 +2445,9 @@ services:
         );
 
         // Should deploy both despite timeout (with warning)
-        manager.deploy_with_dependencies(services).await.unwrap();
+        Box::pin(manager.deploy_with_dependencies(services))
+            .await
+            .unwrap();
 
         let service_list = manager.list_services().await;
         assert_eq!(service_list.len(), 2);
@@ -2469,7 +2473,7 @@ services:
         );
 
         // Should fail after B is started but doesn't become healthy
-        let result = manager.deploy_with_dependencies(services).await;
+        let result = Box::pin(manager.deploy_with_dependencies(services)).await;
         assert!(result.is_err());
 
         // B should be started (it has no deps), but A should fail
@@ -2587,8 +2591,7 @@ services:
 
         // Register job
         let job_spec = mock_job_spec();
-        manager
-            .upsert_service("backup".to_string(), job_spec)
+        Box::pin(manager.upsert_service("backup".to_string(), job_spec))
             .await
             .unwrap();
 
@@ -2617,8 +2620,7 @@ services:
 
         // Register cron job
         let cron_spec = mock_cron_spec();
-        manager
-            .upsert_service("cleanup".to_string(), cron_spec)
+        Box::pin(manager.upsert_service("cleanup".to_string(), cron_spec))
             .await
             .unwrap();
 
@@ -2641,8 +2643,7 @@ services:
 
         // Register cron job
         let cron_spec = mock_cron_spec();
-        manager
-            .upsert_service("cleanup".to_string(), cron_spec)
+        Box::pin(manager.upsert_service("cleanup".to_string(), cron_spec))
             .await
             .unwrap();
 
@@ -2661,8 +2662,7 @@ services:
 
         // Register cron job
         let cron_spec = mock_cron_spec();
-        manager
-            .upsert_service("cleanup".to_string(), cron_spec)
+        Box::pin(manager.upsert_service("cleanup".to_string(), cron_spec))
             .await
             .unwrap();
 
@@ -2690,8 +2690,7 @@ services:
 
         // Register job
         let job_spec = mock_job_spec();
-        manager
-            .upsert_service("backup".to_string(), job_spec)
+        Box::pin(manager.upsert_service("backup".to_string(), job_spec))
             .await
             .unwrap();
 
@@ -2717,8 +2716,7 @@ services:
 
         // Register cron job
         let cron_spec = mock_cron_spec();
-        manager
-            .upsert_service("cleanup".to_string(), cron_spec)
+        Box::pin(manager.upsert_service("cleanup".to_string(), cron_spec))
             .await
             .unwrap();
 
@@ -2750,9 +2748,7 @@ services:
 
         // Try to register cron job without scheduler configured
         let cron_spec = mock_cron_spec();
-        let result = manager
-            .upsert_service("cleanup".to_string(), cron_spec)
-            .await;
+        let result = Box::pin(manager.upsert_service("cleanup".to_string(), cron_spec)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not configured"));
     }
@@ -2766,8 +2762,7 @@ services:
 
         // Register job
         let job_spec = mock_job_spec();
-        manager
-            .upsert_service("backup".to_string(), job_spec)
+        Box::pin(manager.upsert_service("backup".to_string(), job_spec))
             .await
             .unwrap();
 
@@ -2800,8 +2795,7 @@ services:
 
         // Add service
         let spec = mock_spec();
-        manager
-            .upsert_service("api".to_string(), spec)
+        Box::pin(manager.upsert_service("api".to_string(), spec))
             .await
             .unwrap();
 
@@ -2829,8 +2823,7 @@ services:
 
         // Add and scale service
         let spec = mock_spec();
-        manager
-            .upsert_service("web".to_string(), spec)
+        Box::pin(manager.upsert_service("web".to_string(), spec))
             .await
             .unwrap();
         manager.scale_service("web", 1).await.unwrap();
@@ -2975,8 +2968,7 @@ services:
 
         // Add TCP-only service
         let spec = mock_tcp_spec();
-        manager
-            .upsert_service("database".to_string(), spec)
+        Box::pin(manager.upsert_service("database".to_string(), spec))
             .await
             .unwrap();
 
@@ -3000,8 +2992,7 @@ services:
 
         // Add UDP-only service
         let spec = mock_udp_spec();
-        manager
-            .upsert_service("dns".to_string(), spec)
+        Box::pin(manager.upsert_service("dns".to_string(), spec))
             .await
             .unwrap();
 
@@ -3025,8 +3016,7 @@ services:
 
         // Add mixed service (HTTP + TCP + UDP)
         let spec = mock_mixed_spec();
-        manager
-            .upsert_service("mixed".to_string(), spec)
+        Box::pin(manager.upsert_service("mixed".to_string(), spec))
             .await
             .unwrap();
 
@@ -3065,8 +3055,7 @@ services:
 
         // Add TCP service - should log warning but not fail
         let spec = mock_tcp_spec();
-        manager
-            .upsert_service("database".to_string(), spec)
+        Box::pin(manager.upsert_service("database".to_string(), spec))
             .await
             .unwrap();
 

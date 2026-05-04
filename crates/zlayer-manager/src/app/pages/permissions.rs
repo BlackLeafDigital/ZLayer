@@ -610,7 +610,7 @@ fn GrantPermissionModal(
                     on_success();
                 }
                 Err(e) => {
-                    set_error.set(Some(format!("Grant failed: {}", format_server_error(&e),)));
+                    set_error.set(Some(format!("Grant failed: {}", format_server_error(&e))));
                 }
             }
         });

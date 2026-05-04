@@ -6,26 +6,35 @@
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{
-    signal_name_from_exit_code, ContainerId, ContainerInspectDetails, ContainerState, ExecEvent,
-    ExecEventStream, HealthDetail, ImageInfo, NetworkAttachmentDetail, PruneResult, Runtime,
-    WaitOutcome, WaitReason,
+    signal_name_from_exit_code, ArchivePutOptions, ArchiveStream, CommitOptions, CommitOutcome,
+    ContainerId, ContainerInspectDetails, ContainerResourceUpdate, ContainerState,
+    ContainerUpdateOutcome, ExecEvent, ExecEventStream, ExecHandle, ExecOptions, ExecPtyStream,
+    HealthDetail, ImageExportStream, ImageHistoryEntry, ImageInfo, ImageInspectInfo,
+    ImageSearchResult, LoadProgress, LoadProgressStream, LogChannel, LogChunk, LogsStream,
+    LogsStreamOptions, NetworkAttachmentDetail, PathStat, PruneResult, PullProgress,
+    PullProgressStream, Runtime, StatsSample, StatsStream, WaitCondition, WaitOutcome, WaitReason,
 };
 use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
-use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, ImageInspect, PortBinding,
+    ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, CreateImageInfo,
+    DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect, PortBinding,
     RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, StatsOptions, StopContainerOptions, WaitContainerOptions,
+    RenameContainerOptionsBuilder, StartContainerOptions, StatsOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::Docker;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::instrument;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::{PullPolicy, RegistryAuth, RegistryAuthType, ServiceSpec};
@@ -267,6 +276,25 @@ fn extract_local_digest(inspect: &ImageInspect, repo_name: &str) -> Option<Strin
             None
         }
     })
+}
+
+/// Build the `Config.Labels` map for a container from `spec.labels`.
+///
+/// Returns `None` when no labels are set so we hand the daemon a missing
+/// `Labels` field rather than an empty object — bollard's
+/// [`ContainerCreateBody::labels`] is `Option<HashMap<_, _>>` and the daemon
+/// treats `None` and an empty map equivalently, but `None` keeps the wire
+/// payload minimal.
+///
+/// The map is forwarded verbatim. Callers that need to stamp reserved-key
+/// labels (e.g. `com.zlayer.container_id`) onto the container must inject
+/// them into `spec.labels` before invoking [`Runtime::create_container`].
+fn build_labels(spec: &ServiceSpec) -> Option<HashMap<String, String>> {
+    if spec.labels.is_empty() {
+        None
+    } else {
+        Some(spec.labels.clone())
+    }
 }
 
 /// Build exposed ports list for Docker container config
@@ -852,6 +880,7 @@ impl Runtime for DockerRuntime {
             } else {
                 Some(exposed_ports)
             },
+            labels: build_labels(spec),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -1309,6 +1338,158 @@ impl Runtime for DockerRuntime {
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
+    /// Start a long-lived interactive exec session against a running
+    /// container.
+    ///
+    /// Mirrors Docker's two-step flow: `POST /containers/{id}/exec` to mint
+    /// the exec instance, then `POST /exec/{id}/start` with `Detach: false,
+    /// Tty: <opts.tty>` to upgrade the HTTP connection into a hijacked
+    /// duplex stream. The returned [`ExecHandle`] bundles three independent
+    /// halves the caller drives concurrently:
+    ///
+    /// - `stream` — bollard's split `output` (`Stream<LogOutput>`) and
+    ///   `input` (`AsyncWrite`) stitched together via [`ExecPtyDuplex`] so
+    ///   the caller sees a single `AsyncRead + AsyncWrite` byte channel.
+    /// - `resize` — an `mpsc::Receiver<(rows, cols)>` drained by a spawned
+    ///   task that calls `Docker::resize_exec` for every tick. The bound is
+    ///   small (`8`) on purpose: resize events are bursty (each xterm
+    ///   resize fires a flurry of `SIGWINCH`-driven sends), and dropping
+    ///   the older sizes is fine because only the latest geometry matters.
+    /// - `exit` — a `Pin<Box<dyn Future<...>>>` that resolves once the
+    ///   bollard output stream EOFs. We then call `inspect_exec` to read
+    ///   the actual exit code (Docker only reports it through the inspect
+    ///   endpoint; the hijacked stream itself just closes).
+    #[instrument(
+        skip(self, opts),
+        fields(
+            otel.name = "container.exec_pty",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            tty = opts.tty,
+        )
+    )]
+    async fn exec_pty(&self, id: &ContainerId, opts: ExecOptions) -> Result<ExecHandle> {
+        let name = container_name(id);
+
+        let create_opts = build_create_exec_options(&opts);
+
+        let exec_created = self
+            .docker
+            .create_exec(&name, create_opts)
+            .await
+            .map_err(|e| AgentError::NotFound {
+                container: name.clone(),
+                reason: format!("failed to create exec: {e}"),
+            })?;
+
+        // Force `detach: false` — a detached start would return
+        // `StartExecResults::Detached` and leave us with no I/O channels,
+        // which is incompatible with the `ExecHandle` contract. The `tty`
+        // flag has to match what we passed to `create_exec`; bollard
+        // doesn't enforce that for us.
+        let start_result = self
+            .docker
+            .start_exec(
+                &exec_created.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    tty: opts.tty,
+                    output_capacity: None,
+                }),
+            )
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to start exec: {e}")))?;
+
+        let (output, input) = match start_result {
+            StartExecResults::Attached { output, input } => (output, input),
+            StartExecResults::Detached => {
+                return Err(AgentError::Internal(
+                    "exec started in detached mode despite detach=false".into(),
+                ));
+            }
+        };
+
+        let duplex = ExecPtyDuplex {
+            output,
+            input,
+            current_chunk: bytes::Bytes::new(),
+            output_done: false,
+        };
+        let stream: ExecPtyStream = Box::new(duplex);
+
+        // Resize task: drain the receiver and forward every (rows, cols)
+        // pair to Docker. The channel closes when the caller drops the
+        // sender (typically when the session ends), at which point this
+        // task naturally exits.
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+        let docker_for_resize = self.docker.clone();
+        let exec_id_for_resize = exec_created.id.clone();
+        let container_for_resize = name.clone();
+        tokio::spawn(async move {
+            while let Some((rows, cols)) = resize_rx.recv().await {
+                let opts = resize_options_for(rows, cols);
+                if let Err(e) = docker_for_resize
+                    .resize_exec(&exec_id_for_resize, opts)
+                    .await
+                {
+                    // Docker returns 404 if the exec already exited, which
+                    // is benign — log at debug so noisy resizes after exit
+                    // don't pollute warn-level logs.
+                    tracing::debug!(
+                        container = %container_for_resize,
+                        rows = rows,
+                        cols = cols,
+                        error = %e,
+                        "resize_exec failed (exec may have exited)"
+                    );
+                }
+            }
+        });
+
+        // Exit future: spun up here so the boxed future can own its handles
+        // independently of the duplex stream. Note we cannot `await` the
+        // bollard output stream from inside this future because the stream
+        // is already moved into the duplex — instead, the exit future
+        // polls a oneshot signalled by the caller's reader hitting EOF.
+        //
+        // To keep things simple and avoid forcing the caller to manually
+        // notify EOF, we instead poll `inspect_exec` periodically until
+        // the exec reports `running == Some(false)`. That's exactly how
+        // Docker CLI's `docker exec -it` waits for completion, and it
+        // tolerates the caller dropping the duplex stream without ever
+        // reading to EOF.
+        let docker_for_exit = self.docker.clone();
+        let exec_id_for_exit = exec_created.id.clone();
+        let exit: crate::runtime::ExecExitFuture = Box::pin(async move {
+            // Polling cadence: 100ms is fast enough to feel instant for
+            // interactive shells (a `exit` typed at the prompt is usually
+            // observed within 1–2 ticks) and slow enough that the daemon
+            // doesn't burn cycles inspecting a quiescent exec.
+            let interval = Duration::from_millis(100);
+            loop {
+                match docker_for_exit.inspect_exec(&exec_id_for_exit).await {
+                    Ok(inspect) => {
+                        if inspect.running == Some(false) {
+                            return Ok(extract_exec_exit_code(&inspect));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(AgentError::Internal(format!(
+                            "failed to inspect exec for exit code: {e}"
+                        )));
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+
+        Ok(ExecHandle {
+            stream,
+            resize: resize_tx,
+            exit,
+        })
+    }
+
     /// Get container resource statistics (CPU and memory)
     #[instrument(
         skip(self),
@@ -1511,6 +1692,152 @@ impl Runtime for DockerRuntime {
             signal,
             finished_at,
         })
+    }
+
+    /// Wait for a container to reach a specific [`WaitCondition`].
+    ///
+    /// Forwards the condition to bollard's `wait_container` via
+    /// [`WaitContainerOptions::condition`] so Docker's native
+    /// `not-running | next-exit | removed` semantics are respected, then
+    /// reuses [`Runtime::wait_outcome`]'s post-wait inspect to produce a
+    /// classified [`WaitOutcome`].
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.wait_outcome_with_condition",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            wait.condition = %condition.as_wire_str(),
+        )
+    )]
+    async fn wait_outcome_with_condition(
+        &self,
+        id: &ContainerId,
+        condition: WaitCondition,
+    ) -> Result<WaitOutcome> {
+        let name = container_name(id);
+
+        let options = WaitContainerOptions {
+            condition: condition.as_wire_str().to_string(),
+        };
+
+        let mut stream = self.docker.wait_container(&name, Some(options));
+
+        let wait_response = stream
+            .next()
+            .await
+            .ok_or_else(|| AgentError::NotFound {
+                container: name.clone(),
+                reason: "wait stream closed unexpectedly".to_string(),
+            })?
+            .map_err(|e| AgentError::NotFound {
+                container: name.clone(),
+                reason: format!("failed to wait for container: {e}"),
+            })?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let exit_code_from_wait = wait_response.status_code as i32;
+
+        // For `Removed`, the container is gone by definition: we cannot
+        // inspect it. Emit a minimal `Exited` outcome carrying just the
+        // wait-stream exit code.
+        if matches!(condition, WaitCondition::Removed) {
+            return Ok(WaitOutcome::exited(exit_code_from_wait));
+        }
+
+        // Otherwise reuse the same inspect-and-classify path as
+        // `wait_outcome` to populate `reason`/`signal`/`finished_at`.
+        let inspect = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .map_err(|e| AgentError::NotFound {
+                container: name.clone(),
+                reason: format!("failed to inspect container after wait: {e}"),
+            })?;
+
+        let state = inspect.state.unwrap_or_default();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let exit_code = state.exit_code.map_or(exit_code_from_wait, |c| c as i32);
+
+        let oom = state.oom_killed.unwrap_or(false);
+        let error = state.error.unwrap_or_default();
+        let error_trimmed = error.trim();
+
+        let (reason, signal) = if oom {
+            (WaitReason::OomKilled, None)
+        } else if let Some(sig) = signal_name_from_exit_code(exit_code) {
+            (WaitReason::Signal, Some(sig))
+        } else if !error_trimmed.is_empty() && exit_code == 0 {
+            (WaitReason::RuntimeError, None)
+        } else {
+            (WaitReason::Exited, None)
+        };
+
+        let finished_at = state.finished_at.as_deref().and_then(|s| {
+            if s.starts_with("0001-") || s.is_empty() {
+                None
+            } else {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }
+        });
+
+        Ok(WaitOutcome {
+            exit_code,
+            reason,
+            signal,
+            finished_at,
+        })
+    }
+
+    /// Rename a Docker container via bollard's `POST /containers/{id}/rename`
+    /// endpoint.
+    ///
+    /// Looks up the container by its `ContainerId`-derived name and asks
+    /// the daemon to assign `new_name`. Docker enforces the name's validity
+    /// and uniqueness, so any rejection (already-taken, invalid characters,
+    /// container missing) surfaces as a [`BollardError`] that is mapped to
+    /// [`AgentError::NotFound`] for "missing" cases and
+    /// [`AgentError::Internal`] otherwise.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.rename",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            new_name = %new_name,
+        )
+    )]
+    async fn rename_container(&self, id: &ContainerId, new_name: &str) -> Result<()> {
+        let current = container_name(id);
+
+        let options = RenameContainerOptionsBuilder::default()
+            .name(new_name)
+            .build();
+
+        self.docker
+            .rename_container(&current, options)
+            .await
+            .map_err(|e| match &e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: current.clone(),
+                    reason: format!("rename target not found: {e}"),
+                },
+                _ => AgentError::Internal(format!("failed to rename container: {e}")),
+            })?;
+
+        tracing::info!(
+            container = %current,
+            new_name = %new_name,
+            "renamed Docker container",
+        );
+
+        Ok(())
     }
 
     /// Get all container logs as a vector of lines
@@ -1756,6 +2083,337 @@ impl Runtime for DockerRuntime {
     #[instrument(
         skip(self),
         fields(
+            otel.name = "container.pause",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn pause_container(&self, id: &ContainerId) -> Result<()> {
+        let name = container_name(id);
+        self.docker
+            .pause_container(&name)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => {
+                    AgentError::Internal(format!("failed to pause container '{name}': {other}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.unpause",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn unpause_container(&self, id: &ContainerId) -> Result<()> {
+        let name = container_name(id);
+        self.docker
+            .unpause_container(&name)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => {
+                    AgentError::Internal(format!("failed to unpause container '{name}': {other}"))
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Update a container's runtime resource limits and restart policy.
+    ///
+    /// Forwards to bollard's `update_container` with a populated
+    /// [`ContainerUpdateBody`]. Empty updates short-circuit before the
+    /// daemon roundtrip — Docker still accepts them, but skipping the
+    /// network call keeps idle paths cheap and avoids spurious 200s
+    /// in the access log.
+    ///
+    /// Errors map the same way as the other lifecycle endpoints: a
+    /// 404 response from the Docker daemon turns into
+    /// [`AgentError::NotFound`], everything else becomes
+    /// [`AgentError::Internal`] with the original message preserved.
+    /// Docker doesn't return any warnings on update success, so the
+    /// returned [`ContainerUpdateOutcome`] always has an empty
+    /// `warnings` vector.
+    #[instrument(
+        skip(self, update),
+        fields(
+            otel.name = "container.update",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn update_container_resources(
+        &self,
+        id: &ContainerId,
+        update: &ContainerResourceUpdate,
+    ) -> Result<ContainerUpdateOutcome> {
+        let name = container_name(id);
+        if update.is_empty() {
+            return Ok(ContainerUpdateOutcome::default());
+        }
+
+        let restart_policy = update.restart_policy.as_ref().map(|rp| {
+            let name_enum = rp.name.as_deref().and_then(|s| match s {
+                "" => Some(RestartPolicyNameEnum::EMPTY),
+                "no" => Some(RestartPolicyNameEnum::NO),
+                "always" => Some(RestartPolicyNameEnum::ALWAYS),
+                "unless-stopped" => Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                "on-failure" => Some(RestartPolicyNameEnum::ON_FAILURE),
+                _ => None,
+            });
+            RestartPolicy {
+                name: name_enum,
+                maximum_retry_count: rp.maximum_retry_count,
+            }
+        });
+
+        let body = ContainerUpdateBody {
+            cpu_shares: update.cpu_shares,
+            memory: update.memory,
+            cpu_period: update.cpu_period,
+            cpu_quota: update.cpu_quota,
+            cpu_realtime_period: update.cpu_realtime_period,
+            cpu_realtime_runtime: update.cpu_realtime_runtime,
+            cpuset_cpus: update.cpuset_cpus.clone(),
+            cpuset_mems: update.cpuset_mems.clone(),
+            memory_reservation: update.memory_reservation,
+            memory_swap: update.memory_swap,
+            blkio_weight: update.blkio_weight,
+            pids_limit: update.pids_limit,
+            restart_policy,
+            ..Default::default()
+        };
+
+        self.docker
+            .update_container(&name, body)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                BollardError::DockerResponseServerError {
+                    status_code: 400,
+                    message,
+                } => AgentError::InvalidSpec(message),
+                other => {
+                    AgentError::Internal(format!("failed to update container '{name}': {other}"))
+                }
+            })?;
+
+        // Surface a single advisory warning when the caller passed
+        // `kernel_memory` — bollard's `ContainerUpdateBody` doesn't
+        // expose a kernel-memory field anymore (Docker deprecated it
+        // upstream), so we accept it on the wire but never forward it.
+        let mut warnings = Vec::new();
+        if update.kernel_memory.is_some() {
+            warnings.push(
+                "KernelMemory is deprecated upstream and was not forwarded to the daemon".into(),
+            );
+        }
+        Ok(ContainerUpdateOutcome { warnings })
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.top",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn top_container(
+        &self,
+        id: &ContainerId,
+        ps_args: &[String],
+    ) -> Result<crate::runtime::ContainerTopOutput> {
+        use bollard::query_parameters::TopOptionsBuilder;
+        let name = container_name(id);
+        let options = if ps_args.is_empty() {
+            None
+        } else {
+            // Bollard accepts a single `ps_args` string; join the user's argv
+            // with spaces (Docker's daemon does the same on the wire).
+            Some(TopOptionsBuilder::new().ps_args(&ps_args.join(" ")).build())
+        };
+        let response = self
+            .docker
+            .top_processes(&name, options)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => AgentError::Internal(format!("failed to top container '{name}': {other}")),
+            })?;
+        Ok(crate::runtime::ContainerTopOutput {
+            titles: response.titles.unwrap_or_default(),
+            processes: response.processes.unwrap_or_default(),
+        })
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.changes",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn changes_container(
+        &self,
+        id: &ContainerId,
+    ) -> Result<Vec<crate::runtime::FilesystemChangeEntry>> {
+        use crate::runtime::{FilesystemChangeEntry, FilesystemChangeKind};
+        use bollard::models::ChangeType;
+        let name = container_name(id);
+        let changes = self
+            .docker
+            .container_changes(&name)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => AgentError::Internal(format!(
+                    "failed to fetch changes for container '{name}': {other}"
+                )),
+            })?
+            .unwrap_or_default();
+        Ok(changes
+            .into_iter()
+            .map(|change| {
+                // Bollard exposes `ChangeType` as a `#[repr(i32)]` enum with
+                // `_0`, `_1`, `_2` variants matching Docker's wire integers.
+                let kind = match change.kind {
+                    ChangeType::_0 => FilesystemChangeKind::Modified,
+                    ChangeType::_1 => FilesystemChangeKind::Added,
+                    ChangeType::_2 => FilesystemChangeKind::Deleted,
+                };
+                FilesystemChangeEntry {
+                    path: change.path,
+                    kind,
+                }
+            })
+            .collect())
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.port",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn port_mappings_container(
+        &self,
+        id: &ContainerId,
+    ) -> Result<Vec<crate::runtime::PortMappingEntry>> {
+        use crate::runtime::PortMappingEntry;
+        let name = container_name(id);
+        let inspect = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => {
+                    AgentError::Internal(format!("failed to inspect container '{name}': {other}"))
+                }
+            })?;
+
+        let mut out = Vec::new();
+        let Some(port_map) = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.ports.as_ref())
+        else {
+            return Ok(out);
+        };
+        for (key, maybe_bindings) in port_map {
+            let Some((container_port, protocol)) = parse_port_key(key) else {
+                continue;
+            };
+            let proto_str = protocol.as_str().to_string();
+            match maybe_bindings {
+                Some(bindings) if !bindings.is_empty() => {
+                    for binding in bindings {
+                        let host_ip = binding.host_ip.as_ref().filter(|s| !s.is_empty()).cloned();
+                        let host_port = binding
+                            .host_port
+                            .as_deref()
+                            .and_then(|s| s.parse::<u16>().ok());
+                        out.push(PortMappingEntry {
+                            container_port,
+                            protocol: proto_str.clone(),
+                            host_ip,
+                            host_port,
+                        });
+                    }
+                }
+                _ => {
+                    out.push(PortMappingEntry {
+                        container_port,
+                        protocol: proto_str,
+                        host_ip: None,
+                        host_port: None,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[instrument(skip(self), fields(otel.name = "container.prune"))]
+    async fn prune_containers(&self) -> Result<crate::runtime::ContainerPruneResult> {
+        let response = self
+            .docker
+            .prune_containers(None::<bollard::query_parameters::PruneContainersOptions>)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to prune containers: {e}")))?;
+        let deleted = response.containers_deleted.unwrap_or_default();
+        let space_reclaimed = response
+            .space_reclaimed
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+        Ok(crate::runtime::ContainerPruneResult {
+            deleted,
+            space_reclaimed,
+        })
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
             otel.name = "image.tag",
             source = %source,
             target = %target,
@@ -1833,6 +2491,566 @@ impl Runtime for DockerRuntime {
             })?;
 
         Ok(translate_inspect_details(&inspect))
+    }
+
+    /// Stream container logs as `LogChunk`s, mirroring `GET /containers/{id}/logs`.
+    ///
+    /// Translates `LogsStreamOptions` into bollard's `LogsOptions`, opens the
+    /// bollard log stream, and pumps each `LogOutput` frame into an mpsc
+    /// channel as a `LogChunk` tagged with the appropriate `LogChannel`. The
+    /// returned stream is `'static` so callers can hold it past the trait
+    /// method's borrow of `self`.
+    #[instrument(
+        skip(self, opts),
+        fields(
+            otel.name = "container.logs_stream",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            follow = opts.follow,
+            tail = ?opts.tail,
+            since = ?opts.since,
+            until = ?opts.until,
+            timestamps = opts.timestamps,
+            stdout = opts.stdout,
+            stderr = opts.stderr,
+        )
+    )]
+    async fn logs_stream(&self, id: &ContainerId, opts: LogsStreamOptions) -> Result<LogsStream> {
+        let name = container_name(id);
+        let bollard_opts = build_logs_options(&opts);
+        let want_timestamps = opts.timestamps;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<LogChunk>>(256);
+        let docker = self.docker.clone();
+        let container_name_for_task = name.clone();
+
+        tokio::spawn(async move {
+            let mut stream = docker.logs(&container_name_for_task, Some(bollard_opts));
+            while let Some(result) = stream.next().await {
+                let send_result = match result {
+                    Ok(log_output) => {
+                        let chunk = log_output_to_chunk(log_output, want_timestamps);
+                        tx.send(Ok(chunk)).await
+                    }
+                    Err(e) => {
+                        let err = AgentError::NotFound {
+                            container: container_name_for_task.clone(),
+                            reason: format!("failed to read logs: {e}"),
+                        };
+                        let _ = tx.send(Err(err)).await;
+                        break;
+                    }
+                };
+                if send_result.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// Stream periodic `StatsSample` snapshots, mirroring the streaming form of
+    /// `GET /containers/{id}/stats`.
+    ///
+    /// Drives bollard's `stats` stream (`stream: true, one_shot: false`),
+    /// translates each `ContainerStatsResponse` into a `StatsSample`, and
+    /// forwards it through an mpsc channel.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.stats_stream",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn stats_stream(&self, id: &ContainerId) -> Result<StatsStream> {
+        let name = container_name(id);
+        let options = StatsOptions {
+            stream: true,
+            one_shot: false,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StatsSample>>(64);
+        let docker = self.docker.clone();
+        let container_name_for_task = name.clone();
+
+        tokio::spawn(async move {
+            let mut stream = docker.stats(&container_name_for_task, Some(options));
+            while let Some(result) = stream.next().await {
+                let send_result = match result {
+                    Ok(response) => {
+                        let sample = translate_stats_sample(&response);
+                        tx.send(Ok(sample)).await
+                    }
+                    Err(e) => {
+                        let err = AgentError::NotFound {
+                            container: container_name_for_task.clone(),
+                            reason: format!("failed to read stats: {e}"),
+                        };
+                        let _ = tx.send(Err(err)).await;
+                        break;
+                    }
+                };
+                if send_result.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// Pull an image with streaming progress events, mirroring `POST /images/create`.
+    ///
+    /// Translates inline `RegistryAuth` into bollard's `DockerCredentials`,
+    /// drives bollard's `create_image` stream, and emits one
+    /// `PullProgress::Status` per `CreateImageInfo` frame followed by exactly
+    /// one `PullProgress::Done` when the underlying stream closes without
+    /// error. Errors mid-pull surface as `Err` items on the stream and
+    /// terminate it.
+    #[instrument(
+        skip(self, auth),
+        fields(
+            otel.name = "image.pull_stream",
+            container.image.name = %image,
+            inline_auth = auth.is_some(),
+        )
+    )]
+    async fn pull_image_stream(
+        &self,
+        image: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> Result<PullProgressStream> {
+        let (name, tag) = match ImageReference::from_str(image) {
+            Ok(r) => (
+                format!("{}/{}", r.registry(), r.repository()),
+                r.tag().unwrap_or("latest").to_string(),
+            ),
+            Err(_) => (image.to_string(), "latest".to_string()),
+        };
+
+        let options = CreateImageOptions {
+            from_image: Some(name.clone()),
+            tag: if tag.is_empty() { None } else { Some(tag) },
+            ..Default::default()
+        };
+
+        let credentials = auth.map(docker_credentials_from_registry_auth);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<PullProgress>>(64);
+        let docker = self.docker.clone();
+        let image_for_task = image.to_string();
+
+        tokio::spawn(async move {
+            let mut stream = docker.create_image(Some(options), None, credentials);
+            // Track the most recent digest seen on the wire so the final
+            // `Done` event can carry it. Docker emits a `Digest: sha256:...`
+            // status line near the end of every successful pull.
+            let mut last_digest: Option<String> = None;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(info) => {
+                        if let Some(digest) = extract_digest_from_status(info.status.as_deref()) {
+                            last_digest = Some(digest);
+                        }
+                        let progress = translate_pull_progress(info);
+                        if tx.send(Ok(progress)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let err = AgentError::PullFailed {
+                            image: image_for_task.clone(),
+                            reason: e.to_string(),
+                        };
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                }
+            }
+
+            // Stream closed without error — emit the final Done event.
+            let _ = tx
+                .send(Ok(PullProgress::Done {
+                    reference: image_for_task.clone(),
+                    digest: last_digest,
+                }))
+                .await;
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// Stream a TAR archive of `path` inside the container.
+    ///
+    /// Forwards to bollard's `download_from_container`, which returns a
+    /// chunked stream of `application/x-tar` bytes. Errors emitted by
+    /// bollard are translated into [`AgentError`] and surfaced on the
+    /// returned stream so callers see them mid-stream.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.archive_get",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            archive.path = %path,
+        )
+    )]
+    async fn archive_get(&self, id: &ContainerId, path: &str) -> Result<ArchiveStream> {
+        use bollard::query_parameters::DownloadFromContainerOptionsBuilder;
+        let name = container_name(id);
+        let options = DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+        // Probe with HEAD first so we surface a clean `NotFound` for missing
+        // paths instead of letting the error appear mid-stream.
+        let _ = self.archive_head(id, path).await?;
+        let stream = self.docker.download_from_container(&name, Some(options));
+        let mapped = stream.map(|item| {
+            item.map_err(|e| AgentError::Internal(format!("archive_get stream error: {e}")))
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    /// Extract a TAR archive into the container at `path`.
+    #[instrument(
+        skip(self, tar_bytes),
+        fields(
+            otel.name = "container.archive_put",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            archive.path = %path,
+            archive.bytes = tar_bytes.len(),
+        )
+    )]
+    async fn archive_put(
+        &self,
+        id: &ContainerId,
+        path: &str,
+        tar_bytes: bytes::Bytes,
+        opts: ArchivePutOptions,
+    ) -> Result<()> {
+        use bollard::query_parameters::UploadToContainerOptionsBuilder;
+        let name = container_name(id);
+        let options = UploadToContainerOptionsBuilder::default()
+            .path(path)
+            .no_overwrite_dir_non_dir(if opts.no_overwrite_dir_non_dir {
+                "1"
+            } else {
+                "0"
+            })
+            .copy_uidgid(if opts.copy_uid_gid { "1" } else { "0" })
+            .build();
+        self.docker
+            .upload_to_container(&name, Some(options), bollard::body_full(tar_bytes))
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' or path '{path}' not found"),
+                },
+                BollardError::DockerResponseServerError {
+                    status_code: 400 | 403,
+                    message,
+                } => AgentError::InvalidSpec(message),
+                other => AgentError::Internal(format!(
+                    "failed to upload archive to container '{name}': {other}"
+                )),
+            })?;
+        Ok(())
+    }
+
+    /// Return path-stat metadata for `path` inside the container.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.archive_head",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            archive.path = %path,
+        )
+    )]
+    async fn archive_head(&self, id: &ContainerId, path: &str) -> Result<PathStat> {
+        use bollard::query_parameters::ContainerArchiveInfoOptionsBuilder;
+        let name = container_name(id);
+        let options = ContainerArchiveInfoOptionsBuilder::default()
+            .path(path)
+            .build();
+        let stat = self
+            .docker
+            .get_container_archive_info(&name, Some(options))
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("path '{path}' not found in container '{name}'"),
+                },
+                other => AgentError::Internal(format!(
+                    "failed to stat path '{path}' in container '{name}': {other}"
+                )),
+            })?;
+        Ok(PathStat {
+            name: stat.name,
+            size: stat.size,
+            mode: stat.file_mode,
+            mtime: stat.modification_time,
+            link_target: stat.link_target,
+        })
+    }
+
+    #[instrument(skip(self), fields(otel.name = "image.inspect", container.image.name = %image))]
+    async fn inspect_image_native(&self, image: &str) -> Result<ImageInspectInfo> {
+        let inspect = self
+            .docker
+            .inspect_image(image)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: image.to_string(),
+                    reason: format!("image '{image}' not found"),
+                },
+                other => {
+                    AgentError::Internal(format!("failed to inspect image '{image}': {other}"))
+                }
+            })?;
+        Ok(translate_image_inspect(inspect))
+    }
+
+    #[instrument(skip(self), fields(otel.name = "image.history", container.image.name = %image))]
+    async fn image_history(&self, image: &str) -> Result<Vec<ImageHistoryEntry>> {
+        let history = self
+            .docker
+            .image_history(image)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: image.to_string(),
+                    reason: format!("image '{image}' not found"),
+                },
+                other => AgentError::Internal(format!("failed to fetch image history: {other}")),
+            })?;
+        Ok(history
+            .into_iter()
+            .map(|item| ImageHistoryEntry {
+                id: item.id,
+                created: item.created,
+                created_by: item.created_by,
+                tags: item.tags,
+                size: u64::try_from(item.size).unwrap_or(0),
+                comment: item.comment,
+            })
+            .collect())
+    }
+
+    #[instrument(skip(self), fields(otel.name = "image.search", search.term = %term, search.limit = %limit))]
+    async fn search_images(&self, term: &str, limit: u32) -> Result<Vec<ImageSearchResult>> {
+        use bollard::query_parameters::SearchImagesOptionsBuilder;
+        if term.trim().is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "search term must not be empty".to_string(),
+            ));
+        }
+        let mut builder = SearchImagesOptionsBuilder::default().term(term);
+        if limit > 0 {
+            builder = builder.limit(i32::try_from(limit).unwrap_or(i32::MAX));
+        }
+        let options = builder.build();
+        let results = self.docker.search_images(options).await.map_err(|e| {
+            AgentError::Internal(format!("failed to search images for '{term}': {e}"))
+        })?;
+        Ok(results
+            .into_iter()
+            .map(|item| ImageSearchResult {
+                name: item.name.unwrap_or_default(),
+                description: item.description.unwrap_or_default(),
+                star_count: u64::try_from(item.star_count.unwrap_or(0)).unwrap_or(0),
+                official: item.is_official.unwrap_or(false),
+                automated: item.is_automated.unwrap_or(false),
+            })
+            .collect())
+    }
+
+    #[instrument(skip(self, names), fields(otel.name = "image.save", count = names.len()))]
+    async fn save_images(&self, names: &[String]) -> Result<ImageExportStream> {
+        if names.is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "save_images requires at least one image reference".to_string(),
+            ));
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // bollard's `export_images` borrows the slice for the lifetime of the
+        // stream, so collect it eagerly here. The stream itself is `'static`
+        // — bollard returns chunks via process_into_body which is owned.
+        let stream = self.docker.export_images(&refs);
+        let mapped = stream.map(|res| {
+            res.map_err(|e| AgentError::Internal(format!("image export stream error: {e}")))
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    #[instrument(skip(self, tar_bytes), fields(otel.name = "image.load", quiet = %quiet, bytes = tar_bytes.len()))]
+    async fn load_images(
+        &self,
+        tar_bytes: bytes::Bytes,
+        quiet: bool,
+    ) -> Result<LoadProgressStream> {
+        use bollard::query_parameters::ImportImageOptionsBuilder;
+        let options = ImportImageOptionsBuilder::default().quiet(quiet).build();
+        let body = bollard::body_full(tar_bytes);
+        let stream = self.docker.import_image(options, body, None);
+        let mapped = stream.map(|res| {
+            res.map_err(|e| AgentError::Internal(format!("image load stream error: {e}")))
+                .map(|info| {
+                    if let Some(stream_msg) = info.stream {
+                        // Docker's load endpoint emits "Loaded image: foo:latest\n"
+                        // lines. The terminal `Done` is synthesised by the API
+                        // handler from the cumulative loaded references; here
+                        // we surface every line as a Status event.
+                        let trimmed = stream_msg.trim();
+                        LoadProgress::Status {
+                            id: None,
+                            status: trimmed.to_string(),
+                        }
+                    } else if let Some(status_msg) = info.status {
+                        LoadProgress::Status {
+                            id: info.id,
+                            status: status_msg,
+                        }
+                    } else {
+                        LoadProgress::Status {
+                            id: info.id,
+                            status: String::new(),
+                        }
+                    }
+                })
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    #[instrument(skip(self, tar_bytes), fields(otel.name = "image.import", repo = ?repo, tag = ?tag, bytes = tar_bytes.len()))]
+    async fn import_image(
+        &self,
+        tar_bytes: bytes::Bytes,
+        repo: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<String> {
+        // Docker's `POST /images/create?fromSrc=-` import path is exposed
+        // by bollard via `create_image` with a body. We use `import_image`
+        // for the load-style entrypoint and post-tag the result. The
+        // simpler bollard surface is `commit_container`-style: build the
+        // image via `import_image` (which actually targets `/images/load`)
+        // and let Docker auto-tag. For a dedicated import we instead use
+        // bollard's `import_image` and parse the stream for the resulting
+        // image id, then optionally tag it.
+        use bollard::query_parameters::ImportImageOptionsBuilder;
+        let options = ImportImageOptionsBuilder::default().build();
+        let body = bollard::body_full(tar_bytes);
+        let mut stream = self.docker.import_image(options, body, None);
+        let mut last_id: Option<String> = None;
+        while let Some(item) = stream.next().await {
+            let info =
+                item.map_err(|e| AgentError::Internal(format!("image import stream error: {e}")))?;
+            if let Some(id) = info.id {
+                last_id = Some(id);
+            } else if let Some(stream_msg) = info.stream {
+                // Older daemons report "Loaded image ID: sha256:..." on
+                // stream lines — extract the digest if so.
+                if let Some(digest) = extract_loaded_id(&stream_msg) {
+                    last_id = Some(digest);
+                }
+            }
+        }
+        let id = last_id.ok_or_else(|| {
+            AgentError::Internal("import_image stream produced no image id".to_string())
+        })?;
+        if let Some(repo) = repo.filter(|s| !s.trim().is_empty()) {
+            let target = match tag.filter(|s| !s.trim().is_empty()) {
+                Some(t) => format!("{repo}:{t}"),
+                None => format!("{repo}:latest"),
+            };
+            self.tag_image(&id, &target).await?;
+        }
+        Ok(id)
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.export",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn export_container_fs(&self, id: &ContainerId) -> Result<ImageExportStream> {
+        let name = container_name(id);
+        let stream = self.docker.export_container(&name);
+        let mapped = stream.map(|res| {
+            res.map_err(|e| AgentError::Internal(format!("container export stream error: {e}")))
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    #[instrument(
+        skip(self, opts),
+        fields(
+            otel.name = "container.commit",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn commit_container(
+        &self,
+        id: &ContainerId,
+        opts: &CommitOptions,
+    ) -> Result<CommitOutcome> {
+        use bollard::query_parameters::CommitContainerOptionsBuilder;
+        let name = container_name(id);
+        let mut builder = CommitContainerOptionsBuilder::default()
+            .container(&name)
+            .pause(opts.pause);
+        if let Some(repo) = opts.repo.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.repo(repo);
+        }
+        if let Some(tag) = opts.tag.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.tag(tag);
+        }
+        if let Some(comment) = opts.comment.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.comment(comment);
+        }
+        if let Some(author) = opts.author.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.author(author);
+        }
+        if let Some(changes) = opts.changes.as_deref().filter(|s| !s.is_empty()) {
+            builder = builder.changes(changes);
+        }
+        let options = builder.build();
+        let config = bollard::models::ContainerConfig::default();
+        let resp = self
+            .docker
+            .commit_container(options, config)
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => {
+                    AgentError::Internal(format!("failed to commit container '{name}': {other}"))
+                }
+            })?;
+        Ok(CommitOutcome { id: resp.id })
     }
 }
 
@@ -1978,6 +3196,468 @@ pub(crate) fn translate_inspect_details(
         ipv4,
         health,
         exit_code,
+    }
+}
+
+/// Translate a runtime-level [`LogsStreamOptions`] into bollard's
+/// [`LogsOptions`].
+///
+/// Mostly a 1:1 field copy. The runtime trait carries `since`/`until` as
+/// `i64` Unix seconds (matching the Docker Engine API), but bollard's stub
+/// types declare them as `i32` — large absolute timestamps are clamped to
+/// the `i32` range so we never silently wrap-around to a negative value.
+/// `tail = None` becomes the bollard sentinel `"all"`, mirroring the rest of
+/// the Docker logs API.
+fn build_logs_options(opts: &LogsStreamOptions) -> LogsOptions {
+    LogsOptions {
+        follow: opts.follow,
+        stdout: opts.stdout,
+        stderr: opts.stderr,
+        // i64 -> i32 saturating cast: any timestamp outside the i32 range is
+        // far enough in the past/future that clamping is harmless.
+        since: opts
+            .since
+            .map_or(0, |v| i32::try_from(v).unwrap_or(i32::MAX)),
+        until: opts
+            .until
+            .map_or(0, |v| i32::try_from(v).unwrap_or(i32::MAX)),
+        timestamps: opts.timestamps,
+        tail: opts
+            .tail
+            .map_or_else(|| "all".to_string(), |n| n.to_string()),
+    }
+}
+
+/// Translate a bollard `LogOutput` into the runtime-level [`LogChunk`] shape.
+///
+/// The four bollard variants map onto our three [`LogChannel`]s as follows:
+/// `StdOut → Stdout`, `StdErr → Stderr`, `StdIn → Stdin`,
+/// `Console → Stdout` (Docker emits `Console` only for tty-attached
+/// containers; treating it as stdout matches `docker logs`'s own
+/// non-multiplexed view).
+///
+/// `want_timestamps` controls whether [`LogChunk::timestamp`] is populated.
+/// The bollard frame itself doesn't carry a timestamp — Docker prepends one
+/// to the log line when the request set `timestamps=true`. Parsing that
+/// prefix is fragile (timezone, nanosecond precision, occasional
+/// non-RFC3339 lines) so we stamp the chunk with `Utc::now()` at receive
+/// time when timestamps were requested. This is consistent with the
+/// existing buffered `container_logs` / `get_logs` paths.
+fn log_output_to_chunk(
+    log_output: bollard::container::LogOutput,
+    want_timestamps: bool,
+) -> LogChunk {
+    let stream = match &log_output {
+        bollard::container::LogOutput::StdOut { .. }
+        | bollard::container::LogOutput::Console { .. } => LogChannel::Stdout,
+        bollard::container::LogOutput::StdErr { .. } => LogChannel::Stderr,
+        bollard::container::LogOutput::StdIn { .. } => LogChannel::Stdin,
+    };
+    let bytes = log_output.into_bytes();
+    let timestamp = if want_timestamps {
+        Some(chrono::Utc::now())
+    } else {
+        None
+    };
+    LogChunk {
+        stream,
+        bytes,
+        timestamp,
+    }
+}
+
+/// Translate a bollard [`ContainerStatsResponse`] into the runtime-level
+/// [`StatsSample`] shape.
+///
+/// Pulled out as a free function so it can be unit-tested without a live
+/// Docker daemon. Counters that the daemon doesn't report (e.g. memory
+/// limit on cgroups v2 hosts that omit the field, network stats on
+/// host-network containers) collapse to `0`, matching the trait's
+/// "missing data is signalled separately" contract. Network and block-IO
+/// counters sum across all interfaces / devices because `StatsSample`
+/// carries a single per-container total.
+fn translate_stats_sample(response: &ContainerStatsResponse) -> StatsSample {
+    let cpu_total_ns = response
+        .cpu_stats
+        .as_ref()
+        .and_then(|cs| cs.cpu_usage.as_ref())
+        .and_then(|u| u.total_usage)
+        .unwrap_or(0);
+
+    let cpu_system_ns = response
+        .cpu_stats
+        .as_ref()
+        .and_then(|cs| cs.system_cpu_usage)
+        .unwrap_or(0);
+
+    let online_cpus = response
+        .cpu_stats
+        .as_ref()
+        .and_then(|cs| cs.online_cpus)
+        .unwrap_or(0);
+
+    let mem_used_bytes = response
+        .memory_stats
+        .as_ref()
+        .and_then(|m| m.usage)
+        .unwrap_or(0);
+
+    let mem_limit_bytes = response
+        .memory_stats
+        .as_ref()
+        .and_then(|m| m.limit)
+        .unwrap_or(0);
+
+    // Network: sum rx_bytes / tx_bytes across every interface. Distinct
+    // long-form names sidestep `clippy::similar_names`'s "too close" check.
+    let (net_received_bytes, net_transmitted_bytes) =
+        response.networks.as_ref().map_or((0_u64, 0_u64), |nets| {
+            nets.values().fold((0_u64, 0_u64), |(rx_acc, tx_acc), n| {
+                (
+                    rx_acc.saturating_add(n.rx_bytes.unwrap_or(0)),
+                    tx_acc.saturating_add(n.tx_bytes.unwrap_or(0)),
+                )
+            })
+        });
+
+    // Block IO: sum bytes across `io_service_bytes_recursive` entries,
+    // splitting by op name. Docker reports per-op rows like
+    // `{ op: "Read", value: 12345 }` — case-insensitive match keeps us
+    // compatible with both cgroups v1 ("Read"/"Write") and any future
+    // capitalisation tweaks.
+    let (blkio_read_bytes, blkio_write_bytes) = response
+        .blkio_stats
+        .as_ref()
+        .and_then(|b| b.io_service_bytes_recursive.as_ref())
+        .map_or((0, 0), |entries| {
+            entries.iter().fold((0_u64, 0_u64), |(r, w), entry| {
+                let v = entry.value.unwrap_or(0);
+                match entry.op.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("read") => (r.saturating_add(v), w),
+                    Some("write") => (r, w.saturating_add(v)),
+                    _ => (r, w),
+                }
+            })
+        });
+
+    let pids_current = response
+        .pids_stats
+        .as_ref()
+        .and_then(|p| p.current)
+        .unwrap_or(0);
+
+    // Docker reports `limit: 0` to mean "no limit"; collapse that to None
+    // so the trait's contract ("`None` means unlimited") holds end-to-end.
+    let pids_limit = response
+        .pids_stats
+        .as_ref()
+        .and_then(|p| p.limit)
+        .filter(|&l| l > 0);
+
+    StatsSample {
+        cpu_total_ns,
+        cpu_system_ns,
+        online_cpus,
+        mem_used_bytes,
+        mem_limit_bytes,
+        net_rx_bytes: net_received_bytes,
+        net_tx_bytes: net_transmitted_bytes,
+        blkio_read_bytes,
+        blkio_write_bytes,
+        pids_current,
+        pids_limit,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// Translate a bollard [`CreateImageInfo`] frame into a
+/// [`PullProgress::Status`] event.
+///
+/// Bollard surfaces error frames separately by mapping
+/// `error_detail.message` into `BollardError::DockerStreamError` before they
+/// reach us, so this translator only sees progress / status frames.
+/// `progress` is left `None` because bollard's stub doesn't model the
+/// preformatted progress-bar string Docker sometimes emits — callers that
+/// want a bar can render one from `current`/`total`.
+fn translate_pull_progress(info: CreateImageInfo) -> PullProgress {
+    let CreateImageInfo {
+        id,
+        status,
+        progress_detail,
+        ..
+    } = info;
+    let (current, total) = progress_detail.map_or((None, None), |d| {
+        (
+            d.current.and_then(|v| u64::try_from(v).ok()),
+            d.total.and_then(|v| u64::try_from(v).ok()),
+        )
+    });
+    PullProgress::Status {
+        id,
+        status: status.unwrap_or_default(),
+        progress: None,
+        current,
+        total,
+    }
+}
+
+/// Pluck a `sha256:...` digest out of a Docker pull status line, when
+/// present.
+///
+/// Docker's `POST /images/create` stream includes a status line like
+/// `"Digest: sha256:abc..."` once per pull, just before the final
+/// `"Status: Downloaded newer image for ..."` line. Capturing it lets the
+/// `Done` event we synthesise carry the resolved digest without an extra
+/// round-trip to `inspect_image`.
+fn extract_digest_from_status(status: Option<&str>) -> Option<String> {
+    let s = status?.trim();
+    let prefix = "Digest:";
+    if !s.starts_with(prefix) {
+        return None;
+    }
+    let candidate = s[prefix.len()..].trim();
+    if candidate.starts_with("sha256:") || candidate.starts_with("sha512:") {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse a bollard `BuildInfo.stream` line emitted during `import_image`
+/// looking for `"Loaded image ID: sha256:..."`. Returns the digest when
+/// present, `None` otherwise. Used by [`DockerRuntime::import_image`] to
+/// recover the freshly-imported image id from the pre-engine-22.10 daemons
+/// that stream messages instead of populating `BuildInfo.id`.
+fn extract_loaded_id(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let prefix = "Loaded image ID:";
+    if let Some(after) = trimmed.strip_prefix(prefix) {
+        let candidate = after.trim();
+        if candidate.starts_with("sha256:") {
+            return Some(candidate.to_string());
+        }
+    }
+    let alt = "Loaded image:";
+    if let Some(after) = trimmed.strip_prefix(alt) {
+        let candidate = after.trim();
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Convert bollard's [`bollard::models::ImageInspect`] into the runtime-level
+/// [`ImageInspectInfo`] DTO. Pure translation: missing optional fields stay
+/// `None` / empty so the API/Docker shim can serialise them as Docker's
+/// canonical empty defaults.
+fn translate_image_inspect(inspect: bollard::models::ImageInspect) -> ImageInspectInfo {
+    let bollard::models::ImageInspect {
+        id,
+        repo_tags,
+        repo_digests,
+        comment,
+        created,
+        author,
+        config,
+        architecture,
+        os,
+        size,
+        root_fs,
+        ..
+    } = inspect;
+
+    let mut env = Vec::new();
+    let mut cmd = Vec::new();
+    let mut entrypoint = Vec::new();
+    let mut working_dir = None;
+    let mut user = None;
+    let mut labels = std::collections::BTreeMap::new();
+    if let Some(cfg) = config {
+        env = cfg.env.unwrap_or_default();
+        cmd = cfg.cmd.unwrap_or_default();
+        entrypoint = cfg.entrypoint.unwrap_or_default();
+        working_dir = cfg.working_dir.filter(|s| !s.is_empty());
+        user = cfg.user.filter(|s| !s.is_empty());
+        if let Some(ls) = cfg.labels {
+            for (k, v) in ls {
+                labels.insert(k, v);
+            }
+        }
+    }
+
+    let layers = root_fs
+        .map(|fs| fs.layers.unwrap_or_default())
+        .unwrap_or_default();
+
+    ImageInspectInfo {
+        id,
+        repo_tags: repo_tags.unwrap_or_default(),
+        repo_digests: repo_digests.unwrap_or_default(),
+        parent: None,
+        comment,
+        created: created.map(|t| t.to_string()),
+        container: None,
+        docker_version: None,
+        author,
+        architecture,
+        os,
+        size: size.and_then(|v| u64::try_from(v).ok()),
+        layers,
+        env,
+        cmd,
+        entrypoint,
+        working_dir,
+        user,
+        labels,
+    }
+}
+
+/// Translate the runtime-facing [`ExecOptions`] into bollard's
+/// [`CreateExecOptions`] payload. Field names are 1:1 with the Docker Engine
+/// `ExecConfig` schema (which both shapes mirror) so this is a straight
+/// re-pack — the only adjustment is wrapping non-empty optional collections /
+/// strings in `Some(..)` (bollard treats `None` as "field absent" in the JSON
+/// body, which is how Docker tells empty-vs-unset apart).
+fn build_create_exec_options(opts: &ExecOptions) -> CreateExecOptions<String> {
+    CreateExecOptions {
+        cmd: if opts.command.is_empty() {
+            None
+        } else {
+            Some(opts.command.clone())
+        },
+        env: if opts.env.is_empty() {
+            None
+        } else {
+            Some(opts.env.clone())
+        },
+        working_dir: opts.working_dir.clone(),
+        user: opts.user.clone(),
+        privileged: Some(opts.privileged),
+        tty: Some(opts.tty),
+        attach_stdin: Some(opts.attach_stdin),
+        attach_stdout: Some(opts.attach_stdout),
+        attach_stderr: Some(opts.attach_stderr),
+        detach_keys: None,
+    }
+}
+
+/// Build a bollard [`ResizeExecOptions`] from a `(rows, cols)` pair as sent
+/// over [`ExecHandle::resize`]. Docker's API uses `h` for rows and `w` for
+/// cols, mirroring tty ioctls (`TIOCSWINSZ`). Kept as a free fn so it can be
+/// unit-tested without a live Docker connection.
+fn resize_options_for(rows: u16, cols: u16) -> ResizeExecOptions {
+    ResizeExecOptions {
+        height: rows,
+        width: cols,
+    }
+}
+
+/// Pull the exit code out of a bollard [`ExecInspectResponse`] and clamp it
+/// into `i32` the way `Runtime` callers expect. Docker's stub models
+/// `exit_code` as an `Option<i64>`; `None` (the exec is still running, or
+/// reporting failed) collapses to `0` to match the existing buffered
+/// [`Runtime::exec`] behaviour. Any out-of-range `i64` (effectively
+/// impossible for a real Unix exit status, but the Engine wire-type allows
+/// it) saturates to the nearest `i32` bound.
+#[allow(clippy::cast_possible_truncation)]
+fn extract_exec_exit_code(inspect: &ExecInspectResponse) -> i32 {
+    match inspect.exit_code {
+        None => 0,
+        Some(code) if code > i64::from(i32::MAX) => i32::MAX,
+        Some(code) if code < i64::from(i32::MIN) => i32::MIN,
+        Some(code) => code as i32,
+    }
+}
+
+/// Newtype that bridges bollard's split exec channels (an output `Stream`
+/// and an input `AsyncWrite`) into a single duplex byte stream so the
+/// `Runtime::exec_pty` contract — one [`ExecPtyStream`] for both directions —
+/// can be honoured without per-caller plumbing.
+///
+/// On the read side we drain bollard's `LogOutput` stream a chunk at a time;
+/// `current_chunk` holds whatever bytes the caller hasn't consumed yet from
+/// the most recent frame. With `tty: true` Docker emits everything as
+/// `LogOutput::Console`; with `tty: false` it splits stdout/stderr into the
+/// `StdOut` / `StdErr` variants. We treat all four payloads identically here
+/// and let the caller demultiplex if it cares — the duplex API is byte-level
+/// by design (mirrors Docker's hijacked socket).
+///
+/// On the write side we forward `poll_write` / `poll_flush` / `poll_shutdown`
+/// straight to bollard's input `AsyncWrite`, which is the upgraded HTTP
+/// connection's write half.
+struct ExecPtyDuplex {
+    output: Pin<
+        Box<
+            dyn Stream<Item = std::result::Result<bollard::container::LogOutput, BollardError>>
+                + Send,
+        >,
+    >,
+    input: Pin<Box<dyn AsyncWrite + Send>>,
+    /// Bytes from the most recent `LogOutput` frame that haven't been
+    /// delivered to a `poll_read` caller yet. Drained left-to-right.
+    current_chunk: bytes::Bytes,
+    /// Once the underlying `output` stream returns `None`, no further reads
+    /// will ever produce data. Latched so polling after EOF doesn't keep
+    /// driving the (now-fused) stream.
+    output_done: bool,
+}
+
+impl AsyncRead for ExecPtyDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            // Fast path: hand the caller as many buffered bytes as fit.
+            if !self.current_chunk.is_empty() {
+                let take = self.current_chunk.len().min(buf.remaining());
+                let chunk = self.current_chunk.split_to(take);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.output_done {
+                // EOF: zero-fill is the AsyncRead contract for "no more data".
+                return Poll::Ready(Ok(()));
+            }
+
+            // Pull the next frame from bollard.
+            match self.output.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    self.output_done = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    self.current_chunk = frame.into_bytes();
+                    // Loop around to deliver the bytes (or, if the frame was
+                    // empty, to fetch the next one).
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(std::io::Error::other(e.to_string())));
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ExecPtyDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.input.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.input.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.input.as_mut().poll_shutdown(cx)
     }
 }
 
@@ -2158,6 +3838,42 @@ mod tests {
         assert_eq!(host_config.privileged, Some(true));
     }
 
+    /// Empty `spec.labels` must produce `None`, not an empty map. Bollard's
+    /// `ContainerCreateBody.labels` is `Option<HashMap<_, _>>` and the daemon
+    /// treats `None` and `{}` equivalently, but `None` keeps the wire payload
+    /// minimal and matches the convention used for other optional fields in
+    /// `create_container`.
+    #[test]
+    fn build_labels_returns_none_for_empty_map() {
+        let spec = create_test_spec(vec![]);
+        assert!(spec.labels.is_empty(), "test fixture starts with no labels");
+        assert!(build_labels(&spec).is_none());
+    }
+
+    /// When the API handler injects `com.zlayer.container_id=<hex>` (and
+    /// optionally other user labels) into `spec.labels`, `build_labels` must
+    /// forward the entire map verbatim into `Config.Labels`. This is the
+    /// runtime-side contract that makes task 1.4.5's reconciliation label
+    /// actually land on the Docker container.
+    #[test]
+    fn build_labels_forwards_zlayer_container_id_label() {
+        let mut spec = create_test_spec(vec![]);
+        let hex = "deadbeef".repeat(8); // 64-char fake hex
+        spec.labels
+            .insert("com.zlayer.container_id".to_string(), hex.clone());
+        spec.labels
+            .insert("user-key".to_string(), "user-value".to_string());
+
+        let labels = build_labels(&spec).expect("non-empty labels must be Some");
+        assert_eq!(labels.get("com.zlayer.container_id"), Some(&hex));
+        assert_eq!(
+            labels.get("user-key"),
+            Some(&"user-value".to_string()),
+            "user-supplied labels must be preserved alongside the reserved key"
+        );
+        assert_eq!(labels.len(), 2, "no extra labels should appear");
+    }
+
     /// Helper to create a minimal test `ServiceSpec`
     fn create_test_spec(ports: Vec<u16>) -> ServiceSpec {
         use zlayer_spec::*;
@@ -2201,10 +3917,12 @@ mod tests {
             },
             init: InitSpec::default(),
             errors: ErrorsSpec::default(),
+            lifecycle: zlayer_spec::LifecycleSpec::default(),
             devices: vec![],
             storage: vec![],
             port_mappings: vec![],
             capabilities: vec![],
+            cap_drop: vec![],
             privileged: false,
             node_mode: NodeMode::default(),
             node_selector: None,
@@ -2217,6 +3935,24 @@ mod tests {
             extra_hosts: Vec::new(),
             restart_policy: None,
             platform: None,
+            labels: std::collections::HashMap::new(),
+            user: None,
+            stop_signal: None,
+            stop_grace_period: None,
+            sysctls: std::collections::HashMap::new(),
+            ulimits: std::collections::HashMap::new(),
+            security_opt: Vec::new(),
+            pid_mode: None,
+            ipc_mode: None,
+            network_mode: zlayer_spec::NetworkMode::default(),
+            extra_groups: Vec::new(),
+            read_only_root_fs: false,
+            init_container: None,
+            tty: false,
+            stdin_open: false,
+            userns_mode: None,
+            cgroup_parent: None,
+            expose: Vec::new(),
         }
     }
 
@@ -2555,5 +4291,492 @@ mod tests {
         assert!(details.ipv4.is_none());
         assert!(details.health.is_none());
         assert!(details.exit_code.is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // logs_stream / stats_stream / pull_image_stream — shape conversion
+    // tests that exercise the pure translation helpers without a daemon.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn build_logs_options_maps_every_field() {
+        let opts = LogsStreamOptions {
+            follow: true,
+            tail: Some(50),
+            since: Some(1_700_000_000),
+            until: Some(1_700_000_500),
+            timestamps: true,
+            stdout: true,
+            stderr: false,
+        };
+        let bollard = build_logs_options(&opts);
+        assert!(bollard.follow);
+        assert!(bollard.stdout);
+        assert!(!bollard.stderr);
+        assert!(bollard.timestamps);
+        assert_eq!(bollard.tail, "50");
+        assert_eq!(bollard.since, 1_700_000_000_i32);
+        assert_eq!(bollard.until, 1_700_000_500_i32);
+    }
+
+    #[test]
+    fn build_logs_options_default_tail_is_all_and_zero_window() {
+        // `tail = None` -> bollard sentinel "all"; `since` / `until` = None
+        // -> 0 (Docker's "no bound" sentinel).
+        let opts = LogsStreamOptions::default();
+        let bollard = build_logs_options(&opts);
+        assert_eq!(bollard.tail, "all");
+        assert_eq!(bollard.since, 0);
+        assert_eq!(bollard.until, 0);
+        assert!(!bollard.follow);
+        assert!(!bollard.stdout);
+        assert!(!bollard.stderr);
+        assert!(!bollard.timestamps);
+    }
+
+    #[test]
+    fn log_output_to_chunk_classifies_each_variant() {
+        // StdOut and Console both translate to the Stdout channel.
+        let stdout = log_output_to_chunk(
+            bollard::container::LogOutput::StdOut {
+                message: bytes::Bytes::from_static(b"hello\n"),
+            },
+            false,
+        );
+        assert_eq!(stdout.stream, LogChannel::Stdout);
+        assert_eq!(stdout.bytes.as_ref(), b"hello\n");
+        assert!(
+            stdout.timestamp.is_none(),
+            "no timestamp when not requested"
+        );
+
+        let console = log_output_to_chunk(
+            bollard::container::LogOutput::Console {
+                message: bytes::Bytes::from_static(b"tty\n"),
+            },
+            false,
+        );
+        assert_eq!(console.stream, LogChannel::Stdout);
+
+        // StdErr -> Stderr.
+        let stderr = log_output_to_chunk(
+            bollard::container::LogOutput::StdErr {
+                message: bytes::Bytes::from_static(b"oops\n"),
+            },
+            true,
+        );
+        assert_eq!(stderr.stream, LogChannel::Stderr);
+        assert_eq!(stderr.bytes.as_ref(), b"oops\n");
+        assert!(
+            stderr.timestamp.is_some(),
+            "timestamp populated when requested"
+        );
+
+        // StdIn -> Stdin (rare but supported).
+        let stdin = log_output_to_chunk(
+            bollard::container::LogOutput::StdIn {
+                message: bytes::Bytes::from_static(b"in\n"),
+            },
+            false,
+        );
+        assert_eq!(stdin.stream, LogChannel::Stdin);
+    }
+
+    #[test]
+    fn translate_stats_sample_maps_cpu_memory_and_pids() {
+        use bollard::models::{
+            ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerPidsStats,
+        };
+
+        let response = ContainerStatsResponse {
+            cpu_stats: Some(ContainerCpuStats {
+                cpu_usage: Some(ContainerCpuUsage {
+                    total_usage: Some(123_456_789),
+                    ..Default::default()
+                }),
+                system_cpu_usage: Some(987_654_321),
+                online_cpus: Some(8),
+                ..Default::default()
+            }),
+            memory_stats: Some(ContainerMemoryStats {
+                usage: Some(50 * 1024 * 1024),
+                limit: Some(256 * 1024 * 1024),
+                ..Default::default()
+            }),
+            pids_stats: Some(ContainerPidsStats {
+                current: Some(17),
+                limit: Some(0), // 0 means "unlimited" -> None on our side
+            }),
+            ..Default::default()
+        };
+
+        let sample = translate_stats_sample(&response);
+        assert_eq!(sample.cpu_total_ns, 123_456_789);
+        assert_eq!(sample.cpu_system_ns, 987_654_321);
+        assert_eq!(sample.online_cpus, 8);
+        assert_eq!(sample.mem_used_bytes, 50 * 1024 * 1024);
+        assert_eq!(sample.mem_limit_bytes, 256 * 1024 * 1024);
+        assert_eq!(sample.pids_current, 17);
+        assert_eq!(sample.pids_limit, None, "Docker `limit: 0` -> None");
+        // Network & blkio: no inputs -> 0 across the board.
+        assert_eq!(sample.net_rx_bytes, 0);
+        assert_eq!(sample.net_tx_bytes, 0);
+        assert_eq!(sample.blkio_read_bytes, 0);
+        assert_eq!(sample.blkio_write_bytes, 0);
+    }
+
+    #[test]
+    fn translate_stats_sample_sums_networks_and_blkio() {
+        use bollard::models::{
+            ContainerBlkioStatEntry, ContainerBlkioStats, ContainerNetworkStats, ContainerPidsStats,
+        };
+        use std::collections::HashMap;
+
+        let mut nets: HashMap<String, ContainerNetworkStats> = HashMap::new();
+        nets.insert(
+            "eth0".to_string(),
+            ContainerNetworkStats {
+                rx_bytes: Some(1000),
+                tx_bytes: Some(2000),
+                ..Default::default()
+            },
+        );
+        nets.insert(
+            "eth1".to_string(),
+            ContainerNetworkStats {
+                rx_bytes: Some(500),
+                tx_bytes: Some(750),
+                ..Default::default()
+            },
+        );
+
+        let blkio = ContainerBlkioStats {
+            io_service_bytes_recursive: Some(vec![
+                ContainerBlkioStatEntry {
+                    op: Some("Read".to_string()),
+                    value: Some(4096),
+                    ..Default::default()
+                },
+                ContainerBlkioStatEntry {
+                    op: Some("Read".to_string()),
+                    value: Some(2048),
+                    ..Default::default()
+                },
+                ContainerBlkioStatEntry {
+                    op: Some("Write".to_string()),
+                    value: Some(8192),
+                    ..Default::default()
+                },
+                // Unknown op (e.g. "Sync") should be ignored.
+                ContainerBlkioStatEntry {
+                    op: Some("Sync".to_string()),
+                    value: Some(99),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let response = ContainerStatsResponse {
+            networks: Some(nets),
+            blkio_stats: Some(blkio),
+            pids_stats: Some(ContainerPidsStats {
+                current: Some(5),
+                // A real (non-zero) limit must round-trip to Some.
+                limit: Some(4096),
+            }),
+            ..Default::default()
+        };
+
+        let sample = translate_stats_sample(&response);
+        assert_eq!(sample.net_rx_bytes, 1500);
+        assert_eq!(sample.net_tx_bytes, 2750);
+        assert_eq!(sample.blkio_read_bytes, 4096 + 2048);
+        assert_eq!(sample.blkio_write_bytes, 8192);
+        assert_eq!(sample.pids_current, 5);
+        assert_eq!(sample.pids_limit, Some(4096));
+    }
+
+    #[test]
+    fn translate_pull_progress_maps_status_and_detail() {
+        use bollard::models::ProgressDetail;
+
+        let info = CreateImageInfo {
+            id: Some("layer-abc".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(ProgressDetail {
+                current: Some(1024),
+                total: Some(2048),
+            }),
+            ..Default::default()
+        };
+        match translate_pull_progress(info) {
+            PullProgress::Status {
+                id,
+                status,
+                progress,
+                current,
+                total,
+            } => {
+                assert_eq!(id.as_deref(), Some("layer-abc"));
+                assert_eq!(status, "Downloading");
+                assert!(progress.is_none(), "preformatted bar not modelled");
+                assert_eq!(current, Some(1024));
+                assert_eq!(total, Some(2048));
+            }
+            done @ PullProgress::Done { .. } => panic!("expected Status, got {done:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_pull_progress_handles_missing_status_and_negative_detail() {
+        use bollard::models::ProgressDetail;
+
+        // Missing status -> empty string. Negative `current`/`total` are
+        // dropped (u64::try_from fails) — they should not panic.
+        let info = CreateImageInfo {
+            id: None,
+            status: None,
+            progress_detail: Some(ProgressDetail {
+                current: Some(-1),
+                total: Some(-2),
+            }),
+            ..Default::default()
+        };
+        match translate_pull_progress(info) {
+            PullProgress::Status {
+                id,
+                status,
+                current,
+                total,
+                ..
+            } => {
+                assert!(id.is_none());
+                assert!(status.is_empty());
+                assert!(current.is_none());
+                assert!(total.is_none());
+            }
+            done @ PullProgress::Done { .. } => panic!("expected Status, got {done:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_digest_from_status_recognises_sha256() {
+        assert_eq!(
+            extract_digest_from_status(Some("Digest: sha256:abc123")).as_deref(),
+            Some("sha256:abc123")
+        );
+        // Whitespace tolerance.
+        assert_eq!(
+            extract_digest_from_status(Some("  Digest:  sha256:def456  ")).as_deref(),
+            Some("sha256:def456")
+        );
+        // Non-digest status lines are ignored.
+        assert!(extract_digest_from_status(Some("Pulling fs layer")).is_none());
+        assert!(extract_digest_from_status(Some("Digest: not-a-hash")).is_none());
+        assert!(extract_digest_from_status(None).is_none());
+    }
+
+    #[test]
+    fn docker_credentials_from_registry_auth_basic_and_token() {
+        // Basic auth: username + password populate the corresponding fields,
+        // everything else stays default-empty.
+        let basic = RegistryAuth {
+            username: "alice".to_string(),
+            password: "hunter2".to_string(),
+            auth_type: RegistryAuthType::Basic,
+        };
+        let creds = docker_credentials_from_registry_auth(&basic);
+        assert_eq!(creds.username.as_deref(), Some("alice"));
+        assert_eq!(creds.password.as_deref(), Some("hunter2"));
+        assert!(creds.serveraddress.is_none());
+        assert!(creds.identitytoken.is_none());
+
+        // Token auth: same shape — the token rides as the password per the
+        // Docker CLI convention noted on `docker_credentials_from_registry_auth`.
+        let token = RegistryAuth {
+            username: "<token>".to_string(),
+            password: "ghp_xxx".to_string(),
+            auth_type: RegistryAuthType::Token,
+        };
+        let creds = docker_credentials_from_registry_auth(&token);
+        assert_eq!(creds.username.as_deref(), Some("<token>"));
+        assert_eq!(creds.password.as_deref(), Some("ghp_xxx"));
+    }
+
+    #[test]
+    fn build_create_exec_options_translates_full_payload() {
+        // Every field populated: verifies cmd/env round-trip as
+        // `Some(non_empty)` and that bool flags are forwarded literally
+        // (none of them implicitly default — Docker treats unset as the
+        // server-side default, which differs from `false`).
+        let opts = ExecOptions {
+            command: vec!["sh".into(), "-lc".into(), "echo hi".into()],
+            env: vec!["PATH=/usr/bin".into(), "FOO=bar".into()],
+            working_dir: Some("/work".into()),
+            user: Some("1000:1000".into()),
+            privileged: true,
+            tty: true,
+            attach_stdin: true,
+            attach_stdout: true,
+            attach_stderr: true,
+        };
+        let bollard_opts = build_create_exec_options(&opts);
+        assert_eq!(
+            bollard_opts.cmd.as_deref(),
+            Some(&["sh".to_string(), "-lc".to_string(), "echo hi".to_string()][..])
+        );
+        assert_eq!(
+            bollard_opts.env.as_deref(),
+            Some(&["PATH=/usr/bin".to_string(), "FOO=bar".to_string()][..])
+        );
+        assert_eq!(bollard_opts.working_dir.as_deref(), Some("/work"));
+        assert_eq!(bollard_opts.user.as_deref(), Some("1000:1000"));
+        assert_eq!(bollard_opts.privileged, Some(true));
+        assert_eq!(bollard_opts.tty, Some(true));
+        assert_eq!(bollard_opts.attach_stdin, Some(true));
+        assert_eq!(bollard_opts.attach_stdout, Some(true));
+        assert_eq!(bollard_opts.attach_stderr, Some(true));
+        assert!(bollard_opts.detach_keys.is_none());
+    }
+
+    #[test]
+    fn build_create_exec_options_collapses_empty_collections_to_none() {
+        // Default `ExecOptions` carries empty `command`/`env` vecs. We
+        // translate those to `None` rather than `Some(vec![])` so Docker
+        // sees the fields as absent — the daemon distinguishes "unset"
+        // (use container default) from "empty array" (literally no
+        // command), and the latter would fail with `cmd: required`.
+        let opts = ExecOptions::default();
+        let bollard_opts = build_create_exec_options(&opts);
+        assert!(
+            bollard_opts.cmd.is_none(),
+            "empty command must translate to None"
+        );
+        assert!(
+            bollard_opts.env.is_none(),
+            "empty env must translate to None"
+        );
+        assert!(bollard_opts.working_dir.is_none());
+        assert!(bollard_opts.user.is_none());
+        // The bool flags do still get forwarded as `Some(false)` —
+        // `false` is a meaningful explicit override (e.g. "definitely no
+        // tty" even if the image config requested one).
+        assert_eq!(bollard_opts.privileged, Some(false));
+        assert_eq!(bollard_opts.tty, Some(false));
+        assert_eq!(bollard_opts.attach_stdin, Some(false));
+    }
+
+    #[test]
+    fn resize_options_for_maps_rows_to_h_and_cols_to_w() {
+        // Docker's API uses `h` for rows and `w` for cols (matching
+        // `TIOCSWINSZ`). The runtime channel is `(rows, cols)` to match
+        // termios convention; verify the swap from the channel ordering
+        // to the wire ordering happens correctly.
+        let opts = resize_options_for(40, 132);
+        assert_eq!(opts.height, 40, "rows -> h (height)");
+        assert_eq!(opts.width, 132, "cols -> w (width)");
+
+        // Edge: a (0, 0) resize is a valid termios pattern (means
+        // "default"). It must round-trip without saturation.
+        let zero = resize_options_for(0, 0);
+        assert_eq!(zero.height, 0);
+        assert_eq!(zero.width, 0);
+
+        // Edge: u16::MAX in either dimension. Docker's wire type is i32
+        // so this is well within range; nothing should clamp.
+        let max = resize_options_for(u16::MAX, u16::MAX);
+        assert_eq!(max.height, u16::MAX);
+        assert_eq!(max.width, u16::MAX);
+    }
+
+    #[test]
+    fn extract_exec_exit_code_handles_present_missing_and_out_of_range() {
+        // Common case: a real Unix exit status fits in i32 cleanly.
+        let inspect = ExecInspectResponse {
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(extract_exec_exit_code(&inspect), 0);
+
+        let nonzero = ExecInspectResponse {
+            exit_code: Some(137), // SIGKILL convention
+            ..Default::default()
+        };
+        assert_eq!(extract_exec_exit_code(&nonzero), 137);
+
+        // Missing exit code (e.g. inspect raced the exec finishing)
+        // collapses to 0 to match the existing buffered `exec` behaviour.
+        let missing = ExecInspectResponse {
+            exit_code: None,
+            ..Default::default()
+        };
+        assert_eq!(extract_exec_exit_code(&missing), 0);
+
+        // Wire type is i64; values outside i32 range saturate (impossible
+        // for real exits, but the type system permits it).
+        let too_big = ExecInspectResponse {
+            exit_code: Some(i64::from(i32::MAX) + 1),
+            ..Default::default()
+        };
+        assert_eq!(extract_exec_exit_code(&too_big), i32::MAX);
+
+        let too_small = ExecInspectResponse {
+            exit_code: Some(i64::from(i32::MIN) - 1),
+            ..Default::default()
+        };
+        assert_eq!(extract_exec_exit_code(&too_small), i32::MIN);
+    }
+
+    /// Live end-to-end smoke: connects to the local Docker daemon, spawns
+    /// an `alpine:3` container, drives an interactive `sh` exec through
+    /// `exec_pty`, sends `exit 7\n`, and asserts the exit future resolves
+    /// with `7`. Marked `#[ignore]` so it doesn't run in the normal test
+    /// suite — bring it back with `cargo test ... -- --ignored` on a host
+    /// that has Docker available.
+    #[ignore = "requires a running local Docker daemon"]
+    #[tokio::test]
+    async fn exec_pty_round_trip_against_real_docker() {
+        use crate::runtime::ContainerId;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let runtime = DockerRuntime::new(None)
+            .await
+            .expect("connect to local docker");
+
+        // Caller is expected to provision the container themselves; for
+        // the smoke test we rely on a pre-existing `alpine` container
+        // named `zlayer-exec-pty-smoke-0` so this test stays independent
+        // of the rest of the runtime API.
+        let id = ContainerId {
+            service: "exec-pty-smoke".to_string(),
+            replica: 0,
+        };
+
+        let opts = ExecOptions {
+            command: vec!["sh".into()],
+            tty: true,
+            attach_stdin: true,
+            attach_stdout: true,
+            attach_stderr: true,
+            ..Default::default()
+        };
+
+        let mut handle = runtime.exec_pty(&id, opts).await.expect("exec_pty starts");
+
+        handle
+            .stream
+            .write_all(b"exit 7\n")
+            .await
+            .expect("send exit 7");
+        handle.stream.flush().await.expect("flush");
+
+        // Drain output to EOF so the daemon-side process actually exits
+        // before we ask for the exit code.
+        let mut buf = Vec::new();
+        let _ = handle.stream.read_to_end(&mut buf).await;
+
+        let code = handle.exit.await.expect("exit future resolves");
+        assert_eq!(code, 7, "shell exited with the value we asked for");
     }
 }

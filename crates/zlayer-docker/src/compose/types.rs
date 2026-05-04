@@ -26,6 +26,13 @@ pub struct ComposeFile {
     #[serde(default)]
     pub name: Option<String>,
 
+    /// Optional top-level `include:` directive — each entry references an
+    /// external compose file whose contents are merged into this one before
+    /// the rest of this file is applied. Accepts both short-form strings and
+    /// long-form objects.
+    #[serde(default, deserialize_with = "deserialize_includes")]
+    pub include: Vec<ComposeInclude>,
+
     /// Service definitions.
     #[serde(default)]
     pub services: HashMap<String, ComposeService>,
@@ -49,6 +56,25 @@ pub struct ComposeFile {
     /// Extension fields (x-*) and any unknown top-level keys.
     #[serde(flatten)]
     pub extensions: HashMap<String, serde_yaml::Value>,
+}
+
+/// A single entry in the top-level `include:` directive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeInclude {
+    /// Files this include references. Compose treats a single string as a
+    /// one-element path list; the long form lets users layer multiple files
+    /// in a single include entry.
+    #[serde(default)]
+    pub path: Vec<String>,
+
+    /// Optional project directory used to resolve relative paths inside the
+    /// included file. Defaults to the directory of the first include path.
+    #[serde(default)]
+    pub project_directory: Option<String>,
+
+    /// Optional `.env`-style file applied while loading the include.
+    #[serde(default)]
+    pub env_file: Option<StringOrList>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +239,137 @@ pub struct ComposeService {
 
     #[serde(default)]
     pub scale: Option<u64>,
+
+    /// `extends:` directive — inherit from another service. Compose accepts
+    /// either a bare string (sibling service in the same file) or an object
+    /// with `service:` and optional `file:`.
+    #[serde(default)]
+    pub extends: Option<ComposeExtends>,
+
+    /// `develop:` block — file watch + sync rules. Parsed only; the watch
+    /// runner is a separate subsystem.
+    #[serde(default)]
+    pub develop: Option<ComposeDevelop>,
+
+    /// Short-form GPU request (`gpus: all` or `gpus: 2` or
+    /// `gpus: ["device=0,1"]`). The long form lives under
+    /// `deploy.resources.reservations.devices`.
+    #[serde(default)]
+    pub gpus: Option<ComposeGpus>,
+
+    /// Custom DNS resolver options (e.g. `["use-vc"]`).
+    #[serde(default)]
+    pub dns_opt: Vec<String>,
+
+    /// Container MAC address (e.g. `"02:42:ac:11:00:02"`).
+    #[serde(default)]
+    pub mac_address: Option<String>,
+
+    /// Legacy network links: `["service-name"]` or `["service-name:alias"]`.
+    #[serde(default)]
+    pub links: Vec<String>,
+
+    /// Legacy links to services outside this compose file.
+    #[serde(default)]
+    pub external_links: Vec<String>,
+
+    /// Container memory swappiness (0-100).
+    #[serde(default)]
+    pub mem_swappiness: Option<i64>,
+
+    /// Disable the OOM killer for this container.
+    #[serde(default)]
+    pub oom_kill_disable: bool,
+
+    /// Tune the OOM killer score (-1000..=1000).
+    #[serde(default)]
+    pub oom_score_adj: Option<i64>,
+
+    /// Container runtime to use (e.g. `"runc"`, `"nvidia"`).
+    #[serde(default)]
+    pub runtime: Option<String>,
+
+    /// User namespace mode (`"host"` or `""`).
+    #[serde(default)]
+    pub userns_mode: Option<String>,
+
+    /// Isolation technology (Windows-specific: `"default"`, `"process"`,
+    /// `"hyperv"`).
+    #[serde(default)]
+    pub isolation: Option<String>,
+
+    /// Storage driver options (e.g. `{ size: "20G" }`).
+    #[serde(default)]
+    pub storage_opt: HashMap<String, StringOrNumber>,
+
+    /// Top-level `cpu_count` (Windows-style).
+    #[serde(default)]
+    pub cpu_count: Option<u64>,
+
+    /// Top-level `cpu_percent`.
+    #[serde(default)]
+    pub cpu_percent: Option<u64>,
+
+    /// CPU CFS period in microseconds.
+    #[serde(default)]
+    pub cpu_period: Option<StringOrNumber>,
+
+    /// CPU CFS quota in microseconds.
+    #[serde(default)]
+    pub cpu_quota: Option<StringOrNumber>,
+
+    /// CPU realtime period in microseconds.
+    #[serde(default)]
+    pub cpu_rt_period: Option<StringOrNumber>,
+
+    /// CPU realtime runtime in microseconds.
+    #[serde(default)]
+    pub cpu_rt_runtime: Option<StringOrNumber>,
+
+    /// CPU shares (relative weight, default 1024).
+    #[serde(default)]
+    pub cpu_shares: Option<u64>,
+
+    /// Top-level `cpus:` shorthand (e.g. `"1.5"`).
+    #[serde(default)]
+    pub cpus: Option<StringOrNumber>,
+
+    /// CPUs in which to allow execution (e.g. `"0-3,5"`).
+    #[serde(default)]
+    pub cpuset: Option<String>,
+
+    /// Top-level `mem_limit` shorthand.
+    #[serde(default)]
+    pub mem_limit: Option<StringOrNumber>,
+
+    /// Top-level `mem_reservation` shorthand.
+    #[serde(default)]
+    pub mem_reservation: Option<StringOrNumber>,
+
+    /// Total memory + swap limit (`-1` for unlimited swap).
+    #[serde(default)]
+    pub memswap_limit: Option<StringOrNumber>,
+
+    /// Kernel memory limit (deprecated by the Linux kernel but still in
+    /// the Compose schema).
+    #[serde(default)]
+    pub kernel_memory: Option<StringOrNumber>,
+
+    /// Block-I/O configuration.
+    #[serde(default)]
+    pub blkio_config: Option<ComposeBlkioConfig>,
+
+    /// Tune the container's PID limit (-1 for unlimited).
+    #[serde(default)]
+    pub pids_limit: Option<i64>,
+
+    /// Cgroup namespace (`"host"` or `"private"`).
+    #[serde(default)]
+    pub cgroup: Option<String>,
+
+    /// Additional groups for the container's user.
+    #[serde(default)]
+    pub group_add: Vec<StringOrNumber>,
 
     /// Catch-all for any unknown / extension fields.
     #[serde(flatten)]
@@ -1151,6 +1308,153 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Extends / Develop / Gpus / Blkio — long-tail Compose features
+// ---------------------------------------------------------------------------
+
+/// `extends:` directive. Compose accepts either a bare service name (sibling
+/// service in the same file) or an object with `service:` and optional `file:`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ComposeExtends {
+    /// Short form: `extends: <other-service-name>`.
+    Service(String),
+    /// Long form: `extends: { service: <name>, file: <path> }`.
+    Full(ComposeExtendsConfig),
+}
+
+/// Long-form `extends:` configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeExtendsConfig {
+    /// Name of the service to inherit from.
+    pub service: String,
+    /// Optional external compose file containing the parent service. When
+    /// omitted, the parent service must exist in the same file.
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+/// `develop:` block — file watch + sync rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComposeDevelop {
+    /// File watch rules. Each entry says "when files matching `path` change,
+    /// run `action` (rebuild, sync, restart, sync+restart, sync+exec)".
+    #[serde(default)]
+    pub watch: Vec<ComposeDevelopWatch>,
+
+    /// Extension fields.
+    #[serde(flatten)]
+    pub extensions: HashMap<String, serde_yaml::Value>,
+}
+
+/// A single `develop.watch[]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeDevelopWatch {
+    /// Path glob (relative to project context) to watch.
+    pub path: String,
+
+    /// Action to take when a watched path changes (`rebuild`, `sync`,
+    /// `restart`, `sync+restart`, `sync+exec`).
+    pub action: String,
+
+    /// Container path that the source maps to (only meaningful for
+    /// `sync` actions).
+    #[serde(default)]
+    pub target: Option<String>,
+
+    /// Glob patterns to ignore relative to `path`.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+
+    /// `sync+exec`-style follow-up command.
+    #[serde(default)]
+    pub exec: Option<ComposeDevelopExec>,
+
+    /// Extension fields.
+    #[serde(flatten)]
+    pub extensions: HashMap<String, serde_yaml::Value>,
+}
+
+/// `develop.watch[].exec` configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeDevelopExec {
+    /// Command to execute. Accepts string or list, like service-level
+    /// `command:`.
+    #[serde(default, deserialize_with = "deserialize_string_or_list")]
+    pub command: Vec<String>,
+
+    /// Working directory for the exec'd command.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+
+    /// User to run the exec'd command as.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Privileged exec.
+    #[serde(default)]
+    pub privileged: bool,
+}
+
+/// Short-form `gpus:` directive. Compose accepts:
+/// * `gpus: all` — request every GPU on the host.
+/// * `gpus: 2` — request a specific count.
+/// * `gpus: [device=0,1]` — request specific devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ComposeGpus {
+    /// `gpus: all` — captured as the string `"all"`.
+    All(String),
+    /// `gpus: 2` — numeric count.
+    Count(u64),
+    /// `gpus: ["device=0,1"]` — explicit device selectors.
+    Devices(Vec<String>),
+}
+
+/// Block-I/O tuning under `blkio_config:`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComposeBlkioConfig {
+    /// Per-device read-rate limit in bytes per second.
+    #[serde(default)]
+    pub device_read_bps: Vec<ComposeBlkioBpsLimit>,
+    /// Per-device write-rate limit in bytes per second.
+    #[serde(default)]
+    pub device_write_bps: Vec<ComposeBlkioBpsLimit>,
+    /// Per-device read-rate limit in I/O operations per second.
+    #[serde(default)]
+    pub device_read_iops: Vec<ComposeBlkioIopsLimit>,
+    /// Per-device write-rate limit in I/O operations per second.
+    #[serde(default)]
+    pub device_write_iops: Vec<ComposeBlkioIopsLimit>,
+    /// Block-I/O weight (10-1000).
+    #[serde(default)]
+    pub weight: Option<u64>,
+    /// Per-device weight overrides.
+    #[serde(default)]
+    pub weight_device: Vec<ComposeBlkioWeightDevice>,
+}
+
+/// `device_read_bps` / `device_write_bps` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeBlkioBpsLimit {
+    pub path: String,
+    pub rate: StringOrNumber,
+}
+
+/// `device_read_iops` / `device_write_iops` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeBlkioIopsLimit {
+    pub path: String,
+    pub rate: u64,
+}
+
+/// `weight_device` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeBlkioWeightDevice {
+    pub path: String,
+    pub weight: u64,
+}
+
+// ---------------------------------------------------------------------------
 // StringOrList / StringOrNumber — common Docker Compose patterns
 // ---------------------------------------------------------------------------
 
@@ -1231,13 +1535,31 @@ struct PortLongSyntax {
     host_ip: Option<String>,
 }
 
+/// Round-trip-friendly view of [`ComposePort`] using its native field names.
+/// This lets a serialize → deserialize cycle (e.g. when resolving
+/// `extends:`) preserve the typed shape without choking on the difference
+/// between Docker's `target/published` schema and our internal one.
+#[derive(Deserialize)]
+struct PortRoundTrip {
+    container_port: StringOrNumber,
+    #[serde(default)]
+    host_port: Option<StringOrNumber>,
+    #[serde(default)]
+    host_ip: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
 /// Intermediate enum for port deserialization. Each element in the `ports`
-/// list can be either a string (short syntax) or an object (long syntax).
+/// list can be either a string (short syntax) or an object in one of two
+/// long-syntax flavours (Docker's `target/published` or our own
+/// `container_port/host_port` round-trip shape).
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum PortEntry {
     Short(StringOrNumber),
     Long(PortLongSyntax),
+    RoundTrip(PortRoundTrip),
 }
 
 /// Deserialize the `ports` field which can contain a mix of short-syntax
@@ -1261,6 +1583,14 @@ where
                     host_port: long.published.map(|p| p.as_string()),
                     container_port: long.target.as_string(),
                     protocol: long.protocol,
+                });
+            }
+            PortEntry::RoundTrip(rt) => {
+                result.push(ComposePort {
+                    host_ip: rt.host_ip,
+                    host_port: rt.host_port.map(|p| p.as_string()),
+                    container_port: rt.container_port.as_string(),
+                    protocol: rt.protocol,
                 });
             }
         }
@@ -1579,6 +1909,59 @@ where
     D: Deserializer<'de>,
 {
     Vec::<ComposeServiceSecret>::deserialize(deserializer)
+}
+
+// ---------------------------------------------------------------------------
+// deserialize_includes: top-level `include:` directive
+// ---------------------------------------------------------------------------
+
+/// One element of a top-level `include:` list. Compose accepts:
+/// * a bare string path,
+/// * an object with `path` (string or list), `project_directory`, `env_file`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IncludeEntry {
+    Path(String),
+    Long(IncludeLong),
+}
+
+#[derive(Deserialize)]
+struct IncludeLong {
+    #[serde(default)]
+    path: Option<StringOrList>,
+    #[serde(default)]
+    project_directory: Option<String>,
+    #[serde(default)]
+    env_file: Option<StringOrList>,
+}
+
+/// Deserialize the top-level `include:` directive. Each entry can be either
+/// a bare string (treated as a one-element path list) or an object with a
+/// `path` field (string or list).
+fn deserialize_includes<'de, D>(deserializer: D) -> Result<Vec<ComposeInclude>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let entries: Vec<IncludeEntry> = Vec::deserialize(deserializer)?;
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            IncludeEntry::Path(p) => result.push(ComposeInclude {
+                path: vec![p],
+                project_directory: None,
+                env_file: None,
+            }),
+            IncludeEntry::Long(long) => {
+                let path = long.path.map(StringOrList::into_list).unwrap_or_default();
+                result.push(ComposeInclude {
+                    path,
+                    project_directory: long.project_directory,
+                    env_file: long.env_file,
+                });
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Deserialize service-level configs list that can contain strings or objects.
@@ -2283,6 +2666,207 @@ services:
         // Long syntax gets deserialized into ComposePort fields.
         // The target becomes container_port, published becomes host_port.
         assert_eq!(app.ports[0].container_port, "80");
+    }
+
+    #[test]
+    fn test_extends_short_form_string() {
+        let yaml = r"
+services:
+  child:
+    extends: parent
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        let child = &compose.services["child"];
+        match &child.extends {
+            Some(ComposeExtends::Service(s)) => assert_eq!(s, "parent"),
+            other => panic!("expected short-form extends, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extends_long_form_with_file() {
+        let yaml = r"
+services:
+  child:
+    extends:
+      service: parent
+      file: ./common.yaml
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        let child = &compose.services["child"];
+        match &child.extends {
+            Some(ComposeExtends::Full(cfg)) => {
+                assert_eq!(cfg.service, "parent");
+                assert_eq!(cfg.file.as_deref(), Some("./common.yaml"));
+            }
+            other => panic!("expected long-form extends, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_include_short_form() {
+        let yaml = r"
+include:
+  - base.yaml
+  - extras.yaml
+services:
+  app:
+    image: alpine
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(compose.include.len(), 2);
+        assert_eq!(compose.include[0].path, vec!["base.yaml".to_string()]);
+        assert_eq!(compose.include[1].path, vec!["extras.yaml".to_string()]);
+    }
+
+    #[test]
+    fn test_include_long_form_object() {
+        let yaml = r"
+include:
+  - path: shared.yaml
+    project_directory: ../shared
+services:
+  app:
+    image: alpine
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(compose.include.len(), 1);
+        assert_eq!(compose.include[0].path, vec!["shared.yaml".to_string()]);
+        assert_eq!(
+            compose.include[0].project_directory.as_deref(),
+            Some("../shared")
+        );
+    }
+
+    #[test]
+    fn test_include_long_form_path_list() {
+        let yaml = r"
+include:
+  - path:
+      - a.yaml
+      - b.yaml
+services:
+  app:
+    image: alpine
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(compose.include.len(), 1);
+        assert_eq!(
+            compose.include[0].path,
+            vec!["a.yaml".to_string(), "b.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_gpus_short_form_all() {
+        let yaml = r"
+services:
+  ml:
+    image: pytorch
+    gpus: all
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        match &compose.services["ml"].gpus {
+            Some(ComposeGpus::All(s)) => assert_eq!(s, "all"),
+            other => panic!("expected gpus: all, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_gpus_short_form_count() {
+        let yaml = r"
+services:
+  ml:
+    image: pytorch
+    gpus: 4
+";
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        match &compose.services["ml"].gpus {
+            Some(ComposeGpus::Count(n)) => assert_eq!(*n, 4),
+            other => panic!("expected gpus count, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_develop_watch_parsed() {
+        let yaml = r#"
+services:
+  web:
+    image: node
+    develop:
+      watch:
+        - path: ./src
+          action: sync
+          target: /app/src
+          ignore:
+            - "*.tmp"
+        - path: package.json
+          action: rebuild
+"#;
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        let dev = compose.services["web"].develop.as_ref().unwrap();
+        assert_eq!(dev.watch.len(), 2);
+        assert_eq!(dev.watch[0].action, "sync");
+        assert_eq!(dev.watch[0].ignore, vec!["*.tmp"]);
+    }
+
+    #[test]
+    fn test_long_tail_misc_fields_parse() {
+        let yaml = r#"
+services:
+  svc:
+    image: alpine
+    domainname: corp.example.com
+    dns_opt:
+      - "use-vc"
+    mac_address: "02:42:ac:11:00:02"
+    links:
+      - "db:database"
+    external_links:
+      - "extdb:extdb"
+    mem_swappiness: 60
+    oom_kill_disable: true
+    oom_score_adj: -500
+    runtime: runc
+    userns_mode: host
+    isolation: process
+    storage_opt:
+      size: "20G"
+    cpu_count: 2
+    cpu_percent: 50
+    cpu_shares: 512
+    cpus: "1.5"
+    cpuset: "0-3"
+    mem_limit: "1g"
+    mem_reservation: "512m"
+    memswap_limit: -1
+    pids_limit: 1024
+    cgroup: host
+    group_add:
+      - "users"
+      - 200
+"#;
+        let compose: ComposeFile = serde_yaml::from_str(yaml).unwrap();
+        let svc = &compose.services["svc"];
+        assert_eq!(svc.domainname.as_deref(), Some("corp.example.com"));
+        assert_eq!(svc.dns_opt, vec!["use-vc"]);
+        assert_eq!(svc.mac_address.as_deref(), Some("02:42:ac:11:00:02"));
+        assert_eq!(svc.links, vec!["db:database"]);
+        assert_eq!(svc.external_links, vec!["extdb:extdb"]);
+        assert_eq!(svc.mem_swappiness, Some(60));
+        assert!(svc.oom_kill_disable);
+        assert_eq!(svc.oom_score_adj, Some(-500));
+        assert_eq!(svc.runtime.as_deref(), Some("runc"));
+        assert_eq!(svc.userns_mode.as_deref(), Some("host"));
+        assert_eq!(svc.isolation.as_deref(), Some("process"));
+        assert_eq!(svc.cpu_count, Some(2));
+        assert_eq!(svc.cpu_percent, Some(50));
+        assert_eq!(svc.cpu_shares, Some(512));
+        assert_eq!(svc.cpuset.as_deref(), Some("0-3"));
+        assert_eq!(svc.pids_limit, Some(1024));
+        assert_eq!(svc.cgroup.as_deref(), Some("host"));
+        assert_eq!(svc.group_add.len(), 2);
+        assert!(svc.storage_opt.contains_key("size"));
     }
 
     #[test]

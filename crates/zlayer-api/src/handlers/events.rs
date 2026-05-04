@@ -1,42 +1,52 @@
-//! Daemon-wide container event stream.
+//! Daemon-wide event stream.
 //!
-//! Exposes `GET /api/v1/events` as a Server-Sent Events stream of container
-//! lifecycle events (start, die, oom, health). Clients subscribe to the
-//! broadcast bus carried on [`ContainerApiState::event_bus`] and receive
-//! events as they are published by lifecycle handlers.
+//! Exposes `GET /api/v1/events` as a Newline-Delimited-JSON (NDJSON) stream
+//! of daemon lifecycle events: container start/die/oom/health, image
+//! pull/push/delete/tag, network create/delete/connect/disconnect, and
+//! volume create/delete/mount/unmount. Clients subscribe to the broadcast
+//! bus carried on [`ContainerApiState::event_bus`] and receive events as
+//! they are published by lifecycle handlers.
+//!
+//! NDJSON is the format Docker's `/events` API uses: one JSON object per
+//! line, `Content-Type: application/json`, no `data:` prefix and no
+//! `event:` field. The Docker-compat layer in `zlayer-docker` proxies this
+//! stream verbatim onto its own NDJSON `/events` endpoint.
 //!
 //! # Query parameters
 //!
 //! - `follow` (bool, default `true`): reserved for parity with the Docker
 //!   events API. Today the endpoint is always streaming; when `follow=false`
-//!   the handler emits a single keep-alive and closes immediately.
-//! - `label` (repeated, `k=v`): AND-filter. Only events whose `labels` map
-//!   contains every `(k, v)` pair are delivered.
+//!   the handler emits an empty body and closes immediately.
+//! - `label` (repeated, `k=v`): AND-filter against container labels. Only
+//!   container events whose `labels` map contains every `(k, v)` pair are
+//!   delivered; non-container events bypass the filter when the filter is
+//!   empty and are excluded when it is non-empty.
 //!
 //! # Backpressure
 //!
 //! If a subscriber lags behind [`crate::event_bus::EVENT_BUS_CAPACITY`]
 //! events, the broadcast channel reports [`BroadcastStreamRecvError::Lagged`].
-//! The handler emits a terminal `close` event naming the lag and ends the
-//! stream -- the client is expected to reconnect.
+//! The handler emits a terminal `{"close": ..., "dropped": N}` line and
+//! ends the stream -- the client is expected to reconnect.
 
+use axum::{
+    body::Body,
+    extract::{Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
-
-use axum::{
-    extract::{Query, State},
-    response::sse::{Event, KeepAlive, Sse},
-};
-use futures_util::{Stream, StreamExt};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, warn};
 pub use zlayer_types::api::events::*;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
-use crate::event_bus::ContainerEvent;
+use crate::event_bus::DaemonEvent;
 use crate::handlers::containers::ContainerApiState;
 
 /// Parse `label=k=v` query strings into a vector of `(key, value)` pairs.
@@ -61,31 +71,26 @@ fn parse_label_filters(raw: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// Serialize a [`ContainerEvent`] into an SSE [`Event`]. Uses the event's
-/// kind as the SSE `event:` name (e.g. `container.start`) and the full event
-/// body as JSON data.
-fn to_sse_event(ev: &ContainerEvent) -> Event {
-    Event::default()
-        .event(ev.kind.sse_name())
-        .json_data(ev)
-        .unwrap_or_else(|err| {
-            // Extremely unlikely -- ContainerEvent is trivially serializable.
-            warn!(error = %err, "Failed to serialize ContainerEvent");
-            Event::default().event("error").data("serialization_error")
-        })
+/// Encode a [`DaemonEvent`] as a single NDJSON line: JSON body + trailing
+/// `\n`. Returns `None` if serialization fails (which never happens in
+/// practice for the well-typed event variants).
+fn ndjson_line(ev: &DaemonEvent) -> Option<Bytes> {
+    let mut bytes = serde_json::to_vec(ev).ok()?;
+    bytes.push(b'\n');
+    Some(Bytes::from(bytes))
 }
 
-/// One of the two stream outputs this handler produces: a normal SSE event,
-/// or a terminal `close` marker that causes the stream to end.
+/// One of the two stream outputs this handler produces: a normal NDJSON
+/// line, or a terminal close marker that causes the stream to end.
 enum StreamItem {
-    Event(Event),
-    Close(Event),
+    Line(Bytes),
+    Close(Bytes),
 }
 
-/// Stream adapter that yields events until a `Close` item is produced, then
-/// ends. Used to drop laggy subscribers after a single terminal `close` SSE
-/// event -- `BroadcastStream` otherwise stays open indefinitely after a
-/// `Lagged` error and the client would silently miss events.
+/// Stream adapter that yields lines until a `Close` item is produced, then
+/// ends. Used to drop laggy subscribers after a single terminal close line --
+/// `BroadcastStream` otherwise stays open indefinitely after a `Lagged`
+/// error and the client would silently miss events.
 struct CloseOnTerminal<S> {
     inner: S,
     terminated: bool,
@@ -104,17 +109,17 @@ impl<S> Stream for CloseOnTerminal<S>
 where
     S: Stream<Item = StreamItem> + Unpin,
 {
-    type Item = std::result::Result<Event, Infallible>;
+    type Item = std::result::Result<Bytes, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.terminated {
             return Poll::Ready(None);
         }
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(StreamItem::Event(ev))) => Poll::Ready(Some(Ok(ev))),
-            Poll::Ready(Some(StreamItem::Close(ev))) => {
+            Poll::Ready(Some(StreamItem::Line(b))) => Poll::Ready(Some(Ok(b))),
+            Poll::Ready(Some(StreamItem::Close(b))) => {
                 self.terminated = true;
-                Poll::Ready(Some(Ok(ev)))
+                Poll::Ready(Some(Ok(b)))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -122,7 +127,28 @@ where
     }
 }
 
-/// Stream container lifecycle events as Server-Sent Events.
+/// Build the NDJSON response headers. `Content-Type: application/json` (NOT
+/// `text/event-stream`); intermediaries are told not to cache or buffer.
+fn ndjson_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    // Hint to nginx-style proxies not to buffer the streaming body.
+    headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    headers
+}
+
+/// Stream daemon lifecycle events as NDJSON.
+///
+/// Each event is one JSON object on its own line, terminated with `\n`. The
+/// response advertises `Content-Type: application/json` (matching Docker's
+/// `/events` endpoint contract).
 ///
 /// # Errors
 ///
@@ -133,7 +159,7 @@ where
     path = "/api/v1/events",
     params(EventsQuery),
     responses(
-        (status = 200, description = "SSE stream of container lifecycle events"),
+        (status = 200, description = "NDJSON stream of daemon lifecycle events"),
         (status = 400, description = "Invalid label filter"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -144,78 +170,72 @@ pub async fn stream_events(
     _user: AuthUser,
     State(state): State<ContainerApiState>,
     Query(query): Query<EventsQuery>,
-) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>> + Send>> {
+) -> Result<Response> {
     let filters = parse_label_filters(&query.label)?;
     let follow = query.follow.unwrap_or(true);
 
     debug!(
         filters = ?filters,
         follow,
-        "Subscribing to container event stream"
+        "Subscribing to daemon event stream (NDJSON)"
     );
 
     let rx = state.event_bus.subscribe();
 
-    // Build a single unified stream that either:
-    //  - emits filtered container events and a terminal `close` on lag
-    //    (follow=true), or
-    //  - immediately ends (follow=false).
-    // Using one return shape keeps the `impl Stream` signature happy.
-    let boxed: Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>> =
-        if follow {
-            let inner = BroadcastStream::new(rx).filter_map(move |res| {
-                let filters = filters.clone();
-                async move {
-                    match res {
-                        Ok(ev) => {
-                            if ev.matches_labels(&filters) {
-                                Some(StreamItem::Event(to_sse_event(&ev)))
-                            } else {
-                                None
-                            }
+    let body = if follow {
+        let inner = BroadcastStream::new(rx).filter_map(move |res| {
+            let filters = filters.clone();
+            async move {
+                match res {
+                    Ok(ev) => {
+                        if !ev.matches_labels(&filters) {
+                            return None;
                         }
-                        Err(BroadcastStreamRecvError::Lagged(n)) => {
-                            warn!(
-                                dropped = n,
-                                "Container event subscriber lagged; closing stream"
-                            );
-                            // Emit a single terminal `close` event so the
-                            // client can distinguish a deliberate termination
-                            // from a broken connection; CloseOnTerminal then
-                            // ends the stream.
-                            let payload = serde_json::json!({
-                                "reason": "lagged",
-                                "dropped": n,
-                            });
-                            let close = Event::default()
-                                .event("close")
-                                .json_data(&payload)
-                                .unwrap_or_else(|_| Event::default().event("close").data("lagged"));
-                            Some(StreamItem::Close(close))
-                        }
+                        ndjson_line(&ev).map(StreamItem::Line)
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(n)) => {
+                        warn!(
+                            dropped = n,
+                            "Daemon event subscriber lagged; closing stream"
+                        );
+                        // Emit a single terminal close marker so the client
+                        // can distinguish a deliberate termination from a
+                        // dropped TCP connection; CloseOnTerminal then ends
+                        // the stream.
+                        let payload = serde_json::json!({
+                            "close": "lagged",
+                            "dropped": n,
+                        });
+                        let mut buf =
+                            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                        buf.push(b'\n');
+                        Some(StreamItem::Close(Bytes::from(buf)))
                     }
                 }
-            });
-            // Box-pin the filter_map (which is !Unpin due to the inner async
-            // block), then wrap with CloseOnTerminal which requires its
-            // inner stream to be Unpin (Pin<Box<_>> always is).
-            Box::pin(CloseOnTerminal::new(Box::pin(inner)))
-        } else {
-            Box::pin(futures_util::stream::empty())
-        };
+            }
+        });
+        let stream = CloseOnTerminal::new(Box::pin(inner));
+        Body::from_stream(stream)
+    } else {
+        Body::empty()
+    };
 
-    Ok(Sse::new(boxed).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    let mut response = Response::builder().status(StatusCode::OK);
+    if let Some(headers) = response.headers_mut() {
+        headers.extend(ndjson_headers());
+    }
+    response
+        .body(body)
+        .map_err(|e| ApiError::Internal(format!("failed to build events response: {e}")))
+        .map(IntoResponse::into_response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_bus::{ContainerEvent, ContainerEventBus};
+    use crate::event_bus::{ContainerEvent, DaemonEventBus, ImageEvent, ImageEventKind};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -239,8 +259,6 @@ mod tests {
 
     #[test]
     fn parse_label_filters_accepts_empty_value() {
-        // k= is a valid filter -- used to match labels whose value is literally
-        // the empty string. Some Docker tooling uses this.
         let input = vec!["app=".to_string()];
         let parsed = parse_label_filters(&input).expect("empty value is fine");
         assert_eq!(parsed, vec![("app".to_string(), String::new())]);
@@ -268,16 +286,18 @@ mod tests {
 
     #[tokio::test]
     async fn label_filter_matches_and_rejects() {
-        let bus = ContainerEventBus::new();
+        let bus = DaemonEventBus::new();
         let mut rx = bus.subscribe();
 
-        let web = ContainerEvent::start("c1", labels(&[("app", "web"), ("env", "prod")]));
-        let worker = ContainerEvent::start("c2", labels(&[("app", "worker"), ("env", "prod")]));
-        bus.publish(web.clone());
-        bus.publish(worker.clone());
+        bus.publish(ContainerEvent::start(
+            "c1",
+            labels(&[("app", "web"), ("env", "prod")]),
+        ));
+        bus.publish(ContainerEvent::start(
+            "c2",
+            labels(&[("app", "worker"), ("env", "prod")]),
+        ));
 
-        // Both published; the AND filter on ("app", "web") should only match
-        // `web`.
         let ev1 = rx.recv().await.expect("event 1");
         let ev2 = rx.recv().await.expect("event 2");
 
@@ -286,11 +306,50 @@ mod tests {
         assert!(!ev2.matches_labels(&filter));
     }
 
+    #[test]
+    fn ndjson_line_is_one_object_terminated_by_newline() {
+        let ev = DaemonEvent::Container(ContainerEvent::start("c1", labels(&[("app", "web")])));
+        let line = ndjson_line(&ev).expect("encoded line");
+        let s = std::str::from_utf8(&line).expect("utf8");
+
+        // Exactly one trailing newline; nothing else after it.
+        assert!(s.ends_with('\n'));
+        assert_eq!(s.matches('\n').count(), 1);
+        // Body itself is parseable JSON.
+        let trimmed = s.trim_end_matches('\n');
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).expect("valid json");
+        assert_eq!(parsed["resource"], "container");
+        // No SSE-specific framing fields.
+        assert!(!s.contains("data:"));
+        assert!(!s.contains("event:"));
+        assert!(!s.contains("\n\n"));
+    }
+
+    #[test]
+    fn ndjson_line_for_image_event() {
+        let ev = DaemonEvent::Image(ImageEvent::pull("nginx:latest", None));
+        let line = ndjson_line(&ev).expect("encoded line");
+        let s = std::str::from_utf8(&line).expect("utf8");
+        assert!(s.ends_with('\n'));
+        let parsed: serde_json::Value =
+            serde_json::from_str(s.trim_end_matches('\n')).expect("valid json");
+        assert_eq!(parsed["resource"], "image");
+        assert_eq!(parsed["reference"], "nginx:latest");
+    }
+
+    #[test]
+    fn ndjson_headers_advertise_application_json() {
+        let h = ndjson_headers();
+        assert_eq!(h.get(header::CONTENT_TYPE).unwrap(), "application/json");
+        // Must NOT be SSE.
+        assert_ne!(h.get(header::CONTENT_TYPE).unwrap(), "text/event-stream");
+    }
+
     #[tokio::test]
-    async fn sse_stream_delivers_filtered_events() {
-        // Smoke-test: build the underlying filter_map stream the handler uses,
+    async fn stream_delivers_filtered_events_only() {
+        // Smoke-test: build the underlying filter stream the handler uses,
         // publish events, and confirm only matching ones arrive.
-        let bus = ContainerEventBus::new();
+        let bus = DaemonEventBus::new();
         let rx = bus.subscribe();
 
         let filters = vec![("app".to_string(), "web".to_string())];
@@ -298,7 +357,7 @@ mod tests {
             let filters = filters.clone();
             async move {
                 match res {
-                    Ok(ev) if ev.matches_labels(&filters) => Some(Ok::<_, Infallible>(ev)),
+                    Ok(ev) if ev.matches_labels(&filters) => ndjson_line(&ev),
                     _ => None,
                 }
             }
@@ -309,19 +368,27 @@ mod tests {
         bus.publish(ContainerEvent::start("c2", labels(&[("app", "worker")])));
         bus.publish(ContainerEvent::start("c3", labels(&[("app", "web")])));
 
-        // Bounded wait: we expect exactly two matches.
         let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("first event before timeout")
-            .expect("non-empty stream")
-            .expect("no error");
-        assert_eq!(first.id, "c1");
+            .expect("non-empty stream");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&first[..first.len() - 1]).expect("json");
+        assert_eq!(parsed["id"], "c1");
 
         let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("second event before timeout")
-            .expect("non-empty stream")
-            .expect("no error");
-        assert_eq!(second.id, "c3");
+            .expect("non-empty stream");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&second[..second.len() - 1]).expect("json");
+        assert_eq!(parsed["id"], "c3");
+    }
+
+    #[test]
+    fn image_event_kind_wire_names() {
+        // Sanity check that `image.pull` etc. are the wire names the
+        // Docker-compat translator expects.
+        assert_eq!(ImageEventKind::Pull.sse_name(), "image.pull");
     }
 }

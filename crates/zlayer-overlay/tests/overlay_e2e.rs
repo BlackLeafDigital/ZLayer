@@ -90,8 +90,7 @@ async fn test_native_keys_compatible_with_wg_tool() {
         .arg("wg")
         .output()
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
 
     if !wg_available {
         eprintln!("SKIP: `wg` binary not found; skipping key compatibility test (wg is optional)");

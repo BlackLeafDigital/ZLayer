@@ -244,8 +244,7 @@ pub async fn get_all_service_stats() -> Result<Vec<ServiceStats>, ServerFnError>
                     metrics_collector
                         .collect(&service_name)
                         .await
-                        .map(|m| (m.avg_cpu_percent, m.avg_memory_percent))
-                        .unwrap_or((0.0, 0.0))
+                        .map_or((0.0, 0.0), |m| (m.avg_cpu_percent, m.avg_memory_percent))
                 } else {
                     (0.0, 0.0)
                 };

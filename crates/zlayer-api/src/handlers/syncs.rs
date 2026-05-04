@@ -518,7 +518,7 @@ mod tests {
 
     fn write_deployment_yaml(dir: &Path, name: &str, deployment_name: &str) {
         // Minimal valid DeploymentSpec: version + deployment + empty services.
-        let yaml = format!("version: v1\ndeployment: {deployment_name}\nservices: {{}}\n",);
+        let yaml = format!("version: v1\ndeployment: {deployment_name}\nservices: {{}}\n");
         std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
     }
 

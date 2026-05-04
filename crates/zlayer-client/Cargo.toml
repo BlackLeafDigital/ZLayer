@@ -33,6 +33,13 @@ http-body-util = "0.1"
 bytes = { workspace = true }
 tower = { workspace = true }
 tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+
+# WebSocket transport for the bidirectional exec PTY endpoint
+# (`POST /api/v1/exec/{id}/start`). Pinned to 0.26 so we share a single
+# tungstenite copy with `zlayer-tunnel` rather than dragging in a second
+# version of the protocol crate.
+tokio-tungstenite = "0.26"
 
 # Typed request/response structs used by the daemon API.
 zlayer-api.workspace = true

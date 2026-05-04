@@ -316,6 +316,45 @@ pub async fn get_deployment(
     )))
 }
 
+/// Get the raw stored deployment, including the full `DeploymentSpec`.
+///
+/// Unlike [`get_deployment`], which projects to the public `DeploymentDetails`
+/// shape, this endpoint returns the full [`StoredDeployment`] so callers that
+/// need the underlying spec (image, command, env, scale) — for example the
+/// Docker Engine API compatibility shim translating `/services` requests —
+/// can reconstruct the original input.
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found or storage access fails.
+#[utoipa::path(
+    get,
+    path = "/api/v1/deployments/{name}/spec",
+    params(
+        ("name" = String, Path, description = "Deployment name"),
+    ),
+    responses(
+        (status = 200, description = "Stored deployment with full spec", body = StoredDeployment),
+        (status = 404, description = "Deployment not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Deployments"
+)]
+pub async fn get_deployment_spec(
+    _user: AuthUser,
+    State(state): State<DeploymentState>,
+    Path(name): Path<String>,
+) -> Result<Json<StoredDeployment>> {
+    let deployment = state
+        .storage
+        .get(&name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{name}' not found")))?;
+    Ok(Json(deployment))
+}
+
 /// Create a new deployment.
 ///
 /// When the daemon has orchestration wired (service manager, proxy, overlay),
@@ -465,7 +504,7 @@ async fn orchestrate_deployment(
         );
         {
             let mgr = mgr_lock.read().await;
-            if let Err(e) = mgr.upsert_service(name.clone(), service_spec.clone()).await {
+            if let Err(e) = Box::pin(mgr.upsert_service(name.clone(), service_spec.clone())).await {
                 let msg = format!("{name}: failed to register: {e}");
                 warn!(deployment = %deployment_name, service = %name, error = %e, "Service registration failed");
                 emit_progress(
