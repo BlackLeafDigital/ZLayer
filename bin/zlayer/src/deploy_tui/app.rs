@@ -23,6 +23,7 @@
 use std::io::{self, Stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
@@ -66,6 +67,16 @@ pub struct DeployTui {
     frame_counter: usize,
     /// Shared shutdown signal - when notified, the deploy task begins shutdown
     shutdown_signal: Arc<Notify>,
+    /// How long to keep the final state on screen after the channel
+    /// disconnects in a terminal phase. `Duration::ZERO` means "exit on the
+    /// next iteration." Detach/background mode passes a non-zero value so the
+    /// user can read the final summary before the alternate screen tears down.
+    flash_duration: Duration,
+    /// Deadline at which the loop should actually stop. Set when the channel
+    /// disconnects in `Running`/`Complete`/`ShuttingDown`. While `Some(t)` and
+    /// `Instant::now() < t`, the render loop keeps drawing so the terminal
+    /// displays the final state for `flash_duration`.
+    exit_at: Option<Instant>,
 }
 
 impl DeployTui {
@@ -75,13 +86,23 @@ impl DeployTui {
     ///
     /// * `event_rx` - Channel receiver for `DeployEvent`s from the deploy orchestration
     /// * `shutdown_signal` - Shared `Notify` that the TUI will trigger on Ctrl+C
-    pub fn new(event_rx: Receiver<DeployEvent>, shutdown_signal: Arc<Notify>) -> Self {
+    /// * `flash_duration` - How long to keep the final state visible after the
+    ///   channel closes in a terminal phase. Pass `Duration::ZERO` for the
+    ///   foreground path (the user is interactive and will dismiss explicitly);
+    ///   pass ~1s for `-d`/`-b` so the auto-exit doesn't blink past the result.
+    pub fn new(
+        event_rx: Receiver<DeployEvent>,
+        shutdown_signal: Arc<Notify>,
+        flash_duration: Duration,
+    ) -> Self {
         Self {
             event_rx,
             state: DeployState::new(),
             running: true,
             frame_counter: 0,
             shutdown_signal,
+            flash_duration,
+            exit_at: None,
         }
     }
 
@@ -116,7 +137,7 @@ impl DeployTui {
     /// 2. Renders the current state
     /// 3. Polls for keyboard input
     fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-        while self.running {
+        loop {
             // Process any pending deploy events
             self.process_events();
 
@@ -134,9 +155,36 @@ impl DeployTui {
 
             // Advance frame counter for spinner animation
             self.frame_counter = self.frame_counter.wrapping_add(1);
+
+            // Termination: `running == false` means the user pressed q or a
+            // non-flash auto-exit fired. Otherwise, if a flash deadline is
+            // pending and has elapsed, exit. This keeps the alternate screen
+            // up for `flash_duration` after the channel disconnects so the
+            // final summary is readable in detach/background mode.
+            if !self.running {
+                break;
+            }
+            if let Some(deadline) = self.exit_at {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Schedule the loop to exit. With `flash_duration == 0` this exits on
+    /// the next iteration; otherwise the loop keeps rendering until
+    /// `Instant::now() >= self.exit_at`. Called from the auto-exit arms in
+    /// `process_events` so detach/background mode flashes the final state
+    /// instead of disappearing the moment the channel closes.
+    fn schedule_exit(&mut self) {
+        if self.flash_duration.is_zero() {
+            self.running = false;
+        } else if self.exit_at.is_none() {
+            self.exit_at = Some(Instant::now() + self.flash_duration);
+        }
     }
 
     /// Process all pending deploy events from the channel
@@ -161,17 +209,21 @@ impl DeployTui {
                         DeployPhase::Running | DeployPhase::Complete => {
                             // Normal completion: background/detach mode returned after
                             // DeploymentRunning, or foreground shutdown completed.
-                            // Auto-exit the TUI.
+                            // Schedule auto-exit. If `flash_duration` is zero this
+                            // exits on the next loop iteration; otherwise the loop
+                            // keeps rendering for `flash_duration` so the user can
+                            // read the final summary before the alternate screen
+                            // tears down.
                             if self.state.phase != DeployPhase::Complete {
                                 self.state.apply_event(&DeployEvent::ShutdownComplete);
                             }
-                            self.running = false;
+                            self.schedule_exit();
                         }
                         DeployPhase::ShuttingDown => {
                             // Shutdown was in progress; the deploy task finished cleanup.
-                            // Mark complete and auto-exit.
+                            // Mark complete and schedule auto-exit (flash respected).
                             self.state.apply_event(&DeployEvent::ShutdownComplete);
-                            self.running = false;
+                            self.schedule_exit();
                         }
                         _ => {
                             // Unexpected disconnect during Initializing/Deploying/Stabilizing.
@@ -181,7 +233,7 @@ impl DeployTui {
                                 message: "Deploy process ended unexpectedly".to_string(),
                             });
                             self.state.apply_event(&DeployEvent::ShutdownComplete);
-                            // Do NOT set self.running = false; wait for user to press q.
+                            // Do NOT auto-exit; wait for user to press q.
                         }
                     }
                     break;
@@ -415,7 +467,8 @@ mod tests {
     fn create_tui() -> (mpsc::Sender<DeployEvent>, DeployTui) {
         let (tx, rx) = mpsc::channel();
         let shutdown = Arc::new(Notify::new());
-        let tui = DeployTui::new(rx, shutdown);
+        // Tests don't need the flash window -- exit on next iteration.
+        let tui = DeployTui::new(rx, shutdown, Duration::ZERO);
         (tx, tui)
     }
 

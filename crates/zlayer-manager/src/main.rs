@@ -57,6 +57,21 @@ async fn start_server(
     use tower_http::services::ServeDir;
     use zlayer_manager::app::shell;
 
+    // Build-vs-runtime sanity check: prove `leptos_router/ssr` is actually
+    // active in this binary BEFORE we start serving requests.
+    //
+    // `leptos_router::location::Url::escape` has two arms gated on the
+    // `ssr` feature -- the SSR arm uses `percent_encoding`, the non-SSR
+    // arm calls `js_sys::encode_uri_component`, which panics on native
+    // targets with "cannot access imported statics on non-wasm targets".
+    // If a Cargo.toml change or a cargo-chef cache poisoning silently
+    // dropped the `ssr` feature on `leptos_router`, every SSR request
+    // would panic -- which is exactly the production regression that
+    // motivated this guard. Failing here gives a clear, immediate stack
+    // pointing at the build configuration instead of confusing the user
+    // with first-request panics.
+    let _smoke = leptos_router::location::Url::escape("test/path with space");
+
     // Load Leptos configuration from LEPTOS_* env vars (cargo-leptos sets
     // these from [package.metadata.leptos] in Cargo.toml).  Passing `None`
     // means "don't read Cargo.toml directly; rely on env vars / defaults".

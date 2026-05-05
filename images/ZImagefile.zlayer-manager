@@ -36,11 +36,18 @@ stages:
             id: cargo-registry
             sharing: shared
 
-      # Cook dependencies (cached layer - only rebuilds when Cargo.lock changes)
+      # Cook dependencies (cached layer - only rebuilds when Cargo.lock changes).
+      # Scope to `--bin zlayer-manager --features ssr` so cached object files
+      # are built with `leptos_router/ssr` (and friends) active. Otherwise
+      # chef cooks leptos_router against the workspace's default feature set
+      # (empty for the manager bin), priming cargo's cache with rlibs that
+      # lack the SSR arm of `Url::escape`. cargo leptos build may then link
+      # those stale rlibs and the binary panics on every request with
+      # "cannot access imported statics on non-wasm targets".
       - copy: "recipe.json"
         from: planner
         to: "/build/recipe.json"
-      - run: "cargo chef cook --release --recipe-path recipe.json"
+      - run: "cargo chef cook --release --recipe-path recipe.json -p zlayer-manager --bin zlayer-manager --features ssr"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
