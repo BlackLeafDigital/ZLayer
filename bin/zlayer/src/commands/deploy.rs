@@ -251,6 +251,37 @@ async fn deploy_core(
         // Connect to daemon (auto-starts if needed)
         let client = DaemonClient::connect().await?;
 
+        // Daemon is reachable -- by definition its infrastructure (runtime,
+        // overlay, DNS, proxy, supervisor, API) is already up, otherwise
+        // the daemon's own bootstrap would have failed. Mark the 6 infra
+        // phases Complete now so the TUI's infra panel renders filled
+        // immediately. This is RACE-FREE: it happens before the SSE
+        // subscribe, so we don't depend on the daemon's `started` event
+        // arriving (the daemon spawns its orchestrator which emits
+        // `started` synchronously before yielding -- which the CLI
+        // typically misses, since `broadcast::Sender::subscribe()` does
+        // not replay history). The `started`-arm below ALSO emits these,
+        // and `InfraPhaseComplete` on an already-Complete phase is a
+        // no-op (state.rs handler is idempotent), so duplicate events
+        // are harmless.
+        for phase in [
+            InfraPhase::Runtime,
+            InfraPhase::Overlay,
+            InfraPhase::Dns,
+            InfraPhase::Proxy,
+            InfraPhase::Supervisor,
+            InfraPhase::Api,
+        ] {
+            emit(
+                &tx,
+                DeployEvent::InfraPhaseComplete {
+                    phase,
+                    success: true,
+                    message: None,
+                },
+            );
+        }
+
         emit(
             &tx,
             DeployEvent::Log {

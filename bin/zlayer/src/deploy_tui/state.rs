@@ -224,6 +224,30 @@ impl DeployState {
                 self.deployment_name.clone_from(deployment_name);
                 self.version.clone_from(version);
                 self.service_plans.clone_from(services);
+                // Seed `services` from the plan so the Services panel shows
+                // one Pending row per planned service immediately. This is
+                // race-free -- `PlanReady` is emitted by the CLI itself
+                // before submitting to the daemon, so it always lands.
+                //
+                // Without this, the panel relies on the daemon's `started`
+                // SSE event for seeding (see commands/deploy.rs). The
+                // broadcast subscribe happens AFTER the daemon spawns the
+                // orchestrator -- which fires `started` synchronously
+                // before yielding -- so the CLI usually misses it and the
+                // panel sits at "0/0 deployed" forever.
+                for plan in services {
+                    if !self.services.iter().any(|s| s.name == plan.name) {
+                        self.services.push(ServiceState {
+                            name: plan.name.clone(),
+                            phase: ServiceDeployPhase::Pending,
+                            sub_phase: ServiceSubPhase::Idle,
+                            target_replicas: 0,
+                            current_replicas: 0,
+                            health: ServiceHealth::Unknown,
+                            redeploy: RedeployState::None,
+                        });
+                    }
+                }
                 self.phase = DeployPhase::Deploying;
             }
 

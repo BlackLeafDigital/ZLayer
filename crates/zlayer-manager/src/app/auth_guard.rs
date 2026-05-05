@@ -15,8 +15,6 @@
 //! "please log in" would be misleading.
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
-use leptos_router::NavigateOptions;
 
 use crate::app::server_fns::{manager_me, ManagerUserView};
 
@@ -116,10 +114,30 @@ fn AuthGuardError(
     }
 }
 
-/// Navigate to `path` via the Leptos router. On SSR this is a no-op (the
-/// server-rendered HTML for the "not authenticated" branch will be replaced
-/// by the client-side navigate on hydration).
+/// Redirect to `path`. On SSR this issues a 302 via `leptos_axum::redirect`;
+/// on the hydrate (browser) side it goes through `use_navigate`.
+///
+/// The two arms are NOT interchangeable: `use_navigate` ultimately calls
+/// `tachys::dom::window()` (via `BrowserUrl::parse`), which on a non-wasm
+/// target panics inside `js_sys::global()` with "cannot access imported
+/// statics on non-wasm targets". `tachys::dom` has no SSR fallback. Calling
+/// it from a Suspense view-render closure on the server panics on every
+/// request -- which is the exact regression we are fixing here.
+#[cfg(feature = "ssr")]
 fn redirect_to(path: &'static str) {
+    leptos_axum::redirect(path);
+}
+
+#[cfg(feature = "hydrate")]
+fn redirect_to(path: &'static str) {
+    use leptos_router::hooks::use_navigate;
+    use leptos_router::NavigateOptions;
     let navigate = use_navigate();
     navigate(path, NavigateOptions::default());
 }
+
+// Default-features build (`cargo check`/`cargo clippy --workspace` with no
+// feature flags) compiles the lib without `ssr` or `hydrate`. Provide a
+// no-op so the lib still type-checks; this mode is never run in production.
+#[cfg(not(any(feature = "ssr", feature = "hydrate")))]
+fn redirect_to(_path: &'static str) {}
