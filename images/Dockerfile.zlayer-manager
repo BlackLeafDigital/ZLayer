@@ -40,7 +40,7 @@ RUN rustup target add wasm32-unknown-unknown && \
 # panics on the first request with "cannot access imported statics on
 # non-wasm targets". This was the actual production regression.
 RUN cargo chef cook --release --recipe-path recipe.json \
-    --bin zlayer-manager --features ssr
+    -p zlayer-manager --bin zlayer-manager --features ssr
 
 # Copy source and build
 COPY . .

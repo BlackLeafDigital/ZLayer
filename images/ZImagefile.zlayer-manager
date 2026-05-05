@@ -47,7 +47,7 @@ stages:
       - copy: "recipe.json"
         from: planner
         to: "/build/recipe.json"
-      - run: "cargo chef cook --release --recipe-path recipe.json --bin zlayer-manager --features ssr"
+      - run: "cargo chef cook --release --recipe-path recipe.json -p zlayer-manager --bin zlayer-manager --features ssr"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
