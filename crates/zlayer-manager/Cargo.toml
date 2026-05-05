@@ -59,7 +59,16 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [features]
 default = []
 
-# SSR feature for server-side rendering (server binary)
+# SSR feature for server-side rendering (server binary).
+#
+# `leptos_router/ssr` is the load-bearing flag here: it swaps `Url::escape`
+# from a `js_sys::encode_uri_component` call (which panics on native targets
+# with "cannot access imported statics on non-wasm targets") to a
+# `percent_encoding`-backed implementation. If anything in the build pipeline
+# strips `--features ssr` -- a missing flag on `cargo chef cook`, a manual
+# `cargo build` without `--features`, etc. -- the binary panics on the first
+# request. The startup smoke-test in `src/main.rs` exercises `Url::escape`
+# before binding the listener so a misconfigured build dies loud and early.
 ssr = [
     "leptos/ssr",
     "leptos_router/ssr",

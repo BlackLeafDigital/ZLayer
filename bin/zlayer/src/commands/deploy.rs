@@ -84,13 +84,19 @@ fn setup_plain_channel() -> mpsc::Sender<DeployEvent> {
 /// task drops the sender. Ctrl+C inside the TUI calls `shutdown.notify_one()`
 /// rather than killing the process, so the caller must also listen on
 /// `shutdown` and tear down the deploy flow when it fires.
+///
+/// `flash_duration` controls how long the alternate screen stays up after
+/// the channel closes in a terminal phase. Pass `Duration::ZERO` for the
+/// foreground path (the user dismisses with q) and ~1s for `-d`/`-b` so the
+/// auto-exit doesn't blink past the final summary.
 fn setup_tui_channel(
     shutdown: Arc<Notify>,
+    flash_duration: Duration,
 ) -> (mpsc::Sender<DeployEvent>, JoinHandle<std::io::Result<()>>) {
     let (tx, rx) = mpsc::channel::<DeployEvent>();
 
     let handle = tokio::task::spawn_blocking(move || {
-        let mut tui = DeployTui::new(rx, shutdown);
+        let mut tui = DeployTui::new(rx, shutdown, flash_duration);
         tui.run()
     });
 
@@ -204,13 +210,23 @@ async fn deploy_core(
     // Decide between TUI and plain logger. TUI is the default when stdout is
     // a TTY and --no-tui wasn't passed; detach/background still use the TUI so
     // the submit -> register -> scale -> ready (or failed) sequence animates.
+    //
+    // For detach/background, give the TUI a 1s flash window after the deploy
+    // task drops the sender so the final "Running" summary stays on screen
+    // long enough for the user to read instead of disappearing instantly. The
+    // foreground path uses ZERO -- the user is interactive and dismisses with q.
     let use_tui = !cli.no_tui && std::io::stdout().is_terminal();
+    let flash_duration = if cli.detach || cli.background {
+        Duration::from_millis(1000)
+    } else {
+        Duration::ZERO
+    };
     let shutdown = Arc::new(Notify::new());
     let (tx, tui_handle): (
         mpsc::Sender<DeployEvent>,
         Option<JoinHandle<std::io::Result<()>>>,
     ) = if use_tui {
-        let (tx, h) = setup_tui_channel(shutdown.clone());
+        let (tx, h) = setup_tui_channel(shutdown.clone(), flash_duration);
         (tx, Some(h))
     } else {
         (setup_plain_channel(), None)
@@ -266,9 +282,18 @@ async fn deploy_core(
         );
 
     // ------------------------------------------------------------------
-    // Foreground mode: stream SSE events for real-time progress
+    // Stream SSE events for real-time progress
+    //
+    // The TUI feeds off these events for the per-step animation
+    // (service-registered, image-pull progress, scaling, ready, ...).
+    // Detach (`-d`) and background (`-b`) ALSO need this stream so the user
+    // sees what's happening before we exit -- the only thing those modes
+    // change is whether we wait for Ctrl+C at the end (handled in
+    // `print_deployment_success`). Skipping SSE here previously meant the
+    // TUI sat empty until the polling fallback flipped to "running" and
+    // tore down without ever showing per-step progress.
     // ------------------------------------------------------------------
-    if !cli.detach && !cli.background {
+    {
         match client.watch_deployment(&deployment_name).await {
             Ok(mut rx) => {
                 let mut deployment_ready = false;
@@ -579,7 +604,6 @@ async fn deploy_core(
     let mut attempt: u32 = 0;
 
     while start.elapsed() < poll_timeout {
-        tokio::time::sleep(poll_interval).await;
         attempt += 1;
 
         match client.get_deployment(&deployment_name).await {
@@ -638,6 +662,11 @@ async fn deploy_core(
                 }
             }
         }
+
+        // Sleep AFTER each poll so the first attempt fires immediately and
+        // the user doesn't stare at an empty TUI for `poll_interval` before
+        // any progress event reaches them.
+        tokio::time::sleep(poll_interval).await;
     }
 
         // Timeout
