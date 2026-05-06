@@ -234,7 +234,7 @@ pub fn Sidebar() -> impl IntoView {
 
             // Version footer
             <div class="p-4 border-t border-base-300">
-                <div class="text-xs text-base-content/40">"ZLayer v0.1.0"</div>
+                <div class="text-xs text-base-content/40">{format!("ZLayer v{}", env!("CARGO_PKG_VERSION"))}</div>
             </div>
         </aside>
     }
