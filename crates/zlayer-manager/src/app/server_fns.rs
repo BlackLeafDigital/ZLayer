@@ -91,7 +91,7 @@ async fn extract_forwarded_headers() -> ForwardedHeaders {
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    tracing::debug!(
+    tracing::info!(
         cookie_len = cookie.as_ref().map_or(0, String::len),
         cookie_present = cookie.is_some(),
         csrf_present = csrf.is_some(),
@@ -1727,6 +1727,20 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
 
+    {
+        let preview: String = hdr
+            .cookie
+            .as_deref()
+            .map(|c| c.chars().take(32).collect())
+            .unwrap_or_else(|| "<none>".to_string());
+        tracing::info!(
+            cookie_preview = %preview,
+            cookie_len = hdr.cookie.as_ref().map_or(0, String::len),
+            csrf_present = hdr.csrf.is_some(),
+            "manager_me: about to forward cookie to upstream /auth/me",
+        );
+    }
+
     let me_resp = client
         .raw_request(
             RawMethod::Get,
@@ -1738,7 +1752,7 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
 
-    tracing::debug!(
+    tracing::info!(
         status = %me_resp.status,
         forwarded_cookie = hdr.cookie.is_some(),
         "manager_me: upstream /auth/me responded"

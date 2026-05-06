@@ -16,6 +16,7 @@
 
 mod encryption;
 mod error;
+mod jwt;
 mod key_manager;
 mod provider;
 mod types;
@@ -37,6 +38,7 @@ mod vault;
 
 pub use encryption::EncryptionKey;
 pub use error::{Result, SecretsError};
+pub use jwt::{JwtSecretManager, ENV_JWT_SECRET};
 pub use key_manager::KeyManager;
 pub use provider::{EnvScopeProvider, SecretsProvider, SecretsResolver, SecretsStore};
 pub use types::{RotationResult, Secret, SecretMetadata, SecretRef, SecretScope};

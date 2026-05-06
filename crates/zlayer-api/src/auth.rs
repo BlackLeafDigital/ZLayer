@@ -138,7 +138,25 @@ pub fn verify_token(secret: &str, token: &str) -> Result<Claims, ApiError> {
     )
     .map(|data| data.claims)
     .map_err(|e| {
-        warn!(error = %e, "Token verification failed");
+        use jsonwebtoken::errors::ErrorKind;
+        let variant = match e.kind() {
+            ErrorKind::ExpiredSignature => "Expired",
+            ErrorKind::InvalidSignature => "InvalidSignature",
+            ErrorKind::InvalidToken => "InvalidToken",
+            ErrorKind::InvalidIssuer => "InvalidIssuer",
+            ErrorKind::InvalidAudience => "InvalidAudience",
+            ErrorKind::Base64(_) => "Base64",
+            ErrorKind::Json(_) => "Json",
+            ErrorKind::Utf8(_) => "Utf8",
+            ErrorKind::Crypto(_) => "Crypto",
+            _ => "Other",
+        };
+        warn!(
+            event = "jwt_verify_failed",
+            variant = variant,
+            error = %e,
+            "Token verification failed",
+        );
         ApiError::Unauthorized(format!("Invalid token: {e}"))
     })
 }
@@ -321,20 +339,46 @@ where
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let auth_state = parts
-            .extensions
-            .get::<AuthState>()
-            .cloned()
+        let auth_state_opt = parts.extensions.get::<AuthState>().cloned();
+        tracing::warn!(
+            auth_state_present = auth_state_opt.is_some(),
+            "SessionAuthUser: extension lookup",
+        );
+        let auth_state = auth_state_opt
             .ok_or_else(|| ApiError::Internal("Auth state not configured".to_string()))?;
 
         let jar = axum_extra::extract::cookie::CookieJar::from_headers(&parts.headers);
-        let token = jar
+        let token_opt = jar
             .get(crate::middleware::cookies::SESSION_COOKIE)
-            .map(|c| c.value().to_string())
+            .map(|c| c.value().to_string());
+        tracing::warn!(
+            session_cookie_present = token_opt.is_some(),
+            cookie_len = token_opt.as_ref().map_or(0, String::len),
+            "SessionAuthUser: session cookie lookup",
+        );
+        let token = token_opt
             .ok_or_else(|| ApiError::Unauthorized("Session cookie missing".to_string()))?;
 
-        let claims = verify_token(auth_state.jwt_secret.expose_secret(), &token)?;
+        let verify_res = verify_token(auth_state.jwt_secret.expose_secret(), &token);
+        match &verify_res {
+            Ok(c) => tracing::warn!(
+                token_verify_result = "ok",
+                sub_prefix = %c.sub.chars().take(8).collect::<String>(),
+                "SessionAuthUser: token verified",
+            ),
+            Err(e) => tracing::warn!(
+                token_verify_result = "err",
+                error = %e,
+                "SessionAuthUser: token verification failed",
+            ),
+        }
+        let claims = verify_res?;
         if claims.is_expired() {
+            tracing::warn!(
+                sub_prefix = %claims.sub.chars().take(8).collect::<String>(),
+                exp = claims.exp,
+                "SessionAuthUser: claims is_expired() == true",
+            );
             return Err(ApiError::Unauthorized("Session expired".to_string()));
         }
 

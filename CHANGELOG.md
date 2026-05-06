@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.14] - 2026-05-06
+
+### Added
+- Structured tracing across the `/auth/me` path so failed manager-login flows
+  can be diagnosed without speculation. New fields: `auth_state_present`,
+  `session_cookie_present`, `cookie_len`, `token_verify_result`, `sub_prefix`
+  on `SessionAuthUser`; named JWT failure `variant` (Expired /
+  InvalidSignature / InvalidToken / Crypto / …) on `verify_token`;
+  `actor_path` (bearer / cookie / none) on `AuthActor`; `store_result`
+  (found / missing / error) on `me`; one-time `jwt_secret_fp` (8-hex
+  SHA-256 prefix) at router build; and `cookie_preview` (32-char prefix)
+  in the manager's `manager_me` server function. Daemon-side lines emit
+  at `warn!` (visible in default daemon logs at `/var/log/zlayer/daemon.log.*`
+  and journald without setting `RUST_LOG`); manager-side lines emit at
+  `info!` (visible via `zlayer logs zlayer-manager` since the manager
+  image bakes `RUST_LOG=info`). None log secrets, full tokens, or full
+  session subjects. The elevated daemon-side levels are temporary while
+  diagnosing the post-login auth bug; they revert to `debug!` once the
+  root cause is fixed.
+- `zlayer-secrets` now exposes `JwtSecretManager`, mirroring `KeyManager`
+  for the API daemon's JWT signing secret. The daemon resolves it as:
+  `--jwt-secret` / `ZLAYER_JWT_SECRET` env, then a persisted file at
+  `{data_dir}/jwt_secret_zlayer.key` (mode 0600), then auto-generate +
+  persist 64 random bytes. Previously, omitting `--jwt-secret` silently
+  used the literal `"CHANGE_ME_IN_PRODUCTION"`, and any operator who set
+  the env var once and forgot it would invalidate every previously issued
+  session cookie on the next restart.
+
+### Fixed
+- `zlayer up` now actually rolls running replicas when the upstream image
+  digest moves on a floating tag (e.g. `:latest`). The youki runtime's
+  `list_images` was reading the manifest digest sidecar under
+  `manifest-digest:{ref}` while `zlayer-registry` writes it under
+  `manifest:digest-{ref}`, so the reader always saw `digest: None` and the
+  `should_recreate` branch in `upsert_service` short-circuited to "no
+  recreate." Both crates now share `zlayer_registry::manifest_digest_cache_key`
+  to keep the format in sync. Users no longer have to run `zlayer pull`
+  before `zlayer up -b` / `zlayer up -d`.
+
 ## [0.11.13] - 2026-05-06
 
 ### Added

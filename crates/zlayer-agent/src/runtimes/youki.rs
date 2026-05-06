@@ -2000,7 +2000,7 @@ impl Runtime for YoukiRuntime {
             };
 
             // Look up the stored registry digest (Wave 2 convention)
-            let digest_key = format!("manifest-digest:{reference}");
+            let digest_key = zlayer_registry::manifest_digest_cache_key(&reference);
             let digest = self
                 .blob_cache
                 .get(&digest_key)
@@ -2021,7 +2021,7 @@ impl Runtime for YoukiRuntime {
 
     async fn remove_image(&self, image: &str, _force: bool) -> Result<()> {
         let manifest_key = format!("manifest:{image}");
-        let digest_key = format!("manifest-digest:{image}");
+        let digest_key = zlayer_registry::manifest_digest_cache_key(image);
 
         // Load manifest to learn the blob digests it references
         let manifest_bytes = self
@@ -2641,9 +2641,9 @@ impl Runtime for YoukiRuntime {
             .map_err(|e| AgentError::Internal(format!("failed to write manifest for tag: {e}")))?;
 
         // Best-effort: carry over the registry digest sidecar if present.
-        let src_digest_key = format!("manifest-digest:{source}");
+        let src_digest_key = zlayer_registry::manifest_digest_cache_key(source);
         if let Ok(Some(digest_bytes)) = self.blob_cache.get(&src_digest_key).await {
-            let dst_digest_key = format!("manifest-digest:{target}");
+            let dst_digest_key = zlayer_registry::manifest_digest_cache_key(target);
             if let Err(e) = self.blob_cache.put(&dst_digest_key, &digest_bytes).await {
                 tracing::warn!(
                     source = %source,

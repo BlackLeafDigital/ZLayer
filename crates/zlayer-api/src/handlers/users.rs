@@ -102,6 +102,11 @@ where
     ) -> std::result::Result<Self, Self::Rejection> {
         // Try Bearer first (API clients).
         if let Ok(user) = AuthUser::from_request_parts(parts, state).await {
+            tracing::warn!(
+                actor_path = "bearer",
+                sub_prefix = %user.claims.sub.chars().take(8).collect::<String>(),
+                "AuthActor: resolved via bearer token",
+            );
             return Ok(AuthActor {
                 user_id: user.claims.sub,
                 roles: user.claims.roles,
@@ -109,7 +114,22 @@ where
             });
         }
         // Fall back to session cookie (browser).
-        let session = SessionAuthUser::from_request_parts(parts, state).await?;
+        let session = match SessionAuthUser::from_request_parts(parts, state).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    actor_path = "none",
+                    error = %e,
+                    "AuthActor: neither bearer nor cookie produced an authenticated user",
+                );
+                return Err(e);
+            }
+        };
+        tracing::warn!(
+            actor_path = "cookie",
+            sub_prefix = %session.claims.sub.chars().take(8).collect::<String>(),
+            "AuthActor: resolved via session cookie",
+        );
         Ok(AuthActor {
             user_id: session.claims.sub,
             roles: session.claims.roles,

@@ -226,15 +226,42 @@ pub fn logout(jar: CookieJar) -> (StatusCode, CookieJar) {
     tag = "Authentication"
 )]
 pub async fn me(actor: AuthActor, State(auth): State<AuthState>) -> Result<Json<UserView>> {
+    tracing::warn!(
+        sub_prefix = %actor.user_id.chars().take(8).collect::<String>(),
+        roles = ?actor.roles,
+        "me: handler entered",
+    );
     let user_store = auth
         .user_store
         .as_ref()
         .ok_or_else(|| ApiError::Internal("User store not configured".to_string()))?;
-    let user = user_store
-        .get(&actor.user_id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?
-        .ok_or_else(|| ApiError::Unauthorized("User no longer exists".to_string()))?;
+    let user = match user_store.get(&actor.user_id).await {
+        Ok(Some(u)) => {
+            tracing::warn!(
+                store_result = "found",
+                sub_prefix = %actor.user_id.chars().take(8).collect::<String>(),
+                "me: user_store hit",
+            );
+            u
+        }
+        Ok(None) => {
+            tracing::warn!(
+                store_result = "missing",
+                user_id = %actor.user_id,
+                "me: user_store miss — claim sub no longer exists in store",
+            );
+            return Err(ApiError::Unauthorized("User no longer exists".to_string()));
+        }
+        Err(e) => {
+            tracing::error!(
+                store_result = "error",
+                sub_prefix = %actor.user_id.chars().take(8).collect::<String>(),
+                error = %e,
+                "me: user_store lookup errored",
+            );
+            return Err(ApiError::Internal(format!("User store: {e}")));
+        }
+    };
     Ok(Json(UserView::from(&user)))
 }
 
