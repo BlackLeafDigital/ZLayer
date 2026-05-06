@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.13] - 2026-05-06
+
+### Added
+- `zlayer manager init` now reuses an existing `bootstrap/ZLAYER_BOOTSTRAP_PASSWORD`
+  secret instead of re-prompting on every run. Pass `--force` (or any of
+  `--password` / `--password-file` / `--random`) to rotate the stored value.
+- Diagnostic tracing in the manager's `extract_forwarded_headers` and
+  `manager_me` server fns to log cookie-forwarding state and upstream
+  `/auth/me` status — surfaces which layer is dropping cookies on
+  post-login probes.
+
+### Changed
+- Manager sidebar version footer now reads from `env!("CARGO_PKG_VERSION")`
+  instead of the hard-coded `v0.1.0`, so dev builds show `0.0.0-dev` and
+  release builds reflect the workspace version automatically.
+
+### Fixed
+- Manager favicon and sidebar logo (`/assets/zlayer_logo.png`) no longer 404.
+  cargo-leptos preserves the `assets-dir` subdirectory layout when copying to
+  `site-root`; the file lives under `assets/assets/` so it lands at
+  `target/site/assets/zlayer_logo.png` to match the `nest_service("/assets",
+  …)` mount.
+
 ## [0.11.12] - 2026-05-04
 
 ### Added

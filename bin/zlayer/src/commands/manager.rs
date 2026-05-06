@@ -20,6 +20,7 @@ pub(crate) async fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
             no_prompt,
             env_file,
             no_bootstrap,
+            force,
         } => {
             handle_manager_init(
                 output.clone(),
@@ -33,6 +34,7 @@ pub(crate) async fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
                 *no_prompt,
                 env_file.clone(),
                 *no_bootstrap,
+                *force,
             )
             .await
         }
@@ -69,6 +71,7 @@ pub(crate) async fn handle_manager_init(
     no_prompt: bool,
     env_file: Option<PathBuf>,
     no_bootstrap: bool,
+    force: bool,
 ) -> Result<()> {
     // --env-file and --no-bootstrap are mutually exclusive: the former wires
     // an active reference into the spec, the latter leaves the spec silent.
@@ -110,6 +113,7 @@ pub(crate) async fn handle_manager_init(
         password_file,
         random,
         no_prompt,
+        force,
     )
     .await
 }
@@ -142,6 +146,7 @@ async fn integrated_bootstrap_init(
     password_file: Option<PathBuf>,
     random: bool,
     no_prompt: bool,
+    force: bool,
 ) -> Result<()> {
     let email = if let Some(e) = email {
         validate_email(&e)?;
@@ -153,15 +158,46 @@ async fn integrated_bootstrap_init(
         prompt_email_interactive()?
     };
 
-    let (password_plaintext, was_random) =
-        resolve_password(password, password_file, random, no_prompt)?;
-
     // Connect to the daemon and make sure the `bootstrap` env exists.
     let client = zlayer_client::DaemonClient::connect().await.context(
         "Failed to connect to the daemon — is it running? Start with `zlayer serve --daemon`",
     )?;
 
     let env_id = ensure_bootstrap_env(&client).await?;
+
+    // Reuse-or-overwrite policy: if the password is already stored AND the
+    // user did not pass an explicit password source AND --force is absent,
+    // keep the existing password and just rewrite the spec.
+    let explicit_pw_source = password.is_some() || password_file.is_some() || random;
+    let already_stored = bootstrap_password_exists(&client, &env_id).await?;
+
+    if already_stored && !explicit_pw_source && !force {
+        println!("Bootstrap password already set in the `bootstrap` environment; reusing.");
+        println!("  Key: ZLAYER_BOOTSTRAP_PASSWORD");
+        println!(
+            "  (pass --force to rotate, or --password / --password-file / --random to overwrite.)"
+        );
+
+        emit_integrated_spec(output, port, version, deploy, &email)?;
+        let spec_path = output.join("manager.zlayer.yml");
+        println!();
+        println!("Admin email: {email}");
+        if deploy {
+            println!();
+            println!("Deploying zlayer-manager...");
+            println!();
+            println!("To deploy manually, run:");
+            println!("  zlayer deploy {}", spec_path.display());
+        } else {
+            println!();
+            println!("To deploy: zlayer deploy {}", spec_path.display());
+        }
+        return Ok(());
+    }
+
+    let (password_plaintext, was_random) =
+        resolve_password(password, password_file, random, no_prompt)?;
+
     client
         .set_secret_in_env(&env_id, "ZLAYER_BOOTSTRAP_PASSWORD", &password_plaintext)
         .await
@@ -172,7 +208,11 @@ async fn integrated_bootstrap_init(
     let spec_path = output.join("manager.zlayer.yml");
 
     println!();
-    println!("Stored admin password in the `bootstrap` environment.");
+    if already_stored {
+        println!("Rotated admin password in the `bootstrap` environment.");
+    } else {
+        println!("Stored admin password in the `bootstrap` environment.");
+    }
     println!("  Key: ZLAYER_BOOTSTRAP_PASSWORD");
     println!();
     if was_random {
@@ -198,6 +238,23 @@ async fn integrated_bootstrap_init(
     Ok(())
 }
 
+/// Return true iff `ZLAYER_BOOTSTRAP_PASSWORD` already exists in the given
+/// environment. Uses the metadata-only `list_secrets_in_env` endpoint —
+/// reading the value would require admin auth and is unnecessary here.
+#[cfg(unix)]
+async fn bootstrap_password_exists(
+    client: &zlayer_client::DaemonClient,
+    env_id: &str,
+) -> Result<bool> {
+    let secrets = client
+        .list_secrets_in_env(env_id)
+        .await
+        .context("Failed to list secrets in bootstrap environment")?;
+    Ok(secrets
+        .iter()
+        .any(|s| s.name == "ZLAYER_BOOTSTRAP_PASSWORD"))
+}
+
 /// Windows stub for [`integrated_bootstrap_init`]: the daemon is Unix-only,
 /// so we can't resolve `$secret://` refs or talk to the secrets API from the
 /// thin Windows CLI. Point the user at the two cross-platform branches or at
@@ -219,6 +276,7 @@ async fn integrated_bootstrap_init(
     _password_file: Option<PathBuf>,
     _random: bool,
     _no_prompt: bool,
+    _force: bool,
 ) -> Result<()> {
     bail!(
         "`zlayer manager init` with bootstrap password integration requires \

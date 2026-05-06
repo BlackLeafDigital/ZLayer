@@ -73,11 +73,15 @@ struct ForwardedHeaders {
 #[cfg(feature = "ssr")]
 async fn extract_forwarded_headers() -> ForwardedHeaders {
     use axum::http::HeaderMap;
-    let Ok(headers) = leptos_axum::extract::<HeaderMap>().await else {
-        return ForwardedHeaders {
-            cookie: None,
-            csrf: None,
-        };
+    let headers = match leptos_axum::extract::<HeaderMap>().await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "extract_forwarded_headers: HeaderMap extract failed");
+            return ForwardedHeaders {
+                cookie: None,
+                csrf: None,
+            };
+        }
     };
     let cookie = headers
         .get(axum::http::header::COOKIE)
@@ -87,6 +91,12 @@ async fn extract_forwarded_headers() -> ForwardedHeaders {
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    tracing::debug!(
+        cookie_len = cookie.as_ref().map_or(0, String::len),
+        cookie_present = cookie.is_some(),
+        csrf_present = csrf.is_some(),
+        "extract_forwarded_headers"
+    );
     ForwardedHeaders { cookie, csrf }
 }
 
@@ -1727,6 +1737,12 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
         )
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
+
+    tracing::debug!(
+        status = %me_resp.status,
+        forwarded_cookie = hdr.cookie.is_some(),
+        "manager_me: upstream /auth/me responded"
+    );
 
     if me_resp.status.is_success() {
         let user: ManagerUserView = serde_json::from_slice(&me_resp.body)

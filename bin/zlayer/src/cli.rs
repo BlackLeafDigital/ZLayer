@@ -2312,6 +2312,13 @@ pub(crate) enum ManagerCommands {
         /// Skip prompts + secret-store writes. Mutually exclusive with --env-file.
         #[arg(long, default_value_t = false)]
         no_bootstrap: bool,
+
+        /// Overwrite an existing bootstrap password. By default, if a
+        /// `ZLAYER_BOOTSTRAP_PASSWORD` is already stored in the `bootstrap`
+        /// environment, it is reused and the spec is rewritten without
+        /// prompting. Pass --force to rotate the stored password.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Show manager status
