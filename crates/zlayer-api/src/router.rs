@@ -14,6 +14,26 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::AuthState;
 use crate::config::ApiConfig;
+
+/// One-time startup audit logged when an `AuthState` is built. The
+/// `jwt_secret_fp` is the first 8 hex chars of `SHA-256(secret)` — enough to
+/// detect a per-restart secret rotation across two boots without ever
+/// logging the secret itself. If this fingerprint differs across daemon
+/// restarts, every previously-issued session cookie becomes signature
+/// invalid (look for `variant = "InvalidSignature"` in `verify_token` logs).
+fn log_auth_state_audit(state: &AuthState) {
+    use secrecy::ExposeSecret;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(state.jwt_secret.expose_secret().as_bytes());
+    let fp = hex::encode(hasher.finalize());
+    tracing::warn!(
+        user_store_configured = state.user_store.is_some(),
+        jwt_secret_fp = %&fp[..8],
+        cookie_secure = state.cookie_secure,
+        "api: AuthState startup audit",
+    );
+}
 use crate::handlers;
 use crate::handlers::audit::AuditState;
 use crate::handlers::cluster::ClusterApiState;
@@ -130,6 +150,7 @@ pub fn build_router_with_storage(
         oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
+    log_auth_state_audit(&auth_state);
 
     // Deployment state (for CRUD operations)
     let deployment_state = DeploymentState::new(storage.clone());
@@ -372,6 +393,7 @@ pub fn build_router_with_services(
         oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
+    log_auth_state_audit(&auth_state);
 
     // Deployment state (for deployment CRUD operations)
     let deployment_state = DeploymentState::new(storage.clone());
@@ -494,6 +516,7 @@ pub fn build_router_with_deployment_state(
         oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
+    log_auth_state_audit(&auth_state);
 
     // Service state (for service scaling operations)
     let service_state = ServiceState::new(service_manager, storage);

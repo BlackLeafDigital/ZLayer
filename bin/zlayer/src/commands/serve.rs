@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -621,11 +621,27 @@ pub(crate) async fn serve_with_external_shutdown(
     data_dir: std::path::PathBuf,
     external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
-    let jwt_secret_raw = jwt_secret.unwrap_or_else(|| {
-        warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
-        "CHANGE_ME_IN_PRODUCTION".to_string()
-    });
-    let jwt_secret = SecretString::from(jwt_secret_raw.clone());
+    // Resolve the JWT signing secret. Priority is:
+    //   1. Explicit `--jwt-secret` flag / `ZLAYER_JWT_SECRET` env var
+    //      (clap reads both into the `jwt_secret` parameter).
+    //   2. A persisted file under `data_dir` managed by
+    //      `zlayer_secrets::JwtSecretManager`.
+    //   3. Auto-generate 64 random bytes and persist to that file.
+    //
+    // Without persistence, every restart minted a fresh secret and silently
+    // invalidated every previously issued session cookie.
+    let jwt_secret = if let Some(provided) = jwt_secret {
+        if provided.is_empty() {
+            anyhow::bail!("--jwt-secret was provided but is empty");
+        }
+        info!("Using JWT secret from --jwt-secret flag / ZLAYER_JWT_SECRET");
+        SecretString::from(provided)
+    } else {
+        zlayer_secrets::JwtSecretManager::with_base_dir(&data_dir)
+            .get_or_create("zlayer")
+            .context("Failed to resolve JWT signing secret")?
+    };
+    let jwt_secret_raw = jwt_secret.expose_secret().to_string();
 
     let bind_addr: std::net::SocketAddr = bind
         .parse()

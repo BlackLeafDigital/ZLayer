@@ -18,6 +18,16 @@ use tracing::instrument;
 #[cfg(feature = "local")]
 use crate::wasm_export::WasmExportResult;
 
+/// Blob-cache key under which the registry's content-addressable manifest
+/// digest is stored alongside the manifest body. Both the registry-side
+/// pull paths and the agent-side runtimes (e.g. youki's `list_images`)
+/// must agree on this key — otherwise readers silently miss the digest
+/// and image-drift detection short-circuits to "no recreate."
+#[must_use]
+pub fn manifest_digest_cache_key(image: &str) -> String {
+    format!("manifest:digest-{image}")
+}
+
 /// Errors that can occur during push operations
 #[derive(Debug, Error)]
 pub enum PushError {
@@ -665,7 +675,7 @@ impl ImagePuller {
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
         let cache_key = format!("manifest:{image}");
-        let digest_key = format!("manifest:digest-{image}");
+        let digest_key = manifest_digest_cache_key(image);
 
         // 1. Blob cache hit?
         if let Some(hit) = self
@@ -777,7 +787,7 @@ impl ImagePuller {
     ) -> Result<(OciImageManifest, String)> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest:digest-{image}");
+            let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,
@@ -880,7 +890,7 @@ impl ImagePuller {
     ) -> Result<ImageConfig> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest:digest-{image}");
+            let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,
@@ -1141,7 +1151,7 @@ impl ImagePuller {
     ) -> Result<Vec<(Vec<u8>, String)>> {
         if force_refresh {
             let cache_key = format!("manifest:{image}");
-            let digest_key = format!("manifest:digest-{image}");
+            let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
                     image = %image,
