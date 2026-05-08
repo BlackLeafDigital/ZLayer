@@ -690,7 +690,7 @@ pub async fn import_image_from_bytes(
         } else {
             name.clone()
         };
-        let cache_key = format!("manifest:{image_ref}");
+        let cache_key = crate::client::manifest_cache_key(&image_ref);
         let _ = cache.put(&cache_key, manifest_data).await;
     }
 

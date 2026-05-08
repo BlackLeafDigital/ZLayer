@@ -138,10 +138,13 @@ pub async fn bind_dual_with_local_auth(
     // Bind Unix listener
     let unix = UnixListener::bind(&unix_path)?;
 
-    // Set Unix socket permissions to 0o666 so non-root users can connect
-    // when the daemon runs as root via systemd. Access control is handled by
-    // the local auth token, not filesystem permissions.
-    std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o666))?;
+    // Socket perms 0o660: only root and members of the socket's group can
+    // connect. The UDS middleware injects an admin Bearer for any request
+    // lacking `Authorization`, so anyone who can `connect()` to this socket
+    // gains daemon admin. Keeping the perms tight is the access-control.
+    // Non-root operators that need CLI access should be added to the
+    // daemon's primary group.
+    std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o660))?;
 
     info!(
         tcp = %tcp_local_addr,
@@ -474,10 +477,13 @@ impl ApiServer {
         // Bind Unix listener
         let unix_listener = UnixListener::bind(&unix_path)?;
 
-        // Set Unix socket permissions to 0o666 so non-root users can connect
-        // when the daemon runs as root via systemd. Access control is handled by
-        // the local auth token, not filesystem permissions.
-        std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o666))?;
+        // Socket perms 0o660: only root and members of the socket's group can
+        // connect. The UDS middleware injects an admin Bearer for any request
+        // lacking `Authorization`, so anyone who can `connect()` to this socket
+        // gains daemon admin. Keeping the perms tight is the access-control.
+        // Non-root operators that need CLI access should be added to the
+        // daemon's primary group.
+        std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o660))?;
 
         info!(
             tcp = %tcp_local_addr,
@@ -615,14 +621,14 @@ mod tests {
         // Verify the Unix socket file was created
         assert!(sock_path.exists(), "Unix socket file should exist");
 
-        // Verify Unix socket permissions are 0o666
+        // Verify Unix socket permissions are 0o660
         {
             use std::os::unix::fs::PermissionsExt;
             let meta = std::fs::metadata(&sock_path).unwrap();
             let mode = meta.permissions().mode() & 0o777;
             assert_eq!(
-                mode, 0o666,
-                "Socket permissions should be 0o666, got {mode:o}",
+                mode, 0o660,
+                "Socket permissions should be 0o660, got {mode:o}",
             );
         }
 

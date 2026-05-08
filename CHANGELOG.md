@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.15] - 2026-05-08
+
+### Added
+- `ProtectedShell` component (`crates/zlayer-manager/src/app/components/protected_shell.rs`)
+  combining `AuthGuard` with the drawer / Navbar / Sidebar chrome.
+  Authenticated routes render inside it; `/login` and `/bootstrap` render
+  bare so the sidebar and navbar are no longer visible to logged-out users.
+- `zlayer_registry::manifest_cache_key(image)` helper alongside the
+  existing `manifest_digest_cache_key`. Both registry-side writers
+  (`client.rs`, `oci_export.rs`) and agent-side readers
+  (`runtimes/youki.rs`) now compose the manifest body cache key through
+  one function instead of raw `format!("manifest:{image}")` strings,
+  closing the same drift hazard that broke image-recreate detection on
+  the digest sidecar (fixed in 0.11.14). `crates/zlayer-registry/src/cache.rs`
+  documents the construction rule at the top of the file.
+
+### Fixed
+- `zlayer up -b` / `zlayer up -d` no longer fails with `401 Unauthorized`
+  on the daemon host. The CLI's `apply_session_auth` is now a no-op on
+  Unix; the daemon's UDS middleware injects the local-admin Bearer for
+  any request lacking `Authorization`, so a stale `~/.zlayer/session.json`
+  signed under a previous JWT secret no longer shadows that injection.
+  Root on the daemon host never has to "log in." Windows behaviour
+  unchanged: TCP loopback still uses the file-backed admin bearer +
+  optional session.
+- Daemon Unix socket permissions reverted from `0o666` to `0o660` (in
+  `bind_dual_with_local_auth` and `ApiServer::run_dual`). The earlier
+  flip rationalised "non-root users can connect via systemd," but
+  combined with the UDS middleware's auto-injection of the admin Bearer
+  it meant any local user could claim full daemon-API admin by
+  `connect()`-ing the socket. Tight perms are the access-control;
+  non-root operators needing CLI access should be added to the daemon's
+  primary group. Test assertion updated to match.
+
+### Changed
+- Manager `App` shell no longer renders the drawer / Navbar / Sidebar
+  unconditionally. Those components are now reachable only via the new
+  `ProtectedShell` wrapper applied to authenticated routes (see Added).
+
 ## [0.11.14] - 2026-05-06
 
 ### Added

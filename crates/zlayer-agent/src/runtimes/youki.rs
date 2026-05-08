@@ -2020,7 +2020,7 @@ impl Runtime for YoukiRuntime {
     }
 
     async fn remove_image(&self, image: &str, _force: bool) -> Result<()> {
-        let manifest_key = format!("manifest:{image}");
+        let manifest_key = zlayer_registry::manifest_cache_key(image);
         let digest_key = zlayer_registry::manifest_digest_cache_key(image);
 
         // Load manifest to learn the blob digests it references
@@ -2623,7 +2623,7 @@ impl Runtime for YoukiRuntime {
 
         // Copy the source manifest and its digest sidecar under the target
         // reference. All blobs remain shared content-addressed in the cache.
-        let src_manifest_key = format!("manifest:{source}");
+        let src_manifest_key = zlayer_registry::manifest_cache_key(source);
         let manifest_bytes = self
             .blob_cache
             .get(&src_manifest_key)
@@ -2634,7 +2634,7 @@ impl Runtime for YoukiRuntime {
                 reason: format!("source image '{source}' not found in cache"),
             })?;
 
-        let dst_manifest_key = format!("manifest:{target}");
+        let dst_manifest_key = zlayer_registry::manifest_cache_key(target);
         self.blob_cache
             .put(&dst_manifest_key, &manifest_bytes)
             .await

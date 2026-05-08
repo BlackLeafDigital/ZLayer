@@ -977,59 +977,73 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("invalid uri {url:?}: {e}"))
     }
 
-    /// If the user has a saved session (`~/.zlayer/session.json`) with an
-    /// unexpired token, attach it as an `Authorization: Bearer <token>`
-    /// header. When the file is absent or the token has expired, this falls
-    /// back on Windows to the locally-persisted admin bearer (if any); on
-    /// Unix it is a no-op because the daemon's Unix-socket middleware injects
-    /// the local-admin token via peer-credential check.
+    /// Attach a Bearer token to outbound CLI requests when one is appropriate
+    /// for the current transport.
+    ///
+    /// **On Unix (UDS transport):** This is a no-op. The CLI on Unix always
+    /// talks to the local daemon over its Unix domain socket, and the daemon
+    /// installs a middleware that injects an admin Bearer for any request
+    /// lacking `Authorization` (see `crates/zlayer-api/src/server.rs` —
+    /// `bind_dual_with_local_auth` + the `unix_router.layer(...)` call in
+    /// `serve_bound`). Reading `~/.zlayer/session.json` and attaching its
+    /// token would shadow that injection with whatever the file happens to
+    /// contain — including a token signed under a previous JWT secret, which
+    /// the daemon would reject as `InvalidSignature`. The local CLI never
+    /// logs in. Period.
+    ///
+    /// **On Windows (TCP loopback):** Prefer a saved session bearer from
+    /// `~/.zlayer/session.json` when present and unexpired; otherwise fall
+    /// back to the locally-persisted admin bearer (`self.bearer`, populated
+    /// from `default_admin_bearer_path()` at connect time).
     #[cfg_attr(unix, allow(clippy::unused_self))]
     fn apply_session_auth(
         &self,
-        mut builder: hyper::http::request::Builder,
+        builder: hyper::http::request::Builder,
     ) -> hyper::http::request::Builder {
-        let mut session_attached = false;
-        match crate::session::read_session() {
-            Ok(Some(session)) if !session.is_expired() => {
-                builder = builder.header(
-                    hyper::header::AUTHORIZATION,
-                    format!("Bearer {}", session.token),
-                );
-                session_attached = true;
-            }
-            Ok(Some(expired)) => {
-                tracing::debug!(
-                    email = %expired.email,
-                    "Session file present but token has expired; ignoring"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to read session file; proceeding without bearer"
-                );
-            }
+        #[cfg(unix)]
+        {
+            // Trust the daemon's UDS middleware; do not attach a session
+            // bearer that could be stale and override the middleware's
+            // freshly-minted local-admin token.
+            builder
         }
 
-        // On Windows: if no session was attached, fall back to the
-        // locally-persisted admin bearer. Batch B populates this; Batch A
-        // leaves it as `None`, making this a no-op for now.
         #[cfg(windows)]
         {
+            let mut builder = builder;
+            let mut session_attached = false;
+            match crate::session::read_session() {
+                Ok(Some(session)) if !session.is_expired() => {
+                    builder = builder.header(
+                        hyper::header::AUTHORIZATION,
+                        format!("Bearer {}", session.token),
+                    );
+                    session_attached = true;
+                }
+                Ok(Some(expired)) => {
+                    tracing::debug!(
+                        email = %expired.email,
+                        "Session file present but token has expired; ignoring"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to read session file; proceeding without bearer"
+                    );
+                }
+            }
+
             if !session_attached {
                 if let Some(bearer) = self.bearer.as_deref() {
                     builder =
                         builder.header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"));
                 }
             }
-        }
-        #[cfg(unix)]
-        {
-            let _ = session_attached;
-        }
 
-        builder
+            builder
+        }
     }
 
     /// Send a GET request and return the response body as bytes.
