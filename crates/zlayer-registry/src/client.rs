@@ -18,6 +18,19 @@ use tracing::instrument;
 #[cfg(feature = "local")]
 use crate::wasm_export::WasmExportResult;
 
+/// Blob-cache key under which the OCI manifest body for `image` is stored.
+///
+/// Both the registry-side pull paths and the agent-side runtimes
+/// (`crates/zlayer-agent/src/runtimes/youki.rs`) must construct this key
+/// via this function — never via raw `format!("manifest:{image}")`. A
+/// drift between writer and reader silently breaks image lookup; we just
+/// burned one debugging session on exactly that bug class for the digest
+/// sidecar key (see [`manifest_digest_cache_key`]).
+#[must_use]
+pub fn manifest_cache_key(image: &str) -> String {
+    format!("manifest:{image}")
+}
+
 /// Blob-cache key under which the registry's content-addressable manifest
 /// digest is stored alongside the manifest body. Both the registry-side
 /// pull paths and the agent-side runtimes (e.g. youki's `list_images`)
@@ -674,7 +687,7 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
-        let cache_key = format!("manifest:{image}");
+        let cache_key = manifest_cache_key(image);
         let digest_key = manifest_digest_cache_key(image);
 
         // 1. Blob cache hit?
@@ -786,7 +799,7 @@ impl ImagePuller {
         force_refresh: bool,
     ) -> Result<(OciImageManifest, String)> {
         if force_refresh {
-            let cache_key = format!("manifest:{image}");
+            let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
@@ -889,7 +902,7 @@ impl ImagePuller {
         force_refresh: bool,
     ) -> Result<ImageConfig> {
         if force_refresh {
-            let cache_key = format!("manifest:{image}");
+            let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
@@ -1150,7 +1163,7 @@ impl ImagePuller {
         force_refresh: bool,
     ) -> Result<Vec<(Vec<u8>, String)>> {
         if force_refresh {
-            let cache_key = format!("manifest:{image}");
+            let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
             if let Err(e) = self.cache.delete(&cache_key).await {
                 tracing::warn!(
@@ -3278,5 +3291,44 @@ mod tests {
             TargetPlatform::new(OsKind::Linux, ArchKind::Amd64).with_os_version("ignored.on.linux");
         let resolver = build_platform_resolver(Some(target));
         assert_eq!(resolver(&manifests).as_deref(), Some("sha256:linux"));
+    }
+
+    #[test]
+    fn manifest_cache_key_is_stable() {
+        assert_eq!(
+            manifest_cache_key("alpine:latest"),
+            "manifest:alpine:latest"
+        );
+        assert_eq!(manifest_cache_key(""), "manifest:");
+    }
+
+    #[test]
+    fn manifest_digest_cache_key_is_stable() {
+        assert_eq!(
+            manifest_digest_cache_key("alpine:latest"),
+            "manifest:digest-alpine:latest"
+        );
+    }
+
+    #[test]
+    fn manifest_and_digest_keys_never_collide() {
+        // The digest variant always has `:digest-` after the leading
+        // `manifest`, so for any pair of non-empty image references the two
+        // keys are distinct. Spot-check a handful of inputs.
+        for image in [
+            "alpine",
+            "alpine:latest",
+            "library/redis:7",
+            "ghcr.io/x/y:tag",
+        ] {
+            let body = manifest_cache_key(image);
+            let digest = manifest_digest_cache_key(image);
+            assert_ne!(body, digest, "cache-key collision for {image}");
+            assert!(body.starts_with("manifest:"), "manifest key shape: {body}");
+            assert!(
+                digest.starts_with("manifest:digest-"),
+                "digest key shape: {digest}"
+            );
+        }
     }
 }

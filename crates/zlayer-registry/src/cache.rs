@@ -1,6 +1,20 @@
 //! Local blob cache for OCI images
 //!
 //! Simplified cache implementation using `std::collections::HashMap`.
+//!
+//! ## Cache-key construction rule
+//!
+//! All cache keys for OCI manifest data MUST be constructed via the
+//! helpers in [`crate::client`]:
+//!
+//! - [`crate::client::manifest_cache_key`] for the manifest body.
+//! - [`crate::client::manifest_digest_cache_key`] for the digest sidecar.
+//!
+//! Do NOT write `format!("manifest...")` anywhere outside `crate::client`.
+//! A previous drift between two `format!` strings (writer using
+//! `"manifest:digest-{image}"`, reader using `"manifest-digest:{image}"`)
+//! silently broke image-recreate detection — exactly the bug class these
+//! helpers exist to prevent.
 
 use crate::error::{CacheError, Result};
 use async_trait::async_trait;
