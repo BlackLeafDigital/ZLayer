@@ -12478,6 +12478,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
+ "js-sys",
  "leptos",
  "leptos-chartistry",
  "leptos_axum",

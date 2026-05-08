@@ -18,6 +18,8 @@
 #[cfg(feature = "ssr")]
 pub mod api_client;
 pub mod app;
+#[cfg(feature = "hydrate")]
+pub mod csrf_client;
 pub mod wire;
 
 /// Hydrate the client-side application.
@@ -27,5 +29,6 @@ pub mod wire;
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
     console_error_panic_hook::set_once();
+    csrf_client::install_fetch_csrf_hook();
     leptos::mount::hydrate_body(app::App);
 }
