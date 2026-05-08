@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.16] - 2026-05-08
+
+### Fixed
+- Manager mutating server_fns no longer 403 with
+  `"CSRF token missing or does not match session cookie"`. The Leptos
+  hydrate side now installs a `window.fetch` wrapper on startup
+  (`crates/zlayer-manager/src/csrf_client.rs`) that reads the
+  JS-readable `zlayer_csrf` cookie and echoes it as `x-csrf-token` on
+  every fetch. The daemon already enforces the double-submit check
+  (`crates/zlayer-api/src/middleware/csrf.rs`); the browser half was
+  unimplemented and any POST/PATCH/DELETE from the Manager UI would
+  have detonated the moment a user got past `/auth/me`. GET requests
+  are CSRF-exempt so this was invisible until a mutating call was made.
+- Manager `manager_me`, `manager_list_*`, and every other read-side
+  server_fn that calls the daemon now propagates upstream `Set-Cookie`
+  headers back to the browser. Previously only `manager_login`,
+  `manager_bootstrap`, and `manager_logout` did, so daemon-side cookie
+  rotations / session refreshes / 401-clear-cookie hints disappeared
+  silently between fetch and browser. Centralised through a new
+  `forward_raw` helper in `crates/zlayer-manager/src/app/server_fns.rs`
+  that wraps `client.raw_request(...)` with `propagate_set_cookies`;
+  ~60 call sites across users, variables, secrets, tasks, notifiers,
+  workflows, groups, permissions, audit, and projects converted in one
+  pass. The bootstrap-state probe inside `manager_me` deliberately
+  bypasses the helper since it is an unauthenticated state probe, not
+  part of the user's auth flow.
+
+### Changed
+- `extract_forwarded_headers` (manager SSR) now logs `cookie_names`
+  (no values) plus `has_session` / `has_csrf_cookie` booleans, so
+  diagnosing whether the `zlayer_session` cookie reached the manager
+  no longer requires inferring from a 32-char preview. The redundant
+  `manager_me: about to forward cookie` block (which only logged the
+  first 32 chars and effectively only ever showed the CSRF cookie
+  name) was removed; the new fields cover every server_fn entry, not
+  just `/auth/me`.
+- `manager_me` now logs the upstream response body verbatim on
+  non-success status, so the daemon's own
+  `"Session cookie missing"` / `"Session expired"` JSON message is
+  visible from the manager log alone without having to splice in
+  daemon journal entries.
+
 ## [0.11.15] - 2026-05-08
 
 ### Added

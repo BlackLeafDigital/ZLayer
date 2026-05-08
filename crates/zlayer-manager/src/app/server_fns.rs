@@ -91,10 +91,22 @@ async fn extract_forwarded_headers() -> ForwardedHeaders {
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let names: Vec<String> = cookie
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|p| p.split_once('=').map(|(n, _)| n.trim().to_string()))
+        .filter(|n| !n.is_empty())
+        .collect();
+    let has_session = names.iter().any(|n| n == "zlayer_session");
+    let has_csrf_cookie = names.iter().any(|n| n == "zlayer_csrf");
     tracing::info!(
         cookie_len = cookie.as_ref().map_or(0, String::len),
         cookie_present = cookie.is_some(),
-        csrf_present = csrf.is_some(),
+        csrf_header_present = csrf.is_some(),
+        cookie_names = ?names,
+        has_session,
+        has_csrf_cookie,
         "extract_forwarded_headers"
     );
     ForwardedHeaders { cookie, csrf }
@@ -117,6 +129,35 @@ fn propagate_set_cookies(cookies: &[String]) {
             Err(e) => tracing::warn!(error = %e, cookie = %c, "invalid Set-Cookie value; skipping"),
         }
     }
+}
+
+/// Forward a raw HTTP request to the daemon, passing the browser's cookie +
+/// CSRF header through, and mirror every upstream `Set-Cookie` header back
+/// to the browser response. Every server_fn that calls the daemon should
+/// go through this helper so the browser session round-trips cleanly —
+/// the daemon may rotate the session cookie or clear it on auth failure,
+/// and dropping those headers leaves the browser stuck with a stale
+/// session.
+#[cfg(feature = "ssr")]
+async fn forward_raw(
+    client: &crate::api_client::ZLayerClient,
+    method: crate::api_client::RawMethod,
+    path: &str,
+    body: Option<&[u8]>,
+    hdr: &ForwardedHeaders,
+) -> std::result::Result<crate::api_client::RawResponse, ServerFnError> {
+    let resp = client
+        .raw_request(
+            method,
+            path,
+            body,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    Ok(resp)
 }
 
 /// Pull a human-readable error message out of an upstream JSON error body.
@@ -1593,18 +1634,7 @@ pub async fn manager_login(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
 
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/auth/login",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, "/auth/login", Some(&body), &hdr).await?;
 
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
@@ -1624,16 +1654,7 @@ pub async fn manager_list_oidc_providers() -> Result<Vec<ManagerOidcProvider>, S
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/auth/oidc/providers",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/auth/oidc/providers", None, &hdr).await?;
 
     if !resp.status.is_success() {
         // On any non-2xx just return empty so the UI degrades gracefully.
@@ -1654,18 +1675,14 @@ pub async fn manager_bootstrap(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
 
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/auth/bootstrap",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/auth/bootstrap",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
 
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
@@ -1686,18 +1703,7 @@ pub async fn manager_logout() -> Result<(), ServerFnError> {
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/auth/logout",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, "/auth/logout", None, &hdr).await?;
 
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
@@ -1727,36 +1733,7 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
 
-    {
-        let preview: String = hdr
-            .cookie
-            .as_deref()
-            .map(|c| c.chars().take(32).collect())
-            .unwrap_or_else(|| "<none>".to_string());
-        tracing::info!(
-            cookie_preview = %preview,
-            cookie_len = hdr.cookie.as_ref().map_or(0, String::len),
-            csrf_present = hdr.csrf.is_some(),
-            "manager_me: about to forward cookie to upstream /auth/me",
-        );
-    }
-
-    let me_resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/auth/me",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-
-    tracing::info!(
-        status = %me_resp.status,
-        forwarded_cookie = hdr.cookie.is_some(),
-        "manager_me: upstream /auth/me responded"
-    );
+    let me_resp = forward_raw(&client, RawMethod::Get, "/auth/me", None, &hdr).await?;
 
     if me_resp.status.is_success() {
         let user: ManagerUserView = serde_json::from_slice(&me_resp.body)
@@ -1767,9 +1744,19 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
         });
     }
 
+    let body_preview = String::from_utf8_lossy(&me_resp.body);
+    tracing::warn!(
+        status = %me_resp.status,
+        body = %body_preview,
+        set_cookie_count = me_resp.set_cookies.len(),
+        "manager_me: upstream rejected /auth/me",
+    );
+
     // Not authenticated — probe bootstrap state with an intentionally
     // invalid (empty) body. We don't forward cookies/csrf here — this is
-    // a pure state probe against the unauthenticated endpoint.
+    // a pure state probe against the unauthenticated endpoint, and we do
+    // NOT propagate Set-Cookie headers from it since they aren't part of
+    // the user's auth flow.
     let probe_body = b"{\"email\":\"\",\"password\":\"\"}";
     let probe = client
         .raw_request(
@@ -1801,16 +1788,7 @@ pub async fn manager_list_users() -> Result<Vec<ManagerUserView>, ServerFnError>
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/users",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/users", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -1832,16 +1810,7 @@ pub async fn manager_create_user(
     let client = get_api_client();
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/users",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Post, "/api/v1/users", Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -1865,16 +1834,7 @@ pub async fn manager_update_user(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/users/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Patch,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Patch, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -1892,16 +1852,7 @@ pub async fn manager_delete_user(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/users/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -1924,16 +1875,7 @@ pub async fn manager_set_user_password(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/users/{}/password", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Post, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -1978,16 +1920,7 @@ pub async fn manager_list_variables() -> Result<Vec<WireVariable>, ServerFnError
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/variables",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/variables", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2013,17 +1946,14 @@ pub async fn manager_create_variable(
     let req = ManagerCreateVariableRequest { name, value, scope };
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/variables",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/variables",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2049,17 +1979,7 @@ pub async fn manager_update_variable(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/variables/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Patch,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Patch, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2078,17 +1998,7 @@ pub async fn manager_delete_variable(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/variables/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2134,16 +2044,14 @@ pub async fn manager_list_environments() -> Result<Vec<WireEnvironment>, ServerF
     // Always request `?project=*` so the Secrets page can show secrets
     // attached to project envs in addition to globals. The backend sorts
     // them by name.
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/environments?project=*",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(
+        &client,
+        RawMethod::Get,
+        "/api/v1/environments?project=*",
+        None,
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2170,16 +2078,7 @@ pub async fn manager_list_secrets(
         }
         _ => "/api/v1/secrets".to_string(),
     };
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2212,17 +2111,7 @@ pub async fn manager_create_secret(
         }
         _ => "/api/v1/secrets".to_string(),
     };
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2268,17 +2157,7 @@ pub async fn manager_reveal_secret(
         ),
         _ => format!("/api/v1/secrets/{}?reveal=true", pct_encode_path(&name)),
     };
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2309,17 +2188,7 @@ pub async fn manager_delete_secret(
         ),
         _ => format!("/api/v1/secrets/{}", pct_encode_path(&name)),
     };
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2366,17 +2235,7 @@ pub async fn manager_bulk_import_secrets(
         "/api/v1/secrets/bulk-import?environment={}",
         pct_encode_path(env_id)
     );
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            Some(body.as_bytes()),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, Some(body.as_bytes()), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2400,16 +2259,7 @@ pub async fn manager_list_tasks() -> Result<Vec<WireTask>, ServerFnError> {
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/tasks",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/tasks", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2428,16 +2278,7 @@ pub async fn manager_get_task(id: String) -> Result<WireTask, ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/tasks/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2460,17 +2301,7 @@ pub async fn manager_create_task(spec: WireTaskSpec) -> Result<WireTask, ServerF
     let client = get_api_client();
     let body =
         serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/tasks",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, "/api/v1/tasks", Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2489,17 +2320,7 @@ pub async fn manager_delete_task(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/tasks/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2521,17 +2342,7 @@ pub async fn manager_run_task(id: String) -> Result<WireTaskRun, ServerFnError> 
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/tasks/{}/run", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2551,16 +2362,7 @@ pub async fn manager_list_task_runs(task_id: String) -> Result<Vec<WireTaskRun>,
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/tasks/{}/runs", pct_encode_path(&task_id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2612,16 +2414,7 @@ pub async fn manager_list_notifiers() -> Result<Vec<WireNotifier>, ServerFnError
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/notifiers",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/notifiers", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2653,17 +2446,14 @@ pub async fn manager_create_notifier(
     let req = ManagerCreateNotifierRequest { name, kind, config };
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/notifiers",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/notifiers",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2698,17 +2488,7 @@ pub async fn manager_update_notifier(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/notifiers/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Patch,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Patch, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2728,17 +2508,7 @@ pub async fn manager_delete_notifier(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/notifiers/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2761,17 +2531,7 @@ pub async fn manager_test_notifier(id: String) -> Result<NotifierTestResult, Ser
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/notifiers/{}/test", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2808,16 +2568,7 @@ pub async fn manager_list_workflows() -> Result<Vec<WireWorkflow>, ServerFnError
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/workflows",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/workflows", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2836,16 +2587,7 @@ pub async fn manager_get_workflow(id: String) -> Result<WireWorkflow, ServerFnEr
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/workflows/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2869,17 +2611,14 @@ pub async fn manager_create_workflow(
     let client = get_api_client();
     let body =
         serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/workflows",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/workflows",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2900,17 +2639,7 @@ pub async fn manager_delete_workflow(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/workflows/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2935,17 +2664,7 @@ pub async fn manager_run_workflow(id: String) -> Result<WireWorkflowRun, ServerF
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/workflows/{}/run", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -2968,16 +2687,7 @@ pub async fn manager_list_workflow_runs(
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/workflows/{}/runs", pct_encode_path(&workflow_id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3021,16 +2731,7 @@ pub async fn manager_list_groups() -> Result<Vec<WireUserGroup>, ServerFnError> 
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/groups",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/groups", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3054,17 +2755,14 @@ pub async fn manager_create_group(
     let req = WireCreateGroup { name, description };
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/groups",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/groups",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3094,17 +2792,7 @@ pub async fn manager_update_group(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/groups/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Patch,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Patch, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3124,17 +2812,7 @@ pub async fn manager_delete_group(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/groups/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3153,16 +2831,7 @@ pub async fn manager_list_group_members(group_id: String) -> Result<Vec<String>,
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/groups/{}/members", pct_encode_path(&group_id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3188,17 +2857,7 @@ pub async fn manager_add_group_member(
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/groups/{}/members", pct_encode_path(&group_id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3224,17 +2883,7 @@ pub async fn manager_remove_group_member(
         pct_encode_path(&group_id),
         pct_encode_path(&user_id),
     );
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3298,16 +2947,7 @@ pub async fn manager_list_permissions_for_subject(
         query_key,
         pct_encode_path(&subject_id)
     );
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3329,17 +2969,14 @@ pub async fn manager_grant_permission(
     let client = get_api_client();
     let body =
         serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/permissions",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/permissions",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3359,17 +2996,7 @@ pub async fn manager_revoke_permission(id: String) -> Result<(), ServerFnError> 
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/permissions/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3453,16 +3080,7 @@ pub async fn manager_list_audit(
         format!("/api/v1/audit?{}", params.join("&"))
     };
 
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3488,16 +3106,7 @@ pub async fn manager_list_projects() -> Result<Vec<WireProject>, ServerFnError> 
     use crate::api_client::RawMethod;
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            "/api/v1/projects",
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, "/api/v1/projects", None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3516,16 +3125,7 @@ pub async fn manager_get_project(id: String) -> Result<WireProject, ServerFnErro
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3550,17 +3150,14 @@ pub async fn manager_create_project(spec: WireProjectSpec) -> Result<WireProject
     let client = get_api_client();
     let body =
         serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            "/api/v1/projects",
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(
+        &client,
+        RawMethod::Post,
+        "/api/v1/projects",
+        Some(&body),
+        &hdr,
+    )
+    .await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3584,17 +3181,7 @@ pub async fn manager_update_project(
     let body =
         serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
     let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Patch,
-            &path,
-            Some(&body),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Patch, &path, Some(&body), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3614,17 +3201,7 @@ pub async fn manager_delete_project(id: String) -> Result<(), ServerFnError> {
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3645,17 +3222,7 @@ pub async fn manager_pull_project(id: String) -> Result<WirePullResult, ServerFn
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}/pull", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3675,16 +3242,7 @@ pub async fn manager_list_project_deployments(id: String) -> Result<Vec<String>,
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}/deployments", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3710,17 +3268,7 @@ pub async fn manager_link_project_deployment(
     let body = serde_json::json!({ "deployment_name": deployment_name });
     let body_vec =
         serde_json::to_vec(&body).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            Some(&body_vec),
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, Some(&body_vec), &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3746,17 +3294,7 @@ pub async fn manager_unlink_project_deployment(
         pct_encode_path(&id),
         pct_encode_path(&deployment_name)
     );
-    let resp = client
-        .raw_request(
-            RawMethod::Delete,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Delete, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3775,16 +3313,7 @@ pub async fn manager_get_project_webhook(id: String) -> Result<WireWebhookInfo, 
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}/webhook", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Get,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
+    let resp = forward_raw(&client, RawMethod::Get, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3804,17 +3333,7 @@ pub async fn manager_rotate_project_webhook(id: String) -> Result<WireWebhookInf
     let hdr = extract_forwarded_headers().await;
     let client = get_api_client();
     let path = format!("/api/v1/projects/{}/webhook/rotate", pct_encode_path(&id));
-    let resp = client
-        .raw_request(
-            RawMethod::Post,
-            &path,
-            None,
-            hdr.cookie.as_deref(),
-            hdr.csrf.as_deref(),
-        )
-        .await
-        .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    let resp = forward_raw(&client, RawMethod::Post, &path, None, &hdr).await?;
     if !resp.status.is_success() {
         let msg = parse_error_message(&resp.body);
         return Err(ServerFnError::new(format!(
@@ -3864,16 +3383,14 @@ pub async fn manager_list_credentials(
     let mut out: Vec<WireProjectCredential> = Vec::new();
 
     if want_registry {
-        let resp = client
-            .raw_request(
-                RawMethod::Get,
-                "/api/v1/credentials/registry",
-                None,
-                hdr.cookie.as_deref(),
-                hdr.csrf.as_deref(),
-            )
-            .await
-            .map_err(|e| api_error_to_server_error(&e))?;
+        let resp = forward_raw(
+            &client,
+            RawMethod::Get,
+            "/api/v1/credentials/registry",
+            None,
+            &hdr,
+        )
+        .await?;
         if !resp.status.is_success() {
             let msg = parse_error_message(&resp.body);
             return Err(ServerFnError::new(format!(
@@ -3894,16 +3411,14 @@ pub async fn manager_list_credentials(
     }
 
     if want_git {
-        let resp = client
-            .raw_request(
-                RawMethod::Get,
-                "/api/v1/credentials/git",
-                None,
-                hdr.cookie.as_deref(),
-                hdr.csrf.as_deref(),
-            )
-            .await
-            .map_err(|e| api_error_to_server_error(&e))?;
+        let resp = forward_raw(
+            &client,
+            RawMethod::Get,
+            "/api/v1/credentials/git",
+            None,
+            &hdr,
+        )
+        .await?;
         if !resp.status.is_success() {
             let msg = parse_error_message(&resp.body);
             return Err(ServerFnError::new(format!(

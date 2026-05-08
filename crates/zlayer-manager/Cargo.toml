@@ -34,7 +34,8 @@ tower-http = { workspace = true, features = ["fs", "trace", "compression-br", "c
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Storage", "MediaQueryList", "Location"], optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Storage", "MediaQueryList", "Location", "console"], optional = true }
 
 zlayer-agent = { workspace = true, optional = true }
 zlayer-api = { workspace = true, optional = true }
@@ -99,6 +100,7 @@ hydrate = [
     "leptos/hydrate",
     "dep:wasm-bindgen",
     "dep:web-sys",
+    "dep:js-sys",
     "dep:console_error_panic_hook",
     "dep:gloo-timers",
 ]
