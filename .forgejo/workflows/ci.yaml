@@ -22,6 +22,24 @@ env:
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
 
+# ===========================================
+# Commit-message markers
+# ----
+# Substring-matched against the head commit message on dev pushes:
+#
+#   [np]   "no publish" — `prepare-release` outputs no version, so no temp/v*
+#          branch is cut and `trigger-e2e` runs e2e.yml for signal but its
+#          dispatch-build job no-ops. Tests still run.
+#   [fast] "fast release" — keeps fmt/check/clippy on Linux+macOS+Windows for
+#          sanity, skips ALL tests (Linux/macOS/Windows + feature-tests) and
+#          E2E, then dispatches build.yml directly. Use when confident the
+#          change is benign (docs, minor manager-UI tweaks, etc.). Skipping
+#          tests on a release is a real risk for daemon/agent regressions.
+#
+# Markers are detected in the `version` job and propagated as outputs so
+# every downstream `if:` clause references one source of truth.
+# ===========================================
+
 jobs:
   # ===========================================
   # Resolve version for ci-step-status tracking.
@@ -40,6 +58,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      fast: ${{ steps.fast.outputs.fast }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +71,21 @@ jobs:
           tag-prefix: v
           bump: patch
           service-type: rust
+      - name: Detect [fast] marker
+        id: fast
+        shell: bash
+        env:
+          # Only `push` events carry head_commit; PR/dispatch events leave it
+          # empty so the substring check is harmlessly false.
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ] && [[ "$MSG" == *"[fast]"* ]]; then
+            echo "fast=true" >> "$GITHUB_OUTPUT"
+            echo "[fast] detected — tests, feature-tests, and E2E will be skipped; build.yml dispatched directly."
+          else
+            echo "fast=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # ===========================================
   # Prepare release branch (temp/v{VERSION})
@@ -468,6 +502,7 @@ jobs:
     name: Test (Windows)
     runs-on: windows-latest
     needs: [version, check, check-macos, check-windows]
+    if: needs.version.outputs.fast != 'true'
     env:
       CARGO_BUILD_JOBS: "4"
     steps:
@@ -576,6 +611,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     needs: [version, check, check-macos, check-windows]
+    if: needs.version.outputs.fast != 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -662,6 +698,7 @@ jobs:
     name: Test (macOS)
     runs-on: macos-latest
     needs: [version, check-macos]
+    if: needs.version.outputs.fast != 'true'
     env:
       CARGO_BUILD_JOBS: "4"
     steps:
@@ -849,6 +886,7 @@ jobs:
     name: Feature Tests
     runs-on: ubuntu-latest
     needs: [version, check, check-macos, check-windows]
+    if: needs.version.outputs.fast != 'true'
     strategy:
       matrix:
         features:
@@ -967,6 +1005,54 @@ jobs:
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             -H "Content-Type: application/json" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/e2e.yml/dispatches" \
+            -d '{"ref": "${{ steps.version.outputs.ref }}", "inputs": {"version": "${{ steps.version.outputs.version }}", "sha": "${{ steps.version.outputs.sha }}"}}'
+
+  # ===========================================
+  # Trigger Build directly (fast-release path)
+  # ----
+  # Fires only on dev pushes whose commit message contains `[fast]`. Skips
+  # e2e.yml entirely and dispatches build.yml with the temp/v{VERSION} branch
+  # ref. The full normal path is `ci → e2e → build`; the fast path is
+  # `ci → build`. Tests/feature-tests/E2E all skipped via their own `if:`
+  # gates upstream, so this job's `needs:` only waits on the lightweight
+  # checks (fmt + cargo check + clippy on Linux/macOS/Windows).
+  #
+  # Skipping tests + E2E on a release is a real risk for daemon/agent
+  # changes; intended for benign edits where a full belt-and-suspenders
+  # release is overkill. See the `[fast]` marker doc at the top of this file.
+  # ===========================================
+  trigger-build-direct:
+    name: Trigger Build (fast path)
+    runs-on: ubuntu-latest
+    needs: [version, prepare-release, check, check-macos, check-windows]
+    if: |
+      always()
+      && needs.version.outputs.fast == 'true'
+      && needs.prepare-release.result == 'success'
+      && needs.prepare-release.outputs.version != ''
+      && needs.check.result == 'success'
+      && needs.check-macos.result == 'success'
+      && needs.check-windows.result == 'success'
+    steps:
+      - name: Determine version + ref to forward
+        id: version
+        env:
+          PREP_VERSION: ${{ needs.prepare-release.outputs.version }}
+          PREP_BRANCH: ${{ needs.prepare-release.outputs.branch }}
+          PREP_SHA: ${{ needs.prepare-release.outputs.sha }}
+        run: |
+          {
+            echo "version=v${PREP_VERSION}"
+            echo "ref=refs/heads/${PREP_BRANCH}"
+            echo "sha=${PREP_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch build.yml directly (skipping E2E)
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
             -d '{"ref": "${{ steps.version.outputs.ref }}", "inputs": {"version": "${{ steps.version.outputs.version }}", "sha": "${{ steps.version.outputs.sha }}"}}'
 
   # ===========================================
