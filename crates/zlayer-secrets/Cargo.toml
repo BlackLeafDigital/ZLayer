@@ -25,8 +25,11 @@ tracing.workspace = true
 # Cryptography
 hex.workspace = true
 chacha20poly1305 = "0.10"
+crypto_box = { version = "0.9", features = ["seal"] }
 argon2 = "0.5"
 rand.workspace = true
+sha2.workspace = true
+base64.workspace = true
 
 # Secret handling
 secrecy = { version = "0.10", features = ["serde"] }

@@ -133,6 +133,6 @@ pub use transport::*;
 
 #[cfg(feature = "nat")]
 pub use nat::{
-    Candidate, CandidateType, ConnectionType, NatConfig, NatTraversal, RelayClient, RelayDiscovery,
-    RelayServer, StunClient,
+    Candidate, CandidateType, ConnectionType, NatConfig, NatPeerSnapshot, NatStatusSnapshot,
+    NatTraversal, RelayClient, RelayDiscovery, RelayServer, StunClient,
 };

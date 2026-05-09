@@ -278,46 +278,6 @@ impl OverlayTransport {
         format!("/var/run/wireguard/{}.sock", self.interface_name)
     }
 
-    /// Best-effort cleanup of a stale Linux TUN interface left behind by a
-    /// previously crashed process.
-    ///
-    /// If the process was `SIGKILLed` (or crashed without running Drop),
-    /// the TUN device persists in the kernel and boringtun's
-    /// `DeviceHandle::new()` will fail on re-create with EEXIST. We probe
-    /// for the interface via [`InterfaceOps`] and delete it if present.
-    ///
-    /// Any error from either the probe or the delete is logged at WARN
-    /// level and swallowed — this is a cleanup path, not the primary
-    /// code path, and failure here is recoverable (the caller proceeds
-    /// with creation and the next step surfaces any real problem).
-    #[cfg(target_os = "linux")]
-    async fn cleanup_stale_linux_interface(iface_name: &str) {
-        let iface_ops = platform_ops();
-        match iface_ops.link_exists(iface_name).await {
-            Ok(true) => {
-                tracing::warn!(
-                    interface = %iface_name,
-                    "stale network interface found, cleaning up before re-create"
-                );
-                if let Err(e) = iface_ops.delete_link(iface_name).await {
-                    tracing::warn!(
-                        interface = %iface_name,
-                        error = %e,
-                        "failed to delete stale overlay interface (continuing)"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(
-                    interface = %iface_name,
-                    error = %e,
-                    "failed to probe for stale overlay interface (continuing)"
-                );
-            }
-        }
-    }
-
     /// Create the TUN interface.
     ///
     /// On Linux/macOS this spawns boringtun worker threads that manage
@@ -366,13 +326,42 @@ impl OverlayTransport {
         // Ensure the UAPI socket directory exists
         tokio::fs::create_dir_all("/var/run/wireguard").await?;
 
-        // On Linux, clean up stale interfaces from a previous crashed deploy.
-        // If the process was SIGKILLed, the TUN device persists in the kernel
-        // and DeviceHandle::new() will fail on re-create.
+        // On Linux, refuse to silently delete an existing kernel link. Stale
+        // interfaces from a previous crashed daemon are swept by the
+        // boot-time cleanup in `bin/zlayer/src/commands/serve.rs::cleanup_stale_daemon`.
+        // If a link with this name still exists when we get here, that's a
+        // real duplicate-name bug (or a foreign owner) and silently deleting
+        // it would yank the TUN out from under another live boringtun
+        // worker, producing the upstream "Fatal read error on tun interface:
+        // Os { code: 77 }" (EBADFD) symptom.
+        //
         // macOS utun devices are kernel-managed and auto-destroyed when the
-        // owning socket closes, so cleanup is a no-op there.
+        // owning socket closes, so this check is Linux-only.
         #[cfg(target_os = "linux")]
-        Self::cleanup_stale_linux_interface(&self.interface_name).await;
+        {
+            let iface_ops = platform_ops();
+            match iface_ops.link_exists(&self.interface_name).await {
+                Ok(true) => {
+                    return Err(format!(
+                        "Kernel link '{}' already exists; refusing to delete it. \
+                         If this is a stale interface from a previous crash, restart \
+                         the daemon (its boot-time sweep clears stale zl-* / veth-* \
+                         links). If this fires during normal operation, there is a \
+                         duplicate-name bug somewhere in the overlay setup path.",
+                        self.interface_name
+                    )
+                    .into());
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        interface = %self.interface_name,
+                        error = %e,
+                        "failed to probe for existing overlay interface; proceeding"
+                    );
+                }
+            }
+        }
 
         // Clean up stale UAPI socket left behind by a crashed process.
         let sock_path = format!("/var/run/wireguard/{}.sock", self.interface_name);

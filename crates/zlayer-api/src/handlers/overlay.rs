@@ -55,6 +55,15 @@ impl OverlayApiState {
     }
 }
 
+/// Map a [`zlayer_overlay::CandidateType`] to its API string form.
+fn candidate_kind_str(kind: zlayer_overlay::CandidateType) -> &'static str {
+    match kind {
+        zlayer_overlay::CandidateType::Host => "host",
+        zlayer_overlay::CandidateType::ServerReflexive => "server-reflexive",
+        zlayer_overlay::CandidateType::Relay => "relay",
+    }
+}
+
 /// Get overlay network status.
 ///
 /// Returns the current overlay network status including interface name,
@@ -266,6 +275,92 @@ pub async fn get_dns_status(State(state): State<OverlayApiState>) -> Json<DnsSta
         bind_addr: Some(listen.ip().to_string()),
         service_count: 0,
         services: Vec::new(),
+    })
+}
+
+/// Get NAT traversal status.
+///
+/// Returns the daemon's current NAT traversal configuration plus the live
+/// runtime state from the overlay manager: configured STUN/TURN servers,
+/// the bound relay-server address (if running), the locally gathered ICE
+/// candidates, per-peer connection types, and the timestamp of the last
+/// successful STUN refresh.
+///
+/// When the overlay manager is not initialised (host-networking mode) the
+/// response reports `enabled: false` with empty server / candidate lists
+/// rather than 503 — the Manager UI uses this endpoint to surface "NAT
+/// disabled" badges and shouldn't have to special-case missing overlays.
+#[utoipa::path(
+    get,
+    path = "/api/v1/overlay/nat/status",
+    responses(
+        (status = 200, description = "NAT traversal status", body = NatStatusResponse),
+    ),
+    tag = "Overlay"
+)]
+pub async fn get_nat_status(State(state): State<OverlayApiState>) -> Json<NatStatusResponse> {
+    let Some(om) = state.overlay.as_ref() else {
+        return Json(NatStatusResponse {
+            enabled: false,
+            stun_servers: Vec::new(),
+            turn_servers: Vec::new(),
+            relay_server_bind: None,
+            candidates: Vec::new(),
+            peers: Vec::new(),
+            last_refresh: 0,
+        });
+    };
+
+    let guard = om.read().await;
+    let enabled = guard.nat_enabled();
+    let nat_config = guard.nat_config().unwrap_or_default();
+    let stun_servers = nat_config
+        .stun_servers
+        .iter()
+        .map(|s| s.address.clone())
+        .collect();
+    let turn_servers = nat_config
+        .turn_servers
+        .iter()
+        .map(|s| s.address.clone())
+        .collect();
+    let relay_server_bind = nat_config.relay_server.as_ref().map(|r| {
+        // The configured external address is what other nodes use to reach
+        // this relay; surface it as the human-readable bind for the UI.
+        r.external_addr.clone()
+    });
+
+    let snapshot = guard.nat_status_snapshot().await;
+
+    let candidates = snapshot
+        .candidates
+        .into_iter()
+        .map(|c| NatCandidateDto {
+            kind: candidate_kind_str(c.candidate_type).to_string(),
+            transport: "udp".to_string(),
+            address: c.address.to_string(),
+            priority: c.priority,
+        })
+        .collect();
+
+    let peers = snapshot
+        .peers
+        .into_iter()
+        .map(|p| NatPeerDto {
+            node_id: p.node_id,
+            connection_type: p.connection_type,
+            remote_endpoint: p.remote_endpoint,
+        })
+        .collect();
+
+    Json(NatStatusResponse {
+        enabled,
+        stun_servers,
+        turn_servers,
+        relay_server_bind,
+        candidates,
+        peers,
+        last_refresh: snapshot.last_refresh,
     })
 }
 
@@ -576,5 +671,83 @@ mod tests {
 
         // They should be different
         assert_ne!(v4_json, v6_json);
+    }
+
+    // =========================================================================
+    // NAT status endpoint
+    // =========================================================================
+
+    /// When no overlay manager is wired in (host-networking mode), the NAT
+    /// endpoint returns an `enabled: false` payload instead of 503.
+    #[tokio::test]
+    async fn test_get_nat_status_returns_disabled_when_none() {
+        let state = OverlayApiState::new();
+        let Json(response) = get_nat_status(State(state)).await;
+        assert!(!response.enabled);
+        assert!(response.stun_servers.is_empty());
+        assert!(response.turn_servers.is_empty());
+        assert!(response.relay_server_bind.is_none());
+        assert!(response.candidates.is_empty());
+        assert!(response.peers.is_empty());
+        assert_eq!(response.last_refresh, 0);
+    }
+
+    /// With a live overlay manager but no NAT bootstrap, the endpoint
+    /// surfaces the configured STUN defaults and an empty candidate list.
+    #[tokio::test]
+    async fn test_get_nat_status_with_manager_no_traversal() {
+        let om = OverlayManager::new("test-deploy".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let Json(response) = get_nat_status(State(state)).await;
+        // Default NatConfig has enabled = true
+        assert!(response.enabled);
+        // STUN defaults populate when no override is provided
+        assert!(!response.stun_servers.is_empty());
+        // Candidates / peers empty until start_nat_traversal runs
+        assert!(response.candidates.is_empty());
+        assert!(response.peers.is_empty());
+    }
+
+    #[test]
+    fn test_nat_status_response_serialise_round_trip() {
+        let response = NatStatusResponse {
+            enabled: true,
+            stun_servers: vec!["stun.l.google.com:19302".to_string()],
+            turn_servers: vec![],
+            relay_server_bind: Some("203.0.113.5:3478".to_string()),
+            candidates: vec![NatCandidateDto {
+                kind: "host".to_string(),
+                transport: "udp".to_string(),
+                address: "192.168.1.5:51820".to_string(),
+                priority: 100,
+            }],
+            peers: vec![NatPeerDto {
+                node_id: "node-1".to_string(),
+                connection_type: "direct".to_string(),
+                remote_endpoint: Some("203.0.113.6:51820".to_string()),
+            }],
+            last_refresh: 1_706_900_000,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: NatStatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.stun_servers.len(), 1);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.peers.len(), 1);
+        assert_eq!(parsed.last_refresh, 1_706_900_000);
+    }
+
+    #[test]
+    fn test_candidate_kind_str_mapping() {
+        use zlayer_overlay::CandidateType;
+        assert_eq!(candidate_kind_str(CandidateType::Host), "host");
+        assert_eq!(
+            candidate_kind_str(CandidateType::ServerReflexive),
+            "server-reflexive"
+        );
+        assert_eq!(candidate_kind_str(CandidateType::Relay), "relay");
     }
 }

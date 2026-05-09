@@ -96,7 +96,7 @@ fn default_max_relay_sessions() -> usize {
 impl Default for NatConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             stun_servers: default_stun_servers(),
             turn_servers: Vec::new(),
             hole_punch_timeout_secs: default_hole_punch_timeout(),
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn test_nat_config_default() {
         let config = NatConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.stun_servers.len(), 2);
         assert!(config.turn_servers.is_empty());
         assert_eq!(config.hole_punch_timeout_secs, 15);

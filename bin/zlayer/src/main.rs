@@ -23,6 +23,7 @@ pub mod daemon;
 mod daemon_service;
 #[allow(dead_code)]
 mod deploy_tui;
+mod privilege;
 pub mod resources;
 pub mod ui;
 mod util;
@@ -640,6 +641,14 @@ async fn run(
             docker_socket,
             #[cfg(feature = "docker-compat")]
             docker_socket_path,
+            no_nat,
+            stun_servers,
+            turn_servers,
+            relay_server_bind,
+            tunnel_bind,
+            tunnel_tls_cert,
+            tunnel_tls_key,
+            no_tunnel_server,
             ..
         } => {
             // Spawn Docker API socket server if enabled. On Unix this is a
@@ -658,15 +667,52 @@ async fn run(
 
             let socket_path = cli.effective_socket_path();
             let data_dir = cli.effective_data_dir();
-            Box::pin(commands::serve::serve(
-                bind,
-                jwt_secret.clone(),
-                *no_swagger,
-                &socket_path,
-                cli.host_network,
-                data_dir,
-            ))
-            .await
+
+            // Stash CLI-level tunnel overrides so the daemon picks them up
+            // alongside the `ZLAYER_TUNNEL_*` env vars when it builds its
+            // `TunnelDaemonConfig`.
+            let tunnel_overrides = commands::serve::TunnelCliOverrides {
+                no_tunnel_server: *no_tunnel_server,
+                bind: tunnel_bind.clone(),
+                tls_cert: tunnel_tls_cert.clone(),
+                tls_key: tunnel_tls_key.clone(),
+            };
+            commands::serve::set_pending_tunnel_overrides(tunnel_overrides);
+
+            // NAT overrides are gated on the `nat` feature; on builds without
+            // it, fall back to the env-var-only path via `serve()`.
+            #[cfg(feature = "nat")]
+            {
+                let nat_overrides = commands::serve::NatCliOverrides {
+                    no_nat: *no_nat,
+                    stun_servers: stun_servers.clone(),
+                    turn_servers: turn_servers.clone(),
+                    relay_server_bind: relay_server_bind.clone(),
+                };
+                Box::pin(commands::serve::serve_with_nat_overrides(
+                    bind,
+                    jwt_secret.clone(),
+                    *no_swagger,
+                    &socket_path,
+                    cli.host_network,
+                    data_dir,
+                    nat_overrides,
+                ))
+                .await
+            }
+            #[cfg(not(feature = "nat"))]
+            {
+                let _ = (no_nat, stun_servers, turn_servers, relay_server_bind);
+                Box::pin(commands::serve::serve(
+                    bind,
+                    jwt_secret.clone(),
+                    *no_swagger,
+                    &socket_path,
+                    cli.host_network,
+                    data_dir,
+                ))
+                .await
+            }
         }
 
         // =================================================================

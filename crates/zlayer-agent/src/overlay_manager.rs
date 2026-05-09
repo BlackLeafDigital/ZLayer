@@ -10,7 +10,9 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
-use zlayer_overlay::{OverlayConfig, OverlayTransport};
+use zlayer_overlay::{
+    NatConfig, NatPeerSnapshot, NatStatusSnapshot, NatTraversal, OverlayConfig, OverlayTransport,
+};
 
 /// Maximum length for Linux network interface names (IFNAMSIZ - 1 for null terminator).
 const MAX_IFNAME_LEN: usize = 15;
@@ -107,6 +109,20 @@ pub struct OverlayManager {
     /// resolve to `svc-a.<domain>` without the container needing an explicit
     /// search list.
     dns_domain: Option<String>,
+    /// NAT traversal configuration threaded into [`OverlayConfig::nat`] when
+    /// the manager builds overlay transports. `None` means the underlying
+    /// `OverlayConfig::default()` value is used (which itself defaults to
+    /// `NatConfig::default()`, i.e. NAT enabled with public STUN servers).
+    nat_config: Option<NatConfig>,
+    /// Live NAT traversal orchestrator. `Some` after a successful
+    /// [`OverlayManager::start_nat_traversal`] call, otherwise `None`.
+    /// Wrapped in a `RwLock` so the maintenance tick (which mutates
+    /// reflexive-address state on STUN refresh) can run without holding the
+    /// outer manager's write lock.
+    nat_traversal: tokio::sync::RwLock<Option<NatTraversal>>,
+    /// Unix-epoch seconds of the last successful candidate gather / STUN
+    /// refresh. Surfaced to the API for diagnostics.
+    nat_last_refresh: AtomicU64,
 }
 
 impl OverlayManager {
@@ -126,9 +142,9 @@ impl OverlayManager {
     /// Panics if the default CIDR `10.200.0.0/16` cannot be parsed (this is a compile-time constant).
     #[allow(clippy::unused_async)]
     pub async fn new(deployment: String) -> Result<Self, AgentError> {
-        tracing::warn!(
+        tracing::debug!(
             deployment = %deployment,
-            "OverlayManager::new uses full /16 default; prefer with_slice for cluster deployments"
+            "OverlayManager::new uses full /16 default; cluster deployments should use with_slice"
         );
         let default_cidr: IpNetwork = "10.200.0.0/16".parse().unwrap();
         Ok(Self {
@@ -148,6 +164,9 @@ impl OverlayManager {
             )),
             dns_server_addr: None,
             dns_domain: None,
+            nat_config: None,
+            nat_traversal: tokio::sync::RwLock::new(None),
+            nat_last_refresh: AtomicU64::new(0),
         })
     }
 
@@ -185,6 +204,9 @@ impl OverlayManager {
             )),
             dns_server_addr: None,
             dns_domain: None,
+            nat_config: None,
+            nat_traversal: tokio::sync::RwLock::new(None),
+            nat_last_refresh: AtomicU64::new(0),
         }
     }
 
@@ -193,6 +215,160 @@ impl OverlayManager {
     pub fn with_overlay_port(mut self, port: u16) -> Self {
         self.overlay_port = port;
         self
+    }
+
+    /// Set the NAT traversal configuration for the overlay network.
+    ///
+    /// When set, the [`NatConfig`] is threaded into every [`OverlayConfig`]
+    /// the manager builds (global and per-service). When unset (the default),
+    /// `OverlayConfig::default()` is used, which itself defaults to
+    /// `NatConfig::default()` — i.e. NAT traversal enabled with public STUN.
+    #[must_use]
+    pub fn with_nat_config(mut self, nat: NatConfig) -> Self {
+        self.nat_config = Some(nat);
+        self
+    }
+
+    /// Returns the number of services currently registered with this manager.
+    ///
+    /// Counts entries in `service_interfaces`, which is populated by
+    /// [`OverlayManager::setup_service_overlay`] regardless of whether the
+    /// underlying overlay transport was successfully created or fell through
+    /// to direct networking. Useful for the race regression test in
+    /// `tests/overlay_setup_race.rs` and for telemetry endpoints.
+    pub async fn service_count(&self) -> usize {
+        self.service_interfaces.read().await.len()
+    }
+
+    /// Returns whether NAT traversal is enabled for this manager.
+    ///
+    /// Reflects the most recent `with_nat_config()` call. When no NAT config
+    /// has been provided this falls back to [`NatConfig::default`] which has
+    /// `enabled = true`.
+    #[must_use]
+    pub fn nat_enabled(&self) -> bool {
+        self.nat_config
+            .as_ref()
+            .map_or_else(|| NatConfig::default().enabled, |c| c.enabled)
+    }
+
+    /// Returns a clone of the configured [`NatConfig`], or `None` if no
+    /// override was provided. Used by the API layer to surface the daemon's
+    /// effective NAT configuration without exposing the raw
+    /// `NatConfig::default()` baseline.
+    #[must_use]
+    pub fn nat_config(&self) -> Option<NatConfig> {
+        self.nat_config.clone()
+    }
+
+    /// Bootstrap a [`NatTraversal`] orchestrator for this manager.
+    ///
+    /// Constructs a fresh `NatTraversal` from the configured [`NatConfig`]
+    /// (defaulting when none is set), gathers ICE-style local candidates
+    /// (host + STUN reflexive + relay) and stores it for later
+    /// [`OverlayManager::nat_maintenance_tick`] / status calls.
+    ///
+    /// No-op when `enabled = false` in the configured `NatConfig`. Failures
+    /// during candidate gathering are logged and surfaced as `Ok(false)` so
+    /// the caller can decide whether to spawn a maintenance loop or skip it.
+    ///
+    /// Returns `Ok(true)` when the traversal was successfully constructed and
+    /// at least one candidate was gathered, `Ok(false)` when NAT is disabled
+    /// or candidate gathering yielded nothing actionable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only on unexpected internal failures; STUN/TURN
+    /// network errors are downgraded to `Ok(false)` with a warning log so
+    /// the daemon can boot with NAT degraded rather than aborting.
+    pub async fn start_nat_traversal(&self) -> Result<bool, AgentError> {
+        let config = self.nat_config.clone().unwrap_or_default();
+        if !config.enabled {
+            tracing::debug!("NAT traversal disabled in config; skipping start");
+            return Ok(false);
+        }
+
+        let mut nat = NatTraversal::new(config, self.overlay_port);
+        match nat.gather_candidates().await {
+            Ok(candidates) => {
+                tracing::info!(
+                    count = candidates.len(),
+                    "Gathered NAT candidates for overlay manager",
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.nat_last_refresh.store(now, Ordering::SeqCst);
+                *self.nat_traversal.write().await = Some(nat);
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "NAT candidate gathering failed");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Periodic NAT traversal maintenance: re-probe STUN, refresh relays,
+    /// attempt to upgrade relayed peer connections to direct/hole-punched.
+    ///
+    /// Intended to be called from a `tokio::time::interval` loop spawned by
+    /// the daemon. No-op when [`OverlayManager::start_nat_traversal`] has
+    /// not yet succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying STUN refresh fails. The daemon's
+    /// loop logs and ignores these so a transient STUN outage doesn't kill
+    /// the maintenance task.
+    pub async fn nat_maintenance_tick(&self) -> Result<(), AgentError> {
+        let mut guard = self.nat_traversal.write().await;
+        let Some(nat) = guard.as_mut() else {
+            return Ok(());
+        };
+
+        match nat.refresh().await {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!("NAT reflexive address changed during refresh");
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.nat_last_refresh.store(now, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => Err(AgentError::Network(format!(
+                "NAT maintenance tick failed: {e}"
+            ))),
+        }
+    }
+
+    /// Snapshot the current NAT traversal state for API consumers.
+    ///
+    /// Returns an empty snapshot when NAT traversal has not been started.
+    /// Per-peer entries are not yet tracked here (the agent path does not
+    /// route peers through `NatTraversal::connect_to_peer`); callers should
+    /// treat the `peers` list as advisory.
+    pub async fn nat_status_snapshot(&self) -> NatStatusSnapshot {
+        let guard = self.nat_traversal.read().await;
+        let Some(nat) = guard.as_ref() else {
+            return NatStatusSnapshot::empty();
+        };
+        let candidates = nat.local_candidates().to_vec();
+        let last_refresh = self.nat_last_refresh.load(Ordering::SeqCst);
+        // Per-peer state isn't tracked through this manager today (peers
+        // come in via the OverlayTransport's UAPI rather than through
+        // NatTraversal::connect_to_peer). Surface an empty list for now;
+        // future wiring can populate this once the agent owns peer state.
+        let peers: Vec<NatPeerSnapshot> = Vec::new();
+        NatStatusSnapshot {
+            candidates,
+            peers,
+            last_refresh,
+        }
     }
 
     /// Record the overlay DNS server address and zone domain so attaches can
@@ -233,9 +409,8 @@ impl OverlayManager {
     /// Returns an error if key generation or interface creation fails.
     pub async fn setup_global_overlay(&mut self) -> Result<(), AgentError> {
         // Idempotency: if a global transport is already live, reuse it.
-        // Recreating would call cleanup_stale_linux_interface, which
-        // deletes the live TUN out from under the running boringtun
-        // worker, causing EBADFD on its read loop.
+        // Recreating without this guard could yank the kernel TUN out from
+        // under the running boringtun worker, causing EBADFD on its read loop.
         if self.global_transport.is_some() {
             tracing::debug!(
                 deployment = %self.deployment,
@@ -277,60 +452,74 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if the overlay interface cannot be created.
     pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
-        // Idempotency: if a transport already exists for this service,
-        // return its interface name without touching the kernel.
-        // Recreating would call cleanup_stale_linux_interface, which
-        // deletes the live TUN out from under the running boringtun
-        // worker, causing EBADFD on its read loop.
-        {
-            let transports = self.service_transports.read().await;
-            if let Some(existing) = transports.get(service_name) {
-                let existing_name = existing.interface_name().to_string();
-                tracing::debug!(
-                    service = %service_name,
-                    interface = %existing_name,
-                    "Service overlay already active, reusing existing transport"
-                );
-                return Ok(existing_name);
-            }
+        // Hold the service_transports write lock across the entire check-and-create.
+        // This closes the TOCTOU race where two concurrent callers (e.g. restore_deployments
+        // racing the deploy API handler) both passed the read-lock idempotency check, both
+        // entered transport creation, and the second one's netlink activity killed the
+        // first's live TUN -> boringtun worker EBADFD.
+        let mut transports = self.service_transports.write().await;
+
+        if let Some(existing) = transports.get(service_name) {
+            let existing_name = existing.interface_name().to_string();
+            tracing::debug!(
+                service = %service_name,
+                interface = %existing_name,
+                "Service overlay already active, reusing existing transport"
+            );
+            drop(transports);
+            return Ok(existing_name);
         }
 
         let interface_name = make_interface_name(&[&self.deployment, service_name], "s");
 
-        // Attempt overlay creation (for inter-node communication)
-        // This is non-fatal: single-node deployments work fine without it
-        match self.try_create_overlay(&interface_name, service_name).await {
-            Ok(()) => {
+        // Attempt overlay creation (for inter-node communication).
+        // Non-fatal: single-node deployments work fine without it.
+        match self
+            .build_service_transport(&interface_name, service_name)
+            .await
+        {
+            Ok(transport) => {
+                let actual_name = transport.interface_name().to_string();
+                transports.insert(service_name.to_string(), transport);
+                drop(transports);
                 tracing::info!(
                     service = %service_name,
-                    interface = %interface_name,
+                    interface = %actual_name,
                     "Service overlay created"
                 );
+                // Always register service so attach_container can proceed.
+                self.service_interfaces
+                    .write()
+                    .await
+                    .insert(service_name.to_string(), actual_name.clone());
+                Ok(actual_name)
             }
             Err(e) => {
+                drop(transports);
                 tracing::warn!(
                     service = %service_name,
                     error = %e,
                     "Overlay unavailable, using direct networking"
                 );
+                // Always register service so attach_container can proceed
+                // (veth pair creation doesn't require the overlay interface).
+                self.service_interfaces
+                    .write()
+                    .await
+                    .insert(service_name.to_string(), interface_name.clone());
+                Ok(interface_name)
             }
         }
-
-        // Always register service so attach_container can proceed
-        // (veth pair creation doesn't require the overlay interface)
-        self.service_interfaces
-            .write()
-            .await
-            .insert(service_name.to_string(), interface_name.clone());
-        Ok(interface_name)
     }
 
-    /// Attempt to create an overlay interface for inter-node traffic
-    async fn try_create_overlay(
+    /// Build an overlay transport for a service without touching the manager's maps.
+    /// Caller is responsible for inserting the returned transport into
+    /// `service_transports` while holding the write lock.
+    async fn build_service_transport(
         &self,
         interface_name: &str,
         service_name: &str,
-    ) -> Result<(), AgentError> {
+    ) -> Result<OverlayTransport, AgentError> {
         let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to generate keys: {e}")))?;
@@ -347,18 +536,7 @@ impl OverlayManager {
             AgentError::Network(format!("Failed to configure service overlay: {e}"))
         })?;
 
-        // Update interface tracking with the actual name (on macOS, kernel assigns utunN)
-        let actual_name = transport.interface_name().to_string();
-        self.service_interfaces
-            .write()
-            .await
-            .insert(service_name.to_string(), actual_name);
-
-        self.service_transports
-            .write()
-            .await
-            .insert(service_name.to_string(), transport);
-        Ok(())
+        Ok(transport)
     }
 
     /// Add a container to the appropriate overlay networks.
@@ -798,7 +976,6 @@ impl OverlayManager {
         (offset.saturating_sub(1), self.ip_allocator.base)
     }
 
-    #[allow(clippy::unused_self)]
     fn build_config(
         &self,
         private_key: String,
@@ -812,13 +989,17 @@ impl OverlayManager {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
-        OverlayConfig {
+        let mut config = OverlayConfig {
             local_endpoint: SocketAddr::new(local_addr, listen_port),
             private_key,
             public_key,
             overlay_cidr: format!("{ip}/{mask}"),
             ..OverlayConfig::default()
+        };
+        if let Some(nat) = self.nat_config.clone() {
+            config.nat = nat;
         }
+        config
     }
 }
 

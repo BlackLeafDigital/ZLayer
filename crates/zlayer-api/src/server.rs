@@ -146,6 +146,41 @@ pub async fn bind_dual_with_local_auth(
     // daemon's primary group.
     std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o660))?;
 
+    #[cfg(unix)]
+    {
+        use nix::unistd::{chown, Gid, Group};
+        match Group::from_name("zlayer") {
+            Ok(Some(grp)) => {
+                let gid = Gid::from_raw(grp.gid.as_raw());
+                if let Err(e) = chown(&unix_path, None, Some(gid)) {
+                    tracing::debug!(
+                        error = %e,
+                        group = "zlayer",
+                        socket = %unix_path.display(),
+                        "failed to chown socket to zlayer group; falling back to default group ownership"
+                    );
+                } else {
+                    tracing::info!(
+                        socket = %unix_path.display(),
+                        "socket chowned to root:zlayer 0o660"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    socket = %unix_path.display(),
+                    "group 'zlayer' not present on this system; skipping socket chown"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "failed to look up 'zlayer' group; skipping socket chown"
+                );
+            }
+        }
+    }
+
     info!(
         tcp = %tcp_local_addr,
         unix = %unix_path.display(),
@@ -484,6 +519,41 @@ impl ApiServer {
         // Non-root operators that need CLI access should be added to the
         // daemon's primary group.
         std::fs::set_permissions(&unix_path, std::fs::Permissions::from_mode(0o660))?;
+
+        #[cfg(unix)]
+        {
+            use nix::unistd::{chown, Gid, Group};
+            match Group::from_name("zlayer") {
+                Ok(Some(grp)) => {
+                    let gid = Gid::from_raw(grp.gid.as_raw());
+                    if let Err(e) = chown(&unix_path, None, Some(gid)) {
+                        tracing::debug!(
+                            error = %e,
+                            group = "zlayer",
+                            socket = %unix_path.display(),
+                            "failed to chown socket to zlayer group; falling back to default group ownership"
+                        );
+                    } else {
+                        tracing::info!(
+                            socket = %unix_path.display(),
+                            "socket chowned to root:zlayer 0o660"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        socket = %unix_path.display(),
+                        "group 'zlayer' not present on this system; skipping socket chown"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "failed to look up 'zlayer' group; skipping socket chown"
+                    );
+                }
+            }
+        }
 
         info!(
             tcp = %tcp_local_addr,

@@ -597,6 +597,60 @@ pub struct DaemonClient {
     bearer: Option<String>,
 }
 
+/// Distinguishes the ways a probe of the daemon's local socket / endpoint
+/// can fail.  This lets callers tell "daemon is not running" from "daemon is
+/// running but the current user has no permission to talk to it" — the
+/// latter is common on freshly-installed Linux systems where the user has
+/// been added to the `zlayer` group but the current shell session has not
+/// picked up the new group membership yet (`newgrp zlayer` or re-login).
+pub enum DaemonReachability {
+    /// The daemon answered a health probe successfully.
+    ///
+    /// Boxed because [`DaemonClient`] is ~296 bytes and dwarfs the other
+    /// variants; otherwise clippy fires `large_enum_variant`.
+    Reachable(Box<DaemonClient>),
+    /// The socket file (or endpoint) does not exist — daemon is not running.
+    SocketMissing,
+    /// The socket file exists but `connect()` returned `EACCES`.  Daemon is
+    /// running, but the calling process lacks group permission to reach it.
+    PermissionDenied,
+    /// The socket file exists but `connect()` returned `ECONNREFUSED`.
+    /// Often indicates a stale socket file from a crashed daemon.
+    ConnectionRefused,
+    /// Any other I/O or transport error.
+    Other(std::io::Error),
+}
+
+impl std::fmt::Debug for DaemonReachability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reachable(_) => f.write_str("Reachable(DaemonClient)"),
+            Self::SocketMissing => f.write_str("SocketMissing"),
+            Self::PermissionDenied => f.write_str("PermissionDenied"),
+            Self::ConnectionRefused => f.write_str("ConnectionRefused"),
+            Self::Other(e) => f.debug_tuple("Other").field(e).finish(),
+        }
+    }
+}
+
+impl DaemonReachability {
+    /// Convenience: collapse to `Option<DaemonClient>` for callers that
+    /// don't care about the reason.
+    #[must_use]
+    pub fn into_option(self) -> Option<DaemonClient> {
+        match self {
+            Self::Reachable(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// Convenience: did we find a daemon to talk to?
+    #[must_use]
+    pub fn is_reachable(&self) -> bool {
+        matches!(self, Self::Reachable(_))
+    }
+}
+
 #[allow(clippy::missing_errors_doc)]
 impl DaemonClient {
     // ------------------------------------------------------------------
@@ -667,6 +721,57 @@ impl DaemonClient {
         }
     }
 
+    /// Probe the daemon at `socket_path` and return a categorized result.
+    ///
+    /// Unlike [`try_connect_to`](Self::try_connect_to), this does NOT collapse
+    /// permission and connection-refused errors into "not running" — callers
+    /// (status display, install readiness probe) can branch on the reason.
+    #[cfg(unix)]
+    pub async fn probe(socket_path: impl AsRef<Path>) -> DaemonReachability {
+        use std::io::ErrorKind;
+
+        let socket_path = socket_path.as_ref().to_path_buf();
+
+        // Quick stat: if the path doesn't exist, the daemon is not running.
+        // Note: `Path::exists()` returns false for both ENOENT and EACCES on
+        // the parent directory, so we use `metadata()` to disambiguate when
+        // possible.
+        match std::fs::metadata(&socket_path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return DaemonReachability::SocketMissing;
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                return DaemonReachability::PermissionDenied;
+            }
+            Err(e) => {
+                return DaemonReachability::Other(e);
+            }
+            Ok(_) => {}
+        }
+
+        // Attempt the connect + health check.
+        match Self::try_build(&socket_path).await {
+            Ok(client) => DaemonReachability::Reachable(Box::new(client)),
+            Err(e) => {
+                // Walk the error chain looking for an io::Error so we can
+                // bucket on ErrorKind.
+                let mut err_kind = None;
+                for cause in e.chain() {
+                    if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+                        err_kind = Some(io_err.kind());
+                        break;
+                    }
+                }
+                match err_kind {
+                    Some(ErrorKind::PermissionDenied) => DaemonReachability::PermissionDenied,
+                    Some(ErrorKind::ConnectionRefused) => DaemonReachability::ConnectionRefused,
+                    Some(ErrorKind::NotFound) => DaemonReachability::SocketMissing,
+                    _ => DaemonReachability::Other(std::io::Error::other(format!("{e}"))),
+                }
+            }
+        }
+    }
+
     /// Like [`try_connect`](Self::try_connect) but with a custom TCP endpoint.
     ///
     /// Accepts either `tcp://127.0.0.1:3669` or bare `127.0.0.1:3669`.
@@ -682,6 +787,37 @@ impl DaemonClient {
                 }
             }
             Err(_) => Ok(None),
+        }
+    }
+
+    /// Probe the daemon TCP endpoint and return a categorized result.
+    #[cfg(windows)]
+    pub async fn probe(endpoint: impl Into<String>) -> DaemonReachability {
+        use std::io::ErrorKind;
+
+        let raw = endpoint.into();
+        let parsed = match parse_tcp_url(&raw) {
+            Ok(p) => p,
+            Err(e) => return DaemonReachability::Other(std::io::Error::other(format!("{e}"))),
+        };
+        let bearer = read_local_bearer();
+        match Self::try_build_windows(parsed, bearer).await {
+            Ok(client) => DaemonReachability::Reachable(Box::new(client)),
+            Err(e) => {
+                let mut err_kind = None;
+                for cause in e.chain() {
+                    if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+                        err_kind = Some(io_err.kind());
+                        break;
+                    }
+                }
+                match err_kind {
+                    Some(ErrorKind::PermissionDenied) => DaemonReachability::PermissionDenied,
+                    Some(ErrorKind::ConnectionRefused) => DaemonReachability::ConnectionRefused,
+                    Some(ErrorKind::NotFound) => DaemonReachability::SocketMissing,
+                    _ => DaemonReachability::Other(std::io::Error::other(format!("{e}"))),
+                }
+            }
         }
     }
 
@@ -2590,6 +2726,37 @@ impl DaemonClient {
         let (status, body) = self.delete(&path).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
+    }
+
+    /// Create a temporary access session for a tunneled service.
+    ///
+    /// The daemon binds a local TCP listener that proxies to the requested
+    /// `endpoint` and tears it down when `ttl_secs` elapses. Returns the
+    /// daemon-side local address so the caller can connect (or open a
+    /// secondary forwarder when running on a different host).
+    ///
+    /// `POST /api/v1/tunnels/access/sessions`
+    pub async fn create_access_session(
+        &self,
+        endpoint: &str,
+        ttl_secs: u64,
+        local_port: Option<u16>,
+    ) -> Result<zlayer_types::api::tunnels::CreateAccessSessionResponse> {
+        // `CreateAccessSessionRequest` is `Deserialize`-only on the daemon
+        // side, so we build the wire JSON inline rather than going through
+        // `serde_json::to_string`.
+        let mut payload = serde_json::json!({
+            "endpoint": endpoint,
+            "ttl_secs": ttl_secs,
+        });
+        if let Some(port) = local_port {
+            payload["local_port"] = serde_json::Value::from(port);
+        }
+        let (status, resp) = self
+            .post_json("/api/v1/tunnels/access/sessions", &payload.to_string())
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
     }
 
     // ------------------------------------------------------------------

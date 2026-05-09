@@ -19,8 +19,10 @@ use zlayer_api::router::{
 };
 use zlayer_api::{
     ApiConfig, BridgeNetworkApiState, BuildState, ContainerApiState, CronState, JobState,
-    NetworkApiState, TunnelApiState, VolumeApiState,
+    NetworkApiState, VolumeApiState,
 };
+#[cfg(feature = "nat")]
+use zlayer_overlay::nat::{NatConfig, RelayServerConfig, StunServerConfig, TurnServerConfig};
 use zlayer_overlay::IpAllocator;
 
 /// Daemon metadata written to `{data_dir}/daemon.json`.
@@ -576,6 +578,12 @@ async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
 /// Foreground variant — uses Ctrl+C / SIGTERM for shutdown. For the
 /// Windows Service variant that also honours SCM Stop/Shutdown control
 /// codes, see [`serve_with_external_shutdown`].
+///
+/// On builds without the `nat` feature, this is the entry point used by
+/// `Commands::Serve`. With the `nat` feature, [`serve_with_nat_overrides`]
+/// is used instead (so the CLI flags actually win over env vars), and this
+/// shim is only kept for source compatibility.
+#[cfg_attr(feature = "nat", allow(dead_code))]
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -597,6 +605,410 @@ pub(crate) async fn serve(
         None,
     ))
     .await
+}
+
+/// Variant of [`serve`] that also accepts CLI-level NAT overrides so callers
+/// (the `Commands::Serve` dispatcher in `main.rs`) can thread `--no-nat` /
+/// `--stun-server` / etc. into the daemon config without going through env
+/// vars.
+#[cfg(feature = "nat")]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) async fn serve_with_nat_overrides(
+    bind: &str,
+    jwt_secret: Option<String>,
+    no_swagger: bool,
+    socket_path: &str,
+    host_network: bool,
+    data_dir: std::path::PathBuf,
+    nat_overrides: NatCliOverrides,
+) -> Result<()> {
+    // Stash the overrides in a process-global slot so
+    // `serve_with_external_shutdown` (which keeps its public signature for
+    // back-compat with `daemon_service.rs`) can pick them up alongside the
+    // `ZLAYER_NAT_*` env vars.
+    set_pending_nat_overrides(nat_overrides);
+    Box::pin(serve_with_external_shutdown(
+        bind,
+        jwt_secret,
+        no_swagger,
+        socket_path,
+        host_network,
+        data_dir,
+        None,
+    ))
+    .await
+}
+
+/// CLI overrides for the daemon-side tunnel server.
+///
+/// Resolved in `serve()` against environment variables (`ZLAYER_TUNNEL_*`) and
+/// the [`crate::daemon::TunnelDaemonConfig::default`] baseline; the result is
+/// threaded into the daemon via [`crate::daemon::DaemonConfig::tunnel`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TunnelCliOverrides {
+    /// `--no-tunnel-server`: disable the tunnel server entirely.
+    pub no_tunnel_server: bool,
+    /// `--tunnel-bind <host:port>`. When set, the WebSocket accept loop binds
+    /// here; otherwise the [`crate::daemon::TunnelDaemonConfig::default`]
+    /// address (`0.0.0.0:3679`) is used.
+    pub bind: Option<String>,
+    /// `--tunnel-tls-cert <path>`.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// `--tunnel-tls-key <path>`.
+    pub tls_key: Option<std::path::PathBuf>,
+}
+
+static PENDING_TUNNEL_OVERRIDES: std::sync::Mutex<Option<TunnelCliOverrides>> =
+    std::sync::Mutex::new(None);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_tunnel_overrides(overrides: TunnelCliOverrides) {
+    if let Ok(mut slot) = PENDING_TUNNEL_OVERRIDES.lock() {
+        *slot = Some(overrides);
+    }
+}
+
+fn take_pending_tunnel_overrides() -> TunnelCliOverrides {
+    PENDING_TUNNEL_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default()
+}
+
+/// Resolve the tunnel daemon config from CLI overrides + env vars + defaults.
+fn build_tunnel_config_from_overrides(
+    overrides: &TunnelCliOverrides,
+) -> crate::daemon::TunnelDaemonConfig {
+    let mut cfg = crate::daemon::TunnelDaemonConfig::default();
+
+    // Defaults (the same env-var fallbacks clap supplies via `env=...`,
+    // duplicated here so the foreground shim path also picks them up when
+    // CLI overrides are absent).
+    if let Ok(raw) = std::env::var("ZLAYER_TUNNEL_BIND") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(addr) = trimmed.parse() {
+                cfg.bind = addr;
+            } else {
+                tracing::warn!(value = %trimmed, "Ignoring invalid ZLAYER_TUNNEL_BIND");
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("ZLAYER_TUNNEL_TLS_CERT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            cfg.tls_cert = Some(std::path::PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(raw) = std::env::var("ZLAYER_TUNNEL_TLS_KEY") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            cfg.tls_key = Some(std::path::PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(raw) = std::env::var("ZLAYER_DISABLE_TUNNEL_SERVER") {
+        cfg.disabled = !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        );
+    }
+
+    // CLI overrides win over env.
+    if let Some(ref bind) = overrides.bind {
+        match bind.parse() {
+            Ok(addr) => cfg.bind = addr,
+            Err(e) => tracing::warn!(value = %bind, error = %e, "Ignoring invalid --tunnel-bind"),
+        }
+    }
+    if overrides.tls_cert.is_some() {
+        cfg.tls_cert.clone_from(&overrides.tls_cert);
+    }
+    if overrides.tls_key.is_some() {
+        cfg.tls_key.clone_from(&overrides.tls_key);
+    }
+    if overrides.no_tunnel_server {
+        cfg.disabled = true;
+    }
+
+    cfg
+}
+
+/// Process-global slot for the most recently parsed `NatCliOverrides`.
+///
+/// The serve dispatch flow is:
+///   1. `main.rs` parses CLI flags into a `NatCliOverrides` and calls
+///      [`serve_with_nat_overrides`].
+///   2. That helper writes the overrides into this slot, then defers to
+///      [`serve_with_external_shutdown`].
+///   3. Inside `serve_with_external_shutdown`, the slot is taken back out
+///      and combined with the `ZLAYER_NAT_*` env vars + `NatConfig::default()`.
+///
+/// Older entry points (the Windows Service `daemon_service.rs` flow and the
+/// foreground `serve()` shim) keep their existing signatures and end up with
+/// an empty slot — they pick up env-var overrides only.
+#[cfg(feature = "nat")]
+static PENDING_NAT_OVERRIDES: std::sync::Mutex<Option<NatCliOverrides>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "nat")]
+fn set_pending_nat_overrides(overrides: NatCliOverrides) {
+    if let Ok(mut slot) = PENDING_NAT_OVERRIDES.lock() {
+        *slot = Some(overrides);
+    }
+}
+
+#[cfg(feature = "nat")]
+fn take_pending_nat_overrides() -> NatCliOverrides {
+    PENDING_NAT_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default()
+}
+
+/// Bag of NAT-related CLI overrides surfaced from `zlayer serve` flags.
+///
+/// Resolved in `serve()` against environment variables (`ZLAYER_NAT_*`) and
+/// the [`NatConfig::default`] baseline; the result is threaded into the
+/// daemon's `OverlayManager` via [`crate::daemon::DaemonConfig::nat`].
+#[cfg(feature = "nat")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NatCliOverrides {
+    /// `--no-nat`: disable NAT traversal entirely.
+    pub no_nat: bool,
+    /// `--stun-server <host:port>` (repeatable). Overrides the default STUN
+    /// server list when non-empty.
+    pub stun_servers: Vec<String>,
+    /// `--turn-server <host:port>` (repeatable). Overrides the default TURN
+    /// server list when non-empty.
+    pub turn_servers: Vec<String>,
+    /// `--relay-server-bind <host:port>`. When set, the built-in relay server
+    /// listens on this address; otherwise no relay server is started locally.
+    pub relay_server_bind: Option<String>,
+}
+
+/// Parse a comma-separated host:port list from an env var into a `Vec<String>`.
+#[cfg(feature = "nat")]
+fn parse_csv_env(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse a boolean-ish env value. "0", "false", "no", "off" => false. Everything
+/// else => true. Empty / unset is handled by the caller.
+#[cfg(feature = "nat")]
+fn parse_bool_env(raw: &str) -> bool {
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Resolve NAT settings from CLI overrides (highest precedence), env vars
+/// (middle), and `NatConfig::default()` (lowest).
+#[cfg(feature = "nat")]
+fn build_nat_config_from_overrides(overrides: &NatCliOverrides) -> NatConfig {
+    let mut nat = NatConfig::default();
+
+    // 1. ZLAYER_NAT_ENABLED env (defaults to true via NatConfig::default()).
+    if let Ok(raw) = std::env::var("ZLAYER_NAT_ENABLED") {
+        if !raw.trim().is_empty() {
+            nat.enabled = parse_bool_env(&raw);
+        }
+    }
+
+    // 2. STUN servers from env (only if set & non-empty).
+    if let Ok(raw) = std::env::var("ZLAYER_STUN_SERVERS") {
+        let parsed = parse_csv_env(&raw);
+        if !parsed.is_empty() {
+            nat.stun_servers = parsed
+                .into_iter()
+                .map(|address| StunServerConfig {
+                    address,
+                    label: None,
+                })
+                .collect();
+        }
+    }
+
+    // 3. TURN servers from env. Format: `host:port` (no auth from env; use a
+    //    config file for credentialed TURN). Username/credential default to
+    //    empty strings — the runtime should treat empty creds as anonymous.
+    if let Ok(raw) = std::env::var("ZLAYER_TURN_SERVERS") {
+        let parsed = parse_csv_env(&raw);
+        if !parsed.is_empty() {
+            nat.turn_servers = parsed
+                .into_iter()
+                .map(|address| TurnServerConfig {
+                    address,
+                    username: String::new(),
+                    credential: String::new(),
+                    region: None,
+                })
+                .collect();
+        }
+    }
+
+    // 4. Hole-punch / STUN refresh tunables.
+    if let Ok(raw) = std::env::var("ZLAYER_HOLE_PUNCH_TIMEOUT_SECS") {
+        if let Ok(secs) = raw.trim().parse::<u64>() {
+            nat.hole_punch_timeout_secs = secs;
+        }
+    }
+    if let Ok(raw) = std::env::var("ZLAYER_STUN_REFRESH_INTERVAL_SECS") {
+        if let Ok(secs) = raw.trim().parse::<u64>() {
+            nat.stun_refresh_interval_secs = secs;
+        }
+    }
+
+    // 5. Built-in relay server bind from env (host:port).
+    if let Ok(raw) = std::env::var("ZLAYER_RELAY_SERVER_BIND") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            nat.relay_server = parse_relay_bind(trimmed);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI overrides (highest precedence) — apply *after* env so they win.
+    // -----------------------------------------------------------------------
+    if overrides.no_nat {
+        nat.enabled = false;
+    }
+    if !overrides.stun_servers.is_empty() {
+        nat.stun_servers = overrides
+            .stun_servers
+            .iter()
+            .cloned()
+            .map(|address| StunServerConfig {
+                address,
+                label: None,
+            })
+            .collect();
+    }
+    if !overrides.turn_servers.is_empty() {
+        nat.turn_servers = overrides
+            .turn_servers
+            .iter()
+            .cloned()
+            .map(|address| TurnServerConfig {
+                address,
+                username: String::new(),
+                credential: String::new(),
+                region: None,
+            })
+            .collect();
+    }
+    if let Some(bind) = overrides.relay_server_bind.as_deref() {
+        let trimmed = bind.trim();
+        if !trimmed.is_empty() {
+            nat.relay_server = parse_relay_bind(trimmed);
+        }
+    }
+
+    nat
+}
+
+/// Parse a relay-server bind expression `host:port` into a [`RelayServerConfig`].
+///
+/// Returns `None` if the expression doesn't contain a valid `:port`. The
+/// `external_addr` is set to the same string the operator passed; downstream
+/// callers can override it if they need to advertise a different reachable
+/// address.
+#[cfg(feature = "nat")]
+fn parse_relay_bind(bind: &str) -> Option<RelayServerConfig> {
+    let port_str = bind.rsplit(':').next()?;
+    let port: u16 = port_str.parse().ok()?;
+    Some(RelayServerConfig {
+        listen_port: port,
+        external_addr: bind.to_string(),
+        max_sessions: 100,
+    })
+}
+
+/// Redirect process stderr (fd 2) into the tracing subscriber, line by line.
+///
+/// Background: `boringtun` (and any other dep that uses `eprintln!`) writes
+/// directly to fd 2 from worker threads it owns. Those bytes bypass the
+/// `tracing` pipeline entirely, so under `systemd`/`launchd` they land in the
+/// journal as raw, unstructured text alongside our structured JSON log lines.
+///
+/// We solve that by replacing fd 2 with the write end of a pipe, then spawning
+/// a tokio task that reads the pipe line by line and re-emits each line as a
+/// structured `tracing::error!` event with `target = "stderr"`.
+///
+/// This runs only when stderr is **not** a TTY — interactive
+/// `zlayer serve` sessions still see normal stderr output. It is also
+/// `#[cfg(unix)]`-only; the Windows daemon uses the SCM event log path.
+///
+/// On any setup failure (`pipe(2)` / `dup2(2)` returning an error) we log a
+/// warning via tracing (which at this point is on stdout / a log file, not
+/// stderr) and return without aborting daemon startup — running without the
+/// redirect is a strictly better failure mode than refusing to come up.
+#[cfg(unix)]
+fn install_stderr_redirect_to_tracing() {
+    use std::io::IsTerminal;
+    use std::os::fd::{AsFd, FromRawFd, IntoRawFd};
+
+    if std::io::stderr().is_terminal() {
+        // Foreground from a shell — preserve normal stderr UX.
+        return;
+    }
+
+    let (read_fd, write_fd) = match nix::unistd::pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to create stderr-redirect pipe; continuing without redirect");
+            return;
+        }
+    };
+
+    if let Err(e) = nix::unistd::dup2_stderr(write_fd.as_fd()) {
+        tracing::warn!(error = %e, "failed to dup2 stderr to pipe; continuing without redirect");
+        return;
+    }
+    // After dup2, fd 2 is now a duplicate of the pipe write end. We can drop
+    // our extra OwnedFd handle; the kernel keeps the pipe alive via fd 2 for
+    // the lifetime of the process.
+    drop(write_fd);
+
+    // Hand the pipe read end to a background task that re-emits each line as
+    // a structured tracing event. The task lives until EOF on the pipe, which
+    // only happens when every writer (including fd 2) is closed — i.e. at
+    // process shutdown.
+    let read_fd_raw = read_fd.into_raw_fd();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+
+        // SAFETY: `read_fd_raw` came from an `OwnedFd` we just forfeited via
+        // `into_raw_fd`, so we are the unique owner. `File::from_raw_fd` takes
+        // ownership and will close the fd when the resulting `File` drops.
+        #[allow(unsafe_code)]
+        let std_file = unsafe { std::fs::File::from_raw_fd(read_fd_raw) };
+        let async_file = tokio::fs::File::from_std(std_file);
+        let mut lines = tokio::io::BufReader::new(async_file).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::error!(target: "stderr", "{line}");
+                }
+                Ok(None) => break, // EOF: all writers (including fd 2) closed.
+                Err(e) => {
+                    tracing::warn!(error = %e, "stderr-redirect reader I/O error; ending task");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_stderr_redirect_to_tracing() {
+    // Windows daemon path uses the SCM event log; nothing to redirect here.
 }
 
 /// Entry point equivalent to [`serve`] but with an additional external
@@ -621,6 +1033,24 @@ pub(crate) async fn serve_with_external_shutdown(
     data_dir: std::path::PathBuf,
     external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
+    // Capture stderr (fd 2) into the tracing pipeline so direct `eprintln!`
+    // writes from dependencies (notably boringtun's tun-read worker threads)
+    // land as structured `tracing::error!` events instead of raw lines in the
+    // systemd/launchd journal. No-op when stderr is a TTY (interactive
+    // `zlayer serve`) or on Windows. `init_observability` ran in `main.rs`
+    // before this function was reached, so the tracing subscriber is already
+    // installed and ready to receive events.
+    install_stderr_redirect_to_tracing();
+
+    // Pick up any CLI overrides stashed by `serve_with_nat_overrides`, plus
+    // `ZLAYER_NAT_*` env vars, plus `NatConfig::default()`. Empty when called
+    // through the foreground `serve()` shim or the Windows Service flow.
+    #[cfg(feature = "nat")]
+    let nat_overrides = take_pending_nat_overrides();
+
+    // Pick up tunnel-server CLI overrides + ZLAYER_TUNNEL_* env vars.
+    let tunnel_overrides = take_pending_tunnel_overrides();
+    let tunnel_config = build_tunnel_config_from_overrides(&tunnel_overrides);
     // Resolve the JWT signing secret. Priority is:
     //   1. Explicit `--jwt-secret` flag / `ZLAYER_JWT_SECRET` env var
     //      (clap reads both into the `jwt_secret` parameter).
@@ -666,6 +1096,17 @@ pub(crate) async fn serve_with_external_shutdown(
         config
     });
 
+    // -----------------------------------------------------------------------
+    // NAT traversal: resolve CLI flags > env vars > NatConfig::default().
+    //
+    // CLI flags always win when set. Env vars (`ZLAYER_NAT_*`) act as the
+    // fallback before the built-in defaults kick in. The resulting NatConfig
+    // is threaded into DaemonConfig and through to the OverlayManager so the
+    // overlay transports the agent builds carry the right settings.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "nat")]
+    let nat_config = build_nat_config_from_overrides(&nat_overrides);
+
     // Shared network policy list — the proxy and API both hold a reference.
     let network_policies = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::<
         zlayer_spec::NetworkPolicySpec,
@@ -683,6 +1124,9 @@ pub(crate) async fn serve_with_external_shutdown(
             socket_path: socket_path.to_string(),
         }),
         network_policies: Some(std::sync::Arc::clone(&network_policies)),
+        #[cfg(feature = "nat")]
+        nat: nat_config,
+        tunnel: tunnel_config,
         ..Default::default()
     };
 
@@ -730,6 +1174,7 @@ pub(crate) async fn serve_with_external_shutdown(
         cert_manager,
         log_rotator_handle,
         health_checker_handle,
+        nat_maintenance_handle,
         node_config,
         raft: _raft,
         raft_server_handle,
@@ -740,6 +1185,8 @@ pub(crate) async fn serve_with_external_shutdown(
         replicator,
         job_executor,
         cron_scheduler,
+        tunnel: tunnel_handles,
+        tunnel_api_state,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -1119,9 +1566,10 @@ pub(crate) async fn serve_with_external_shutdown(
     let overlay_routes = build_overlay_routes(overlay_state);
     router = router.nest("/api/v1/overlay", overlay_routes);
 
-    // Merge tunnel routes
-    let tunnel_state = TunnelApiState::new();
-    let tunnel_routes = build_tunnel_routes(tunnel_state);
+    // Merge tunnel routes -- reuse the state built in init_daemon so the
+    // daemon-side tunnel server's TokenValidator and the API handler share
+    // the same token map and access manager.
+    let tunnel_routes = build_tunnel_routes(tunnel_api_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
 
     // Merge proxy status routes
@@ -1505,6 +1953,22 @@ pub(crate) async fn serve_with_external_shutdown(
         let _ = handle.await;
     }
     info!("Stream health checker stopped");
+
+    // Stop NAT maintenance task (STUN refresh / relay upgrade loop)
+    if let Some(handle) = nat_maintenance_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    info!("NAT maintenance task stopped");
+
+    // Stop tunnel server (WebSocket accept loop + active sessions)
+    if let Some(handles) = tunnel_handles {
+        handles.accept_handle.abort();
+        let _ = handles.accept_handle.await;
+        handles.access_manager.shutdown();
+        handles.node_manager.shutdown();
+        info!("Tunnel server stopped");
+    }
 
     // Stop log rotator
     if let Some(handle) = log_rotator_handle {

@@ -16,7 +16,7 @@ pub mod session;
 
 mod daemon_client;
 
-pub use daemon_client::{default_socket_path, DaemonClient};
+pub use daemon_client::{default_socket_path, DaemonClient, DaemonReachability};
 
 // Re-export the streaming-endpoint wire DTOs so SDK consumers using
 // `DaemonClient::stream_container_logs` / `stream_container_stats` /

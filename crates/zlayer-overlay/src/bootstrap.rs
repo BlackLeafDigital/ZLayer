@@ -305,6 +305,12 @@ pub struct OverlayBootstrap {
     /// Built-in relay server (available after `start()` if relay is configured)
     #[cfg(feature = "nat")]
     relay_server: Option<RelayServer>,
+
+    /// NAT traversal configuration. When `None`, [`NatConfig::default()`] is
+    /// used at `start()` time so callers that never set a value still pick up
+    /// the defaults (NAT enabled, public STUN servers).
+    #[cfg(feature = "nat")]
+    nat_config: Option<crate::nat::NatConfig>,
 }
 
 impl OverlayBootstrap {
@@ -411,6 +417,8 @@ impl OverlayBootstrap {
             nat_traversal: None,
             #[cfg(feature = "nat")]
             relay_server: None,
+            #[cfg(feature = "nat")]
+            nat_config: None,
         };
 
         // Persist state
@@ -514,6 +522,8 @@ impl OverlayBootstrap {
             nat_traversal: None,
             #[cfg(feature = "nat")]
             relay_server: None,
+            #[cfg(feature = "nat")]
+            nat_config: None,
         };
 
         // Persist state
@@ -562,6 +572,8 @@ impl OverlayBootstrap {
             nat_traversal: None,
             #[cfg(feature = "nat")]
             relay_server: None,
+            #[cfg(feature = "nat")]
+            nat_config: None,
         })
     }
 
@@ -634,6 +646,17 @@ impl OverlayBootstrap {
         self.with_dns(zone, DEFAULT_DNS_PORT)
     }
 
+    /// Override the NAT traversal configuration used by `start()`.
+    ///
+    /// When unset, `start()` falls back to [`crate::nat::NatConfig::default()`]
+    /// which enables NAT traversal with public STUN servers.
+    #[cfg(feature = "nat")]
+    #[must_use]
+    pub fn with_nat_config(mut self, nat: crate::nat::NatConfig) -> Self {
+        self.nat_config = Some(nat);
+        self
+    }
+
     /// Get the DNS handle for managing records
     ///
     /// Returns None if DNS is not enabled or `start()` hasn't been called yet.
@@ -677,7 +700,7 @@ impl OverlayBootstrap {
             cluster_cidr: Some(self.config.cidr.clone()),
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
-            nat: crate::nat::NatConfig::default(),
+            nat: self.nat_config.clone().unwrap_or_default(),
         };
 
         #[cfg(feature = "nat")]

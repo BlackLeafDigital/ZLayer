@@ -403,34 +403,40 @@ pub(crate) async fn handle_tunnel_access(
         "Requesting access to tunneled service"
     );
 
-    // Parse TTL for validation
-    let _ttl_secs = parse_duration(ttl)?;
+    // `parse_duration` accepts the same `1h` / `30m` / `120s` forms as the rest
+    // of the CLI and returns whole seconds; the daemon API takes seconds too.
+    let ttl_secs = parse_duration(ttl)?.max(1);
 
-    let port = local_port.unwrap_or(0);
-
-    // Verify daemon is reachable
-    let _client = DaemonClient::connect().await?;
+    let preferred_port = local_port.filter(|p| *p > 0);
 
     println!("Requesting temporary access to: {endpoint}");
     println!(
         "  Local port: {}",
-        if port == 0 {
-            "auto-assign".to_string()
-        } else {
-            port.to_string()
+        match preferred_port {
+            Some(p) => p.to_string(),
+            None => "auto-assign".to_string(),
         }
     );
     println!("  TTL: {ttl}");
     println!();
 
-    // Access requires a daemon-side temporary token + LocalProxy integration.
-    // The daemon is reachable, but the access-token API endpoint is not yet
-    // available. Once it is, this command will:
-    //   1. Request a temporary token from the daemon API
-    //   2. Start a LocalProxy to the target service
-    //   3. Display the local port for connection
-    println!("Access proxy is not yet available in the daemon API.");
-    println!("Use 'zlayer tunnel connect' to establish a full tunnel instead.");
+    let client = DaemonClient::connect().await?;
+    let session = client
+        .create_access_session(endpoint, ttl_secs, preferred_port)
+        .await
+        .with_context(|| format!("Failed to create access session for '{endpoint}'"))?;
+
+    println!("Access session created.");
+    println!("  Session ID: {}", session.session_id);
+    println!("  Endpoint:   {}", session.endpoint);
+    println!("  Local addr: {}", session.local_addr);
+    println!("  Expires at: {} (unix seconds)", session.expires_at);
+    println!();
+    println!(
+        "Connect to the service at: {} (e.g. `nc {}` / `curl http://{}/`)",
+        session.local_addr, session.local_addr, session.local_addr,
+    );
+    println!("The daemon will tear down the listener automatically after the TTL expires.");
 
     Ok(())
 }

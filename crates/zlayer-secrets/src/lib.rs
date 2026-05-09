@@ -19,7 +19,11 @@ mod error;
 mod jwt;
 mod key_manager;
 mod provider;
+pub mod sealed;
 mod types;
+
+#[cfg(feature = "persistent")]
+pub mod client_keys;
 
 #[cfg(feature = "persistent")]
 mod persistent;
@@ -41,7 +45,11 @@ pub use error::{Result, SecretsError};
 pub use jwt::{JwtSecretManager, ENV_JWT_SECRET};
 pub use key_manager::KeyManager;
 pub use provider::{EnvScopeProvider, SecretsProvider, SecretsResolver, SecretsStore};
+pub use sealed::{RecipientPrivateKey, RecipientPublicKey, SealedError, SealedSecret};
 pub use types::{RotationResult, Secret, SecretMetadata, SecretRef, SecretScope};
+
+#[cfg(feature = "persistent")]
+pub use client_keys::{ActorKind, ClientKeyStore, ClientPublicKey, PersistentClientKeyStore};
 
 #[cfg(feature = "persistent")]
 pub use persistent::PersistentSecretsStore;

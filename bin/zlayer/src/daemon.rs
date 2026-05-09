@@ -20,13 +20,22 @@ use zlayer_agent::{
     ContainerSupervisor, CronScheduler, JobExecutor, OverlayManager, ProxyManager,
     ProxyManagerConfig, Runtime, RuntimeConfig, ServiceManager,
 };
-use zlayer_api::{DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment};
+use zlayer_api::handlers::tunnels::TunnelTokenMap;
+use zlayer_api::{
+    DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment, TunnelApiState,
+};
+#[cfg(feature = "nat")]
+use zlayer_overlay::NatConfig;
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
 use zlayer_secrets::{CredentialStore, KeyManager, PersistentSecretsStore};
+use zlayer_tunnel::{
+    AccessManager, ControlHandler, ListenerManager, NodeTunnelManager, TokenValidator, TunnelError,
+    TunnelRegistry, TunnelServerConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Node identity (cross-platform)
@@ -126,6 +135,38 @@ pub(crate) fn detect_local_ip() -> String {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Configuration for the daemon's built-in tunnel server.
+#[derive(Debug, Clone)]
+pub struct TunnelDaemonConfig {
+    /// Disable the tunnel server entirely. When `true`, the WebSocket accept
+    /// loop is not spawned and the on-demand access manager is unavailable.
+    pub disabled: bool,
+    /// Address to bind the tunnel WebSocket control server to. Format: host:port.
+    pub bind: std::net::SocketAddr,
+    /// Optional path to a TLS certificate (PEM). When `Some`, callers are
+    /// expected to pair it with [`TunnelDaemonConfig::tls_key`]. TLS termination
+    /// itself is handled by an external reverse proxy or future enhancement
+    /// of the tunnel WebSocket loop.
+    pub tls_cert: Option<PathBuf>,
+    /// Optional path to a TLS private key (PEM).
+    pub tls_key: Option<PathBuf>,
+    /// Underlying [`TunnelServerConfig`] (port range, heartbeat, limits, ...).
+    pub server: TunnelServerConfig,
+}
+
+impl Default for TunnelDaemonConfig {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            // Bind on the same port the tunnel CLI defaults to (3679 = 3669+10).
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3679),
+            tls_cert: None,
+            tls_key: None,
+            server: TunnelServerConfig::default(),
+        }
+    }
+}
+
 /// Configuration for daemon infrastructure initialization.
 pub struct DaemonConfig {
     /// Skip overlay networking and use the host network stack directly.
@@ -160,6 +201,23 @@ pub struct DaemonConfig {
     /// Shared network policy list for proxy access control enforcement.
     /// When populated, the proxy checks incoming requests against these policies.
     pub network_policies: Option<Arc<RwLock<Vec<zlayer_spec::NetworkPolicySpec>>>>,
+
+    /// NAT traversal configuration for the overlay network. Resolved by
+    /// `serve()` from CLI flags + `ZLAYER_NAT_*` env vars + the
+    /// `NatConfig::default()` baseline. Threaded into the [`OverlayManager`]
+    /// at init time via [`zlayer_agent::OverlayManager::with_nat_config`].
+    #[cfg(feature = "nat")]
+    pub nat: NatConfig,
+
+    /// Configuration for the daemon-side tunnel server. When
+    /// [`TunnelDaemonConfig::disabled`] is `true`, the tunnel server is not
+    /// started and the on-demand access endpoints return 503.
+    pub tunnel: TunnelDaemonConfig,
+
+    /// Logical name for this node, used as the source identifier for
+    /// node-to-node tunnels. Mirrors `node_config.node_id` but is exposed
+    /// separately so tests can override it.
+    pub node_name: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -178,6 +236,10 @@ impl Default for DaemonConfig {
             s3_storage: None,
             auth_context: None,
             network_policies: None,
+            #[cfg(feature = "nat")]
+            nat: NatConfig::default(),
+            tunnel: TunnelDaemonConfig::default(),
+            node_name: None,
         }
     }
 }
@@ -237,6 +299,11 @@ pub struct DaemonState {
     /// Background task for L4 stream backend health checking.
     pub health_checker_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Background task driving periodic NAT traversal maintenance
+    /// (STUN refresh, relay-to-direct upgrades). `None` when NAT is
+    /// disabled or no overlay manager is active.
+    pub nat_maintenance_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// Node configuration (identity, networking, `WireGuard` keys).
     pub(crate) node_config: NodeConfig,
 
@@ -269,6 +336,32 @@ pub struct DaemonState {
 
     /// Cron scheduler for managing scheduled/recurring jobs.
     pub cron_scheduler: Arc<CronScheduler>,
+
+    /// Tunnel server runtime handles. `None` when the tunnel server is
+    /// disabled via configuration (e.g. `--no-tunnel-server`).
+    pub tunnel: Option<TunnelHandles>,
+
+    /// Shared API state for tunnel endpoints. The `tunnel_tokens` map within
+    /// is populated by the API handler when a token is created and read by
+    /// the tunnel server's [`TokenValidator`].
+    pub tunnel_api_state: TunnelApiState,
+}
+
+/// Bag of tunnel-server runtime handles owned by [`DaemonState`].
+pub struct TunnelHandles {
+    /// Active tunnel registry (tokens, services, port pool).
+    pub registry: Arc<TunnelRegistry>,
+    /// Listener manager (per-service TCP/UDP data channels).
+    pub listener_manager: Arc<ListenerManager>,
+    /// Control channel handler (consumes WebSocket connections).
+    pub control_handler: Arc<ControlHandler>,
+    /// On-demand access session manager (used by `tunnel access`).
+    pub access_manager: Arc<AccessManager>,
+    /// Node-to-node tunnel manager (cluster outbound tunnels).
+    pub node_manager: Arc<NodeTunnelManager>,
+    /// Background task running the WebSocket accept loop. Aborted at
+    /// shutdown.
+    pub accept_handle: tokio::task::JoinHandle<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +525,11 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         None
     } else {
         match OverlayManager::new(config.deployment_name.clone()).await {
-            Ok(mut om) => {
+            Ok(om) => {
+                #[cfg(feature = "nat")]
+                let mut om = om.with_nat_config(config.nat.clone());
+                #[cfg(not(feature = "nat"))]
+                let mut om = om;
                 if let Err(e) = om.setup_global_overlay().await {
                     warn!("Global overlay failed (cross-node networking disabled): {e}");
                 } else {
@@ -446,6 +543,75 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             }
         }
     };
+
+    // -----------------------------------------------------------------------
+    // Phase 3b: NAT traversal bootstrap + periodic maintenance task
+    //
+    // After the overlay manager is up, kick off NAT candidate gathering
+    // (host + STUN reflexive + relay) and spawn a tokio interval task
+    // that periodically re-probes STUN to detect rebinding events and
+    // attempts to upgrade relayed connections to direct/hole-punched.
+    // No-op when NAT is disabled, no overlay is configured, or candidate
+    // gathering fails (logged at warn level by start_nat_traversal).
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "nat")]
+    let nat_maintenance_handle: Option<tokio::task::JoinHandle<()>> = if let Some(om_arc) =
+        overlay.clone()
+    {
+        let nat_enabled = {
+            let guard = om_arc.read().await;
+            guard.nat_enabled()
+        };
+        if nat_enabled {
+            let started = {
+                let guard = om_arc.read().await;
+                guard.start_nat_traversal().await
+            };
+            match started {
+                Ok(true) => {
+                    let interval_secs = config.nat.stun_refresh_interval_secs.max(1);
+                    let task_om = Arc::clone(&om_arc);
+                    let handle = tokio::spawn(async move {
+                        let mut tick =
+                            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                        // Skip the immediate first tick — gather_candidates
+                        // already populated state moments ago.
+                        tick.tick().await;
+                        loop {
+                            tick.tick().await;
+                            let res = {
+                                let guard = task_om.read().await;
+                                guard.nat_maintenance_tick().await
+                            };
+                            if let Err(e) = res {
+                                tracing::warn!(error = %e, "NAT maintenance tick failed");
+                            }
+                        }
+                    });
+                    info!(
+                        interval_secs = interval_secs,
+                        "NAT traversal maintenance task started"
+                    );
+                    Some(handle)
+                }
+                Ok(false) => {
+                    info!("NAT traversal not started (no candidates gathered)");
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, "NAT traversal start failed");
+                    None
+                }
+            }
+        } else {
+            info!("NAT traversal disabled in config; skipping maintenance task");
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "nat"))]
+    let nat_maintenance_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // -----------------------------------------------------------------------
     // Phase 4: DNS server
@@ -942,6 +1108,147 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     };
 
     // -----------------------------------------------------------------------
+    // Phase 17: Tunnel server (control channel + listener + access manager).
+    //
+    // The tunnel server boots a single TcpListener that accepts WebSocket
+    // upgrades and dispatches them to `ControlHandler::handle_connection`.
+    // The token validator reads from a `TunnelTokenMap` shared with the
+    // API handler so `POST /api/v1/tunnels` immediately makes a token
+    // valid for the live tunnel server.
+    //
+    // The `AccessManager` is wired separately and exposed through the
+    // tunnel API handler's `create_access_session` endpoint. That endpoint
+    // is unavailable (503) when the tunnel server is disabled.
+    // -----------------------------------------------------------------------
+    let tunnel_api_state;
+    let tunnel_handles_opt: Option<TunnelHandles> = if config.tunnel.disabled {
+        info!("Tunnel server disabled by configuration; skipping");
+        tunnel_api_state = TunnelApiState::new();
+        None
+    } else {
+        let tunnel_registry = Arc::new(TunnelRegistry::new(config.tunnel.server.data_port_range));
+        let listener_manager = Arc::new(ListenerManager::new(
+            Arc::clone(&tunnel_registry),
+            config.tunnel.server.heartbeat_timeout,
+        ));
+        let access_manager = Arc::new(AccessManager::new());
+
+        // Build the API state first; it owns the canonical token map and
+        // access manager, both shared with the tunnel server.
+        tunnel_api_state = TunnelApiState::with_access_manager(Arc::clone(&access_manager));
+        let token_map: TunnelTokenMap = tunnel_api_state.token_map();
+
+        // Build the token validator. Looks up the SHA-256 hash of the
+        // supplied token against the shared token map. The map is keyed by
+        // tunnel ID, so we scan values for a hash match. Expired tokens are
+        // rejected. The map is small in practice (one entry per active
+        // tunnel) and scans are O(n) which is acceptable; a future
+        // enhancement would index by hash.
+        //
+        // TODO: validate against IdentityManager-backed tokens once the
+        // identity layer exposes a hashed-token table.
+        let validator_tokens = Arc::clone(&token_map);
+        let token_validator: TokenValidator = Arc::new(move |raw: &str| {
+            let hash = zlayer_tunnel::hash_token(raw);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let map = validator_tokens.read();
+            for stored in map.values() {
+                if stored.token_hash == hash {
+                    if stored.expires_at < now {
+                        return Err(TunnelError::auth("tunnel token expired"));
+                    }
+                    return Ok(());
+                }
+            }
+            Err(TunnelError::auth("invalid tunnel token"))
+        });
+
+        let control_handler = Arc::new(ControlHandler::new(
+            Arc::clone(&tunnel_registry),
+            config.tunnel.server.clone(),
+            token_validator,
+        ));
+
+        let node_manager = Arc::new(NodeTunnelManager::new(
+            config
+                .node_name
+                .clone()
+                .unwrap_or_else(|| node_config.node_id.clone()),
+            config.tunnel.server.clone(),
+        ));
+
+        // Spawn the WebSocket accept loop. ControlHandler::handle_connection
+        // upgrades the TcpStream to a WebSocket, performs the AUTH handshake
+        // and runs the message loop until disconnect. Each accepted
+        // connection runs in its own task so a slow client doesn't block
+        // others.
+        let accept_addr = config.tunnel.bind;
+        let accept_handler = Arc::clone(&control_handler);
+        let accept_handle = tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(accept_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(
+                        bind = %accept_addr,
+                        error = %e,
+                        "Tunnel server bind failed; tunnel functionality unavailable"
+                    );
+                    return;
+                }
+            };
+            info!(bind = %accept_addr, "Tunnel WebSocket server listening");
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let handler = Arc::clone(&accept_handler);
+                        tokio::spawn(async move {
+                            if let Err(e) = handler.handle_connection(stream, peer).await {
+                                tracing::warn!(
+                                    peer = %peer,
+                                    error = %e,
+                                    "Tunnel control connection ended with error"
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Tunnel accept failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        });
+
+        if let (Some(cert), Some(key)) = (
+            config.tunnel.tls_cert.as_ref(),
+            config.tunnel.tls_key.as_ref(),
+        ) {
+            // TLS termination on the WebSocket loop is not yet plumbed into
+            // ControlHandler -- the typical deployment terminates TLS at the
+            // L7 proxy / API frontend in front of the daemon. We log the
+            // configured paths so operators see they were honoured at the
+            // CLI level even if not yet used by the WebSocket loop.
+            // TODO: thread tokio-rustls into the accept loop above.
+            info!(
+                cert = %cert.display(),
+                key = %key.display(),
+                "Tunnel TLS material configured (terminate at the API edge proxy)"
+            );
+        }
+
+        Some(TunnelHandles {
+            registry: tunnel_registry,
+            listener_manager,
+            control_handler,
+            access_manager,
+            node_manager,
+            accept_handle,
+        })
+    };
+
+    // -----------------------------------------------------------------------
     info!("Daemon infrastructure initialisation complete");
 
     let job_executor = Arc::new(JobExecutor::new(Arc::clone(&runtime)));
@@ -963,6 +1270,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         cert_manager,
         log_rotator_handle,
         health_checker_handle: Some(health_checker_handle),
+        nat_maintenance_handle,
         node_config,
         raft,
         raft_server_handle,
@@ -973,6 +1281,8 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         replicator,
         job_executor,
         cron_scheduler,
+        tunnel: tunnel_handles_opt,
+        tunnel_api_state,
     })
 }
 

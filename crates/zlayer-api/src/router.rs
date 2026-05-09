@@ -1149,6 +1149,7 @@ pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
         .route("/peers", get(handlers::overlay::get_overlay_peers))
         .route("/ip-alloc", get(handlers::overlay::get_ip_allocation))
         .route("/dns", get(handlers::overlay::get_dns_status))
+        .route("/nat/status", get(handlers::overlay::get_nat_status))
         .with_state(overlay_state)
 }
 
@@ -1219,6 +1220,10 @@ pub fn build_tunnel_routes(tunnel_state: TunnelApiState) -> Router<()> {
         .route(
             "/node/{name}",
             delete(handlers::tunnels::remove_node_tunnel),
+        )
+        .route(
+            "/access/sessions",
+            post(handlers::tunnels::create_access_session),
         )
         .with_state(tunnel_state)
 }

@@ -103,14 +103,17 @@ pub async fn link_exists(name: &str) -> Result<bool, NetlinkError> {
 /// Replaces the shell-out:
 ///   ip link delete `<name>`
 ///
-/// Used by the stale-interface cleanup in
-/// [`crate::transport::OverlayTransport::create_interface`].
+/// Currently unused at runtime (the boot-time stale-interface sweep in
+/// `bin/zlayer/src/commands/serve.rs::cleanup_stale_daemon` uses `ip link
+/// delete` directly). Kept as a tested netlink helper for any future
+/// caller-driven cleanup that wants to avoid the shell hop.
 ///
 /// # Errors
 ///
 /// Returns [`NetlinkError::Netlink`] if RTNETLINK reports a failure
 /// other than `ENODEV` / "No such device" (which are treated as
 /// success so this is safe to call unconditionally).
+#[allow(dead_code)]
 pub async fn delete_link_by_name(name: &str) -> Result<(), NetlinkError> {
     use futures_util::stream::TryStreamExt;
 

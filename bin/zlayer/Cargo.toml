@@ -147,6 +147,14 @@ zlayer-agent = { workspace = true, optional = true }
 # `src/daemon_service.rs`. Required by I-2..I-5 (install/stop/uninstall/status
 # via SCM) so keep it unconditional on Windows.
 windows-service = "0.8"
+# UAC re-launch path in `src/privilege.rs`. `Win32_UI_Shell` for
+# `ShellExecuteW`, `Win32_UI_WindowsAndMessaging` for `SW_NORMAL`,
+# `Win32_Foundation` for shared HINSTANCE/PCWSTR types.
+windows = { version = "0.62", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
 
 [dev-dependencies]
 tempfile = "3"

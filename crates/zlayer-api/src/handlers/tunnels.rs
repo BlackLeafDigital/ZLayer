@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
@@ -11,6 +12,7 @@ use axum::{
 };
 use parking_lot::RwLock;
 use uuid::Uuid;
+use zlayer_tunnel::AccessManager;
 
 pub use zlayer_types::api::tunnels::*;
 
@@ -36,23 +38,58 @@ pub struct StoredTunnel {
     pub last_connected: Option<u64>,
 }
 
+/// Shared map of authorised tunnel-token hashes -> [`StoredTunnel`].
+///
+/// Owned by `DaemonState` so the tunnel server's [`zlayer_tunnel::TokenValidator`]
+/// can do hash-lookups against the same map the API handler writes into.
+pub type TunnelTokenMap = Arc<RwLock<HashMap<String, StoredTunnel>>>;
+
 /// State for tunnel endpoints
 #[derive(Clone)]
 pub struct TunnelApiState {
-    /// Stored tunnel configurations
-    tunnels: Arc<RwLock<HashMap<String, StoredTunnel>>>,
+    /// Stored tunnel configurations, keyed by tunnel ID.
+    tunnels: TunnelTokenMap,
     /// Node-to-node tunnels
     node_tunnels: Arc<RwLock<HashMap<String, CreateNodeTunnelResponse>>>,
+    /// On-demand access manager (None when the tunnel server is disabled).
+    access_manager: Option<Arc<AccessManager>>,
 }
 
 impl TunnelApiState {
-    /// Create a new tunnel API state
+    /// Create a new tunnel API state with fresh internal maps and no access
+    /// manager (used by tests and the openapi-spec binary). Production
+    /// instances should be built via [`TunnelApiState::with_shared`] so the
+    /// daemon and the API share the same token map and access manager.
     #[must_use]
     pub fn new() -> Self {
         Self {
             tunnels: Arc::new(RwLock::new(HashMap::new())),
             node_tunnels: Arc::new(RwLock::new(HashMap::new())),
+            access_manager: None,
         }
+    }
+
+    /// Build a [`TunnelApiState`] paired with an [`AccessManager`].
+    ///
+    /// The internal token map is created fresh and can be retrieved via
+    /// [`TunnelApiState::token_map`] so the daemon's tunnel
+    /// [`zlayer_tunnel::TokenValidator`] reads from the same storage that
+    /// `POST /api/v1/tunnels` writes into. That guarantees that token
+    /// creation and live tunnel authentication never diverge.
+    #[must_use]
+    pub fn with_access_manager(access_manager: Arc<AccessManager>) -> Self {
+        Self {
+            tunnels: Arc::new(RwLock::new(HashMap::new())),
+            node_tunnels: Arc::new(RwLock::new(HashMap::new())),
+            access_manager: Some(access_manager),
+        }
+    }
+
+    /// Borrow the shared token map. Used by `init_daemon` to construct a
+    /// validator that lives in the tunnel server task.
+    #[must_use]
+    pub fn token_map(&self) -> TunnelTokenMap {
+        Arc::clone(&self.tunnels)
     }
 }
 
@@ -405,6 +442,81 @@ pub async fn remove_node_tunnel(
             "Node tunnel '{name}' not found"
         )))
     }
+}
+
+/// Create a temporary access session for an existing tunneled service.
+///
+/// Binds a local TCP listener on the daemon that proxies connections to the
+/// requested endpoint. Returns the local address so the caller can either
+/// connect directly (when sharing the daemon's host) or open a forwarder
+/// from a different host. The session is automatically torn down when its
+/// TTL expires.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel server (and therefore the access manager)
+/// is disabled, or if binding the local listener fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/tunnels/access/sessions",
+    request_body = CreateAccessSessionRequest,
+    responses(
+        (status = 201, description = "Access session created", body = CreateAccessSessionResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Tunnel server disabled"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Tunnels"
+)]
+pub async fn create_access_session(
+    _user: AuthUser,
+    State(state): State<TunnelApiState>,
+    Json(request): Json<CreateAccessSessionRequest>,
+) -> Result<Json<CreateAccessSessionResponse>> {
+    let Some(access_manager) = state.access_manager.as_ref() else {
+        return Err(ApiError::ServiceUnavailable(
+            "Tunnel server is disabled on this daemon".to_string(),
+        ));
+    };
+
+    if request.endpoint.trim().is_empty() {
+        return Err(ApiError::BadRequest("endpoint is required".to_string()));
+    }
+    if request.ttl_secs == 0 {
+        return Err(ApiError::BadRequest(
+            "ttl_secs must be greater than zero".to_string(),
+        ));
+    }
+
+    let ttl = Duration::from_secs(request.ttl_secs);
+    let session = access_manager
+        .start_session(
+            request.endpoint.clone(),
+            request.endpoint.clone(),
+            request.local_port,
+            Some(ttl),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to start access session: {e}")))?;
+
+    let now = current_timestamp();
+    let expires_at = now.saturating_add(request.ttl_secs);
+
+    tracing::info!(
+        session_id = %session.id,
+        endpoint = %request.endpoint,
+        local_addr = %session.local_addr,
+        ttl_secs = request.ttl_secs,
+        "Created tunnel access session"
+    );
+
+    Ok(Json(CreateAccessSessionResponse {
+        session_id: session.id.to_string(),
+        local_addr: session.local_addr.to_string(),
+        endpoint: request.endpoint,
+        expires_at,
+    }))
 }
 
 // =============================================================================
