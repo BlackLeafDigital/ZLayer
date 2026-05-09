@@ -106,6 +106,7 @@ lettre.workspace = true
 
 # Synchronization
 parking_lot.workspace = true
+nix.workspace = true
 dashmap.workspace = true
 
 # CIDR / IP parsing (bridge-network subnet validation)

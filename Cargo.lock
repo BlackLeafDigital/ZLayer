@@ -12216,6 +12216,7 @@ dependencies = [
  "ipnetwork",
  "jsonwebtoken",
  "lettre",
+ "nix 0.31.2",
  "oauth2",
  "oci-client",
  "openidconnect",

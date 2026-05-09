@@ -640,6 +640,13 @@ pub fn print_install_summary(
         } else {
             println!("  Logs:       <data_dir>/logs/daemon.log");
         }
+        // Group-membership hint mirrors the Linux block. macOS supplementary
+        // groups behave the same way on stale shells: log out / log back in
+        // for the new membership to land, or run `newgrp zlayer` in the
+        // current shell for a one-shot subshell that has the group.
+        println!("  Group:      You were added to the 'zlayer' group. New shells get this");
+        println!("              automatically. For the current shell, run:");
+        println!("                newgrp zlayer");
     }
     #[cfg(target_os = "windows")]
     {
@@ -838,6 +845,8 @@ async fn install(
 <dict>
     <key>Label</key>
     <string>{PLIST_LABEL}</string>
+    <key>GroupName</key>
+    <string>zlayer</string>
     <key>ProgramArguments</key>
     <array>
 {args_xml}
@@ -862,6 +871,11 @@ async fn install(
         .with_context(|| format!("Failed to create {}", log_dir.display()))?;
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("Failed to create {}", run_dir.display()))?;
+
+    // Provision the `zlayer` group BEFORE writing the new plist — the plist
+    // sets `<key>GroupName</key><string>zlayer</string>`, so launchd will fail
+    // to spawn the daemon if the group does not yet exist.
+    ensure_zlayer_group_macos(data_dir).await?;
 
     let (plist_dir, target) = launchd_context()?;
     let path = plist_path_for(&plist_dir);
@@ -1406,6 +1420,172 @@ async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// macOS counterpart of [`ensure_zlayer_group`].  Same trust model and same
+/// scope (only the `registry`, `cache`, `bundles` data subdirs are made
+/// group-writable), implemented with macOS's Directory Services tools.
+///
+/// `dseditgroup` reads/writes the local DS node by default, which is what we
+/// want — local groups defined under `/Local/Default` are honored by
+/// launchd's `<key>GroupName</key>` plist field.
+///
+/// Failures here are non-fatal: install still completes if `dseditgroup`
+/// isn't on `$PATH` or the group cannot be created (the launchd plist will
+/// then fail to spawn the daemon with a clearer error than a silent socket
+/// unreachable, which is the actual diagnostic improvement here).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines, unsafe_code)]
+async fn ensure_zlayer_group_macos(data_dir: &Path) -> Result<()> {
+    use tokio::process::Command;
+
+    // dseditgroup creating/modifying a system group requires root.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if !is_root {
+        return Ok(());
+    }
+
+    // 1. Create the group if it doesn't exist.
+    let group_exists = Command::new("dseditgroup")
+        .args(["-o", "read", "zlayer"])
+        .output()
+        .await
+        .is_ok_and(|out| out.status.success());
+
+    if !group_exists {
+        match Command::new("dseditgroup")
+            .args([
+                "-o",
+                "create",
+                "-r",
+                "ZLayer Daemon Group",
+                "-t",
+                "group",
+                "zlayer",
+            ])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                println!("Created group 'zlayer'.");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "Warning: dseditgroup create zlayer failed: {}",
+                    stderr.trim()
+                );
+                eprintln!("         The launchd unit will fail to start until the group exists.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Warning: could not run dseditgroup: {e}");
+                return Ok(());
+            }
+        }
+    }
+
+    // 2. Add the invoking user to the group (if sudo'd).
+    let sudo_user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root");
+
+    if let Some(ref user) = sudo_user {
+        // dseditgroup checkmember exits 0 if the user is already a member.
+        let already_member = Command::new("dseditgroup")
+            .args(["-o", "checkmember", "-m", user, "zlayer"])
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success());
+
+        if !already_member {
+            match Command::new("dseditgroup")
+                .args(["-o", "edit", "-a", user, "-t", "user", "zlayer"])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    println!("Added user '{user}' to group 'zlayer'.");
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    eprintln!(
+                        "Warning: dseditgroup edit -a {user} zlayer failed: {}",
+                        stderr.trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not run dseditgroup edit: {e}");
+                }
+            }
+        }
+    }
+
+    // 3. Give the installing user write access to the build-facing subdirs.
+    //    Same scope as the Linux helper: registry/cache/bundles only.
+    let shared_dirs = ["registry", "cache", "bundles"];
+    let mut provisioned_any = false;
+    for sub in shared_dirs {
+        let path = data_dir.join(sub);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            eprintln!("Warning: could not create {}: {e}", path.display());
+            continue;
+        }
+
+        let ownership_ok = if let Some(ref user) = sudo_user {
+            Command::new("chown")
+                .args(["-R", &format!("{user}:zlayer")])
+                .arg(&path)
+                .output()
+                .await
+                .is_ok_and(|out| out.status.success())
+        } else {
+            Command::new("chgrp")
+                .args(["-R", "zlayer"])
+                .arg(&path)
+                .output()
+                .await
+                .is_ok_and(|out| out.status.success())
+        };
+        if !ownership_ok {
+            eprintln!(
+                "Warning: could not set ownership on {}; unprivileged builds may fail",
+                path.display()
+            );
+            continue;
+        }
+
+        let _ = Command::new("chmod")
+            .args(["-R", "u+rwX,g+rwX"])
+            .arg(&path)
+            .output()
+            .await;
+
+        // setgid on directories so new files inherit the zlayer group.
+        let _ = Command::new("find")
+            .arg(&path)
+            .args(["-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+            .output()
+            .await;
+
+        provisioned_any = true;
+    }
+
+    if provisioned_any {
+        if let Some(ref user) = sudo_user {
+            println!(
+                "Configured build data directories for '{user}': {}",
+                shared_dirs.join(", ")
+            );
+        } else {
+            println!(
+                "Configured group-writable data directories: {}",
+                shared_dirs.join(", ")
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::too_many_lines,
@@ -1566,6 +1746,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
+Group=zlayer
 ExecStart={exec_start}
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=60
@@ -2713,13 +2894,47 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    loop {
-        match zlayer_client::DaemonClient::try_connect().await {
-            Ok(Some(_)) => return Ok(()),
-            _ if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(poll_interval).await;
+    #[cfg(unix)]
+    {
+        let socket_path = zlayer_client::default_socket_path();
+        loop {
+            let reachability = zlayer_client::DaemonClient::probe(&socket_path).await;
+            match reachability {
+                zlayer_client::DaemonReachability::Reachable(_) => return Ok(()),
+                zlayer_client::DaemonReachability::PermissionDenied => {
+                    // Daemon IS up — we just can't talk to it from this user's shell.
+                    // Don't burn the whole timeout; surface the right hint and return Ok.
+                    eprintln!();
+                    eprintln!(
+                        "Daemon is running, but its socket at {socket_path} is not readable from your user."
+                    );
+                    eprintln!(
+                        "  The 'zlayer' group was added during install. Pick up the new group"
+                    );
+                    eprintln!("  membership in the current shell with:");
+                    eprintln!("    newgrp zlayer");
+                    eprintln!("  or open a new login shell.");
+                    eprintln!();
+                    return Ok(());
+                }
+                _ if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(poll_interval).await;
+                }
+                _ => break,
             }
-            _ => break,
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        loop {
+            match zlayer_client::DaemonClient::try_connect().await {
+                Ok(Some(_)) => return Ok(()),
+                _ if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(poll_interval).await;
+                }
+                _ => break,
+            }
         }
     }
 

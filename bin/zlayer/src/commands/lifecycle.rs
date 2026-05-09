@@ -20,6 +20,10 @@ use zlayer_spec::DeploymentSpec;
 /// When the daemon is running, displays PID, API bind address, socket path,
 /// runtime type, and a summary of active deployments.  When the daemon is
 /// not running, shows helpful instructions for starting it.
+// Five distinct user-facing branches (Reachable/SocketMissing/PermissionDenied/
+// ConnectionRefused/Other) each emit a multi-line diagnostic. Splitting them
+// into helper fns would just shuffle the same line count across more functions.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn status(cli: &Cli) -> Result<()> {
     info!("Checking daemon status");
 
@@ -29,95 +33,126 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
     // Try reading daemon.json for metadata (PID, bind address, etc.)
     let metadata = read_daemon_metadata(&data_dir).await;
 
-    // Try connecting to the daemon without auto-starting it
-    let client = zlayer_client::DaemonClient::try_connect_to(&socket_path).await;
+    // Probe the daemon without auto-starting it -- this distinguishes
+    // "not running" from "running but unreachable due to permissions".
+    let reachability = zlayer_client::DaemonClient::probe(&socket_path).await;
 
-    if let Ok(Some(client)) = client {
-        // Daemon is running -- show rich status
-        println!();
-        println!("ZLayer Daemon");
+    match reachability {
+        zlayer_client::DaemonReachability::Reachable(client) => {
+            // Daemon is running -- show rich status
+            println!();
+            println!("ZLayer Daemon");
 
-        // PID from daemon.json
-        if let Some(ref meta) = metadata {
-            if let Some(pid) = meta.get("pid").and_then(serde_json::Value::as_u64) {
-                println!("  Status:    running (PID {pid})");
+            // PID from daemon.json
+            if let Some(ref meta) = metadata {
+                if let Some(pid) = meta.get("pid").and_then(serde_json::Value::as_u64) {
+                    println!("  Status:    running (PID {pid})");
+                } else {
+                    println!("  Status:    running");
+                }
+                if let Some(api_bind) = meta.get("api_bind").and_then(|v| v.as_str()) {
+                    println!("  API:       {api_bind}");
+                }
             } else {
                 println!("  Status:    running");
             }
-            if let Some(api_bind) = meta.get("api_bind").and_then(|v| v.as_str()) {
-                println!("  API:       {api_bind}");
-            }
-        } else {
-            println!("  Status:    running");
-        }
 
-        println!("  Socket:    {socket_path}");
+            println!("  Socket:    {socket_path}");
 
-        // Detect runtime from metadata or platform
-        if let Some(ref meta) = metadata {
-            if let Some(host_net) = meta
-                .get("host_network")
-                .and_then(serde_json::Value::as_bool)
-            {
-                if host_net {
-                    println!("  Network:   host");
-                }
-            }
-        }
-
-        println!("  Runtime:   {}", detect_runtime_name());
-
-        // Fetch deployment info
-        println!();
-        match client.list_deployments().await {
-            Ok(deployments) if deployments.is_empty() => {
-                println!("Deployments: none");
-            }
-            Ok(deployments) => {
-                let active_count = deployments.len();
-                println!("Deployments: {active_count} active");
-
-                for dep in &deployments {
-                    let name = dep
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let status = dep
-                        .get("status")
-                        .and_then(|v| {
-                            v.as_str()
-                                .map(std::string::ToString::to_string)
-                                .or_else(|| serde_json::to_string(v).ok())
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    // Try to get service/replica counts from the spec
-                    let (svc_count, replica_count) = extract_deployment_counts(dep);
-
-                    if svc_count > 0 {
-                        println!(
-                            "  {name}: {svc_count} services, {replica_count} replicas ({status})"
-                        );
-                    } else {
-                        println!("  {name}: ({status})");
+            // Detect runtime from metadata or platform
+            if let Some(ref meta) = metadata {
+                if let Some(host_net) = meta
+                    .get("host_network")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    if host_net {
+                        println!("  Network:   host");
                     }
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch deployments");
-                println!("Deployments: error fetching ({e})");
-            }
-        }
 
-        println!();
-    } else {
-        // Daemon is not running
-        println!();
-        println!("ZLayer Daemon: not running");
-        println!();
-        println!("  Start:  zlayer serve --daemon");
-        println!("  Or:     zlayer up (auto-starts daemon)");
-        println!();
+            println!("  Runtime:   {}", detect_runtime_name());
+
+            // Fetch deployment info
+            println!();
+            match client.list_deployments().await {
+                Ok(deployments) if deployments.is_empty() => {
+                    println!("Deployments: none");
+                }
+                Ok(deployments) => {
+                    let active_count = deployments.len();
+                    println!("Deployments: {active_count} active");
+
+                    for dep in &deployments {
+                        let name = dep
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let status = dep
+                            .get("status")
+                            .and_then(|v| {
+                                v.as_str()
+                                    .map(std::string::ToString::to_string)
+                                    .or_else(|| serde_json::to_string(v).ok())
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        // Try to get service/replica counts from the spec
+                        let (svc_count, replica_count) = extract_deployment_counts(dep);
+
+                        if svc_count > 0 {
+                            println!(
+                                "  {name}: {svc_count} services, {replica_count} replicas ({status})"
+                            );
+                        } else {
+                            println!("  {name}: ({status})");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch deployments");
+                    println!("Deployments: error fetching ({e})");
+                }
+            }
+
+            println!();
+        }
+        zlayer_client::DaemonReachability::SocketMissing => {
+            println!();
+            println!("ZLayer Daemon: not running");
+            println!();
+            println!("  Start:  zlayer serve --daemon");
+            println!("  Or:     zlayer up (auto-starts daemon)");
+            println!();
+        }
+        zlayer_client::DaemonReachability::PermissionDenied => {
+            println!();
+            println!(
+                "ZLayer Daemon: running, but the socket at {socket_path} is not readable from your user."
+            );
+            println!();
+            println!("  The CLI requires membership in the 'zlayer' group.");
+            println!("    Refresh the current shell:  newgrp zlayer");
+            println!("    Or open a new login shell after install.");
+            println!();
+            println!("  If neither works, the socket may be owned by root:root instead of");
+            println!("  root:zlayer (older builds had this bug). Check with:");
+            println!("    ls -la {socket_path}");
+            println!();
+        }
+        zlayer_client::DaemonReachability::ConnectionRefused => {
+            println!();
+            println!("ZLayer Daemon: socket file is present but nothing is listening.");
+            println!("  The daemon may have crashed. Check:");
+            println!("    systemctl status zlayer.service");
+            println!("    journalctl -fu zlayer.service");
+            println!();
+        }
+        zlayer_client::DaemonReachability::Other(e) => {
+            println!();
+            println!("ZLayer Daemon: unknown failure connecting to socket: {e}");
+            println!();
+        }
     }
 
     Ok(())
