@@ -103,6 +103,7 @@ mod windows_impl {
     /// verb, which triggers the UAC elevation prompt. Returns `Ok(())` only
     /// to satisfy the type signature — on success the parent process exits
     /// with status 0 before this returns to the caller.
+    #[allow(unsafe_code)]
     pub(super) fn relaunch_as_admin() -> Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
@@ -148,8 +149,8 @@ mod windows_impl {
         std::process::exit(0);
     }
 
-    /// Quote and join command-line arguments per the rules ShellExecuteW /
-    /// CommandLineToArgvW expect. Arguments containing whitespace or quotes
+    /// Quote and join command-line arguments per the rules `ShellExecuteW` /
+    /// `CommandLineToArgvW` expect. Arguments containing whitespace or quotes
     /// are wrapped in `"..."` and embedded backslashes/quotes are escaped.
     fn build_parameter_string<I, S>(args: I) -> String
     where
@@ -184,7 +185,7 @@ mod windows_impl {
                     '"' => {
                         // Each backslash before a `"` must be doubled, plus
                         // one extra backslash to escape the `"` itself.
-                        for _ in 0..(backslashes * 2 + 1) {
+                        for _ in 0..=(backslashes * 2) {
                             out.push('\\');
                         }
                         out.push('"');

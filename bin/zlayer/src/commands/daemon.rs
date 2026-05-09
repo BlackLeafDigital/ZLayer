@@ -712,7 +712,12 @@ fn plist_path_for(plist_dir: &str) -> std::path::PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_lines, unsafe_code)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    unsafe_code
+)]
 async fn install(
     data_dir: &Path,
     no_start: bool,
@@ -2224,7 +2229,12 @@ fn build_service_launch_arguments(
 }
 
 #[cfg(target_os = "windows")]
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::items_after_statements
+)]
 async fn install(
     data_dir: &Path,
     no_start: bool,
