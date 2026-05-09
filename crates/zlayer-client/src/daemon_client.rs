@@ -2592,6 +2592,37 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// Create a temporary access session for a tunneled service.
+    ///
+    /// The daemon binds a local TCP listener that proxies to the requested
+    /// `endpoint` and tears it down when `ttl_secs` elapses. Returns the
+    /// daemon-side local address so the caller can connect (or open a
+    /// secondary forwarder when running on a different host).
+    ///
+    /// `POST /api/v1/tunnels/access/sessions`
+    pub async fn create_access_session(
+        &self,
+        endpoint: &str,
+        ttl_secs: u64,
+        local_port: Option<u16>,
+    ) -> Result<zlayer_types::api::tunnels::CreateAccessSessionResponse> {
+        // `CreateAccessSessionRequest` is `Deserialize`-only on the daemon
+        // side, so we build the wire JSON inline rather than going through
+        // `serde_json::to_string`.
+        let mut payload = serde_json::json!({
+            "endpoint": endpoint,
+            "ttl_secs": ttl_secs,
+        });
+        if let Some(port) = local_port {
+            payload["local_port"] = serde_json::Value::from(port);
+        }
+        let (status, resp) = self
+            .post_json("/api/v1/tunnels/access/sessions", &payload.to_string())
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
     // ------------------------------------------------------------------
     // Secrets management
     // ------------------------------------------------------------------

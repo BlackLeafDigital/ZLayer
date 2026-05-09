@@ -80,6 +80,51 @@ pub struct IpAllocationResponse {
     pub allocated_ips: Option<Vec<String>>,
 }
 
+/// NAT traversal status response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NatStatusResponse {
+    /// Whether NAT traversal is enabled in the daemon's config
+    pub enabled: bool,
+    /// Configured STUN servers (host:port)
+    pub stun_servers: Vec<String>,
+    /// Configured TURN/relay servers (host:port)
+    pub turn_servers: Vec<String>,
+    /// Address of the locally-bound built-in relay server, if running
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_server_bind: Option<String>,
+    /// Locally gathered ICE candidates
+    pub candidates: Vec<NatCandidateDto>,
+    /// Per-peer NAT connectivity state
+    pub peers: Vec<NatPeerDto>,
+    /// Unix epoch seconds of the last successful STUN refresh
+    pub last_refresh: u64,
+}
+
+/// Locally gathered NAT candidate (`Host` / `ServerReflexive` / `Relay`).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NatCandidateDto {
+    /// `Host` / `ServerReflexive` / `Relay`
+    pub kind: String,
+    /// Transport (e.g. "udp")
+    pub transport: String,
+    /// Address (host:port)
+    pub address: String,
+    /// Priority (higher = preferred)
+    pub priority: u32,
+}
+
+/// Per-peer NAT connectivity entry.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NatPeerDto {
+    /// Peer node ID
+    pub node_id: String,
+    /// Direct / `HolePunched` / Relayed / Unreachable
+    pub connection_type: String,
+    /// Selected remote endpoint, if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_endpoint: Option<String>,
+}
+
 /// DNS service status response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DnsStatusResponse {

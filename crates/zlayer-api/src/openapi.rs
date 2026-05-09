@@ -58,7 +58,8 @@ use crate::handlers::notifiers::{
     CreateNotifierRequest, TestNotifierResponse, UpdateNotifierRequest,
 };
 use crate::handlers::overlay::{
-    DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
+    DnsStatusResponse, IpAllocationResponse, NatCandidateDto, NatPeerDto, NatStatusResponse,
+    OverlayStatusResponse, PeerInfo, PeerListResponse,
 };
 use crate::handlers::projects::{
     CreateProjectRequest, LinkDeploymentRequest, ProjectPullResponse, UpdateProjectRequest,
@@ -81,8 +82,9 @@ use crate::handlers::syncs::{
 };
 use crate::handlers::tasks::CreateTaskRequest;
 use crate::handlers::tunnels::{
-    CreateNodeTunnelRequest, CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse,
-    RegisteredServiceInfo, SuccessResponse, TunnelStatus, TunnelSummary,
+    CreateAccessSessionRequest, CreateAccessSessionResponse, CreateNodeTunnelRequest,
+    CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse, RegisteredServiceInfo,
+    SuccessResponse, TunnelStatus, TunnelSummary,
 };
 use crate::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use crate::handlers::variables::{CreateVariableRequest, UpdateVariableRequest};
@@ -168,8 +170,8 @@ use crate::handlers::notifiers::{
 };
 use crate::handlers::oidc::{__path_callback, __path_list_providers, __path_start};
 use crate::handlers::overlay::{
-    __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
-    __path_get_overlay_status,
+    __path_get_dns_status, __path_get_ip_allocation, __path_get_nat_status,
+    __path_get_overlay_peers, __path_get_overlay_status,
 };
 use crate::handlers::permissions::{
     __path_grant_permission, __path_list_permissions, __path_list_permissions_by_resource,
@@ -200,8 +202,8 @@ use crate::handlers::tasks::{
     __path_list_tasks, __path_run_task,
 };
 use crate::handlers::tunnels::{
-    __path_create_node_tunnel, __path_create_tunnel, __path_get_tunnel_status, __path_list_tunnels,
-    __path_remove_node_tunnel, __path_revoke_tunnel,
+    __path_create_access_session, __path_create_node_tunnel, __path_create_tunnel,
+    __path_get_tunnel_status, __path_list_tunnels, __path_remove_node_tunnel, __path_revoke_tunnel,
 };
 use crate::handlers::users::{
     __path_create_user, __path_delete_user, __path_get_user, __path_list_users,
@@ -424,6 +426,7 @@ impl Modify for SecurityAddon {
         get_overlay_peers,
         get_ip_allocation,
         get_dns_status,
+        get_nat_status,
         // Tunnels
         create_tunnel,
         list_tunnels,
@@ -431,6 +434,7 @@ impl Modify for SecurityAddon {
         get_tunnel_status,
         create_node_tunnel,
         remove_node_tunnel,
+        create_access_session,
         // Networks
         list_networks,
         get_network,
@@ -642,6 +646,9 @@ impl Modify for SecurityAddon {
             PeerListResponse,
             IpAllocationResponse,
             DnsStatusResponse,
+            NatStatusResponse,
+            NatCandidateDto,
+            NatPeerDto,
             // Tunnel schemas
             CreateTunnelRequest,
             CreateTunnelResponse,
@@ -651,6 +658,8 @@ impl Modify for SecurityAddon {
             CreateNodeTunnelRequest,
             CreateNodeTunnelResponse,
             SuccessResponse,
+            CreateAccessSessionRequest,
+            CreateAccessSessionResponse,
             // Network schemas
             NetworkSummary,
             // Container bridge / overlay network schemas

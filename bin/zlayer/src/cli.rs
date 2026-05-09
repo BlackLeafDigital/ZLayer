@@ -634,6 +634,43 @@ pub(crate) enum Commands {
         #[cfg(feature = "docker-compat")]
         #[arg(long, default_value_t = zlayer_paths::ZLayerDirs::default_docker_socket_path())]
         docker_socket_path: String,
+
+        /// Disable NAT traversal (STUN/TURN). Default is enabled.
+        #[clap(long)]
+        no_nat: bool,
+
+        /// Override STUN servers (repeatable). Format: host:port.
+        #[clap(long = "stun-server")]
+        stun_servers: Vec<String>,
+
+        /// Override TURN/relay servers (repeatable). Format: host:port.
+        #[clap(long = "turn-server")]
+        turn_servers: Vec<String>,
+
+        /// Bind address for the built-in relay server (format: host:port).
+        /// If unset, no relay server is started locally.
+        #[clap(long)]
+        relay_server_bind: Option<String>,
+
+        /// Bind address for the tunnel WebSocket control server (format:
+        /// host:port). Defaults to 0.0.0.0:3679 when unset.
+        #[clap(long, env = "ZLAYER_TUNNEL_BIND")]
+        tunnel_bind: Option<String>,
+
+        /// Path to a TLS certificate (PEM) for the tunnel server.
+        /// Used when terminating TLS at the tunnel listener (future
+        /// enhancement); currently logged at startup for diagnostics.
+        #[clap(long, env = "ZLAYER_TUNNEL_TLS_CERT")]
+        tunnel_tls_cert: Option<std::path::PathBuf>,
+
+        /// Path to a TLS private key (PEM) for the tunnel server.
+        #[clap(long, env = "ZLAYER_TUNNEL_TLS_KEY")]
+        tunnel_tls_key: Option<std::path::PathBuf>,
+
+        /// Disable the daemon-side tunnel server entirely. Endpoints under
+        /// `POST /api/v1/tunnels/access/sessions` will return 503.
+        #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
+        no_tunnel_server: bool,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
@@ -918,37 +955,94 @@ pub enum WindowsCommands {
     },
 }
 
+/// All flags accepted by `daemon install`. Boxed inside [`DaemonAction::Install`]
+/// to keep the enum small (`clippy::large_enum_variant`).
+#[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct InstallArgs {
+    /// Don't start the service after installing
+    #[arg(long)]
+    pub(crate) no_start: bool,
+
+    /// API bind address for the daemon
+    #[arg(long, default_value = "0.0.0.0:3669")]
+    pub(crate) bind: String,
+
+    /// JWT secret for API authentication
+    #[arg(long, env = "ZLAYER_JWT_SECRET")]
+    pub(crate) jwt_secret: Option<String>,
+
+    /// Disable Swagger UI
+    #[arg(long)]
+    pub(crate) no_swagger: bool,
+
+    /// Enable Docker API socket emulation at /var/run/docker.sock
+    #[cfg(feature = "docker-compat")]
+    #[arg(long)]
+    pub(crate) docker_socket: bool,
+
+    /// WSL2 auto-install consent (Windows only — parsed here for
+    /// forward-compatibility when `daemon install` lands on Windows).
+    #[command(flatten)]
+    pub(crate) install_wsl: InstallWslArgs,
+
+    /// Admin email for the management UI (also accepts `ZLAYER_BOOTSTRAP_EMAIL` env).
+    /// If unset and stdin is a TTY, install prompts unless `--no-admin-prompt`.
+    #[clap(long, env = "ZLAYER_BOOTSTRAP_EMAIL")]
+    pub(crate) admin_email: Option<String>,
+
+    /// Admin password (cleartext). Prefer --admin-password-file in production.
+    #[clap(long, hide_env_values = true)]
+    pub(crate) admin_password: Option<String>,
+
+    /// Path to a file containing the admin password (preferred over --admin-password).
+    #[clap(long)]
+    pub(crate) admin_password_file: Option<std::path::PathBuf>,
+
+    /// Skip the interactive admin prompt entirely.
+    #[clap(long)]
+    pub(crate) no_admin_prompt: bool,
+
+    /// Disable NAT traversal (STUN/TURN). Default is enabled.
+    #[clap(long)]
+    pub(crate) no_nat: bool,
+
+    /// Override STUN servers (repeatable). Format: host:port.
+    #[clap(long = "stun-server")]
+    pub(crate) stun_servers: Vec<String>,
+
+    /// Override TURN/relay servers (repeatable). Format: host:port.
+    #[clap(long = "turn-server")]
+    pub(crate) turn_servers: Vec<String>,
+
+    /// Bind address for the built-in relay server (format: host:port).
+    /// If unset, no relay server is started locally.
+    #[clap(long)]
+    pub(crate) relay_server_bind: Option<String>,
+
+    /// Bind address for the tunnel WebSocket control server (format:
+    /// host:port). Defaults to 0.0.0.0:3679 when unset.
+    #[clap(long, env = "ZLAYER_TUNNEL_BIND")]
+    pub(crate) tunnel_bind: Option<String>,
+
+    /// Path to a TLS certificate (PEM) for the tunnel server.
+    #[clap(long, env = "ZLAYER_TUNNEL_TLS_CERT")]
+    pub(crate) tunnel_tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to a TLS private key (PEM) for the tunnel server.
+    #[clap(long, env = "ZLAYER_TUNNEL_TLS_KEY")]
+    pub(crate) tunnel_tls_key: Option<std::path::PathBuf>,
+
+    /// Disable the daemon-side tunnel server entirely.
+    #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
+    pub(crate) no_tunnel_server: bool,
+}
+
 /// Daemon lifecycle actions
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
     /// Install zlayer as a system service (launchd on macOS, systemd on Linux)
-    Install {
-        /// Don't start the service after installing
-        #[arg(long)]
-        no_start: bool,
-
-        /// API bind address for the daemon
-        #[arg(long, default_value = "0.0.0.0:3669")]
-        bind: String,
-
-        /// JWT secret for API authentication
-        #[arg(long, env = "ZLAYER_JWT_SECRET")]
-        jwt_secret: Option<String>,
-
-        /// Disable Swagger UI
-        #[arg(long)]
-        no_swagger: bool,
-
-        /// Enable Docker API socket emulation at /var/run/docker.sock
-        #[cfg(feature = "docker-compat")]
-        #[arg(long)]
-        docker_socket: bool,
-
-        /// WSL2 auto-install consent (Windows only — parsed here for
-        /// forward-compatibility when `daemon install` lands on Windows).
-        #[command(flatten)]
-        install_wsl: InstallWslArgs,
-    },
+    Install(Box<InstallArgs>),
 
     /// Uninstall the zlayer system service
     Uninstall,
@@ -970,6 +1064,19 @@ pub(crate) enum DaemonAction {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+
+    /// Resume deployments from a snapshot file written by `daemon install`.
+    ///
+    /// `daemon install` snapshots the running deployments before restarting the
+    /// daemon and, on success, replays the snapshot to re-scale services that
+    /// ended up stopped. If the install fails partway, or the auto-restore
+    /// only handled some services, the snapshot file is retained at
+    /// `<data_dir>/.install-snapshot-<unix-ts>.json` and can be replayed
+    /// manually with this command.
+    ResumeFromSnapshot {
+        /// Path to the snapshot JSON file produced by `daemon install`.
+        path: std::path::PathBuf,
     },
 }
 

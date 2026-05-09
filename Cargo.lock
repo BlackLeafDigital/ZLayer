@@ -12102,6 +12102,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows 0.62.2",
  "windows-service",
  "zlayer-agent",
  "zlayer-api",
@@ -12255,6 +12256,7 @@ dependencies = [
  "zlayer-secrets",
  "zlayer-spec",
  "zlayer-storage",
+ "zlayer-tunnel",
  "zlayer-types",
 ]
 

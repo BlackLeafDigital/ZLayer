@@ -11,7 +11,7 @@ categories = ["os", "virtualization"]
 readme = "README.md"
 
 [features]
-default = []
+default = ["nat"]
 # Linux-native container runtime via libcontainer/youki. OFF by default so the
 # crate publishes cleanly: the published `libcontainer 0.6.0` on crates.io has
 # strict pins (`protobuf = =3.2.0`, `rust-criu = ^0.4.0`) that conflict with
@@ -43,6 +43,12 @@ wasm = [
     "dep:sha2",
 ]
 s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3", "dep:zlayer-storage"]
+# NAT traversal (STUN/TURN/relay). Forwards to `zlayer-overlay/nat`. Required
+# because `OverlayManager` references `NatConfig` and `NatTraversal` from
+# `zlayer-overlay` unconditionally at the source level. Enabled by default so
+# `cargo test -p zlayer-agent` works out of the box; downstream consumers can
+# opt out with `default-features = false`.
+nat = ["zlayer-overlay/nat"]
 
 [dependencies]
 async-trait.workspace = true
