@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.19] - 2026-05-10
+
+### Fixed
+- `cargo publish` failure on `zlayer-secrets`. The crate's
+  `zlayer-types` dep was declared path-only (`{ path = "../zlayer-types" }`)
+  with no `version` field, which `cargo publish` rejects. Switched to
+  `zlayer-types.workspace = true` to match every other crate in the
+  workspace; the workspace entry already carries the placeholder version
+  that the release sed step rewrites at publish time. Earlier
+  `0.11.17`/`0.11.18` retries hit the same wall partway through the
+  publish chain (early crates landed on crates.io, the rest never made
+  it); the action's idempotency check skips already-live crates so
+  re-running `0.11.19` resumes at `zlayer-secrets`.
+
 ## [0.11.16] - 2026-05-08
 
 ### Fixed
