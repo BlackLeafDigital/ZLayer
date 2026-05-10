@@ -58,6 +58,12 @@ struct NodeJoinRequest {
     /// CPU architecture of the joining agent (detected via `std::env::consts::ARCH`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arch: Option<zlayer_spec::ArchKind>,
+    /// Joiner's 32-byte X25519 pubkey for sealed-box DEK wrapping (Phase 1+).
+    /// `None` only when the local keypair could not be created (extremely
+    /// unusual — the leader will then treat this node as not eligible to
+    /// host replicated-secret ciphertext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secrets_pubkey: Option<[u8; 32]>,
 }
 
 /// Join response from the leader
@@ -75,6 +81,22 @@ struct NodeJoinResponse {
     slice_cidr: String,
     /// Existing peers in the cluster
     peers: Vec<PeerNode>,
+    /// Node JWT minted by the leader for this joiner — `roles: ["node"]`
+    /// with the assigned `node_id` baked in. Used to authenticate inter-node
+    /// calls separately from any user identity. `None` when the leader is a
+    /// legacy build without secrets capability.
+    #[serde(default)]
+    node_jwt: Option<String>,
+    /// Sealed-box-wrapped copy of the cluster DEK addressed to the joiner's
+    /// `secrets_pubkey`. The daemon unwraps this on startup with the on-disk
+    /// node X25519 private key. `None` on legacy responses or when the
+    /// joiner did not provide a `secrets_pubkey`.
+    #[serde(default)]
+    wrapped_dek: Option<Vec<u8>>,
+    /// Cluster DEK generation that `wrapped_dek` was sealed under. Lets the
+    /// daemon detect rotation drift. `None` when `wrapped_dek` is `None`.
+    #[serde(default)]
+    dek_generation: Option<u64>,
 }
 
 /// Peer node information
@@ -178,6 +200,117 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
         serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
 
     Ok(token_data)
+}
+
+/// Write `bytes` to `path`, creating the file with restrictive permissions
+/// (Unix mode 0600 — owner read/write only) **before** any data is written.
+///
+/// On non-Unix targets the file is written with the default platform
+/// permissions. Windows ACL hardening is handled at the data-directory
+/// level by the installer (`%ProgramData%\ZLayer` inherits SYSTEM +
+/// Administrators write, Users read), so per-file ACL plumbing is not
+/// duplicated here.
+///
+/// This helper is the canonical way to persist secrets-bearing files
+/// (node JWTs, wrapped DEKs, etc.) from the CLI side. It mirrors the
+/// open-with-mode-0600 pattern used by
+/// [`zlayer_secrets::load_or_generate_node_keypair`] so the on-disk
+/// permission story is consistent across all node-secret material.
+fn write_secure(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Make sure the parent directory exists. `secrets_dir` may have been
+    // created by `load_or_generate_node_keypair` already, but callers are
+    // free to use this helper for files that live elsewhere too.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+
+        // Belt-and-suspenders: explicitly re-set perms in case a pre-existing
+        // file at this path overrode the open-time mode (mode_t is only
+        // honored on creation, not on truncation of an existing file).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+    }
+
+    Ok(())
+}
+
+/// File names for the on-disk secrets join artifacts under
+/// [`zlayer_paths::ZLayerDirs::secrets()`] (`{data_dir}/secrets/`).
+///
+/// **Stable on-disk contract** consumed by the daemon-side bootstrap (Task #18).
+///
+/// Layout:
+/// - `node_secrets.key` — raw 32-byte X25519 private key (mode 0600).
+///   Written by `zlayer_secrets::load_or_generate_node_keypair` on the
+///   first call from the CLI; the daemon loads the same file at startup.
+/// - `node.jwt` — UTF-8 JWT minted by the leader, `roles: ["node"]`,
+///   `node_id` set (mode 0600). Used to authenticate inter-node API calls
+///   separately from user identity.
+/// - `wrapped_dek.bin` — raw bytes of the sealed-box-wrapped cluster DEK
+///   addressed to `node_secrets.key`'s pubkey (mode 0600). Daemon unwraps
+///   with the X25519 private key on startup and holds the DEK in zeroized
+///   memory.
+/// - `dek_generation` — decimal-string DEK generation (e.g. `"3"`), used
+///   for rotation drift detection (mode 0600).
+const NODE_JWT_FILE: &str = "node.jwt";
+const WRAPPED_DEK_FILE: &str = "wrapped_dek.bin";
+const DEK_GENERATION_FILE: &str = "dek_generation";
+
+/// Persist the secrets join material returned by the leader under
+/// `secrets_dir` (which must already exist — typically created by
+/// `load_or_generate_node_keypair`).
+///
+/// All three pieces (`jwt`, `wrapped_dek`, `dek_generation`) are written
+/// atomically from the caller's perspective: any partial state is the
+/// result of a process kill mid-write, in which case the daemon-side
+/// loader treats a missing or short-read file as "no secrets capability"
+/// and falls back to local-only secrets (matching the legacy-leader path).
+///
+/// Returns `Ok(())` on a clean write of all three files, otherwise an
+/// `anyhow::Error` annotated with the path that failed.
+fn persist_secrets_join_material(
+    secrets_dir: &Path,
+    jwt: &str,
+    wrapped_dek: &[u8],
+    dek_generation: u64,
+) -> Result<()> {
+    let jwt_path = secrets_dir.join(NODE_JWT_FILE);
+    let dek_path = secrets_dir.join(WRAPPED_DEK_FILE);
+    let gen_path = secrets_dir.join(DEK_GENERATION_FILE);
+
+    write_secure(&jwt_path, jwt.as_bytes())
+        .with_context(|| format!("write node JWT to {}", jwt_path.display()))?;
+    write_secure(&dek_path, wrapped_dek)
+        .with_context(|| format!("write wrapped DEK to {}", dek_path.display()))?;
+    write_secure(&gen_path, dek_generation.to_string().as_bytes())
+        .with_context(|| format!("write DEK generation to {}", gen_path.display()))?;
+
+    info!(
+        jwt_path = %jwt_path.display(),
+        dek_path = %dek_path.display(),
+        dek_generation,
+        "persisted secrets join material"
+    );
+
+    Ok(())
 }
 
 // =============================================================================
@@ -922,7 +1055,28 @@ pub(crate) async fn handle_node_join(
         );
     }
 
-    // 7. Send join request to the leader.
+    // 7. Load (or generate) the node X25519 secrets keypair and prepare the
+    //    pubkey for the join request. The private key file is left on disk
+    //    under `{secrets_dir}/node_secrets.key` for the daemon to load on
+    //    startup (Task #18). We deliberately do not keep the private key in
+    //    memory after this point — the join flow only needs the pubkey.
+    let secrets_dir = zlayer_paths::ZLayerDirs::new(data_dir.clone()).secrets();
+    let secrets_pubkey: Option<[u8; 32]> =
+        match zlayer_secrets::load_or_generate_node_keypair(&secrets_dir) {
+            Ok((_node_priv, node_pub)) => Some(*node_pub.as_bytes()),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    secrets_dir = %secrets_dir.display(),
+                    "failed to load/generate node X25519 keypair; joining without \
+                     replicated-secrets capability — node will not host secret \
+                     ciphertext until the keypair is created and the join is retried"
+                );
+                None
+            }
+        };
+
+    // 8. Send join request to the leader.
     println!("  Contacting leader at {}...", token_data.api_endpoint);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -943,6 +1097,7 @@ pub(crate) async fn handle_node_join(
         services: services.clone(),
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+        secrets_pubkey,
     };
 
     let response = client
@@ -973,7 +1128,31 @@ pub(crate) async fn handle_node_join(
         "Received join response"
     );
 
-    // 8. Save node configuration.
+    // 8a. Persist the secrets join material returned by the leader so the
+    //     daemon can pick it up on startup (Task #18). Three pieces are
+    //     written into `{secrets_dir}` (mode 0600 on Unix):
+    //       - `node.jwt`         — node-scoped JWT for inter-node calls
+    //       - `wrapped_dek.bin`  — sealed-box-wrapped cluster DEK
+    //       - `dek_generation`   — decimal generation marker
+    //     A legacy leader returns all three as `None`; in that case we log a
+    //     warning and continue — the join still succeeds and Raft membership
+    //     is not gated on the secrets material.
+    if let (Some(jwt), Some(wrapped), Some(generation)) = (
+        join_response.node_jwt.as_ref(),
+        join_response.wrapped_dek.as_ref(),
+        join_response.dek_generation,
+    ) {
+        persist_secrets_join_material(&secrets_dir, jwt, wrapped, generation)
+            .context("failed to persist secrets join material")?;
+    } else {
+        warn!(
+            "leader did not return secrets capability — node will run without \
+             cluster-replicated secrets access; re-run join against a Phase-1+ \
+             leader to enable replicated secrets"
+        );
+    }
+
+    // 9. Save node configuration.
     let node_config = NodeConfig {
         node_id: join_response.node_id.clone(),
         raft_node_id: join_response.raft_node_id,
@@ -989,7 +1168,7 @@ pub(crate) async fn handle_node_join(
     };
     save_node_config(&data_dir, &node_config).await?;
 
-    // 9. Configure overlay with peers.
+    // 10. Configure overlay with peers.
     println!("  Configuring overlay network...");
 
     let our_overlay_ip: std::net::IpAddr = join_response
@@ -1054,7 +1233,7 @@ pub(crate) async fn handle_node_join(
         );
     }
 
-    // 10. Persist overlay bootstrap state (same schema as Unix).
+    // 11a. Persist overlay bootstrap state (same schema as Unix).
     let bootstrap_state = zlayer_overlay::BootstrapState {
         config: zlayer_overlay::BootstrapConfig {
             cidr: token_data.overlay_cidr.clone(),
@@ -1291,7 +1470,28 @@ pub(crate) async fn handle_node_join(
         );
     }
 
-    // 5. Send join request to the leader
+    // 5. Load (or generate) the node X25519 secrets keypair and prepare the
+    //    pubkey for the join request. The private key file is left on disk
+    //    under `{secrets_dir}/node_secrets.key` for the daemon to load on
+    //    startup (Task #18). We deliberately do not keep the private key in
+    //    memory after this point — the join flow only needs the pubkey.
+    let secrets_dir = zlayer_paths::ZLayerDirs::new(data_dir.clone()).secrets();
+    let secrets_pubkey: Option<[u8; 32]> =
+        match zlayer_secrets::load_or_generate_node_keypair(&secrets_dir) {
+            Ok((_node_priv, node_pub)) => Some(*node_pub.as_bytes()),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    secrets_dir = %secrets_dir.display(),
+                    "failed to load/generate node X25519 keypair; joining without \
+                     replicated-secrets capability — node will not host secret \
+                     ciphertext until the keypair is created and the join is retried"
+                );
+                None
+            }
+        };
+
+    // 6. Send join request to the leader
     println!("  Contacting leader at {}...", token_data.api_endpoint);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1312,6 +1512,7 @@ pub(crate) async fn handle_node_join(
         services: services.clone(),
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+        secrets_pubkey,
     };
 
     let response = client
@@ -1342,7 +1543,31 @@ pub(crate) async fn handle_node_join(
         "Received join response"
     );
 
-    // 6. Save node configuration
+    // 6a. Persist the secrets join material returned by the leader so the
+    //     daemon can pick it up on startup (Task #18). Three pieces are
+    //     written into `{secrets_dir}` (mode 0600 on Unix):
+    //       - `node.jwt`         — node-scoped JWT for inter-node calls
+    //       - `wrapped_dek.bin`  — sealed-box-wrapped cluster DEK
+    //       - `dek_generation`   — decimal generation marker
+    //     A legacy leader returns all three as `None`; in that case we log a
+    //     warning and continue — the join still succeeds and Raft membership
+    //     is not gated on the secrets material.
+    if let (Some(jwt), Some(wrapped), Some(generation)) = (
+        join_response.node_jwt.as_ref(),
+        join_response.wrapped_dek.as_ref(),
+        join_response.dek_generation,
+    ) {
+        persist_secrets_join_material(&secrets_dir, jwt, wrapped, generation)
+            .context("failed to persist secrets join material")?;
+    } else {
+        warn!(
+            "leader did not return secrets capability — node will run without \
+             cluster-replicated secrets access; re-run join against a Phase-1+ \
+             leader to enable replicated secrets"
+        );
+    }
+
+    // 7. Save node configuration
     let node_config = NodeConfig {
         node_id: join_response.node_id.clone(),
         raft_node_id: join_response.raft_node_id,
@@ -1358,7 +1583,7 @@ pub(crate) async fn handle_node_join(
     };
     save_node_config(&data_dir, &node_config).await?;
 
-    // 7. Configure overlay with peers
+    // 8. Configure overlay with peers
     println!("  Configuring overlay network...");
 
     // Parse the overlay IP assigned by the leader
@@ -2503,6 +2728,73 @@ mod tests {
         assert!(
             !tmp.path().join("node_config.json").exists(),
             "node_config.json must not be written before admin check"
+        );
+    }
+
+    /// `write_secure` must round-trip exactly the bytes it is given. This is
+    /// the contract relied on by `persist_secrets_join_material` for the
+    /// node JWT (UTF-8) and the wrapped DEK (binary).
+    #[test]
+    fn write_secure_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("secret.bin");
+
+        // Use a payload with explicit non-UTF8 bytes (0xFF, 0x00) to prove
+        // the helper does not corrupt binary content.
+        let payload: &[u8] = &[0x00, 0x01, 0xFE, 0xFF, b'h', b'i'];
+        super::write_secure(&path, payload).expect("write_secure");
+
+        let read_back = std::fs::read(&path).expect("read back");
+        assert_eq!(read_back, payload);
+    }
+
+    /// On Unix, `write_secure` must create the file with mode 0600 so that
+    /// a misconfigured umask cannot widen permissions. This is the same
+    /// invariant that `zlayer_secrets::load_or_generate_node_keypair`
+    /// enforces for `node_secrets.key`.
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_sets_mode_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("secret.bin");
+
+        super::write_secure(&path, b"sensitive").expect("write_secure");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "expected mode 0600, got {mode:o}");
+    }
+
+    /// `write_secure` must overwrite an existing file's content **and** ensure
+    /// its mode is reset to 0600 — covering the case where a pre-existing file
+    /// at the path was created with a more permissive mode (`mode_t` passed
+    /// to `OpenOptions::mode` is only honored on file creation, not truncation).
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_overwrite_resets_mode_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("secret.bin");
+
+        // Pre-create with a wide-open mode and unrelated content.
+        std::fs::write(&path, b"old").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed perms");
+
+        super::write_secure(&path, b"new").expect("write_secure overwrite");
+
+        // Content was replaced.
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+
+        // Mode was tightened back down to 0600 by the belt-and-suspenders
+        // `set_permissions` call inside `write_secure`.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "overwrite must reset mode to 0600, got {mode:o}"
         );
     }
 }

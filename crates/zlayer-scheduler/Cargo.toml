@@ -14,8 +14,10 @@ readme = "README.md"
 # Internal crates
 zlayer-paths.workspace = true
 zlayer-spec.workspace = true
+zlayer-types.workspace = true
 zlayer-core.workspace = true
 zlayer-consensus.workspace = true
+zlayer-secrets.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -62,6 +64,7 @@ utoipa.workspace = true
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+chrono.workspace = true
 
 [features]
 test-skip-http = []

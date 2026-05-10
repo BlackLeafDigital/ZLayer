@@ -792,6 +792,7 @@ mod tests {
                 iss: "zlayer-test".to_string(),
                 roles: vec!["operator".to_string()],
                 email: None,
+                node_id: None,
             },
         }
     }

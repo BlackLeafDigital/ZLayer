@@ -21,6 +21,12 @@ pub struct CreateSecretRequest {
     /// `?environment=` query parameter.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Optional per-secret node affinity. `None` (default) = any node may
+    /// host the decryptable form. When set, only matching nodes receive a
+    /// wrap of the DEK material for this row, and the API gate filters
+    /// reads accordingly. Ignored on standalone (non-clustered) daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_affinity: Option<crate::storage::NodeAffinity>,
 }
 
 /// Response containing secret metadata. Never includes the value unless
@@ -46,6 +52,11 @@ pub struct SecretMetadataResponse {
 pub struct RotateSecretRequest {
     /// The new secret value (will be encrypted at rest).
     pub value: String,
+    /// Optional per-secret node affinity update. `None` here means "leave
+    /// existing affinity unchanged"; to clear affinity explicitly, pass an
+    /// empty selector via a separate update endpoint (Phase 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_affinity: Option<crate::storage::NodeAffinity>,
 }
 
 /// Response returned by the rotate endpoint.

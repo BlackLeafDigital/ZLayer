@@ -7,88 +7,27 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use crypto_box::{PublicKey, SecretKey};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// A sealed secret payload — recipient-encrypted ciphertext plus identifying metadata.
-///
-/// The ciphertext is base64-encoded (standard alphabet, with padding) so it can be
-/// transported as a string and decrypted by any libsodium-compatible client.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SealedSecret {
-    /// The name of the secret this payload corresponds to.
-    pub name: String,
-    /// The version of the secret at the time of sealing.
-    pub version: u32,
-    /// Identifier (typically a fingerprint) of the recipient public key.
-    pub key_id: String,
-    /// Standard-base64 (with padding) libsodium sealed-box ciphertext.
-    pub ciphertext_b64: String,
-}
-
-/// Errors produced by sealed-box operations.
-#[derive(Debug, thiserror::Error)]
-pub enum SealedError {
-    /// Base64 decoding of an input string failed.
-    #[error("base64 decode failed: {0}")]
-    Decode(#[from] base64::DecodeError),
-    /// The decoded byte slice did not match the expected length for its role.
-    #[error("ciphertext invalid length: {0}")]
-    InvalidLength(usize),
-    /// Sealing (encryption) failed.
-    #[error("encryption failed")]
-    Encrypt,
-    /// Opening (decryption / authentication) failed.
-    #[error("decryption failed")]
-    Decrypt,
-}
-
-/// A 32-byte X25519 recipient public key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecipientPublicKey([u8; 32]);
-
-impl RecipientPublicKey {
-    /// Construct a recipient public key directly from its 32 raw bytes.
-    #[must_use]
-    pub fn from_bytes(b: [u8; 32]) -> Self {
-        Self(b)
-    }
-
-    /// Decode a recipient public key from a standard-base64 (padded) string.
-    ///
-    /// # Errors
-    /// Returns `SealedError::Decode` if the string is not valid base64, or
-    /// `SealedError::InvalidLength` if it does not decode to exactly 32 bytes.
-    pub fn from_base64(s: &str) -> Result<Self, SealedError> {
-        let bytes = B64.decode(s)?;
-        if bytes.len() != 32 {
-            return Err(SealedError::InvalidLength(bytes.len()));
-        }
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(&bytes);
-        Ok(Self(buf))
-    }
-
-    /// Encode this public key as standard-base64 (with padding).
-    #[must_use]
-    pub fn to_base64(&self) -> String {
-        B64.encode(self.0)
-    }
-
-    /// Borrow the raw 32-byte representation.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
+pub use zlayer_types::secrets::sealed::{RecipientPublicKey, SealedError, SealedSecret};
 
 /// A 32-byte X25519 recipient private key.
 ///
-/// The bytes are zeroed on drop. The type intentionally does **not** implement
-/// `Debug` or `Display` to prevent accidental disclosure via logging.
+/// The bytes are zeroed on drop. The type implements a sanitizing `Debug`
+/// impl that only prints `RecipientPrivateKey(<redacted>)` — the raw bytes
+/// are never disclosed via formatting. `Display` is intentionally not
+/// implemented for the same reason.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RecipientPrivateKey([u8; 32]);
+
+impl std::fmt::Debug for RecipientPrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RecipientPrivateKey")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
 
 impl RecipientPrivateKey {
     /// Generate a fresh X25519 keypair using the operating system RNG.
@@ -98,7 +37,7 @@ impl RecipientPrivateKey {
         let pk = sk.public_key();
         let sk_bytes: [u8; 32] = sk.to_bytes();
         let pk_bytes: [u8; 32] = pk.as_bytes().to_owned();
-        (Self(sk_bytes), RecipientPublicKey(pk_bytes))
+        (Self(sk_bytes), RecipientPublicKey::from_bytes(pk_bytes))
     }
 
     /// Construct a recipient private key directly from its 32 raw bytes.
@@ -136,7 +75,7 @@ impl RecipientPrivateKey {
     pub fn public_key(&self) -> RecipientPublicKey {
         let sk = SecretKey::from_bytes(self.0);
         let pk = sk.public_key();
-        RecipientPublicKey(pk.as_bytes().to_owned())
+        RecipientPublicKey::from_bytes(pk.as_bytes().to_owned())
     }
 }
 
@@ -168,6 +107,42 @@ pub fn open(
     let bytes = B64.decode(ciphertext_b64)?;
     let sk = SecretKey::from_bytes(recipient_priv.0);
     sk.unseal(&bytes).map_err(|_| SealedError::Decrypt)
+}
+
+/// Seal `plaintext` to `recipient_pub` and return the **raw** libsodium
+/// sealed-box ciphertext bytes (no base64 encoding, no `SealedSecret`
+/// metadata wrapper).
+///
+/// Wire format is the standard libsodium sealed box:
+/// `ephemeral_pubkey (32 bytes) || box(plaintext)`.
+///
+/// Used by [`crate::cluster_dek::ClusterDek`] to produce per-node DEK wraps
+/// that go straight into [`zlayer_types::storage::WrappedDek::wraps`] as
+/// `Vec<u8>` values.
+///
+/// # Errors
+/// Returns `SealedError::Encrypt` if the underlying sealed-box construction fails.
+pub fn seal_raw(
+    plaintext: &[u8],
+    recipient_pub: &RecipientPublicKey,
+) -> Result<Vec<u8>, SealedError> {
+    let pk = PublicKey::from(*recipient_pub.as_bytes());
+    pk.seal(&mut crypto_box::aead::OsRng, plaintext)
+        .map_err(|_| SealedError::Encrypt)
+}
+
+/// Open a raw libsodium sealed-box ciphertext (as produced by [`seal_raw`])
+/// with `recipient_priv`.
+///
+/// # Errors
+/// Returns `SealedError::Decrypt` if the ciphertext fails authentication or
+/// is otherwise malformed.
+pub fn open_raw(
+    ciphertext: &[u8],
+    recipient_priv: &RecipientPrivateKey,
+) -> Result<Vec<u8>, SealedError> {
+    let sk = SecretKey::from_bytes(recipient_priv.0);
+    sk.unseal(ciphertext).map_err(|_| SealedError::Decrypt)
 }
 
 /// Compute a stable, short fingerprint for a recipient public key.

@@ -35,10 +35,13 @@ use axum::{
 };
 pub use zlayer_types::api::secrets::*;
 
-use crate::auth::AuthUser;
+use crate::auth::{require_secret_perm, AuthUser};
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
-use crate::storage::{EnvironmentStorage, PermissionLevel, PermissionStorage, StoredEnvironment};
+use crate::storage::{
+    EnvironmentStorage, GroupStorage, InMemoryGroupStore, PermissionLevel, PermissionStorage,
+    StoredEnvironment,
+};
 use zlayer_secrets::{RotationResult, Secret, SecretMetadata, SecretsStore};
 
 /// Default scope used when no explicit scope and no environment are provided.
@@ -107,14 +110,24 @@ pub fn rotate_secret_response_from(name: String, r: &RotationResult) -> RotateSe
 #[derive(Clone)]
 pub struct SecretsState {
     /// Secrets store for CRUD operations.
+    ///
+    /// Boxed as a trait object so the daemon can swap between
+    /// `PersistentSecretsStore` (standalone) and
+    /// `RaftSecretsStore` (clustered) without retyping every handler.
     pub store: Arc<dyn SecretsStore + Send + Sync>,
     /// Optional environment store for env-aware routing. Without it, only
     /// the legacy `scope`-based code paths are usable.
     pub env_store: Option<Arc<dyn EnvironmentStorage>>,
-    /// Permission store for per-env RBAC checks. When `None`, all endpoints
-    /// fall back to blanket admin-only gates (used by tests or legacy setups
+    /// Permission store for RBAC checks. When `None`, all endpoints fall
+    /// back to blanket admin-only gates (used by tests or legacy setups
     /// without the permission store wired up yet).
     pub perm_store: Option<Arc<dyn PermissionStorage>>,
+    /// Group store, consulted by [`require_secret_perm`] to expand the
+    /// caller's group memberships when looking for inherited grants.
+    /// Defaults to an empty in-memory store so the helper can run even on
+    /// legacy routers that haven't wired up groups yet — the empty store
+    /// is observationally equivalent to "no group grants".
+    pub group_store: Arc<dyn GroupStorage>,
 }
 
 impl SecretsState {
@@ -126,6 +139,7 @@ impl SecretsState {
             store,
             env_store: None,
             perm_store: None,
+            group_store: Arc::new(InMemoryGroupStore::new()),
         }
     }
 
@@ -140,10 +154,12 @@ impl SecretsState {
             store,
             env_store: Some(env_store),
             perm_store: None,
+            group_store: Arc::new(InMemoryGroupStore::new()),
         }
     }
 
     /// Full wiring: secrets + env store + permission store. Enables per-env RBAC.
+    /// Group store defaults to empty.
     #[must_use]
     pub fn with_rbac(
         store: Arc<dyn SecretsStore + Send + Sync>,
@@ -154,6 +170,24 @@ impl SecretsState {
             store,
             env_store: Some(env_store),
             perm_store: Some(perm_store),
+            group_store: Arc::new(InMemoryGroupStore::new()),
+        }
+    }
+
+    /// Full wiring including the group store. The daemon should use this
+    /// constructor; tests and legacy setups can stick with [`Self::with_rbac`].
+    #[must_use]
+    pub fn with_full_rbac(
+        store: Arc<dyn SecretsStore + Send + Sync>,
+        env_store: Arc<dyn EnvironmentStorage>,
+        perm_store: Arc<dyn PermissionStorage>,
+        group_store: Arc<dyn GroupStorage>,
+    ) -> Self {
+        Self {
+            store,
+            env_store: Some(env_store),
+            perm_store: Some(perm_store),
+            group_store,
         }
     }
 
@@ -241,32 +275,37 @@ async fn resolve_scope_get(state: &SecretsState, query: &GetSecretQuery) -> Resu
 
 // ---- RBAC helpers ----
 
-/// Gate a mutating env-scoped operation: require `Write` on the env.
-/// Admin short-circuits via [`AuthActor::require_env_access`].
+/// Gate a per-secret operation. Routes through [`require_secret_perm`] so
+/// callers benefit from direct/wildcard secret grants, env-scope fallback
+/// (`env:{id}` / `project:{pid}:env:{id}`), and group-membership grants in
+/// one shot. Admin role short-circuits.
 ///
-/// Falls back to [`AuthActor::require_admin`] when `perm_store` is not wired
-/// (legacy setups).
-async fn require_env_write(state: &SecretsState, actor: &AuthActor, env_id: &str) -> Result<()> {
+/// `name` may be empty for list operations — `require_secret_perm` accepts
+/// the wildcard secret-grant shape (`resource_id == None`) which covers
+/// "list any secret" without needing a per-name grant.
+///
+/// Falls back to [`AuthActor::require_admin`] when `perm_store` is not
+/// wired up (legacy setups without RBAC). The fallback preserves the
+/// pre-RBAC contract: every endpoint demanded admin.
+async fn require_secret_op(
+    state: &SecretsState,
+    actor: &AuthActor,
+    scope: &str,
+    name: &str,
+    level: PermissionLevel,
+) -> Result<()> {
     match state.perm_store.as_ref() {
         Some(ps) => {
-            actor
-                .require_env_access(ps.as_ref(), env_id, PermissionLevel::Write)
-                .await
-        }
-        None => actor.require_admin(),
-    }
-}
-
-/// Gate a read-only env-scoped operation: require `Read` on the env.
-/// Admin short-circuits via [`AuthActor::require_env_access`].
-///
-/// Falls back to [`AuthActor::require_admin`] when `perm_store` is not wired.
-async fn require_env_read(state: &SecretsState, actor: &AuthActor, env_id: &str) -> Result<()> {
-    match state.perm_store.as_ref() {
-        Some(ps) => {
-            actor
-                .require_env_access(ps.as_ref(), env_id, PermissionLevel::Read)
-                .await
+            require_secret_perm(
+                actor,
+                ps.as_ref(),
+                state.group_store.as_ref(),
+                state.env_store.as_deref(),
+                scope,
+                name,
+                level,
+            )
+            .await
         }
         None => actor.require_admin(),
     }
@@ -310,13 +349,6 @@ pub async fn create_secret(
     Query(query): Query<SecretsScopeQuery>,
     Json(request): Json<CreateSecretRequest>,
 ) -> Result<(StatusCode, Json<SecretMetadataResponse>)> {
-    if let Some(env_id) = &query.environment {
-        require_env_write(&state, &actor, env_id).await?;
-    } else {
-        // Legacy scope path stays admin-only.
-        actor.require_admin()?;
-    }
-
     if request.name.is_empty() {
         return Err(ApiError::BadRequest(
             "Secret name cannot be empty".to_string(),
@@ -330,6 +362,19 @@ pub async fn create_secret(
 
     let scope = resolve_scope(&state, request.scope.as_deref(), &query).await?;
 
+    // RBAC: write on the secret. `require_secret_perm` covers admin
+    // shortcut, direct/wildcard secret-kind grants, env-fallback when the
+    // scope is env-shaped, and group-membership grants. Legacy
+    // (no-perm-store) routers still gate on admin via `require_secret_op`.
+    require_secret_op(
+        &state,
+        &actor,
+        &scope,
+        &request.name,
+        PermissionLevel::Write,
+    )
+    .await?;
+
     let exists = state
         .store
         .exists(&scope, &request.name)
@@ -337,9 +382,17 @@ pub async fn create_secret(
         .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {e}")))?;
 
     let secret = Secret::new(&request.value);
+    // Pass the optional `node_affinity` through the affinity-aware shim.
+    // Standalone (PersistentSecretsStore) backends ignore it via the
+    // default trait impl; RaftSecretsStore actually persists it.
     state
         .store
-        .set_secret(&scope, &request.name, &secret)
+        .set_secret_with_affinity(
+            &scope,
+            &request.name,
+            &secret,
+            request.node_affinity.as_ref(),
+        )
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to store secret: {e}")))?;
 
@@ -392,12 +445,14 @@ pub async fn list_secrets(
     State(state): State<SecretsState>,
     Query(query): Query<SecretsScopeQuery>,
 ) -> Result<Json<Vec<SecretMetadataResponse>>> {
-    if let Some(env_id) = &query.environment {
-        require_env_read(&state, &actor, env_id).await?;
-    }
-    // else: authenticated actor can list legacy scope (unchanged).
-
     let scope = resolve_scope(&state, None, &query).await?;
+
+    // Listing only requires Read. Empty `name` causes
+    // `require_secret_perm` to consult the wildcard secret grant
+    // (`resource_id == None`), the env-scope fallback (which only needs
+    // env Read), and group grants — all the right ways to authorise a
+    // listing op without per-secret-name knowledge.
+    require_secret_op(&state, &actor, &scope, "", PermissionLevel::Read).await?;
 
     let metadata_list = state
         .store
@@ -447,20 +502,23 @@ pub async fn get_secret_metadata(
     Query(query): Query<GetSecretQuery>,
 ) -> Result<Json<SecretMetadataResponse>> {
     let reveal = query.reveal;
-    if let Some(env_id) = &query.environment {
-        if reveal {
-            // Design choice: reveal on an env-scoped secret requires Write —
-            // plaintext exfil is a more sensitive op than simply listing/
-            // reading metadata.
-            require_env_write(&state, &actor, env_id).await?;
-        } else {
-            require_env_read(&state, &actor, env_id).await?;
-        }
-    } else if reveal {
-        // Legacy scope reveal stays admin-only.
+    let scope = resolve_scope_get(&state, &query).await?;
+
+    // Reveal on a legacy scope still requires admin (per the Phase 1 plan
+    // — plaintext exfil from non-env scopes hasn't been wired to a fine-
+    // grained grant yet). For env-shaped scopes, `require_secret_op` at
+    // Write level is the correct gate: `require_secret_perm`'s env
+    // fallback maps Write → env Write so a non-admin user with env Write
+    // can still reveal.
+    if reveal && !is_env_shaped_scope(&scope) {
         actor.require_admin()?;
     }
-    let scope = resolve_scope_get(&state, &query).await?;
+    let level = if reveal {
+        PermissionLevel::Write
+    } else {
+        PermissionLevel::Read
+    };
+    require_secret_op(&state, &actor, &scope, &name, level).await?;
 
     let exists = state
         .store
@@ -485,6 +543,10 @@ pub async fn get_secret_metadata(
     let mut response = secret_metadata_response_from_owned(metadata);
 
     if reveal {
+        // Goes through the `SecretsStore` trait so `RaftSecretsStore` can
+        // enforce per-secret `node_affinity` (returns NotFound when this
+        // node isn't in the affinity selector). `PersistentSecretsStore`
+        // is single-node so affinity is meaningless there.
         let secret = state
             .store
             .get_secret(&scope, &name)
@@ -494,6 +556,13 @@ pub async fn get_secret_metadata(
     }
 
     Ok(Json(response))
+}
+
+/// Test whether `scope` is one of the recognised env-shapes
+/// (`env:{id}` / `project:{pid}:env:{id}`) that
+/// [`require_secret_perm`] understands as the env-fallback path.
+fn is_env_shaped_scope(scope: &str) -> bool {
+    crate::auth::parse_env_id_from_scope(scope).is_some()
 }
 
 /// Delete a secret.
@@ -528,13 +597,8 @@ pub async fn delete_secret(
     Path(name): Path<String>,
     Query(query): Query<SecretsScopeQuery>,
 ) -> Result<StatusCode> {
-    if let Some(env_id) = &query.environment {
-        require_env_write(&state, &actor, env_id).await?;
-    } else {
-        actor.require_admin()?;
-    }
-
     let scope = resolve_scope(&state, None, &query).await?;
+    require_secret_op(&state, &actor, &scope, &name, PermissionLevel::Write).await?;
 
     let exists = state
         .store
@@ -590,12 +654,6 @@ pub async fn rotate_secret(
     Query(query): Query<SecretsScopeQuery>,
     Json(request): Json<RotateSecretRequest>,
 ) -> Result<Json<RotateSecretResponse>> {
-    if let Some(env_id) = &query.environment {
-        require_env_write(&state, &actor, env_id).await?;
-    } else {
-        actor.require_admin()?;
-    }
-
     if name.is_empty() {
         return Err(ApiError::BadRequest(
             "Secret name cannot be empty".to_string(),
@@ -603,11 +661,15 @@ pub async fn rotate_secret(
     }
 
     let scope = resolve_scope(&state, None, &query).await?;
+    require_secret_op(&state, &actor, &scope, &name, PermissionLevel::Write).await?;
+
     let new_secret = Secret::new(&request.value);
 
+    // Affinity-aware rotation: `None` means "leave existing affinity
+    // unchanged" per the DTO contract; `Some(...)` overwrites.
     let result = state
         .store
-        .rotate_secret(&scope, &name, &new_secret)
+        .rotate_secret_with_affinity(&scope, &name, &new_secret, request.node_affinity.as_ref())
         .await
         .map_err(|e| match e {
             zlayer_secrets::SecretsError::NotFound { .. } => {
@@ -653,12 +715,14 @@ pub async fn bulk_import_secrets(
     Query(query): Query<BulkImportQuery>,
     body: String,
 ) -> Result<Json<BulkImportResponse>> {
-    // `environment` is required on bulk-import, so always route through
-    // per-env RBAC. Admin short-circuits inside `require_env_write`.
-    require_env_write(&state, &actor, &query.environment).await?;
-
     let env = state.lookup_env(&query.environment).await?;
     let scope = env_scope(&env);
+
+    // Bulk import targets every key in the env, so a wildcard secret-Write
+    // grant or env-Write grant covers it. Per-name grants do NOT — the
+    // import would have to spam the perm store. Pass an empty `name` so
+    // `require_secret_perm` consults wildcard + env-fallback only.
+    require_secret_op(&state, &actor, &scope, "", PermissionLevel::Write).await?;
 
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -696,7 +760,14 @@ pub async fn bulk_import_secrets(
             }
         };
         let secret = Secret::new(value);
-        if let Err(e) = state.store.set_secret(&scope, name, &secret).await {
+        // Bulk import doesn't accept per-key affinity; pass `None` so the
+        // affinity-aware shim leaves any existing selector in place (Raft
+        // backend) or no-ops (standalone backend).
+        if let Err(e) = state
+            .store
+            .set_secret_with_affinity(&scope, name, &secret, None)
+            .await
+        {
             errors.push(format!("line {line_no}: store failed: {e}"));
             continue;
         }
@@ -745,10 +816,16 @@ pub async fn reveal_all_secrets(
     let env_id = query.environment.clone().ok_or_else(|| {
         ApiError::BadRequest("`?environment=` is required for reveal-all".to_string())
     })?;
-    require_env_read(&state, &actor, &env_id).await?;
 
     // Resolve env -> scope string
     let scope = resolve_scope(&state, None, &query).await?;
+
+    // Bulk plaintext reveal — gate at Write so a plain Read grant on the
+    // env can't be used to siphon every secret value. Per-secret reveal
+    // uses the same Write-on-env-shaped-scope policy via
+    // `get_secret_metadata`. Empty `name` means we consult only wildcard
+    // and env-fallback grants — plus admin via the helper's shortcut.
+    require_secret_op(&state, &actor, &scope, "", PermissionLevel::Write).await?;
 
     let metadata_list = state
         .store
@@ -1127,6 +1204,7 @@ mod tests {
             name: "my-secret".into(),
             value: "hunter2".into(),
             scope: None,
+            node_affinity: None,
         };
 
         let err = create_secret(actor, State(state), Query(query), Json(body))
@@ -1136,6 +1214,254 @@ mod tests {
             matches!(err, ApiError::Forbidden(_)),
             "expected Forbidden, got {err:?}"
         );
+    }
+
+    // ----- Task #14 tests: per-secret RBAC + node_affinity -----
+
+    /// Non-admin user holding a per-secret Read grant on `default:foo` can
+    /// read the secret's metadata via the legacy-scope GET path. This
+    /// exercises the `require_secret_perm` direct-grant branch through
+    /// the handler (vs. the unit-tested helper directly).
+    #[tokio::test]
+    async fn non_admin_with_secret_grant_can_read() {
+        use crate::storage::{
+            InMemoryGroupStore, InMemoryPermissionStore, PermissionLevel, PermissionStorage,
+            StoredPermission, SubjectKind,
+        };
+        use axum::extract::{Path, Query, State};
+
+        // Pre-seed a secret in the default scope.
+        let mock = MockSecretsStore::new();
+        mock.inner
+            .lock()
+            .await
+            .insert(("default".into(), "foo".into()), Secret::new("hunter2"));
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(mock);
+
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+        let group_store: Arc<dyn crate::storage::GroupStorage> =
+            Arc::new(InMemoryGroupStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+
+        // Direct per-secret grant on default:foo at Read.
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "secret",
+            Some("default:foo".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(perm_store.as_ref(), &grant)
+            .await
+            .unwrap();
+
+        let state = SecretsState::with_full_rbac(secrets_store, env_store, perm_store, group_store);
+
+        let actor = AuthActor {
+            user_id: "u1".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+        let query = GetSecretQuery {
+            environment: None,
+            scope: None,
+            reveal: false,
+        };
+
+        let result = get_secret_metadata(actor, State(state), Path("foo".into()), Query(query))
+            .await
+            .expect("non-admin with secret Read grant should succeed");
+
+        let Json(meta) = result;
+        assert_eq!(meta.name, "foo");
+        assert!(meta.value.is_none(), "no reveal -> no plaintext");
+    }
+
+    /// Non-admin without any grant gets `Forbidden` (not `NotFound`) on
+    /// the legacy-scope read path.
+    #[tokio::test]
+    async fn non_admin_without_grant_403() {
+        use crate::storage::{InMemoryGroupStore, InMemoryPermissionStore};
+        use axum::extract::{Path, Query, State};
+
+        let mock = MockSecretsStore::new();
+        mock.inner
+            .lock()
+            .await
+            .insert(("default".into(), "foo".into()), Secret::new("hunter2"));
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(mock);
+
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+        let group_store: Arc<dyn crate::storage::GroupStorage> =
+            Arc::new(InMemoryGroupStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+
+        let state = SecretsState::with_full_rbac(secrets_store, env_store, perm_store, group_store);
+
+        let actor = AuthActor {
+            user_id: "u-nobody".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+        let query = GetSecretQuery {
+            environment: None,
+            scope: None,
+            reveal: false,
+        };
+
+        let err = get_secret_metadata(actor, State(state), Path("foo".into()), Query(query))
+            .await
+            .expect_err("no grants -> Forbidden");
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "expected Forbidden, got {err:?}",
+        );
+    }
+
+    /// A wildcard `("secret", None, Read)` grant should permit listing
+    /// secrets in any scope — the wildcard branch in
+    /// `require_secret_perm` is the cleanest way to authorise listing.
+    #[tokio::test]
+    async fn wildcard_secret_grant_allows_list() {
+        use crate::storage::{
+            InMemoryGroupStore, InMemoryPermissionStore, PermissionLevel, PermissionStorage,
+            StoredPermission, SubjectKind,
+        };
+        use axum::extract::{Query, State};
+
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(MockSecretsStore::new());
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+        let group_store: Arc<dyn crate::storage::GroupStorage> =
+            Arc::new(InMemoryGroupStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+
+        // Wildcard secret-kind Read grant — resource_id == None.
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "secret",
+            None,
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(perm_store.as_ref(), &grant)
+            .await
+            .unwrap();
+
+        let state = SecretsState::with_full_rbac(secrets_store, env_store, perm_store, group_store);
+
+        let actor = AuthActor {
+            user_id: "u1".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+
+        // List in default scope.
+        let result = list_secrets(
+            actor.clone(),
+            State(state.clone()),
+            Query(SecretsScopeQuery::default()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "wildcard Read should authorise list, got {result:?}"
+        );
+
+        // List in some other (non-env) scope — wildcard covers it too.
+        let result = list_secrets(
+            actor,
+            State(state),
+            Query(SecretsScopeQuery {
+                environment: None,
+                scope: Some("anything-else".to_string()),
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "wildcard Read should authorise list across scopes, got {result:?}",
+        );
+    }
+
+    /// Standalone `MockSecretsStore` ignores `node_affinity` — reads
+    /// succeed regardless of the selector. Per-affinity filtering is a
+    /// `RaftSecretsStore` responsibility (covered by its own tests in
+    /// `zlayer-secrets`). This test documents the standalone contract:
+    /// affinity is silently dropped, so the read path returns the
+    /// secret as written.
+    ///
+    /// Marked `#[ignore]` per the task plan: affinity isn't observable
+    /// through the standalone store, so there's nothing meaningful to
+    /// assert beyond "it didn't crash". Kept for documentation /
+    /// future RaftSecretsStore-backed integration coverage.
+    #[tokio::test]
+    #[ignore = "node_affinity is enforced by RaftSecretsStore, not standalone — see raft_store.rs tests"]
+    async fn node_affinity_excluded_node_404() {
+        // Intentional no-op; see doc-comment.
+    }
+
+    /// `POST`ing a `CreateSecretRequest` with `node_affinity: Some(_)` must
+    /// not error and must store the secret. Standalone backends drop the
+    /// affinity (no peers to select from); the affinity surfacing for
+    /// cluster mode is covered by `RaftSecretsStore` unit tests.
+    #[tokio::test]
+    async fn create_with_node_affinity_persists() {
+        use crate::storage::{InMemoryGroupStore, InMemoryPermissionStore};
+        use axum::extract::{Query, State};
+        use zlayer_types::storage::NodeAffinity;
+
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(MockSecretsStore::new());
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+        let group_store: Arc<dyn crate::storage::GroupStorage> =
+            Arc::new(InMemoryGroupStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+
+        let state =
+            SecretsState::with_full_rbac(secrets_store.clone(), env_store, perm_store, group_store);
+
+        // Admin actor — short-circuits the RBAC gate so we can focus on
+        // the affinity write path.
+        let actor = AuthActor {
+            user_id: "admin-1".into(),
+            roles: vec!["admin".into()],
+            email: None,
+        };
+
+        let body = CreateSecretRequest {
+            name: "my-secret".into(),
+            value: "hunter2".into(),
+            scope: None,
+            node_affinity: Some(NodeAffinity::Nodes {
+                node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+            }),
+        };
+
+        let (status, Json(meta)) = create_secret(
+            actor,
+            State(state.clone()),
+            Query(SecretsScopeQuery::default()),
+            Json(body),
+        )
+        .await
+        .expect("create with node_affinity should succeed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(meta.name, "my-secret");
+
+        // Standalone store: confirm the secret round-trips. (Affinity
+        // visibility on standalone stores is documented as ignored —
+        // see `node_affinity_excluded_node_404` above.)
+        let exists = state.store.exists("default", "my-secret").await.unwrap();
+        assert!(exists, "secret should be persisted under default scope");
+
+        // Make sure the affinity-aware shim path doesn't double-write or
+        // mangle the value.
+        let got = state
+            .store
+            .get_secret("default", "my-secret")
+            .await
+            .expect("get back the secret");
+        assert_eq!(got.expose(), "hunter2");
     }
 
     // ---- minimal mock secrets store for unit tests above ----

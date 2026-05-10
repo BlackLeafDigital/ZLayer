@@ -31,7 +31,10 @@ use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
-use zlayer_secrets::{CredentialStore, KeyManager, PersistentSecretsStore};
+use zlayer_secrets::{
+    load_or_generate_node_keypair, CredentialStore, KeyManager, PersistentSecretsStore,
+    RaftSecretsHandle, RaftSecretsStore, RecipientPrivateKey, SecretsStore,
+};
 use zlayer_tunnel::{
     AccessManager, ControlHandler, ListenerManager, NodeTunnelManager, TokenValidator, TunnelError,
     TunnelRegistry, TunnelServerConfig,
@@ -281,8 +284,19 @@ pub struct DaemonState {
     /// Persistent deployment storage (`SQLite`).
     pub storage: Arc<SqlxStorage>,
 
-    /// Persistent encrypted secrets store (`SQLite` + XChaCha20-Poly1305).
-    pub secrets: Arc<PersistentSecretsStore>,
+    /// User-secrets store, chosen at startup based on whether this node is a
+    /// member of a clustered deployment.
+    ///
+    /// - **Standalone** (no `wrapped_dek.bin` on disk): wraps the local
+    ///   [`PersistentSecretsStore`] in a trait object so the same handler
+    ///   wiring works on a single-node deployment.
+    /// - **Clustered** (`wrapped_dek.bin` present after `zlayer node join`):
+    ///   a [`RaftSecretsStore`] that reads/writes through the cluster Raft
+    ///   state machine, decrypting with the node's on-disk X25519 key.
+    ///
+    /// The trait-object type lets the API handler state stay agnostic. See
+    /// [`select_secrets_store`] for the selection logic.
+    pub secrets: Arc<dyn SecretsStore + Send + Sync>,
 
     /// Credential store for API key authentication.
     pub credential_store: Arc<CredentialStore<Arc<PersistentSecretsStore>>>,
@@ -761,7 +775,15 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 10: Persistent secrets store
+    // Phase 10: Persistent secrets store + node X25519 keypair
+    //
+    // The persistent store always exists (it backs `credential_store`,
+    // `RegistryCredentialStore`, and `GitCredentialStore`, which are
+    // local-only). The user-secrets store handed to handler state is
+    // chosen later (Phase 15b) once the Raft instance is up — see
+    // [`select_secrets_store`]. The node keypair is loaded
+    // unconditionally (even in standalone mode) so a daemon can later
+    // be promoted into a cluster without re-keying.
     // -----------------------------------------------------------------------
     let key_manager = KeyManager::with_base_dir(&config.data_dir);
     let encryption_key = key_manager
@@ -769,19 +791,30 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         .context("Failed to resolve secrets encryption key")?;
 
     let secrets_dir = config.data_dir.join("secrets");
-    let secrets = Arc::new(
+    let persistent_secrets = Arc::new(
         PersistentSecretsStore::open(&secrets_dir, encryption_key)
             .await
             .with_context(|| {
                 format!("Failed to open secrets store at {}", secrets_dir.display())
             })?,
     );
-    info!(path = %secrets_dir.display(), "Secrets store opened");
+    info!(path = %secrets_dir.display(), "Persistent secrets store opened");
+
+    // Always load (or generate) the node X25519 keypair. Cheap on hot
+    // path, and a standalone daemon that later joins a cluster can
+    // present its existing pubkey instead of having to re-key.
+    let (node_priv, node_pub) = load_or_generate_node_keypair(&secrets_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to load/generate node keypair: {e}"))?;
+    let node_priv = Arc::new(node_priv);
+    info!(
+        node_pubkey_b64 = %base64::Engine::encode(&base64::engine::general_purpose::STANDARD, node_pub.as_bytes()),
+        "Node X25519 keypair ready"
+    );
 
     // -----------------------------------------------------------------------
     // Phase 11: Credential store + admin bootstrap
     // -----------------------------------------------------------------------
-    let credential_store = Arc::new(CredentialStore::new(Arc::clone(&secrets)));
+    let credential_store = Arc::new(CredentialStore::new(Arc::clone(&persistent_secrets)));
 
     // Bootstrap admin credential if none exists.
     let admin_password = generate_admin_password();
@@ -918,7 +951,21 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             ..Default::default()
         };
 
-        match RaftCoordinator::with_auth(raft_cfg, Some(internal_token.clone())).await {
+        // Wire the secrets capability into the coordinator so leader-side
+        // helpers (`propose_register_node_and_rotate`, `propose_rotate_dek`)
+        // can seal the cluster DEK to this node's X25519 pubkey. The pair
+        // must be `Some(_)`/`Some(_)` together — a missing node_uuid would
+        // disable the secrets helpers entirely.
+        let raft_node_priv: RecipientPrivateKey = (*node_priv).clone();
+        let raft_node_uuid = node_config.node_id.clone();
+        match RaftCoordinator::with_auth_and_secrets(
+            raft_cfg,
+            Some(internal_token.clone()),
+            Some(raft_node_priv),
+            Some(raft_node_uuid),
+        )
+        .await
+        {
             Ok(coordinator) => {
                 // Bootstrap as single-node cluster if this is the leader (first node)
                 if node_config.is_leader {
@@ -1042,6 +1089,34 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             }
         }
     };
+
+    // -----------------------------------------------------------------------
+    // Phase 15b: Select user-secrets store (standalone vs clustered)
+    //
+    // Standalone-mode daemons (single node, no `wrapped_dek.bin` on disk)
+    // continue to use the local `PersistentSecretsStore`. A node that has
+    // joined a cluster (wrapped_dek.bin written by the join handler in
+    // Task #17) switches to `RaftSecretsStore`, which reads from the
+    // replicated SM and decrypts with the on-disk node X25519 key.
+    //
+    // We make the choice *after* Raft is up so the cluster store has a
+    // live `RaftSecretsHandle` to bind to. When Raft failed to come up
+    // (e.g. on a host without a writable raft data dir), we fall back to
+    // the persistent store unconditionally — better than leaving the API
+    // 503'ing on every secret read.
+    //
+    // TODO Phase-1.5: switch inter-node auth to node JWT (currently the
+    // daemon attaches `state.internal_token` as `X-ZLayer-Internal-Token`
+    // for inter-node calls; the JWT minted by the leader at join time
+    // (`{secrets_dir}/node.jwt`) replaces that path in a later task).
+    // -----------------------------------------------------------------------
+    let secrets: Arc<dyn SecretsStore + Send + Sync> = select_secrets_store(
+        &secrets_dir,
+        Arc::clone(&persistent_secrets),
+        raft.as_ref().map(Arc::clone),
+        &node_priv,
+        node_config.node_id.clone(),
+    );
 
     // -----------------------------------------------------------------------
     // Phase 16: Scheduler + Heartbeat & dead-node detection
@@ -1430,6 +1505,106 @@ fn generate_internal_token() -> String {
         let _ = write!(buf, "{byte:02x}");
     }
     buf
+}
+
+/// Path to the bootstrap wrapped DEK file written by the join handler
+/// (Task #17). Its presence is the signal that this daemon has joined a
+/// cluster and should serve user secrets through `RaftSecretsStore`
+/// rather than the local `PersistentSecretsStore`.
+fn wrapped_dek_path(secrets_dir: &std::path::Path) -> std::path::PathBuf {
+    secrets_dir.join("wrapped_dek.bin")
+}
+
+/// True iff this daemon should run with `RaftSecretsStore` for user
+/// secrets.
+///
+/// The cluster-join flow drops `wrapped_dek.bin` into the secrets dir
+/// alongside `node.jwt` and `dek_generation` (Task #17). Standalone
+/// daemons never go through that flow, so the file is absent and we
+/// stay on `PersistentSecretsStore`.
+///
+/// We do not key off `NodeConfig.is_leader` because a single-node
+/// auto-init also sets `is_leader = true`; the file marker is the
+/// least-ambiguous signal.
+pub(crate) fn is_clustered_mode(secrets_dir: &std::path::Path) -> bool {
+    wrapped_dek_path(secrets_dir).exists()
+}
+
+/// Pick the user-secrets store appropriate for this daemon.
+///
+/// - Standalone (or Raft init failed, or no `wrapped_dek.bin`): the
+///   `PersistentSecretsStore` is widened to `Arc<dyn SecretsStore>` and
+///   handed back unchanged. Existing standalone daemons continue to
+///   behave bit-for-bit as before.
+/// - Clustered (cluster-join artifacts on disk *and* the local Raft
+///   coordinator is up): a fresh [`RaftSecretsStore`] is constructed
+///   bound to the live coordinator. Reads pull from the replicated
+///   [`zlayer_secrets::SecretsState`]; writes propose through the
+///   leader. Decryption uses the local node's X25519 private key.
+///
+/// `node_priv` is *always* loaded by the caller (cheap, lets a
+/// standalone node later upgrade into a cluster without re-keying), so
+/// it is unconditionally present. `node_uuid` is the cluster-wide UUID
+/// from `NodeConfig.node_id`.
+pub(crate) fn select_secrets_store(
+    secrets_dir: &std::path::Path,
+    persistent: Arc<PersistentSecretsStore>,
+    raft: Option<Arc<RaftCoordinator>>,
+    node_priv: &Arc<RecipientPrivateKey>,
+    node_uuid: String,
+) -> Arc<dyn SecretsStore + Send + Sync> {
+    // Up-cast `Arc<RaftCoordinator>` to `Arc<dyn RaftSecretsHandle>` and
+    // hand off to the testable inner helper. The cast is free at runtime
+    // (same fat pointer) and keeps the production call site short.
+    let handle: Option<Arc<dyn RaftSecretsHandle>> = raft.map(|c| c as Arc<dyn RaftSecretsHandle>);
+    select_secrets_store_inner(secrets_dir, persistent, handle, node_priv, node_uuid)
+}
+
+/// Inner store-selection logic that takes the raft handle as a trait
+/// object so unit tests can inject an in-memory mock without standing up
+/// a real `RaftCoordinator` (which would require a real network and a
+/// writable redb store on disk).
+///
+/// Production callers should invoke [`select_secrets_store`] which does
+/// the trivial up-cast for them.
+pub(crate) fn select_secrets_store_inner(
+    secrets_dir: &std::path::Path,
+    persistent: Arc<PersistentSecretsStore>,
+    raft: Option<Arc<dyn RaftSecretsHandle>>,
+    node_priv: &Arc<RecipientPrivateKey>,
+    node_uuid: String,
+) -> Arc<dyn SecretsStore + Send + Sync> {
+    if is_clustered_mode(secrets_dir) {
+        if let Some(raft_handle) = raft {
+            info!(
+                node_uuid = %node_uuid,
+                "Cluster mode: using RaftSecretsStore for user secrets"
+            );
+            // RaftSecretsStore takes RecipientPrivateKey by value; clone
+            // out of the Arc so the original wrap can keep being shared
+            // (e.g. for future helpers that re-seal DEKs via the same
+            // key). `node_priv: &Arc<RecipientPrivateKey>` needs a double
+            // deref to reach the inner value.
+            return Arc::new(RaftSecretsStore::new(
+                node_priv.as_ref().clone(),
+                node_uuid,
+                raft_handle,
+            ));
+        }
+        // wrapped_dek.bin exists but Raft didn't come up. We can't serve
+        // cluster secrets without a coordinator, so fall back to the
+        // persistent store and warn loudly. The cluster's user-secret
+        // reads will be unavailable until raft initialises (a restart
+        // typically resolves it).
+        warn!(
+            "wrapped_dek.bin present but Raft is unavailable; \
+             falling back to PersistentSecretsStore. Cluster-replicated \
+             secrets will not be served until Raft is restored."
+        );
+    }
+
+    info!("Standalone mode: using PersistentSecretsStore for user secrets");
+    persistent
 }
 
 /// Resolve the current Raft leader's HTTP API URL from cluster state.
@@ -1961,3 +2136,212 @@ fn generate_admin_password() -> String {
 // NOTE: Shutdown is handled inline in serve.rs after DaemonState is destructured
 // for router setup. If you add a new subsystem to DaemonState, add its shutdown
 // to the teardown sequence in commands/serve.rs (search for "Post-shutdown cleanup").
+
+#[cfg(test)]
+mod tests {
+    //! Tests for daemon-level startup helpers added in Task #18:
+    //! node-keypair load on first startup and the standalone-vs-clustered
+    //! secrets-store selection.
+
+    use super::*;
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use zlayer_secrets::{
+        node_secrets_key_path, EncryptionKey, RaftSecretsHandle, SecretsError, SecretsState,
+    };
+    use zlayer_types::storage::ReplicatedSecret;
+
+    /// Open a `PersistentSecretsStore` at `dir` with a freshly generated
+    /// 32-byte symmetric key. Returns the `Arc` ready to feed into
+    /// [`select_secrets_store`].
+    async fn make_persistent(dir: &std::path::Path) -> Arc<PersistentSecretsStore> {
+        let key = EncryptionKey::generate();
+        Arc::new(
+            PersistentSecretsStore::open(dir, key)
+                .await
+                .expect("open persistent store"),
+        )
+    }
+
+    /// In-memory `RaftSecretsHandle` that just panics if anything calls
+    /// it — the store-selection tests only need the *option* of a handle
+    /// being present, never to actually use it.
+    struct DummyRaftHandle;
+
+    #[async_trait]
+    impl RaftSecretsHandle for DummyRaftHandle {
+        async fn secrets_state(&self) -> SecretsState {
+            unreachable!("store-selection test should not invoke the handle")
+        }
+        async fn propose_put_secret(&self, _: ReplicatedSecret) -> Result<(), SecretsError> {
+            unreachable!("store-selection test should not invoke the handle")
+        }
+        async fn propose_delete_secret(&self, _: &str) -> Result<(), SecretsError> {
+            unreachable!("store-selection test should not invoke the handle")
+        }
+    }
+
+    #[test]
+    fn daemon_loads_node_keypair_on_first_startup() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = node_secrets_key_path(dir.path());
+        assert!(!path.exists(), "key file must not exist before first call");
+
+        let (priv1, pub1) = load_or_generate_node_keypair(dir.path()).expect("first generate");
+
+        // File now exists with exactly 32 bytes.
+        assert!(path.exists(), "key file must exist after generation");
+        let buf = std::fs::read(&path).expect("read key file");
+        assert_eq!(buf.len(), 32, "raw private key must be 32 bytes");
+
+        // Unix mode 0600 — never world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("stat key file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "key file must be 0600 (got {mode:o})");
+        }
+
+        // A second call returns the *same* keypair (no re-keying).
+        let (priv2, pub2) = load_or_generate_node_keypair(dir.path()).expect("second load");
+        assert_eq!(
+            priv1.to_base64(),
+            priv2.to_base64(),
+            "private key must be stable across reloads"
+        );
+        assert_eq!(
+            pub1.as_bytes(),
+            pub2.as_bytes(),
+            "public key must be stable across reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_secrets_store_picks_persistent_when_standalone() {
+        let dir = TempDir::new().expect("tempdir");
+        let secrets_dir = dir.path();
+        let persistent = make_persistent(secrets_dir).await;
+        let (sk, _pk) = RecipientPrivateKey::generate();
+
+        // No wrapped_dek.bin → standalone mode.
+        assert!(!is_clustered_mode(secrets_dir));
+        let baseline_count = Arc::strong_count(&persistent);
+
+        // Even with a Raft handle wired in, absence of wrapped_dek.bin
+        // forces the persistent store.
+        let raft_handle: Arc<dyn RaftSecretsHandle> = Arc::new(DummyRaftHandle);
+        let node_priv = Arc::new(sk);
+        let chosen = select_secrets_store_inner(
+            secrets_dir,
+            Arc::clone(&persistent),
+            Some(raft_handle),
+            &node_priv,
+            "node-uuid".to_string(),
+        );
+
+        // The function returned the persistent Arc widened to a trait
+        // object. The strong count on `persistent` should reflect that
+        // `chosen` is another reference to the *same* allocation.
+        // (baseline + 1 for `chosen`. The clone passed into the call
+        // is consumed by the function's argument and either dropped or
+        // re-returned; in the standalone branch it's re-returned, so
+        // the count is baseline + 1.)
+        let chosen_count = Arc::strong_count(&persistent);
+        assert!(
+            chosen_count > baseline_count,
+            "standalone branch must hand back the persistent Arc \
+             (strong count was {baseline_count}, became {chosen_count})"
+        );
+
+        // Drop the chosen Arc and confirm the count returns to baseline.
+        drop(chosen);
+        assert_eq!(
+            Arc::strong_count(&persistent),
+            baseline_count,
+            "dropping `chosen` should restore the strong count if it pointed at `persistent`"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_secrets_store_picks_raft_when_clustered() {
+        let dir = TempDir::new().expect("tempdir");
+        let secrets_dir = dir.path();
+        let persistent = make_persistent(secrets_dir).await;
+        let (sk, _pk) = RecipientPrivateKey::generate();
+
+        // Drop a non-empty wrapped_dek.bin to flip the clustered marker.
+        std::fs::write(wrapped_dek_path(secrets_dir), b"placeholder")
+            .expect("write wrapped_dek.bin");
+        assert!(is_clustered_mode(secrets_dir));
+        let baseline_count = Arc::strong_count(&persistent);
+
+        // With a live Raft handle, we must construct a RaftSecretsStore.
+        let raft_handle: Arc<dyn RaftSecretsHandle> = Arc::new(DummyRaftHandle);
+        let node_priv = Arc::new(sk);
+        let chosen = select_secrets_store_inner(
+            secrets_dir,
+            Arc::clone(&persistent),
+            Some(raft_handle),
+            &node_priv,
+            "node-uuid".to_string(),
+        );
+
+        // The chosen store must NOT be the persistent Arc — it should
+        // be a freshly-allocated RaftSecretsStore wrapper. So the
+        // strong count on `persistent` is back at baseline (the clone
+        // passed into the function was dropped on the way out of the
+        // clustered branch).
+        assert_eq!(
+            Arc::strong_count(&persistent),
+            baseline_count,
+            "clustered branch must NOT hold a reference to the persistent Arc"
+        );
+
+        // And `chosen` is the only owner of its (Raft-backed) allocation.
+        assert_eq!(
+            Arc::strong_count(&chosen),
+            1,
+            "chosen RaftSecretsStore must be a fresh, sole-owner Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_secrets_store_falls_back_when_clustered_but_raft_down() {
+        // wrapped_dek.bin present but Raft failed to come up — degrade
+        // gracefully to the persistent store with a logged warning
+        // rather than refusing every secret op.
+        let dir = TempDir::new().expect("tempdir");
+        let secrets_dir = dir.path();
+        let persistent = make_persistent(secrets_dir).await;
+        let (sk, _pk) = RecipientPrivateKey::generate();
+
+        std::fs::write(wrapped_dek_path(secrets_dir), b"placeholder")
+            .expect("write wrapped_dek.bin");
+        assert!(is_clustered_mode(secrets_dir));
+        let baseline_count = Arc::strong_count(&persistent);
+
+        let node_priv = Arc::new(sk);
+        let chosen = select_secrets_store_inner(
+            secrets_dir,
+            Arc::clone(&persistent),
+            None, // raft unavailable
+            &node_priv,
+            "node-uuid".to_string(),
+        );
+
+        // Same as the standalone case: the persistent Arc count must
+        // grow because `chosen` is another reference to it.
+        let chosen_count = Arc::strong_count(&persistent);
+        assert!(
+            chosen_count > baseline_count,
+            "fallback branch must hand back the persistent Arc \
+             (strong count was {baseline_count}, became {chosen_count})"
+        );
+        drop(chosen);
+        assert_eq!(Arc::strong_count(&persistent), baseline_count);
+    }
+}

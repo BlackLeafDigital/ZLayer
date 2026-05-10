@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tracing::instrument;
 
+use zlayer_types::storage::NodeAffinity;
+
 use crate::{Result, RotationResult, Secret, SecretMetadata, SecretRef, SecretsError};
 
 /// Read-only secrets provider trait.
@@ -178,6 +180,49 @@ pub trait SecretsStore: SecretsProvider {
             new_version,
         })
     }
+
+    /// Store a secret along with an optional [`NodeAffinity`] selector.
+    ///
+    /// Cluster-replicated stores use the affinity to control which nodes
+    /// receive a decryptable copy of the secret. Standalone stores ignore
+    /// `_node_affinity` (single-node deployments have no peers to select
+    /// from); the default impl therefore delegates to [`Self::set_secret`].
+    ///
+    /// Backends that support affinity (currently
+    /// `zlayer_secrets::raft_store::RaftSecretsStore`) override this
+    /// method to actually persist the selector alongside the row.
+    ///
+    /// # Errors
+    ///
+    /// Same error surface as [`Self::set_secret`].
+    async fn set_secret_with_affinity(
+        &self,
+        scope: &str,
+        name: &str,
+        value: &Secret,
+        _node_affinity: Option<&NodeAffinity>,
+    ) -> Result<()> {
+        self.set_secret(scope, name, value).await
+    }
+
+    /// Rotate a secret, optionally updating its [`NodeAffinity`] selector.
+    ///
+    /// `None` for `node_affinity` means "leave the existing selector
+    /// unchanged" (standalone backends ignore the parameter entirely and
+    /// fall through to [`Self::rotate_secret`]).
+    ///
+    /// # Errors
+    ///
+    /// Same error surface as [`Self::rotate_secret`].
+    async fn rotate_secret_with_affinity(
+        &self,
+        scope: &str,
+        name: &str,
+        value: &Secret,
+        _node_affinity: Option<&NodeAffinity>,
+    ) -> Result<RotationResult> {
+        self.rotate_secret(scope, name, value).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +265,30 @@ impl<T: SecretsStore + ?Sized> SecretsStore for std::sync::Arc<T> {
         value: &Secret,
     ) -> Result<RotationResult> {
         (**self).rotate_secret(scope, name, value).await
+    }
+
+    async fn set_secret_with_affinity(
+        &self,
+        scope: &str,
+        name: &str,
+        value: &Secret,
+        node_affinity: Option<&NodeAffinity>,
+    ) -> Result<()> {
+        (**self)
+            .set_secret_with_affinity(scope, name, value, node_affinity)
+            .await
+    }
+
+    async fn rotate_secret_with_affinity(
+        &self,
+        scope: &str,
+        name: &str,
+        value: &Secret,
+        node_affinity: Option<&NodeAffinity>,
+    ) -> Result<RotationResult> {
+        (**self)
+            .rotate_secret_with_affinity(scope, name, value, node_affinity)
+            .await
     }
 }
 
