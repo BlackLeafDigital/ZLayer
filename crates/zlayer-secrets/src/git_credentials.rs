@@ -25,41 +25,18 @@
 //! # }
 //! ```
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{Result, Secret, SecretsError, SecretsStore};
+
+pub use zlayer_types::secrets::git::{GitCredential, GitCredentialKind};
 
 /// Scope used for storing Git credential secrets (PAT / SSH key).
 const GIT_CRED_SCOPE: &str = "git_credentials";
 
 /// Scope used for storing Git credential metadata (JSON).
 const GIT_CRED_META_SCOPE: &str = "git_credentials_meta";
-
-/// Git authentication credential metadata.
-///
-/// The actual PAT or SSH key is stored separately as a [`Secret`] in the
-/// `git_credentials` scope, keyed by [`id`](GitCredential::id).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitCredential {
-    /// Unique identifier (UUID v4).
-    pub id: String,
-    /// Human-readable display label, e.g. `"GitHub PAT for ci"`.
-    pub name: String,
-    /// Whether this credential is a personal access token or an SSH key.
-    pub kind: GitCredentialKind,
-}
-
-/// The kind of Git credential.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GitCredentialKind {
-    /// Personal access token.
-    Pat,
-    /// SSH private key.
-    SshKey,
-}
 
 /// Store for Git authentication credentials.
 ///

@@ -12,7 +12,7 @@ use std::time::Duration;
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use utoipa::ToSchema;
 use zlayer_consensus::network::http_client::HttpNetwork;
 #[cfg(not(feature = "persistent"))]
@@ -20,6 +20,11 @@ use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData}
 #[cfg(feature = "persistent")]
 use zlayer_consensus::storage::redb_store::{RedbLogStore, RedbSmCache, RedbStateMachine};
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
+use zlayer_secrets::cluster_dek::ClusterDek;
+use zlayer_secrets::sealed::{RecipientPrivateKey, RecipientPublicKey};
+use zlayer_secrets::{SecretsError, SecretsState};
+use zlayer_types::api::internal::SecretsRaftOp;
+use zlayer_types::storage::{NodeIdentity, ReplicatedSecret};
 
 use crate::error::{Result, SchedulerError};
 
@@ -103,6 +108,16 @@ pub enum Request {
         service_name: String,
         node_ids: Vec<NodeId>,
     },
+    /// Cluster-replicated secrets operation.
+    ///
+    /// Wraps a [`SecretsRaftOp`] (defined in `zlayer-types`) so the secrets
+    /// state machine in `zlayer-secrets::raft_sm::SecretsState` can be
+    /// driven through the same Raft log as the scheduler's own ops.
+    ///
+    /// This variant is intentionally **appended last** so its postcard2
+    /// discriminant does not shift any of the pre-existing variants — older
+    /// log entries stay decodable bit-for-bit.
+    Secrets(SecretsRaftOp),
 }
 
 /// Raft response types
@@ -181,6 +196,13 @@ pub struct ClusterState {
     pub nodes: HashMap<NodeId, NodeInfo>,
     /// Recent scale events (ring buffer, keep last 100)
     pub scale_events: Vec<ScaleEvent>,
+    /// Cluster-replicated secrets state.
+    ///
+    /// `#[serde(default)]` so snapshots written before this field existed
+    /// (any node still on the pre-secrets `ClusterState` shape) restore
+    /// cleanly with an empty [`SecretsState`].
+    #[serde(default)]
+    pub secrets: SecretsState,
 }
 
 /// Node information
@@ -258,16 +280,11 @@ fn default_node_mode() -> String {
     "full".to_string()
 }
 
-/// Summary of a GPU on a node, stored in Raft cluster state
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-pub struct GpuInfoSummary {
-    /// Vendor: "nvidia", "amd", "intel", or "unknown"
-    pub vendor: String,
-    /// Model name (e.g., "NVIDIA A100-SXM4-80GB")
-    pub model: String,
-    /// VRAM in MB
-    pub memory_mb: u64,
-}
+/// Summary of a GPU on a node, stored in Raft cluster state.
+///
+/// Lifted into [`zlayer_types::api::nodes::GpuInfoSummary`]; re-exported
+/// here for source compatibility with existing call sites.
+pub use zlayer_types::api::nodes::GpuInfoSummary;
 
 /// Per-GPU utilization snapshot reported in node heartbeats
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -438,6 +455,36 @@ impl ClusterState {
                     Response::Error {
                         message: format!("Service not found: {service_name}"),
                     }
+                }
+            }
+            Request::Secrets(op) => self.apply_secrets(op),
+        }
+    }
+
+    /// Apply a [`SecretsRaftOp`] to the inner [`SecretsState`].
+    ///
+    /// Extracted from [`Self::apply`] both to keep that match arm small and
+    /// to give clippy a saner per-function line budget.
+    fn apply_secrets(&mut self, op: &SecretsRaftOp) -> Response {
+        match self.secrets.apply(op.clone()) {
+            Ok(()) => Response::Success { data: None },
+            Err(e) => {
+                // Determinism guard: every replica must reach the same
+                // outcome on the same op. `SecretsState::apply` only
+                // returns an error for "impossible" inputs (revoke
+                // unknown node, delete unknown secret) — log so an
+                // operator can audit, but treat the apply as a no-op
+                // on the SM side and surface the message back to the
+                // caller via `Response::Error`. Followers will produce
+                // the same `Response::Error` for the same log index,
+                // keeping the SM convergent.
+                warn!(
+                    op = ?op,
+                    error = %e,
+                    "SecretsRaftOp apply returned error",
+                );
+                Response::Error {
+                    message: format!("Secrets apply failed: {e}"),
                 }
             }
         }
@@ -630,6 +677,35 @@ pub struct RaftCoordinator {
     /// Configuration (retained for callers that need `raft_port`, etc.)
     #[allow(dead_code)]
     config: RaftConfig,
+    /// Local node X25519 private key for unwrapping cluster DEKs.
+    ///
+    /// Required by leader-side secrets orchestration helpers
+    /// (`propose_register_node_and_rotate`, `propose_rotate_dek`). When
+    /// unset, those helpers return [`SecretsError::Provider`] explaining
+    /// that the node was constructed without secrets capability.
+    ///
+    /// Wrapped in `Arc` so [`RaftCoordinator`] stays cheap to share, and
+    /// because [`RecipientPrivateKey`] is not [`Clone`].
+    node_priv: Option<Arc<RecipientPrivateKey>>,
+    /// Local node UUID — the key under which `WrappedDek::wraps` stores
+    /// this node's wrap. Set alongside `node_priv`.
+    node_uuid: Option<String>,
+}
+
+/// Why a `RotateDek` is being proposed. Drives the recipient set:
+/// `NodeRevoked` excludes the named node; everything else keeps every
+/// active node.
+#[derive(Debug, Clone)]
+pub enum RotateReason {
+    /// A node was revoked and the DEK must be rotated to exclude it.
+    NodeRevoked {
+        /// Cluster-wide UUID of the revoked node.
+        node_id: String,
+    },
+    /// Periodic scheduled rotation (no nodes excluded).
+    Scheduled,
+    /// Operator-initiated rotation (no nodes excluded).
+    Manual,
 }
 
 impl RaftCoordinator {
@@ -640,7 +716,7 @@ impl RaftCoordinator {
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn new(config: RaftConfig) -> Result<Self> {
-        Self::with_auth(config, None).await
+        Self::with_auth_and_secrets(config, None, None, None).await
     }
 
     /// Create a new Raft coordinator with an optional bearer token for RPC auth.
@@ -648,11 +724,38 @@ impl RaftCoordinator {
     /// When `auth_token` is `Some`, the HTTP client will attach it to every
     /// outgoing Raft RPC as an `Authorization: Bearer <token>` header.
     ///
+    /// This constructor leaves the secrets capability disabled. Use
+    /// [`Self::with_auth_and_secrets`] when the daemon also needs to drive
+    /// the cluster secrets state machine.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
+        Self::with_auth_and_secrets(config, auth_token, None, None).await
+    }
+
+    /// Create a new Raft coordinator with optional auth and optional secrets
+    /// capability.
+    ///
+    /// `node_priv` and `node_uuid` enable the leader-side secrets
+    /// orchestration helpers ([`Self::propose_register_node_and_rotate`],
+    /// [`Self::propose_rotate_dek`]). They must either both be `Some` or
+    /// both be `None`; if mismatched, the secrets helpers behave as if
+    /// they were both `None` (returning a "no secrets capability" error
+    /// from each helper).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data directory cannot be created, or if the
+    /// log store, state machine, or consensus node fails to initialize.
+    pub async fn with_auth_and_secrets(
+        config: RaftConfig,
+        auth_token: Option<String>,
+        node_priv: Option<RecipientPrivateKey>,
+        node_uuid: Option<String>,
+    ) -> Result<Self> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
             heartbeat_interval_ms: config.heartbeat_interval_ms,
@@ -707,10 +810,19 @@ impl RaftCoordinator {
 
         info!(node_id = config.node_id, "Created Raft coordinator");
 
+        // Pair the secrets-capability inputs: only enable secrets helpers
+        // when *both* the node private key and the node UUID are present.
+        let (node_priv, node_uuid) = match (node_priv, node_uuid) {
+            (Some(pk), Some(uuid)) => (Some(Arc::new(pk)), Some(uuid)),
+            _ => (None, None),
+        };
+
         Ok(Self {
             node,
             sm_data,
             config,
+            node_priv,
+            node_uuid,
         })
     }
 
@@ -1038,6 +1150,347 @@ impl RaftCoordinator {
         self.config.node_id
     }
 
+    // =========================================================================
+    // Secrets state machine helpers
+    //
+    // These are leader-only orchestration entry points for the Raft-replicated
+    // cluster secrets state machine. Followers should observe the secrets
+    // state via [`Self::secrets_state`] and propose any writes through the
+    // leader (typically by redirecting on the API layer using
+    // [`Self::leader_id`] / [`Self::is_leader`]).
+    //
+    // Note on DEK rotation policy on `RegisterNode`: this helper *re-wraps the
+    // existing DEK* for the new joiner rather than rotating to a fresh DEK on
+    // every join. Re-wrapping is the cheap path (one sealed-box per node) and
+    // does not require re-encrypting any existing `ReplicatedSecret` rows.
+    // Genuine forward-secrecy concerns (e.g. node revocation) go through
+    // [`Self::propose_rotate_dek`] which generates a fresh DEK and walks the
+    // entire secrets table to re-encrypt every entry.
+    // =========================================================================
+
+    /// Read-only snapshot of the cluster secrets state.
+    ///
+    /// Returned by clone, which is fine because [`SecretsState`] is small —
+    /// a few hash maps of identity / wrap / ciphertext bytes. Use this for
+    /// follower-side reads in `RaftSecretsStore` (Task #12).
+    pub async fn secrets_state(&self) -> SecretsState {
+        let sm = self.sm_data.read().await;
+        sm.state.secrets.clone()
+    }
+
+    /// Generic propose helper for an arbitrary [`SecretsRaftOp`].
+    ///
+    /// Used by the upcoming `RaftSecretsStore` (Task #12) for the simpler
+    /// `PutSecret` / `DeleteSecret` paths that don't need DEK orchestration.
+    ///
+    /// # Errors
+    /// - Returns [`SecretsError::Provider`] with a "not leader" message
+    ///   when this node is not the current leader, so the API layer can
+    ///   redirect to the leader's address surfaced via [`Self::leader_id`].
+    /// - Returns [`SecretsError::Provider`] for any other Raft propose
+    ///   failure (commit timeout, log append error, etc.).
+    pub async fn propose_secrets_op(
+        &self,
+        op: SecretsRaftOp,
+    ) -> std::result::Result<(), SecretsError> {
+        if !self.node.is_leader() {
+            return Err(SecretsError::Provider(format!(
+                "not leader; redirect to: {}",
+                self.node
+                    .leader_id()
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string(),),
+            )));
+        }
+        match self.node.propose(Request::Secrets(op)).await {
+            Ok(Response::Success { .. }) => Ok(()),
+            Ok(Response::Error { message }) => Err(SecretsError::Provider(message)),
+            Err(e) => Err(SecretsError::Provider(format!("Raft propose failed: {e}"))),
+        }
+    }
+
+    /// Propose a [`SecretsRaftOp::PutSecret`].
+    ///
+    /// Leader-only. Followers receive a `not leader` error so the API
+    /// layer can redirect.
+    ///
+    /// # Errors
+    /// See [`Self::propose_secrets_op`].
+    pub async fn propose_put_secret(
+        &self,
+        secret: ReplicatedSecret,
+    ) -> std::result::Result<(), SecretsError> {
+        self.propose_secrets_op(SecretsRaftOp::PutSecret { secret })
+            .await
+    }
+
+    /// Propose a [`SecretsRaftOp::DeleteSecret`].
+    ///
+    /// Leader-only. Followers receive a `not leader` error so the API
+    /// layer can redirect.
+    ///
+    /// # Errors
+    /// See [`Self::propose_secrets_op`].
+    pub async fn propose_delete_secret(
+        &self,
+        storage_key: &str,
+    ) -> std::result::Result<(), SecretsError> {
+        self.propose_secrets_op(SecretsRaftOp::DeleteSecret {
+            storage_key: storage_key.to_string(),
+        })
+        .await
+    }
+
+    /// Propose a [`SecretsRaftOp::RegisterNode`] followed by a
+    /// [`SecretsRaftOp::RotateDek`] re-wrap that includes the joining node.
+    ///
+    /// The re-wrap is performed against the *current* DEK when one already
+    /// exists (no actual rotation), or a freshly generated DEK on the
+    /// first registration. Returns the joiner's sealed-box wrap of the
+    /// effective DEK plus the resulting `dek_generation`, which the
+    /// cluster-join HTTP handler echoes back to the joining agent.
+    ///
+    /// # Errors
+    /// - [`SecretsError::Provider`] when this node is not the leader, when
+    ///   secrets capability was not enabled at construction (no
+    ///   `node_priv` / `node_uuid`), when unwrapping the existing DEK
+    ///   fails, or when any subsequent Raft propose fails.
+    /// - [`SecretsError::Encryption`] when sealed-box wrapping fails for
+    ///   any recipient.
+    pub async fn propose_register_node_and_rotate(
+        &self,
+        identity: NodeIdentity,
+    ) -> std::result::Result<(Vec<u8>, u64), SecretsError> {
+        if !self.node.is_leader() {
+            return Err(SecretsError::Provider(format!(
+                "not leader; redirect to: {}",
+                self.node
+                    .leader_id()
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string(),),
+            )));
+        }
+        let leader_priv = self.node_priv.as_ref().ok_or_else(|| {
+            SecretsError::Provider(
+                "RaftCoordinator constructed without secrets capability \
+                 (missing node_priv); cannot orchestrate RegisterNode + RotateDek"
+                    .to_string(),
+            )
+        })?;
+        let leader_uuid = self.node_uuid.as_ref().ok_or_else(|| {
+            SecretsError::Provider(
+                "RaftCoordinator constructed without secrets capability \
+                 (missing node_uuid); cannot orchestrate RegisterNode + RotateDek"
+                    .to_string(),
+            )
+        })?;
+
+        // Snapshot current state. The lock is dropped before any await on
+        // a Raft propose to avoid holding it across the wide network round
+        // trip the apply will trigger.
+        let current = self.secrets_state().await;
+
+        // Determine the effective DEK: re-use the current one when one
+        // already exists, else generate a fresh DEK. Re-wrap (no rotate)
+        // keeps existing `ReplicatedSecret` rows valid under the same
+        // generation.
+        let (dek, base_generation) = match current.wrapped_dek.as_ref() {
+            Some(envelope) => {
+                let leader_wrap = envelope.wraps.get(leader_uuid).ok_or_else(|| {
+                    SecretsError::Provider(format!(
+                        "leader node_uuid {leader_uuid} has no wrap in current DEK \
+                         (generation {}) — cluster cannot register a new node",
+                        envelope.dek_generation
+                    ))
+                })?;
+                let dek = ClusterDek::unwrap(leader_priv, leader_wrap)?;
+                (dek, envelope.dek_generation)
+            }
+            None => (ClusterDek::generate(), 0),
+        };
+
+        // 1) RegisterNode — proposed first so the apply ordering matches
+        //    the natural reading: the recipient set used by the subsequent
+        //    `RotateDek` reflects the post-registration node table.
+        self.propose_secrets_op(SecretsRaftOp::RegisterNode {
+            identity: identity.clone(),
+        })
+        .await?;
+
+        // 2) Build the recipient set (every active node + the joiner).
+        //    The joiner is added explicitly because, depending on apply
+        //    timing on the leader, the in-memory snapshot may still be
+        //    pre-RegisterNode at this exact moment.
+        let mut recipients: HashMap<String, RecipientPublicKey> = HashMap::new();
+        for (node_id, node) in &current.nodes {
+            if node.revoked_at.is_some() {
+                continue;
+            }
+            recipients.insert(
+                node_id.clone(),
+                RecipientPublicKey::from_bytes(node.secrets_pubkey),
+            );
+        }
+        recipients.insert(
+            identity.node_id.clone(),
+            RecipientPublicKey::from_bytes(identity.secrets_pubkey),
+        );
+
+        // 3) RotateDek with the same DEK material at generation
+        //    `base_generation + 1`. Pure re-wrap — existing
+        //    ReplicatedSecrets stay valid because the DEK bytes are
+        //    unchanged (only the per-node sealed-box wraps differ).
+        let new_generation = base_generation.saturating_add(1);
+        let envelope = dek.rewrap_for_set(&recipients, new_generation)?;
+
+        // Pull the joiner's wrap out before moving the envelope into
+        // Raft. Cloned so the subsequent `Secrets(...)` propose can
+        // serialize the full `WrappedDek` unchanged.
+        let joiner_wrap = envelope
+            .wraps
+            .get(&identity.node_id)
+            .cloned()
+            .ok_or_else(|| {
+                SecretsError::Provider(format!(
+                    "internal: rewrap_for_set produced no wrap for joiner {}",
+                    identity.node_id
+                ))
+            })?;
+
+        self.propose_secrets_op(SecretsRaftOp::RotateDek {
+            new_wraps: envelope,
+        })
+        .await?;
+
+        Ok((joiner_wrap, new_generation))
+    }
+
+    /// Propose a [`SecretsRaftOp::RotateDek`] that generates a fresh DEK,
+    /// re-wraps it for every active node (excluding any node named in
+    /// [`RotateReason::NodeRevoked`]), and re-encrypts every existing
+    /// [`ReplicatedSecret`] from the previous generation to the new one
+    /// via a batch of [`SecretsRaftOp::PutSecret`] proposes.
+    ///
+    /// The previous DEK is unwrapped on the leader and held in a local
+    /// variable for the duration of the re-encrypt batch, then dropped
+    /// (zeroized) at the end of the call.
+    ///
+    /// Returns the new DEK generation.
+    ///
+    /// # Errors
+    /// - [`SecretsError::Provider`] when this node is not the leader, when
+    ///   secrets capability is disabled (no `node_priv` / `node_uuid`),
+    ///   when there is no current DEK to rotate from, or when any Raft
+    ///   propose fails.
+    /// - [`SecretsError::Encryption`] / [`SecretsError::Decryption`] when
+    ///   sealed-box (un)wrapping or AEAD (en|de)cryption fails.
+    pub async fn propose_rotate_dek(
+        &self,
+        reason: RotateReason,
+    ) -> std::result::Result<u64, SecretsError> {
+        if !self.node.is_leader() {
+            return Err(SecretsError::Provider(format!(
+                "not leader; redirect to: {}",
+                self.node
+                    .leader_id()
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string(),),
+            )));
+        }
+        let leader_priv = self.node_priv.as_ref().ok_or_else(|| {
+            SecretsError::Provider(
+                "RaftCoordinator constructed without secrets capability \
+                 (missing node_priv); cannot orchestrate RotateDek"
+                    .to_string(),
+            )
+        })?;
+        let leader_uuid = self.node_uuid.as_ref().ok_or_else(|| {
+            SecretsError::Provider(
+                "RaftCoordinator constructed without secrets capability \
+                 (missing node_uuid); cannot orchestrate RotateDek"
+                    .to_string(),
+            )
+        })?;
+
+        // Snapshot the pre-rotation state — both the DEK envelope (for
+        // unwrapping) and the secrets table (for re-encrypt).
+        let current = self.secrets_state().await;
+        let previous_envelope = current.wrapped_dek.as_ref().ok_or_else(|| {
+            SecretsError::Provider(
+                "no current DEK to rotate from; call \
+                 propose_register_node_and_rotate first"
+                    .to_string(),
+            )
+        })?;
+        let previous_dek = {
+            let leader_wrap = previous_envelope.wraps.get(leader_uuid).ok_or_else(|| {
+                SecretsError::Provider(format!(
+                    "leader node_uuid {leader_uuid} has no wrap in current DEK \
+                     (generation {}) — cannot rotate",
+                    previous_envelope.dek_generation
+                ))
+            })?;
+            ClusterDek::unwrap(leader_priv, leader_wrap)?
+        };
+        let previous_generation = previous_envelope.dek_generation;
+
+        // Build the post-rotation recipient set. Any node whose
+        // `revoked_at` is set or that matches `RotateReason::NodeRevoked`
+        // is excluded from the new wraps and from any future re-encrypts.
+        let revoked_id = match &reason {
+            RotateReason::NodeRevoked { node_id } => Some(node_id.as_str()),
+            _ => None,
+        };
+        let mut recipients: HashMap<String, RecipientPublicKey> = HashMap::new();
+        for (node_id, node) in &current.nodes {
+            if node.revoked_at.is_some() {
+                continue;
+            }
+            if Some(node_id.as_str()) == revoked_id {
+                continue;
+            }
+            recipients.insert(
+                node_id.clone(),
+                RecipientPublicKey::from_bytes(node.secrets_pubkey),
+            );
+        }
+
+        // Generate the new DEK and propose the rotation.
+        let new_dek = ClusterDek::generate();
+        let new_generation = previous_generation.saturating_add(1);
+        let new_envelope = new_dek.rewrap_for_set(&recipients, new_generation)?;
+        self.propose_secrets_op(SecretsRaftOp::RotateDek {
+            new_wraps: new_envelope,
+        })
+        .await?;
+
+        // Re-encrypt every secret on the old generation and propose
+        // PutSecret updates one at a time. Followers apply each update
+        // atomically; partial-progress on leader failure is recoverable
+        // because the rows already on the new generation stay valid and
+        // the leftover rows can be picked up by a subsequent rotation.
+        for secret in current.secrets.values() {
+            if secret.dek_generation == new_generation {
+                continue;
+            }
+            // Decrypt under the old DEK, re-encrypt under the new one.
+            let plaintext = previous_dek.decrypt(&secret.ciphertext)?;
+            let new_ciphertext = new_dek.encrypt(plaintext.as_slice())?;
+            let mut updated = secret.clone();
+            updated.ciphertext = new_ciphertext;
+            updated.dek_generation = new_generation;
+            self.propose_secrets_op(SecretsRaftOp::PutSecret { secret: updated })
+                .await?;
+        }
+
+        // `previous_dek` and `new_dek` go out of scope here and are
+        // zeroized by `Drop`.
+        info!(
+            previous_generation,
+            new_generation,
+            reason = ?reason,
+            "Rotated cluster DEK and re-encrypted secrets",
+        );
+        Ok(new_generation)
+    }
+
     /// Shutdown the Raft node
     ///
     /// # Errors
@@ -1065,6 +1518,35 @@ impl RaftCoordinator {
     #[must_use]
     pub fn raft_clone(&self) -> ZLayerRaft {
         self.node.raft_clone()
+    }
+}
+
+// `RaftSecretsHandle` impl: lets `zlayer_secrets::RaftSecretsStore`
+// drive cluster-mode secrets reads/writes through us without
+// `zlayer-secrets` needing to depend on `zlayer-scheduler` (that edge
+// would close a cycle — `zlayer-scheduler -> zlayer-secrets` already
+// exists for crypto + SM types). The trait body is just thin
+// adapters over the existing `secrets_state` / `propose_*` methods.
+#[async_trait::async_trait]
+impl zlayer_secrets::RaftSecretsHandle for RaftCoordinator {
+    async fn secrets_state(&self) -> SecretsState {
+        // Delegate to the inherent method by full path so the trait
+        // method and the inherent method don't shadow each other.
+        Self::secrets_state(self).await
+    }
+
+    async fn propose_put_secret(
+        &self,
+        secret: ReplicatedSecret,
+    ) -> std::result::Result<(), SecretsError> {
+        Self::propose_put_secret(self, secret).await
+    }
+
+    async fn propose_delete_secret(
+        &self,
+        storage_key: &str,
+    ) -> std::result::Result<(), SecretsError> {
+        Self::propose_delete_secret(self, storage_key).await
     }
 }
 
@@ -1388,5 +1870,86 @@ mod tests {
         let learner = MemberRole::Learner;
         assert_eq!(serde_json::to_string(&voter).unwrap(), "\"Voter\"");
         assert_eq!(serde_json::to_string(&learner).unwrap(), "\"Learner\"");
+    }
+
+    // -- Secrets dispatch --------------------------------------------------
+
+    #[test]
+    fn cluster_state_secrets_dispatch_register_node() {
+        // `Request::Secrets(...)` should be applied by the existing
+        // `ClusterState::apply` to the inner `SecretsState`. Verify the
+        // RegisterNode op lands in `state.secrets.nodes` without disturbing
+        // any of the pre-existing scheduler tables.
+        let mut state = ClusterState::new();
+
+        let identity = NodeIdentity {
+            node_id: "node-uuid-a".to_string(),
+            secrets_pubkey: [1u8; 32],
+            wg_pubkey: "wg-pub-a".to_string(),
+            joined_at: chrono::Utc::now(),
+            revoked_at: None,
+        };
+
+        let resp = state.apply(&Request::Secrets(SecretsRaftOp::RegisterNode {
+            identity: identity.clone(),
+        }));
+        assert!(matches!(resp, Response::Success { .. }));
+        assert!(state.secrets.nodes.contains_key("node-uuid-a"));
+        assert!(state.services.is_empty());
+        assert!(state.nodes.is_empty());
+    }
+
+    #[test]
+    fn cluster_state_secrets_dispatch_propagates_inner_error() {
+        // `SecretsState::apply` returns an error for unknown deletes;
+        // the dispatcher should surface that as `Response::Error` so the
+        // proposer can see what happened, while the SM stays converged
+        // (no panics, deterministic outcome on every replica).
+        let mut state = ClusterState::new();
+        let resp = state.apply(&Request::Secrets(SecretsRaftOp::DeleteSecret {
+            storage_key: "dep:nope".to_string(),
+        }));
+        match resp {
+            Response::Error { message } => {
+                assert!(message.contains("nope"), "unexpected message: {message}");
+            }
+            other @ Response::Success { .. } => {
+                panic!("expected Response::Error, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_state_snapshot_backcompat_missing_secrets_field() {
+        // Pre-secrets snapshots have no `secrets` field. The new field
+        // is `#[serde(default)]` so they must deserialize cleanly with
+        // an empty SecretsState.
+        let legacy_json = r#"{
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+        }"#;
+        let restored: ClusterState =
+            serde_json::from_str(legacy_json).expect("legacy snapshot deserializes");
+        assert!(restored.services.is_empty());
+        assert!(restored.nodes.is_empty());
+        assert!(restored.secrets.nodes.is_empty());
+        assert!(restored.secrets.wrapped_dek.is_none());
+        assert!(restored.secrets.secrets.is_empty());
+    }
+
+    #[test]
+    fn rotate_reason_node_revoked_carries_id() {
+        // Sanity check on the `RotateReason::NodeRevoked` payload shape
+        // so future changes don't accidentally drop the `node_id` field
+        // (the leader-side rotation orchestration relies on it to filter
+        // the recipient set).
+        let r = RotateReason::NodeRevoked {
+            node_id: "revoked-uuid".to_string(),
+        };
+        match r {
+            RotateReason::NodeRevoked { node_id } => assert_eq!(node_id, "revoked-uuid"),
+            RotateReason::Scheduled | RotateReason::Manual => panic!("wrong variant"),
+        }
     }
 }

@@ -25,6 +25,15 @@ use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
 use crate::storage::{GroupStorage, PermissionStorage, StoredPermission, SubjectKind};
 
+/// Canonical `resource_kind` values accepted by the permissions API.
+///
+/// `StoredPermission::resource_kind` is a free-form `String` at the storage
+/// layer so future kinds can be added without a schema migration; the handler
+/// is the only place that gates the wire format. Phase 1 of the secrets/RBAC
+/// milestone adds `"secret"` (handler-side authorization for secrets) and
+/// `"node"` (per-node grants for node-affined secrets / cluster operations).
+const KNOWN_RESOURCE_KINDS: &[&str] = &["environment", "deployment", "project", "secret", "node"];
+
 /// State for permission endpoints.
 #[derive(Clone)]
 pub struct PermissionsState {
@@ -150,6 +159,48 @@ pub async fn grant_permission(
         ));
     }
 
+    // Reject unknown resource_kind values. The storage layer is permissive
+    // (free-form String) so the handler is the policy gate.
+    if !KNOWN_RESOURCE_KINDS.contains(&req.resource_kind.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "unknown resource_kind: {} (expected one of: {})",
+            req.resource_kind,
+            KNOWN_RESOURCE_KINDS.join(", "),
+        )));
+    }
+
+    // Light shape validation for resource_id by kind. Wildcards (None) are
+    // always allowed; the only constraint is that, when an id is supplied,
+    // it follows the storage convention for that kind.
+    match req.resource_kind.as_str() {
+        "node" => {
+            if let Some(rid) = &req.resource_id {
+                if uuid::Uuid::parse_str(rid).is_err() {
+                    return Err(ApiError::BadRequest(format!(
+                        "resource_kind=node requires resource_id to be a node UUID; got: {rid}"
+                    )));
+                }
+            }
+        }
+        "secret" => {
+            if let Some(rid) = &req.resource_id {
+                let (scope, name) = rid.split_once(':').ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "resource_kind=secret requires resource_id of form 'scope:name'"
+                            .to_string(),
+                    )
+                })?;
+                if scope.is_empty() || name.is_empty() {
+                    return Err(ApiError::BadRequest(
+                        "resource_kind=secret resource_id parts (scope, name) must be non-empty"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+
     // Verify group exists when granting to a group.
     if req.subject_kind == SubjectKind::Group {
         let group = state
@@ -218,4 +269,144 @@ pub async fn revoke_permission(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{InMemoryGroupStore, InMemoryPermissionStore, PermissionLevel};
+    use axum::Json;
+
+    fn admin_actor() -> AuthActor {
+        AuthActor {
+            user_id: "admin-1".into(),
+            roles: vec!["admin".into()],
+            email: None,
+        }
+    }
+
+    fn state() -> PermissionsState {
+        PermissionsState::new(
+            Arc::new(InMemoryPermissionStore::new()),
+            Arc::new(InMemoryGroupStore::new()),
+        )
+    }
+
+    fn req(kind: &str, id: Option<&str>) -> GrantPermissionRequest {
+        GrantPermissionRequest {
+            subject_kind: SubjectKind::User,
+            subject_id: "u-1".into(),
+            resource_kind: kind.into(),
+            resource_id: id.map(str::to_string),
+            level: PermissionLevel::Read,
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_with_resource_kind_secret_accepted() {
+        let r = grant_permission(
+            admin_actor(),
+            State(state()),
+            Json(req("secret", Some("default:foo"))),
+        )
+        .await
+        .expect("secret grant with valid scope:name should succeed");
+        assert_eq!(r.0, StatusCode::CREATED);
+        assert_eq!(r.1.resource_kind, "secret");
+        assert_eq!(r.1.resource_id.as_deref(), Some("default:foo"));
+    }
+
+    #[tokio::test]
+    async fn grant_with_resource_kind_node_accepted() {
+        let node_id = uuid::Uuid::new_v4().to_string();
+        let r = grant_permission(
+            admin_actor(),
+            State(state()),
+            Json(req("node", Some(&node_id))),
+        )
+        .await
+        .expect("node grant with valid UUID should succeed");
+        assert_eq!(r.0, StatusCode::CREATED);
+        assert_eq!(r.1.resource_kind, "node");
+        assert_eq!(r.1.resource_id.as_deref(), Some(node_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn grant_with_resource_kind_node_wildcard_accepted() {
+        let r = grant_permission(admin_actor(), State(state()), Json(req("node", None)))
+            .await
+            .expect("wildcard node grant should succeed");
+        assert_eq!(r.0, StatusCode::CREATED);
+        assert_eq!(r.1.resource_kind, "node");
+        assert!(r.1.resource_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn grant_with_unknown_resource_kind_rejected() {
+        let err = grant_permission(
+            admin_actor(),
+            State(state()),
+            Json(req("banana", Some("anything"))),
+        )
+        .await
+        .expect_err("unknown resource_kind must be rejected");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("unknown resource_kind") && msg.contains("banana"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_secret_with_malformed_resource_id_rejected() {
+        let err = grant_permission(
+            admin_actor(),
+            State(state()),
+            Json(req("secret", Some("nocolon"))),
+        )
+        .await
+        .expect_err("secret grant without ':' must be rejected");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("scope:name"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Empty halves are also rejected.
+        for bad in ["scope:", ":name", ":"] {
+            let err = grant_permission(
+                admin_actor(),
+                State(state()),
+                Json(req("secret", Some(bad))),
+            )
+            .await
+            .expect_err("secret grant with empty scope or name must be rejected");
+            assert!(
+                matches!(err, ApiError::BadRequest(_)),
+                "expected BadRequest for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_node_with_non_uuid_resource_id_rejected() {
+        let err = grant_permission(
+            admin_actor(),
+            State(state()),
+            Json(req("node", Some("not-a-uuid"))),
+        )
+        .await
+        .expect_err("node grant with non-UUID resource_id must be rejected");
+        match err {
+            ApiError::BadRequest(msg) => assert!(
+                msg.contains("node UUID") && msg.contains("not-a-uuid"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
 }

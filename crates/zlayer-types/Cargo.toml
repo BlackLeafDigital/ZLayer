@@ -21,6 +21,11 @@ thiserror = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 validator = { workspace = true, features = ["derive"] }
+# Lifted from zlayer-secrets so cross-crate consumers (zlayer-api, zlayer-agent,
+# the CLI) can name secrets data shapes without depending on zlayer-secrets.
+secrecy = { workspace = true }
+zeroize = { version = "1.7", features = ["derive"] }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

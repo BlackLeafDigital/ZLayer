@@ -1448,12 +1448,19 @@ pub(crate) async fn serve_with_external_shutdown(
 
     // Add secrets routes — env-aware so secrets handlers can resolve the
     // environment scope from the bundle's persistent environments store.
-    // Wired with the permission store so env-scoped endpoints can enforce
-    // per-env RBAC instead of blanket admin.
-    let secrets_state = zlayer_api::SecretsState::with_rbac(
+    // Wired with the permission store + group store so secrets endpoints
+    // can enforce per-env RBAC, per-secret grants, wildcard grants, and
+    // group-membership grants in one shot via `require_secret_perm`.
+    //
+    // The daemon currently always uses the standalone
+    // `PersistentSecretsStore`; Task #18 will swap to `RaftSecretsStore`
+    // when `--cluster` is on. The `Arc<dyn SecretsStore>` field on
+    // `SecretsState` makes that swap cheap.
+    let secrets_state = zlayer_api::SecretsState::with_full_rbac(
         secrets,
         bundle.environments.clone(),
         bundle.permissions.clone(),
+        bundle.groups.clone(),
     );
     let environments_state = zlayer_api::EnvironmentsState::new(bundle.environments.clone());
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());

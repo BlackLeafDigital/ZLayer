@@ -8,79 +8,21 @@ use axum::{
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::warn;
 
 use crate::error::ApiError;
+use crate::handlers::users::AuthActor;
+use crate::storage::{
+    EnvironmentStorage, GroupStorage, PermissionLevel, PermissionStorage, SubjectKind,
+};
 
-/// JWT claims
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    /// Subject (user ID or API key ID)
-    pub sub: String,
-    /// Expiration time (Unix timestamp)
-    pub exp: u64,
-    /// Issued at (Unix timestamp)
-    pub iat: u64,
-    /// Issuer
-    pub iss: String,
-    /// Roles/permissions
-    #[serde(default)]
-    pub roles: Vec<String>,
-    /// Email address of the user (optional; absent on tokens issued before
-    /// user accounts existed, hence `#[serde(default)]` for back-compat).
-    #[serde(default)]
-    pub email: Option<String>,
-}
-
-impl Claims {
-    /// Create new claims.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the system clock is before the Unix epoch.
-    pub fn new(
-        subject: impl Into<String>,
-        expiry: Duration,
-        roles: Vec<String>,
-        email: Option<String>,
-    ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_secs();
-
-        Self {
-            sub: subject.into(),
-            exp: now + expiry.as_secs(),
-            iat: now,
-            iss: "zlayer".to_string(),
-            roles,
-            email,
-        }
-    }
-
-    /// Check if token is expired.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the system clock is before the Unix epoch.
-    #[must_use]
-    pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_secs();
-        self.exp < now
-    }
-
-    /// Check if the user has a specific role
-    #[must_use]
-    pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|r| r == role || r == "admin")
-    }
-}
+/// JWT claims.
+///
+/// Re-exported from `zlayer-types` so cross-crate consumers can name the
+/// type without depending on `zlayer-api`. Token signing/verification
+/// helpers (below) are still owned by this crate.
+pub use zlayer_types::jwt::Claims;
 
 /// Create a JWT token.
 ///
@@ -456,6 +398,175 @@ pub async fn resolve_registry_auth_async<S: zlayer_secrets::SecretsStore>(
     }
 }
 
+// =========================================================================
+// Cluster-replicated secrets RBAC
+// =========================================================================
+
+/// Parse `"env:{id}"` or `"project:{pid}:env:{id}"` into the env id.
+///
+/// Returns `None` when `scope` does not match either env-shaped form. Used by
+/// [`require_secret_perm`] to decide whether per-env RBAC should be consulted
+/// as a fallback for secret access.
+#[must_use]
+pub fn parse_env_id_from_scope(scope: &str) -> Option<String> {
+    if let Some(rest) = scope.strip_prefix("env:") {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = scope.strip_prefix("project:") {
+        if let Some((_pid, env_part)) = rest.split_once(":env:") {
+            if env_part.is_empty() {
+                return None;
+            }
+            return Some(env_part.to_string());
+        }
+    }
+    None
+}
+
+/// Build the cluster-wide storage key used for a per-secret permission grant.
+///
+/// Mirrors the `{scope}:{name}` shape used by `PersistentSecretsStore` and the
+/// Raft secrets state machine, so a `StoredPermission` whose `resource_id`
+/// equals this string targets exactly one secret row.
+#[must_use]
+pub fn secret_storage_key(scope: &str, name: &str) -> String {
+    format!("{scope}:{name}")
+}
+
+/// Returns `true` when `perms` includes a grant on `("secret", storage_key)`
+/// (or a `("secret", *)` wildcard) at >= `level`.
+fn secret_grants_satisfy(
+    perms: &[crate::storage::StoredPermission],
+    storage_key: &str,
+    level: PermissionLevel,
+) -> bool {
+    perms.iter().any(|p| {
+        p.resource_kind == "secret"
+            && (p.resource_id.is_none() || p.resource_id.as_deref() == Some(storage_key))
+            && p.level >= level
+    })
+}
+
+/// Map a requested per-secret access level to the env-fallback level.
+///
+/// `Read` requires env `Read`; `Execute`/`Write` require env `Write`; `None`
+/// requires nothing. Used inside [`require_secret_perm`] when the secret's
+/// scope is env-shaped (`"env:{id}"` or `"project:{pid}:env:{id}"`).
+fn env_fallback_level(level: PermissionLevel) -> Option<PermissionLevel> {
+    match level {
+        PermissionLevel::None => None,
+        PermissionLevel::Read => Some(PermissionLevel::Read),
+        PermissionLevel::Execute | PermissionLevel::Write => Some(PermissionLevel::Write),
+    }
+}
+
+/// Check whether `actor` is allowed to perform an operation at `level`
+/// against the secret named `name` in `scope`.
+///
+/// Resolution order:
+///
+/// 1. **Admin role** — short-circuits to `Ok(())` regardless of grants.
+/// 2. **Direct or wildcard user grant** on
+///    `(resource_kind: "secret", resource_id: Some("{scope}:{name}"))` or
+///    `(resource_kind: "secret", resource_id: None)` at >= `level`.
+/// 3. **Env-scope fallback** — when `scope` matches the env-scope shape
+///    (`"env:{env_id}"` or `"project:{pid}:env:{env_id}"`) and `env_store` is
+///    `Some`, fall back to per-env RBAC via
+///    [`AuthActor::require_env_access`]. `Read` maps to env `Read`;
+///    `Execute`/`Write` map to env `Write`. The env id is **not** verified
+///    against `env_store` here — `require_env_access` only consults the
+///    permission store; the env-store argument is reserved for future
+///    expansion (e.g. project-scope inheritance) and currently unused.
+/// 4. **Group secret grants** — for every group `actor` belongs to, repeat
+///    the secret-kind direct/wildcard check at the group subject.
+/// 5. **Otherwise** — `Forbidden`.
+///
+/// # Arguments
+///
+/// * `actor` — the authenticated caller.
+/// * `perm_store` — backing permission store; queried for direct, wildcard,
+///   and group grants.
+/// * `group_store` — group store used to expand the actor's group membership
+///   for step 4.
+/// * `env_store` — environment store, only consulted when `scope` is
+///   env-shaped (currently reserved; the env-fallback path uses
+///   `perm_store` directly via [`AuthActor::require_env_access`]). Pass
+///   `None` to disable the env-fallback branch entirely.
+/// * `scope` — the secret's scope namespace.
+/// * `name` — the secret's name within the scope.
+/// * `level` — minimum [`PermissionLevel`] required.
+///
+/// # Errors
+///
+/// - [`ApiError::Forbidden`] when no rule grants access.
+/// - [`ApiError::Internal`] when the permission or group store call fails.
+pub async fn require_secret_perm(
+    actor: &AuthActor,
+    perm_store: &(dyn PermissionStorage + 'static),
+    group_store: &(dyn GroupStorage + 'static),
+    env_store: Option<&(dyn EnvironmentStorage + 'static)>,
+    scope: &str,
+    name: &str,
+    level: PermissionLevel,
+) -> Result<(), ApiError> {
+    // 1. Admin shortcut.
+    if actor.has_role("admin") {
+        return Ok(());
+    }
+
+    let storage_key = secret_storage_key(scope, name);
+
+    // 2. Direct + wildcard secret-kind grants for the user.
+    let user_perms = perm_store
+        .list_for_subject(SubjectKind::User, &actor.user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Permission store: {e}")))?;
+    if secret_grants_satisfy(&user_perms, &storage_key, level) {
+        return Ok(());
+    }
+
+    // 3. Env-scope fallback.
+    if env_store.is_some() {
+        if let Some(env_id) = parse_env_id_from_scope(scope) {
+            return match env_fallback_level(level) {
+                None => Ok(()),
+                Some(env_level) => actor
+                    .require_env_access(perm_store, &env_id, env_level)
+                    .await
+                    .map_err(|e| match e {
+                        ApiError::Forbidden(_) => ApiError::Forbidden(format!(
+                            "user lacks {level} on secret {storage_key}"
+                        )),
+                        other => other,
+                    }),
+            };
+        }
+    }
+
+    // 4. Group-membership secret grants.
+    let group_ids = group_store
+        .list_groups_for_user(&actor.user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Group store: {e}")))?;
+    for group_id in group_ids {
+        let group_perms = perm_store
+            .list_for_subject(SubjectKind::Group, &group_id)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Permission store: {e}")))?;
+        if secret_grants_satisfy(&group_perms, &storage_key, level) {
+            return Ok(());
+        }
+    }
+
+    // 5. Denied.
+    Err(ApiError::Forbidden(format!(
+        "user lacks {level} on secret {storage_key}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +600,7 @@ mod tests {
             iss: "zlayer".to_string(),
             roles: vec![],
             email: None,
+            node_id: None,
         };
 
         assert!(claims.is_expired());
@@ -503,6 +615,7 @@ mod tests {
             iss: "zlayer".to_string(),
             roles: vec!["admin".to_string()],
             email: None,
+            node_id: None,
         };
 
         // Admin should have access to any role
@@ -678,5 +791,376 @@ mod tests {
         )
         .await;
         assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
+    }
+
+    // =====================================================================
+    // require_secret_perm
+    // =====================================================================
+
+    use crate::storage::{
+        InMemoryEnvironmentStore, InMemoryGroupStore, InMemoryPermissionStore, StoredPermission,
+        StoredUserGroup,
+    };
+
+    fn user_actor(id: &str) -> AuthActor {
+        AuthActor {
+            user_id: id.to_string(),
+            roles: vec!["user".to_string()],
+            email: None,
+        }
+    }
+
+    fn admin_actor(id: &str) -> AuthActor {
+        AuthActor {
+            user_id: id.to_string(),
+            roles: vec!["admin".to_string()],
+            email: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_env_id_from_scope_shapes() {
+        assert_eq!(parse_env_id_from_scope("env:abc"), Some("abc".to_string()));
+        assert_eq!(
+            parse_env_id_from_scope("project:p1:env:xyz"),
+            Some("xyz".to_string())
+        );
+        assert_eq!(parse_env_id_from_scope("default"), None);
+        assert_eq!(parse_env_id_from_scope("env:"), None);
+        assert_eq!(parse_env_id_from_scope("project:p1:env:"), None);
+    }
+
+    #[test]
+    fn test_secret_storage_key_shape() {
+        assert_eq!(secret_storage_key("default", "foo"), "default:foo");
+        assert_eq!(
+            secret_storage_key("project:p1:env:xyz", "API_KEY"),
+            "project:p1:env:xyz:API_KEY"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_short_circuits() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let envs = InMemoryEnvironmentStore::new();
+        let actor = admin_actor("admin-1");
+
+        // Admin succeeds even with no grants and a non-env scope.
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            Some(&envs),
+            "default",
+            "anything",
+            PermissionLevel::Write,
+        )
+        .await
+        .expect("admin should always be allowed");
+
+        // Same with env_store=None.
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "env:abc",
+            "API_KEY",
+            PermissionLevel::Write,
+        )
+        .await
+        .expect("admin should always be allowed (no env store)");
+    }
+
+    #[tokio::test]
+    async fn direct_grant_user_read() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let actor = user_actor("u1");
+
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "secret",
+            Some("default:foo".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &grant)
+            .await
+            .unwrap();
+
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "default",
+            "foo",
+            PermissionLevel::Read,
+        )
+        .await
+        .expect("direct user Read grant should allow Read");
+    }
+
+    #[tokio::test]
+    async fn direct_grant_user_insufficient_level() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let actor = user_actor("u1");
+
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "secret",
+            Some("default:foo".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &grant)
+            .await
+            .unwrap();
+
+        let err = require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "default",
+            "foo",
+            PermissionLevel::Write,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "Read grant should not satisfy Write request, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_grant_user_write() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let actor = user_actor("u1");
+
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "secret",
+            None,
+            PermissionLevel::Write,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &grant)
+            .await
+            .unwrap();
+
+        // Any scope, any name should pass at Write or below.
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "default",
+            "foo",
+            PermissionLevel::Write,
+        )
+        .await
+        .expect("wildcard Write should allow Write on default:foo");
+
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "anything-else",
+            "bar",
+            PermissionLevel::Read,
+        )
+        .await
+        .expect("wildcard Write should allow Read on any other scope");
+    }
+
+    #[tokio::test]
+    async fn group_membership_grant() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let actor = user_actor("u1");
+
+        // Create group g1 and add u1 to it.
+        let g1 = StoredUserGroup::new("g1");
+        let g1_id = g1.id.clone();
+        groups.store(&g1).await.unwrap();
+        groups.add_member(&g1_id, "u1").await.unwrap();
+
+        // Grant the GROUP a Read on default:foo.
+        let grant = StoredPermission::new(
+            SubjectKind::Group,
+            &g1_id,
+            "secret",
+            Some("default:foo".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &grant)
+            .await
+            .unwrap();
+
+        // u1 should be allowed via group membership; no env-fallback because
+        // scope `default` is not env-shaped.
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "default",
+            "foo",
+            PermissionLevel::Read,
+        )
+        .await
+        .expect("group membership Read grant should allow Read");
+
+        // But Write should still be denied (group only has Read).
+        let err = require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "default",
+            "foo",
+            PermissionLevel::Write,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "group Read grant should not cover Write, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_scope_fallback_read() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let envs = InMemoryEnvironmentStore::new();
+        let actor = user_actor("u1");
+
+        // Grant u1 environment Read on env "abc"; NO secret-kind grants.
+        let env_grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "environment",
+            Some("abc".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &env_grant)
+            .await
+            .unwrap();
+
+        // env-shaped scope should fall back to per-env RBAC.
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            Some(&envs),
+            "env:abc",
+            "API_KEY",
+            PermissionLevel::Read,
+        )
+        .await
+        .expect("env Read should permit secret Read on env-shaped scope");
+
+        // Without env_store, the fallback is disabled — should now deny.
+        let err = require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            None,
+            "env:abc",
+            "API_KEY",
+            PermissionLevel::Read,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn env_scope_fallback_project() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let envs = InMemoryEnvironmentStore::new();
+        let actor = user_actor("u1");
+
+        let env_grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "environment",
+            Some("abc".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&perms, &env_grant)
+            .await
+            .unwrap();
+
+        // project:p1:env:abc should be parsed to env id "abc".
+        require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            Some(&envs),
+            "project:p1:env:abc",
+            "DB_URL",
+            PermissionLevel::Read,
+        )
+        .await
+        .expect("project-scoped env Read should permit secret Read");
+
+        // Read-level env grant should NOT satisfy a Write request — env
+        // fallback maps Write to env Write.
+        let err = require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            Some(&envs),
+            "project:p1:env:abc",
+            "DB_URL",
+            PermissionLevel::Write,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "env Read should not satisfy secret Write, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_grants_denied() {
+        let perms = InMemoryPermissionStore::new();
+        let groups = InMemoryGroupStore::new();
+        let envs = InMemoryEnvironmentStore::new();
+        let actor = user_actor("nobody");
+
+        let err = require_secret_perm(
+            &actor,
+            &perms,
+            &groups,
+            Some(&envs),
+            "default",
+            "foo",
+            PermissionLevel::Read,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            ApiError::Forbidden(msg) => {
+                assert!(
+                    msg.contains("default:foo"),
+                    "denial message should reference storage key, got: {msg}"
+                );
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
     }
 }

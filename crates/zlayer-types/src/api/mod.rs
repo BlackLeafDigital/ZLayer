@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod build;
+pub mod cluster;
 pub mod container_networks;
 pub mod containers;
 pub mod credentials;

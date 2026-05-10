@@ -936,6 +936,13 @@ impl std::fmt::Display for PermissionLevel {
 
 /// A stored permission grant binding a subject (user or group) to a resource
 /// with a specific access level.
+///
+/// Canonical `resource_kind` strings (kept here for grep-ability):
+/// - `"environment"` — a `StoredEnvironment` row.
+/// - `"deployment"` — a `StoredDeployment` row.
+/// - `"project"` — a `StoredProject` row.
+/// - `"secret"` — a row in the secrets store (`{scope}:{name}` keyed).
+/// - `"node"` — a cluster member identified by `NodeIdentity::node_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StoredPermission {
     /// UUID identifier of this permission grant.
@@ -1043,3 +1050,111 @@ impl OidcIdentity {
 // `details` field to a string), `AuditEntry` can move alongside the other
 // `Stored*` types — it lives in `zlayer-api::storage` for now.
 // =========================================================================
+
+// =========================================================================
+// Cluster-replicated secrets (Phase 1 — Raft + sealed-box DEK wrap)
+// =========================================================================
+
+/// Per-node identity and key material.
+///
+/// Each node generates an X25519 keypair on first start and publishes the
+/// pubkey via `RegisterNode` during cluster join. Lives in Raft state so
+/// every node knows the recipient set when wrapping the cluster DEK.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeIdentity {
+    /// Cluster-wide UUID for this node (matches Raft's view of the node).
+    pub node_id: String,
+
+    /// 32-byte X25519 pubkey used as the sealed-box recipient when the
+    /// leader wraps the cluster DEK to this node.
+    #[schema(value_type = String, format = "byte")]
+    pub secrets_pubkey: [u8; 32],
+
+    /// `WireGuard` pubkey, kept here for reference — overlay/tunnelling
+    /// already track this elsewhere; duplicating it in `NodeIdentity` lets
+    /// callers correlate sealed-box identity with overlay identity without
+    /// a second lookup.
+    pub wg_pubkey: String,
+
+    /// When this node was registered with the cluster.
+    #[schema(value_type = String, example = "2026-04-15T12:00:00Z")]
+    pub joined_at: DateTime<Utc>,
+
+    /// Soft-revocation timestamp. When set, the node no longer receives
+    /// new wraps and must be excluded from `RotateDek` after a quorum
+    /// confirms it has been physically removed.
+    #[schema(value_type = Option<String>, example = "2026-04-16T12:00:00Z")]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// The cluster data-encryption key (DEK), wrapped per-node so each member
+/// can decrypt without ever holding a shared cluster-wide private key.
+///
+/// The DEK itself is never stored anywhere; only the per-node sealed-box
+/// wraps live in Raft. A node decrypts its own wrap on startup using its
+/// node X25519 private key, and holds the unwrapped DEK in zeroized memory.
+///
+/// Generation increments on every rotation (e.g. node revocation, scheduled
+/// rotation, suspected compromise). Every `ReplicatedSecret` records the
+/// `dek_generation` it was encrypted under so re-encrypts can be batched.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct WrappedDek {
+    /// Monotonically increasing generation counter.
+    pub dek_generation: u64,
+
+    /// Map from `node_id` to that node's sealed-box-wrapped copy of the DEK.
+    /// A node missing from this map cannot decrypt any secret encrypted
+    /// under this generation and must be re-wrapped via `RegisterNode` (or
+    /// through a `RotateDek` that includes it).
+    pub wraps: std::collections::HashMap<String, Vec<u8>>,
+}
+
+/// A secret replicated through Raft. Every node has the same encrypted
+/// blob; only nodes whose `secrets_pubkey` is in the current `WrappedDek`
+/// for this generation can decrypt.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ReplicatedSecret {
+    /// `"{scope}:{name}"` — same key shape used by `PersistentSecretsStore`.
+    pub storage_key: String,
+
+    /// XChaCha20-Poly1305 ciphertext of the plaintext value, encrypted
+    /// under the cluster DEK at `dek_generation`. Nonce is prepended.
+    pub ciphertext: Vec<u8>,
+
+    /// Which DEK generation produced `ciphertext`. After a rotation, the
+    /// state machine batches re-encrypts of every row whose `dek_generation`
+    /// is older than current.
+    pub dek_generation: u64,
+
+    /// Standard secret metadata (name, version, timestamps).
+    #[schema(value_type = Object)]
+    pub metadata: crate::secrets::SecretMetadata,
+
+    /// Optional per-secret affinity. `None` = any node may host (the
+    /// default). When set, only matching nodes are entitled to a wrap of
+    /// this row's DEK material; the API gate also filters reads accordingly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_affinity: Option<NodeAffinity>,
+}
+
+/// Constrains which nodes are allowed to host a given secret's
+/// decryptable form. Used as the value of `ReplicatedSecret.node_affinity`.
+/// `None` on a secret = unconstrained (any node may host); `Some(...)`
+/// = only matching nodes receive a wrap of this row's DEK material,
+/// and the API gate filters reads accordingly.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeAffinity {
+    /// Explicit allow-list of `node_id`s.
+    Nodes {
+        /// The set of `node_id`s entitled to host this secret.
+        node_ids: Vec<String>,
+    },
+
+    /// Match by node labels — every entry in the map must be present on
+    /// the node. Empty map matches every node.
+    Labels {
+        /// Required label key/value pairs.
+        labels: std::collections::HashMap<String, String>,
+    },
+}

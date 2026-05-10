@@ -14,11 +14,14 @@
 //!   [`EnvScopeProvider`] wired via [`SecretsResolver::with_env_resolver`])
 //! - `$secret://<env>/<KEY>/<field>` - With JSON field extraction
 
+pub mod cluster_dek;
 mod encryption;
 mod error;
 mod jwt;
 mod key_manager;
 mod provider;
+pub mod raft_sm;
+pub mod raft_store;
 pub mod sealed;
 mod types;
 
@@ -40,11 +43,14 @@ pub mod git_credentials;
 #[cfg(feature = "vault")]
 mod vault;
 
+pub use cluster_dek::ClusterDek;
 pub use encryption::EncryptionKey;
 pub use error::{Result, SecretsError};
 pub use jwt::{JwtSecretManager, ENV_JWT_SECRET};
-pub use key_manager::KeyManager;
+pub use key_manager::{load_or_generate_node_keypair, node_secrets_key_path, KeyManager};
 pub use provider::{EnvScopeProvider, SecretsProvider, SecretsResolver, SecretsStore};
+pub use raft_sm::SecretsState;
+pub use raft_store::{RaftSecretsHandle, RaftSecretsStore};
 pub use sealed::{RecipientPrivateKey, RecipientPublicKey, SealedError, SealedSecret};
 pub use types::{RotationResult, Secret, SecretMetadata, SecretRef, SecretScope};
 

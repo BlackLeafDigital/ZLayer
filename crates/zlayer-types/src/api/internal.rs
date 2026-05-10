@@ -62,3 +62,50 @@ pub struct InternalAddPeerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// Op type for the secrets Raft state machine.
+///
+/// Replicated through openraft alongside the existing scheduler ops.
+/// `zlayer-consensus` carries the bytes; `zlayer-secrets`'s `raft_sm.rs`
+/// applies them. The variants intentionally mirror the structure of
+/// [`crate::storage::NodeIdentity`], [`crate::storage::WrappedDek`], and
+/// [`crate::storage::ReplicatedSecret`] so the wire shape is identical to
+/// the stored shape.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SecretsRaftOp {
+    /// Register a new node. Triggers an automatic re-wrap of the current
+    /// DEK so the new node can decrypt secrets going forward.
+    RegisterNode {
+        /// Identity payload (uuid, X25519 pubkey, WG pubkey, `joined_at`).
+        identity: crate::storage::NodeIdentity,
+    },
+
+    /// Soft-revoke a node. Followers stop including it in DEK wraps; the
+    /// next `RotateDek` excludes it permanently.
+    RevokeNode {
+        /// Cluster-wide node UUID being revoked.
+        node_id: String,
+    },
+
+    /// Rotate the cluster DEK. The leader proposes a new generation with
+    /// fresh per-node wraps; followers re-encrypt every `ReplicatedSecret`
+    /// from the previous generation to the new one.
+    RotateDek {
+        /// New wrapped-DEK envelope (generation + per-node wraps).
+        new_wraps: crate::storage::WrappedDek,
+    },
+
+    /// Insert or update a secret. The ciphertext is encrypted under the
+    /// `dek_generation` recorded inside the payload.
+    PutSecret {
+        /// The full replicated secret record.
+        secret: crate::storage::ReplicatedSecret,
+    },
+
+    /// Remove a secret entirely. Hard delete — re-encryption skips it.
+    DeleteSecret {
+        /// `"{scope}:{name}"` storage key, same shape as elsewhere.
+        storage_key: String,
+    },
+}

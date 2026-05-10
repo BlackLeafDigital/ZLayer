@@ -19,7 +19,149 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 use tracing::{debug, info};
 
+use crate::sealed::{RecipientPrivateKey, RecipientPublicKey};
 use crate::{EncryptionKey, Result, SecretsError};
+
+/// File name used for the on-disk node X25519 keypair (raw 32-byte private key).
+const NODE_SECRETS_KEY_FILE: &str = "node_secrets.key";
+
+/// Path of the on-disk node X25519 keypair (raw 32-byte private key bytes,
+/// Unix mode 0600).
+#[must_use]
+pub fn node_secrets_key_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(NODE_SECRETS_KEY_FILE)
+}
+
+/// Load the existing node keypair from `{base_dir}/node_secrets.key`, or
+/// generate a new one and persist it (Unix mode 0600) if the file does
+/// not exist yet.
+///
+/// Returns `(private, public)`. The private key is held in [`RecipientPrivateKey`]
+/// which zeroes itself on drop.
+///
+/// # Errors
+/// - [`SecretsError::Storage`] if the directory cannot be created, the file
+///   cannot be read/written, or the on-disk content is the wrong length
+///   (must be exactly 32 bytes).
+/// - [`SecretsError::Storage`] if file permissions cannot be set on Unix.
+pub fn load_or_generate_node_keypair(
+    base_dir: &Path,
+) -> std::result::Result<(RecipientPrivateKey, RecipientPublicKey), SecretsError> {
+    // 1. Ensure base_dir exists (mkdir -p semantics).
+    fs::create_dir_all(base_dir).map_err(|e| {
+        SecretsError::Storage(format!(
+            "Failed to create node key directory {}: {e}",
+            base_dir.display()
+        ))
+    })?;
+
+    let path = node_secrets_key_path(base_dir);
+
+    // 2. If the file exists, load it.
+    if path.exists() {
+        debug!("Loading node X25519 keypair from {}", path.display());
+        let buf = fs::read(&path).map_err(|e| {
+            SecretsError::Storage(format!(
+                "Failed to read node key file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        if buf.len() != 32 {
+            return Err(SecretsError::Storage(format!(
+                "node_secrets.key has wrong length: expected 32, got {}",
+                buf.len()
+            )));
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&buf);
+        let private = RecipientPrivateKey::from_bytes(bytes);
+        let public = private.public_key();
+        return Ok((private, public));
+    }
+
+    // 3. Otherwise, generate a fresh keypair and persist it.
+    info!("Generating new node X25519 keypair at {}", path.display());
+    let (private, public) = RecipientPrivateKey::generate();
+
+    write_node_key_file(&path, &private)?;
+
+    Ok((private, public))
+}
+
+/// Persist the raw 32-byte private key to `path`, setting Unix mode 0600
+/// before any data is written so the key is never world-readable on disk.
+fn write_node_key_file(
+    path: &Path,
+    private: &RecipientPrivateKey,
+) -> std::result::Result<(), SecretsError> {
+    // RecipientPrivateKey holds raw 32 bytes internally but does not expose
+    // a direct byte accessor (intentional: the type is zeroize-on-drop and
+    // we want any disclosure to be explicit). Round-trip through its
+    // `to_base64` representation to recover the raw bytes for on-disk storage.
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    let raw = B64
+        .decode(private.to_base64())
+        .map_err(|e| SecretsError::Storage(format!("Failed to encode node private key: {e}")))?;
+    debug_assert_eq!(raw.len(), 32);
+
+    // On Unix, create the file with mode 0600 from the start so the key
+    // bytes are never written under a more permissive mode.
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                SecretsError::Storage(format!(
+                    "Failed to create node key file {}: {e}",
+                    path.display()
+                ))
+            })?;
+
+        file.write_all(&raw).map_err(|e| {
+            SecretsError::Storage(format!(
+                "Failed to write node key file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        // Belt-and-suspenders: explicitly set perms in case the umask or
+        // a pre-existing file overrode the open mode.
+        let permissions = fs::Permissions::from_mode(0o600);
+        if let Err(e) = fs::set_permissions(path, permissions) {
+            warn!(
+                "Failed to set permissions on node key file {}: {e}",
+                path.display()
+            );
+            return Err(SecretsError::Storage(format!(
+                "Failed to set permissions on node key file {}: {e}",
+                path.display()
+            )));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, &raw).map_err(|e| {
+            SecretsError::Storage(format!(
+                "Failed to write node key file {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+
+    Ok(())
+}
 
 /// Environment variable name for hex-encoded encryption key.
 const ENV_KEY: &str = "ZLAYER_SECRETS_KEY";
@@ -414,5 +556,72 @@ mod tests {
 
         // Should be 0600 (owner read/write only)
         assert_eq!(permissions.mode() & 0o777, 0o600);
+    }
+
+    // -------------------------------------------------------------------
+    // Node X25519 keypair persistence tests.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn node_keypair_round_trip_generate_then_load() {
+        let temp = TempDir::new().unwrap();
+
+        let (_priv1, pub1) = load_or_generate_node_keypair(temp.path()).unwrap();
+        let (_priv2, pub2) = load_or_generate_node_keypair(temp.path()).unwrap();
+
+        // Second call must load the same key from disk, not generate a new one.
+        assert_eq!(pub1, pub2);
+
+        // And the file must exist at the documented path.
+        assert!(node_secrets_key_path(temp.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_keypair_perms_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let _ = load_or_generate_node_keypair(temp.path()).unwrap();
+
+        let path = node_secrets_key_path(temp.path());
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "expected mode 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn node_keypair_rejects_wrong_length() {
+        let temp = TempDir::new().unwrap();
+        let path = node_secrets_key_path(temp.path());
+
+        // Pre-create a 16-byte file at the keypair path.
+        fs::create_dir_all(temp.path()).unwrap();
+        fs::write(&path, [0u8; 16]).unwrap();
+
+        // `RecipientPrivateKey` does not implement `Debug` (intentional —
+        // see `sealed.rs`), so we can't `.unwrap_err()` on the tuple result.
+        // Match it manually instead.
+        let result = load_or_generate_node_keypair(temp.path());
+        match result {
+            Ok(_) => panic!("expected SecretsError::Storage, got Ok(_)"),
+            Err(SecretsError::Storage(msg)) => {
+                assert!(
+                    msg.contains("length") || msg.contains("expected 32"),
+                    "expected length error message, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected SecretsError::Storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_keypair_pubkey_matches_private() {
+        let temp = TempDir::new().unwrap();
+        let (private, public) = load_or_generate_node_keypair(temp.path()).unwrap();
+
+        // Re-derive the public key from the private key and confirm it
+        // matches the public key returned by `load_or_generate_node_keypair`.
+        let derived = private.public_key();
+        assert_eq!(derived, public);
     }
 }

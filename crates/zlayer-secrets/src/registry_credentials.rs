@@ -25,43 +25,18 @@
 //! # }
 //! ```
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{Result, Secret, SecretsError, SecretsStore};
+
+pub use zlayer_types::secrets::registry::{RegistryAuthType, RegistryCredential};
 
 /// Scope used for storing registry password/token secrets.
 const REGISTRY_CRED_SCOPE: &str = "registry_credentials";
 
 /// Scope used for storing registry credential metadata (JSON).
 const REGISTRY_CRED_META_SCOPE: &str = "registry_credentials_meta";
-
-/// Docker/OCI registry credential metadata.
-///
-/// The actual password/token is stored separately as a [`Secret`] in the
-/// `registry_credentials` scope, keyed by [`id`](RegistryCredential::id).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryCredential {
-    /// Unique identifier (UUID v4).
-    pub id: String,
-    /// Registry hostname, e.g. `"docker.io"`, `"ghcr.io"`.
-    pub registry: String,
-    /// Username for authentication.
-    pub username: String,
-    /// Whether this credential uses basic auth or a bearer token.
-    pub auth_type: RegistryAuthType,
-}
-
-/// Authentication method for a registry credential.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RegistryAuthType {
-    /// HTTP Basic authentication (username + password).
-    Basic,
-    /// Bearer token authentication.
-    Token,
-}
 
 /// Store for Docker/OCI registry credentials.
 ///

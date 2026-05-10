@@ -4,6 +4,23 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Summary of a GPU on a node, stored in Raft cluster state and reported
+/// via cluster join requests.
+///
+/// Lifted from `zlayer-scheduler::raft` so that wire-types consumers
+/// (zlayer-api DTOs, the CLI, the manager UI) can describe GPU inventory
+/// without depending on the heavier scheduler crate. `zlayer-scheduler`
+/// re-exports this type for source compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct GpuInfoSummary {
+    /// Vendor: "nvidia", "amd", "intel", or "unknown"
+    pub vendor: String,
+    /// Model name (e.g., "NVIDIA A100-SXM4-80GB")
+    pub model: String,
+    /// VRAM in MB
+    pub memory_mb: u64,
+}
+
 /// Node summary for list operations
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NodeSummary {

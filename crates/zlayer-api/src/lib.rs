@@ -36,8 +36,8 @@ pub mod server;
 pub mod storage;
 
 pub use auth::{
-    create_token, resolve_registry_auth_async, verify_token, AuthState, AuthUser, Claims,
-    OptionalAuthUser,
+    create_token, parse_env_id_from_scope, require_secret_perm, resolve_registry_auth_async,
+    secret_storage_key, verify_token, AuthState, AuthUser, Claims, OptionalAuthUser,
 };
 pub use config::ApiConfig;
 pub use error::{ApiError, Result};

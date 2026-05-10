@@ -12071,6 +12071,7 @@ name = "zlayer"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -12697,6 +12698,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "metrics",
  "num_cpus",
  "openraft",
@@ -12716,7 +12718,9 @@ dependencies = [
  "zlayer-consensus",
  "zlayer-core",
  "zlayer-paths",
+ "zlayer-secrets",
  "zlayer-spec",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12744,7 +12748,9 @@ dependencies = [
  "uuid",
  "vaultrs",
  "zeroize",
+ "zlayer-api",
  "zlayer-paths",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12814,11 +12820,13 @@ dependencies = [
 name = "zlayer-types"
 version = "0.0.0-dev"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "cron",
  "humantime",
  "oci-client",
  "regex",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -12826,6 +12834,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "validator",
+ "zeroize",
 ]
 
 [[package]]
