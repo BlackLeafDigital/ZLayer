@@ -208,6 +208,9 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             crate::privilege::ensure_root_or_reexec("reset daemon state")?;
         }
         DaemonAction::Status | DaemonAction::ResumeFromSnapshot { .. } => {}
+        DaemonAction::Migrate { .. } => {
+            crate::privilege::ensure_root_or_reexec("migrate data directory layout")?;
+        }
     }
 
     match action {
@@ -248,7 +251,65 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             print_restore_summary(&outcome);
             Ok(())
         }
+        DaemonAction::Migrate {
+            data_dir: cli_data_dir,
+            dry_run,
+        } => {
+            // Resolve the effective data dir: explicit --data-dir wins, else
+            // use the top-level data_dir we were called with.
+            let effective: &Path = cli_data_dir.as_deref().unwrap_or(data_dir);
+            run_migrate(effective, *dry_run)
+        }
     }
+}
+
+/// Implementation of `zlayer daemon migrate`. Extracted from `handle_daemon`
+/// to keep that dispatcher short enough for clippy's `too_many_lines` budget,
+/// since the dry-run branch has several distinct outcomes worth reporting.
+fn run_migrate(effective: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        // Read-only inspection: report what we WOULD change without
+        // touching disk.
+        let secrets_path = effective.join("secrets");
+        match std::fs::symlink_metadata(&secrets_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "No migrations needed (no data directory at {}).",
+                    secrets_path.display()
+                );
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to stat {}: {e}", secrets_path.display());
+            }
+            Ok(meta) if meta.is_dir() => {
+                println!("No migrations needed (already migrated).");
+            }
+            Ok(meta) if meta.is_file() => {
+                println!(
+                    "Would migrate legacy secrets file {} -> {}/secrets.sqlite",
+                    secrets_path.display(),
+                    secrets_path.display()
+                );
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "{} is not a regular file or directory; refusing to plan migration",
+                    secrets_path.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+    let report = crate::migrations::migrate_data_dir(effective)
+        .context("Failed to migrate on-disk data directory layout")?;
+    if report.changed() {
+        for step in &report.steps {
+            println!("✓ {step}");
+        }
+    } else {
+        println!("No migrations needed.");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +793,16 @@ async fn install(
     tunnel: TunnelInstallArgs<'_>,
 ) -> Result<()> {
     use tokio::process::Command;
+
+    // Run on-disk layout migrations first so the rest of the install operates
+    // on the current expected layout. Idempotent. Use `println!` rather than
+    // `tracing::info!` because this is invoked interactively from
+    // `sudo zlayer daemon install` and the user expects to see progress.
+    let report = crate::migrations::migrate_data_dir(data_dir)
+        .context("Failed to migrate on-disk data directory layout")?;
+    for step in &report.steps {
+        println!("Migration: {step}");
+    }
 
     // Capture the running deployment topology *before* we tear the daemon
     // down. This is best-effort — if no daemon is running, nothing to do.
@@ -1614,6 +1685,16 @@ async fn install(
     use std::fmt::Write as _;
     use tokio::process::Command;
 
+    // Run on-disk layout migrations first so the rest of the install operates
+    // on the current expected layout. Idempotent. Use `println!` rather than
+    // `tracing::info!` because this is invoked interactively from
+    // `sudo zlayer daemon install` and the user expects to see progress.
+    let report = crate::migrations::migrate_data_dir(data_dir)
+        .context("Failed to migrate on-disk data directory layout")?;
+    for step in &report.steps {
+        println!("Migration: {step}");
+    }
+
     // Capture the running deployment topology *before* we tear the daemon
     // down. If no daemon is running (`try_connect` returns Ok(None)), this
     // is a no-op. Snapshot failures never block the install.
@@ -1757,6 +1838,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=60
 Restart=always
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zlayer
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
@@ -2254,6 +2338,16 @@ async fn install(
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+    // Run on-disk layout migrations first so the rest of the install operates
+    // on the current expected layout. Idempotent. Use `println!` rather than
+    // `tracing::info!` because this is invoked interactively from an elevated
+    // PowerShell prompt and the operator expects to see progress.
+    let report = crate::migrations::migrate_data_dir(data_dir)
+        .context("Failed to migrate on-disk data directory layout")?;
+    for step in &report.steps {
+        println!("Migration: {step}");
+    }
+
     // Capture the running deployment topology *before* we tear the daemon
     // down. If no daemon is running, this is a no-op.
     let snapshot_path = snapshot_running_deployments(data_dir).await;
@@ -2285,6 +2379,16 @@ async fn install(
 
     // Pre-create the log directory so tracing-appender has a destination on
     // first SCM start — parity with the systemd install flow.
+    //
+    // NOTE: Windows SCM does not natively redirect a service's stdout/stderr
+    // to a file (unlike launchd's `StandardErrorPath` or systemd's
+    // `StandardError=journal`). Pre-init crashes (panics before the tracing
+    // subscriber attaches) are therefore lost — there is no equivalent of
+    // `journalctl -u zlayer` for those frames. The daemon catches this in
+    // practice by initialising tracing-appender to `log_dir` very early in
+    // `serve`, so anything after subscriber init lands on disk. If we ever
+    // need pre-init capture on Windows, the path is wrapping `serve` in a
+    // shim that redirects its handles, or attaching ETW.
     let log_dir = crate::cli::default_log_dir(data_dir);
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Warning: could not create {}: {e}", log_dir.display());

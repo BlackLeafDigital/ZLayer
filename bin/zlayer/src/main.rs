@@ -23,6 +23,7 @@ pub mod daemon;
 mod daemon_service;
 #[allow(dead_code)]
 mod deploy_tui;
+pub mod migrations;
 mod privilege;
 pub mod resources;
 pub mod ui;
@@ -43,6 +44,25 @@ use zlayer_observability::{
 
 #[allow(clippy::too_many_lines, unsafe_code)]
 fn main() -> ExitCode {
+    // Install a minimal stderr tracing subscriber as the very first thing,
+    // before arg parsing or anything else that can fail. The full subscriber
+    // (with the file appender) is installed later for the `serve` command
+    // and replaces this one; until then, any panic, parse error, or early
+    // initialization failure surfaces on stderr -> journald (systemd) /
+    // unified log (launchd) / Event Log (Windows SCM via the launcher).
+    //
+    // Failure to install is non-fatal: tracing-subscriber's `try_init`
+    // returns Err if a subscriber is already set, which is fine.
+    {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .try_init();
+    }
+
     let cli = Cli::parse();
 
     // No subcommand or explicit `tui` -> launch the interactive TUI
@@ -126,38 +146,52 @@ fn main() -> ExitCode {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            use std::fs;
+            // Don't double-fork when systemd is our supervisor. Type=notify
+            // expects the foreground PID to call sd_notify(READY=1); forking
+            // confuses the supervisor and silently drops stdout/stderr to
+            // /dev/null, which masks every startup error.
+            let under_systemd = std::env::var_os("NOTIFY_SOCKET").is_some()
+                || std::env::var_os("INVOCATION_ID").is_some();
+            if under_systemd {
+                eprintln!(
+                    "zlayer: --daemon ignored — running under systemd \
+                     (NOTIFY_SOCKET / INVOCATION_ID set); staying in foreground"
+                );
+                // Fall through to the normal serve path below by skipping the fork.
+            } else {
+                use std::fs;
 
-            let run_dir = cli.effective_run_dir();
-            let log_dir = cli.effective_log_dir();
+                let run_dir = cli.effective_run_dir();
+                let log_dir = cli.effective_log_dir();
 
-            // Create directories (idempotent via create_dir_all)
-            if let Err(e) = fs::create_dir_all(&run_dir)
-                .with_context(|| format!("Failed to create {}", run_dir.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
-            if let Err(e) = fs::create_dir_all(&log_dir)
-                .with_context(|| format!("Failed to create {}", log_dir.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
+                // Create directories (idempotent via create_dir_all)
+                if let Err(e) = fs::create_dir_all(&run_dir)
+                    .with_context(|| format!("Failed to create {}", run_dir.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(e) = fs::create_dir_all(&log_dir)
+                    .with_context(|| format!("Failed to create {}", log_dir.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
 
-            // Fork + setsid + chdir to /.
-            if let Err(e) = nix::unistd::daemon(false, true).context("Failed to daemonize") {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
+                // Fork + setsid + chdir to /.
+                if let Err(e) = nix::unistd::daemon(false, true).context("Failed to daemonize") {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
 
-            // Write PID file
-            let pid_path = run_dir.join("zlayer.pid");
-            if let Err(e) = fs::write(&pid_path, std::process::id().to_string())
-                .with_context(|| format!("Failed to write PID file at {}", pid_path.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
+                // Write PID file
+                let pid_path = run_dir.join("zlayer.pid");
+                if let Err(e) = fs::write(&pid_path, std::process::id().to_string())
+                    .with_context(|| format!("Failed to write PID file at {}", pid_path.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
