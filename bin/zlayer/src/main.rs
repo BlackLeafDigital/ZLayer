@@ -44,25 +44,17 @@ use zlayer_observability::{
 
 #[allow(clippy::too_many_lines, unsafe_code)]
 fn main() -> ExitCode {
-    // Install a minimal stderr tracing subscriber as the very first thing,
-    // before arg parsing or anything else that can fail. The full subscriber
-    // (with the file appender) is installed later for the `serve` command
-    // and replaces this one; until then, any panic, parse error, or early
-    // initialization failure surfaces on stderr -> journald (systemd) /
-    // unified log (launchd) / Event Log (Windows SCM via the launcher).
+    // No early tracing subscriber here: downstream code paths
+    // (`init_observability` for serve/CLI, `init_file_logging` for the TUI,
+    // and the SCM service entry on Windows) each install a full subscriber
+    // via `.init()`, which calls `set_global_default()` and panics if the
+    // global slot is already taken. Installing anything via `try_init()` or
+    // similar here would claim that slot and crash every downstream path.
     //
-    // Failure to install is non-fatal: tracing-subscriber's `try_init`
-    // returns Err if a subscriber is already set, which is fine.
-    {
-        use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .try_init();
-    }
-
+    // The silent-exit class of bugs is addressed at the actual root cause:
+    // `install_stderr_redirect_to_tracing()` in `commands/serve.rs` now
+    // runs AFTER `init_daemon` succeeds, so early-init errors print on the
+    // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
     // No subcommand or explicit `tui` -> launch the interactive TUI
