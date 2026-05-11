@@ -258,6 +258,14 @@ if [ "$OS" = "linux" ]; then
     echo "Setting up container runtime directories..."
     sudo mkdir -p /var/lib/zlayer/containers /var/lib/zlayer/rootfs \
         /var/lib/zlayer/bundles /var/lib/zlayer/cache /var/lib/zlayer/volumes
+
+    # /var/lib/zlayer/secrets must be a directory in 0.11.20+. If a prior version
+    # left it as a regular file, leave it — `zlayer daemon install` (called below)
+    # runs the migration that renames it to secrets/secrets.sqlite. We only
+    # pre-create the directory when the path is absent or already a directory.
+    if [ ! -e /var/lib/zlayer/secrets ] || [ -d /var/lib/zlayer/secrets ]; then
+        sudo install -d -m 0750 /var/lib/zlayer/secrets
+    fi
 fi
 
 # --- Install and start service ---
@@ -268,6 +276,10 @@ if [ -z "$SKIP_SERVICE" ]; then
     case "$OS" in
         linux)
             sudo "${INSTALL_DIR}/${BINARY}" daemon install
+            # Belt-and-suspenders: `daemon install` already runs the migration,
+            # but if the user is upgrading from a build that predates that, this
+            # second invocation heals it. Idempotent and never fails the install.
+            sudo "${INSTALL_DIR}/${BINARY}" daemon migrate >/dev/null 2>&1 || true
             ;;
         darwin)
             "${INSTALL_DIR}/${BINARY}" daemon install

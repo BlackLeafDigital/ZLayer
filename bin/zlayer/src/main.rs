@@ -23,6 +23,7 @@ pub mod daemon;
 mod daemon_service;
 #[allow(dead_code)]
 mod deploy_tui;
+pub mod migrations;
 mod privilege;
 pub mod resources;
 pub mod ui;
@@ -43,6 +44,17 @@ use zlayer_observability::{
 
 #[allow(clippy::too_many_lines, unsafe_code)]
 fn main() -> ExitCode {
+    // No early tracing subscriber here: downstream code paths
+    // (`init_observability` for serve/CLI, `init_file_logging` for the TUI,
+    // and the SCM service entry on Windows) each install a full subscriber
+    // via `.init()`, which calls `set_global_default()` and panics if the
+    // global slot is already taken. Installing anything via `try_init()` or
+    // similar here would claim that slot and crash every downstream path.
+    //
+    // The silent-exit class of bugs is addressed at the actual root cause:
+    // `install_stderr_redirect_to_tracing()` in `commands/serve.rs` now
+    // runs AFTER `init_daemon` succeeds, so early-init errors print on the
+    // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
     // No subcommand or explicit `tui` -> launch the interactive TUI
@@ -126,38 +138,52 @@ fn main() -> ExitCode {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            use std::fs;
+            // Don't double-fork when systemd is our supervisor. Type=notify
+            // expects the foreground PID to call sd_notify(READY=1); forking
+            // confuses the supervisor and silently drops stdout/stderr to
+            // /dev/null, which masks every startup error.
+            let under_systemd = std::env::var_os("NOTIFY_SOCKET").is_some()
+                || std::env::var_os("INVOCATION_ID").is_some();
+            if under_systemd {
+                eprintln!(
+                    "zlayer: --daemon ignored — running under systemd \
+                     (NOTIFY_SOCKET / INVOCATION_ID set); staying in foreground"
+                );
+                // Fall through to the normal serve path below by skipping the fork.
+            } else {
+                use std::fs;
 
-            let run_dir = cli.effective_run_dir();
-            let log_dir = cli.effective_log_dir();
+                let run_dir = cli.effective_run_dir();
+                let log_dir = cli.effective_log_dir();
 
-            // Create directories (idempotent via create_dir_all)
-            if let Err(e) = fs::create_dir_all(&run_dir)
-                .with_context(|| format!("Failed to create {}", run_dir.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
-            if let Err(e) = fs::create_dir_all(&log_dir)
-                .with_context(|| format!("Failed to create {}", log_dir.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
+                // Create directories (idempotent via create_dir_all)
+                if let Err(e) = fs::create_dir_all(&run_dir)
+                    .with_context(|| format!("Failed to create {}", run_dir.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+                if let Err(e) = fs::create_dir_all(&log_dir)
+                    .with_context(|| format!("Failed to create {}", log_dir.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
 
-            // Fork + setsid + chdir to /.
-            if let Err(e) = nix::unistd::daemon(false, true).context("Failed to daemonize") {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
-            }
+                // Fork + setsid + chdir to /.
+                if let Err(e) = nix::unistd::daemon(false, true).context("Failed to daemonize") {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
 
-            // Write PID file
-            let pid_path = run_dir.join("zlayer.pid");
-            if let Err(e) = fs::write(&pid_path, std::process::id().to_string())
-                .with_context(|| format!("Failed to write PID file at {}", pid_path.display()))
-            {
-                eprintln!("Error: {e:#}");
-                return ExitCode::FAILURE;
+                // Write PID file
+                let pid_path = run_dir.join("zlayer.pid");
+                if let Err(e) = fs::write(&pid_path, std::process::id().to_string())
+                    .with_context(|| format!("Failed to write PID file at {}", pid_path.display()))
+                {
+                    eprintln!("Error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }

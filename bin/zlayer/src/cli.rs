@@ -1078,6 +1078,19 @@ pub(crate) enum DaemonAction {
         /// Path to the snapshot JSON file produced by `daemon install`.
         path: std::path::PathBuf,
     },
+
+    /// Migrate the on-disk data directory layout to the current version's
+    /// expected layout. Idempotent — safe to run repeatedly. The daemon also
+    /// runs this on every boot, so this is primarily a manual escape hatch.
+    Migrate {
+        /// Override the data directory. Defaults to the top-level --data-dir
+        /// (or its platform default if unset).
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+        /// Report what would be migrated without making any changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Tunnel management subcommands

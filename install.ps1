@@ -122,6 +122,46 @@ try {
     Write-Host "Installing to $InstallDir..."
     Copy-Item -Path $ExePath.FullName -Destination $TargetExe -Force
 
+    # --- Pre-create data directory layout (secrets/) ---
+    # zlayer 0.11.20+ requires `<data_dir>\secrets` to be a directory (the
+    # encrypted-secrets sqlite store lives at `secrets\secrets.sqlite`). If a
+    # prior version left `secrets` as a regular file, leave it alone — the
+    # daemon's startup migration (also exposed via `zlayer daemon migrate`)
+    # renames it into place. We only pre-create when the path is absent or
+    # already a directory, mirroring the POSIX installer.
+    #
+    # Data dir on Windows is %ProgramData%\ZLayer (per zlayer-paths), falling
+    # back to C:\ProgramData\ZLayer when the env var is unset.
+    $DataDir = if ($env:PROGRAMDATA) {
+        Join-Path $env:PROGRAMDATA 'ZLayer'
+    }
+    else {
+        'C:\ProgramData\ZLayer'
+    }
+    $SecretsPath = Join-Path $DataDir 'secrets'
+    try {
+        if (-not (Test-Path -LiteralPath $SecretsPath) -or (Test-Path -LiteralPath $SecretsPath -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $SecretsPath | Out-Null
+        }
+    }
+    catch {
+        # Non-fatal: the daemon will create/migrate this itself on first boot.
+        Write-Host "  Warning: could not pre-create $SecretsPath ($_); daemon will handle it on first boot." -ForegroundColor Yellow
+    }
+
+    # --- Belt-and-suspenders: run the data-dir migration. ---
+    # On platforms where the installer registers a service, `daemon install`
+    # already runs this; the Windows installer leaves service registration to
+    # the user, so we invoke `daemon migrate` directly. It's idempotent and
+    # self-heals legacy `secrets` regular-files into the new layout. Never
+    # block the install on migration failure.
+    try {
+        & $TargetExe daemon migrate 2>&1 | Out-Null
+    }
+    catch {
+        # Intentionally swallow — never block install on migration.
+    }
+
     # --- Warn if an older zlayer.exe shadows the one we just installed ---
     # Get-Command walks PATH in order; a stale binary earlier on PATH will
     # silently be used instead of the one we installed, which produces

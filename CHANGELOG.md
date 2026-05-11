@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.21] - 2026-05-10
+
+### Fixed
+- Upgrades from versions prior to 0.11.20 no longer crash-loop on first
+  boot under the new `secrets/` directory layout. The daemon now
+  migrates the legacy top-level `secrets` SQLite file into the new
+  layout in place on every startup, and the same migration is exposed
+  as a manual subcommand (see `zlayer daemon migrate` below). Linux,
+  macOS, and Windows all run the same migration path.
+- Early-init failures (corrupt redb, missing keys, layout mismatches,
+  unparseable JWT secret) now surface in stderr — and therefore in
+  journald on Linux, the unified log on macOS, and the Event Log on
+  Windows — instead of the daemon exiting silently with status 1. The
+  stderr-to-tracing redirect that swallows these messages is now
+  installed only after the daemon has fully initialised, so the final
+  error print on startup failure reaches the system log.
+- The daemon no longer double-forks when launched under systemd.
+  Presence of `NOTIFY_SOCKET` or `INVOCATION_ID` in the environment is
+  treated as a signal to stay in the foreground so systemd's
+  `Type=notify` readiness handshake works as designed; previously the
+  daemon's own `daemon()` call detached from systemd and masked every
+  startup error as a "service exited cleanly" event.
+- A minimal stderr `tracing_subscriber` is now installed as the very
+  first action in `main()`, so panics, argument-parse failures, and any
+  error that fires before the full observability stack is up still
+  reach the system log instead of vanishing.
+
+### Added
+- `zlayer daemon migrate [--data-dir <path>] [--dry-run]` — manual,
+  idempotent data-directory migration. Safe to re-run; used by the
+  install scripts as a belt-and-suspenders step after `daemon install`,
+  and available as an escape hatch for operators recovering a node by
+  hand.
+- The systemd unit now sets `StandardOutput=journal`,
+  `StandardError=journal`, and `SyslogIdentifier=zlayer`, so daemon
+  output is captured in journald even when the binary writes to stderr
+  directly, and `journalctl SYSLOG_IDENTIFIER=zlayer` works without
+  having to know the unit name.
+- `install.sh` and `install.ps1` now pre-create the `secrets/`
+  directory with tight permissions and run `zlayer daemon migrate`
+  after `daemon install`, so the very first boot after an upgrade is
+  already on the new layout.
+
 ## [0.11.19] - 2026-05-10
 
 ### Fixed

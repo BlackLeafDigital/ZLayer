@@ -470,6 +470,19 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 #[allow(clippy::too_many_lines)]
 pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
+    // Phase 0: Self-heal pre-0.11.20 on-disk layouts before anything else
+    // opens the data dir. Pre-0.11.20 installs left a SQLite file at
+    // `{data_dir}/secrets`, which collided with the directory the persistent
+    // secrets store now expects. Running this first lets every daemon boot
+    // migrate forward without operator intervention.
+    // -----------------------------------------------------------------------
+    let report = crate::migrations::migrate_data_dir(&config.data_dir)
+        .context("Failed to migrate on-disk data directory layout")?;
+    for step in &report.steps {
+        info!("Migration: {step}");
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 1: Create directories
     // -----------------------------------------------------------------------
     for dir in [&config.data_dir, &config.log_dir, &config.run_dir] {

@@ -1033,14 +1033,13 @@ pub(crate) async fn serve_with_external_shutdown(
     data_dir: std::path::PathBuf,
     external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
-    // Capture stderr (fd 2) into the tracing pipeline so direct `eprintln!`
-    // writes from dependencies (notably boringtun's tun-read worker threads)
-    // land as structured `tracing::error!` events instead of raw lines in the
-    // systemd/launchd journal. No-op when stderr is a TTY (interactive
-    // `zlayer serve`) or on Windows. `init_observability` ran in `main.rs`
-    // before this function was reached, so the tracing subscriber is already
-    // installed and ready to receive events.
-    install_stderr_redirect_to_tracing();
+    // NOTE: the stderr-to-tracing redirect is deliberately installed AFTER
+    // `init_daemon` returns (see below). Installing it here would swallow any
+    // early-boot error from `init_daemon` -- including the pre-0.11.20 data
+    // dir migration -- into the tracing file appender instead of letting it
+    // reach journald via the original fd 2. The `eprintln!` in `main.rs`
+    // that prints the final error from `run(cli)` needs the unredirected
+    // stderr to be visible in `journalctl`.
 
     // Pick up any CLI overrides stashed by `serve_with_nat_overrides`, plus
     // `ZLAYER_NAT_*` env vars, plus `NatConfig::default()`. Empty when called
@@ -1147,6 +1146,15 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     info!("Initialising daemon infrastructure");
     let state = init_daemon(&config).await?;
+
+    // Capture stderr (fd 2) into the tracing pipeline so direct `eprintln!`
+    // writes from dependencies (notably boringtun's tun-read worker threads)
+    // land as structured `tracing::error!` events instead of raw lines in the
+    // systemd/launchd journal. No-op when stderr is a TTY (interactive
+    // `zlayer serve`) or on Windows. Deliberately installed AFTER `init_daemon`
+    // so any early-boot error (e.g. on-disk migration failure) still reaches
+    // the original stderr -> journald path before the redirect is in place.
+    install_stderr_redirect_to_tracing();
 
     // -----------------------------------------------------------------------
     // 2b. Restore previously-persisted deployments
