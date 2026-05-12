@@ -67,6 +67,25 @@ All notable changes to this project will be documented in this file.
   `ZLAYER_E2E_WG_PORT`, `ZLAYER_E2E_DNS_PORT`) are env-overridable.
 
 ### Changed
+- The manager e2e harness (`crates/zlayer-manager/tests/e2e/scripts/
+  run-suite.sh`) now defaults to running against the user's locally-
+  installed zlayer daemon: it resolves the daemon's Unix socket
+  (`/var/run/zlayer.sock` or `~/.zlayer/run/zlayer.sock`), creates a
+  scoped fixture admin via `zlayer user create` (using the auto-
+  injected `local-admin` bearer that the daemon mints for any UDS
+  connection), drives the login UI through intellitester, and deletes
+  the fixture user on exit. The stale-session regression replaces its
+  `sqlite3 DELETE FROM users` step with `zlayer user delete <id>
+  --yes` and now asserts a redirect to `/login` (other users still
+  exist in the host daemon's user table). A new `--throwaway` flag
+  (also `ZLAYER_E2E_THROWAWAY=1`) keeps the previous behaviour of
+  spinning up an isolated daemon for clean CI runners. Removes the
+  `sqlite3` PATH dependency from the harness. The obsolete
+  `bootstrap.test.yaml`, `logout.test.yaml`,  `auth.workflow.yaml`,
+  and `scripts/reset-data-dir.sh` files are deleted — the suite now
+  exercises the login flow (which is the bug regression we actually
+  care about) and signup is exercised every time someone installs
+  zlayer.
 - The `BlackLeafDigital/ZLayer` composite action (`action.yml`) is now
   CI-safe and supports both portable and system installs. Three new
   inputs: `install-dir` (empty = portable temp install to
@@ -84,8 +103,63 @@ All notable changes to this project will be documented in this file.
   composite sub-steps) has been replaced with a bash-internal guard, so
   empty-command invocations install-only instead of hanging on the
   implicit TUI.
+- The manager e2e harness has been rewritten from bash to Python
+  (`run-suite.py`, stdlib only, invoked via `uv run`). The bash version
+  (`run-suite.sh`) is deleted in the same commit. Same flags
+  (`--throwaway`, `--only`, `--no-build`), same yamls, same login-based
+  flow — none of the bash-shaped failure modes (subshell-scope loss of
+  `DAEMON_PID`, env-prefix parameter expansion, `trap`-on-`$()` cleanup
+  drops, tmpfs orphans, CLI silently hitting the wrong daemon). The
+  throwaway daemon's data dir moved from `mktemp /tmp/zlayer-e2e-*` to
+  `target/zlayer-e2e/<suite-id>/` (gitignored, swept by `cargo clean`,
+  user-owned). A new `--sudo-daemon` flag is available as an escape
+  hatch in case the daemon's overlay init ever starts demanding
+  CAP_NET_ADMIN at startup — today the overlay manager logs a
+  permission warning and degrades to "cross-node networking disabled",
+  which is harmless for the auth/manager flow the suite exercises, so
+  no part of the local or CI invocation runs under sudo. CI workflows
+  (`.github/workflows/e2e.yml` and `.forgejo/workflows/e2e.yml`)
+  install uv via `astral-sh/setup-uv@v6` and invoke
+  `uv run …/run-suite.py --throwaway`.
+- The `test` `workflow_dispatch` dropdown in both e2e workflows now
+  gates every e2e job, not just the intellitester sub-suite. Options
+  are `youki`, `wasm`, `docker`, `manager-unit`,
+  `manager-intellitester`, `manager-intellitester:<yaml>`, and
+  `macos-sandbox` (plus `macos-unit` on GitHub). Empty value runs all
+  jobs as before. The release dispatch gate
+  (`dispatch-build` on Forgejo, `trigger-release` on GitHub) now
+  additionally requires `inputs.test == ''` so a partial e2e run can
+  never short-circuit into a release with the other suites skipped.
+  Dead `bootstrap.test.yaml`, `logout.test.yaml`, and
+  `auth.workflow.yaml` dropdown options (the underlying files were
+  deleted earlier in 0.11.22) are removed.
 
 ### Fixed
+- The daemon's `AuthActor` extractor now prefers a session cookie
+  over a Bearer token when both are present on the same request.
+  Previously the Bearer always won, which meant any user-facing call
+  the manager proxied to the daemon **over the Unix socket** would
+  be auth'd as the auto-injected `local-admin` instead of the real
+  logged-in user. `/auth/me` would then look up `local-admin` in
+  the user store, find nothing, and return `401 "User no longer
+  exists"` — so the manager's `AuthGuard` bounced every logged-in
+  request back to `/login`. The bug was latent in TCP-transported
+  manager → daemon setups (the auto-bearer middleware is
+  Unix-socket-only) but blocked any deployment that pointed
+  `ZLAYER_SOCKET` at the daemon — including the e2e harness. CLI /
+  service auth (Bearer-only, no cookie) is unchanged: cookie
+  extraction fails, the extractor falls through to Bearer, and
+  `local-admin` continues to drive the request. Mirrors to
+  zlayer-zql.
+- `DELETE /api/v1/users/{id}` is now properly idempotent: deleting an
+  id that no longer exists returns `204 No Content` instead of
+  `404 Not Found`, matching REST DELETE semantics. The underlying
+  `IdentityManager::delete_user` signature changed from
+  `Result<StoredUser, IdentityError>` to
+  `Result<Option<StoredUser>, IdentityError>` (`Ok(None)` = already
+  gone, `Ok(Some(u))` = deleted). Removes the need for `zlayer user
+  delete <id> --yes || true` wrappers in cleanup scripts and trap
+  handlers.
 - `zlayer` (no subcommand) and `zlayer tui` now refuse to launch the
   Ratatui TUI when stdin or stdout is not a terminal, exiting 1 with a
   clear error pointing at `zlayer --help`. Previously a non-TTY caller

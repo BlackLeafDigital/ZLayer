@@ -6,14 +6,14 @@ platform: web
 #
 # The state file was written by stale-session-setup.test.yaml. Between
 # the two runs, run-suite.sh executes:
-#   sqlite3 $ZLAYER_DATA_DIR/users.db "DELETE FROM users WHERE email='admin@e2e.local'"
+#   zlayer user delete <fixture_user_id> --yes
 # So the browser holds valid-looking cookies the API will reject.
 #
 # Part A's fix: manager_me detects the 401 against a forwarded
 # zlayer_session cookie and fires POST /auth/logout, whose Set-Cookie
 # expiry headers ride back on the manager_me response. AuthGuard sees
-# `user: None, needs_bootstrap: true` (users.db is empty) and routes
-# to /bootstrap.
+# `user: None` and routes us to /login (other users still exist in the
+# host daemon's users table, so we get login — not bootstrap).
 
 steps:
   # Sanity: the storageState file actually loaded the cookies.
@@ -36,9 +36,10 @@ steps:
   - type: navigate
     value: /
 
-  # users.db was wiped, so the manager redirects us to /bootstrap.
+  # The fixture user was deleted, so the manager redirects us to
+  # /login (other users still exist in the table).
   - type: waitForSelector
-    target: { css: "#bs-email" }
+    target: { css: "#login-email" }
     state: visible
     timeout: 15000
 
@@ -52,7 +53,7 @@ steps:
       - zlayer_csrf
 
   - type: assert
-    target: { text: "Welcome to ZLayer" }
+    target: { text: "Sign in to ZLayer" }
 
   - type: screenshot
     name: stale-session-redirected.png
