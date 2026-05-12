@@ -17,6 +17,8 @@ use super::types::{
     EnvFileEntry, VolumeType,
 };
 use crate::DockerError;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Compose-style image name produced for a service that ships a `build:`
 /// directive but no explicit `image:`. Mirrors Docker Compose's
@@ -1972,7 +1974,9 @@ services:
     /// with inline `environment` overriding file entries.
     #[test]
     fn test_silent_drop_env_file_forwarding() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-silent-drop-env-file-forwarding-")
+            .expect("tempdir");
         let env_path = dir.path().join("svc.env");
         std::fs::write(
             &env_path,

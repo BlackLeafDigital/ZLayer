@@ -3753,6 +3753,7 @@ impl tokio::io::AsyncWrite for PtyDuplex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn test_youki_config_default() {
@@ -3882,7 +3883,9 @@ mod tests {
     #[tokio::test]
     async fn test_youki_runtime_directory_creation() {
         // Use a unique temp directory based on test run
-        let temp_base = std::env::temp_dir().join(format!("youki_test_{}", std::process::id()));
+        let temp_base = ZLayerDirs::system_default()
+            .tmp()
+            .join(format!("youki_test_{}", std::process::id()));
 
         let config = YoukiConfig {
             state_dir: temp_base.join("state"),
@@ -3924,7 +3927,7 @@ mod tests {
     /// the offset lands on the third-to-last line's start.
     #[tokio::test]
     async fn youki_tail_offset_returns_last_n_lines() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ZLayerDirs::system_default().tmp().join(format!(
             "zlayer_tail_test_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
@@ -3955,7 +3958,7 @@ mod tests {
     /// without needing a real container.
     #[tokio::test]
     async fn youki_logs_stream_reads_static_file_without_follow() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ZLayerDirs::system_default().tmp().join(format!(
             "zlayer_logs_static_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
@@ -4050,8 +4053,9 @@ mod tests {
     /// validation path without needing a running container.
     #[tokio::test]
     async fn youki_exec_pty_rejects_empty_command() {
-        let temp_base =
-            std::env::temp_dir().join(format!("youki_exec_pty_empty_{}", std::process::id()));
+        let temp_base = ZLayerDirs::system_default()
+            .tmp()
+            .join(format!("youki_exec_pty_empty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_base);
 
         let config = YoukiConfig {
@@ -4117,7 +4121,9 @@ mod tests {
     #[tokio::test]
     async fn archive_helpers_round_trip_a_directory_tree() {
         // Build a small tree.
-        let src_dir = tempfile::tempdir().unwrap();
+        let src_dir = ZLayerDirs::system_default()
+            .scratch_dir("youki-archive-test-")
+            .unwrap();
         let nested = src_dir.path().join("a/b");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("c.txt"), b"deep file").unwrap();
@@ -4136,7 +4142,9 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         // Unpack into a fresh dir; the entry should land under `root/`.
-        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_dir = ZLayerDirs::system_default()
+            .scratch_dir("youki-archive-test-")
+            .unwrap();
         super::unpack_tar_into(
             dest_dir.path(),
             &buf,
@@ -4156,13 +4164,17 @@ mod tests {
     /// with a non-directory (or vice versa).
     #[tokio::test]
     async fn archive_helpers_reject_dir_nondir_replacements() {
-        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_dir = ZLayerDirs::system_default()
+            .scratch_dir("youki-archive-test-")
+            .unwrap();
         // Pre-create a directory at `target`.
         let target = dest_dir.path().join("target");
         std::fs::create_dir_all(&target).unwrap();
 
         // Build an archive whose only entry is a *file* named `target`.
-        let src_file_dir = tempfile::tempdir().unwrap();
+        let src_file_dir = ZLayerDirs::system_default()
+            .scratch_dir("youki-archive-test-")
+            .unwrap();
         let src_file = src_file_dir.path().join("target");
         std::fs::write(&src_file, b"i am a file").unwrap();
         let bytes = super::build_tar_from_path_for_test(&src_file, "target");

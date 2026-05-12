@@ -2340,6 +2340,7 @@ mod tests {
     use crate::cli::{Cli, Commands, NodeCommands};
     use clap::Parser;
     use std::path::PathBuf;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn test_cli_node_init_command() {
@@ -2673,7 +2674,9 @@ mod tests {
             eprintln!("test skipped: running as Administrator");
             return;
         }
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("handle-node-init-non-admin-errors-early-")
+            .expect("tempdir");
         let err = super::handle_node_init(
             "127.0.0.1".to_string(),
             3669,
@@ -2707,7 +2710,9 @@ mod tests {
             eprintln!("test skipped: running as Administrator");
             return;
         }
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("handle-node-join-non-admin-errors-early-")
+            .expect("tempdir");
         let err = super::handle_node_join(
             "127.0.0.1:3669".to_string(),
             "dummy-token".to_string(),
@@ -2736,7 +2741,9 @@ mod tests {
     /// node JWT (UTF-8) and the wrapped DEK (binary).
     #[test]
     fn write_secure_round_trip() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("write-secure-round-trip-")
+            .expect("tempdir");
         let path = tmp.path().join("secret.bin");
 
         // Use a payload with explicit non-UTF8 bytes (0xFF, 0x00) to prove
@@ -2757,7 +2764,9 @@ mod tests {
     fn write_secure_sets_mode_0600_on_unix() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("write-secure-sets-mode-0600-on-unix-")
+            .expect("tempdir");
         let path = tmp.path().join("secret.bin");
 
         super::write_secure(&path, b"sensitive").expect("write_secure");
@@ -2775,7 +2784,9 @@ mod tests {
     fn write_secure_overwrite_resets_mode_0600_on_unix() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("write-secure-overwrite-resets-mode-0600-on-unix-")
+            .expect("tempdir");
         let path = tmp.path().join("secret.bin");
 
         // Pre-create with a wide-open mode and unrelated content.

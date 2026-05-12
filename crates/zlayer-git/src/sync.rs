@@ -191,18 +191,22 @@ fn extract_kind_and_name(yaml: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn scan_empty_directory() {
-        let dir = TempDir::new().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("git-sync-test-")
+            .unwrap();
         let resources = scan_resources(dir.path()).unwrap();
         assert!(resources.is_empty());
     }
 
     #[test]
     fn scan_ignores_non_yaml_files() {
-        let dir = TempDir::new().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("git-sync-test-")
+            .unwrap();
         std::fs::write(dir.path().join("readme.md"), "# hello").unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
         let resources = scan_resources(dir.path()).unwrap();
@@ -211,7 +215,9 @@ mod tests {
 
     #[test]
     fn scan_finds_yaml_and_yml() {
-        let dir = TempDir::new().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("git-sync-test-")
+            .unwrap();
         std::fs::write(
             dir.path().join("app.yaml"),
             "deployment: my-app\nversion: v1\nservices: {}\n",
@@ -233,7 +239,9 @@ mod tests {
 
     #[test]
     fn scan_extracts_explicit_kind() {
-        let dir = TempDir::new().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("git-sync-test-")
+            .unwrap();
         std::fs::write(
             dir.path().join("svc.yaml"),
             "kind: Deployment\nname: web-frontend\n",
@@ -248,7 +256,9 @@ mod tests {
 
     #[test]
     fn scan_errors_on_unknown_kind() {
-        let dir = TempDir::new().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("git-sync-test-")
+            .unwrap();
         std::fs::write(dir.path().join("mystery.yaml"), "foo: bar\n").unwrap();
 
         let result = scan_resources(dir.path());

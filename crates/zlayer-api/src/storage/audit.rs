@@ -290,6 +290,7 @@ mod tests {
     use super::*;
     use crate::storage::AuditEntry;
     use chrono::Duration;
+    use zlayer_paths::ZLayerDirs;
 
     fn make_entry(user_id: &str, action: &str, resource_kind: &str) -> AuditEntry {
         AuditEntry::new(user_id, action, resource_kind)
@@ -684,7 +685,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_round_trip() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("audit.db");
 
         let mut entry = make_entry("u1", "create", "secret");

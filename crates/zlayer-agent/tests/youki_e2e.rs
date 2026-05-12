@@ -27,6 +27,7 @@ use zlayer_agent::{
     ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager, YoukiConfig, YoukiRuntime,
 };
 use zlayer_overlay::DnsServer;
+use zlayer_paths::ZLayerDirs;
 use zlayer_proxy::ServiceRegistry;
 use zlayer_spec::{DeploymentSpec, HealthCheck, ServiceSpec};
 
@@ -46,7 +47,11 @@ macro_rules! with_timeout {
 }
 
 /// E2E test directory prefix
-const E2E_TEST_DIR: &str = "/tmp/zlayer-youki-e2e-test";
+fn e2e_test_dir() -> PathBuf {
+    ZLayerDirs::system_default()
+        .tmp()
+        .join("zlayer-youki-e2e-test")
+}
 
 /// Test images
 const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
@@ -156,7 +161,7 @@ async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), String> {
 
 /// Create a `YoukiRuntime` configured for E2E testing
 async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
-    let test_dir = PathBuf::from(E2E_TEST_DIR);
+    let test_dir = e2e_test_dir();
     let config = YoukiConfig {
         state_dir: test_dir.join("state"),
         rootfs_dir: test_dir.join("rootfs"),
@@ -870,7 +875,12 @@ async fn test_cleanup_state_directory() {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // State directory should exist
-        let state_dir = format!("{E2E_TEST_DIR}/state/{}-{}", id.service, id.replica);
+        let state_dir = format!(
+            "{}/state/{}-{}",
+            e2e_test_dir().display(),
+            id.service,
+            id.replica
+        );
         let exists_before = tokio::fs::metadata(&state_dir).await.is_ok();
         println!("State directory {state_dir} exists before removal: {exists_before}");
 

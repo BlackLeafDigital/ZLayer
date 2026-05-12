@@ -35,6 +35,8 @@ use tokio::sync::RwLock;
 
 use super::sqlx_json::{IndexSpec, JsonTable, SqlxJsonStore};
 use super::{StorageError, StoredWorkflow, WorkflowRun};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for workflow storage backends.
 #[async_trait]
@@ -558,7 +560,9 @@ mod tests {
     async fn test_sqlx_persistent_round_trip() {
         // Survives closing + reopening the database — the whole point of the
         // persistent backend, exercised across both tables.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("workflows.db");
 
         let wf = make_workflow("persist-me");

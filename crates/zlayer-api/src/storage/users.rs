@@ -13,6 +13,8 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use super::{StorageError, StoredUser};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for user storage backends
 #[async_trait]
@@ -578,7 +580,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_storage() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-storage-")
+            .unwrap();
         let db_path = temp_dir.path().join("users.db");
 
         let user = make_user("persist@example.com", "Persist");

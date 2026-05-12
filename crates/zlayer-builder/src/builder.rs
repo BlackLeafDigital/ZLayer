@@ -116,6 +116,8 @@ use tokio::fs;
 #[cfg(feature = "local-registry")]
 use tracing::warn;
 use tracing::{debug, info, instrument};
+#[cfg(feature = "local-registry")]
+use zlayer_paths::ZLayerDirs;
 
 use crate::backend::BuildBackend;
 #[cfg(feature = "local-registry")]
@@ -1523,7 +1525,9 @@ impl ImageBuilder {
         #[cfg(feature = "local-registry")]
         if let Some(ref registry) = self.local_registry {
             if !built.tags.is_empty() {
-                let tmp_path = std::env::temp_dir().join(format!(
+                let tmp_dir = ZLayerDirs::system_default().tmp();
+                std::fs::create_dir_all(&tmp_dir).ok();
+                let tmp_path = tmp_dir.join(format!(
                     "zlayer-build-{}-{}.tar",
                     std::process::id(),
                     start_time.elapsed().as_nanos()

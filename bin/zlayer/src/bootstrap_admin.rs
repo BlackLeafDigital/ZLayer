@@ -94,6 +94,7 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use zlayer_api::storage::{InMemoryUserStore, UserStorage};
+    use zlayer_paths::ZLayerDirs;
     use zlayer_secrets::{CredentialStore, EncryptionKey, PersistentSecretsStore};
     use zlayer_types::storage::StoredUser;
 
@@ -108,9 +109,11 @@ mod tests {
         Arc<IdentityManager>,
         Arc<dyn UserStorage>,
         Arc<CredentialStore<Arc<PersistentSecretsStore>>>,
-        tempfile::TempDir,
+        zlayer_types::Scratch,
     ) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("make-identity-")
+            .unwrap();
         let users: Arc<dyn UserStorage> = Arc::new(InMemoryUserStore::new());
         let secrets = Arc::new(
             PersistentSecretsStore::open(
@@ -167,7 +170,9 @@ mod tests {
     #[serial]
     fn load_password_file_reads_and_trims() {
         clear_envs();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_file("load-password-file-reads-and-trims-")
+            .unwrap();
         writeln!(tmp.as_file(), "filesecret123").unwrap();
         std::env::set_var(ENV_PASSWORD_FILE, tmp.path());
         let got = load_password().unwrap();
@@ -179,7 +184,9 @@ mod tests {
     #[serial]
     fn load_password_file_empty_errors() {
         clear_envs();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_file("load-password-file-empty-errors-")
+            .unwrap();
         std::env::set_var(ENV_PASSWORD_FILE, tmp.path());
         let err = load_password().unwrap_err().to_string();
         assert!(err.contains("is empty"), "unexpected: {err}");
@@ -274,7 +281,9 @@ mod tests {
     #[serial]
     async fn maybe_bootstrap_is_idempotent_across_restart() {
         clear_envs();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("maybe-bootstrap-is-idempotent-across-restart-")
+            .unwrap();
         let users_path = tmp.path().join("users.db");
         let secrets_path = tmp.path().join("secrets.sqlite");
         let key = EncryptionKey::generate();

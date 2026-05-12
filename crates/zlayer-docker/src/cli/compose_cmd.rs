@@ -32,6 +32,8 @@ use crate::compose::env_source::collect_env_sources;
 use crate::compose::interpolate::interpolate_yaml_value;
 use crate::compose::profiles::{filter_services_by_profile, select_active_profiles};
 use crate::compose::{compose_to_deployment, parse_compose_with_layers, ComposeFile};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 // ---------------------------------------------------------------------------
 // Subcommand definitions
@@ -2906,7 +2908,9 @@ mod tests {
     #[test]
     fn load_project_merges_two_files_in_order() {
         // Two compose files: the second overrides the first's image and adds a service.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-merges-two-files-in-order-")
+            .unwrap();
         let _ = write_file(
             dir.path(),
             "base.yaml",
@@ -2966,7 +2970,9 @@ services:
     fn load_project_project_name_flag_overrides_default() {
         // Default would derive from the directory basename. Confirm that
         // `--project-name` wins and is sanitised.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-project-name-flag-overrides-default-")
+            .unwrap();
         write_file(
             dir.path(),
             "compose.yaml",
@@ -2999,7 +3005,9 @@ services:
     fn load_project_profile_filter_drops_inactive_services() {
         // `web` has no profiles (always active); `debug` requires the
         // `debug` profile.  Confirm filtering happens during load.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-profile-filter-drops-inactive-services-")
+            .unwrap();
         write_file(
             dir.path(),
             "compose.yaml",
@@ -3062,7 +3070,9 @@ services:
     async fn persist_lists_and_deletes_via_storage() {
         let storage: Arc<dyn ComposeProjectStorage> =
             Arc::new(InMemoryComposeProjectStorage::new());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("persist-lists-and-deletes-via-storage-")
+            .unwrap();
 
         // 1. compose up persists a record.
         let project = make_loaded("alpha", dir.path());
@@ -3105,7 +3115,9 @@ services:
     async fn persist_overwrites_existing_record() {
         let storage: Arc<dyn ComposeProjectStorage> =
             Arc::new(InMemoryComposeProjectStorage::new());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("persist-overwrites-existing-record-")
+            .unwrap();
         let project = make_loaded("beta", dir.path());
 
         persist_compose_project(&storage, &project, vec!["beta-web-0".to_string()])

@@ -6,6 +6,8 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::info;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use axum::Router;
 
@@ -666,7 +668,9 @@ mod tests {
         use axum::routing::get;
         use std::time::Duration;
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-run-dual-starts-and-shuts-down-")
+            .unwrap();
         let sock_path = tmp_dir.path().join("test.sock");
 
         let router = Router::new().route("/health", get(|| async { "ok" }));

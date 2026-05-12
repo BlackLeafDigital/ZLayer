@@ -101,11 +101,14 @@ impl RaftService {
 mod tests {
     use super::*;
     use crate::raft::RaftConfig;
+    use zlayer_paths::ZLayerDirs;
 
     fn test_config() -> RaftConfig {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-config-")
+            .unwrap();
         RaftConfig {
-            data_dir: tmp.keep(),
+            data_dir: tmp.into_path(),
             ..RaftConfig::default()
         }
     }

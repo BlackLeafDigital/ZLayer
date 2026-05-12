@@ -234,12 +234,15 @@ async fn fetch_base_config_and_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn empty_parent_chain_rejected_before_hcs_call() {
         // We deliberately never touch HCS in this path — an empty chain
         // short-circuits with a clear message so the test runs on any host.
-        let tmp = tempfile::tempdir().expect("tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("empty-parent-chain-rejected-before-hcs-call-")
+            .expect("tmpdir");
         let chain = LayerChain::default();
         let err = create_writable_layer(tmp.path(), &chain, 20)
             .expect_err("empty chain must fail before calling HCS");

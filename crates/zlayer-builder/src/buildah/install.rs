@@ -656,11 +656,11 @@ mod tests {
 
     #[test]
     fn test_get_search_paths_not_empty() {
-        let install_dir = PathBuf::from("/tmp/zlayer-test");
+        let install_dir = PathBuf::from("/var/lib/zlayer-test");
         let paths = get_search_paths(&install_dir);
         assert!(!paths.is_empty());
         // First path should be in our custom install dir
-        assert!(paths[0].starts_with("/tmp/zlayer-test"));
+        assert!(paths[0].starts_with("/var/lib/zlayer-test"));
     }
 
     #[test]

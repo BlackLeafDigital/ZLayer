@@ -82,6 +82,9 @@ pub mod api;
 pub mod auth;
 pub mod client;
 pub mod jwt;
+pub mod scratch;
 pub mod secrets;
 pub mod spec;
 pub mod storage;
+
+pub use scratch::{Scratch, ScratchFile};

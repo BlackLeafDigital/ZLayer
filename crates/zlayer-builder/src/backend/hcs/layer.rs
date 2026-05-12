@@ -177,6 +177,7 @@ fn gzip_bytes(input: &[u8]) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn gzip_bytes_roundtrips_via_flate2() {
@@ -195,7 +196,9 @@ mod tests {
         // Build a tiny folder tree mirroring the HCS wclayer layout so we can
         // confirm `tar_export_folder` walks it correctly without actually
         // invoking HCS.
-        let tmp = tempfile::tempdir().expect("tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("invoking-hcs-")
+            .expect("tmpdir");
         std::fs::create_dir_all(tmp.path().join("Files")).unwrap();
         std::fs::create_dir_all(tmp.path().join("Hives")).unwrap();
         std::fs::write(tmp.path().join("Files").join("alpha.txt"), b"hello").unwrap();

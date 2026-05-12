@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use zlayer_agent::{AgentError, ContainerId, MacSandboxConfig, Runtime, SandboxRuntime};
+use zlayer_paths::ZLayerDirs;
 use zlayer_spec::DeploymentSpec;
 
 /// Macro to run async test body with a timeout
@@ -36,7 +37,11 @@ macro_rules! with_timeout {
     }};
 }
 
-const E2E_TEST_DIR: &str = "/tmp/zlayer-mps-smoke-test";
+fn e2e_test_dir() -> PathBuf {
+    ZLayerDirs::system_default()
+        .tmp()
+        .join("zlayer-mps-smoke-test")
+}
 
 // =============================================================================
 // Swift Metal source programs
@@ -253,7 +258,7 @@ fn unique_name(prefix: &str) -> String {
 }
 
 fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
-    let test_dir = PathBuf::from(E2E_TEST_DIR);
+    let test_dir = e2e_test_dir();
     let config = MacSandboxConfig {
         data_dir: test_dir.join("data"),
         log_dir: test_dir.join("logs"),
@@ -265,7 +270,7 @@ fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
 /// Compile a Swift source file into a binary using swiftc.
 /// Returns the path to the compiled binary.
 fn compile_swift(source: &str, binary_name: &str) -> PathBuf {
-    let tmp_dir = PathBuf::from(E2E_TEST_DIR).join("swift-build");
+    let tmp_dir = e2e_test_dir().join("swift-build");
     std::fs::create_dir_all(&tmp_dir).expect("Failed to create swift build dir");
 
     let src_path = tmp_dir.join(format!("{binary_name}.swift"));

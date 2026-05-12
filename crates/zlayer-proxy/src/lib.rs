@@ -54,6 +54,8 @@ pub mod stream;
 
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 // Re-export main types
 pub use config::{
@@ -481,14 +483,18 @@ mod tests {
 
     #[test]
     fn test_discover_certificates_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-discover-certificates-empty-dir-")
+            .unwrap();
         let certs = discover_certificates(&dir.path().to_path_buf());
         assert!(certs.is_empty());
     }
 
     #[test]
     fn test_discover_certificates_with_certs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-discover-certificates-with-certs-")
+            .unwrap();
 
         // Create a valid cert/key pair
         std::fs::write(dir.path().join("example.com.crt"), "cert content").unwrap();
@@ -508,7 +514,9 @@ mod tests {
 
     #[test]
     fn test_discover_certificates_missing_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-discover-certificates-missing-key-")
+            .unwrap();
 
         // Create a cert without corresponding key
         std::fs::write(dir.path().join("orphan.com.crt"), "cert content").unwrap();
@@ -526,7 +534,9 @@ mod tests {
 
     #[test]
     fn test_discovered_cert_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-discovered-cert-paths-")
+            .unwrap();
 
         std::fs::write(dir.path().join("test.example.com.crt"), "cert").unwrap();
         std::fs::write(dir.path().join("test.example.com.key"), "key").unwrap();

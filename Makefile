@@ -58,7 +58,7 @@ test-manager:
 # E2E tests requiring root (youki/libcontainer)
 test-e2e:
 	@echo "Cleaning up leftover state..."
-	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	sudo rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E tests with root privileges..."
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
 		cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1
@@ -66,7 +66,7 @@ test-e2e:
 # Run specific E2E test (usage: make test-e2e-single TEST=test_cleanup_state_directory)
 test-e2e-single:
 	@echo "Cleaning up leftover state..."
-	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	sudo rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E test: $(TEST)"
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
 		cargo test --package zlayer-agent --test youki_e2e $(TEST) -- --nocapture
@@ -94,9 +94,9 @@ test-features:
 # macOS Sandbox E2E tests
 test-macos-sandbox:
 	@echo "Setting up macOS sandbox E2E environment..."
-	rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
-	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
-	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+	rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test 2>/dev/null || true
+	mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/{data,logs}
+	mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/data/{containers,images}
 	@echo "Running macOS Sandbox E2E tests..."
 	cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture
 

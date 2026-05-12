@@ -42,6 +42,8 @@ use crate::storage::{
     StoredWorkflow, SyncStorage, TaskStorage, WorkflowAction, WorkflowRun, WorkflowRunStatus,
     WorkflowStep, WorkflowStorage,
 };
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// State for workflow endpoints.
 ///
@@ -967,7 +969,9 @@ mod tests {
     /// by confirming the deployment was written to the deployment store.
     #[tokio::test]
     async fn test_apply_sync_action_dispatches_to_inner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-apply-sync-action-dispatches-to-inner-")
+            .unwrap();
         // Scan dir = clone_root (sync has project_id = None and git_path = ".")
         std::fs::write(
             tmp.path().join("hello.yaml"),
@@ -1024,7 +1028,9 @@ mod tests {
     /// whole should be recorded as `Failed`.
     #[tokio::test]
     async fn test_deploy_project_missing_spec_path() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-deploy-project-missing-spec-path-")
+            .unwrap();
         let state = build_test_state(tmp.path().to_path_buf());
 
         // Project with no deploy_spec_path.
@@ -1059,7 +1065,9 @@ mod tests {
     /// from the cloned working copy, parses it, and upserts the deployment.
     #[tokio::test]
     async fn test_deploy_project_happy_path() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-deploy-project-happy-path-")
+            .unwrap();
         let state = build_test_state(tmp.path().to_path_buf());
 
         let mut project = StoredProject::new("with-spec");
@@ -1114,7 +1122,9 @@ mod tests {
     /// final run status.
     #[tokio::test]
     async fn test_build_project_propagates_terminal_status() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-build-project-propagates-terminal-status-")
+            .unwrap();
         let state = build_test_state(tmp.path().to_path_buf());
 
         // Project without a git URL — the action skips the clone step and

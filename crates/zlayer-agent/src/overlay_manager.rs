@@ -13,6 +13,8 @@ use tokio::sync::RwLock;
 use zlayer_overlay::{
     NatConfig, NatPeerSnapshot, NatStatusSnapshot, NatTraversal, OverlayConfig, OverlayTransport,
 };
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Maximum length for Linux network interface names (IFNAMSIZ - 1 for null terminator).
 const MAX_IFNAME_LEN: usize = 15;
@@ -1484,7 +1486,9 @@ mod tests {
         assert_eq!(a2, IpAddr::V4(Ipv4Addr::new(10, 200, 42, 2)));
         assert_eq!(a3, IpAddr::V4(Ipv4Addr::new(10, 200, 42, 3)));
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-allocator-persistence-roundtrip-")
+            .expect("tempdir");
         let state_path = dir.path().join("agent_ipam.json");
         alloc.save(&state_path).await.expect("save");
 

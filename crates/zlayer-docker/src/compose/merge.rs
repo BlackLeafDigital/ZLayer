@@ -164,6 +164,7 @@ pub fn resolve_paths(project_dir: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use zlayer_paths::ZLayerDirs;
 
     fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -180,7 +181,9 @@ mod tests {
 
     #[test]
     fn merge_single_file_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-single-file-round-trips-")
+            .unwrap();
         let f = write_file(
             dir.path(),
             "compose.yaml",
@@ -199,7 +202,9 @@ services:
 
     #[test]
     fn merge_two_files_later_overrides_scalar() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-two-files-later-overrides-scalar-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -225,7 +230,9 @@ services:
 
     #[test]
     fn merge_two_files_named_maps_are_merged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-two-files-named-maps-are-merged-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -273,7 +280,9 @@ services:
     fn merge_lists_are_replaced_not_appended() {
         // The Compose spec states that lists are replaced wholesale by the
         // override.  This is the property regression-tested here.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-lists-are-replaced-not-appended-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -304,7 +313,9 @@ services:
     #[test]
     fn merge_environment_maps_are_merged() {
         // When `environment` arrives as a YAML mapping it merges per-key.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-environment-maps-are-merged-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -339,7 +350,9 @@ services:
 
     #[test]
     fn merge_three_files_chain_left_to_right() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-three-files-chain-left-to-right-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -393,7 +406,9 @@ services:
 
     #[test]
     fn merge_rejects_invalid_yaml() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-rejects-invalid-yaml-")
+            .unwrap();
         let f = write_file(dir.path(), "bad.yaml", ":\n  - oops\n   bad indent\n");
         let err = merge_compose_files(std::slice::from_ref(&f)).unwrap_err();
         match err {

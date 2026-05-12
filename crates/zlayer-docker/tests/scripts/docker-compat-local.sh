@@ -6,11 +6,11 @@
 # against it.
 #
 # Process tracking:
-#   - State dir at /tmp/zlayer-docker-compat-state holds pidfile + last-test-dir.
+#   - State dir at ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/docker-compat-state holds pidfile + last-test-dir.
 #   - Daemon is spawned in its own process group via `setsid`; cleanup kills the
 #     whole pgid so child processes (e.g. spawned containers) die with it.
 #   - On startup, any leftover daemon listed in the pidfile is reaped.
-#   - Test dirs are timestamped under /tmp/zlayer-docker-compat-<ts>-<rand>/ and
+#   - Test dirs are timestamped under ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/docker-compat-<ts>-<rand>/ and
 #     pruned to the most-recent 5 unless KEEP_TEST_DIR=1.
 #
 # Modes:
@@ -25,11 +25,11 @@
 
 set -uo pipefail
 
-STATE_DIR="/tmp/zlayer-docker-compat-state"
+STATE_DIR="${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/docker-compat-state"
 PIDFILE="$STATE_DIR/daemon.pid"
 PGIDFILE="$STATE_DIR/daemon.pgid"
 LASTDIR_FILE="$STATE_DIR/last-test-dir"
-DIR_PREFIX="/tmp/zlayer-docker-compat-"
+DIR_PREFIX="${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/docker-compat-"
 mkdir -p "$STATE_DIR"
 
 # --- Reap any tracked leftover daemon ---

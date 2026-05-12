@@ -19,7 +19,7 @@
 //!   for credentials the closure returns the configured username/token. The
 //!   token never touches the filesystem and never appears on a command line.
 //! * **SSH key** — the private key is materialised in a private
-//!   [`tempfile::TempDir`] with mode `0600` on Unix. The `GIT_SSH_COMMAND`
+//!   [`zlayer_types::Scratch`] with mode `0600` on Unix. The `GIT_SSH_COMMAND`
 //!   environment variable is set for the duration of the operation so that
 //!   the SSH transport (which `gix` delegates to the system `ssh` binary)
 //!   picks up the key. Host-key checking is disabled because `ZLayer` manages
@@ -27,7 +27,7 @@
 //!   layer that in. An internal mutex serialises SSH-authenticated operations
 //!   to prevent concurrent callers from clobbering each other's environment.
 //!
-//! All temporary files are cleaned up when the [`tempfile::TempDir`] guard is
+//! All temporary files are cleaned up when the [`zlayer_types::Scratch`] guard is
 //! dropped at the end of each operation.
 
 pub mod sync;
@@ -215,7 +215,8 @@ mod blocking {
     use gix::refs::Target;
     use std::path::Path;
     use std::sync::Mutex;
-    use tempfile::TempDir;
+    use zlayer_paths::ZLayerDirs;
+    use zlayer_types::Scratch;
 
     /// Environment variables applied for the duration of a git operation,
     /// holding any on-disk credential material alive via a [`TempDir`].
@@ -224,7 +225,7 @@ mod blocking {
     /// impl — it keeps the on-disk SSH key alive for the duration of the
     /// operation, after which the temp directory and its contents vanish.
     struct AuthEnv {
-        _ssh_key_dir: Option<TempDir>,
+        _ssh_key_dir: Option<Scratch>,
         ssh_command: Option<String>,
     }
 
@@ -246,9 +247,8 @@ mod blocking {
             .as_ref()
             .ok_or_else(|| anyhow!("SSH auth requested but no key supplied"))?;
 
-        let tmp = tempfile::Builder::new()
-            .prefix("zlayer-git-ssh-")
-            .tempdir()
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-ssh-")
             .context("creating tempdir for SSH key")?;
         let key_path = tmp.path().join("id_key");
         write_ssh_key(&key_path, key)?;
@@ -635,10 +635,9 @@ mod blocking {
         with_auth(auth, &env, || {
             // gix has no "no-repo" remote listing path in 0.81, so stand up a
             // throwaway bare repository and use its remote subsystem. The
-            // TempDir is cleaned up automatically when this scope returns.
-            let scratch = tempfile::Builder::new()
-                .prefix("zlayer-git-lsremote-")
-                .tempdir()
+            // Scratch is cleaned up automatically when this scope returns.
+            let scratch = ZLayerDirs::system_default()
+                .scratch_dir("zlayer-git-lsremote-")
                 .context("creating tempdir for ls-remote scratch repo")?;
             let repo = gix::init_bare(scratch.path()).with_context(|| {
                 format!(
@@ -812,14 +811,14 @@ mod blocking {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
-    use tempfile::TempDir;
+    use zlayer_paths::ZLayerDirs;
+    use zlayer_types::Scratch;
 
     /// Create a bare repository and a working clone with an initial commit
     /// on `main`, then push. Returns `(bare_dir, first_clone_dir)`.
-    fn init_remote_with_commit() -> (TempDir, TempDir) {
-        let bare = tempfile::Builder::new()
-            .prefix("zlayer-git-bare-")
-            .tempdir()
+    fn init_remote_with_commit() -> (Scratch, Scratch) {
+        let bare = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-bare-")
             .expect("bare tempdir");
         let status = StdCommand::new("git")
             .args(["init", "--bare", "--initial-branch=main"])
@@ -828,9 +827,8 @@ mod tests {
             .expect("git init --bare");
         assert!(status.success(), "git init --bare failed");
 
-        let work = tempfile::Builder::new()
-            .prefix("zlayer-git-work-")
-            .tempdir()
+        let work = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-work-")
             .expect("work tempdir");
         run_sync(
             StdCommand::new("git")
@@ -913,9 +911,8 @@ mod tests {
         let bare_url = bare.path().to_string_lossy().into_owned();
 
         // --- Clone into a second workspace ------------------------------------
-        let second_root = tempfile::Builder::new()
-            .prefix("zlayer-git-second-")
-            .tempdir()
+        let second_root = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-second-")
             .unwrap();
         let second = second_root.path().join("repo");
         let clone_sha = clone_repo(&bare_url, "main", &GitAuth::anonymous(), &second)
@@ -1010,9 +1007,8 @@ mod tests {
             "git push",
         );
 
-        let target = tempfile::Builder::new()
-            .prefix("zlayer-git-checkout-")
-            .tempdir()
+        let target = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-checkout-")
             .unwrap();
         let repo = target.path().join("repo");
         let tip = clone_repo(&bare_url, "main", &GitAuth::anonymous(), &repo)
@@ -1055,16 +1051,14 @@ mod tests {
         // Initialise a bare repository purely through gix (no CLI), plant a
         // commit in it via a sibling non-bare repo created by the system
         // `git`, then clone it back out with zlayer-git's gix-backed API.
-        let bare = tempfile::Builder::new()
-            .prefix("zlayer-git-native-bare-")
-            .tempdir()
+        let bare = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-native-bare-")
             .unwrap();
         gix::init_bare(bare.path()).expect("gix::init_bare");
 
         // Seed the bare repo with a commit via the system git CLI.
-        let seed = tempfile::Builder::new()
-            .prefix("zlayer-git-native-seed-")
-            .tempdir()
+        let seed = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-native-seed-")
             .unwrap();
         run_sync(
             StdCommand::new("git")
@@ -1107,9 +1101,8 @@ mod tests {
         );
 
         // Now clone the gix-initialised bare repo through our gix-backed API.
-        let dest_root = tempfile::Builder::new()
-            .prefix("zlayer-git-native-dest-")
-            .tempdir()
+        let dest_root = ZLayerDirs::system_default()
+            .scratch_dir("zlayer-git-native-dest-")
             .unwrap();
         let dest = dest_root.path().join("clone");
         let url = bare.path().to_string_lossy().into_owned();

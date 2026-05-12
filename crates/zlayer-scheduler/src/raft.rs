@@ -27,6 +27,8 @@ use zlayer_types::api::internal::SecretsRaftOp;
 use zlayer_types::storage::{NodeIdentity, ReplicatedSecret};
 
 use crate::error::{Result, SchedulerError};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Node ID type (u64 for simplicity)
 pub type NodeId = u64;
@@ -1720,7 +1722,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_state_save_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-state-save-load-")
+            .unwrap();
         let mut state = ClusterState::new();
         state.apply(&Request::UpdateServiceState {
             service_name: "test-svc".to_string(),
@@ -1766,7 +1770,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_state_save_load_ipv6_overlay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-state-save-load-ipv6-overlay-")
+            .unwrap();
         let mut state = ClusterState::new();
         state.apply(&Request::UpdateServiceState {
             service_name: "test-svc-v6".to_string(),
@@ -1850,7 +1856,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_no_marker() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-no-marker-")
+            .unwrap();
         let result = load_and_clear_force_leader_state(dir.path()).unwrap();
         assert!(result.is_none());
     }

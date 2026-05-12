@@ -255,6 +255,7 @@ pub async fn try_pull_zlayer_image(
     image_dir: &Path,
     rootfs_dir: &Path,
 ) -> Result<bool> {
+    use zlayer_paths::ZLayerDirs;
     use zlayer_registry::{BlobCache, ImagePuller, LayerUnpacker};
 
     info!("Attempting to pull ZLayer image: {}", image_ref);
@@ -1925,7 +1926,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "live network test; runs against published RepoSources"]
     async fn test_map_linux_packages_live_reposources() {
-        let tmp = std::env::temp_dir().join("zlayer-test-pkg-map-live");
+        let tmp = ZLayerDirs::system_default()
+            .tmp()
+            .join("zlayer-test-pkg-map-live");
         let _ = tokio::process::Command::new("chmod")
             .args(["-R", "u+w"])
             .arg(&tmp)
@@ -1992,7 +1995,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_linux_packages_with_seeded_cache() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-with-seeded-cache-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("debian_12");
@@ -2036,7 +2041,9 @@ mod tests {
     /// `libssl-dev` (debian-only name) but `common/l.json` does.
     #[tokio::test]
     async fn test_map_linux_packages_falls_back_to_common() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-falls-back-to-common-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("centos_8");
@@ -2081,7 +2088,9 @@ mod tests {
     /// the more-specific source of truth for that distro.
     #[tokio::test]
     async fn test_map_linux_packages_distro_overrides_common() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-distro-overrides-common-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("alpine_3_20");

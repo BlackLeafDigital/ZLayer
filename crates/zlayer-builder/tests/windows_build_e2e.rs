@@ -24,13 +24,16 @@ use zlayer_builder::backend::hcs::HcsBackend;
 use zlayer_builder::backend::BuildBackend;
 use zlayer_builder::windows::deps::{validate_dockerfile, DepsError};
 use zlayer_builder::{BuildError, BuildOptions, Dockerfile};
+use zlayer_paths::ZLayerDirs;
 
 /// Where the HCS backend stages scratch layers, pulled parent chains, and
 /// written OCI blobs for this test. Lives under `%TEMP%\zlayer-builder-e2e-<n>`
 /// so a failing test leaves artefacts the developer can inspect without
 /// polluting the per-user `LocalAppData` directory the real builder uses.
 fn scratch_storage_root(slot: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("zlayer-builder-e2e-{slot}"))
+    ZLayerDirs::system_default()
+        .tmp()
+        .join(format!("zlayer-builder-e2e-{slot}"))
 }
 
 /// Full end-to-end build: pull `nanoserver`, apply a trivial `COPY`, capture
@@ -48,7 +51,9 @@ fn scratch_storage_root(slot: &str) -> std::path::PathBuf {
 #[tokio::test]
 #[ignore = "requires Windows host with HCS + MCR network access + SeBackupPrivilege"]
 async fn hcs_backend_round_trip_nanoserver_copy() {
-    let tmp = tempfile::tempdir().expect("tempdir for build context");
+    let tmp = ZLayerDirs::system_default()
+        .scratch_dir("hcs-backend-round-trip-nanoserver-copy-")
+        .expect("tempdir for build context");
     let context = tmp.path();
 
     // COPY source — the HCS builder's COPY handler doesn't care about the
@@ -148,7 +153,9 @@ COPY --from=builder C:\artifact.txt C:\artifact.txt
         "sanity: parser produces two stages"
     );
 
-    let tmp = tempfile::tempdir().expect("tempdir for build context");
+    let tmp = ZLayerDirs::system_default()
+        .scratch_dir("hcs-backend-rejects-multi-stage-")
+        .expect("tempdir for build context");
     let backend = HcsBackend::with_storage_root(scratch_storage_root("reject-multi-stage"))
         .await
         .expect("construct HCS backend");

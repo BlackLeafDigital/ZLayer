@@ -33,7 +33,7 @@ impl ZLayerDirs {
     pub fn default_data_dir() -> PathBuf {
         #[cfg(target_os = "macos")]
         {
-            home_dir_or_tmp().join(".zlayer")
+            home_dir_or_fallback().join(".zlayer")
         }
         #[cfg(target_os = "windows")]
         {
@@ -44,7 +44,7 @@ impl ZLayerDirs {
             if is_root() {
                 PathBuf::from("/var/lib/zlayer")
             } else {
-                home_dir_or_tmp().join(".zlayer")
+                home_dir_or_fallback().join(".zlayer")
             }
         }
     }
@@ -284,6 +284,12 @@ impl ZLayerDirs {
         self.data_dir.join("volumes")
     }
 
+    /// Project git clones directory (`{data}/projects`). Persistent state —
+    /// per-project working copies live at `{data}/projects/{project_id}`.
+    pub fn projects(&self) -> PathBuf {
+        self.data_dir.join("projects")
+    }
+
     /// WASM module cache directory (`{data}/wasm`).
     pub fn wasm(&self) -> PathBuf {
         self.data_dir.join("wasm")
@@ -375,6 +381,44 @@ impl ZLayerDirs {
         self.data_dir.join("tmp")
     }
 
+    /// Create a uniquely-named scratch directory under `{data}/tmp`.
+    ///
+    /// Returns a [`zlayer_types::Scratch`] RAII guard — the directory is
+    /// removed when the guard is dropped. Use this instead of
+    /// `tempfile::tempdir()` so scratch data lives on the configured data
+    /// filesystem rather than `/tmp`, which is tmpfs (RAM-backed) on most
+    /// modern Linux distros and risks OOM for large scratch data
+    /// (build contexts, image tarballs, layer staging, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying filesystem error if `{data}/tmp` can't be
+    /// created or the unique subdirectory can't be allocated.
+    pub fn scratch_dir(&self, prefix: &str) -> std::io::Result<zlayer_types::Scratch> {
+        std::fs::create_dir_all(self.tmp())?;
+        let td = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(self.tmp())?;
+        Ok(zlayer_types::Scratch::from_tempdir(td))
+    }
+
+    /// Create a uniquely-named scratch file under `{data}/tmp`.
+    ///
+    /// Returns a [`zlayer_types::ScratchFile`] RAII guard. Same rationale
+    /// as [`Self::scratch_dir`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying filesystem error if `{data}/tmp` can't be
+    /// created or the unique file can't be allocated.
+    pub fn scratch_file(&self, prefix: &str) -> std::io::Result<zlayer_types::ScratchFile> {
+        std::fs::create_dir_all(self.tmp())?;
+        let nf = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempfile_in(self.tmp())?;
+        Ok(zlayer_types::ScratchFile::from_named(nf))
+    }
+
     /// Data-dir-aware WireGuard UAPI socket directory.
     ///
     /// When `data_dir == Self::default_data_dir()`, returns
@@ -411,10 +455,13 @@ pub fn default_admin_bearer_path() -> PathBuf {
 // -- Internal helpers --------------------------------------------------------
 
 #[cfg(not(target_os = "windows"))]
-fn home_dir_or_tmp() -> PathBuf {
+fn home_dir_or_fallback() -> PathBuf {
+    // Falls back to the FHS system data dir rather than /tmp because /tmp is
+    // tmpfs (RAM-backed) on most modern Linux distros and silently landing
+    // daemon state there courts OOM.
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/zlayer"))
 }
 
 /// Resolve the Windows system-wide ZLayer data root.
@@ -518,10 +565,10 @@ mod tests {
 
     #[test]
     fn admin_bearer_path_is_under_data_dir() {
-        let dirs = ZLayerDirs::new(PathBuf::from("/tmp/zlayer-test"));
+        let dirs = ZLayerDirs::new(PathBuf::from("/var/lib/zlayer-test"));
         assert_eq!(
             dirs.admin_bearer_path(),
-            PathBuf::from("/tmp/zlayer-test/admin_bearer.token")
+            PathBuf::from("/var/lib/zlayer-test/admin_bearer.token")
         );
     }
 
@@ -708,5 +755,29 @@ mod tests {
         let dirs = ZLayerDirs::system_default();
         let expected = ZLayerDirs::default_data_dir().join("run").join("wireguard");
         assert_eq!(dirs.wireguard(), expected);
+    }
+
+    #[test]
+    fn scratch_dir_under_data_tmp() {
+        let parent = tempfile::tempdir().expect("parent");
+        let dirs = ZLayerDirs::new(parent.path());
+        let s = dirs.scratch_dir("zlayer-test-").expect("scratch_dir");
+        assert!(s.path().starts_with(dirs.tmp()));
+        assert!(s.path().is_dir());
+        let kept = s.path().to_path_buf();
+        drop(s);
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn scratch_file_under_data_tmp() {
+        let parent = tempfile::tempdir().expect("parent");
+        let dirs = ZLayerDirs::new(parent.path());
+        let f = dirs.scratch_file("zlayer-test-").expect("scratch_file");
+        assert!(f.path().starts_with(dirs.tmp()));
+        assert!(f.path().is_file());
+        let kept = f.path().to_path_buf();
+        drop(f);
+        assert!(!kept.exists());
     }
 }

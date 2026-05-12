@@ -31,6 +31,8 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use super::StorageError;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// A compose project record.
 ///
@@ -600,7 +602,9 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_persists_across_reopen() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("sqlite-persists-across-reopen-")
+            .unwrap();
         let db_path = temp_dir.path().join("compose-projects.db");
         let project = make_project("persist");
 

@@ -276,6 +276,6 @@ mod tests {
     fn lockfile_path_for_directory() {
         // Real path; relies on /tmp existing.
         let p = lockfile_path_for(Path::new("/tmp"));
-        assert_eq!(p, PathBuf::from("/tmp/zlayer-bottles.lock"));
+        assert_eq!(p, PathBuf::from("/var/lib/zlayer-bottles.lock"));
     }
 }

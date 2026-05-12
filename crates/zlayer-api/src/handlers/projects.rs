@@ -14,6 +14,7 @@ use axum::{
     Json,
 };
 
+use zlayer_paths::ZLayerDirs;
 pub use zlayer_types::api::projects::*;
 
 use crate::error::{ApiError, Result};
@@ -53,7 +54,7 @@ impl ProjectState {
         Self {
             store,
             git_creds: None,
-            clone_root: std::env::temp_dir().join("zlayer-projects"),
+            clone_root: ZLayerDirs::system_default().projects(),
         }
     }
 

@@ -261,6 +261,7 @@ mod tests {
     use super::*;
     use crate::storage::DeploymentStatus;
     use std::collections::HashMap;
+    use zlayer_paths::ZLayerDirs;
     use zlayer_spec::{DeploymentSpec, ImageSpec, ServiceSpec};
 
     fn create_test_spec(name: &str) -> DeploymentSpec {
@@ -545,7 +546,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_storage() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-storage-")
+            .unwrap();
         let db_path = temp_dir.path().join("test.db");
 
         // Create and populate database

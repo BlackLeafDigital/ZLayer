@@ -42,6 +42,7 @@ use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 use zlayer_types::ImageReference;
 
+use zlayer_paths::ZLayerDirs;
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
 
@@ -2666,7 +2667,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_directory_recursive() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-copy-directory-recursive-")
+            .unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
 
@@ -2701,7 +2704,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sandbox_builder_scratch_base() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-sandbox-builder-scratch-base-")
+            .unwrap();
         let context_dir = tmp.path().join("context");
         let data_dir = tmp.path().join("data");
         tokio::fs::create_dir_all(&context_dir).await.unwrap();
@@ -2749,7 +2754,9 @@ CMD ["cat", "/hello.txt"]
 
     #[tokio::test]
     async fn test_multi_stage_build() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-multi-stage-build-")
+            .unwrap();
         let context_dir = tmp.path().join("context");
         let data_dir = tmp.path().join("data");
         tokio::fs::create_dir_all(&context_dir).await.unwrap();
@@ -2790,7 +2797,9 @@ CMD ["cat", "/app.txt"]
 
     #[tokio::test]
     async fn test_arg_substitution_in_build() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-arg-substitution-in-build-")
+            .unwrap();
         let context_dir = tmp.path().join("context");
         let data_dir = tmp.path().join("data");
         tokio::fs::create_dir_all(&context_dir).await.unwrap();
@@ -2827,7 +2836,9 @@ COPY file.txt .
 
     #[tokio::test]
     async fn test_shell_instruction() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-shell-instruction-")
+            .unwrap();
         let context_dir = tmp.path().join("context");
         let data_dir = tmp.path().join("data");
         tokio::fs::create_dir_all(&context_dir).await.unwrap();

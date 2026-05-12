@@ -37,6 +37,7 @@ use zlayer_registry::oci_export::{OciDescriptor, OciIndex, OciLayout, OciManifes
 use crate::dockerfile::{HealthcheckInstruction, ShellOrExec};
 
 use super::scratch::BaseLayerBlob;
+use zlayer_paths::ZLayerDirs;
 
 /// OCI image-config media type. Public so tests and the backend module can
 /// reference the exact string without retyping it.
@@ -649,7 +650,9 @@ mod tests {
             enc.finish().unwrap()
         }
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("gzip-bytes-")
+            .unwrap();
         let cfg = demo_config();
 
         let base_uncompressed = b"fake base bytes";

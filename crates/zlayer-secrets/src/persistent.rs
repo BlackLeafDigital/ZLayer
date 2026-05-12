@@ -34,6 +34,8 @@ use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use tracing::{debug, info};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use crate::{
     EncryptionKey, Result, Secret, SecretMetadata, SecretsError, SecretsProvider, SecretsStore,
@@ -361,8 +363,10 @@ impl SecretsStore for PersistentSecretsStore {
 mod tests {
     use super::*;
 
-    async fn create_test_store() -> (PersistentSecretsStore, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn create_test_store() -> (PersistentSecretsStore, zlayer_types::Scratch) {
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("create-test-store-")
+            .unwrap();
         let db_path = temp_dir.path().join("test_secrets.sqlite");
         let key = EncryptionKey::generate();
         let store = PersistentSecretsStore::open(&db_path, key).await.unwrap();
@@ -510,7 +514,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-persistence-")
+            .unwrap();
         let db_path = temp_dir.path().join("persist_test.sqlite");
 
         // Use fixed key for persistence test
@@ -538,7 +544,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_key_fails_decryption() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-wrong-key-fails-decryption-")
+            .unwrap();
         let db_path = temp_dir.path().join("wrong_key_test.sqlite");
 
         // Write with one key
@@ -562,7 +570,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_with_directory() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-open-with-directory-")
+            .unwrap();
         let key = EncryptionKey::generate();
 
         // Pass directory path instead of file path
@@ -638,7 +648,9 @@ mod tests {
     ///    a no-op instead of tripping `File exists (os error 17)`.
     #[tokio::test]
     async fn open_on_fresh_dir_creates_directory() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("open-on-fresh-dir-creates-directory-")
+            .unwrap();
         // Subpath that does not exist yet — mirrors the
         // `{data_dir}/secrets` shape the daemon passes in.
         let path = tmp.path().join("secrets");
@@ -677,7 +689,9 @@ mod tests {
     /// which will reject the malformed database.
     #[tokio::test]
     async fn open_on_pre_existing_file_does_not_clobber() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("open-on-pre-existing-file-does-not-clobber-")
+            .unwrap();
         let path = tmp.path().join("secrets");
         std::fs::write(&path, b"legacy content not a sqlite db").unwrap();
         assert!(path.is_file(), "precondition: path is a regular file");

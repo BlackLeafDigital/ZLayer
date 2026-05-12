@@ -12,6 +12,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// A single structured log entry from any source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +304,9 @@ mod tests {
 
     #[test]
     fn file_log_writer_writes_jsonl() {
-        let dir = std::env::temp_dir().join(format!("zlayer-log-test-{}", std::process::id()));
+        let dir = ZLayerDirs::system_default()
+            .tmp()
+            .join(format!("zlayer-log-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.jsonl");
 
@@ -345,8 +349,9 @@ mod tests {
 
     #[test]
     fn file_log_writer_appends_to_existing_file() {
-        let dir =
-            std::env::temp_dir().join(format!("zlayer-log-append-test-{}", std::process::id()));
+        let dir = ZLayerDirs::system_default()
+            .tmp()
+            .join(format!("zlayer-log-append-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("append.jsonl");
 

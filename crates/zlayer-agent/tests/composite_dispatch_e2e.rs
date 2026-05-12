@@ -137,7 +137,8 @@ fn test_slice() -> ipnet::IpNet {
 /// dedicated test slice so containers pick up real overlay endpoints.
 fn test_hcs_config(storage_suffix: &str) -> HcsConfig {
     HcsConfig {
-        storage_root: std::env::temp_dir()
+        storage_root: ZLayerDirs::system_default()
+            .tmp()
             .join("zlayer-composite-e2e")
             .join(storage_suffix),
         slice_cidr: Some(test_slice()),

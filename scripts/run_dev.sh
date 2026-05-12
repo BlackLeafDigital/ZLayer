@@ -45,7 +45,7 @@ else
     RUN_DIR="/var/run/zlayer"
 fi
 ROOTFS="${DATA_DIR}/images/zlayer-manager_native/rootfs"
-DEPLOY_SPEC="/tmp/zlayer-deploy-test/manager-native.zlayer.yml"
+DEPLOY_SPEC="${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/deploy-test/manager-native.zlayer.yml"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -294,9 +294,9 @@ cmd_test() {
     # Platform-specific tests
     if [ "$PLATFORM" = "macos" ]; then
         info "Running macOS sandbox E2E tests (28 tests)..."
-        rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
-        mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
-        mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+        rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test 2>/dev/null || true
+        mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/{data,logs}
+        mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/data/{containers,images}
         if cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture; then
             ok "Sandbox E2E passed"
             passed=$((passed + 1))
@@ -317,7 +317,7 @@ cmd_test() {
 
     if [ "$PLATFORM" = "linux" ]; then
         info "Running youki E2E tests (requires sudo)..."
-        sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+        sudo rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/youki-e2e-test/state/* 2>/dev/null || true
         if sudo -E env "PATH=$HOME/.cargo/bin:$PATH" \
             cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1; then
             ok "Youki E2E passed"
@@ -503,7 +503,7 @@ cmd_smoke() {
         cmd_build
     fi
 
-    local SMOKE_SPEC="/tmp/zlayer-smoke-test.yml"
+    local SMOKE_SPEC="${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/smoke-test.yml"
     local ZLAYER="./target/release/zlayer"
 
     # Create a simple nginx deploy spec

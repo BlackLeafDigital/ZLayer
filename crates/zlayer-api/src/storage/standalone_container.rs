@@ -26,6 +26,8 @@ use zlayer_agent::runtime::ContainerId;
 
 use super::StorageError;
 use crate::handlers::containers::StandaloneContainer;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for standalone-container storage backends.
 ///
@@ -621,7 +623,9 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_persists_across_reopen() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("sqlite-persists-across-reopen-")
+            .unwrap();
         let db_path = temp_dir.path().join("standalone-containers.db");
 
         // Write through one handle...

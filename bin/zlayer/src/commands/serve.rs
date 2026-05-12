@@ -2397,17 +2397,22 @@ async fn build_bridge_network_state() -> BridgeNetworkApiState {
 #[cfg(test)]
 mod tests {
     use super::{container_reachable_api_url, read_daemon_metadata};
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn read_daemon_metadata_missing_file_is_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("does-not-exist.json");
         assert!(read_daemon_metadata(&path).is_none());
     }
 
     #[test]
     fn read_daemon_metadata_malformed_is_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(&path, "this is not json {{}").expect("write");
         assert!(read_daemon_metadata(&path).is_none());
@@ -2415,7 +2420,9 @@ mod tests {
 
     #[test]
     fn read_daemon_metadata_valid_returns_pid() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(
             &path,
@@ -2433,7 +2440,9 @@ mod tests {
         // StaleDaemonMeta marks it `#[serde(default)]` to tolerate older
         // formats. Verify that path explicitly so a future tightening of the
         // schema doesn't silently break stale-daemon detection.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(&path, r#"{"pid":9}"#).expect("write");
         let meta = read_daemon_metadata(&path).expect("parsed");
@@ -2487,7 +2496,9 @@ mod tests {
             WorkflowStep,
         };
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let dir = tmp.path().to_path_buf();
 
         // ---- first run: open bundle, write one record per store ----

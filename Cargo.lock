@@ -12414,9 +12414,10 @@ dependencies = [
  "gix",
  "serde",
  "serde_yaml",
- "tempfile",
  "tokio",
  "tracing",
+ "zlayer-paths",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12567,6 +12568,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "zlayer-paths",
 ]
 
 [[package]]
@@ -12609,6 +12611,7 @@ dependencies = [
  "nix 0.31.2",
  "tempfile",
  "windows 0.62.2",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12831,6 +12834,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.18",
  "utoipa",
  "uuid",

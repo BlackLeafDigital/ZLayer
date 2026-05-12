@@ -10,6 +10,8 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
 use tracing::warn;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use crate::error::ApiError;
 use crate::handlers::users::AuthActor;
@@ -696,7 +698,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_registry_auth_async_with_cred_store() {
         let key = zlayer_secrets::EncryptionKey::generate();
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-resolve-registry-auth-async-with-cred-store-")
+            .unwrap();
         let db_path = temp_dir.path().join("test_async_auth.sqlite");
         let store = zlayer_secrets::PersistentSecretsStore::open(&db_path, key)
             .await
@@ -745,7 +749,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_registry_auth_async_missing_credential() {
         let key = zlayer_secrets::EncryptionKey::generate();
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-resolve-registry-auth-async-missing-credential-")
+            .unwrap();
         let db_path = temp_dir.path().join("test_async_auth_missing.sqlite");
         let store = zlayer_secrets::PersistentSecretsStore::open(&db_path, key)
             .await

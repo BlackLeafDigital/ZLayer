@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.23] - 2026-05-12
+
+### Changed
+- Scratch storage (Docker build contexts, OCI image tarballs, S3 layer staging,
+  SQLite replicator caches, git clones, in-memory store fixtures) now lives
+  under `{data_dir}/tmp` instead of the OS temp dir. Avoids putting large
+  scratch data on `tmpfs` (RAM-backed `/tmp` on most Linux distros), preventing
+  OOM on memory-tight nodes during big builds or layer uploads. New types
+  `zlayer_types::Scratch` and `zlayer_types::ScratchFile` (RAII guards), plus
+  helpers `ZLayerDirs::scratch_dir(prefix)` / `ZLayerDirs::scratch_file(prefix)`
+  in `zlayer-paths`. Project git clones moved from `${TMPDIR}/zlayer-projects`
+  to `{data_dir}/projects` (new `ZLayerDirs::projects()` accessor), so they
+  survive daemon restarts. Shell scripts (`build-macos-images.sh`,
+  `run_dev.sh`, `Makefile`, `docker-compat-local.sh`) now anchor scratch dirs
+  at `${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/...` for the same reason.
+
 ## [0.11.22] - 2026-05-11
 
 ### Added

@@ -167,6 +167,7 @@ impl NotifierStorage for SqlxNotifierStore {
 mod tests {
     use super::*;
     use crate::storage::{NotifierConfig, NotifierKind, StoredNotifier};
+    use zlayer_paths::ZLayerDirs;
 
     fn make_notifier(name: &str, kind: NotifierKind) -> StoredNotifier {
         let config = match kind {
@@ -365,7 +366,9 @@ mod tests {
     async fn test_sqlx_persistent_storage() {
         // Survives closing + reopening the database — the whole point of the
         // persistent backend.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("persistent-backend-")
+            .unwrap();
         let db_path = temp_dir.path().join("notifiers.db");
 
         let n = make_notifier("persist-me", NotifierKind::Webhook);

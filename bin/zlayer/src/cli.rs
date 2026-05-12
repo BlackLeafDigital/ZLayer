@@ -3465,7 +3465,7 @@ mod tests {
             "--no-swagger",
             "--daemon",
             "--socket",
-            "/tmp/zlayer-test.sock",
+            "/var/lib/zlayer-test.sock",
         ])
         .unwrap();
 
@@ -3482,7 +3482,7 @@ mod tests {
                 assert_eq!(jwt_secret, Some("test-secret".to_string()));
                 assert!(no_swagger);
                 assert!(daemon);
-                assert_eq!(socket, Some("/tmp/zlayer-test.sock".to_string()));
+                assert_eq!(socket, Some("/var/lib/zlayer-test.sock".to_string()));
             }
             _ => panic!("Expected Serve command"),
         }

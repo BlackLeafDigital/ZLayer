@@ -18,13 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
 use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_paths::ZLayerDirs;
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, PullPolicy,
     ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
 };
+use zlayer_types::Scratch;
 
 // =============================================================================
 // Test WASM Modules (WAT - WebAssembly Text Format)
@@ -169,12 +170,14 @@ fn compile_wat(wat: &str) -> Vec<u8> {
 }
 
 /// Create a temporary cache directory for testing
-fn create_test_cache_dir() -> TempDir {
-    tempfile::tempdir().expect("Failed to create temp directory")
+fn create_test_cache_dir() -> Scratch {
+    ZLayerDirs::system_default()
+        .scratch_dir("create-test-cache-dir-")
+        .expect("Failed to create temp directory")
 }
 
 /// Create a `WasmConfig` for testing
-fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
+fn create_test_config(cache_dir: &Scratch) -> WasmConfig {
     WasmConfig {
         cache_dir: cache_dir.path().to_path_buf(),
         enable_epochs: true,
@@ -271,7 +274,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
 }
 
 /// Write a WASM binary to the cache directory and return the "image" path
-fn write_wasm_to_cache(cache_dir: &TempDir, name: &str, wasm_bytes: &[u8]) -> String {
+fn write_wasm_to_cache(cache_dir: &Scratch, name: &str, wasm_bytes: &[u8]) -> String {
     let cache_key = name.replace(['/', ':', '@'], "_");
     let cache_path = cache_dir.path().join(format!("{cache_key}.wasm"));
     std::fs::write(&cache_path, wasm_bytes).expect("Failed to write WASM to cache");

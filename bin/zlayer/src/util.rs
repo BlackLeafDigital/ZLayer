@@ -200,10 +200,15 @@ pub(crate) fn decode_base64_json(input: &str) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
     use std::fs;
+    use zlayer_paths::ZLayerDirs;
 
     /// Create a unique temp directory for each test to avoid parallel test interference.
     fn make_temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zlayer_test_{}_{}", name, std::process::id()));
+        let dir = ZLayerDirs::system_default().tmp().join(format!(
+            "zlayer_test_{}_{}",
+            name,
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("failed to create temp dir");
         dir

@@ -18,6 +18,8 @@ use tracing::{error, info, warn};
 use crate::storage::{
     OidcIdentity, OidcIdentityStorage, StorageError, StoredUser, UserRole, UserStorage,
 };
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 use zlayer_secrets::{CredentialStore, PersistentSecretsStore, SecretsError};
 
 /// Error surface for [`IdentityManager`] operations.
@@ -364,9 +366,9 @@ mod tests {
         Arc<IdentityManager>,
         Arc<dyn UserStorage>,
         Arc<CredentialStore<Arc<PersistentSecretsStore>>>,
-        tempfile::TempDir,
+        zlayer_types::Scratch,
     ) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default().scratch_dir("mk-").unwrap();
         let users: Arc<dyn UserStorage> = Arc::new(InMemoryUserStore::new());
         let secrets = Arc::new(
             PersistentSecretsStore::open(
@@ -510,7 +512,7 @@ mod tests {
         Arc<IdentityManager>,
         Arc<dyn UserStorage>,
         Arc<dyn OidcIdentityStorage>,
-        tempfile::TempDir,
+        zlayer_types::Scratch,
     ) {
         let (_i, users, creds, tmp) = mk().await;
         let oidc: Arc<dyn OidcIdentityStorage> =

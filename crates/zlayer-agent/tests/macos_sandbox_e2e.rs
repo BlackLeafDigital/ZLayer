@@ -24,6 +24,7 @@ use std::time::Duration;
 use zlayer_agent::{
     AgentError, ContainerId, ContainerState, MacSandboxConfig, Runtime, SandboxRuntime,
 };
+use zlayer_paths::ZLayerDirs;
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
 extern crate libc;
@@ -44,7 +45,11 @@ macro_rules! with_timeout {
 }
 
 /// E2E test directory prefix
-const E2E_TEST_DIR: &str = "/tmp/zlayer-macos-sandbox-e2e-test";
+fn e2e_test_dir() -> PathBuf {
+    ZLayerDirs::system_default()
+        .tmp()
+        .join("zlayer-macos-sandbox-e2e-test")
+}
 
 // =============================================================================
 // Helper Functions
@@ -107,7 +112,7 @@ async fn wait_for_state(
 
 /// Create a `SandboxRuntime` configured for E2E testing
 fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
-    let test_dir = PathBuf::from(E2E_TEST_DIR);
+    let test_dir = e2e_test_dir();
     let config = MacSandboxConfig {
         data_dir: test_dir.join("data"),
         log_dir: test_dir.join("logs"),
@@ -355,9 +360,7 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
         if let Some(dir) = cache.get(&safe_name) {
             dir.clone()
         } else {
-            let dir = PathBuf::from(E2E_TEST_DIR)
-                .join("native-sources")
-                .join(&safe_name);
+            let dir = e2e_test_dir().join("native-sources").join(&safe_name);
 
             std::fs::create_dir_all(dir.join("bin")).expect("Failed to create bin dir");
             for binary in &["echo", "sleep", "sh", "cat", "ls"] {

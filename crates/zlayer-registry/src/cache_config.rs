@@ -230,6 +230,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+    use zlayer_paths::ZLayerDirs;
 
     /// Environment variable names used by cache configuration
     const ENV_CACHE_TYPE: &str = "ZLAYER_CACHE_TYPE";
@@ -382,7 +383,9 @@ mod tests {
     #[cfg(feature = "persistent")]
     #[tokio::test]
     async fn test_build_persistent_cache() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-build-persistent-cache-")
+            .unwrap();
         let cache_path = temp_dir.path().join("test.sqlite");
 
         let cache_type = CacheType::persistent_at(&cache_path);

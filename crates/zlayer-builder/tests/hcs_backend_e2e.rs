@@ -63,8 +63,11 @@ async fn build_trivial_dockerfile_against_nanoserver() {
     use zlayer_builder::backend::hcs::HcsBackend;
     use zlayer_builder::backend::BuildBackend;
     use zlayer_builder::{BuildOptions, Dockerfile};
+    use zlayer_paths::ZLayerDirs;
 
-    let tmp = tempfile::tempdir().expect("tmpdir for build context");
+    let tmp = ZLayerDirs::system_default()
+        .scratch_dir("build-trivial-dockerfile-against-nanoserver-")
+        .expect("tmpdir for build context");
     let context = tmp.path();
 
     // Drop a fake "executable" into the context so COPY has something to do.
@@ -81,7 +84,7 @@ CMD ["C:\\hello.exe"]
     )
     .expect("parse Dockerfile");
 
-    let storage = std::env::temp_dir().join("zlayer-hcs-e2e");
+    let storage = ZLayerDirs::system_default().tmp().join("zlayer-hcs-e2e");
     let backend = HcsBackend::with_storage_root(storage)
         .await
         .expect("construct HCS backend");

@@ -10,6 +10,7 @@ use zlayer_spec::{DependencyCondition, HealthCheck, Protocol, ScaleSpec, Storage
 use super::convert::compose_to_deployment;
 use super::types::{ComposePort, ComposeServiceNetworks, ComposeVolume, DependsOnCondition};
 use crate::compose::parse_compose;
+use zlayer_paths::ZLayerDirs;
 
 // =========================================================================
 // ComposePort::parse (pub method on a pub type)
@@ -482,7 +483,9 @@ services:
 #[test]
 fn test_env_file_single_path() {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ZLayerDirs::system_default()
+        .scratch_dir("test-env-file-single-path-")
+        .unwrap();
     let env_path = dir.path().join(".env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "# comment").unwrap();
@@ -553,7 +556,9 @@ services:
 #[test]
 fn test_env_file_list_mixed() {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ZLayerDirs::system_default()
+        .scratch_dir("test-env-file-list-mixed-")
+        .unwrap();
     let env_path = dir.path().join("real.env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "REAL_VAR=yes").unwrap();
