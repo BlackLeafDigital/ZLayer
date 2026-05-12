@@ -57,6 +57,19 @@ fn main() -> ExitCode {
     // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
+    if matches!(&cli.command, None | Some(Commands::Tui { .. })) {
+        let stdin_tty = std::io::stdin().is_terminal();
+        let stdout_tty = std::io::stdout().is_terminal();
+        if !stdin_tty || !stdout_tty {
+            eprintln!(
+                "Error: zlayer's TUI requires an interactive terminal \
+                 (stdin and stdout must both be a TTY)."
+            );
+            eprintln!("Run `zlayer --help` to list non-interactive subcommands.");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // No subcommand or explicit `tui` -> launch the interactive TUI
     match &cli.command {
         None => return run_tui_entry(None),
