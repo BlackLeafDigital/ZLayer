@@ -701,6 +701,7 @@ impl OverlayBootstrap {
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: self.nat_config.clone().unwrap_or_default(),
+            ..crate::config::OverlayConfig::default()
         };
 
         #[cfg(feature = "nat")]
@@ -978,6 +979,7 @@ impl OverlayBootstrap {
                     peer_discovery_interval: Duration::from_secs(30),
                     #[cfg(feature = "nat")]
                     nat: crate::nat::NatConfig::default(),
+                    ..crate::config::OverlayConfig::default()
                 };
                 let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
                 tmp.add_peer(&peer_info).await
@@ -1110,6 +1112,7 @@ impl OverlayBootstrap {
                 peer_discovery_interval: Duration::from_secs(30),
                 #[cfg(feature = "nat")]
                 nat: crate::nat::NatConfig::default(),
+                ..crate::config::OverlayConfig::default()
             };
             let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
             tmp.remove_peer(public_key).await

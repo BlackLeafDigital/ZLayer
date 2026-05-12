@@ -273,9 +273,18 @@ impl OverlayTransport {
     /// Path to the UAPI Unix socket for this interface.
     ///
     /// Linux/macOS only — Windows does not use UAPI.
+    ///
+    /// Derived from [`OverlayConfig::uapi_sock_dir`] so callers running
+    /// with a non-default `--data-dir` can scope their UAPI sockets to
+    /// their own data directory (avoids collisions with a system-wide
+    /// zlayer install that owns `/var/run/wireguard`).
     #[cfg(not(windows))]
     fn uapi_sock_path(&self) -> String {
-        format!("/var/run/wireguard/{}.sock", self.interface_name)
+        self.config
+            .uapi_sock_dir
+            .join(format!("{}.sock", self.interface_name))
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Create the TUN interface.
@@ -311,6 +320,7 @@ impl OverlayTransport {
 
     /// Linux / macOS implementation of [`Self::create_interface`].
     #[cfg(not(windows))]
+    #[allow(clippy::too_many_lines)]
     async fn create_interface_unix(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // On Linux, validate interface name length (IFNAMSIZ = 15).
         // On macOS, the kernel auto-assigns utunN names so validation is skipped.
@@ -323,8 +333,9 @@ impl OverlayTransport {
             .into());
         }
 
-        // Ensure the UAPI socket directory exists
-        tokio::fs::create_dir_all("/var/run/wireguard").await?;
+        // Ensure the UAPI socket directory exists (data-dir-aware — see
+        // `OverlayConfig::uapi_sock_dir`).
+        tokio::fs::create_dir_all(&self.config.uapi_sock_dir).await?;
 
         // On Linux, refuse to silently delete an existing kernel link. Stale
         // interfaces from a previous crashed daemon are swept by the
@@ -364,9 +375,12 @@ impl OverlayTransport {
         }
 
         // Clean up stale UAPI socket left behind by a crashed process.
-        let sock_path = format!("/var/run/wireguard/{}.sock", self.interface_name);
+        let sock_path = self
+            .config
+            .uapi_sock_dir
+            .join(format!("{}.sock", self.interface_name));
         if tokio::fs::try_exists(&sock_path).await.unwrap_or(false) {
-            tracing::warn!(path = %sock_path, "removing stale UAPI socket");
+            tracing::warn!(path = %sock_path.display(), "removing stale UAPI socket");
             let _ = tokio::fs::remove_file(&sock_path).await;
         }
 
@@ -375,7 +389,7 @@ impl OverlayTransport {
         #[cfg(target_os = "macos")]
         let existing_socks = {
             let mut set = std::collections::HashSet::new();
-            if let Ok(mut entries) = tokio::fs::read_dir("/var/run/wireguard").await {
+            if let Ok(mut entries) = tokio::fs::read_dir(&self.config.uapi_sock_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     set.insert(entry.file_name().to_string_lossy().to_string());
                 }
@@ -421,7 +435,7 @@ impl OverlayTransport {
         {
             // Small delay to let boringtun finish socket setup
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(mut entries) = tokio::fs::read_dir("/var/run/wireguard").await {
+            if let Ok(mut entries) = tokio::fs::read_dir(&self.config.uapi_sock_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     if !existing_socks.contains(&fname)
@@ -1563,6 +1577,7 @@ mod tests {
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: crate::nat::NatConfig::default(),
+            uapi_sock_dir: std::path::PathBuf::from("/var/run/wireguard"),
         };
 
         // On macOS, boringtun uses "utun" and the kernel assigns utunN.
@@ -1613,6 +1628,7 @@ mod tests {
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: crate::nat::NatConfig::default(),
+            uapi_sock_dir: std::path::PathBuf::from("/var/run/wireguard"),
         };
 
         #[cfg(target_os = "macos")]

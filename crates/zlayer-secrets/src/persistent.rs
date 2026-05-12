@@ -86,6 +86,33 @@ impl PersistentSecretsStore {
     pub async fn open(path: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
         let path = path.as_ref();
 
+        // Fresh `--data-dir` boot race: if `path` does not exist yet AND its
+        // extension does not look like a `SQLite` file name, treat it as the
+        // canonical secrets *directory* and `mkdir -p` it now. This makes the
+        // `path.is_dir()` branch below take, so `db_path` ends up as
+        // `{path}/secrets.sqlite` and downstream code that also calls
+        // `fs::create_dir_all({data_dir}/secrets)` (e.g. the node keypair
+        // loader at `bin/zlayer/src/daemon.rs`) no longer trips EEXIST
+        // because we've already created the directory atomically.
+        //
+        // This intentionally does NOT touch the case where `path` exists as
+        // a regular file (legacy pre-0.11.20 layout). The
+        // `migrate_legacy_secrets_layout` step in `bin/zlayer/src/migrations.rs`
+        // owns that path and converts the file to a directory before we ever
+        // get here.
+        let looks_like_dir = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|s| !matches!(s, "sqlite" | "db" | "sqlite3"));
+        if looks_like_dir && !path.exists() {
+            std::fs::create_dir_all(path).map_err(|e| {
+                SecretsError::Storage(format!(
+                    "Failed to create secrets directory {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+
         // If the path is an existing directory, append the default database filename
         let db_path = if path.is_dir() {
             path.join(DEFAULT_DB_FILENAME)
@@ -598,5 +625,79 @@ mod tests {
 
         let retrieved = store.get_secret("scope", "large").await.unwrap();
         assert_eq!(retrieved.expose().len(), 1024 * 1024);
+    }
+
+    /// Regression test for the EEXIST race observed on fresh `--data-dir`
+    /// boots (see `## [0.11.22]` in `CHANGELOG.md`):
+    ///
+    /// 1. Caller passes `{data_dir}/secrets` to `open()` and the path does
+    ///    not exist yet.
+    /// 2. `open()` MUST `mkdir -p` the path BEFORE handing it to `SQLite`,
+    ///    so the subsequent `fs::create_dir_all({data_dir}/secrets)` call
+    ///    in `bin/zlayer/src/daemon.rs::load_or_generate_node_keypair` is
+    ///    a no-op instead of tripping `File exists (os error 17)`.
+    #[tokio::test]
+    async fn open_on_fresh_dir_creates_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Subpath that does not exist yet — mirrors the
+        // `{data_dir}/secrets` shape the daemon passes in.
+        let path = tmp.path().join("secrets");
+        assert!(
+            !path.exists(),
+            "precondition: path must not exist before open()"
+        );
+
+        let key = EncryptionKey::generate();
+        let _store = PersistentSecretsStore::open(&path, key)
+            .await
+            .expect("open() on non-existent dir path should succeed");
+
+        // The path must now be a directory, and SQLite must have created
+        // `secrets.sqlite` *inside* it (not as the path itself).
+        assert!(
+            path.is_dir(),
+            "open() should have created {} as a directory",
+            path.display()
+        );
+        assert!(
+            path.join(DEFAULT_DB_FILENAME).exists(),
+            "secrets.sqlite should exist inside {}",
+            path.display()
+        );
+    }
+
+    /// Confirms the fresh-dir fix does NOT clobber a pre-existing regular
+    /// file at the target path. The legacy pre-0.11.20 layout stored a
+    /// `SQLite` database directly at `{data_dir}/secrets`, and
+    /// `bin/zlayer/src/migrations.rs::migrate_legacy_secrets_layout` is
+    /// responsible for converting that file to a directory *before*
+    /// `open()` is called. If migration is skipped (e.g. a test pointing
+    /// at a stray non-SQLite file), `open()` must NOT silently delete or
+    /// overwrite the file — it should pass the path through to `SQLite`,
+    /// which will reject the malformed database.
+    #[tokio::test]
+    async fn open_on_pre_existing_file_does_not_clobber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets");
+        std::fs::write(&path, b"legacy content not a sqlite db").unwrap();
+        assert!(path.is_file(), "precondition: path is a regular file");
+
+        let key = EncryptionKey::generate();
+        let result = PersistentSecretsStore::open(&path, key).await;
+
+        // SQLite should reject the non-DB file. The exact error code
+        // varies by libsqlite version, but it must be a Storage error and
+        // it must NOT have deleted/replaced the file. We assert the
+        // file's original bytes are intact, which is the load-bearing
+        // invariant (user data preservation).
+        assert!(
+            result.is_err(),
+            "open() on a non-SQLite regular file should fail, not silently succeed"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes, b"legacy content not a sqlite db",
+            "open() must not modify a pre-existing file at the secrets path"
+        );
     }
 }

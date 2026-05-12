@@ -15,28 +15,32 @@ pub(crate) fn default_data_dir() -> PathBuf {
 
 /// Return the platform-appropriate default runtime directory.
 ///
-/// - macOS: `{default_data_dir}/run`
-/// - Linux: `/var/run/zlayer`
-/// - Windows: `{default_data_dir}\run`
-pub(crate) fn default_run_dir(_data_dir: &std::path::Path) -> PathBuf {
-    zlayer_paths::ZLayerDirs::default_run_dir()
+/// When `data_dir` matches the platform default data directory, returns the
+/// system-default run dir (e.g. `/var/run/zlayer` on Linux). Otherwise
+/// derives `{data_dir}/run` so callers passing `--data-dir /tmp/foo` get an
+/// isolated runtime directory and don't collide with a system install.
+pub(crate) fn default_run_dir(data_dir: &std::path::Path) -> PathBuf {
+    zlayer_paths::ZLayerDirs::default_run_dir_for(data_dir)
 }
 
 /// Return the platform-appropriate default log directory.
 ///
-/// - macOS: `{default_data_dir}/logs`
-/// - Linux: `/var/log/zlayer`
-/// - Windows: `{default_data_dir}\logs`
-pub(crate) fn default_log_dir(_data_dir: &std::path::Path) -> PathBuf {
-    zlayer_paths::ZLayerDirs::default_log_dir()
+/// When `data_dir` matches the platform default data directory, returns the
+/// system-default log dir (e.g. `/var/log/zlayer` on Linux). Otherwise
+/// derives `{data_dir}/logs` so callers passing `--data-dir /tmp/foo` get
+/// fully isolated logs and don't collide with a system install.
+pub(crate) fn default_log_dir(data_dir: &std::path::Path) -> PathBuf {
+    zlayer_paths::ZLayerDirs::default_log_dir_for(data_dir)
 }
 
 /// Return the platform-appropriate default socket path.
 ///
-/// On Windows, returns a TCP address instead of a Unix socket path since
-/// Unix domain sockets have limited support on Windows.
-pub(crate) fn default_socket_path(_data_dir: &std::path::Path) -> String {
-    zlayer_paths::ZLayerDirs::default_socket_path()
+/// When `data_dir` matches the platform default data directory, returns the
+/// system-default socket path (e.g. `/var/run/zlayer.sock` on Linux).
+/// Otherwise derives `{data_dir}/run/zlayer.sock`. On Windows always returns
+/// the TCP loopback endpoint since Unix domain sockets have limited support.
+pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
+    zlayer_paths::ZLayerDirs::default_socket_path_for(data_dir)
 }
 
 /// `ZLayer` container orchestration platform
@@ -618,6 +622,29 @@ pub(crate) enum Commands {
         /// Defaults to {run-dir}/zlayer.sock.
         #[arg(long)]
         socket: Option<String>,
+
+        /// Deployment name used to scope overlay network interfaces, socket
+        /// paths, and per-deployment state. Defaults to "zlayer". Set this to
+        /// a unique value when running a second daemon alongside a system
+        /// install to avoid collisions on kernel-level resources (link names
+        /// like `zl-<name>-g`, `WireGuard` UAPI sockets under
+        /// `/var/run/wireguard/`).
+        #[arg(long, env = "ZLAYER_DEPLOYMENT_NAME", default_value = "zlayer")]
+        deployment_name: String,
+
+        /// UDP port for `WireGuard` overlay traffic. Defaults to
+        /// `zlayer_core::DEFAULT_WG_PORT` (51420). Override when running a
+        /// second daemon alongside a system install to avoid UDP port
+        /// collision. CLI flag takes precedence over `node_config.json`'s
+        /// `overlay_port` field (used by the `node init` flow).
+        #[arg(long, env = "ZLAYER_WG_PORT")]
+        wg_port: Option<u16>,
+
+        /// TCP/UDP port for the overlay DNS server (binds on 127.0.0.1).
+        /// Defaults to `zlayer_overlay::DEFAULT_DNS_PORT` (15353). Override
+        /// when running a second daemon to avoid port collision.
+        #[arg(long, env = "ZLAYER_DNS_PORT")]
+        dns_port: Option<u16>,
 
         /// Override the WSL2 vhdSize cap (GiB). Defaults to ~80% of free host disk.
         /// Only meaningful on Windows.
@@ -3480,6 +3507,76 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { socket, .. }) => {
                 assert_eq!(socket, Some("/tmp/custom.sock".to_string()));
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_deployment_name_default() {
+        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                deployment_name, ..
+            }) => {
+                assert_eq!(deployment_name, "zlayer");
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_deployment_name_flag() {
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--deployment-name", "foo"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                deployment_name, ..
+            }) => {
+                assert_eq!(deployment_name, "foo");
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_wg_port_default() {
+        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { wg_port, .. }) => {
+                assert_eq!(wg_port, None);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_wg_port_flag() {
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--wg-port", "51421"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { wg_port, .. }) => {
+                assert_eq!(wg_port, Some(51421));
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_dns_port_default() {
+        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { dns_port, .. }) => {
+                assert_eq!(dns_port, None);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_dns_port_flag() {
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--dns-port", "15354"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { dns_port, .. }) => {
+                assert_eq!(dns_port, Some(15354));
             }
             _ => panic!("Expected Serve command"),
         }

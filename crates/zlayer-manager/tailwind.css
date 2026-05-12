@@ -6,6 +6,17 @@
 /* Source paths for class scanning */
 @source "./src/**/*.rs";
 
+/* Exclude unrelated workspace directories from Tailwind's auto-detect
+ * pass. Without these, the v4 source scan picks up arbitrary-property
+ * patterns like `[api:8080]` from example deployment YAML comments and
+ * generates rules like `.\[api\:8080\]{api:8080}`. Firefox dutifully
+ * drops the unknown declarations and logs warnings. */
+@source not "../../examples/**";
+@source not "../../docs/**";
+@source not "../../images/**";
+@source not "../../tests/**";
+@source not "./tests/**";
+
 /* DaisyUI plugin for component library */
 @plugin "daisyui" {
   themes: light --default, dark --prefersdark, dracula;

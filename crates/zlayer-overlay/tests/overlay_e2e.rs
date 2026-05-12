@@ -209,6 +209,7 @@ async fn test_overlay_config_and_peer_config_format() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     assert_eq!(config.local_endpoint.port(), 51820);
@@ -297,6 +298,7 @@ async fn test_overlay_interface_lifecycle() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     let mut manager = OverlayTransport::new(config, iface_name.to_string());
@@ -413,6 +415,7 @@ async fn test_dual_overlay_connectivity() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     let config_b = OverlayConfig {
@@ -424,6 +427,7 @@ async fn test_dual_overlay_connectivity() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     let mut manager_a = OverlayTransport::new(config_a, iface_a.to_string());
@@ -571,6 +575,7 @@ async fn test_overlay_config_and_peer_config_format_ipv6() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     assert_eq!(config.local_endpoint.port(), 51820);
@@ -717,6 +722,7 @@ async fn test_overlay_interface_lifecycle_ipv6() {
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
     };
 
     let mut manager = OverlayTransport::new(config, iface_name.to_string());

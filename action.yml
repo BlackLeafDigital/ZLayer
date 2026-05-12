@@ -1,5 +1,5 @@
 name: 'ZLayer CLI'
-description: 'Install and run ZLayer CLI commands for container orchestration and WASM plugin management'
+description: 'Install and (optionally) run the ZLayer CLI'
 author: 'BlackLeaf Digital'
 
 branding:
@@ -12,8 +12,9 @@ inputs:
     required: false
     default: 'latest'
   command:
-    description: 'ZLayer command to run'
-    required: true
+    description: 'Optional ZLayer command to run after install. If empty, the action only installs.'
+    required: false
+    default: ''
   working-directory:
     description: 'Working directory for the command'
     required: false
@@ -23,6 +24,9 @@ outputs:
   version:
     description: 'Installed ZLayer version'
     value: ${{ steps.install.outputs.version }}
+  bin-dir:
+    description: 'Directory the zlayer binary was installed into'
+    value: ${{ steps.install.outputs.bin_dir }}
 
 runs:
   using: 'composite'
@@ -31,56 +35,92 @@ runs:
       id: platform
       shell: bash
       run: |
+        set -euo pipefail
         OS=$(uname -s | tr '[:upper:]' '[:lower:]')
         ARCH=$(uname -m)
         case "$ARCH" in
-          x86_64) ARCH="amd64" ;;
+          x86_64|amd64)  ARCH="amd64" ;;
           aarch64|arm64) ARCH="arm64" ;;
+          *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
         esac
         case "$OS" in
-          darwin) PLATFORM="${OS}-${ARCH}" ;;
-          linux) PLATFORM="linux-${ARCH}" ;;
-          *) echo "Unsupported OS: $OS"; exit 1 ;;
+          darwin) PLATFORM="darwin-${ARCH}" ;;
+          linux)  PLATFORM="linux-${ARCH}" ;;
+          *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
         esac
-        echo "platform=$PLATFORM" >> $GITHUB_OUTPUT
+        echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
 
     - name: Install ZLayer
       id: install
       shell: bash
       run: |
+        set -euo pipefail
+
         VERSION="${{ inputs.version }}"
         PLATFORM="${{ steps.platform.outputs.platform }}"
 
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "Error: jq is required but not installed." >&2
+          echo "  macOS:  brew install jq" >&2
+          echo "  Linux:  sudo apt-get install -y jq  (or your package manager)" >&2
+          exit 1
+        fi
+
         if [ "$VERSION" = "latest" ]; then
-          VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-            https://api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest | jq -r .tag_name)
+          if ! API_JSON="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+                  "https://api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest")"; then
+            echo "Error: Failed to fetch latest release from api.github.com (timeout/network)." >&2
+            echo "Pin a version explicitly via the 'version' input if this persists." >&2
+            exit 1
+          fi
+          VERSION="$(printf '%s' "$API_JSON" | jq -r '.tag_name // empty')"
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "Error: Could not determine latest version"
+            echo "Error: Could not parse tag_name from GitHub API response." >&2
             exit 1
           fi
         fi
 
         DL_VERSION="${VERSION#v}"
-        echo "Installing ZLayer $VERSION for $PLATFORM..."
-
         ARTIFACT="zlayer-${DL_VERSION}-${PLATFORM}.tar.gz"
         URL="https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/${ARTIFACT}"
+        echo "Installing ZLayer ${VERSION} for ${PLATFORM}"
+        echo "Source: ${URL}"
 
-        if ! curl -fsSL --connect-timeout 30 --max-time 120 \
-            "$URL" -o zlayer.tar.gz; then
-          echo "Error: Failed to download ZLayer ${VERSION} for ${PLATFORM}"
-          echo "URL: ${URL}"
+        TMPDIR="${RUNNER_TEMP:-/tmp}/zlayer-install-$$"
+        BIN_DIR="${RUNNER_TEMP:-/tmp}/zlayer-bin"
+        mkdir -p "$TMPDIR" "$BIN_DIR"
+        trap 'rm -rf "$TMPDIR"' EXIT
+
+        if ! curl -fsSL --connect-timeout 30 --max-time 300 \
+                "$URL" -o "${TMPDIR}/zlayer.tar.gz"; then
+          echo "Error: Download failed for ${URL}" >&2
           exit 1
         fi
 
-        tar xzf zlayer.tar.gz
-        sudo mv zlayer /usr/local/bin/
-        rm zlayer.tar.gz
+        tar -xzf "${TMPDIR}/zlayer.tar.gz" -C "${TMPDIR}"
 
-        zlayer --version
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer -perm -u+x | head -1)"
+        if [ -z "$BIN_PATH" ]; then
+          BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer | head -1)"
+        fi
+        if [ -z "$BIN_PATH" ]; then
+          echo "Error: zlayer binary not found inside ${ARTIFACT}" >&2
+          ls -laR "${TMPDIR}" >&2 || true
+          exit 1
+        fi
+
+        install -m 0755 "$BIN_PATH" "${BIN_DIR}/zlayer"
+        echo "${BIN_DIR}" >> "$GITHUB_PATH"
+
+        "${BIN_DIR}/zlayer" --version
+
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
 
     - name: Run ZLayer command
+      if: inputs.command != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: zlayer ${{ inputs.command }}
+      run: |
+        set -euo pipefail
+        zlayer ${{ inputs.command }}

@@ -996,7 +996,14 @@ impl DaemonClient {
             delay = std::cmp::min(delay * 2, max_delay);
         }
 
-        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
+        // The daemon was spawned with `--data-dir <detect_data_dir>` (or
+        // inherited ZLAYER_DATA_DIR), so derive its log dir the same way to
+        // surface the correct path under custom data-dirs.
+        let spawn_data_dir = std::env::var_os("ZLAYER_DATA_DIR").map_or_else(
+            zlayer_paths::ZLayerDirs::detect_data_dir,
+            std::path::PathBuf::from,
+        );
+        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir_for(&spawn_data_dir);
         let log_path = log_dir.join("daemon.log");
         let timeout_secs = 10;
         eprintln!("Failed to start ZLayer daemon after {timeout_secs}s.");
@@ -1080,7 +1087,13 @@ impl DaemonClient {
             delay = std::cmp::min(delay * 2, max_delay);
         }
 
-        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
+        // Mirror the data-dir resolution used when spawning the daemon so the
+        // hint points at the correct logs under custom data-dirs.
+        let spawn_data_dir = std::env::var_os("ZLAYER_DATA_DIR").map_or_else(
+            zlayer_paths::ZLayerDirs::detect_data_dir,
+            std::path::PathBuf::from,
+        );
+        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir_for(&spawn_data_dir);
         let log_path = log_dir.join("daemon.log");
         let timeout_secs = 10;
         eprintln!("Failed to start ZLayer daemon after {timeout_secs}s.");
@@ -1520,7 +1533,13 @@ impl DaemonClient {
         match status.as_u16() {
             404 => bail!("404 Not Found: {msg}. Check deployment name with 'zlayer ps'."),
             500 => {
-                let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
+                // Mirror the data-dir resolution the running daemon would use
+                // so the hint is correct under custom `--data-dir`.
+                let spawn_data_dir = std::env::var_os("ZLAYER_DATA_DIR").map_or_else(
+                    zlayer_paths::ZLayerDirs::detect_data_dir,
+                    std::path::PathBuf::from,
+                );
+                let log_dir = zlayer_paths::ZLayerDirs::default_log_dir_for(&spawn_data_dir);
                 let log_path = log_dir.join("daemon.log");
                 bail!(
                     "500 Internal Server Error: {}. Check logs at {}",

@@ -2,6 +2,144 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.22] - 2026-05-11
+
+### Added
+- `zlayer serve --wg-port <port>` (also `ZLAYER_WG_PORT`) and
+  `zlayer serve --dns-port <port>` (also `ZLAYER_DNS_PORT`) let an
+  operator bind the WireGuard overlay UDP port and the overlay DNS
+  server on caller-chosen ports. Defaults remain
+  `zlayer_core::DEFAULT_WG_PORT` (51420) and
+  `zlayer_overlay::DEFAULT_DNS_PORT` (15353). Precedence for `wg-port`
+  is `CLI flag > node_config.json#overlay_port > constant default`; for
+  `dns-port` it is `CLI flag > constant default`. Pair with
+  `--deployment-name` to run a hermetic test daemon alongside a system
+  install without UDP/DNS port collisions. The launchd installer
+  forwards both overrides into the generated plist.
+- `zlayer serve --deployment-name <name>` (also `ZLAYER_DEPLOYMENT_NAME`)
+  scopes overlay network interfaces, the WireGuard UAPI socket name, and
+  per-deployment runtime state to a caller-chosen prefix. The default
+  remains `"zlayer"` (so `zl-zlayer-*` link names and stock socket paths
+  are unchanged), but a second daemon can now run alongside a system
+  install by passing `--deployment-name zlayer-e2e`, which produces
+  `zl-zlayer-e2e-g` instead of colliding on `zl-zlayer-g`. The launchd
+  install path forwards the override into the generated plist.
+- End-to-end test harness for the `zlayer-manager` UI under
+  `crates/zlayer-manager/tests/e2e/`, driven by Intellitester +
+  Playwright. Includes a bootstrap → logout → login workflow, a
+  navigation smoke pass across every protected route, and a
+  stale-session regression covering the ghost-session fix below. The
+  stale-session test bootstraps an admin, persists the resulting
+  Playwright storage state, wipes the user row from `users.db` via
+  `sqlite3`, then loads the cookies back with intellitester's
+  `--storage-state` flag and asserts (network layer via
+  `expectResponse`, browser-jar layer via `assertCookies`) that
+  `manager_me` cleared both `zlayer_session` and `zlayer_csrf`. The
+  hermetic runner (`scripts/run-suite.sh`) spins up a daemon and the
+  manager against a throwaway data directory, runs the suite, and
+  tears everything down on exit. Browsers and node deps are not
+  bundled — see `tests/e2e/README.md` for the one-time install step.
+  Requires `intellitester@^0.4.5`.
+- `manager-intellitester-tests` job added to both
+  `.github/workflows/e2e.yml` and `.forgejo/workflows/e2e.yml`. The job
+  installs cargo-leptos + Playwright Chromium, then drives the
+  hermetic runner under `sudo -E` (the daemon needs CAP_NET_ADMIN for
+  the overlay manager). It is wired into the release-dispatch gate
+  (`trigger-release` on GitHub, `dispatch-build` on Forgejo) so a
+  failing browser test blocks tag creation just like the existing
+  Youki / WASM / Docker / macOS suites. A new `test`
+  `workflow_dispatch` choice input lets an operator run a single
+  intellitester file (`bootstrap.test.yaml`, `nav-smoke.test.yaml`,
+  `auth.workflow.yaml`, etc.) without running the full suite — useful
+  for fast iteration on a single regression. The Forgejo job uses the
+  internal `setup-rust@main`, `s3-cache@main`, and `ci-step-status@main`
+  actions to match the existing e2e jobs, including S3-backed caching
+  of the Playwright browser tarball.
+- `crates/zlayer-manager/tests/e2e/scripts/run-suite.sh` now accepts
+  `--only <test.yaml>` (run a single intellitester file and skip the
+  stale-session sqlite step) and `--no-build` (skip `cargo build` /
+  `cargo leptos build` when `target/release` is already current). The
+  test daemon is now launched with `--deployment-name zlayer-e2e
+  --wg-port 51421 --dns-port 15354` so it can run alongside a stock
+  zlayer install without colliding on `zl-zlayer-*` interface names or
+  the default UDP+DNS ports. All four ports
+  (`ZLAYER_E2E_API_PORT`, `ZLAYER_E2E_MANAGER_PORT`,
+  `ZLAYER_E2E_WG_PORT`, `ZLAYER_E2E_DNS_PORT`) are env-overridable.
+
+### Fixed
+- Fresh `--data-dir` boots no longer crash with
+  `Failed to create node key directory {data_dir}/secrets: File exists
+  (os error 17)`. `PersistentSecretsStore::open` previously branched on
+  `path.is_dir()`, and when the data dir did not yet exist the branch
+  fell through to treat `{data_dir}/secrets` as a *file* path, after
+  which SQLite created a regular file at that location. The subsequent
+  `fs::create_dir_all({data_dir}/secrets)` call in
+  `load_or_generate_node_keypair` then tripped EEXIST against the file.
+  `open` now `mkdir -p`s the path up front when it doesn't exist and the
+  extension doesn't look like a `SQLite` filename, so the directory
+  branch always wins on fresh installs. The legacy upgrade path in
+  `bin/zlayer/src/migrations.rs` also swaps `create_dir` for
+  `create_dir_all` defensively so a partially-completed migration is
+  idempotent on the next boot.
+- The `zlayer serve` boot sweep no longer indiscriminately deletes
+  network interfaces, WireGuard UAPI sockets, or `utun` devices that
+  belong to another live daemon. The Linux/macOS link sweep now only
+  matches names starting with `zl-<deployment-name>-` (derived from the
+  new `--deployment-name` flag), and the WireGuard socket sweep only
+  removes `*.sock` files whose stem starts with that same prefix. On top
+  of that, if a `daemon.json` from another data directory (the system
+  `/var/lib/zlayer` location or the user `~/.zlayer` location) names a
+  PID that is still alive, the entire sweep is skipped with a warning —
+  two daemons sharing the default `"zlayer"` deployment name would
+  otherwise see their prefix matches overlap. Stale links survive a
+  hostile run-over of a live overlay every time.
+- `--data-dir` now actually isolates daemon logs, runtime state, and the
+  control socket. Previously the CLI promised "Other directories (logs,
+  run, containers) are derived from this unless individually overridden"
+  but `default_log_dir` / `default_run_dir` / `default_socket_path`
+  ignored the resolved data dir and always returned `/var/log/zlayer`,
+  `/var/run/zlayer`, and `/var/run/zlayer.sock` on Linux. Passing
+  `--data-dir /tmp/foo` would still collide with a system-installed
+  daemon. The path resolver now exposes data-dir-aware variants
+  (`default_log_dir_for`, `default_run_dir_for`,
+  `default_socket_path_for`) and the CLI wrappers use them: stock
+  installs are unaffected (FHS layout preserved) but custom data-dirs
+  derive `{data_dir}/logs`, `{data_dir}/run`, and
+  `{data_dir}/run/zlayer.sock`. Fixes the e2e harness collision with a
+  running root-owned daemon.
+- The WireGuard UAPI socket directory is now data-dir-aware. Stock
+  installs still write boringtun UAPI sockets to `/var/run/wireguard`
+  (so `wg(8)` can talk to them), but a daemon launched with
+  `--data-dir /tmp/foo` now writes them to `/tmp/foo/run/wireguard`,
+  matching the rest of the data-dir-aware path resolver. The boot sweep
+  scoped to `zl-<deployment-name>-*.sock` walks the same data-dir-aware
+  directory, so an isolated test daemon no longer touches the
+  host-global socket dir even by accident. New
+  `ZLayerDirs::wireguard()` helper centralises the path; new
+  `OverlayConfig::uapi_sock_dir` field threads it through the overlay
+  transport (defaulting to the FHS path for source-compat).
+- The Manager UI's compiled CSS no longer contains malformed
+  `.\[api\:8080\]{api:8080}` / `.\[cache\:6379\]{cache:6379}` /
+  `.\[database\:5432\]{database:5432}` / `.\[web\:443\]{web:443}`
+  rules that triggered "Unknown property" console warnings in
+  Firefox. Tailwind v4's auto-detect pass was scanning the whole
+  workspace and treating ASCII-art port-mapping diagrams in
+  `examples/containers/multi-service/deployment.yaml` as arbitrary-
+  property class names. `crates/zlayer-manager/tailwind.css` now
+  explicitly excludes `examples/`, `docs/`, `images/`, and `tests/`
+  from the scan.
+- The Manager UI no longer gets stuck in a "ghost session" when the
+  upstream API rejects a forwarded `zlayer_session` cookie at
+  `GET /auth/me` (e.g. the user row was deleted, the data directory was
+  swapped, or the daemon restarted with an empty `users.db`). The
+  `manager_me` server function now fires a best-effort
+  `POST /auth/logout` when it sees a 401 against a forwarded session
+  cookie, which returns expired `Set-Cookie` headers for both
+  `zlayer_session` and `zlayer_csrf`. The browser drops the stale
+  cookies and the next request lands cleanly on `/login` (or
+  `/bootstrap` if the user table is empty) instead of re-replaying the
+  dead session forever.
+
 ## [0.11.21] - 2026-05-10
 
 ### Fixed

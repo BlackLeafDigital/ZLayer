@@ -10,6 +10,7 @@ use crate::nat::ConnectionType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,18 +104,29 @@ pub struct OverlayHealthChecker {
     /// Handshake timeout threshold
     handshake_timeout: Duration,
 
+    /// Directory holding the boringtun UAPI sockets
+    /// (`<dir>/<interface>.sock`). Mirrors
+    /// [`crate::config::OverlayConfig::uapi_sock_dir`] so the checker reads
+    /// from the same data-dir-aware location the transport writes to.
+    uapi_sock_dir: PathBuf,
+
     /// Peer status cache
     peer_status: RwLock<HashMap<String, PeerStatus>>,
 }
 
 impl OverlayHealthChecker {
     /// Create a new health checker for the given interface
+    ///
+    /// Uses the FHS-default UAPI socket directory (`/var/run/wireguard`).
+    /// Call [`Self::with_uapi_sock_dir`] to override when the daemon is
+    /// running with a non-default `--data-dir`.
     #[must_use]
     pub fn new(interface: &str, check_interval: Duration) -> Self {
         Self {
             interface: interface.to_string(),
             check_interval,
             handshake_timeout: Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            uapi_sock_dir: PathBuf::from("/var/run/wireguard"),
             peer_status: RwLock::new(HashMap::new()),
         }
     }
@@ -130,6 +142,23 @@ impl OverlayHealthChecker {
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
+    }
+
+    /// Override the UAPI socket directory.
+    ///
+    /// Defaults to `/var/run/wireguard`. The daemon overrides this to
+    /// `{data_dir}/run/wireguard` when running with a non-default
+    /// `--data-dir` to keep test/dev daemons hermetic.
+    #[must_use]
+    pub fn with_uapi_sock_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.uapi_sock_dir = dir.into();
+        self
+    }
+
+    /// Returns the UAPI socket directory in use by this checker.
+    #[must_use]
+    pub fn uapi_sock_dir(&self) -> &Path {
+        &self.uapi_sock_dir
     }
 
     /// Run continuous health check loop
@@ -347,7 +376,11 @@ impl OverlayHealthChecker {
     /// query. Parses the key=value response into [`WgPeerStats`] entries.
     /// No external `wg` binary is required.
     async fn get_wg_stats(&self) -> Result<Vec<WgPeerStats>> {
-        let sock_path = format!("/var/run/wireguard/{}.sock", self.interface);
+        let sock_path = self
+            .uapi_sock_dir
+            .join(format!("{}.sock", self.interface))
+            .to_string_lossy()
+            .into_owned();
 
         let response = match uapi_get_raw(&sock_path).await {
             Ok(resp) => resp,

@@ -12607,6 +12607,7 @@ version = "0.0.0-dev"
 dependencies = [
  "libc",
  "nix 0.31.2",
+ "tempfile",
  "windows 0.62.2",
 ]
 
