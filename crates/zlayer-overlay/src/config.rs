@@ -4,6 +4,7 @@
 use crate::nat::NatConfig;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Overlay network configuration
@@ -46,6 +47,14 @@ pub struct OverlayConfig {
     #[cfg(feature = "nat")]
     #[serde(default)]
     pub nat: NatConfig,
+
+    /// Directory containing per-interface `WireGuard` UAPI sockets
+    /// (`<dir>/<interface_name>.sock`). Defaults to `/var/run/wireguard`
+    /// on Linux for `wg(8)` interop; overridden to `{data_dir}/run/wireguard`
+    /// by the daemon when running with a non-default `--data-dir` to keep
+    /// a test/dev daemon hermetic.
+    #[serde(default = "OverlayConfig::default_uapi_sock_dir")]
+    pub uapi_sock_dir: PathBuf,
 }
 
 impl OverlayConfig {
@@ -60,6 +69,17 @@ impl OverlayConfig {
     fn default_discovery() -> Duration {
         Duration::from_secs(30)
     }
+
+    /// Platform-default `WireGuard` UAPI socket directory.
+    ///
+    /// Linux: `/var/run/wireguard` (FHS, matches `wg(8)`).
+    /// macOS / Windows: `/var/run/wireguard` is the historical literal
+    /// the transport used; the daemon overrides this to a data-dir-aware
+    /// path via [`zlayer_paths::ZLayerDirs::wireguard`] when a non-default
+    /// `--data-dir` is in play.
+    fn default_uapi_sock_dir() -> PathBuf {
+        PathBuf::from("/var/run/wireguard")
+    }
 }
 
 impl Default for OverlayConfig {
@@ -73,6 +93,7 @@ impl Default for OverlayConfig {
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: NatConfig::default(),
+            uapi_sock_dir: Self::default_uapi_sock_dir(),
         }
     }
 }

@@ -1,0 +1,33 @@
+name: Login as admin
+platform: web
+variables:
+  ADMIN_EMAIL: admin@e2e.local
+  ADMIN_PASSWORD: e2e-test-password-1234
+
+steps:
+  - type: navigate
+    value: /login
+
+  - type: wait
+    target: { css: "#login-email" }
+    timeout: 15000
+
+  - type: input
+    target: { css: "#login-email" }
+    value: ${ADMIN_EMAIL}
+
+  - type: input
+    target: { css: "#login-password" }
+    value: ${ADMIN_PASSWORD}
+
+  - type: tap
+    target: { role: button, name: "Sign in" }
+
+  # Successful login navigates to "/" where the dashboard renders.
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+    timeout: 15000
+
+  - type: screenshot
+    name: login-success.png

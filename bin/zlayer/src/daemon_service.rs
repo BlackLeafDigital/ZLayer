@@ -61,6 +61,9 @@ mod stub {
         _socket_path: String,
         _host_network: bool,
         _data_dir: std::path::PathBuf,
+        _deployment_name: String,
+        _wg_port: Option<u16>,
+        _dns_port: Option<u16>,
     ) -> Result<()> {
         bail!("--service is not supported on this platform (Windows only)");
     }
@@ -101,6 +104,9 @@ mod imp {
         socket_path: String,
         host_network: bool,
         data_dir: PathBuf,
+        deployment_name: String,
+        wg_port: Option<u16>,
+        dns_port: Option<u16>,
     }
 
     static SERVICE_ARGS: Mutex<Option<ServiceArgs>> = Mutex::new(None);
@@ -114,7 +120,7 @@ mod imp {
     /// Returns an error if the service dispatcher fails to start (e.g. the
     /// binary was not launched by SCM, in which case `service_dispatcher::start`
     /// returns a `WinError` for `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`).
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     pub fn run_as_windows_service(
         bind: String,
         jwt_secret: Option<String>,
@@ -122,6 +128,9 @@ mod imp {
         socket_path: String,
         host_network: bool,
         data_dir: PathBuf,
+        deployment_name: String,
+        wg_port: Option<u16>,
+        dns_port: Option<u16>,
     ) -> Result<()> {
         // Stash the serve arguments so `my_service_main` can read them when
         // SCM invokes the dispatched entry point.
@@ -136,6 +145,9 @@ mod imp {
                 socket_path,
                 host_network,
                 data_dir,
+                deployment_name,
+                wg_port,
+                dns_port,
             });
         }
 
@@ -249,6 +261,9 @@ mod imp {
             socket_path,
             host_network,
             data_dir,
+            deployment_name,
+            wg_port,
+            dns_port,
         } = args;
 
         let serve_result = runtime.block_on(crate::commands::serve::serve_with_external_shutdown(
@@ -258,6 +273,9 @@ mod imp {
             &socket_path,
             host_network,
             data_dir,
+            deployment_name,
+            wg_port,
+            dns_port,
             Some(shutdown_rx),
         ));
 

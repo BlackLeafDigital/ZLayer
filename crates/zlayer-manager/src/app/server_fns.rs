@@ -1752,6 +1752,31 @@ pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
         "manager_me: upstream rejected /auth/me",
     );
 
+    // Stale-session cleanup: if the browser sent a session cookie and
+    // the API rejected it (401, e.g. the user row vanished), fire a
+    // best-effort POST /auth/logout. The endpoint replies with
+    // expired-cookie Set-Cookie headers; forward_raw mirrors them onto
+    // the Leptos response so the browser drops zlayer_session and
+    // zlayer_csrf. Without this the browser keeps replaying the same
+    // dead cookies forever.
+    let had_session = hdr
+        .cookie
+        .as_deref()
+        .is_some_and(|c| c.contains("zlayer_session="));
+    if me_resp.status.as_u16() == 401 && had_session {
+        match forward_raw(&client, RawMethod::Post, "/auth/logout", None, &hdr).await {
+            Ok(resp) => tracing::info!(
+                status = %resp.status,
+                set_cookie_count = resp.set_cookies.len(),
+                "manager_me: cleared stale session via /auth/logout",
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "manager_me: stale-session logout probe failed",
+            ),
+        }
+    }
+
     // Not authenticated — probe bootstrap state with an intentionally
     // invalid (empty) body. We don't forward cookies/csrf here — this is
     // a pure state probe against the unauthenticated endpoint, and we do

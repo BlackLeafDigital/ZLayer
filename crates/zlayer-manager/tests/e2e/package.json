@@ -1,0 +1,13 @@
+{
+  "name": "zlayer-manager-e2e",
+  "private": true,
+  "description": "End-to-end tests for the zlayer-manager UI. Run via scripts/run-suite.sh.",
+  "scripts": {
+    "test": "intellitester run --config intellitester.config.yaml auth.workflow.yaml nav-smoke.test.yaml",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "intellitester": "^0.4.5",
+    "playwright": "^1.49.0"
+  }
+}

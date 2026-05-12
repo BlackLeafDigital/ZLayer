@@ -11,6 +11,20 @@ on:
         description: 'Commit SHA to test'
         required: false
         type: string
+      test:
+        description: 'Run a single intellitester test (e.g. nav-smoke.test.yaml). Leave empty to run the full suite.'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - bootstrap.test.yaml
+          - login.test.yaml
+          - logout.test.yaml
+          - nav-smoke.test.yaml
+          - stale-session-setup.test.yaml
+          - stale-session-verify.test.yaml
+          - auth.workflow.yaml
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -310,6 +324,135 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
+  # E2E Tests (Manager Intellitester / Playwright)
+  #
+  # Boots a hermetic daemon + manager on non-default ports
+  # (data-dir under /tmp), then runs the Intellitester YAML suite
+  # via crates/zlayer-manager/tests/e2e/scripts/run-suite.sh.
+  # Use the `test` workflow_dispatch input to run a single test.
+  # ===========================================
+  manager-intellitester-tests:
+    name: E2E Tests (Manager Intellitester)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || github.sha }}
+          step: e2e-manager-intellitester
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev sqlite3
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cargo cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Restore Playwright cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: playwright-${{ hashFiles('crates/zlayer-manager/tests/e2e/package.json') }}
+          path: /root/.cache/ms-playwright /home/runner/.cache/ms-playwright
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Install cargo-leptos
+        if: steps.check.outputs.completed != 'true'
+        run: cargo install cargo-leptos --locked || true
+
+      - name: Install node deps
+        if: steps.check.outputs.completed != 'true'
+        run: pnpm install --prefix crates/zlayer-manager/tests/e2e
+
+      - name: Install Playwright Chromium
+        if: steps.check.outputs.completed != 'true'
+        run: pnpm --prefix crates/zlayer-manager/tests/e2e dlx playwright install chromium --with-deps
+
+      - name: Run manager intellitester suite
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          if [ -n "${{ inputs.test }}" ]; then
+            sudo -E env "PATH=$PATH" crates/zlayer-manager/tests/e2e/scripts/run-suite.sh --only "${{ inputs.test }}"
+          else
+            sudo -E env "PATH=$PATH" crates/zlayer-manager/tests/e2e/scripts/run-suite.sh
+          fi
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: info
+
+      - name: Fix permissions after sudo
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${CARGO_HOME}" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "${CARGO_TARGET_DIR}" 2>/dev/null || true
+
+      - name: Save Playwright cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: save
+          key: playwright-${{ hashFiles('crates/zlayer-manager/tests/e2e/package.json') }}
+          path: /root/.cache/ms-playwright /home/runner/.cache/ms-playwright
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manager-e2e-screenshots
+          path: |
+            crates/zlayer-manager/tests/e2e/**/*.png
+            crates/zlayer-manager/tests/e2e/screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || github.sha }}
+          step: e2e-manager-intellitester
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
   # E2E Tests (macOS Sandbox)
   # ===========================================
   macos-sandbox-e2e:
@@ -401,7 +544,7 @@ jobs:
   dispatch-build:
     name: Dispatch Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, macos-sandbox-e2e]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, macos-sandbox-e2e]
     if: inputs.version != ''
     steps:
       - name: Dispatch Build workflow

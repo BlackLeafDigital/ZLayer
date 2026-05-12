@@ -1,0 +1,11 @@
+# Transient Playwright storage state written by stale-session-setup.test.yaml
+# and consumed by stale-session-verify.test.yaml via run-suite.sh's
+# --storage-state flag. Contains throwaway test admin's session JWT.
+.stale-session.state.json
+
+# Local npm install artifacts (intellitester + playwright deps).
+node_modules/
+
+# Screenshots and reports from intellitester runs.
+screenshots/
+reports/

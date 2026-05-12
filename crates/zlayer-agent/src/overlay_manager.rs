@@ -114,6 +114,14 @@ pub struct OverlayManager {
     /// `OverlayConfig::default()` value is used (which itself defaults to
     /// `NatConfig::default()`, i.e. NAT enabled with public STUN servers).
     nat_config: Option<NatConfig>,
+    /// Override for [`OverlayConfig::uapi_sock_dir`] threaded into every
+    /// overlay transport this manager builds. `None` means the underlying
+    /// `OverlayConfig::default()` value is used (which itself defaults to
+    /// `/var/run/wireguard` on Linux for `wg(8)` interop). The daemon sets
+    /// this to `{data_dir}/run/wireguard` when running with a non-default
+    /// `--data-dir` so a test daemon's UAPI sockets don't collide with a
+    /// host-wide install on the same machine.
+    uapi_sock_dir: Option<std::path::PathBuf>,
     /// Live NAT traversal orchestrator. `Some` after a successful
     /// [`OverlayManager::start_nat_traversal`] call, otherwise `None`.
     /// Wrapped in a `RwLock` so the maintenance tick (which mutates
@@ -165,6 +173,7 @@ impl OverlayManager {
             dns_server_addr: None,
             dns_domain: None,
             nat_config: None,
+            uapi_sock_dir: None,
             nat_traversal: tokio::sync::RwLock::new(None),
             nat_last_refresh: AtomicU64::new(0),
         })
@@ -205,6 +214,7 @@ impl OverlayManager {
             dns_server_addr: None,
             dns_domain: None,
             nat_config: None,
+            uapi_sock_dir: None,
             nat_traversal: tokio::sync::RwLock::new(None),
             nat_last_refresh: AtomicU64::new(0),
         }
@@ -226,6 +236,24 @@ impl OverlayManager {
     #[must_use]
     pub fn with_nat_config(mut self, nat: NatConfig) -> Self {
         self.nat_config = Some(nat);
+        self
+    }
+
+    /// Override the `WireGuard` UAPI socket directory for every overlay
+    /// transport built by this manager.
+    ///
+    /// When set, every [`OverlayConfig`] produced by
+    /// [`Self::build_config`] gets `uapi_sock_dir` set to this path. When
+    /// unset (the default), `OverlayConfig::default()` is used, which
+    /// itself defaults to `/var/run/wireguard` on Linux.
+    ///
+    /// The daemon threads `ZLayerDirs::wireguard()` (a data-dir-aware
+    /// path) through this setter so a daemon running under a non-default
+    /// `--data-dir` does not share `/var/run/wireguard` with a system
+    /// install.
+    #[must_use]
+    pub fn with_uapi_sock_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.uapi_sock_dir = Some(dir.into());
         self
     }
 
@@ -998,6 +1026,9 @@ impl OverlayManager {
         };
         if let Some(nat) = self.nat_config.clone() {
             config.nat = nat;
+        }
+        if let Some(dir) = self.uapi_sock_dir.clone() {
+            config.uapi_sock_dir = dir;
         }
         config
     }

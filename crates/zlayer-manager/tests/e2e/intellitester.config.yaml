@@ -1,0 +1,30 @@
+# Intellitester config for the zlayer-manager UI.
+#
+# Tests are run via scripts/run-suite.sh, which spins up a fresh daemon
+# + manager against a throwaway data directory, then invokes
+# `intellitester run` with this config.
+#
+# Healing is OFF by default so CI does not depend on an LLM API key.
+# Tests are written with deterministic selectors (id + role + text).
+# Flip to true locally when authoring a new test against a moving UI.
+
+defaults:
+  timeout: 30000
+  screenshots: on-failure
+
+platforms:
+  web:
+    # Default to the e2e harness's non-default port (16677). run-suite.sh
+    # respects ZLAYER_E2E_MANAGER_PORT, but intellitester reads this
+    # value statically at parse time — if you change the port via env
+    # var, also update this baseUrl or pass --base-url to intellitester.
+    baseUrl: http://127.0.0.1:16677
+    headless: true
+
+healing:
+  enabled: false
+
+# Intentionally NO `ai:` block — healing is off and no test uses
+# `evaluate: mode: ai`, so AI provider config would just trigger
+# intellitester's env-var validator into asking for OPENROUTER_API_KEY
+# at every run. Re-add when authoring a test that needs AI vision.

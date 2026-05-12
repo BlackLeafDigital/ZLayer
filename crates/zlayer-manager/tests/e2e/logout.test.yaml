@@ -1,0 +1,31 @@
+name: Logout via user menu
+platform: web
+
+steps:
+  # Assumes the workflow has already logged in (shared browser session).
+  - type: navigate
+    value: /
+
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+    timeout: 15000
+
+  # Open the user-menu dropdown via the avatar/display-name button.
+  - type: tap
+    target: { text: "E2E Admin" }
+
+  - type: tap
+    target: { text: "Sign out" }
+
+  # AuthGuard sees `user: None` post-logout and redirects to /login.
+  - type: waitForSelector
+    target: { css: "#login-email" }
+    state: visible
+    timeout: 15000
+
+  - type: assert
+    target: { text: "Sign in to ZLayer" }
+
+  - type: screenshot
+    name: logout-success.png

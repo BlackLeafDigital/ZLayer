@@ -158,10 +158,13 @@ fn migrate_legacy_secrets_layout(data_dir: &Path, report: &mut MigrationReport) 
     })?;
 
     // Parent (`data_dir`) already exists (we checked at the top of
-    // `migrate_data_dir`), and `secrets_path` is now vacant, so plain
-    // `create_dir` is correct and surfaces collisions instead of hiding
-    // them the way `create_dir_all` would.
-    fs::create_dir(&secrets_path).with_context(|| {
+    // `migrate_data_dir`), and `secrets_path` is now vacant after the
+    // rename above. We use `create_dir_all` defensively: if a concurrent
+    // process (or a partially-completed prior migration) has already
+    // recreated the directory, we want the idempotent no-op instead of
+    // EEXIST. `create_dir_all` still surfaces real errors (permission,
+    // ENOENT on parent, etc.).
+    fs::create_dir_all(&secrets_path).with_context(|| {
         format!(
             "failed to create new secrets directory {}",
             secrets_path.display(),

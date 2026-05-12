@@ -553,6 +553,12 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     } else {
         match OverlayManager::new(config.deployment_name.clone()).await {
             Ok(om) => {
+                // Data-dir-aware UAPI socket dir: a daemon launched with
+                // `--data-dir /tmp/foo` writes its boringtun sockets under
+                // `/tmp/foo/run/wireguard` so it does not collide with a
+                // system-wide zlayer install owning `/var/run/wireguard`.
+                let uapi_sock_dir = zlayer_paths::ZLayerDirs::new(&config.data_dir).wireguard();
+                let om = om.with_uapi_sock_dir(uapi_sock_dir);
                 #[cfg(feature = "nat")]
                 let mut om = om.with_nat_config(config.nat.clone());
                 #[cfg(not(feature = "nat"))]

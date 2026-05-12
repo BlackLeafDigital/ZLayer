@@ -292,21 +292,28 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     let exe_str = exe.to_string_lossy();
 
     // Extract serve args from the parsed CLI
-    let (bind, jwt_secret, no_swagger, socket) = match &cli.command {
-        Some(Commands::Serve {
-            bind,
-            jwt_secret,
-            no_swagger,
-            socket,
-            ..
-        }) => (
-            bind.clone(),
-            jwt_secret.clone(),
-            *no_swagger,
-            socket.clone(),
-        ),
-        _ => unreachable!("install_launchd_service called without Serve command"),
-    };
+    let (bind, jwt_secret, no_swagger, socket, deployment_name, wg_port, dns_port) =
+        match &cli.command {
+            Some(Commands::Serve {
+                bind,
+                jwt_secret,
+                no_swagger,
+                socket,
+                deployment_name,
+                wg_port,
+                dns_port,
+                ..
+            }) => (
+                bind.clone(),
+                jwt_secret.clone(),
+                *no_swagger,
+                socket.clone(),
+                deployment_name.clone(),
+                *wg_port,
+                *dns_port,
+            ),
+            _ => unreachable!("install_launchd_service called without Serve command"),
+        };
 
     let resolved_socket = cli.effective_socket_path();
 
@@ -335,6 +342,28 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 
     if no_swagger {
         args.push("        <string>--no-swagger</string>".to_string());
+    }
+
+    // Forward the deployment name explicitly so the daemon-supervised
+    // restart uses the same overlay scope as the foreground invocation.
+    // Skipping the default "zlayer" keeps the plist tidy when the operator
+    // didn't override anything.
+    if deployment_name != "zlayer" {
+        args.push("        <string>--deployment-name</string>".to_string());
+        args.push(format!("        <string>{deployment_name}</string>"));
+    }
+
+    // Forward port overrides so a daemon installed via `daemon install`
+    // continues to bind on the same WireGuard / DNS ports the operator
+    // chose for the foreground invocation. Skipping when unset keeps the
+    // plist tidy and lets the runtime defaults (or node_config.json) apply.
+    if let Some(port) = wg_port {
+        args.push("        <string>--wg-port</string>".to_string());
+        args.push(format!("        <string>{port}</string>"));
+    }
+    if let Some(port) = dns_port {
+        args.push("        <string>--dns-port</string>".to_string());
+        args.push(format!("        <string>{port}</string>"));
     }
 
     if cli.host_network {
@@ -474,6 +503,9 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
             bind,
             jwt_secret,
             no_swagger,
+            deployment_name,
+            wg_port,
+            dns_port,
             ..
         }) = cli.command.as_ref()
         else {
@@ -523,6 +555,9 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
             socket_path,
             cli.host_network,
             data_dir,
+            deployment_name.clone(),
+            *wg_port,
+            *dns_port,
         )
     }
 }
@@ -661,6 +696,9 @@ async fn run(
             jwt_secret,
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
+            deployment_name,
+            wg_port,
+            dns_port,
             #[cfg(all(target_os = "windows", feature = "wsl"))]
                 vhd_gb: _,
             #[cfg(feature = "docker-compat")]
@@ -722,6 +760,9 @@ async fn run(
                     &socket_path,
                     cli.host_network,
                     data_dir,
+                    deployment_name.clone(),
+                    *wg_port,
+                    *dns_port,
                     nat_overrides,
                 ))
                 .await
@@ -736,6 +777,9 @@ async fn run(
                     &socket_path,
                     cli.host_network,
                     data_dir,
+                    deployment_name.clone(),
+                    *wg_port,
+                    *dns_port,
                 ))
                 .await
             }

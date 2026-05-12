@@ -46,6 +46,50 @@ struct StaleDaemonMeta {
     api_bind: Option<String>,
 }
 
+/// Read a `daemon.json` file, returning the PID + bind it advertised.
+///
+/// Used by both the stale-self cleanup and the foreign-daemon ownership
+/// check. Returns `None` if the file doesn't exist or is malformed — both
+/// treated as "no claim". Synchronous on purpose: the foreign-daemon probe
+/// runs before we enter async land for the boot sweep, and the file is
+/// small enough that the blocking read is irrelevant in practice.
+fn read_daemon_metadata(path: &std::path::Path) -> Option<StaleDaemonMeta> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Probe the standard daemon data-dir locations OTHER than the current
+/// one for a `daemon.json` with a live PID. Returns `true` when a foreign
+/// zlayer daemon appears to be running on this host.
+///
+/// The sweep that follows must skip its destructive deletes whenever this
+/// returns `true`: even with a prefix-scoped match (`zl-<name>-`), two
+/// daemons could pick the same default `deployment_name` ("zlayer") and
+/// end up clobbering each other's overlay state. Hostility is worse than
+/// letting a stale link survive — a stale link is repaired on the next
+/// clean boot, a corrupted live link tears down running containers.
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::cast_possible_wrap)]
+fn foreign_daemon_alive(self_data_dir: &std::path::Path) -> Option<u32> {
+    let mut probe_dirs: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/var/lib/zlayer")];
+    if let Some(home) = std::env::var_os("HOME") {
+        probe_dirs.push(std::path::PathBuf::from(home).join(".zlayer"));
+    }
+    for probe in probe_dirs {
+        if probe == self_data_dir {
+            continue;
+        }
+        let Some(meta) = read_daemon_metadata(&probe.join("daemon.json")) else {
+            continue;
+        };
+        // SAFETY: signal 0 is a null signal used purely for existence checking.
+        if unsafe { libc::kill(meta.pid as i32, 0) } == 0 {
+            return Some(meta.pid);
+        }
+    }
+    None
+}
+
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
@@ -55,7 +99,12 @@ struct StaleDaemonMeta {
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
+async fn cleanup_stale_daemon(
+    config: &DaemonConfig,
+    socket_path: &str,
+    api_bind: &str,
+    wg_port_override: Option<u16>,
+) {
     let metadata_path = config.data_dir.join("daemon.json");
     #[cfg(unix)]
     let my_pid = std::process::id();
@@ -205,10 +254,34 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 2. Clean up stale network interfaces
+    //
+    // Sweep is scoped to THIS daemon's deployment-name prefix
+    // (`zl-<deployment_name>-`) so a second daemon never deletes another
+    // daemon's overlay links. Even with that scoping, if any foreign
+    // daemon (different data_dir, live PID per its daemon.json) is alive,
+    // we skip the sweep entirely: two daemons can share the default
+    // "zlayer" deployment name, in which case the prefix match would still
+    // be hostile. Stale links are preferable to torn-down live links.
     // -----------------------------------------------------------------------
+    let zl_prefix = format!("zl-{}-", config.deployment_name);
+
+    #[cfg(unix)]
+    let foreign_pid = foreign_daemon_alive(&config.data_dir);
+    #[cfg(not(unix))]
+    let foreign_pid: Option<u32> = None;
+
+    if let Some(pid) = foreign_pid {
+        warn!(
+            pid = pid,
+            deployment_name = %config.deployment_name,
+            "Foreign zlayer daemon detected; skipping link/socket sweep entirely"
+        );
+    }
+
     #[cfg(target_os = "linux")]
-    {
-        // Linux: use `ip` to find and delete stale veth-* and zl-* interfaces.
+    if foreign_pid.is_none() {
+        // Linux: use `ip` to find and delete stale veth-* and
+        // zl-<deployment_name>-* interfaces.
         if let Ok(output) = tokio::process::Command::new("ip")
             .args(["-br", "link"])
             .output()
@@ -222,7 +295,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                         continue;
                     };
 
-                    if iface.starts_with("veth-") || iface.starts_with("zl-") {
+                    if iface.starts_with("veth-") || iface.starts_with(&zl_prefix) {
                         warn!(interface = %iface, "Deleting stale network interface");
                         let _ = tokio::process::Command::new("ip")
                             .args(["link", "delete", iface])
@@ -236,11 +309,14 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         }
     }
     #[cfg(target_os = "macos")]
-    {
+    if foreign_pid.is_none() {
         // macOS: use `ifconfig` to find stale utun devices that have a matching
-        // WireGuard UAPI socket in /var/run/wireguard/, indicating they belong
-        // to a previous zlayer run.
-        let wg_sock_dir = std::path::Path::new("/var/run/wireguard");
+        // WireGuard UAPI socket whose stem matches this daemon's deployment
+        // prefix, indicating they belong to a previous zlayer run with the
+        // same deployment name. The sock dir is data-dir-aware so a daemon
+        // booting against `--data-dir /tmp/foo` only sweeps its own sockets.
+        let wg_sock_dir = zlayer_paths::ZLayerDirs::new(&config.data_dir).wireguard();
+        let wg_sock_dir = wg_sock_dir.as_path();
         if let Ok(output) = tokio::process::Command::new("ifconfig")
             .args(["-l"])
             .output()
@@ -249,17 +325,27 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for iface in stdout.split_whitespace() {
-                    if iface.starts_with("utun") {
-                        let sock_path = wg_sock_dir.join(format!("{iface}.sock"));
-                        if sock_path.exists() {
-                            warn!(interface = %iface, "Destroying stale utun interface");
-                            let _ = tokio::process::Command::new("ifconfig")
-                                .args([iface, "destroy"])
-                                .output()
-                                .await;
-                            let _ = tokio::fs::remove_file(&sock_path).await;
-                        }
+                    // Only iterate utun devices that have an associated sock
+                    // file whose stem belongs to this deployment.
+                    if !iface.starts_with("utun") {
+                        continue;
                     }
+                    let sock_path = wg_sock_dir.join(format!("{iface}.sock"));
+                    if !sock_path.exists() {
+                        continue;
+                    }
+                    let Some(stem) = sock_path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if !stem.starts_with(&zl_prefix) {
+                        continue;
+                    }
+                    warn!(interface = %iface, "Destroying stale utun interface");
+                    let _ = tokio::process::Command::new("ifconfig")
+                        .args([iface, "destroy"])
+                        .output()
+                        .await;
+                    let _ = tokio::fs::remove_file(&sock_path).await;
                 }
             }
         } else {
@@ -269,21 +355,40 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 3. Remove stale WireGuard UAPI sockets
+    //
+    // Scoped to this daemon's `zl-<deployment_name>-*.sock` and skipped
+    // entirely when a foreign daemon is alive (see block 2 above). The
+    // sock dir is data-dir-aware (`ZLayerDirs::wireguard()`) so a daemon
+    // running with a non-default `--data-dir` only sweeps its own
+    // sockets and leaves the host-global `/var/run/wireguard` alone.
     // -----------------------------------------------------------------------
-    let wg_sock_dir = std::path::Path::new("/var/run/wireguard");
-    if wg_sock_dir.is_dir() {
-        match tokio::fs::read_dir(wg_sock_dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+    if foreign_pid.is_none() {
+        let wg_sock_dir = zlayer_paths::ZLayerDirs::new(&config.data_dir).wireguard();
+        if wg_sock_dir.is_dir() {
+            match tokio::fs::read_dir(&wg_sock_dir).await {
+                Ok(mut entries) => {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+                            continue;
+                        }
+                        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        if !stem.starts_with(&zl_prefix) {
+                            continue;
+                        }
                         warn!(path = %path.display(), "Removing stale WireGuard socket");
                         let _ = tokio::fs::remove_file(&path).await;
                     }
                 }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to read /var/run/wireguard for stale socket cleanup");
+                Err(e) => {
+                    warn!(
+                        dir = %wg_sock_dir.display(),
+                        error = %e,
+                        "Failed to read WireGuard sock dir for stale socket cleanup"
+                    );
+                }
             }
         }
     }
@@ -328,7 +433,10 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     // -----------------------------------------------------------------------
     #[cfg(unix)]
     {
-        let wg_port = load_overlay_port(&config.data_dir);
+        // Precedence: CLI flag > node_config.json > zlayer_core::DEFAULT_WG_PORT.
+        // `load_overlay_port` reads `node_config.json#overlay_port`, falling
+        // back to the constant default; the CLI flag wins above both.
+        let wg_port = wg_port_override.unwrap_or_else(|| load_overlay_port(&config.data_dir));
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
 
         if std::net::UdpSocket::bind(wg_addr).is_err() {
@@ -413,7 +521,10 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     }
     #[cfg(not(unix))]
     {
-        let wg_port = load_overlay_port(&config.data_dir);
+        // Precedence: CLI flag > node_config.json > zlayer_core::DEFAULT_WG_PORT.
+        // `load_overlay_port` reads `node_config.json#overlay_port`, falling
+        // back to the constant default; the CLI flag wins above both.
+        let wg_port = wg_port_override.unwrap_or_else(|| load_overlay_port(&config.data_dir));
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
         if std::net::UdpSocket::bind(wg_addr).is_err() {
             // Passive wait — do not kill arbitrary processes on Windows in F-7a.
@@ -584,6 +695,7 @@ async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
 /// is used instead (so the CLI flags actually win over env vars), and this
 /// shim is only kept for source compatibility.
 #[cfg_attr(feature = "nat", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -591,6 +703,9 @@ pub(crate) async fn serve(
     socket_path: &str,
     host_network: bool,
     data_dir: std::path::PathBuf,
+    deployment_name: String,
+    wg_port: Option<u16>,
+    dns_port: Option<u16>,
 ) -> Result<()> {
     // Box::pin keeps the top-level future below clippy's `large_futures`
     // threshold — `serve_with_external_shutdown` materialises the whole
@@ -602,6 +717,9 @@ pub(crate) async fn serve(
         socket_path,
         host_network,
         data_dir,
+        deployment_name,
+        wg_port,
+        dns_port,
         None,
     ))
     .await
@@ -620,6 +738,9 @@ pub(crate) async fn serve_with_nat_overrides(
     socket_path: &str,
     host_network: bool,
     data_dir: std::path::PathBuf,
+    deployment_name: String,
+    wg_port: Option<u16>,
+    dns_port: Option<u16>,
     nat_overrides: NatCliOverrides,
 ) -> Result<()> {
     // Stash the overrides in a process-global slot so
@@ -634,6 +755,9 @@ pub(crate) async fn serve_with_nat_overrides(
         socket_path,
         host_network,
         data_dir,
+        deployment_name,
+        wg_port,
+        dns_port,
         None,
     ))
     .await
@@ -1031,6 +1155,9 @@ pub(crate) async fn serve_with_external_shutdown(
     socket_path: &str,
     host_network: bool,
     data_dir: std::path::PathBuf,
+    deployment_name: String,
+    wg_port: Option<u16>,
+    dns_port: Option<u16>,
     external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     // NOTE: the stderr-to-tracing redirect is deliberately installed AFTER
@@ -1111,8 +1238,15 @@ pub(crate) async fn serve_with_external_shutdown(
         zlayer_spec::NetworkPolicySpec,
     >::new()));
 
+    // DNS port precedence: CLI flag > zlayer_overlay::DEFAULT_DNS_PORT.
+    // Threaded into DaemonConfig.dns_port (default 15353); the overlay
+    // bootstrap consumes the resolved value via `config.dns_port`.
+    let resolved_dns_port = dns_port.unwrap_or(zlayer_overlay::DEFAULT_DNS_PORT);
+
     let config = DaemonConfig {
         host_network,
+        deployment_name,
+        dns_port: resolved_dns_port,
         data_dir,
         log_dir,
         run_dir,
@@ -1132,7 +1266,7 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     // 1b. Clean up any stale daemon from a previous run
     // -----------------------------------------------------------------------
-    cleanup_stale_daemon(&config, socket_path, bind).await;
+    cleanup_stale_daemon(&config, socket_path, bind, wg_port).await;
 
     // -----------------------------------------------------------------------
     // 1c. Bind TCP + Unix listeners early so the socket file exists on disk
@@ -2257,7 +2391,50 @@ async fn build_bridge_network_state() -> BridgeNetworkApiState {
 
 #[cfg(test)]
 mod tests {
-    use super::container_reachable_api_url;
+    use super::{container_reachable_api_url, read_daemon_metadata};
+
+    #[test]
+    fn read_daemon_metadata_missing_file_is_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("does-not-exist.json");
+        assert!(read_daemon_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn read_daemon_metadata_malformed_is_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.json");
+        std::fs::write(&path, "this is not json {{}").expect("write");
+        assert!(read_daemon_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn read_daemon_metadata_valid_returns_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.json");
+        std::fs::write(
+            &path,
+            r#"{"pid":4242,"started_at":"x","api_bind":"0.0.0.0:3669","socket_path":"","host_network":false,"overlay_cidr":"10.0.0.0/16"}"#,
+        )
+        .expect("write");
+        let meta = read_daemon_metadata(&path).expect("parsed");
+        assert_eq!(meta.pid, 4242);
+        assert_eq!(meta.api_bind.as_deref(), Some("0.0.0.0:3669"));
+    }
+
+    #[test]
+    fn read_daemon_metadata_tolerates_missing_api_bind() {
+        // The full DaemonMetadata writer always writes `api_bind`, but
+        // StaleDaemonMeta marks it `#[serde(default)]` to tolerate older
+        // formats. Verify that path explicitly so a future tightening of the
+        // schema doesn't silently break stale-daemon detection.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.json");
+        std::fs::write(&path, r#"{"pid":9}"#).expect("write");
+        let meta = read_daemon_metadata(&path).expect("parsed");
+        assert_eq!(meta.pid, 9);
+        assert!(meta.api_bind.is_none());
+    }
 
     #[test]
     fn wildcard_v4_bind_becomes_loopback() {

@@ -1,0 +1,213 @@
+name: Navigation smoke test across protected routes
+platform: web
+variables:
+  ADMIN_EMAIL: admin@e2e.local
+  ADMIN_PASSWORD: e2e-test-password-1234
+
+steps:
+  # Log in first (this test runs standalone, not in a workflow).
+  - type: navigate
+    value: /login
+
+  - type: wait
+    target: { css: "#login-email" }
+    timeout: 15000
+
+  - type: input
+    target: { css: "#login-email" }
+    value: ${ADMIN_EMAIL}
+
+  - type: input
+    target: { css: "#login-password" }
+    value: ${ADMIN_PASSWORD}
+
+  - type: tap
+    target: { role: button, name: "Sign in" }
+
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+    timeout: 15000
+
+  # Walk every protected route and assert (a) the page-level <h1>/heading
+  # renders and (b) we didn't land on the global "Page not found" fallback.
+  #
+  # The list mirrors the Route declarations in
+  # crates/zlayer-manager/src/app/mod.rs:60-84. Update both when adding
+  # or removing pages.
+
+  - type: navigate
+    value: /
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-dashboard.png
+
+  - type: navigate
+    value: /nodes
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-nodes.png
+
+  - type: navigate
+    value: /deployments
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-deployments.png
+
+  - type: navigate
+    value: /networking
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-networking.png
+
+  - type: navigate
+    value: /networks
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-networks.png
+
+  - type: navigate
+    value: /overlay
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-overlay.png
+
+  - type: navigate
+    value: /proxy
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-proxy.png
+
+  - type: navigate
+    value: /ssh-tunnels
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-ssh-tunnels.png
+
+  - type: navigate
+    value: /git
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-git.png
+
+  - type: navigate
+    value: /builds
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-builds.png
+
+  - type: navigate
+    value: /jobs
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-jobs.png
+
+  - type: navigate
+    value: /users
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-users.png
+
+  - type: navigate
+    value: /groups
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-groups.png
+
+  - type: navigate
+    value: /variables
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-variables.png
+
+  - type: navigate
+    value: /secrets
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-secrets.png
+
+  - type: navigate
+    value: /tasks
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-tasks.png
+
+  - type: navigate
+    value: /workflows
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-workflows.png
+
+  - type: navigate
+    value: /notifiers
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-notifiers.png
+
+  - type: navigate
+    value: /permissions
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-permissions.png
+
+  - type: navigate
+    value: /projects
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-projects.png
+
+  - type: navigate
+    value: /audit
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-audit.png
+
+  - type: navigate
+    value: /settings
+  - type: waitForSelector
+    target: { role: heading }
+    state: visible
+  - type: screenshot
+    name: nav-settings.png

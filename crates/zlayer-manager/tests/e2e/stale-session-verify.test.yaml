@@ -1,0 +1,58 @@
+name: Stale-session verify (cookies cleared on 401 from /auth/me)
+platform: web
+
+# Run this with:
+#   intellitester run --storage-state ./.stale-session.state.json ...
+#
+# The state file was written by stale-session-setup.test.yaml. Between
+# the two runs, run-suite.sh executes:
+#   sqlite3 $ZLAYER_DATA_DIR/users.db "DELETE FROM users WHERE email='admin@e2e.local'"
+# So the browser holds valid-looking cookies the API will reject.
+#
+# Part A's fix: manager_me detects the 401 against a forwarded
+# zlayer_session cookie and fires POST /auth/logout, whose Set-Cookie
+# expiry headers ride back on the manager_me response. AuthGuard sees
+# `user: None, needs_bootstrap: true` (users.db is empty) and routes
+# to /bootstrap.
+
+steps:
+  # Sanity: the storageState file actually loaded the cookies.
+  - type: assertCookies
+    has:
+      - zlayer_session
+      - zlayer_csrf
+
+  # Network-layer assertion: the Set-Cookie expiry came back from
+  # /api/manager/manager_me. Subscribe BEFORE navigate so the response
+  # listener catches the round trip. Substring match against the
+  # comma-joined Set-Cookie header is the simplest signal that the
+  # zlayer_session expiry header rode the response.
+  - type: expectResponse
+    url: "**/api/manager/manager_me*"
+    headers:
+      set-cookie: "/zlayer_session=;.*Max-Age=0/"
+    timeout: 10000
+
+  - type: navigate
+    value: /
+
+  # users.db was wiped, so the manager redirects us to /bootstrap.
+  - type: waitForSelector
+    target: { css: "#bs-email" }
+    state: visible
+    timeout: 15000
+
+  # Browser-jar assertion: after the bounce, both auth cookies must
+  # be gone. context.cookies() (which assertCookies wraps) sees
+  # HttpOnly cookies, so this catches both clears regardless of
+  # JS-visibility.
+  - type: assertCookies
+    not:
+      - zlayer_session
+      - zlayer_csrf
+
+  - type: assert
+    target: { text: "Welcome to ZLayer" }
+
+  - type: screenshot
+    name: stale-session-redirected.png

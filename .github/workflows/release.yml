@@ -124,9 +124,16 @@ jobs:
           cat > release_notes.md << 'EOF'
           ## Install
 
+          **Linux / macOS:**
+
           ```bash
-          # Install zlayer (unified binary: TUI, CLI, runtime, builder)
           curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
+          ```
+
+          **Windows (PowerShell):**
+
+          ```powershell
+          irm https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.ps1 | iex
           ```
 
           ## Binary
