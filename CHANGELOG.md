@@ -66,7 +66,35 @@ All notable changes to this project will be documented in this file.
   (`ZLAYER_E2E_API_PORT`, `ZLAYER_E2E_MANAGER_PORT`,
   `ZLAYER_E2E_WG_PORT`, `ZLAYER_E2E_DNS_PORT`) are env-overridable.
 
+### Changed
+- The `BlackLeafDigital/ZLayer` composite action (`action.yml`) is now
+  CI-safe and supports both portable and system installs. Three new
+  inputs: `install-dir` (empty = portable temp install to
+  `$RUNNER_TEMP/zlayer-bin`; non-empty = system install via `install.sh`
+  with per-OS dep setup — libseccomp, cgroups v2 check, SELinux relabel,
+  PATH wiring, shell completions); `data-dir` (defaults to
+  `$RUNNER_TEMP/zlayer-data` in portable mode, unset in system mode);
+  and `install-daemon` (defaults `false`, sets `ZLAYER_NO_SERVICE=1`
+  when invoking `install.sh`). `ZLAYER_DATA_DIR` is now propagated via
+  `$GITHUB_ENV` so every subsequent step in the job inherits the
+  per-runner sandbox automatically. A new `data-dir` output mirrors
+  the resolved value for callers that want to read it explicitly. The
+  `Run ZLayer command` sub-step's broken YAML-level
+  `if: inputs.command != ''` (which Forgejo's `act_runner` ignores on
+  composite sub-steps) has been replaced with a bash-internal guard, so
+  empty-command invocations install-only instead of hanging on the
+  implicit TUI.
+
 ### Fixed
+- `zlayer` (no subcommand) and `zlayer tui` now refuse to launch the
+  Ratatui TUI when stdin or stdout is not a terminal, exiting 1 with a
+  clear error pointing at `zlayer --help`. Previously a non-TTY caller
+  (CI, piped shells, `</dev/null`) would block forever on crossterm
+  trying to read stdin events — the failure mode that hung the
+  ZArcRunner release workflow for 2h+ until the step timeout fired.
+  `--version`, `--help`, and every explicit subcommand are unaffected
+  (clap short-circuits the flags before the guard, and the guard only
+  fires on the implicit/explicit TUI dispatch paths).
 - Fresh `--data-dir` boots no longer crash with
   `Failed to create node key directory {data_dir}/secrets: File exists
   (os error 17)`. `PersistentSecretsStore::open` previously branched on

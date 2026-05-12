@@ -19,6 +19,27 @@ inputs:
     description: 'Working directory for the command'
     required: false
     default: '.'
+  install-dir:
+    description: |
+      Where to install the zlayer binary.
+      - empty (default): portable install to $RUNNER_TEMP/zlayer-bin. No sudo, no daemon, no system deps touched.
+      - non-empty (e.g. /usr/local/bin): full system install via install.sh. Handles libseccomp / cgroups v2 / SELinux relabel / completions / optional daemon. Requires sudo.
+    required: false
+    default: ''
+  data-dir:
+    description: |
+      ZLAYER_DATA_DIR override propagated via $GITHUB_ENV so every subsequent step in the job sees it.
+      - empty in portable mode: defaults to $RUNNER_TEMP/zlayer-data.
+      - empty in system mode: leaves ZLAYER_DATA_DIR unset (zlayer uses platform default /var/lib/zlayer).
+      - non-empty: written verbatim to $GITHUB_ENV in both modes.
+    required: false
+    default: ''
+  install-daemon:
+    description: |
+      Only used in system mode (install-dir non-empty). If 'true', install.sh runs `zlayer daemon install`
+      (systemd on Linux, launchd on macOS). Default 'false' (sets ZLAYER_NO_SERVICE=1).
+    required: false
+    default: 'false'
 
 outputs:
   version:
@@ -27,6 +48,9 @@ outputs:
   bin-dir:
     description: 'Directory the zlayer binary was installed into'
     value: ${{ steps.install.outputs.bin_dir }}
+  data-dir:
+    description: 'Resolved ZLAYER_DATA_DIR (empty when system mode and no override was given).'
+    value: ${{ steps.install.outputs.data_dir }}
 
 runs:
   using: 'composite'
@@ -58,6 +82,9 @@ runs:
 
         VERSION="${{ inputs.version }}"
         PLATFORM="${{ steps.platform.outputs.platform }}"
+        INSTALL_DIR_INPUT="${{ inputs.install-dir }}"
+        DATA_DIR_INPUT="${{ inputs.data-dir }}"
+        INSTALL_DAEMON_INPUT="${{ inputs.install-daemon }}"
 
         if ! command -v jq >/dev/null 2>&1; then
           echo "Error: jq is required but not installed." >&2
@@ -80,47 +107,112 @@ runs:
           fi
         fi
 
-        DL_VERSION="${VERSION#v}"
-        ARTIFACT="zlayer-${DL_VERSION}-${PLATFORM}.tar.gz"
-        URL="https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/${ARTIFACT}"
-        echo "Installing ZLayer ${VERSION} for ${PLATFORM}"
-        echo "Source: ${URL}"
+        if [ -z "$INSTALL_DIR_INPUT" ]; then
+          # ---------------- Portable mode ----------------
+          DL_VERSION="${VERSION#v}"
+          ARTIFACT="zlayer-${DL_VERSION}-${PLATFORM}.tar.gz"
+          URL="https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/${ARTIFACT}"
+          echo "Installing ZLayer ${VERSION} for ${PLATFORM} (portable mode)"
+          echo "Source: ${URL}"
 
-        TMPDIR="${RUNNER_TEMP:-/tmp}/zlayer-install-$$"
-        BIN_DIR="${RUNNER_TEMP:-/tmp}/zlayer-bin"
-        mkdir -p "$TMPDIR" "$BIN_DIR"
-        trap 'rm -rf "$TMPDIR"' EXIT
+          TMPDIR="${RUNNER_TEMP:-/tmp}/zlayer-install-$$"
+          BIN_DIR="${RUNNER_TEMP:-/tmp}/zlayer-bin"
+          mkdir -p "$TMPDIR" "$BIN_DIR"
+          trap 'rm -rf "$TMPDIR"' EXIT
 
-        if ! curl -fsSL --connect-timeout 30 --max-time 300 \
-                "$URL" -o "${TMPDIR}/zlayer.tar.gz"; then
-          echo "Error: Download failed for ${URL}" >&2
-          exit 1
+          if ! curl -fsSL --connect-timeout 30 --max-time 300 \
+                  "$URL" -o "${TMPDIR}/zlayer.tar.gz"; then
+            echo "Error: Download failed for ${URL}" >&2
+            exit 1
+          fi
+
+          tar -xzf "${TMPDIR}/zlayer.tar.gz" -C "${TMPDIR}"
+
+          BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer -perm -u+x | head -1)"
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer | head -1)"
+          fi
+          if [ -z "$BIN_PATH" ]; then
+            echo "Error: zlayer binary not found inside ${ARTIFACT}" >&2
+            ls -laR "${TMPDIR}" >&2 || true
+            exit 1
+          fi
+
+          install -m 0755 "$BIN_PATH" "${BIN_DIR}/zlayer"
+          echo "${BIN_DIR}" >> "$GITHUB_PATH"
+
+          if [ -n "$DATA_DIR_INPUT" ]; then
+            DATA_DIR="$DATA_DIR_INPUT"
+          else
+            DATA_DIR="${RUNNER_TEMP:-/tmp}/zlayer-data"
+          fi
+          mkdir -p "$DATA_DIR"
+          echo "ZLAYER_DATA_DIR=${DATA_DIR}" >> "$GITHUB_ENV"
+
+          "${BIN_DIR}/zlayer" --version
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
+          echo "data_dir=${DATA_DIR}" >> "$GITHUB_OUTPUT"
+        else
+          # ---------------- System mode ----------------
+          echo "Installing ZLayer ${VERSION} for ${PLATFORM} (system mode -> ${INSTALL_DIR_INPUT})"
+
+          INSTALLER_DIR="${RUNNER_TEMP:-/tmp}/zlayer-installer-$$"
+          mkdir -p "$INSTALLER_DIR"
+          trap 'rm -rf "$INSTALLER_DIR"' EXIT
+          INSTALLER="${INSTALLER_DIR}/install.sh"
+
+          INSTALLER_URL="https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/${VERSION}/install.sh"
+          echo "Fetching installer: ${INSTALLER_URL}"
+          if ! curl -fsSL --connect-timeout 30 --max-time 60 \
+                  "$INSTALLER_URL" -o "$INSTALLER"; then
+            echo "Error: Download failed for ${INSTALLER_URL}" >&2
+            exit 1
+          fi
+          chmod +x "$INSTALLER"
+
+          if [ "$INSTALL_DAEMON_INPUT" != "true" ]; then
+            ZLAYER_VERSION="$VERSION" \
+            ZLAYER_INSTALL_DIR="$INSTALL_DIR_INPUT" \
+            ZLAYER_NO_SERVICE=1 \
+              bash "$INSTALLER"
+          else
+            ZLAYER_VERSION="$VERSION" \
+            ZLAYER_INSTALL_DIR="$INSTALL_DIR_INPUT" \
+              bash "$INSTALLER"
+          fi
+
+          BIN_DIR="$INSTALL_DIR_INPUT"
+          case "$BIN_DIR" in
+            /usr/local/bin|/usr/bin|/opt/homebrew/bin)
+              echo "Skipping \$GITHUB_PATH append: ${BIN_DIR} is already on system PATH"
+              ;;
+            *)
+              echo "${BIN_DIR}" >> "$GITHUB_PATH"
+              ;;
+          esac
+
+          if [ -n "$DATA_DIR_INPUT" ]; then
+            mkdir -p "$DATA_DIR_INPUT"
+            echo "ZLAYER_DATA_DIR=${DATA_DIR_INPUT}" >> "$GITHUB_ENV"
+          fi
+
+          "${BIN_DIR}/zlayer" --version
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
+          echo "data_dir=${DATA_DIR_INPUT}" >> "$GITHUB_OUTPUT"
         fi
-
-        tar -xzf "${TMPDIR}/zlayer.tar.gz" -C "${TMPDIR}"
-
-        BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer -perm -u+x | head -1)"
-        if [ -z "$BIN_PATH" ]; then
-          BIN_PATH="$(find "${TMPDIR}" -type f -name zlayer | head -1)"
-        fi
-        if [ -z "$BIN_PATH" ]; then
-          echo "Error: zlayer binary not found inside ${ARTIFACT}" >&2
-          ls -laR "${TMPDIR}" >&2 || true
-          exit 1
-        fi
-
-        install -m 0755 "$BIN_PATH" "${BIN_DIR}/zlayer"
-        echo "${BIN_DIR}" >> "$GITHUB_PATH"
-
-        "${BIN_DIR}/zlayer" --version
-
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-        echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
 
     - name: Run ZLayer command
-      if: inputs.command != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
         set -euo pipefail
-        zlayer ${{ inputs.command }}
+        CMD="${{ inputs.command }}"
+        if [ -z "$CMD" ]; then
+          echo "(no command supplied — install-only invocation)"
+          exit 0
+        fi
+        zlayer $CMD
