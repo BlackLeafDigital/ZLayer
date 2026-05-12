@@ -53,6 +53,11 @@ struct StaleDaemonMeta {
 /// treated as "no claim". Synchronous on purpose: the foreign-daemon probe
 /// runs before we enter async land for the boot sweep, and the file is
 /// small enough that the blocking read is irrelevant in practice.
+///
+/// Only compiled on unix (the sole non-test caller, `foreign_daemon_alive`,
+/// is unix-only) or under `cfg(test)` so the unit tests still link on
+/// Windows. Without this gate, Windows non-test builds flag it as dead.
+#[cfg(any(unix, test))]
 fn read_daemon_metadata(path: &std::path::Path) -> Option<StaleDaemonMeta> {
     let contents = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
