@@ -72,6 +72,23 @@ All notable changes to this project will be documented in this file.
   HTTP/2 multiplexes, so idle TCP connections aren't useful for raft.
 
 ### Fixed
+- `ZLayerDirs::default_data_dir` now honors `$ZLAYER_DATA_DIR` as the
+  highest-precedence source. Previously the env var was only read by
+  `zlayer serve`'s `--data-dir` clap arg, so CLI subcommands like
+  `zlayer user create` that dispatch through `DaemonClient::connect()`
+  without threading `cli.effective_data_dir()` silently dialed
+  `$HOME/.zlayer/run/zlayer.sock` instead of the throwaway daemon's
+  socket. Surfaced when the manager-intellitester e2e harness ran
+  `user create` against a `--data-dir`-scoped daemon in CI.
+- Manager e2e harness (`crates/zlayer-manager/tests/e2e/scripts/run-suite.py`)
+  now echoes captured stdout/stderr to `sys.stderr` when a
+  `capture_output=True, check=True` subprocess fails. Previously a CLI
+  failure showed only `CalledProcessError: returned non-zero exit
+  status 1` in the CI log with no underlying message.
+- Manager e2e harness polls `/health/ready` (the actual handler in
+  `crates/zlayer-api/src/handlers/health.rs`) instead of the
+  nonexistent `/healthz`. The `/` fallback in `_wait_http_ok` was
+  masking the misnamed endpoint.
 - Dead `peers: RwLock<HashMap<NodeId, String>>` field and its three
   unused accessor methods removed from `HttpNetwork` -- the field was
   never read by any caller in the workspace.

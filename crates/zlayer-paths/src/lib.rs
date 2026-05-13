@@ -24,6 +24,7 @@ impl ZLayerDirs {
 
     /// Platform-aware default data directory.
     ///
+    /// - `$ZLAYER_DATA_DIR` (if set and non-empty) overrides every other source.
     /// - macOS: `~/.zlayer`
     /// - Linux (root): `/var/lib/zlayer`
     /// - Linux (user): `~/.zlayer`
@@ -31,6 +32,11 @@ impl ZLayerDirs {
     ///   fallback. HCS-backed nodes run as SYSTEM so the system-wide
     ///   `ProgramData` location is the right default.
     pub fn default_data_dir() -> PathBuf {
+        if let Some(env_dir) = std::env::var_os("ZLAYER_DATA_DIR") {
+            if !env_dir.is_empty() {
+                return PathBuf::from(env_dir);
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             home_dir_or_fallback().join(".zlayer")

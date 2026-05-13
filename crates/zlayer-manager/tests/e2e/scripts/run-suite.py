@@ -226,12 +226,8 @@ def start_throwaway_daemon(
     }
     proc = subprocess.Popen(argv, cwd=REPO_ROOT, env=env, start_new_session=True)
 
-    healthz = f"http://127.0.0.1:{API_PORT}/healthz"
-    root_url = f"http://127.0.0.1:{API_PORT}/"
-    if not (
-        _wait_http_ok(healthz, HEALTHCHECK_TIMEOUT_S)
-        or _wait_http_ok(root_url, 5)
-    ):
+    ready_url = f"http://127.0.0.1:{API_PORT}/health/ready"
+    if not _wait_http_ok(ready_url, HEALTHCHECK_TIMEOUT_S):
         _kill_pg(proc, "daemon (failed startup)", sudo=sudo)
         die(f"throwaway daemon never came up on 127.0.0.1:{API_PORT}")
 
@@ -254,16 +250,23 @@ def create_fixture_user(
     env = {**os.environ}
     if cli_data_dir:
         env["ZLAYER_DATA_DIR"] = str(cli_data_dir)
-    result = subprocess.run(
-        [
-            str(zlayer_bin), "user", "create",
-            "--email", email,
-            "--password", password,
-            "--role", "admin",
-            "--display-name", display,
-        ],
-        env=env, capture_output=True, text=True, check=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                str(zlayer_bin), "user", "create",
+                "--email", email,
+                "--password", password,
+                "--role", "admin",
+                "--display-name", display,
+            ],
+            env=env, capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            sys.stderr.write(f"--- user create stdout ---\n{exc.stdout}\n")
+        if exc.stderr:
+            sys.stderr.write(f"--- user create stderr ---\n{exc.stderr}\n")
+        raise
     # Stdout: `Created user {display} <{email}> (role: {role}, id: {uuid})`
     match = re.search(r"id:\s*([0-9a-fA-F-]{36})\)", result.stdout)
     if not match:
@@ -493,22 +496,33 @@ def _bootstrap_3node_cluster(
     n1 = _spawn_node_serve(zlayer_bin, data_dirs[0], CLUSTER_NODES[0]["api"])
     procs.append(n1)
     if not _wait_http_ok(
-        f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/healthz", 30,
+        f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/health/ready", 30,
     ):
         die(f"node1 never came up on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
 
     # --- Generate join token from the leader -------------------------------
     log("cluster: generating join token on node1")
-    gen = subprocess.run(
-        [
-            str(zlayer_bin),
-            "--data-dir", str(data_dirs[0]),
-            "node", "generate-join-token",
-            CLUSTER_DEPLOYMENT,
-            "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
-        ],
-        capture_output=True, text=True, check=True, cwd=REPO_ROOT,
-    )
+    try:
+        gen = subprocess.run(
+            [
+                str(zlayer_bin),
+                "--data-dir", str(data_dirs[0]),
+                "node", "generate-join-token",
+                CLUSTER_DEPLOYMENT,
+                "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
+            ],
+            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            sys.stderr.write(
+                f"--- node generate-join-token stdout ---\n{exc.stdout}\n"
+            )
+        if exc.stderr:
+            sys.stderr.write(
+                f"--- node generate-join-token stderr ---\n{exc.stderr}\n"
+            )
+        raise
     token = _parse_join_token(gen.stdout)
     log(f"cluster: join token ({len(token)} chars) acquired")
 
@@ -537,7 +551,7 @@ def _bootstrap_3node_cluster(
         p = _spawn_node_serve(zlayer_bin, data_dirs[i], cfg["api"])
         procs.append(p)
         if not _wait_http_ok(
-            f"http://127.0.0.1:{cfg['api']}/healthz", 30,
+            f"http://127.0.0.1:{cfg['api']}/health/ready", 30,
         ):
             die(f"node{i + 1} never came up on 127.0.0.1:{cfg['api']}")
 
@@ -720,7 +734,7 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
             zlayer_bin, data_dirs[worker_idx], api_ports[worker_idx],
         )
         if not _wait_http_ok(
-            f"http://127.0.0.1:{api_ports[worker_idx]}/healthz", 30,
+            f"http://127.0.0.1:{api_ports[worker_idx]}/health/ready", 30,
         ):
             raise RuntimeError(
                 f"restarted node{worker_idx + 1} never came up on "
