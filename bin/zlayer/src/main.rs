@@ -726,6 +726,7 @@ async fn run(
             tunnel_tls_cert,
             tunnel_tls_key,
             no_tunnel_server,
+            restart_on_exit,
             ..
         } => {
             // Spawn Docker API socket server if enabled. On Unix this is a
@@ -777,6 +778,7 @@ async fn run(
                     *wg_port,
                     *dns_port,
                     nat_overrides,
+                    *restart_on_exit,
                 ))
                 .await
             }
@@ -793,6 +795,7 @@ async fn run(
                     deployment_name.clone(),
                     *wg_port,
                     *dns_port,
+                    *restart_on_exit,
                 ))
                 .await
             }

@@ -109,7 +109,7 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
-    __path_cluster_list_nodes,
+    __path_cluster_list_nodes, __path_cluster_upgrade,
 };
 use crate::handlers::container_networks::{
     __path_connect_container_network, __path_create_container_network,
@@ -152,7 +152,10 @@ use crate::handlers::images::{
     __path_list_images_handler, __path_prune_images_handler, __path_pull_image_handler,
     __path_remove_image_handler, __path_tag_image_handler,
 };
-use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
+use crate::handlers::internal::{
+    __path_get_replicas_internal, __path_internal_upgrade_start, __path_internal_upgrade_status,
+    __path_scale_service_internal,
+};
 use crate::handlers::jobs::{
     __path_cancel_execution, __path_get_execution_status, __path_list_job_executions,
     __path_trigger_job,
@@ -331,6 +334,8 @@ impl Modify for SecurityAddon {
         // Internal (scheduler-to-agent)
         scale_service_internal,
         get_replicas_internal,
+        internal_upgrade_start,
+        internal_upgrade_status,
         // Secrets
         create_secret,
         rotate_secret,
@@ -458,6 +463,7 @@ impl Modify for SecurityAddon {
         cluster_list_nodes,
         cluster_heartbeat,
         cluster_force_leader,
+        cluster_upgrade,
         // Volumes
         list_volumes,
         create_volume,
@@ -511,6 +517,10 @@ impl Modify for SecurityAddon {
             // Internal schemas
             InternalScaleRequest,
             InternalScaleResponse,
+            crate::handlers::internal::UpgradeStartRequest,
+            crate::handlers::internal::UpgradeStartResponse,
+            crate::handlers::internal::UpgradeJobState,
+            crate::handlers::internal::UpgradeStatus,
             // Container schemas
             CreateContainerRequest,
             ContainerInfo,
@@ -696,6 +706,9 @@ impl Modify for SecurityAddon {
             HeartbeatRequest,
             ForceLeaderRequest,
             ForceLeaderResponse,
+            crate::handlers::cluster::ClusterUpgradeRequest,
+            crate::handlers::cluster::ClusterUpgradeResult,
+            crate::handlers::cluster::UpgradeError,
             // Volume schemas
             VolumeSummary,
             VolumeInfo,

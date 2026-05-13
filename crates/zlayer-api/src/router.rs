@@ -627,6 +627,16 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             get(handlers::internal::get_replicas_internal),
         )
         .route("/add-peer", post(handlers::internal::add_peer_internal))
+        // `zlayer node upgrade` — the leader hits `upgrade/start` on each
+        // follower in turn and polls `upgrade/{id}` for progress.
+        .route(
+            "/upgrade/start",
+            post(handlers::internal::internal_upgrade_start),
+        )
+        .route(
+            "/upgrade/{upgrade_id}",
+            get(handlers::internal::internal_upgrade_status),
+        )
         .layer(Extension(internal_state.clone()))
         .with_state(internal_state)
 }
@@ -1270,6 +1280,9 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             "/force-leader",
             post(handlers::cluster::cluster_force_leader),
         )
+        // Rolling daemon-binary upgrade entry point. Followers respond
+        // with 421 + X-Leader-Addr so the CLI can redirect to the leader.
+        .route("/upgrade", post(handlers::cluster::cluster_upgrade))
         .route(
             "/nodes/{id}",
             delete(handlers::cluster::cluster_remove_node),

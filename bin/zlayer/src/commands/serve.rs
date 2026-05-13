@@ -711,7 +711,12 @@ pub(crate) async fn serve(
     deployment_name: String,
     wg_port: Option<u16>,
     dns_port: Option<u16>,
+    restart_on_exit: bool,
 ) -> Result<()> {
+    // Stash the `--restart-on-exit` flag in a process-global slot so
+    // `serve_with_external_shutdown` (whose public signature is locked by the
+    // Windows Service host in `daemon_service.rs`) picks it up after teardown.
+    set_pending_restart_on_exit(restart_on_exit);
     // Box::pin keeps the top-level future below clippy's `large_futures`
     // threshold — `serve_with_external_shutdown` materialises the whole
     // daemon state on the stack and its future is sizeable.
@@ -747,12 +752,14 @@ pub(crate) async fn serve_with_nat_overrides(
     wg_port: Option<u16>,
     dns_port: Option<u16>,
     nat_overrides: NatCliOverrides,
+    restart_on_exit: bool,
 ) -> Result<()> {
     // Stash the overrides in a process-global slot so
     // `serve_with_external_shutdown` (which keeps its public signature for
     // back-compat with `daemon_service.rs`) can pick them up alongside the
     // `ZLAYER_NAT_*` env vars.
     set_pending_nat_overrides(nat_overrides);
+    set_pending_restart_on_exit(restart_on_exit);
     Box::pin(serve_with_external_shutdown(
         bind,
         jwt_secret,
@@ -803,6 +810,25 @@ fn take_pending_tunnel_overrides() -> TunnelCliOverrides {
         .ok()
         .and_then(|mut slot| slot.take())
         .unwrap_or_default()
+}
+
+/// Pending `--restart-on-exit` flag.
+///
+/// `serve()` / `serve_with_nat_overrides()` stash this for
+/// `serve_with_external_shutdown()` to pick up — same pattern as the tunnel /
+/// NAT overrides above. Keeping it in a process-global slot avoids changing
+/// `serve_with_external_shutdown`'s public signature (the Windows Service
+/// host in `daemon_service.rs` calls it with the legacy argument list).
+static PENDING_RESTART_ON_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_restart_on_exit(restart: bool) {
+    PENDING_RESTART_ON_EXIT.store(restart, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_restart_on_exit() -> bool {
+    PENDING_RESTART_ON_EXIT.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Resolve the tunnel daemon config from CLI overrides + env vars + defaults.
@@ -2167,6 +2193,17 @@ pub(crate) async fn serve_with_external_shutdown(
     let _ = tokio::fs::remove_file(&pid_file).await;
 
     info!("Daemon shutdown complete");
+
+    if take_pending_restart_on_exit() {
+        // Per the CLAUDE.md note: there is no in-tree supervisor.
+        // Exit code 75 (EX_TEMPFAIL) signals "transient failure, please retry"
+        // so systemd `Restart=on-failure` (the conventional config) respawns us.
+        // Without a supervisor, this becomes a clean exit that the operator
+        // can re-wrap.
+        tracing::info!("--restart-on-exit set; exiting with code 75 for supervisor respawn");
+        std::process::exit(75);
+    }
+
     Ok(())
 }
 

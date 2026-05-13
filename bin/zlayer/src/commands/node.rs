@@ -416,6 +416,21 @@ pub(crate) async fn handle_node(
             handle_node_label(node_id.clone(), label.clone(), cli_data_dir).await
         }
         NodeCommands::ForceLeader { api_addr } => handle_node_force_leader(api_addr.clone()).await,
+        NodeCommands::Upgrade {
+            version,
+            cooldown_secs,
+            strict,
+            yes,
+        } => {
+            handle_node_upgrade(
+                cli_data_dir.to_path_buf(),
+                version.clone(),
+                *cooldown_secs,
+                *strict,
+                *yes,
+            )
+            .await
+        }
         NodeCommands::GenerateJoinToken {
             deployment,
             api,
@@ -2116,6 +2131,182 @@ pub(crate) async fn handle_node_remove(
     println!("Node '{node_id}' removed successfully.");
     if !force {
         println!("Services have been migrated to other nodes.");
+    }
+
+    Ok(())
+}
+
+/// Body of `POST /api/v1/cluster/upgrade`.
+#[derive(Debug, Clone, Serialize)]
+struct ClusterUpgradeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    cooldown_secs: u64,
+    strict: bool,
+}
+
+/// One entry in the `errors` field of the upgrade response.
+#[derive(Debug, Clone, Deserialize)]
+struct ClusterUpgradeError {
+    node_id: String,
+    message: String,
+}
+
+/// Response body for `POST /api/v1/cluster/upgrade`.
+#[derive(Debug, Clone, Deserialize)]
+struct ClusterUpgradeResponse {
+    #[serde(default)]
+    upgraded: Vec<String>,
+    #[serde(default)]
+    skipped: Vec<String>,
+    #[serde(default)]
+    errors: Vec<ClusterUpgradeError>,
+}
+
+/// Roll a new zlayer version across every follower in the cluster.
+///
+/// The local daemon's API endpoint is contacted first. If it answers with
+/// 421 Misdirected Request, the request is re-issued once against the leader
+/// address advertised in the `X-Leader-Addr` response header. The leader
+/// orchestrates the rolling upgrade internally and blocks until done, so the
+/// HTTP client uses a generous 30-minute timeout.
+///
+/// The leader itself is *not* upgraded by this command — the operator runs
+/// `zlayer self-update --restart` on the leader manually after the rollout
+/// completes.
+pub(crate) async fn handle_node_upgrade(
+    data_dir: PathBuf,
+    version: Option<String>,
+    cooldown_secs: u64,
+    strict: bool,
+    yes: bool,
+) -> Result<()> {
+    use reqwest::StatusCode;
+    use std::io::{self, Write};
+    use std::time::Duration;
+
+    // 1. Resolve the local daemon's API endpoint from node_config.json.
+    let node_config = load_or_init_node_config(&data_dir).await?;
+    let local_api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
+
+    // 2. Confirmation prompt (skipped with `-y`).
+    if !yes {
+        let version_msg = match version.as_deref() {
+            Some(v) => format!(" {v}"),
+            None => String::new(),
+        };
+        print!(
+            "This will roll zlayer{version_msg} across every follower in the cluster. Continue? [y/N] "
+        );
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read confirmation")?;
+        let answer = input.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // 3. Long-running HTTP client — rolling upgrades can take many minutes.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1800))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let body = ClusterUpgradeRequest {
+        version: version.clone(),
+        cooldown_secs,
+        strict,
+    };
+
+    // 4. First attempt: hit the local daemon.
+    let url = format!("http://{local_api_endpoint}/api/v1/cluster/upgrade");
+    info!(%url, "Sending cluster upgrade request to local daemon");
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to send cluster upgrade request")?;
+
+    // 5. Handle 421 by retrying against the leader exactly once.
+    let response = if response.status() == StatusCode::MISDIRECTED_REQUEST {
+        let leader_addr = response
+            .headers()
+            .get("X-Leader-Addr")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        match leader_addr {
+            Some(addr) => {
+                let leader_url = format!("http://{addr}/api/v1/cluster/upgrade");
+                info!("Local daemon is not the leader. Retrying via leader at {addr}...");
+                client
+                    .post(&leader_url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("Failed to send cluster upgrade request to leader")?
+            }
+            None => {
+                anyhow::bail!(
+                    "Local daemon is not the leader and could not determine leader address. \
+                     Run this command on the leader node."
+                );
+            }
+        }
+    } else {
+        response
+    };
+
+    // 6. Bail on any non-2xx.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Upgrade request failed: {status} - {body}");
+    }
+
+    // 7. Parse the upgrade result and report it.
+    let result: ClusterUpgradeResponse = response
+        .json()
+        .await
+        .context("Failed to parse cluster upgrade response")?;
+
+    if result.upgraded.is_empty() {
+        println!("✓ Upgraded 0 follower(s).");
+    } else {
+        println!(
+            "✓ Upgraded {} follower(s): {}",
+            result.upgraded.len(),
+            result.upgraded.join(", ")
+        );
+    }
+    if !result.skipped.is_empty() {
+        println!("- Skipped: {}", result.skipped.join(", "));
+    }
+    if !result.errors.is_empty() {
+        println!("- Errors:");
+        for err in &result.errors {
+            println!("    node {}: {}", err.node_id, err.message);
+        }
+    }
+
+    // 8. Final reminder — the leader is never auto-upgraded by this command.
+    println!();
+    println!(
+        "Note: the leader was NOT auto-upgraded. Run 'zlayer self-update --restart' on the leader once followers are healthy."
+    );
+
+    if strict && !result.errors.is_empty() {
+        let summary = result
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.node_id, e.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("Rolling upgrade failed in strict mode: {summary}");
     }
 
     Ok(())

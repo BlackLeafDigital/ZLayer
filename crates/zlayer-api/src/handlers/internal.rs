@@ -3,15 +3,19 @@
 //! These endpoints are used by the distributed scheduler to trigger operations
 //! on agents. They use a shared secret for authentication rather than JWT tokens.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     extract::{FromRequestParts, State},
-    http::{header::HeaderValue, request::Parts},
+    http::{header::HeaderValue, request::Parts, StatusCode},
     Json,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::error::{ApiError, Result};
 use zlayer_agent::{AgentError, ServiceManager};
@@ -30,6 +34,22 @@ pub struct InternalState {
     /// `WireGuard` overlay interface name (e.g. "zl-overlay0") for add-peer operations.
     /// `None` if overlay networking is not configured.
     pub overlay_interface: Option<String>,
+    /// In-memory map of in-flight / completed daemon-binary upgrade jobs
+    /// (keyed by `upgrade_id`).
+    ///
+    /// This is intentionally non-persistent: an upgrade either completes
+    /// before the daemon restarts (in which case the new process starts
+    /// with an empty map) or fails before restart (in which case the
+    /// failure is reflected here for the leader to poll). Crash recovery
+    /// of an in-flight upgrade is handled by the leader retrying via
+    /// `/api/v1/cluster/upgrade`.
+    pub upgrade_jobs: Arc<RwLock<HashMap<String, UpgradeJobState>>>,
+    /// Optional data directory for writing the restart sentinel that the
+    /// supervisor (or `--restart-on-exit` wrapper) consults after a clean
+    /// exit. `None` disables the sentinel write — the supervisor must
+    /// already restart the daemon unconditionally on exit code 75 in that
+    /// case.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl InternalState {
@@ -39,6 +59,8 @@ impl InternalState {
             service_manager,
             internal_token,
             overlay_interface: None,
+            upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
+            data_dir: None,
         }
     }
 
@@ -52,8 +74,303 @@ impl InternalState {
             service_manager,
             internal_token,
             overlay_interface,
+            upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
+            data_dir: None,
         }
     }
+
+    /// Attach a data directory used for writing the post-upgrade restart
+    /// sentinel (`{data_dir}/run/zlayer.restart`).
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+}
+
+// =============================================================================
+// Daemon-binary upgrade (used by `zlayer node upgrade`)
+// =============================================================================
+
+/// Lifecycle of a daemon-binary upgrade job, tracked in-memory on the node
+/// being upgraded.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeStatus {
+    /// Job has been registered; the worker task has not yet started.
+    Pending,
+    /// Downloading the target release binary.
+    Downloading,
+    /// Replacing the on-disk binary with the new version.
+    Applying,
+    /// Daemon is about to exit so the supervisor can respawn it.
+    Restarting,
+    /// Upgrade failed before the restart was triggered. The `error` field
+    /// on [`UpgradeJobState`] explains why.
+    Failed,
+}
+
+/// State of a single daemon-binary upgrade attempt. Stored in
+/// [`InternalState::upgrade_jobs`] and returned by `GET
+/// /api/v1/internal/upgrade/{id}`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UpgradeJobState {
+    /// Server-generated upgrade id (UUID v4).
+    pub upgrade_id: String,
+    /// Target version (e.g. `"v0.12.0"`); `None` means "latest release".
+    pub version: Option<String>,
+    /// Current lifecycle state.
+    pub status: UpgradeStatus,
+    /// When the job was registered.
+    #[schema(value_type = String, format = "date-time")]
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the job entered its terminal state (`Restarting` or `Failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "date-time")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Human-readable failure reason (set only when `status == Failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request body for `POST /api/v1/internal/upgrade/start`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpgradeStartRequest {
+    /// Target version. `None` (or `"latest"`) defers to `self-update`'s
+    /// "latest GitHub release" resolver.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Response body for `POST /api/v1/internal/upgrade/start`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpgradeStartResponse {
+    pub upgrade_id: String,
+    pub message: String,
+}
+
+/// Schedule a daemon-binary upgrade on this node.
+///
+/// `POST /api/v1/internal/upgrade/start`
+///
+/// Registers an upgrade job, spawns a worker task that runs the
+/// `zlayer self-update` subcommand against `current_exe()`, and returns
+/// `202 Accepted` with an `upgrade_id` the caller can poll via
+/// `internal_upgrade_status`. On success the daemon exits with code 75 so
+/// the supervisor (or `--restart-on-exit`) respawns it.
+///
+/// # Errors
+///
+/// Returns `Unauthorized` if the internal token is missing or wrong.
+#[utoipa::path(
+    post,
+    path = "/api/v1/internal/upgrade/start",
+    request_body = UpgradeStartRequest,
+    responses(
+        (status = 202, description = "Upgrade scheduled", body = UpgradeStartResponse),
+        (status = 401, description = "Unauthorized — invalid or missing internal token"),
+    ),
+    tag = "Internal"
+)]
+#[allow(clippy::too_many_lines)]
+pub async fn internal_upgrade_start(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+    Json(req): Json<UpgradeStartRequest>,
+) -> Result<(StatusCode, Json<UpgradeStartResponse>)> {
+    let upgrade_id = Uuid::new_v4().to_string();
+    let job = UpgradeJobState {
+        upgrade_id: upgrade_id.clone(),
+        version: req.version.clone(),
+        status: UpgradeStatus::Pending,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error: None,
+    };
+    {
+        let mut jobs = state.upgrade_jobs.write().await;
+        jobs.insert(upgrade_id.clone(), job);
+    }
+
+    // Spawn the worker. Returning `202 Accepted` first lets the response
+    // leave before we potentially kill our own process below.
+    let worker_state = state.clone();
+    let worker_id = upgrade_id.clone();
+    let worker_version = req.version.clone();
+    tokio::spawn(async move {
+        // Give the HTTP response a beat to escape the socket before we
+        // start swapping our own binary out from under ourselves.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Helper closures to bump the status field in one short critical section.
+        let update_status = |status: UpgradeStatus, error: Option<String>| {
+            let jobs = worker_state.upgrade_jobs.clone();
+            let id = worker_id.clone();
+            async move {
+                let mut guard = jobs.write().await;
+                if let Some(job) = guard.get_mut(&id) {
+                    let terminal =
+                        matches!(status, UpgradeStatus::Restarting | UpgradeStatus::Failed);
+                    job.status = status;
+                    if let Some(msg) = error {
+                        job.error = Some(msg);
+                    }
+                    if terminal {
+                        job.finished_at = Some(chrono::Utc::now());
+                    }
+                }
+            }
+        };
+
+        // 1. Status -> Downloading. Run `zlayer self-update`.
+        update_status(UpgradeStatus::Downloading, None).await;
+
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "internal_upgrade_start: failed to resolve current_exe");
+                update_status(
+                    UpgradeStatus::Failed,
+                    Some(format!("current_exe lookup failed: {e}")),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let mut cmd = tokio::process::Command::new(&current_exe);
+        cmd.arg("self-update").arg("--yes");
+        if let Some(v) = worker_version.as_deref() {
+            if !v.is_empty() && v != "latest" {
+                cmd.arg("--version").arg(v);
+            }
+        }
+
+        info!(
+            upgrade_id = %worker_id,
+            exe = %current_exe.display(),
+            version = ?worker_version,
+            "internal_upgrade_start: spawning self-update subprocess"
+        );
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => {
+                error!(
+                    upgrade_id = %worker_id,
+                    error = %e,
+                    "internal_upgrade_start: self-update subprocess failed to start"
+                );
+                update_status(
+                    UpgradeStatus::Failed,
+                    Some(format!("self-update spawn failed: {e}")),
+                )
+                .await;
+                return;
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(
+                upgrade_id = %worker_id,
+                exit_status = ?output.status,
+                stderr = %stderr,
+                "internal_upgrade_start: self-update subprocess returned non-zero"
+            );
+            update_status(
+                UpgradeStatus::Failed,
+                Some(format!(
+                    "self-update exited with {:?}: {}",
+                    output.status, stderr
+                )),
+            )
+            .await;
+            return;
+        }
+
+        // 2. Status -> Applying. (self-update covers download+apply in one shot;
+        // we treat the post-success window as `Applying` then `Restarting` so
+        // pollers see a sane progression.)
+        update_status(UpgradeStatus::Applying, None).await;
+
+        // 3. Write the restart sentinel if a data_dir was configured.
+        if let Some(ref data_dir) = worker_state.data_dir {
+            let run_dir = data_dir.join("run");
+            if let Err(e) = tokio::fs::create_dir_all(&run_dir).await {
+                warn!(
+                    upgrade_id = %worker_id,
+                    error = %e,
+                    "internal_upgrade_start: failed to create run/ dir for restart sentinel"
+                );
+            } else {
+                let sentinel = run_dir.join("zlayer.restart");
+                if let Err(e) = tokio::fs::write(&sentinel, b"restart\n").await {
+                    warn!(
+                        upgrade_id = %worker_id,
+                        error = %e,
+                        path = %sentinel.display(),
+                        "internal_upgrade_start: failed to write restart sentinel"
+                    );
+                }
+            }
+        }
+
+        // 4. Status -> Restarting. Exit 75 = EX_TEMPFAIL, which is the
+        // documented "respawn me" signal to the supervisor / wrapper.
+        update_status(UpgradeStatus::Restarting, None).await;
+        info!(
+            upgrade_id = %worker_id,
+            "internal_upgrade_start: exiting with code 75 so the supervisor respawns the daemon"
+        );
+
+        // Tiny grace period so the status write is observable before exit.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        std::process::exit(75);
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UpgradeStartResponse {
+            upgrade_id,
+            message: "Upgrade scheduled".to_string(),
+        }),
+    ))
+}
+
+/// Fetch the status of a previously-scheduled daemon-binary upgrade.
+///
+/// `GET /api/v1/internal/upgrade/{upgrade_id}`
+///
+/// # Errors
+///
+/// Returns `Unauthorized` if the internal token is missing or wrong, or
+/// `NotFound` if `upgrade_id` is not in the in-memory job map (which is
+/// expected after a daemon restart — callers should treat that as
+/// "upgrade likely complete; daemon respawned").
+#[utoipa::path(
+    get,
+    path = "/api/v1/internal/upgrade/{upgrade_id}",
+    params(
+        ("upgrade_id" = String, Path, description = "Upgrade job id returned by internal_upgrade_start"),
+    ),
+    responses(
+        (status = 200, description = "Current upgrade state", body = UpgradeJobState),
+        (status = 401, description = "Unauthorized — invalid or missing internal token"),
+        (status = 404, description = "Upgrade id not found (may have been lost across a daemon restart)"),
+    ),
+    tag = "Internal"
+)]
+pub async fn internal_upgrade_status(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+    axum::extract::Path(upgrade_id): axum::extract::Path<String>,
+) -> Result<Json<UpgradeJobState>> {
+    let jobs = state.upgrade_jobs.read().await;
+    let job = jobs
+        .get(&upgrade_id)
+        .ok_or_else(|| ApiError::NotFound(format!("upgrade id '{upgrade_id}' not found")))?;
+    Ok(Json(job.clone()))
 }
 
 /// Internal authentication extractor

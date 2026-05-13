@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 ## [0.11.24] - 2026-05-12
 
 ### Added
+- `zlayer node upgrade` — leader-driven rolling daemon-binary upgrade
+  across the cluster. The CLI POSTs `/api/v1/cluster/upgrade` to the
+  local daemon; if it isn't the leader the daemon returns
+  `421 Misdirected Request` with an `X-Leader-Addr` response header
+  and the CLI re-targets the leader automatically. The leader
+  iterates followers in stable `node_id` order: it POSTs
+  `/api/v1/internal/upgrade/start` against each follower (using the
+  internal-cluster `X-ZLayer-Internal-Token` header), waits for
+  `/health/ready` to flap (drop, come back), then sleeps
+  `--cooldown-secs` (default 30s) before the next node. Followers
+  shell out to `zlayer self-update --yes [--version <v>]` from the
+  endpoint handler, write a `{data_dir}/run/zlayer.restart` sentinel,
+  and exit code 75 (EX_TEMPFAIL) so a supervisor respawns them on the
+  new binary. Flags: `--version vX.Y.Z`, `--cooldown-secs N`,
+  `--strict` (abort on the first follower failure), `-y/--yes`.
+  Leader is **not** auto-upgraded (no in-cluster leader-transfer API
+  is plumbed yet); operator runs `zlayer self-update --restart` on
+  the leader manually after followers report healthy.
+- `ApiError::NotLeader { leader_addr: Option<String> }` variant
+  mapping to HTTP `421 Misdirected Request`. Includes a
+  `LEADER_ADDR_HEADER` constant (`X-Leader-Addr`) so the response
+  carries the leader's API endpoint when known. First use is the new
+  `cluster_upgrade` handler; eventually every leader-only endpoint
+  should return this instead of generic 503s.
+- `POST /api/v1/cluster/upgrade` and `POST /api/v1/internal/upgrade/start`
+  + `GET /api/v1/internal/upgrade/{id}` endpoints. Internal endpoints
+  reuse the existing `InternalAuth` extractor + `X-ZLayer-Internal-Token`
+  header pattern. Status polling follows the 202-Accepted + UUID-id
+  convention from `start_build`.
+- `zlayer serve --restart-on-exit` (also `ZLAYER_RESTART_ON_EXIT`)
+  flag. After clean shutdown, exits with code 75 (`EX_TEMPFAIL`)
+  instead of 0 so a supervisor (`systemd Restart=on-failure`, runit,
+  etc.) respawns the daemon. Used by `zlayer node upgrade`'s
+  follower-self-update path.
 - `zlayer self-update` subcommand. Downloads a newer zlayer release
   tarball from GitHub (`BlackLeafDigital/ZLayer`), optionally verifies
   a SHA-256 sidecar when present (skips silently when absent so

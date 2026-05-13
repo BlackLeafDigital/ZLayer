@@ -20,7 +20,7 @@ use zlayer_overlay::{IpAllocator, NodeSliceAllocator};
 
 use crate::error::{ApiError, Result};
 use crate::handlers::internal::{InternalAddPeerRequest, INTERNAL_AUTH_HEADER};
-use zlayer_scheduler::{AddMemberParams, RaftCoordinator};
+use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 
 // =============================================================================
 // DTOs
@@ -870,6 +870,269 @@ pub async fn cluster_undrain_node(
     Ok(Json(NodeLifecycleResponse {
         node_id,
         status: "ready".into(),
+    }))
+}
+
+// =============================================================================
+// Rolling daemon upgrade (`zlayer node upgrade`)
+// =============================================================================
+
+/// Request body for `POST /api/v1/cluster/upgrade`.
+///
+/// Drives a leader-coordinated rolling daemon-binary upgrade across the
+/// cluster. The leader walks every follower in ascending `node_id` order
+/// (and finally upgrades itself), instructing each to download the target
+/// `zlayer` release and restart. Followers come back on the same advertise
+/// address and re-join Raft; the leader waits for each one to be healthy
+/// again before moving on.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ClusterUpgradeRequest {
+    /// Target zlayer version (e.g. "v0.12.0"). Defaults to latest GitHub release if absent.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Seconds to pause between node upgrades after each follower comes back healthy.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Abort the rollout if any follower fails to come back healthy.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+fn default_cooldown_secs() -> u64 {
+    30
+}
+
+/// Per-node error captured during a rolling upgrade.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpgradeError {
+    pub node_id: NodeId,
+    pub message: String,
+}
+
+/// Final result of a rolling upgrade attempt.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClusterUpgradeResult {
+    /// Nodes that successfully restarted on the new binary.
+    pub upgraded: Vec<NodeId>,
+    /// Nodes intentionally skipped (e.g. unreachable, missing api endpoint).
+    pub skipped: Vec<NodeId>,
+    /// Nodes that failed mid-upgrade (one entry per failure).
+    pub errors: Vec<UpgradeError>,
+}
+
+/// Best-effort lookup of the current leader's HTTP base URL by inspecting
+/// the Raft cluster state for `leader_id`. Returns `None` if the leader is
+/// unknown or its `advertise_addr` / `api_port` are missing.
+async fn leader_addr_for(state: &ClusterApiState, leader_id: Option<NodeId>) -> Option<String> {
+    let raft = state.raft.as_ref()?;
+    let leader_id = leader_id?;
+    let cluster_state = raft.read_state().await;
+    let node = cluster_state.nodes.get(&leader_id)?;
+    if node.advertise_addr.is_empty() || node.api_port == 0 {
+        return None;
+    }
+    Some(format!("http://{}:{}", node.advertise_addr, node.api_port))
+}
+
+/// Build the HTTP base URL (`http://host:port`) for a follower node.
+fn follower_base_url(node: &zlayer_scheduler::raft::NodeInfo) -> Option<String> {
+    if node.advertise_addr.is_empty() || node.api_port == 0 {
+        return None;
+    }
+    Some(format!("http://{}:{}", node.advertise_addr, node.api_port))
+}
+
+/// Internal helper: poll `<base>/health/ready` and return true when the
+/// endpoint responds with a 2xx status (i.e. the daemon is back up).
+async fn probe_ready(client: &reqwest::Client, base: &str) -> bool {
+    let url = format!("{base}/health/ready");
+    match client.get(&url).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Drive the rolling upgrade for a single follower:
+///   1. POST `internal/upgrade/start` to schedule the upgrade
+///   2. Wait for the daemon to drop (health/ready stops succeeding)
+///   3. Wait for it to come back healthy
+///
+/// Errors from any step are returned to the caller, which decides whether
+/// to abort (strict mode) or record-and-continue.
+async fn upgrade_one_follower(
+    client: &reqwest::Client,
+    base_url: &str,
+    internal_token: &str,
+    version: Option<&str>,
+) -> std::result::Result<(), String> {
+    // 1. POST /api/v1/internal/upgrade/start
+    let start_url = format!("{base_url}/api/v1/internal/upgrade/start");
+    let body = serde_json::json!({ "version": version });
+    let resp = client
+        .post(&start_url)
+        .header(INTERNAL_AUTH_HEADER, internal_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("failed to POST upgrade/start: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "upgrade/start returned non-success status: {}",
+            resp.status()
+        ));
+    }
+
+    // 2. Wait for the daemon to drop. 30s budget.
+    let drop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut dropped = false;
+    while std::time::Instant::now() < drop_deadline {
+        if !probe_ready(client, base_url).await {
+            dropped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !dropped {
+        return Err(
+            "follower did not drop health/ready within 30s — upgrade may not have started".into(),
+        );
+    }
+
+    // 3. Wait for the daemon to come back. 120s budget.
+    let return_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < return_deadline {
+        if probe_ready(client, base_url).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    Err("follower did not return to health/ready within 120s".into())
+}
+
+/// Drive a rolling daemon-binary upgrade across every follower.
+///
+/// `POST /api/v1/cluster/upgrade`
+///
+/// Returns `421 Misdirected Request` (with an `X-Leader-Addr` header) when
+/// called on a follower; the CLI should redirect to the leader. The leader
+/// upgrades followers in ascending `node_id` order; it does NOT upgrade
+/// itself in this handler — the caller is expected to invoke
+/// `/api/v1/internal/upgrade/start` against the leader after followers are
+/// done (or step down first), so the leader process can restart cleanly.
+///
+/// # Errors
+///
+/// Returns `ServiceUnavailable` if no Raft coordinator is wired,
+/// `NotLeader` if this node is not the leader, or `Internal` if cluster
+/// state cannot be read.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/upgrade",
+    request_body = ClusterUpgradeRequest,
+    responses(
+        (status = 200, description = "Rolling upgrade completed", body = ClusterUpgradeResult),
+        (status = 421, description = "Not the leader; clients should redirect via the X-Leader-Addr header"),
+        (status = 500, description = "Internal error driving the rollout"),
+        (status = 503, description = "Raft coordinator not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+pub async fn cluster_upgrade(
+    State(state): State<ClusterApiState>,
+    Json(req): Json<ClusterUpgradeRequest>,
+) -> Result<Json<ClusterUpgradeResult>> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+
+    if !raft.is_leader() {
+        let leader_addr = leader_addr_for(&state, raft.leader_id()).await;
+        return Err(ApiError::NotLeader { leader_addr });
+    }
+
+    let internal_token = state.internal_token.clone().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "internal token not configured; cluster upgrades require an internal shared secret"
+                .into(),
+        )
+    })?;
+
+    // Snapshot the cluster, then upgrade followers in node-id-ascending order
+    // (deterministic so multiple retries land in the same sequence). The
+    // leader is intentionally omitted; the operator/CLI is expected to drive
+    // the leader's self-upgrade as a separate step after followers are
+    // green.
+    let cluster_state = raft.read_state().await;
+    let leader_node_id = raft.node_id();
+    let mut followers: Vec<&zlayer_scheduler::raft::NodeInfo> = cluster_state
+        .nodes
+        .values()
+        .filter(|n| n.node_id != leader_node_id)
+        .collect();
+    followers.sort_by_key(|n| n.node_id);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+    let mut upgraded: Vec<NodeId> = Vec::new();
+    let mut skipped: Vec<NodeId> = Vec::new();
+    let mut errors: Vec<UpgradeError> = Vec::new();
+
+    for node in followers {
+        let Some(base_url) = follower_base_url(node) else {
+            warn!(
+                node_id = node.node_id,
+                "skipping follower with missing advertise_addr or api_port"
+            );
+            skipped.push(node.node_id);
+            continue;
+        };
+
+        info!(
+            node_id = node.node_id,
+            base_url = %base_url,
+            version = ?req.version,
+            "starting rolling upgrade for follower"
+        );
+
+        match upgrade_one_follower(&client, &base_url, &internal_token, req.version.as_deref())
+            .await
+        {
+            Ok(()) => {
+                info!(node_id = node.node_id, "follower upgrade succeeded");
+                upgraded.push(node.node_id);
+            }
+            Err(message) => {
+                warn!(
+                    node_id = node.node_id,
+                    error = %message,
+                    "follower upgrade failed"
+                );
+                errors.push(UpgradeError {
+                    node_id: node.node_id,
+                    message,
+                });
+                if req.strict {
+                    break;
+                }
+            }
+        }
+
+        // Cooldown between nodes lets the cluster re-stabilise (Raft quorum,
+        // overlay handshakes, etc.) before we move on.
+        if req.cooldown_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(req.cooldown_secs)).await;
+        }
+    }
+
+    Ok(Json(ClusterUpgradeResult {
+        upgraded,
+        skipped,
+        errors,
     }))
 }
 

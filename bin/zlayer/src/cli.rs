@@ -698,6 +698,12 @@ pub(crate) enum Commands {
         /// `POST /api/v1/tunnels/access/sessions` will return 503.
         #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
         no_tunnel_server: bool,
+
+        /// On clean shutdown, exit with code 75 (EX_TEMPFAIL) instead of 0, so
+        /// a supervisor (systemd `Restart=on-failure`, runit, etc.) respawns
+        /// the daemon. Used by `zlayer self-update`-driven cluster upgrades.
+        #[arg(long, env = "ZLAYER_RESTART_ON_EXIT")]
+        restart_on_exit: bool,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
@@ -2774,6 +2780,28 @@ pub(crate) enum NodeCommands {
         /// Data directory (where `node_config.json` lives, defaults to platform default)
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Roll a new zlayer version across every follower in the cluster.
+    ///
+    /// Followers self-update one at a time; the operator runs
+    /// `zlayer self-update --restart` on the leader manually afterwards
+    /// (no leader self-update in this command — first pass).
+    #[command(name = "upgrade")]
+    Upgrade {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Pause between followers (after each comes back healthy) to let
+        /// observability soak. Default 30s.
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
+        /// Abort the rollout if any follower fails to come back healthy.
+        #[arg(long)]
+        strict: bool,
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Force this node to become cluster leader (disaster recovery)
