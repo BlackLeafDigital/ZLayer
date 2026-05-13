@@ -378,36 +378,7 @@ impl Scheduler {
             None => return vec![],
         };
 
-        cluster
-            .nodes
-            .values()
-            .filter(|n| n.status == "ready")
-            .map(|n| {
-                let mut resources = placement::NodeResources::new(n.cpu_total, n.memory_total);
-                resources.cpu_used = n.cpu_used;
-                resources.memory_used = n.memory_used;
-                // Map GPU info from the Raft node info
-                #[allow(clippy::cast_possible_truncation)]
-                let gpu_count = n.gpus.len() as u32;
-                resources.gpu_total = gpu_count;
-                resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
-                resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
-                resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
-                if let Some(first_gpu) = n.gpus.first() {
-                    resources.gpu_vendor.clone_from(&first_gpu.vendor);
-                }
-
-                placement::NodeState {
-                    id: n.node_id,
-                    address: n.advertise_addr.clone(),
-                    labels: std::collections::HashMap::new(),
-                    resources,
-                    healthy: true,
-                    os: n.os,
-                    arch: n.arch,
-                }
-            })
-            .collect()
+        cluster_nodes_to_node_states(&cluster.nodes)
     }
 
     /// Compute where to place service replicas across available nodes.
@@ -1199,6 +1170,48 @@ impl Scheduler {
     }
 }
 
+/// Map a Raft node registry into placement-ready `NodeState`s.
+///
+/// Filters to only nodes with `status == "ready"` — `draining` and `dead`
+/// nodes are excluded so the placement algorithm never schedules new work
+/// onto them. See README §"Node Status" (lines 425-433) for the contract.
+///
+/// Extracted from [`Scheduler::build_node_states`] so unit tests can verify
+/// the filter without standing up a full Raft stack.
+pub(crate) fn cluster_nodes_to_node_states(
+    nodes: &HashMap<NodeId, NodeInfo>,
+) -> Vec<placement::NodeState> {
+    nodes
+        .values()
+        .filter(|n| n.status == "ready")
+        .map(|n| {
+            let mut resources = placement::NodeResources::new(n.cpu_total, n.memory_total);
+            resources.cpu_used = n.cpu_used;
+            resources.memory_used = n.memory_used;
+            // Map GPU info from the Raft node info
+            #[allow(clippy::cast_possible_truncation)]
+            let gpu_count = n.gpus.len() as u32;
+            resources.gpu_total = gpu_count;
+            resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
+            resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
+            resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
+            if let Some(first_gpu) = n.gpus.first() {
+                resources.gpu_vendor.clone_from(&first_gpu.vendor);
+            }
+
+            placement::NodeState {
+                id: n.node_id,
+                address: n.advertise_addr.clone(),
+                labels: std::collections::HashMap::new(),
+                resources,
+                healthy: true,
+                os: n.os,
+                arch: n.arch,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1320,64 @@ mod tests {
         assert!(
             matches!(err, SchedulerError::NotLeader),
             "Expected NotLeader, got: {err:?}"
+        );
+    }
+
+    /// Helper: build a minimal `NodeInfo` with a given id and status.
+    /// All other fields are zeroed/empty defaults — only `status` and
+    /// `node_id` matter for the placement filter contract.
+    fn make_node(node_id: NodeId, status: &str) -> NodeInfo {
+        NodeInfo {
+            node_id,
+            address: String::new(),
+            registered_at: 0,
+            last_heartbeat: 0,
+            gpus: vec![],
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 0.0,
+            memory_total: 0,
+            disk_total: 0,
+            cpu_used: 0.0,
+            memory_used: 0,
+            disk_used: 0,
+            gpu_utilization: vec![],
+            status: status.to_string(),
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+        }
+    }
+
+    /// `build_node_states` (via `cluster_nodes_to_node_states`) must drop
+    /// nodes whose status is not "ready". This guards the README §"Node
+    /// Status" contract (lines 425-433): `draining` and `dead` nodes are
+    /// excluded from placement so new replicas are never scheduled onto
+    /// them. If someone "fixes" the filter to allow draining nodes, this
+    /// test fails and the contract is preserved.
+    #[tokio::test]
+    async fn build_node_states_excludes_non_ready() {
+        let mut nodes: HashMap<NodeId, NodeInfo> = HashMap::new();
+        nodes.insert(1, make_node(1, "ready"));
+        nodes.insert(2, make_node(2, "draining"));
+        nodes.insert(3, make_node(3, "dead"));
+
+        let states = cluster_nodes_to_node_states(&nodes);
+
+        assert_eq!(
+            states.len(),
+            1,
+            "expected exactly one ready node in placement set, got {}: {:?}",
+            states.len(),
+            states.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            states[0].id, 1,
+            "expected node 1 (ready) to be the only included node"
         );
     }
 }

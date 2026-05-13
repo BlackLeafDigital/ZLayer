@@ -2657,6 +2657,18 @@ pub(crate) enum NodeCommands {
         #[arg(long)]
         services: Option<Vec<String>>,
 
+        /// API server port
+        #[arg(long, default_value = "3669")]
+        api_port: u16,
+
+        /// Raft consensus port
+        #[arg(long, default_value = "9000")]
+        raft_port: u16,
+
+        /// Overlay network port (`WireGuard` protocol)
+        #[arg(long, default_value_t = zlayer_core::DEFAULT_WG_PORT)]
+        overlay_port: u16,
+
         /// WSL2 auto-install consent (Windows only).
         #[command(flatten)]
         install_wsl: InstallWslArgs,

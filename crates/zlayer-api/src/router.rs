@@ -1270,6 +1270,22 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             "/force-leader",
             post(handlers::cluster::cluster_force_leader),
         )
+        .route(
+            "/nodes/{id}",
+            delete(handlers::cluster::cluster_remove_node),
+        )
+        .route(
+            "/nodes/{id}/mode",
+            put(handlers::cluster::cluster_set_node_mode),
+        )
+        .route(
+            "/nodes/{id}/drain",
+            put(handlers::cluster::cluster_drain_node),
+        )
+        .route(
+            "/nodes/{id}/undrain",
+            put(handlers::cluster::cluster_undrain_node),
+        )
         .with_state(cluster_state)
 }
 

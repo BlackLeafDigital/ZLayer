@@ -749,6 +749,131 @@ pub async fn cluster_force_leader(
 }
 
 // =============================================================================
+// Node lifecycle endpoints
+// =============================================================================
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeLifecycleResponse {
+    pub node_id: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModeRequest {
+    /// `"full"` (eligible voter) or `"replicate"` (permanent learner).
+    pub mode: String,
+}
+
+/// Remove a node from the Raft cluster.
+///
+/// # Errors
+/// Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+/// or `Internal` if the membership change fails.
+pub async fn cluster_remove_node(
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(node_id): axum::extract::Path<u64>,
+) -> Result<Json<NodeLifecycleResponse>> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+    raft.remove_member(node_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("remove_member: {e}")))?;
+    Ok(Json(NodeLifecycleResponse {
+        node_id,
+        status: "removed".into(),
+    }))
+}
+
+/// Switch a node's membership mode between `"full"` (voter-eligible) and
+/// `"replicate"` (permanent learner), then trigger a voter rebalance.
+///
+/// # Errors
+/// Returns `BadRequest` for an unknown mode, `ServiceUnavailable` if the
+/// local Raft coordinator is not running, or `Internal` on propose/rebalance
+/// failure.
+pub async fn cluster_set_node_mode(
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(node_id): axum::extract::Path<u64>,
+    Json(req): Json<SetModeRequest>,
+) -> Result<Json<NodeLifecycleResponse>> {
+    if req.mode != "full" && req.mode != "replicate" {
+        return Err(ApiError::BadRequest(format!(
+            "invalid mode {:?}; expected \"full\" or \"replicate\"",
+            req.mode
+        )));
+    }
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+    raft.propose(zlayer_scheduler::raft::Request::UpdateNodeMode {
+        node_id,
+        mode: req.mode.clone(),
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("propose UpdateNodeMode: {e}")))?;
+    raft.rebalance_voters()
+        .await
+        .map_err(|e| ApiError::Internal(format!("rebalance_voters: {e}")))?;
+    Ok(Json(NodeLifecycleResponse {
+        node_id,
+        status: req.mode,
+    }))
+}
+
+/// Mark a node as `draining` so the scheduler stops placing new containers on it.
+///
+/// # Errors
+/// Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+/// or `Internal` if the propose fails.
+pub async fn cluster_drain_node(
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(node_id): axum::extract::Path<u64>,
+) -> Result<Json<NodeLifecycleResponse>> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+    raft.propose(zlayer_scheduler::raft::Request::UpdateNodeStatus {
+        node_id,
+        status: "draining".into(),
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("propose draining: {e}")))?;
+    Ok(Json(NodeLifecycleResponse {
+        node_id,
+        status: "draining".into(),
+    }))
+}
+
+/// Cancel a drain by returning a node to `ready` status.
+///
+/// # Errors
+/// Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+/// or `Internal` if the propose fails.
+pub async fn cluster_undrain_node(
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(node_id): axum::extract::Path<u64>,
+) -> Result<Json<NodeLifecycleResponse>> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+    raft.propose(zlayer_scheduler::raft::Request::UpdateNodeStatus {
+        node_id,
+        status: "ready".into(),
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("propose ready: {e}")))?;
+    Ok(Json(NodeLifecycleResponse {
+        node_id,
+        status: "ready".into(),
+    }))
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 

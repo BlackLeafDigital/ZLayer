@@ -38,6 +38,7 @@ uuid.workspace = true
 
 # Web framework (for raft service router)
 axum.workspace = true
+hyper-util = { workspace = true }
 
 # HTTP client (used by Scheduler for agent communication)
 reqwest.workspace = true

@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.24] - 2026-05-12
+
+### Added
+- Raft RPC transport upgraded to HTTP/2 prior-knowledge (h2c). Both
+  `RaftHttpClient` reqwest clients now call `.http2_prior_knowledge()`
+  with a 10s keepalive ping interval, and the server-side bind in
+  `crates/zlayer-scheduler/src/raft_service.rs` switched from
+  `axum::serve` to `hyper-util`'s `auto::Builder` so the same socket
+  accepts both HTTP/1.1 and HTTP/2. Multiplexed streams replace the
+  per-RPC connection churn that the previous HTTP/1.1
+  `pool_max_idle_per_host(10)` ceiling caused.
+- `X-ZLayer-Raft-Protocol: 1` header on every Raft RPC, validated by a
+  new middleware in
+  `crates/zlayer-consensus/src/network/http_service.rs`. Mismatched
+  versions return `426 Upgrade Required` with an
+  `X-ZLayer-Raft-Protocol-Supported` response header. A missing header
+  forwards unchanged so peers that don't yet emit it stay compatible.
+- `DELETE /api/v1/cluster/nodes/{id}`, `PUT /api/v1/cluster/nodes/{id}/mode`,
+  `PUT /api/v1/cluster/nodes/{id}/drain`, and
+  `PUT /api/v1/cluster/nodes/{id}/undrain` endpoints. Previously the
+  CLI commands `zlayer node remove`, `zlayer node set-mode`, and
+  `zlayer node drain` 404'd silently; they now reach real handlers
+  that propose the corresponding Raft state changes.
+- `Request::UpdateNodeMode { node_id, mode }` Raft state-machine
+  variant. Appended last to preserve postcard2 discriminant stability
+  for the pre-existing variants.
+- `--api-port`, `--raft-port`, and `--overlay-port` flags on
+  `zlayer node join` for parity with `zlayer node init`. Lets multiple
+  nodes coexist on the same machine, enabling loopback clustering for
+  tests and dev.
+- In-process multi-node Raft test harness under
+  `crates/zlayer-scheduler/tests/` with `common/mod.rs` exposing
+  `spawn_node`, `wait_for_leader`, `wait_for_apply`, and
+  `shutdown_node`. New integration tests: `single_node_bootstrap`,
+  `two_node_cluster` (validates the 1-voter + 1-learner 2-node
+  guarantee from the README), `three_node_replication` (replicates
+  100 entries plus installs a snapshot to a lagging follower),
+  `leader_failover` (kills the leader and asserts a new one wins
+  election), and `allocation_modes` (validates the shared / dedicated
+  / exclusive node-allocation modes from README "Node Allocation
+  Modes").
+- `cluster_3node` and `cluster_failover` suites in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. They spawn
+  three real `zlayer serve` processes on loopback, validate the
+  cluster forms, and confirm the leader recovers from a worker
+  kill+restart.
+- `docs/rolling-upgrade.md` operator runbook covering drain → swap
+  binary → restart, the protocol-version handshake's role in
+  preventing cross-version corruption, and rollback semantics.
+
+### Changed
+- `RedbStateMachine::apply`, `RedbStateMachine::install_snapshot`,
+  `RedbLogStore::save_vote`, `save_committed`, `append`, `truncate`,
+  and `purge` now run their synchronous redb transactions inside
+  `tokio::task::spawn_blocking` so fsync no longer pins a tokio worker
+  thread. In-memory state-machine cache updates stay in the async
+  context and only run after the redb commit succeeds.
+- `RaftHttpClient` precomputes per-connection URL strings as
+  `Arc<str>` and the `Authorization` header as a
+  `reqwest::header::HeaderValue` (built once, marked sensitive).
+  Eliminates two `String` allocations and one header-value rebuild
+  per Raft RPC.
+- `zlayer node list` now displays the server-computed `role` field
+  (`Leader` / `Voter` / `Worker`) instead of deriving the column from
+  the local `node_config.is_leader` bool. Status is shown next to the
+  role (e.g. `Worker (draining)` or `Worker [DEAD]`).
+- Lowered `pool_max_idle_per_host` from 10/5 (RPC/snapshot) to 2/2.
+  HTTP/2 multiplexes, so idle TCP connections aren't useful for raft.
+
+### Fixed
+- Dead `peers: RwLock<HashMap<NodeId, String>>` field and its three
+  unused accessor methods removed from `HttpNetwork` -- the field was
+  never read by any caller in the workspace.
+
+### Internal
+- `crates/zlayer-scheduler/src/lib.rs::build_node_states` extracted to
+  a free helper `cluster_nodes_to_node_states` so the
+  `status == "ready"` filter behind README "Node Status" is now
+  guarded by a unit test (`build_node_states_excludes_non_ready`).
+
 ## [0.11.23] - 2026-05-12
 
 ### Changed

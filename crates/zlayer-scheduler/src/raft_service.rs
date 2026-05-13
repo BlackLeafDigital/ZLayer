@@ -7,6 +7,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -83,11 +86,20 @@ impl RaftService {
             crate::error::SchedulerError::Network(format!("Failed to bind to {addr}: {e}"))
         })?;
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| crate::error::SchedulerError::Network(format!("Server error: {e}")))?;
-
-        Ok(())
+        loop {
+            let (stream, peer_addr) = listener
+                .accept()
+                .await
+                .map_err(|e| crate::error::SchedulerError::Network(format!("accept error: {e}")))?;
+            let io = TokioIo::new(stream);
+            let service = TowerToHyperService::new(app.clone());
+            tokio::spawn(async move {
+                let builder = auto::Builder::new(TokioExecutor::new());
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    tracing::debug!(peer = %peer_addr, error = %e, "raft connection ended");
+                }
+            });
+        }
     }
 
     /// Get a clone of the Raft coordinator

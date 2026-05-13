@@ -21,6 +21,7 @@ Stdlib only. Invoke via `uv run`.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import secrets
@@ -338,6 +339,436 @@ def run_intellitester(
 
 
 # ---------------------------------------------------------------------------
+# Cluster suites (cluster_3node, cluster_failover)
+# ---------------------------------------------------------------------------
+#
+# These suites exercise the multi-node consensus + failover paths backed by
+# the README §385-387 heartbeat-health-monitoring claims. They share the
+# 3-node bootstrap path via `_bootstrap_3node_cluster`.
+
+# Per-node ports for the local 3-node throwaway cluster. Picked above the
+# manager-suite range so the two cannot collide.
+CLUSTER_NODES: list[dict[str, int]] = [
+    {"api": 19110, "raft": 19111, "overlay": 51410},
+    {"api": 19120, "raft": 19121, "overlay": 51420},
+    {"api": 19130, "raft": 19131, "overlay": 51430},
+]
+CLUSTER_DEPLOYMENT = "zlayer-e2e-cluster"
+CLUSTER_NODES_READY_TIMEOUT_S = 60
+CLUSTER_NODE_DEAD_TIMEOUT_S = 45
+CLUSTER_NODE_RECOVER_TIMEOUT_S = 60
+
+
+def _parse_join_token(stdout: str) -> str:
+    """Extract the join token from `zlayer node generate-join-token` stdout.
+
+    The CLI prints a labeled block (see
+    `bin/zlayer/src/commands/node.rs::handle_node_generate_join_token`):
+
+        Join Token Generated
+        ====================
+
+        Deployment: <name>
+        API: <endpoint>
+
+        Token:
+        <base64-url-no-pad-token>
+
+        Usage:
+          zlayer node join <leader-addr> --token <same-token>
+
+    Strategy: find the line that is exactly `Token:`, return the next
+    non-empty line. Fall back to scanning the `--token <X>` usage line.
+    Fall back further to picking the longest base64url-shaped line.
+    """
+    lines = [ln.rstrip() for ln in stdout.splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.strip() == "Token:":
+            for j in range(i + 1, len(lines)):
+                cand = lines[j].strip()
+                if cand:
+                    return cand
+    for ln in lines:
+        m = re.search(r"--token\s+(\S+)", ln)
+        if m:
+            return m.group(1)
+    # Last-ditch: longest base64url-looking token on any line.
+    best = ""
+    for ln in lines:
+        for tok in ln.split():
+            if len(tok) >= 32 and re.fullmatch(r"[A-Za-z0-9_\-]+", tok):
+                if len(tok) > len(best):
+                    best = tok
+    if best:
+        return best
+    raise RuntimeError(
+        "could not parse join token from `node generate-join-token` "
+        f"stdout:\n{stdout}"
+    )
+
+
+def _cluster_nodes_url(api_port: int) -> str:
+    return f"http://127.0.0.1:{api_port}/api/v1/cluster/nodes"
+
+
+def _fetch_cluster_nodes(api_port: int) -> list[dict]:
+    """GET the leader's `/api/v1/cluster/nodes` and return the parsed list.
+
+    The endpoint may be unauthenticated on loopback or may require a JWT —
+    we honor ZLAYER_E2E_CLUSTER_TOKEN as an opt-in bearer override. On any
+    transport/HTTP failure we raise so the caller can poll.
+    """
+    req = urllib.request.Request(_cluster_nodes_url(api_port))
+    bearer = os.environ.get("ZLAYER_E2E_CLUSTER_TOKEN")
+    if bearer:
+        req.add_header("Authorization", f"Bearer {bearer}")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        body = resp.read().decode("utf-8")
+    data = json.loads(body)
+    # Endpoint historically returns either a bare array or {"nodes": [...]}.
+    if isinstance(data, dict) and "nodes" in data:
+        return list(data["nodes"])
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(
+        f"unexpected /api/v1/cluster/nodes payload shape: {data!r}"
+    )
+
+
+def _spawn_node_serve(
+    zlayer_bin: Path, data_dir: Path, api_port: int,
+) -> subprocess.Popen:
+    """Spawn `zlayer serve` for a cluster node (no --daemon, killable group)."""
+    env = {
+        **os.environ,
+        "ZLAYER_JWT_SECRET": os.environ.get(
+            "ZLAYER_JWT_SECRET",
+            "e2e-secret-do-not-use-in-prod-do-not-share-this-key-1234567890",
+        ),
+    }
+    argv = [
+        str(zlayer_bin),
+        "--data-dir", str(data_dir),
+        "serve",
+        "--bind", f"127.0.0.1:{api_port}",
+        "--deployment-name", CLUSTER_DEPLOYMENT,
+    ]
+    return subprocess.Popen(argv, cwd=REPO_ROOT, env=env, start_new_session=True)
+
+
+def _bootstrap_3node_cluster(
+    zlayer_bin: Path, root_dir: Path,
+) -> tuple[list[subprocess.Popen], list[Path], list[int]]:
+    """Stand up a 3-node loopback cluster.
+
+    Returns (procs, data_dirs, api_ports). Caller is responsible for
+    `_kill_pg`-ing every proc in `procs` in its `finally:` block.
+    """
+    data_dirs: list[Path] = []
+    for i in range(3):
+        d = root_dir / f"node{i + 1}" / "data"
+        d.mkdir(parents=True, exist_ok=True)
+        data_dirs.append(d)
+
+    api_ports = [CLUSTER_NODES[i]["api"] for i in range(3)]
+    procs: list[subprocess.Popen] = []
+
+    # --- Node 1: init (bootstrap leader) -----------------------------------
+    log(f"cluster: initializing node1 (api={CLUSTER_NODES[0]['api']})")
+    subprocess.run(
+        [
+            str(zlayer_bin),
+            "--data-dir", str(data_dirs[0]),
+            "node", "init",
+            "--advertise-addr", "127.0.0.1",
+            "--api-port", str(CLUSTER_NODES[0]["api"]),
+            "--raft-port", str(CLUSTER_NODES[0]["raft"]),
+            "--overlay-port", str(CLUSTER_NODES[0]["overlay"]),
+        ],
+        check=True, cwd=REPO_ROOT,
+    )
+
+    # --- Node 1: serve in the background -----------------------------------
+    log(f"cluster: starting node1 serve on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
+    n1 = _spawn_node_serve(zlayer_bin, data_dirs[0], CLUSTER_NODES[0]["api"])
+    procs.append(n1)
+    if not _wait_http_ok(
+        f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/healthz", 30,
+    ):
+        die(f"node1 never came up on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
+
+    # --- Generate join token from the leader -------------------------------
+    log("cluster: generating join token on node1")
+    gen = subprocess.run(
+        [
+            str(zlayer_bin),
+            "--data-dir", str(data_dirs[0]),
+            "node", "generate-join-token",
+            CLUSTER_DEPLOYMENT,
+            "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
+        ],
+        capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+    )
+    token = _parse_join_token(gen.stdout)
+    log(f"cluster: join token ({len(token)} chars) acquired")
+
+    # --- Nodes 2 & 3: join + serve -----------------------------------------
+    for i in (1, 2):
+        cfg = CLUSTER_NODES[i]
+        log(
+            f"cluster: joining node{i + 1} via 127.0.0.1:{CLUSTER_NODES[0]['api']} "
+            f"(advertise=127.0.0.1, api={cfg['api']})"
+        )
+        subprocess.run(
+            [
+                str(zlayer_bin),
+                "--data-dir", str(data_dirs[i]),
+                "node", "join",
+                f"127.0.0.1:{CLUSTER_NODES[0]['api']}",
+                "--token", token,
+                "--advertise-addr", "127.0.0.1",
+                "--api-port", str(cfg["api"]),
+                "--raft-port", str(cfg["raft"]),
+                "--overlay-port", str(cfg["overlay"]),
+            ],
+            check=True, cwd=REPO_ROOT,
+        )
+        log(f"cluster: starting node{i + 1} serve on 127.0.0.1:{cfg['api']}")
+        p = _spawn_node_serve(zlayer_bin, data_dirs[i], cfg["api"])
+        procs.append(p)
+        if not _wait_http_ok(
+            f"http://127.0.0.1:{cfg['api']}/healthz", 30,
+        ):
+            die(f"node{i + 1} never came up on 127.0.0.1:{cfg['api']}")
+
+    return procs, data_dirs, api_ports
+
+
+def _wait_for_ready_cluster(
+    leader_api_port: int, expected_nodes: int, timeout_s: int,
+) -> list[dict]:
+    """Poll the leader until `expected_nodes` show status='ready' and >=1
+    has role='leader'. Returns the final node list."""
+    deadline = time.monotonic() + timeout_s
+    last_nodes: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            nodes = _fetch_cluster_nodes(leader_api_port)
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                ConnectionError, TimeoutError, OSError, json.JSONDecodeError,
+                RuntimeError) as e:
+            last_err = repr(e)
+            time.sleep(2)
+            continue
+        last_nodes = nodes
+        ready = [n for n in nodes if str(n.get("status", "")).lower() == "ready"]
+        leaders = [n for n in nodes if str(n.get("role", "")).lower() == "leader"]
+        if len(ready) >= expected_nodes and len(leaders) >= 1:
+            return nodes
+        time.sleep(2)
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_nodes={last_nodes!r}"
+    )
+    raise RuntimeError(
+        f"cluster never reached {expected_nodes} ready nodes with a leader "
+        f"within {timeout_s}s{detail}"
+    )
+
+
+def _cleanup_cluster(
+    procs: list[subprocess.Popen], root_dir: Path,
+) -> None:
+    for i, p in enumerate(procs):
+        _kill_pg(p, f"cluster-node{i + 1}")
+    if os.environ.get("KEEP_E2E_ARTIFACTS") == "1":
+        log(f"cluster: KEEP_E2E_ARTIFACTS=1 → leaving {root_dir} in place")
+        return
+    shutil.rmtree(root_dir, ignore_errors=True)
+
+
+def run_cluster_3node(args: argparse.Namespace) -> int:
+    """Stand up a 3-node cluster, assert it forms with a leader + 3 ready."""
+    if not args.no_build:
+        build_phase(throwaway=args.throwaway)
+
+    zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
+    log(f"cluster_3node: using zlayer binary {zlayer_bin}")
+
+    root_dir = THROWAWAY_ROOT / "cluster_3node"
+    # Fresh slate: this suite is destructive to its target directory.
+    shutil.rmtree(root_dir, ignore_errors=True)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    try:
+        procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
+            zlayer_bin, root_dir,
+        )
+        log("cluster_3node: waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster(
+            api_ports[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+        for n in nodes:
+            log(
+                f"cluster_3node: node id={n.get('id', '?')} "
+                f"role={n.get('role', '?')} status={n.get('status', '?')}"
+            )
+        log("cluster_3node: PASS — 3 ready nodes with leader elected")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"cluster_3node: FAIL — {e!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        _cleanup_cluster(procs, root_dir)
+
+
+def run_cluster_failover(args: argparse.Namespace) -> int:
+    """Stand up 3 nodes, kill a non-leader, assert dead→ready transition.
+
+    Reschedule of dead-node replicas requires deploying a service first; that
+    assertion belongs in a separate suite. This suite scope is heartbeat
+    transition (ready -> dead -> ready) per README §385-387.
+    """
+    if not args.no_build:
+        build_phase(throwaway=args.throwaway)
+
+    zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
+    log(f"cluster_failover: using zlayer binary {zlayer_bin}")
+
+    root_dir = THROWAWAY_ROOT / "cluster_failover"
+    shutil.rmtree(root_dir, ignore_errors=True)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    try:
+        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+            zlayer_bin, root_dir,
+        )
+        leader_api = api_ports[0]
+        log("cluster_failover: waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster(
+            leader_api, expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        # Pick a worker (non-leader). The leader's API endpoint contains
+        # node1's port; we use that as a fallback identifier when the
+        # `role` field is missing on a worker payload.
+        worker_idx: Optional[int] = None
+        for n in nodes:
+            role = str(n.get("role", "")).lower()
+            api_endpoint = str(n.get("api_endpoint") or n.get("address") or "")
+            if role and role != "leader":
+                # Map endpoint port → our index.
+                for i, port in enumerate(api_ports):
+                    if str(port) in api_endpoint:
+                        worker_idx = i
+                        break
+                if worker_idx is None:
+                    # Fall back to "anything but node 1".
+                    worker_idx = 1
+                break
+        if worker_idx is None:
+            # Cluster reported no explicit leader/worker split; pick node 2.
+            worker_idx = 1
+        log(
+            f"cluster_failover: selected worker = node{worker_idx + 1} "
+            f"(api={api_ports[worker_idx]})"
+        )
+
+        # 1. Kill the worker.
+        _kill_pg(procs[worker_idx], f"cluster-node{worker_idx + 1} (kill)")
+
+        # 2. Poll for `dead`.
+        log(
+            f"cluster_failover: waiting up to {CLUSTER_NODE_DEAD_TIMEOUT_S}s "
+            f"for node{worker_idx + 1} → dead"
+        )
+        deadline = time.monotonic() + CLUSTER_NODE_DEAD_TIMEOUT_S
+        saw_dead = False
+        while time.monotonic() < deadline:
+            try:
+                current = _fetch_cluster_nodes(leader_api)
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
+                continue
+            for n in current:
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                if str(api_ports[worker_idx]) not in api_endpoint:
+                    continue
+                if str(n.get("status", "")).lower() == "dead":
+                    saw_dead = True
+                    break
+            if saw_dead:
+                break
+            time.sleep(2)
+        if not saw_dead:
+            raise RuntimeError(
+                f"node{worker_idx + 1} never transitioned to 'dead' within "
+                f"{CLUSTER_NODE_DEAD_TIMEOUT_S}s"
+            )
+        log(f"cluster_failover: node{worker_idx + 1} → dead (OK)")
+
+        # 3. Restart the killed worker. It already joined → just `serve`.
+        log(f"cluster_failover: restarting node{worker_idx + 1}")
+        procs[worker_idx] = _spawn_node_serve(
+            zlayer_bin, data_dirs[worker_idx], api_ports[worker_idx],
+        )
+        if not _wait_http_ok(
+            f"http://127.0.0.1:{api_ports[worker_idx]}/healthz", 30,
+        ):
+            raise RuntimeError(
+                f"restarted node{worker_idx + 1} never came up on "
+                f"127.0.0.1:{api_ports[worker_idx]}"
+            )
+
+        # 4. Poll for `ready` again.
+        log(
+            f"cluster_failover: waiting up to {CLUSTER_NODE_RECOVER_TIMEOUT_S}s "
+            f"for node{worker_idx + 1} → ready"
+        )
+        deadline = time.monotonic() + CLUSTER_NODE_RECOVER_TIMEOUT_S
+        recovered = False
+        while time.monotonic() < deadline:
+            try:
+                current = _fetch_cluster_nodes(leader_api)
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
+                continue
+            for n in current:
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                if str(api_ports[worker_idx]) not in api_endpoint:
+                    continue
+                if str(n.get("status", "")).lower() == "ready":
+                    recovered = True
+                    break
+            if recovered:
+                break
+            time.sleep(2)
+        if not recovered:
+            raise RuntimeError(
+                f"node{worker_idx + 1} never recovered to 'ready' within "
+                f"{CLUSTER_NODE_RECOVER_TIMEOUT_S}s"
+            )
+        log(
+            f"cluster_failover: PASS — node{worker_idx + 1} ready→dead→ready"
+        )
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"cluster_failover: FAIL — {e!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        _cleanup_cluster(procs, root_dir)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -356,7 +787,29 @@ def parse_args() -> argparse.Namespace:
             "  ZLAYER_E2E_WG_PORT        throwaway WG port (default 51421)\n"
             "  ZLAYER_E2E_DNS_PORT       throwaway DNS port (default 15354)\n"
             "  ZLAYER_SOCKET             override host daemon socket path\n"
+            "  KEEP_E2E_ARTIFACTS=1      retain cluster_* throwaway dirs\n"
+            "  ZLAYER_E2E_CLUSTER_TOKEN  bearer token for /api/v1/cluster/nodes\n"
+            "\n"
+            "Suites:\n"
+            "  manager_auth      (default) login + nav + stale-session\n"
+            "  cluster_3node     boot a local 3-node cluster + assert quorum\n"
+            "  cluster_failover  3-node cluster, kill worker, assert recovery\n"
         ),
+    )
+    parser.add_argument(
+        "suite", nargs="?",
+        choices=["manager_auth", "cluster_3node", "cluster_failover"],
+        default=None,
+        help=(
+            "Which suite to run. Defaults to `manager_auth`. May also be "
+            "supplied via `--suite`."
+        ),
+    )
+    parser.add_argument(
+        "--suite", dest="suite_flag",
+        choices=["manager_auth", "cluster_3node", "cluster_failover"],
+        default=None,
+        help="Alternative to the positional suite argument.",
     )
     parser.add_argument(
         "--throwaway", action="store_true",
@@ -387,11 +840,24 @@ def parse_args() -> argparse.Namespace:
         "--no-build", dest="no_build", action="store_true",
         help="Skip cargo build + cargo leptos build.",
     )
-    return parser.parse_args()
+    ns = parser.parse_args()
+    # Resolve positional/flag suite name → ns.suite (positional wins).
+    if ns.suite is None:
+        ns.suite = ns.suite_flag if ns.suite_flag is not None else "manager_auth"
+    return ns
 
 
 def main() -> int:
     args = parse_args()
+
+    # Cluster suites do not use the manager fixture pipeline below; dispatch
+    # them up-front and return their exit code directly.
+    if args.suite == "cluster_3node":
+        return run_cluster_3node(args)
+    if args.suite == "cluster_failover":
+        return run_cluster_failover(args)
+
+    # Default suite (`manager_auth`) falls through into the manager harness.
 
     daemon_proc: Optional[subprocess.Popen] = None
     manager_proc: Optional[subprocess.Popen] = None

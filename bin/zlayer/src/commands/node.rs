@@ -120,6 +120,12 @@ struct NodeStatus {
     mode: String,
     services: Vec<String>,
     is_leader: bool,
+    /// Server-computed Raft role for this node: `"leader"`, `"voter"`, or
+    /// `"learner"`. Defaulted so old daemons that don't yet return this
+    /// field still deserialize cleanly (empty string then renders as
+    /// "Unknown" in the table).
+    #[serde(default)]
+    role: String,
 }
 
 // =============================================================================
@@ -320,6 +326,7 @@ fn persist_secrets_join_material(
 use crate::cli::NodeCommands;
 
 /// Top-level dispatcher for node subcommands
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_node(
     node_cmd: &NodeCommands,
     cli_data_dir: &std::path::Path,
@@ -363,6 +370,9 @@ pub(crate) async fn handle_node(
             advertise_addr,
             mode,
             services,
+            api_port,
+            raft_port,
+            overlay_port,
             install_wsl,
         } => {
             #[cfg(not(unix))]
@@ -375,6 +385,9 @@ pub(crate) async fn handle_node(
                 advertise_addr.clone(),
                 mode.clone(),
                 services.clone(),
+                *api_port,
+                *raft_port,
+                *overlay_port,
                 cli_data_dir.to_path_buf(),
                 #[cfg(not(unix))]
                 consent,
@@ -939,12 +952,16 @@ pub(crate) async fn handle_node_init(
 ///   under `data_dir`, which resolves to `%ProgramData%\ZLayer\` on Windows.
 #[cfg(windows)]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_node_join(
     leader_addr: String,
     token: String,
     advertise_addr: String,
     mode: String,
     services: Option<Vec<String>>,
+    api_port: u16,
+    raft_port: u16,
+    overlay_port: u16,
     data_dir_override: PathBuf,
     install_wsl: ConsentMode,
 ) -> Result<()> {
@@ -1082,10 +1099,6 @@ pub(crate) async fn handle_node_join(
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create HTTP client")?;
-
-    let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
-    let raft_port: u16 = 9000;
-    let api_port: u16 = 3669;
 
     let join_request = NodeJoinRequest {
         token: token.clone(),
@@ -1408,12 +1421,16 @@ pub(crate) async fn handle_node_join(
 
 /// `node join` fallback for exotic targets that are neither Unix nor Windows.
 #[cfg(all(not(unix), not(windows)))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_node_join(
     _leader_addr: String,
     _token: String,
     _advertise_addr: String,
     _mode: String,
     _services: Option<Vec<String>>,
+    _api_port: u16,
+    _raft_port: u16,
+    _overlay_port: u16,
     _data_dir_override: PathBuf,
     _install_wsl: ConsentMode,
 ) -> Result<()> {
@@ -1426,12 +1443,16 @@ pub(crate) async fn handle_node_join(
 /// Join an existing cluster as a worker node
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_node_join(
     leader_addr: String,
     token: String,
     advertise_addr: String,
     mode: String,
     services: Option<Vec<String>>,
+    api_port: u16,
+    raft_port: u16,
+    overlay_port: u16,
     data_dir_override: PathBuf,
 ) -> Result<()> {
     use std::time::Duration;
@@ -1497,10 +1518,6 @@ pub(crate) async fn handle_node_join(
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create HTTP client")?;
-
-    // Parse overlay port from advertise address or use default
-    let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
-    let raft_port: u16 = 9000;
 
     let join_request = NodeJoinRequest {
         token: token.clone(),
@@ -1572,7 +1589,7 @@ pub(crate) async fn handle_node_join(
         node_id: join_response.node_id.clone(),
         raft_node_id: join_response.raft_node_id,
         advertise_addr: advertise_addr.clone(),
-        api_port: 3669, // Default for workers
+        api_port,
         raft_port,
         overlay_port,
         overlay_cidr: token_data.overlay_cidr.clone(),
@@ -1869,6 +1886,11 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
                     },
                     services: vec![],
                     is_leader: node_config.is_leader,
+                    role: if node_config.is_leader {
+                        "leader".to_string()
+                    } else {
+                        "learner".to_string()
+                    },
                 }]
             })
         }
@@ -1886,6 +1908,11 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
                 },
                 services: vec![],
                 is_leader: node_config.is_leader,
+                role: if node_config.is_leader {
+                    "leader".to_string()
+                } else {
+                    "learner".to_string()
+                },
             }]
         }
     };
@@ -1895,10 +1922,10 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
     } else {
         // Table format
         println!(
-            "{:<36} {:<20} {:<10} {:<10} {:<6} SERVICES",
-            "NODE ID", "ADDRESS", "STATUS", "MODE", "LEADER"
+            "{:<36} {:<20} {:<10} {:<10} {:<20} SERVICES",
+            "NODE ID", "ADDRESS", "STATUS", "MODE", "ROLE"
         );
-        println!("{}", "-".repeat(100));
+        println!("{}", "-".repeat(114));
 
         for node in nodes {
             let services = if node.services.is_empty() {
@@ -1911,10 +1938,30 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
                     s
                 }
             };
-            let leader_marker = if node.is_leader { "*" } else { "" };
+
+            // Map the server-provided Raft role string to a friendly label.
+            // README §400 ("Adding Worker Nodes") uses "Worker" for the
+            // non-leader/learner case, so we follow that convention here.
+            let base_role = match node.role.as_str() {
+                "leader" => "Leader",
+                "voter" => "Voter",
+                "learner" => "Worker",
+                "" => "Unknown",
+                other => other,
+            };
+
+            // Decorate the role with the node's lifecycle status when it's
+            // not in the healthy "ready" / "local" state so operators
+            // immediately see drains and dead nodes.
+            let role_display = match node.status.as_str() {
+                "draining" => format!("{base_role} (draining)"),
+                "dead" => format!("{base_role} [DEAD]"),
+                _ => base_role.to_string(),
+            };
+
             println!(
-                "{:<36} {:<20} {:<10} {:<10} {:<6} {}",
-                node.id, node.address, node.status, node.mode, leader_marker, services
+                "{:<36} {:<20} {:<10} {:<10} {:<20} {}",
+                node.id, node.address, node.status, node.mode, role_display, services
             );
         }
     }
@@ -2719,6 +2766,9 @@ mod tests {
             "127.0.0.1".to_string(),
             "full".to_string(),
             None,
+            3669,
+            9000,
+            zlayer_core::DEFAULT_WG_PORT,
             tmp.path().to_path_buf(),
             crate::ui::consent::ConsentMode::No,
         )

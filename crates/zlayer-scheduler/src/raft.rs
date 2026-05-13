@@ -120,6 +120,8 @@ pub enum Request {
     /// discriminant does not shift any of the pre-existing variants — older
     /// log entries stay decodable bit-for-bit.
     Secrets(SecretsRaftOp),
+    /// Update a node's membership mode (`full` or `replicate`).
+    UpdateNodeMode { node_id: NodeId, mode: String },
 }
 
 /// Raft response types
@@ -358,6 +360,7 @@ impl ClusterState {
     ///
     /// Panics if the system clock is before the Unix epoch (only relevant for
     /// `RegisterNode` requests).
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
             Request::UpdateServiceState {
@@ -435,6 +438,25 @@ impl ClusterState {
                     node.status.clone_from(status);
                 }
                 Response::Success { data: None }
+            }
+            Request::UpdateNodeMode { node_id, mode } => {
+                if mode != "full" && mode != "replicate" {
+                    return Response::Error {
+                        message: format!(
+                            "Invalid node mode: {mode} (expected \"full\" or \"replicate\")"
+                        ),
+                    };
+                }
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.mode.clone_from(mode);
+                    Response::Success {
+                        data: Some(format!("node {node_id} mode = {mode}")),
+                    }
+                } else {
+                    Response::Error {
+                        message: format!("Node not found: {node_id}"),
+                    }
+                }
             }
             Request::DeregisterNode { node_id } => {
                 self.nodes.remove(node_id);
@@ -1704,6 +1726,51 @@ mod tests {
         assert_eq!(node.cpu_total, 8.0);
         assert_eq!(node.memory_total, 16_000_000_000);
         assert_eq!(node.status, "ready");
+    }
+
+    #[test]
+    fn update_node_mode_changes_node_info() {
+        let mut state = ClusterState::new();
+
+        state.apply(&Request::RegisterNode {
+            node_id: 7,
+            address: "10.0.0.7:9000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 4.0,
+            memory_total: 8_000_000_000,
+            disk_total: 100_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+        });
+
+        let resp = state.apply(&Request::UpdateNodeMode {
+            node_id: 7,
+            mode: "replicate".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        assert_eq!(state.get_node(7).unwrap().mode, "replicate");
+
+        // Invalid mode rejected, NodeInfo unchanged.
+        let bad = state.apply(&Request::UpdateNodeMode {
+            node_id: 7,
+            mode: "bogus".to_string(),
+        });
+        assert!(matches!(bad, Response::Error { .. }));
+        assert_eq!(state.get_node(7).unwrap().mode, "replicate");
+
+        // Unknown node id surfaces as an error.
+        let missing = state.apply(&Request::UpdateNodeMode {
+            node_id: 999,
+            mode: "full".to_string(),
+        });
+        assert!(matches!(missing, Response::Error { .. }));
     }
 
     #[test]
