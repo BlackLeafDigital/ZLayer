@@ -268,7 +268,9 @@ jobs:
           node-version: 20
 
       - name: Install node deps
-        run: pnpm install --prefix crates/zlayer-manager/tests/e2e
+        run: |
+          pnpm install --prefix crates/zlayer-manager
+          pnpm install --prefix crates/zlayer-manager/tests/e2e
 
       - name: Install Playwright Chromium
         run: pnpm --prefix crates/zlayer-manager/tests/e2e dlx playwright install chromium --with-deps

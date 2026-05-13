@@ -26,6 +26,11 @@ exit. Pass `--throwaway` to spin up an isolated daemon instead.
 ## One-time setup
 
 ```bash
+# Install daisyui (tailwind v4 plugin) for the manager crate.
+# Without this, `cargo leptos build` fails at the tailwind step with
+# "Error: Can't resolve 'daisyui' in '.../crates/zlayer-manager'".
+pnpm install --prefix crates/zlayer-manager
+
 # Install JS deps (intellitester + playwright)
 pnpm install --prefix crates/zlayer-manager/tests/e2e
 

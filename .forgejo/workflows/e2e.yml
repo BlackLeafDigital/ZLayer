@@ -419,7 +419,9 @@ jobs:
 
       - name: Install node deps
         if: steps.check.outputs.completed != 'true'
-        run: pnpm install --prefix crates/zlayer-manager/tests/e2e
+        run: |
+          pnpm install --prefix crates/zlayer-manager
+          pnpm install --prefix crates/zlayer-manager/tests/e2e
 
       - name: Install Playwright Chromium
         if: steps.check.outputs.completed != 'true'
