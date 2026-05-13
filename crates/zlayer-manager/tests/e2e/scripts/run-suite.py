@@ -1178,6 +1178,216 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Cluster node-upgrade orchestrator suite
+# ---------------------------------------------------------------------------
+#
+# Exercises `POST /api/v1/cluster/upgrade` (added in Commit D) end-to-end
+# against a real 3-node loopback cluster. We post a deliberately
+# nonexistent target version so every follower's `zlayer self-update`
+# shell-out fails, which lets us assert three independent pieces of
+# behaviour without ever actually restarting a daemon:
+#
+#   1. A follower-targeted POST returns 421 + `X-Leader-Addr`.
+#   2. The leader orchestrator walks every follower and records one
+#      `errors[]` entry per follower (no `upgraded[]`, no daemon flap).
+#   3. After the failed rollout, all 3 nodes are still `status=ready`.
+
+
+def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
+    """`POST /api/v1/cluster/upgrade` with a bad version: assert 421
+    leader-redirect, orchestrator follower-walk + error-recording, and
+    that the cluster survives the failed rollout."""
+    if not args.no_build:
+        build_phase(throwaway=args.throwaway)
+
+    zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
+    log(f"cluster_node_upgrade: using zlayer binary {zlayer_bin}")
+
+    root_dir = THROWAWAY_ROOT / "cluster_node_upgrade"
+    shutil.rmtree(root_dir, ignore_errors=True)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    try:
+        procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
+            zlayer_bin, root_dir,
+        )
+        log("cluster_node_upgrade: waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster(
+            api_ports[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        # Identify leader. The bootstrap path makes node1 the leader, but
+        # if the payload exposes an explicit `role=leader` we honour it.
+        leader_port: Optional[int] = None
+        for n in nodes:
+            role = str(n.get("role", "")).lower()
+            if role == "leader":
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                for port in api_ports:
+                    if str(port) in api_endpoint:
+                        leader_port = port
+                        break
+                break
+        if leader_port is None:
+            # Fall back to the bootstrap leader (node1).
+            leader_port = api_ports[0]
+        log(f"cluster_node_upgrade: leader = 127.0.0.1:{leader_port}")
+
+        # Pick a non-leader follower for the 421 redirect test. Use the
+        # last node so we never accidentally collide with the leader.
+        follower_port = api_ports[-1]
+        if follower_port == leader_port:
+            # Defensive fallback: pick any port != leader.
+            follower_port = next(
+                p for p in api_ports if p != leader_port
+            )
+        log(
+            f"cluster_node_upgrade: follower for 421 test = "
+            f"127.0.0.1:{follower_port}"
+        )
+
+        def _post_cluster_upgrade(
+            api_port: int, body: dict, timeout_s: int = 60,
+        ) -> tuple[int, dict, dict]:
+            """POST /api/v1/cluster/upgrade. Returns (status, body_json, headers)."""
+            url = f"http://127.0.0.1:{api_port}/api/v1/cluster/upgrade"
+            req = urllib.request.Request(
+                url, method="POST",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(body).encode("utf-8"),
+            )
+            bearer = os.environ.get("ZLAYER_E2E_CLUSTER_TOKEN")
+            if bearer:
+                req.add_header("Authorization", f"Bearer {bearer}")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    return (
+                        resp.status,
+                        json.loads(resp.read().decode("utf-8")),
+                        dict(resp.headers),
+                    )
+            except urllib.error.HTTPError as e:
+                body_bytes = e.read() if hasattr(e, 'read') else b""
+                body_text = body_bytes.decode("utf-8", errors="replace")
+                try:
+                    body_json = json.loads(body_text) if body_text else {}
+                except json.JSONDecodeError:
+                    body_json = {"raw": body_text}
+                return (
+                    e.code, body_json, dict(e.headers) if e.headers else {},
+                )
+
+        # --- Test 1: 421 leader-redirect ---------------------------------
+        log(
+            "cluster_node_upgrade: Test 1 — POST against non-leader, "
+            "expect 421 + X-Leader-Addr"
+        )
+        bad_body = {
+            "version": "v0.0.0-test-nonexistent",
+            "cooldown_secs": 1,
+            "strict": False,
+        }
+        status1, body1, headers1 = _post_cluster_upgrade(
+            follower_port, bad_body, timeout_s=30,
+        )
+        if status1 != 421:
+            raise RuntimeError(
+                f"expected 421 from follower POST, got {status1}; "
+                f"body={body1!r} headers={headers1!r}"
+            )
+        leader_addr_hdr = (
+            headers1.get("X-Leader-Addr")
+            or headers1.get("x-leader-addr")
+        )
+        if not leader_addr_hdr:
+            raise RuntimeError(
+                "follower 421 response missing X-Leader-Addr header; "
+                f"status={status1} body={body1!r} headers={headers1!r}"
+            )
+        if str(body1.get("error", "")) != "not_leader":
+            raise RuntimeError(
+                "follower 421 response body missing `error: not_leader`; "
+                f"status={status1} body={body1!r} headers={headers1!r}"
+            )
+        log(
+            f"cluster_node_upgrade: 421 redirect OK "
+            f"(leader_addr={leader_addr_hdr})"
+        )
+
+        # --- Test 2: orchestrator walks followers and records errors -----
+        # Every follower's self-update will fail (nonexistent version → no
+        # such GitHub release), so the leader's per-follower drop-deadline
+        # (30s) elapses on each. With 2 followers + a 1s cooldown that's
+        # comfortably under 2 minutes, but we budget a generous 10 minutes
+        # of urllib timeout to keep the suite robust under load.
+        log(
+            "cluster_node_upgrade: Test 2 — POST against leader with bad "
+            "version, expect orchestrator to record 2 errors (one per "
+            "follower) and 0 upgrades"
+        )
+        status2, body2, _headers2 = _post_cluster_upgrade(
+            leader_port, bad_body, timeout_s=600,
+        )
+        if status2 != 200:
+            raise RuntimeError(
+                f"expected 200 from leader POST, got {status2}; "
+                f"body={body2!r}"
+            )
+        upgraded = body2.get("upgraded") or []
+        errors_list = body2.get("errors") or []
+        skipped = body2.get("skipped") or []
+        if len(upgraded) != 0:
+            raise RuntimeError(
+                f"expected upgraded=[], got {upgraded!r}; "
+                f"full body={body2!r}"
+            )
+        if len(errors_list) != 2:
+            raise RuntimeError(
+                f"expected 2 errors (one per follower), got "
+                f"{len(errors_list)}; errors={errors_list!r} "
+                f"upgraded={upgraded!r} skipped={skipped!r}"
+            )
+        log(
+            f"cluster_node_upgrade: orchestrator-walk OK "
+            f"(upgraded={upgraded!r} skipped={skipped!r} "
+            f"errors={[e.get('node_id') for e in errors_list]!r})"
+        )
+
+        # --- Test 3: cluster survives the failed upgrade -----------------
+        log(
+            "cluster_node_upgrade: Test 3 — re-fetch cluster nodes, "
+            "expect all 3 still ready"
+        )
+        after = _fetch_cluster_nodes(leader_port)
+        ready_after = [
+            n for n in after
+            if str(n.get("status", "")).lower() == "ready"
+        ]
+        if len(ready_after) != 3:
+            raise RuntimeError(
+                f"expected 3 ready nodes after failed upgrade, got "
+                f"{len(ready_after)}; nodes={after!r}"
+            )
+        log(
+            "cluster_node_upgrade: PASS — 421-redirect, orchestrator-walk, "
+            "error-recording, cluster-survival all verified"
+        )
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"cluster_node_upgrade: FAIL — {e!r}",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    finally:
+        _cleanup_cluster(procs, root_dir)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1205,6 +1415,8 @@ def parse_args() -> argparse.Namespace:
             "  cluster_failover  3-node cluster, kill worker, assert recovery\n"
             "  cluster_scaling   3-node cluster, deploy 1→3→1 replicas\n"
             "  cluster_upgrade   3-node cluster, image v1→v2 rolling upgrade\n"
+            "  cluster_node_upgrade  POST /api/v1/cluster/upgrade with bad version,\n"
+            "                        assert 421 redirect + orchestrator-walk + cluster survival\n"
         ),
     )
     parser.add_argument(
@@ -1215,6 +1427,7 @@ def parse_args() -> argparse.Namespace:
             "cluster_failover",
             "cluster_scaling",
             "cluster_upgrade",
+            "cluster_node_upgrade",
         ],
         default=None,
         help=(
@@ -1230,6 +1443,7 @@ def parse_args() -> argparse.Namespace:
             "cluster_failover",
             "cluster_scaling",
             "cluster_upgrade",
+            "cluster_node_upgrade",
         ],
         default=None,
         help="Alternative to the positional suite argument.",
@@ -1283,6 +1497,8 @@ def main() -> int:
         return run_cluster_scaling(args)
     if args.suite == "cluster_upgrade":
         return run_cluster_upgrade(args)
+    if args.suite == "cluster_node_upgrade":
+        return run_cluster_node_upgrade(args)
 
     # Default suite (`manager_auth`) falls through into the manager harness.
 

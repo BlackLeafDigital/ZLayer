@@ -34,6 +34,7 @@ on:
           - raft-e2e:cluster_failover
           - raft-e2e:cluster_scaling
           - raft-e2e:cluster_upgrade
+          - raft-e2e:cluster_node_upgrade
           - scheduler-unit
           - macos-unit
           - macos-sandbox
@@ -380,7 +381,7 @@ jobs:
           # "run everything"), iterate all four cluster suites. Otherwise
           # run the single suite resolved above.
           if [ "$YAML" = "raft-e2e" ] || [ -z "$YAML" ]; then
-            for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade; do
+            for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade cluster_node_upgrade; do
               echo "=== Running suite: $s ==="
               uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"
             done

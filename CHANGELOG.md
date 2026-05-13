@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [0.11.24] - 2026-05-12
 
 ### Added
+- `cluster_node_upgrade` e2e suite in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. Boots a real
+  3-node loopback cluster, posts `/api/v1/cluster/upgrade` with a
+  nonexistent target version, and verifies: (a) a follower-targeted
+  POST returns 421 + `X-Leader-Addr`, (b) the leader orchestrator
+  walks every follower and records an error for each, (c) the
+  cluster survives the failed upgrade with all 3 nodes still ready.
+  Surfaced via the new `raft-e2e:cluster_node_upgrade` dropdown
+  option on both `.forgejo/workflows/e2e.yml` and
+  `.github/workflows/e2e.yml`.
 - `zlayer node upgrade` — leader-driven rolling daemon-binary upgrade
   across the cluster. The CLI POSTs `/api/v1/cluster/upgrade` to the
   local daemon; if it isn't the leader the daemon returns
