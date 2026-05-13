@@ -1283,6 +1283,13 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
         // Rolling daemon-binary upgrade entry point. Followers respond
         // with 421 + X-Leader-Addr so the CLI can redirect to the leader.
         .route("/upgrade", post(handlers::cluster::cluster_upgrade))
+        // Leader self-upgrade. Re-enters internal/upgrade/start over
+        // loopback so the daemon exits 75 and is respawned by the
+        // supervisor on the new binary.
+        .route(
+            "/upgrade-self",
+            post(handlers::cluster::cluster_upgrade_self),
+        )
         .route(
             "/nodes/{id}",
             delete(handlers::cluster::cluster_remove_node),

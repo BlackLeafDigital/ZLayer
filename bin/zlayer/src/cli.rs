@@ -699,7 +699,7 @@ pub(crate) enum Commands {
         #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
         no_tunnel_server: bool,
 
-        /// On clean shutdown, exit with code 75 (EX_TEMPFAIL) instead of 0, so
+        /// On clean shutdown, exit with code 75 (`EX_TEMPFAIL`) instead of 0, so
         /// a supervisor (systemd `Restart=on-failure`, runit, etc.) respawns
         /// the daemon. Used by `zlayer self-update`-driven cluster upgrades.
         #[arg(long, env = "ZLAYER_RESTART_ON_EXIT")]
@@ -2782,11 +2782,14 @@ pub(crate) enum NodeCommands {
         data_dir: Option<PathBuf>,
     },
 
-    /// Roll a new zlayer version across every follower in the cluster.
+    /// Roll a new zlayer version across every node in the cluster.
     ///
-    /// Followers self-update one at a time; the operator runs
-    /// `zlayer self-update --restart` on the leader manually afterwards
-    /// (no leader self-update in this command — first pass).
+    /// Followers self-update one at a time (deterministic, ascending
+    /// `node_id` order). After the follower walk, the leader self-upgrades
+    /// last: its daemon exits with code 75 and the OS supervisor
+    /// (launchd / systemd) respawns it on the new binary. Pass
+    /// `--skip-leader` to keep the legacy behaviour of leaving the
+    /// leader untouched.
     #[command(name = "upgrade")]
     Upgrade {
         /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
@@ -2802,6 +2805,11 @@ pub(crate) enum NodeCommands {
         /// Skip the confirmation prompt and apply immediately.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Don't auto-upgrade the leader. Use when the operator wants to
+        /// upgrade the leader manually (e.g. to time a deliberate
+        /// failover window).
+        #[arg(long)]
+        skip_leader: bool,
     },
 
     /// Force this node to become cluster leader (disaster recovery)

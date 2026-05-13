@@ -1764,6 +1764,7 @@ fn compute_reposync_signature(secret: &str, body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     // -- rewrite_image_for_macos tests --
 

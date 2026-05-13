@@ -1001,6 +1001,33 @@ async fn install(
             }
         }
 
+        // Kickstart the (possibly already-loaded) service so launchd
+        // re-reads the freshly-written plist and the daemon ends up
+        // running against the current ProgramArguments / env. `-k`
+        // terminates an existing instance first, then respawns. This is
+        // the macOS analog of `systemctl daemon-reload` + restart.
+        // Tolerate non-zero — on a fresh install the service was just
+        // bootstrapped and may not be running yet, and we don't want to
+        // fail the whole install over a cosmetic warning.
+        let kickstart_out = Command::new("launchctl")
+            .args(["kickstart", "-k", &format!("{target}/{PLIST_LABEL}")])
+            .output()
+            .await;
+        match kickstart_out {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "Warning: launchctl kickstart -k {target}/{PLIST_LABEL} exited non-zero \
+                     (the freshly-installed plist is loaded; if the daemon was already \
+                     running it may still be on the old binary until next restart): {stderr}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to invoke launchctl kickstart: {e}");
+            }
+            _ => {}
+        }
+
         print!("Daemon starting...");
         match wait_for_daemon_ready(45).await {
             Ok(()) => {
@@ -1838,6 +1865,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=60
 Restart=always
 RestartSec=5
+# Exit code 75 (EX_TEMPFAIL) is used by `zlayer serve --restart-on-exit`
+# and the self-update / cluster-upgrade flow to request a supervisor
+# respawn. SuccessExitStatus prevents `Restart=on-failure` from treating
+# 75 as a hard failure if an operator switches the policy, while
+# RestartForceExitStatus guarantees a restart regardless of the chosen
+# Restart= policy. Belt + suspenders against future policy edits.
+SuccessExitStatus=75
+RestartForceExitStatus=75
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=zlayer
@@ -2544,6 +2579,54 @@ async fn install(
     println!("  Startup:  AutoStart");
     if no_swagger {
         println!("  Swagger:  disabled");
+    }
+
+    // Configure SCM failure-restart actions so the daemon respawns on any
+    // non-zero exit (including 75 / EX_TEMPFAIL from
+    // `zlayer serve --restart-on-exit` and the self-update / cluster-upgrade
+    // flow). The `windows-service` crate as of this writing doesn't expose
+    // `ChangeServiceConfig2` for SERVICE_CONFIG_FAILURE_ACTIONS, so we shell
+    // out to `sc.exe failure`. Best-effort: log a warning on failure rather
+    // than rolling the install back — the service is still registered and
+    // operators can re-run `sc failure` manually if needed.
+    //
+    // Reset counter: 86400s (24h) before SCM forgets a previous failure.
+    // Actions: restart at 5s, 5s, 5s. After three consecutive failures
+    // within the reset window SCM stops trying, matching systemd's
+    // `StartLimitBurst=3 / StartLimitIntervalSec=86400` defaults.
+    {
+        let sc_out = tokio::process::Command::new("sc.exe")
+            .args([
+                "failure",
+                crate::daemon_service::SERVICE_NAME,
+                "reset=",
+                "86400",
+                "actions=",
+                "restart/5000/restart/5000/restart/5000",
+            ])
+            .output()
+            .await;
+        match sc_out {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                eprintln!(
+                    "Warning: `sc failure {}` exited non-zero. Service will NOT auto-restart \
+                     on exit code 75 until this is configured. stderr={stderr} stdout={stdout}",
+                    crate::daemon_service::SERVICE_NAME
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to invoke `sc.exe failure` to configure auto-restart \
+                     for service '{}': {e}",
+                    crate::daemon_service::SERVICE_NAME
+                );
+            }
+            _ => {
+                println!("  Restart:  on failure (3x at 5s intervals, 86400s reset)");
+            }
+        }
     }
 
     if !no_start {

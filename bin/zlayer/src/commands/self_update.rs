@@ -471,8 +471,20 @@ fn swap_binary(staged: &Path, current_exe: &Path) -> Result<()> {
 /// took effect. Daemon resumption is out of scope: the caller (or a
 /// supervisor like systemd) is responsible for restarting long-running
 /// processes with their original arguments.
+///
+/// On macOS we additionally fire `launchctl kickstart -k <scope>/<label>`
+/// so launchd terminates the currently-running daemon (which is still
+/// running the OLD binary text segment from before the on-disk swap) and
+/// respawns it with the NEW binary. Best-effort: if the daemon is not
+/// running under launchd (e.g. foreground `zlayer serve` in a terminal),
+/// the kickstart call exits non-zero and we surface a hint without
+/// failing the whole self-update.
 #[allow(clippy::needless_pass_by_value)]
 fn restart_self(current_exe: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        kickstart_launchd_daemon();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -486,6 +498,47 @@ fn restart_self(current_exe: &Path) {
     {
         let _ = current_exe;
         eprintln!("Restart not yet supported on Windows; please re-run zlayer manually.");
+    }
+}
+
+/// Match the label/scope resolution used by `commands::daemon::launchd_context`:
+/// root → `system/com.zlayer.daemon`, non-root → `gui/<uid>/com.zlayer.daemon`.
+/// Kept inline (instead of imported from `commands::daemon`) so this module
+/// stays self-contained — `commands::daemon` already gates its helper on
+/// `cfg(target_os = "macos")` and isn't intended as a public API.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn kickstart_launchd_daemon() {
+    const PLIST_LABEL: &str = "com.zlayer.daemon";
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let uid = unsafe { libc::getuid() };
+    let target = if is_root {
+        format!("system/{PLIST_LABEL}")
+    } else {
+        format!("gui/{uid}/{PLIST_LABEL}")
+    };
+
+    match std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!("launchctl kickstart -k {target} succeeded");
+        }
+        Ok(status) => {
+            eprintln!(
+                "warning: launchctl kickstart -k {target} exited with {status}. \
+                 If the daemon is managed by launchd, terminate and respawn it \
+                 manually so it picks up the new binary."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to invoke launchctl kickstart -k {target}: {e}. \
+                 If the daemon is managed by launchd, run it manually so it \
+                 picks up the new binary."
+            );
+        }
     }
 }
 

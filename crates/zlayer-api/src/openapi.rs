@@ -109,7 +109,7 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
-    __path_cluster_list_nodes, __path_cluster_upgrade,
+    __path_cluster_list_nodes, __path_cluster_upgrade, __path_cluster_upgrade_self,
 };
 use crate::handlers::container_networks::{
     __path_connect_container_network, __path_create_container_network,
@@ -464,6 +464,7 @@ impl Modify for SecurityAddon {
         cluster_heartbeat,
         cluster_force_leader,
         cluster_upgrade,
+        cluster_upgrade_self,
         // Volumes
         list_volumes,
         create_volume,
@@ -708,6 +709,7 @@ impl Modify for SecurityAddon {
             ForceLeaderResponse,
             crate::handlers::cluster::ClusterUpgradeRequest,
             crate::handlers::cluster::ClusterUpgradeResult,
+            crate::handlers::cluster::ClusterUpgradeSelfRequest,
             crate::handlers::cluster::UpgradeError,
             // Volume schemas
             VolumeSummary,

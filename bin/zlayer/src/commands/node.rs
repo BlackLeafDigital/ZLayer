@@ -421,6 +421,7 @@ pub(crate) async fn handle_node(
             cooldown_secs,
             strict,
             yes,
+            skip_leader,
         } => {
             handle_node_upgrade(
                 cli_data_dir.to_path_buf(),
@@ -428,6 +429,7 @@ pub(crate) async fn handle_node(
                 *cooldown_secs,
                 *strict,
                 *yes,
+                *skip_leader,
             )
             .await
         }
@@ -2163,23 +2165,27 @@ struct ClusterUpgradeResponse {
     errors: Vec<ClusterUpgradeError>,
 }
 
-/// Roll a new zlayer version across every follower in the cluster.
+/// Roll a new zlayer version across every node in the cluster.
 ///
 /// The local daemon's API endpoint is contacted first. If it answers with
 /// 421 Misdirected Request, the request is re-issued once against the leader
 /// address advertised in the `X-Leader-Addr` response header. The leader
-/// orchestrates the rolling upgrade internally and blocks until done, so the
-/// HTTP client uses a generous 30-minute timeout.
+/// orchestrates the rolling follower walk internally and blocks until done,
+/// so the HTTP client uses a generous 30-minute timeout.
 ///
-/// The leader itself is *not* upgraded by this command — the operator runs
-/// `zlayer self-update --restart` on the leader manually after the rollout
-/// completes.
+/// After the follower walk returns, the leader is upgraded last via
+/// `POST /api/v1/cluster/upgrade-self` (unless `skip_leader` is true, or
+/// `strict` mode short-circuited because of follower errors). The leader's
+/// daemon exits with code 75 and the OS supervisor (launchd / systemd)
+/// respawns it on the new binary; Raft holds a brief re-election.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_node_upgrade(
     data_dir: PathBuf,
     version: Option<String>,
     cooldown_secs: u64,
     strict: bool,
     yes: bool,
+    skip_leader: bool,
 ) -> Result<()> {
     use reqwest::StatusCode;
     use std::io::{self, Write};
@@ -2195,8 +2201,13 @@ pub(crate) async fn handle_node_upgrade(
             Some(v) => format!(" {v}"),
             None => String::new(),
         };
+        let leader_msg = if skip_leader {
+            " (followers only)"
+        } else {
+            " (followers, then the leader)"
+        };
         print!(
-            "This will roll zlayer{version_msg} across every follower in the cluster. Continue? [y/N] "
+            "This will roll zlayer{version_msg} across every node in the cluster{leader_msg}. Continue? [y/N] "
         );
         io::stdout().flush().ok();
         let mut input = String::new();
@@ -2232,33 +2243,36 @@ pub(crate) async fn handle_node_upgrade(
         .await
         .context("Failed to send cluster upgrade request")?;
 
-    // 5. Handle 421 by retrying against the leader exactly once.
-    let response = if response.status() == StatusCode::MISDIRECTED_REQUEST {
+    // 5. Handle 421 by retrying against the leader exactly once. Track
+    //    which addr we reached the leader on, since that's where we'll
+    //    send the `upgrade-self` follow-up.
+    let (response, leader_endpoint) = if response.status() == StatusCode::MISDIRECTED_REQUEST {
         let leader_addr = response
             .headers()
             .get("X-Leader-Addr")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
         match leader_addr {
             Some(addr) => {
                 let leader_url = format!("http://{addr}/api/v1/cluster/upgrade");
                 info!("Local daemon is not the leader. Retrying via leader at {addr}...");
-                client
+                let resp = client
                     .post(&leader_url)
                     .json(&body)
                     .send()
                     .await
-                    .context("Failed to send cluster upgrade request to leader")?
+                    .context("Failed to send cluster upgrade request to leader")?;
+                (resp, addr)
             }
             None => {
                 anyhow::bail!(
                     "Local daemon is not the leader and could not determine leader address. \
-                     Run this command on the leader node."
+                         Run this command on the leader node."
                 );
             }
         }
     } else {
-        response
+        (response, local_api_endpoint.clone())
     };
 
     // 6. Bail on any non-2xx.
@@ -2293,11 +2307,35 @@ pub(crate) async fn handle_node_upgrade(
         }
     }
 
-    // 8. Final reminder — the leader is never auto-upgraded by this command.
+    // 8. Decide whether to also upgrade the leader.
+    let leader_upgrade_attempted = if skip_leader {
+        info!("Skipping leader upgrade (--skip-leader). Run 'zlayer self-update --restart' on the leader manually.");
+        println!();
+        println!(
+            "Note: --skip-leader set. The leader was NOT auto-upgraded. \
+             Run 'zlayer self-update --restart' on the leader manually."
+        );
+        false
+    } else if strict && !result.errors.is_empty() {
+        warn!("Follower upgrades had errors; skipping leader upgrade.");
+        println!();
+        println!(
+            "- Leader skipped: follower upgrades had errors and --strict was set. \
+             Run 'zlayer self-update --restart' on the leader after resolving the failures."
+        );
+        false
+    } else {
+        upgrade_leader_self(&client, &leader_endpoint, version.as_deref()).await?;
+        true
+    };
+
+    // 9. Final summary.
     println!();
-    println!(
-        "Note: the leader was NOT auto-upgraded. Run 'zlayer self-update --restart' on the leader once followers are healthy."
-    );
+    if leader_upgrade_attempted {
+        println!("Rolling upgrade complete. Followers + leader requested.");
+    } else {
+        println!("Rolling upgrade complete. Followers upgraded; leader NOT auto-upgraded.");
+    }
 
     if strict && !result.errors.is_empty() {
         let summary = result
@@ -2307,6 +2345,91 @@ pub(crate) async fn handle_node_upgrade(
             .collect::<Vec<_>>()
             .join("; ");
         anyhow::bail!("Rolling upgrade failed in strict mode: {summary}");
+    }
+
+    Ok(())
+}
+
+/// GET `<addr>/health/ready` and return true on any 2xx response.
+async fn health_ready_ok(client: &reqwest::Client, addr: &str) -> bool {
+    let url = format!("http://{addr}/health/ready");
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Trigger `POST /api/v1/cluster/upgrade-self` against the leader and wait
+/// for the daemon to drop and come back. Returns Ok on success; surfaces a
+/// hard error only if the POST fails to deliver — drop/comeback timeouts
+/// are logged as warnings (the supervisor may still finish the respawn
+/// asynchronously).
+async fn upgrade_leader_self(
+    client: &reqwest::Client,
+    leader_endpoint: &str,
+    version: Option<&str>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    info!(%leader_endpoint, "Followers upgraded. Scheduling leader self-upgrade...");
+    println!();
+    println!("Scheduling leader self-upgrade at {leader_endpoint}...");
+
+    let leader_url = format!("http://{leader_endpoint}/api/v1/cluster/upgrade-self");
+    let resp = client
+        .post(&leader_url)
+        .json(&serde_json::json!({ "version": version }))
+        .send()
+        .await
+        .context("posting /cluster/upgrade-self")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Leader self-upgrade request failed: {status} - {body}");
+    }
+
+    // The leader daemon will now exit code 75. Wait for /health/ready to flap.
+    info!("Waiting for leader to drop /health/ready (signal restart)...");
+    println!("Waiting for leader to drop /health/ready...");
+    let drop_deadline = Instant::now() + Duration::from_secs(60);
+    let mut dropped = false;
+    while Instant::now() < drop_deadline {
+        if !health_ready_ok(client, leader_endpoint).await {
+            dropped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if !dropped {
+        warn!("Leader's /health/ready did not drop within 60s — upgrade may not have started");
+    }
+
+    info!("Waiting for leader to come back...");
+    println!("Waiting for leader to come back...");
+    let back_deadline = Instant::now() + Duration::from_secs(180);
+    let mut back = false;
+    while Instant::now() < back_deadline {
+        if health_ready_ok(client, leader_endpoint).await {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if back {
+        println!("✓ Leader is back and serving /health/ready.");
+    } else {
+        warn!(
+            "Leader did not return to /health/ready within 180s. The supervisor may still be respawning it — check manually."
+        );
+        println!(
+            "- Leader did not return to /health/ready within 180s. Check the supervisor / logs."
+        );
     }
 
     Ok(())

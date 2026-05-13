@@ -19,7 +19,9 @@ use utoipa::ToSchema;
 use zlayer_overlay::{IpAllocator, NodeSliceAllocator};
 
 use crate::error::{ApiError, Result};
-use crate::handlers::internal::{InternalAddPeerRequest, INTERNAL_AUTH_HEADER};
+use crate::handlers::internal::{
+    InternalAddPeerRequest, UpgradeStartResponse, INTERNAL_AUTH_HEADER,
+};
 use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 
 // =============================================================================
@@ -1134,6 +1136,155 @@ pub async fn cluster_upgrade(
         skipped,
         errors,
     }))
+}
+
+// =============================================================================
+// Leader self-upgrade (`POST /api/v1/cluster/upgrade-self`)
+// =============================================================================
+
+/// Request body for `POST /api/v1/cluster/upgrade-self`.
+///
+/// Triggers a daemon-binary self-upgrade on this node. Used by the CLI
+/// after `cluster_upgrade` finishes the follower walk, so the leader can
+/// upgrade itself last. The handler re-enters
+/// `internal_upgrade_start` over localhost using the configured internal
+/// token, so all the existing self-update / sentinel / exit-75 plumbing
+/// is reused.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ClusterUpgradeSelfRequest {
+    /// Target version (e.g. `"v0.12.0"`). Defaults to latest GitHub release.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// Trigger a daemon-binary self-upgrade on the local (leader) node.
+///
+/// `POST /api/v1/cluster/upgrade-self`
+///
+/// Re-enters `POST /api/v1/internal/upgrade/start` against `127.0.0.1` so
+/// the leader's daemon downloads the target release, writes the restart
+/// sentinel, and exits with code 75 — the OS supervisor (launchd /
+/// systemd) respawns it on the new binary, and Raft holds a brief
+/// re-election.
+///
+/// openraft 0.9 lacks a `transfer_leader` API, so we cannot pre-empt
+/// leadership before restarting; the cluster simply elects a new leader
+/// when this one drops.
+///
+/// # Errors
+///
+/// Returns `ServiceUnavailable` if Raft or the internal token are
+/// unconfigured, `Internal` if the leader's own `advertise_addr` /
+/// `api_port` cannot be resolved from cluster state, or `Internal` if
+/// the localhost upgrade-start call fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/upgrade-self",
+    request_body = ClusterUpgradeSelfRequest,
+    responses(
+        (status = 202, description = "Self-upgrade scheduled", body = UpgradeStartResponse),
+        (status = 500, description = "Internal error scheduling self-upgrade"),
+        (status = 503, description = "Raft coordinator or internal token not configured"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+pub async fn cluster_upgrade_self(
+    State(state): State<ClusterApiState>,
+    Json(req): Json<ClusterUpgradeSelfRequest>,
+) -> Result<(StatusCode, Json<UpgradeStartResponse>)> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+
+    let internal_token = state.internal_token.clone().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "internal token not configured; leader self-upgrade requires an internal shared secret"
+                .into(),
+        )
+    })?;
+
+    // Resolve the local API port by looking up our own node_id in cluster
+    // state. The leader is always registered there, with its
+    // advertise_addr + api_port intact, so this is the most reliable way
+    // to learn our own externally-routable API base.
+    let local_node_id = raft.node_id();
+    let cluster_state = raft.read_state().await;
+    let self_node = cluster_state.nodes.get(&local_node_id).ok_or_else(|| {
+        ApiError::Internal(format!(
+            "leader node {local_node_id} missing from cluster state; cannot resolve local API port",
+        ))
+    })?;
+    if self_node.api_port == 0 {
+        return Err(ApiError::Internal(
+            "leader's api_port is 0; cannot dispatch self-upgrade over localhost".into(),
+        ));
+    }
+    // Bind to 127.0.0.1 so the call never leaves the host; the listener
+    // binds on 0.0.0.0 (or the advertise addr) so loopback is always
+    // routable to it.
+    let local_url = format!(
+        "http://127.0.0.1:{port}/api/v1/internal/upgrade/start",
+        port = self_node.api_port
+    );
+
+    info!(
+        leader_node_id = local_node_id,
+        url = %local_url,
+        version = ?req.version,
+        "scheduling leader self-upgrade via localhost internal/upgrade/start"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+    let resp = client
+        .post(&local_url)
+        .header(INTERNAL_AUTH_HEADER, &internal_token)
+        .json(&serde_json::json!({ "version": req.version }))
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to POST localhost upgrade/start: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!(
+            "localhost upgrade/start returned non-success status {status}: {body}"
+        )));
+    }
+
+    // `UpgradeStartResponse` is server-side-only (Serialize, not
+    // Deserialize), so decode through an untyped Value and rebuild the
+    // response. This keeps `internal.rs` untouched.
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        ApiError::Internal(format!(
+            "failed to decode localhost upgrade/start response: {e}"
+        ))
+    })?;
+    let upgrade_id = body
+        .get("upgrade_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ApiError::Internal("localhost upgrade/start response missing upgrade_id".into())
+        })?
+        .to_string();
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Upgrade scheduled")
+        .to_string();
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UpgradeStartResponse {
+            upgrade_id,
+            message,
+        }),
+    ))
 }
 
 // =============================================================================
