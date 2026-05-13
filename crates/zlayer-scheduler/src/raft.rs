@@ -1528,6 +1528,28 @@ impl RaftCoordinator {
         Ok(())
     }
 
+    /// Trigger an immediate election on this node.
+    ///
+    /// Used by the leader's pre-self-upgrade orchestration: the leader
+    /// picks a healthy follower and asks it to campaign right away,
+    /// instead of waiting for heartbeat-loss to expire after the leader
+    /// drops. Raft safety guarantees that only an up-to-date candidate
+    /// can win, so the worst case is a single failed election round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `Raft::trigger().elect()` call
+    /// reports a fatal coordinator error (shutdown, storage failure).
+    pub async fn trigger_elect(&self) -> Result<()> {
+        self.node
+            .raft()
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("trigger_elect failed: {e}")))?;
+        Ok(())
+    }
+
     /// Get a reference to the underlying Raft instance.
     ///
     /// This is used by the Raft RPC service to forward RPCs to the Raft node.

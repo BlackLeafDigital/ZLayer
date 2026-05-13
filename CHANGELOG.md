@@ -37,10 +37,24 @@ All notable changes to this project will be documented in this file.
   when timing a deliberate failover), `-y/--yes`.
 - `POST /api/v1/cluster/upgrade-self` endpoint (admin auth). Used by
   `zlayer node upgrade` after followers report healthy to schedule
-  the leader's own self-upgrade. Implementation re-enters
-  `internal_upgrade_start` over a loopback request with the
-  configured `X-ZLayer-Internal-Token` so authn/authz semantics stay
-  identical to the follower path.
+  the leader's own self-upgrade. Two-step orchestration: (1) the
+  handler picks a healthy follower (`status == "ready"`, fresh
+  heartbeat) and POSTs `/api/v1/internal/raft/trigger-elect` to it
+  so that follower campaigns immediately via `Raft::trigger().elect()`
+  instead of the cluster waiting for heartbeat-loss after the leader
+  drops; we poll `raft.metrics().current_leader` for up to 5s to
+  confirm leadership flipped, then (2) re-enter
+  `internal_upgrade_start` over a loopback request with the configured
+  `X-ZLayer-Internal-Token` so authn/authz semantics stay identical
+  to the follower path. If the trigger-elect handoff fails or times
+  out we still proceed — the worst case is one heartbeat-loss window
+  of leaderlessness, which is what the previous behavior had anyway.
+- `POST /api/v1/internal/raft/trigger-elect` (internal-token auth).
+  Calls `RaftCoordinator::trigger_elect()` which wraps
+  `Raft::trigger().elect()` from openraft 0.9. Only available on
+  clustered daemons; returns 503 otherwise. Plumbing: `InternalState`
+  gained an `Option<Arc<RaftCoordinator>>` field wired in
+  `bin/zlayer/src/commands/serve.rs` when `_raft` is `Some`.
 - Supervisor-respawn coverage matrix for `zlayer serve
   --restart-on-exit` (exit code 75) — the path used by self-update
   and `zlayer node upgrade`:

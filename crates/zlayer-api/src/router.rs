@@ -637,6 +637,13 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             "/upgrade/{upgrade_id}",
             get(handlers::internal::internal_upgrade_status),
         )
+        // Pre-self-upgrade nudge: the leader picks a healthy follower
+        // and POSTs here so that follower campaigns immediately
+        // instead of waiting for heartbeat-loss after the leader exits.
+        .route(
+            "/raft/trigger-elect",
+            post(handlers::internal::internal_raft_trigger_elect),
+        )
         .layer(Extension(internal_state.clone()))
         .with_state(internal_state)
 }

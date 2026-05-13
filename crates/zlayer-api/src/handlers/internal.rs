@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, Result};
 use zlayer_agent::{AgentError, ServiceManager};
+use zlayer_scheduler::RaftCoordinator;
 pub use zlayer_types::api::internal::*;
 
 /// Header name for internal API authentication
@@ -50,6 +51,10 @@ pub struct InternalState {
     /// already restart the daemon unconditionally on exit code 75 in that
     /// case.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Optional Raft coordinator handle, used by
+    /// `internal_raft_trigger_elect` to ask the local node to campaign
+    /// before the leader self-upgrades. `None` on non-clustered daemons.
+    pub raft: Option<Arc<RaftCoordinator>>,
 }
 
 impl InternalState {
@@ -61,6 +66,7 @@ impl InternalState {
             overlay_interface: None,
             upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
             data_dir: None,
+            raft: None,
         }
     }
 
@@ -76,7 +82,16 @@ impl InternalState {
             overlay_interface,
             upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
             data_dir: None,
+            raft: None,
         }
+    }
+
+    /// Attach a Raft coordinator handle used by the pre-self-upgrade
+    /// "nudge a follower to campaign" path (`internal_raft_trigger_elect`).
+    #[must_use]
+    pub fn with_raft(mut self, raft: Arc<RaftCoordinator>) -> Self {
+        self.raft = Some(raft);
+        self
     }
 
     /// Attach a data directory used for writing the post-upgrade restart
@@ -371,6 +386,50 @@ pub async fn internal_upgrade_status(
         .get(&upgrade_id)
         .ok_or_else(|| ApiError::NotFound(format!("upgrade id '{upgrade_id}' not found")))?;
     Ok(Json(job.clone()))
+}
+
+/// Trigger an immediate Raft election on this node.
+///
+/// `POST /api/v1/internal/raft/trigger-elect`
+///
+/// Called by the cluster leader's pre-self-upgrade flow on a healthy
+/// follower: that follower campaigns immediately instead of waiting for
+/// heartbeat-loss timeout after the leader exits. Raft safety still
+/// holds — only an up-to-date candidate can win — so a stale callee
+/// just loses the term and a more-up-to-date follower wins the next.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the internal token is missing or wrong.
+/// - `ServiceUnavailable` on non-clustered daemons (no Raft coordinator).
+/// - `Internal` if the underlying `Raft::trigger().elect()` returns
+///   `Fatal` (coordinator shutdown / storage failure).
+#[utoipa::path(
+    post,
+    path = "/api/v1/internal/raft/trigger-elect",
+    responses(
+        (status = 202, description = "Election triggered"),
+        (status = 401, description = "Unauthorized — invalid or missing internal token"),
+        (status = 500, description = "Raft trigger_elect failed"),
+        (status = 503, description = "Raft coordinator not configured on this daemon"),
+    ),
+    tag = "Internal"
+)]
+pub async fn internal_raft_trigger_elect(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+) -> Result<StatusCode> {
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "Raft coordinator not configured; trigger-elect is only available on clustered daemons"
+                .into(),
+        )
+    })?;
+    raft.trigger_elect()
+        .await
+        .map_err(|e| ApiError::Internal(format!("trigger_elect failed: {e}")))?;
+    info!("internal_raft_trigger_elect: local node will campaign now");
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Internal authentication extractor

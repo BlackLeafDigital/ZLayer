@@ -1161,15 +1161,23 @@ pub struct ClusterUpgradeSelfRequest {
 ///
 /// `POST /api/v1/cluster/upgrade-self`
 ///
-/// Re-enters `POST /api/v1/internal/upgrade/start` against `127.0.0.1` so
-/// the leader's daemon downloads the target release, writes the restart
-/// sentinel, and exits with code 75 — the OS supervisor (launchd /
-/// systemd) respawns it on the new binary, and Raft holds a brief
-/// re-election.
+/// Two-step orchestration:
 ///
-/// openraft 0.9 lacks a `transfer_leader` API, so we cannot pre-empt
-/// leadership before restarting; the cluster simply elects a new leader
-/// when this one drops.
+/// 1. **Leader handoff via `trigger_elect`**: pick a healthy follower
+///    (status == `"ready"`, fresh heartbeat) and POST to its
+///    `/api/v1/internal/raft/trigger-elect`. That follower campaigns
+///    immediately — Raft safety guarantees only an up-to-date candidate
+///    wins, so a stale callee just loses the term and a better-up-to-date
+///    follower wins the next. We then poll our own `raft.metrics()`
+///    until `current_leader != local_node_id` (timeout 5s). If the
+///    handoff fails or times out, we still proceed; the worst case is
+///    the cluster waits one heartbeat-loss window for a new leader.
+///
+/// 2. **Local self-upgrade**: re-enter `POST /api/v1/internal/upgrade/start`
+///    against `127.0.0.1` so the (now-former) leader's daemon downloads
+///    the target release, writes the restart sentinel, and exits with
+///    code 75 — the OS supervisor (launchd / systemd / SCM) respawns it
+///    on the new binary and it rejoins as a voter.
 ///
 /// # Errors
 ///
@@ -1189,10 +1197,13 @@ pub struct ClusterUpgradeSelfRequest {
     security(("bearer_auth" = [])),
     tag = "Cluster"
 )]
+#[allow(clippy::too_many_lines)]
 pub async fn cluster_upgrade_self(
     State(state): State<ClusterApiState>,
     Json(req): Json<ClusterUpgradeSelfRequest>,
 ) -> Result<(StatusCode, Json<UpgradeStartResponse>)> {
+    const FOLLOWER_FRESH_SECS: u64 = 10;
+
     let raft = state
         .raft
         .as_ref()
@@ -1240,6 +1251,96 @@ pub async fn cluster_upgrade_self(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| ApiError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+    // -----------------------------------------------------------------
+    // Step 1: nudge a healthy follower into immediate election. This is
+    // best-effort — if no follower is reachable, or it doesn't win the
+    // term, we still proceed and let the cluster handle election after
+    // we drop. Total wall-clock budget here is 5s of polling.
+    // -----------------------------------------------------------------
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let candidate = cluster_state
+        .nodes
+        .iter()
+        .filter(|(id, info)| {
+            **id != local_node_id
+                && info.status == "ready"
+                && info.api_port != 0
+                && !info.advertise_addr.is_empty()
+                && now_unix.saturating_sub(info.last_heartbeat) <= FOLLOWER_FRESH_SECS
+        })
+        .min_by_key(|(id, _)| **id)
+        .map(|(id, info)| (*id, info.clone()));
+
+    if let Some((target_id, target_node)) = candidate {
+        let trigger_url = format!(
+            "http://{addr}:{port}/api/v1/internal/raft/trigger-elect",
+            addr = target_node.advertise_addr,
+            port = target_node.api_port,
+        );
+        info!(
+            target_node_id = target_id,
+            url = %trigger_url,
+            "leader self-upgrade: asking follower to campaign before we step down"
+        );
+        match client
+            .post(&trigger_url)
+            .header(INTERNAL_AUTH_HEADER, &internal_token)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                // Poll our own raft metrics until leadership flips
+                // (or the timeout expires).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut handed_off = false;
+                while std::time::Instant::now() < deadline {
+                    let m = raft.metrics();
+                    if m.current_leader.is_some_and(|l| l != local_node_id) {
+                        handed_off = true;
+                        info!(
+                            new_leader = ?m.current_leader,
+                            "leader self-upgrade: leadership handed off, proceeding to local self-update"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                if !handed_off {
+                    info!(
+                        "leader self-upgrade: trigger-elect didn't flip leadership in 5s; proceeding anyway (cluster will elect after we exit)"
+                    );
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                info!(
+                    target_node_id = target_id,
+                    status = %status,
+                    "leader self-upgrade: trigger-elect returned non-success; proceeding with self-update anyway"
+                );
+            }
+            Err(e) => {
+                info!(
+                    target_node_id = target_id,
+                    error = %e,
+                    "leader self-upgrade: trigger-elect call failed; proceeding with self-update anyway"
+                );
+            }
+        }
+    } else {
+        info!(
+            "leader self-upgrade: no healthy follower available to hand off to; proceeding with self-update (cluster will elect after we exit)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Step 2: schedule the local self-update over loopback.
+    // -----------------------------------------------------------------
 
     let resp = client
         .post(&local_url)

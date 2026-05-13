@@ -153,8 +153,8 @@ use crate::handlers::images::{
     __path_remove_image_handler, __path_tag_image_handler,
 };
 use crate::handlers::internal::{
-    __path_get_replicas_internal, __path_internal_upgrade_start, __path_internal_upgrade_status,
-    __path_scale_service_internal,
+    __path_get_replicas_internal, __path_internal_raft_trigger_elect,
+    __path_internal_upgrade_start, __path_internal_upgrade_status, __path_scale_service_internal,
 };
 use crate::handlers::jobs::{
     __path_cancel_execution, __path_get_execution_status, __path_list_job_executions,
@@ -336,6 +336,7 @@ impl Modify for SecurityAddon {
         get_replicas_internal,
         internal_upgrade_start,
         internal_upgrade_status,
+        internal_raft_trigger_elect,
         // Secrets
         create_secret,
         rotate_secret,

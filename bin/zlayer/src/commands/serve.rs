@@ -1616,6 +1616,14 @@ pub(crate) async fn serve_with_external_shutdown(
         internal_token.clone(),
         overlay_interface,
     );
+    // Attach the Raft handle when clustered so the pre-self-upgrade
+    // `trigger-elect` endpoint can nudge this node into campaigning when
+    // the leader steps down for a binary swap.
+    let internal_state = if let Some(raft) = _raft.as_ref() {
+        internal_state.with_raft(raft.clone())
+    } else {
+        internal_state
+    };
     let internal_routes = zlayer_api::build_internal_routes(internal_state);
     let base_router = base_router.nest("/api/v1/internal", internal_routes);
 
