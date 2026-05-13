@@ -98,6 +98,16 @@ hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
+# Self-update: archive extraction and integrity checking. `zip` is Windows-only
+# (see `[target.'cfg(target_os = "windows")'.dependencies]` below).
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+# Temp directory for staged downloads during `zlayer self-update`. Already
+# present in `[dev-dependencies]` for tests; promoted to a regular dep so the
+# `commands::self_update` runtime path can use it without #[cfg(test)] gating.
+tempfile = "3"
+
 # HTTP-over-Unix-socket client (daemon_client)
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -138,6 +148,8 @@ sd-notify = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 zlayer-wsl = { workspace = true, optional = true }
+# Self-update archive extraction on Windows (zlayer-*-windows-amd64.zip).
+zip = { workspace = true }
 # Optional on Windows: pulled in by the `hcs-runtime` feature when the caller
 # wants the full native Windows runtime embedded in the CLI. The thin-CLI
 # build (`--no-default-features --features wsl`) leaves this off.

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [0.11.24] - 2026-05-12
 
 ### Added
+- `zlayer self-update` subcommand. Downloads a newer zlayer release
+  tarball from GitHub (`BlackLeafDigital/ZLayer`), optionally verifies
+  a SHA-256 sidecar when present (skips silently when absent so
+  current releases keep working), extracts the binary, and
+  atomic-renames it onto the running executable. Linux/macOS support
+  the in-place rename because the kernel keeps the old text segment
+  alive via the open fd. Windows falls back to writing
+  `zlayer.exe.new` adjacent to the current exe with a clear restart
+  message. Flags: `--version vX.Y.Z` to target a specific tag,
+  `--yes` to skip the prompt, `--restart` to re-exec the new binary
+  after install, `--repo owner/name` (hidden) for test/mirror
+  overrides.
 - `cluster_scaling` and `cluster_upgrade` suites in
   `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. Both suites
   stand up a real 3-node loopback cluster via

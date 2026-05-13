@@ -945,6 +945,33 @@ pub(crate) enum Commands {
     #[command(subcommand, verbatim_doc_comment, display_order = 45)]
     Docker(Box<zlayer_docker::DockerCommands>),
 
+    // ── Maintenance ───────────────────────────────────────────────────
+    /// Replace the current zlayer binary with a newer release.
+    ///
+    /// Downloads the requested release tarball from GitHub, optionally
+    /// verifies its SHA-256, and atomically swaps the running binary on
+    /// disk. On Unix the swap is in-place (rename onto a running binary
+    /// is safe); Windows requires a manual restart after the new file is
+    /// staged next to the current one.
+    #[command(name = "self-update", display_order = 49)]
+    SelfUpdate {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Re-exec the new binary in place of the current process after install.
+        #[arg(long)]
+        restart: bool,
+
+        /// GitHub repo (owner/name). Override for testing.
+        #[arg(long, default_value = "BlackLeafDigital/ZLayer", hide = true)]
+        repo: String,
+    },
+
     // ── Interface ─────────────────────────────────────────────────────
     /// Launch interactive TUI
     #[command(display_order = 50)]

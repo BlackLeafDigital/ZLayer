@@ -1240,6 +1240,12 @@ async fn run(
                 commands::permission::revoke(id.clone()).await
             }
         },
+        Commands::SelfUpdate {
+            version,
+            yes,
+            restart,
+            repo,
+        } => commands::self_update::run(version.clone(), *yes, *restart, repo).await,
         Commands::Audit(audit_cmd) => match audit_cmd {
             cli::AuditCommands::Tail {
                 user,

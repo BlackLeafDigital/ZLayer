@@ -34,6 +34,7 @@ pub mod ps;
 pub mod resolver;
 pub mod run;
 pub mod secret;
+pub mod self_update;
 pub mod serve;
 pub mod sync_cmd;
 pub mod system;
