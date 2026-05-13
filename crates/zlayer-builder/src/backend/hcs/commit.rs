@@ -37,7 +37,6 @@ use zlayer_registry::oci_export::{OciDescriptor, OciIndex, OciLayout, OciManifes
 use crate::dockerfile::{HealthcheckInstruction, ShellOrExec};
 
 use super::scratch::BaseLayerBlob;
-use zlayer_paths::ZLayerDirs;
 
 /// OCI image-config media type. Public so tests and the backend module can
 /// reference the exact string without retyping it.
@@ -562,6 +561,7 @@ fn write_blob(blobs_dir: &Path, digest: &str, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     fn demo_config() -> ImageConfigBuilder {
         let mut b = ImageConfigBuilder::new();

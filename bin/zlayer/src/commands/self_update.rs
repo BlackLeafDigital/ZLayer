@@ -396,7 +396,7 @@ fn extract_zip_binary(archive: &Path, tmp_dir: &Path) -> Result<PathBuf> {
             .with_context(|| format!("Failed to read zip entry {i}"))?;
         let name = entry
             .enclosed_name()
-            .and_then(|p| p.file_name().map(|s| s.to_owned()))
+            .and_then(|p| p.file_name().map(std::ffi::OsStr::to_owned))
             .and_then(|s| s.into_string().ok())
             .unwrap_or_default();
         if name.eq_ignore_ascii_case("zlayer.exe") {

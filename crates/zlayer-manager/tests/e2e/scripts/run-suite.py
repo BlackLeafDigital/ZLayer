@@ -184,7 +184,7 @@ def resolve_host_socket() -> Optional[Path]:
 # Phases
 # ---------------------------------------------------------------------------
 
-def build_phase(*, throwaway: bool) -> None:
+def build_phase(*, throwaway: bool, with_manager: bool = True) -> None:
     on_path = shutil.which("zlayer") is not None
     if throwaway or not on_path:
         log("Building zlayer (release)")
@@ -194,11 +194,12 @@ def build_phase(*, throwaway: bool) -> None:
         )
     else:
         log(f"Skipping zlayer build (using {shutil.which('zlayer')})")
-    log("Building zlayer-manager (release, cargo-leptos)")
-    subprocess.run(
-        ["cargo", "leptos", "build", "--release"],
-        cwd=REPO_ROOT / "crates" / "zlayer-manager", check=True,
-    )
+    if with_manager:
+        log("Building zlayer-manager (release, cargo-leptos)")
+        subprocess.run(
+            ["cargo", "leptos", "build", "--release"],
+            cwd=REPO_ROOT / "crates" / "zlayer-manager", check=True,
+        )
 
 
 def start_throwaway_daemon(
@@ -605,7 +606,7 @@ def _cleanup_cluster(
 def run_cluster_3node(args: argparse.Namespace) -> int:
     """Stand up a 3-node cluster, assert it forms with a leader + 3 ready."""
     if not args.no_build:
-        build_phase(throwaway=args.throwaway)
+        build_phase(throwaway=args.throwaway, with_manager=False)
 
     zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
     log(f"cluster_3node: using zlayer binary {zlayer_bin}")
@@ -647,7 +648,7 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
     transition (ready -> dead -> ready) per README §385-387.
     """
     if not args.no_build:
-        build_phase(throwaway=args.throwaway)
+        build_phase(throwaway=args.throwaway, with_manager=False)
 
     zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
     log(f"cluster_failover: using zlayer binary {zlayer_bin}")
@@ -980,7 +981,7 @@ def _wait_image_transition(
 def run_cluster_scaling(args: argparse.Namespace) -> int:
     """3-node cluster, deploy nginx-v1 at 1→3→1 replicas via spec swaps."""
     if not args.no_build:
-        build_phase(throwaway=args.throwaway)
+        build_phase(throwaway=args.throwaway, with_manager=False)
 
     zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
     log(f"cluster_scaling: using zlayer binary {zlayer_bin}")
@@ -1093,7 +1094,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
 def run_cluster_upgrade(args: argparse.Namespace) -> int:
     """3-node cluster, rolling image upgrade v1.28 → v1.29."""
     if not args.no_build:
-        build_phase(throwaway=args.throwaway)
+        build_phase(throwaway=args.throwaway, with_manager=False)
 
     zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
     log(f"cluster_upgrade: using zlayer binary {zlayer_bin}")
@@ -1198,7 +1199,7 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
     leader-redirect, orchestrator follower-walk + error-recording, and
     that the cluster survives the failed rollout."""
     if not args.no_build:
-        build_phase(throwaway=args.throwaway)
+        build_phase(throwaway=args.throwaway, with_manager=False)
 
     zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
     log(f"cluster_node_upgrade: using zlayer binary {zlayer_bin}")

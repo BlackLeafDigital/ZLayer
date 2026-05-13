@@ -42,7 +42,6 @@ use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 use zlayer_types::ImageReference;
 
-use zlayer_paths::ZLayerDirs;
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
 
@@ -2487,6 +2486,7 @@ fn rewrite_command_paths(cmd: &str, rootfs_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn test_sanitize_image_name() {

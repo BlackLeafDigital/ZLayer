@@ -255,7 +255,6 @@ pub async fn try_pull_zlayer_image(
     image_dir: &Path,
     rootfs_dir: &Path,
 ) -> Result<bool> {
-    use zlayer_paths::ZLayerDirs;
     use zlayer_registry::{BlobCache, ImagePuller, LayerUnpacker};
 
     info!("Attempting to pull ZLayer image: {}", image_ref);
