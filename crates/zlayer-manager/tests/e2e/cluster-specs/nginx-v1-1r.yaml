@@ -1,0 +1,21 @@
+# Cluster e2e fixture — v1 image, 1 replica. Used by cluster_scaling suite.
+
+version: v1
+deployment: e2e-cluster-app
+
+services:
+  web:
+    rtype: service
+    image:
+      name: nginx:1.28-alpine
+      pull_policy: if_not_present
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 1

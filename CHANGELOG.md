@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 ## [0.11.24] - 2026-05-12
 
 ### Added
+- `cluster_scaling` and `cluster_upgrade` suites in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. Both suites
+  stand up a real 3-node loopback cluster via
+  `_bootstrap_3node_cluster` and exercise
+  `zlayer deploy`/`zlayer ps --containers --format json` against the
+  leader. `cluster_scaling` deploys a single nginx replica, scales to
+  3 (asserting replicas land on at least 2 distinct nodes), then
+  scales back to 1. `cluster_upgrade` deploys
+  `nginx:1.28-alpine` × 3, redeploys with `nginx:1.29-alpine`, and
+  asserts every running replica's image field transitions to the v2
+  tag within 180s.
+- Three deployment fixtures under
+  `crates/zlayer-manager/tests/e2e/cluster-specs/`
+  (`nginx-v1-1r.yaml`, `nginx-v1-3r.yaml`, `nginx-v2-3r.yaml`) used
+  by the two new suites. All three share `deployment: e2e-cluster-app`
+  so re-applying triggers in-place updates rather than fresh
+  deployments.
+- `raft-e2e` / `raft-e2e:<suite>` and `scheduler-unit` dropdown
+  options on both `.forgejo/workflows/e2e.yml` and
+  `.github/workflows/e2e.yml`. New `raft-e2e-tests` job dispatches
+  the four cluster suites (`cluster_3node`, `cluster_failover`,
+  `cluster_scaling`, `cluster_upgrade`) via the existing
+  `run-suite.py` harness. New `scheduler-unit-tests` job runs
+  `cargo nextest run -p zlayer-scheduler --features test-skip-http`
+  — gives GitHub parity with Forgejo's `ci.yaml` raft coverage.
 - Raft RPC transport upgraded to HTTP/2 prior-knowledge (h2c). Both
   `RaftHttpClient` reqwest clients now call `.http2_prior_knowledge()`
   with a 10s keepalive ping interval, and the server-side bind in

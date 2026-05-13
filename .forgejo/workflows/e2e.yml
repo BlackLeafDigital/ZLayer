@@ -27,6 +27,12 @@ on:
           - manager-intellitester:nav-smoke.test.yaml
           - manager-intellitester:stale-session-setup.test.yaml
           - manager-intellitester:stale-session-verify.test.yaml
+          - raft-e2e
+          - raft-e2e:cluster_3node
+          - raft-e2e:cluster_failover
+          - raft-e2e:cluster_scaling
+          - raft-e2e:cluster_upgrade
+          - scheduler-unit
           - macos-sandbox
 
 concurrency:
@@ -496,6 +502,178 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
+  # E2E Tests (Raft / Cluster)
+  #
+  # Builds zlayer once, then runs one or more cluster suites via the
+  # throwaway-daemon harness (run-suite.py). Use the `test` input to
+  # pick a single suite (e.g. `raft-e2e:cluster_failover`) or pass the
+  # bare `raft-e2e` value (or leave empty) to run all four suites
+  # sequentially.
+  # ===========================================
+  raft-e2e-tests:
+    name: E2E Tests (Raft)
+    runs-on: ubuntu-latest
+    if: |
+      inputs.test == '' ||
+      inputs.test == 'raft-e2e' ||
+      startsWith(inputs.test, 'raft-e2e:')
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || github.sha }}
+          step: e2e-raft
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cargo cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Setup uv
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Build zlayer
+        if: steps.check.outputs.completed != 'true'
+        run: cargo build --release -p zlayer
+
+      - name: Run raft cluster suite(s)
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          YAML="${{ inputs.test }}"
+          case "$YAML" in
+            raft-e2e:*) SUITE="${YAML#raft-e2e:}" ;;
+            *) SUITE="cluster_3node" ;;
+          esac
+          # For the bare `raft-e2e` option (or an empty test input meaning
+          # "run everything"), iterate all four cluster suites. Otherwise
+          # run the single suite resolved above.
+          if [ "$YAML" = "raft-e2e" ] || [ -z "$YAML" ]; then
+            for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade; do
+              echo "=== Running suite: $s ==="
+              uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"
+            done
+          else
+            uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$SUITE"
+          fi
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: info
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || github.sha }}
+          step: e2e-raft
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # Scheduler Unit Tests
+  #
+  # Pure-Rust unit-test coverage for the zlayer-scheduler crate using
+  # the `test-skip-http` feature to bypass real HTTP transports.
+  # ===========================================
+  scheduler-unit-tests:
+    name: Unit Tests (Scheduler)
+    runs-on: ubuntu-latest
+    if: inputs.test == '' || inputs.test == 'scheduler-unit'
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || github.sha }}
+          step: scheduler-unit
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cargo cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Install cargo-nextest
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/taiki-e/install-action@nextest
+
+      - name: Run scheduler unit tests
+        if: steps.check.outputs.completed != 'true'
+        run: cargo nextest run -p zlayer-scheduler --features test-skip-http
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: warn
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || github.sha }}
+          step: scheduler-unit
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
   # E2E Tests (macOS Sandbox)
   # ===========================================
   macos-sandbox-e2e:
@@ -588,7 +766,7 @@ jobs:
   dispatch-build:
     name: Dispatch Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, macos-sandbox-e2e]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, raft-e2e-tests, scheduler-unit-tests, macos-sandbox-e2e]
     # Release dispatch requires `inputs.test == ''` so partial e2e runs
     # (e.g. `test: manager-intellitester`) never short-circuit into a
     # build — the other suites would be skipped, not passed.

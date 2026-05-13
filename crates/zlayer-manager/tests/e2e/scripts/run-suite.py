@@ -783,6 +783,401 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Cluster scaling / upgrade suites
+# ---------------------------------------------------------------------------
+#
+# These suites build on `_bootstrap_3node_cluster` and exercise the
+# deploy → scale and rolling-upgrade paths. The spec YAMLs live under
+# `crates/zlayer-manager/tests/e2e/cluster-specs/`.
+
+CLUSTER_SPECS_DIR = (
+    REPO_ROOT / "crates" / "zlayer-manager" / "tests" / "e2e" / "cluster-specs"
+)
+CLUSTER_APP_DEPLOYMENT = "e2e-cluster-app"
+
+# `ps --containers` field names vary across CLI versions; probe in order.
+_IMAGE_FIELDS = ("image", "image_name", "image_ref")
+_NODE_FIELDS = ("node_id", "node", "host_node", "placed_on", "host")
+
+
+def _container_status(entry: dict) -> str:
+    """Best-effort extraction of the running-state for a `ps` entry."""
+    for field in ("status", "state", "phase"):
+        val = entry.get(field)
+        if val:
+            return str(val)
+    return ""
+
+
+def _container_image(entry: dict) -> str:
+    for field in _IMAGE_FIELDS:
+        val = entry.get(field)
+        if val:
+            return str(val)
+    return ""
+
+
+def _container_node(entry: dict) -> str:
+    for field in _NODE_FIELDS:
+        val = entry.get(field)
+        if val:
+            return str(val)
+    return ""
+
+
+def _count_running_containers(
+    zlayer_bin: Path, data_dir: Path, deployment: str,
+    expected_count: int, timeout_s: int = 120,
+) -> list[dict]:
+    """Poll `zlayer ps --containers` until `expected_count` are running.
+
+    Returns the list of running entries. Raises RuntimeError on timeout.
+    Transient `CalledProcessError`s (cluster still reconciling) are
+    swallowed and retried.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_entries: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(data_dir),
+                    "ps",
+                    "--deployment", deployment,
+                    "--containers",
+                    "--format", "json",
+                ],
+                capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_err = (
+                f"exit={exc.returncode} stderr={(exc.stderr or '').strip()!r}"
+            )
+            if exc.stderr:
+                sys.stderr.write(
+                    f"--- ps --containers stderr (retrying) ---\n{exc.stderr}\n"
+                )
+            time.sleep(2)
+            continue
+
+        raw = (result.stdout or "").strip()
+        if not raw:
+            last_err = "empty stdout"
+            time.sleep(2)
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_err = f"json decode error: {e!r}; stdout={raw!r}"
+            time.sleep(2)
+            continue
+
+        if isinstance(parsed, dict) and "containers" in parsed:
+            entries = list(parsed["containers"])
+        elif isinstance(parsed, list):
+            entries = parsed
+        else:
+            last_err = f"unexpected ps payload shape: {parsed!r}"
+            time.sleep(2)
+            continue
+
+        running = [
+            e for e in entries
+            if "running" in _container_status(e).lower()
+        ]
+        last_entries = running
+        if len(running) == expected_count:
+            return running
+        time.sleep(2)
+
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_running={last_entries!r}"
+    )
+    raise RuntimeError(
+        f"deployment {deployment} never reached {expected_count} running "
+        f"containers within {timeout_s}s{detail}"
+    )
+
+
+def _wait_image_transition(
+    zlayer_bin: Path, data_dir: Path, deployment: str,
+    expected_image: str, expected_count: int, timeout_s: int = 180,
+) -> list[dict]:
+    """Poll until all `expected_count` running containers report
+    `image == expected_image`. Returns the converged list."""
+    deadline = time.monotonic() + timeout_s
+    last_state: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(data_dir),
+                    "ps",
+                    "--deployment", deployment,
+                    "--containers",
+                    "--format", "json",
+                ],
+                capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_err = (
+                f"exit={exc.returncode} stderr={(exc.stderr or '').strip()!r}"
+            )
+            if exc.stderr:
+                sys.stderr.write(
+                    f"--- ps --containers stderr (retrying) ---\n{exc.stderr}\n"
+                )
+            time.sleep(2)
+            continue
+
+        raw = (result.stdout or "").strip()
+        if not raw:
+            last_err = "empty stdout"
+            time.sleep(2)
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_err = f"json decode error: {e!r}; stdout={raw!r}"
+            time.sleep(2)
+            continue
+
+        if isinstance(parsed, dict) and "containers" in parsed:
+            entries = list(parsed["containers"])
+        elif isinstance(parsed, list):
+            entries = parsed
+        else:
+            last_err = f"unexpected ps payload shape: {parsed!r}"
+            time.sleep(2)
+            continue
+
+        running = [
+            e for e in entries
+            if "running" in _container_status(e).lower()
+        ]
+        last_state = running
+        if len(running) == expected_count and all(
+            _container_image(e) == expected_image for e in running
+        ):
+            return running
+        time.sleep(2)
+
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_running={[(_container_image(e), _container_status(e)) for e in last_state]!r}"
+    )
+    raise RuntimeError(
+        f"deployment {deployment} never converged to {expected_count} "
+        f"containers on image {expected_image} within {timeout_s}s{detail}"
+    )
+
+
+def run_cluster_scaling(args: argparse.Namespace) -> int:
+    """3-node cluster, deploy nginx-v1 at 1→3→1 replicas via spec swaps."""
+    if not args.no_build:
+        build_phase(throwaway=args.throwaway)
+
+    zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
+    log(f"cluster_scaling: using zlayer binary {zlayer_bin}")
+
+    root_dir = THROWAWAY_ROOT / "cluster_scaling"
+    shutil.rmtree(root_dir, ignore_errors=True)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    try:
+        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+            zlayer_bin, root_dir,
+        )
+        log("cluster_scaling: waiting for cluster to converge")
+        _wait_for_ready_cluster(
+            api_ports[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        leader_data_dir = data_dirs[0]
+        spec_1r = CLUSTER_SPECS_DIR / "nginx-v1-1r.yaml"
+        spec_3r = CLUSTER_SPECS_DIR / "nginx-v1-3r.yaml"
+
+        # --- 1 replica ----------------------------------------------------
+        log(f"cluster_scaling: deploying {spec_1r.name} (1 replica)")
+        try:
+            subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(leader_data_dir),
+                    "deploy", str(spec_1r),
+                ],
+                check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stderr:
+                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+            raise
+        log("cluster_scaling: waiting for 1 running container")
+        _count_running_containers(
+            zlayer_bin, leader_data_dir,
+            CLUSTER_APP_DEPLOYMENT, expected_count=1,
+        )
+        log("cluster_scaling: 1 replica running (OK)")
+
+        # --- 3 replicas ---------------------------------------------------
+        log(f"cluster_scaling: deploying {spec_3r.name} (3 replicas)")
+        try:
+            subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(leader_data_dir),
+                    "deploy", str(spec_3r),
+                ],
+                check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stderr:
+                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+            raise
+        log("cluster_scaling: waiting for 3 running containers")
+        running = _count_running_containers(
+            zlayer_bin, leader_data_dir,
+            CLUSTER_APP_DEPLOYMENT, expected_count=3,
+        )
+
+        node_ids = [_container_node(e) for e in running]
+        distinct = {nid for nid in node_ids if nid}
+        log(f"cluster_scaling: replica node distribution = {node_ids!r}")
+        if len(distinct) < 2:
+            raise RuntimeError(
+                f"expected replicas spread across at least 2 nodes; "
+                f"got distinct={distinct!r} from {node_ids!r}"
+            )
+        log(
+            f"cluster_scaling: replicas spread across {len(distinct)} nodes "
+            f"(OK)"
+        )
+
+        # --- back to 1 replica -------------------------------------------
+        log(f"cluster_scaling: redeploying {spec_1r.name} (scale-down 3→1)")
+        try:
+            subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(leader_data_dir),
+                    "deploy", str(spec_1r),
+                ],
+                check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stderr:
+                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+            raise
+        log("cluster_scaling: waiting for 1 running container (scale-down)")
+        _count_running_containers(
+            zlayer_bin, leader_data_dir,
+            CLUSTER_APP_DEPLOYMENT, expected_count=1,
+        )
+
+        log("cluster_scaling: PASS — 1 → 3 → 1 replicas across cluster")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"cluster_scaling: FAIL — {e!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        _cleanup_cluster(procs, root_dir)
+
+
+def run_cluster_upgrade(args: argparse.Namespace) -> int:
+    """3-node cluster, rolling image upgrade v1.28 → v1.29."""
+    if not args.no_build:
+        build_phase(throwaway=args.throwaway)
+
+    zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
+    log(f"cluster_upgrade: using zlayer binary {zlayer_bin}")
+
+    root_dir = THROWAWAY_ROOT / "cluster_upgrade"
+    shutil.rmtree(root_dir, ignore_errors=True)
+    root_dir.mkdir(parents=True, exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    try:
+        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+            zlayer_bin, root_dir,
+        )
+        log("cluster_upgrade: waiting for cluster to converge")
+        _wait_for_ready_cluster(
+            api_ports[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        leader_data_dir = data_dirs[0]
+        spec_v1 = CLUSTER_SPECS_DIR / "nginx-v1-3r.yaml"
+        spec_v2 = CLUSTER_SPECS_DIR / "nginx-v2-3r.yaml"
+
+        # --- v1 (nginx:1.28-alpine) --------------------------------------
+        log(f"cluster_upgrade: deploying {spec_v1.name} (v1, 3 replicas)")
+        try:
+            subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(leader_data_dir),
+                    "deploy", str(spec_v1),
+                ],
+                check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stderr:
+                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+            raise
+        log("cluster_upgrade: waiting for 3 running v1 containers")
+        v1_running = _count_running_containers(
+            zlayer_bin, leader_data_dir,
+            CLUSTER_APP_DEPLOYMENT, expected_count=3,
+        )
+        initial_images = [_container_image(e) for e in v1_running]
+        log(f"cluster_upgrade: initial images = {initial_images!r}")
+
+        # --- v2 (nginx:1.29-alpine), poll for image-field transition -----
+        log(f"cluster_upgrade: deploying {spec_v2.name} (v2 rolling upgrade)")
+        try:
+            subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(leader_data_dir),
+                    "deploy", str(spec_v2),
+                ],
+                check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stderr:
+                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+            raise
+
+        expected_image = "nginx:1.29-alpine"
+        log(
+            f"cluster_upgrade: waiting for 3 containers on {expected_image}"
+        )
+        _wait_image_transition(
+            zlayer_bin, leader_data_dir,
+            CLUSTER_APP_DEPLOYMENT, expected_image=expected_image,
+            expected_count=3,
+        )
+
+        log(
+            "cluster_upgrade: PASS — 3 replicas migrated v1.28 → v1.29"
+        )
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"cluster_upgrade: FAIL — {e!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        _cleanup_cluster(procs, root_dir)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -808,11 +1203,19 @@ def parse_args() -> argparse.Namespace:
             "  manager_auth      (default) login + nav + stale-session\n"
             "  cluster_3node     boot a local 3-node cluster + assert quorum\n"
             "  cluster_failover  3-node cluster, kill worker, assert recovery\n"
+            "  cluster_scaling   3-node cluster, deploy 1→3→1 replicas\n"
+            "  cluster_upgrade   3-node cluster, image v1→v2 rolling upgrade\n"
         ),
     )
     parser.add_argument(
         "suite", nargs="?",
-        choices=["manager_auth", "cluster_3node", "cluster_failover"],
+        choices=[
+            "manager_auth",
+            "cluster_3node",
+            "cluster_failover",
+            "cluster_scaling",
+            "cluster_upgrade",
+        ],
         default=None,
         help=(
             "Which suite to run. Defaults to `manager_auth`. May also be "
@@ -821,7 +1224,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--suite", dest="suite_flag",
-        choices=["manager_auth", "cluster_3node", "cluster_failover"],
+        choices=[
+            "manager_auth",
+            "cluster_3node",
+            "cluster_failover",
+            "cluster_scaling",
+            "cluster_upgrade",
+        ],
         default=None,
         help="Alternative to the positional suite argument.",
     )
@@ -870,6 +1279,10 @@ def main() -> int:
         return run_cluster_3node(args)
     if args.suite == "cluster_failover":
         return run_cluster_failover(args)
+    if args.suite == "cluster_scaling":
+        return run_cluster_scaling(args)
+    if args.suite == "cluster_upgrade":
+        return run_cluster_upgrade(args)
 
     # Default suite (`manager_auth`) falls through into the manager harness.
 
