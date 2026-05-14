@@ -168,11 +168,16 @@ impl ZLayerDirs {
                     return "/var/run/zlayer.sock".to_string();
                 }
             }
-            data_dir
+            let natural = data_dir
                 .join("run")
                 .join("zlayer.sock")
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
+            if natural.len() <= SUN_PATH_MAX {
+                natural
+            } else {
+                socket_safe_fallback(data_dir, "daemon")
+            }
         }
     }
 
@@ -192,27 +197,43 @@ impl ZLayerDirs {
         {
             #[cfg(target_os = "macos")]
             {
-                Self::default_data_dir()
+                let path = Self::default_data_dir()
                     .join("run")
                     .join("docker.sock")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned();
+                if path.len() <= SUN_PATH_MAX {
+                    path
+                } else {
+                    socket_safe_fallback(&Self::default_data_dir(), "docker")
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
                 if is_root() {
                     "/var/run/zlayer/docker.sock".to_string()
                 } else if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-                    let mut p = PathBuf::from(xdg);
+                    let xdg_path = PathBuf::from(&xdg);
+                    let mut p = xdg_path.clone();
                     p.push("zlayer");
                     p.push("docker.sock");
-                    p.to_string_lossy().into_owned()
+                    let path = p.to_string_lossy().into_owned();
+                    if path.len() <= SUN_PATH_MAX {
+                        path
+                    } else {
+                        socket_safe_fallback(&xdg_path, "docker")
+                    }
                 } else {
-                    Self::default_data_dir()
+                    let path = Self::default_data_dir()
                         .join("run")
                         .join("docker.sock")
                         .to_string_lossy()
-                        .into_owned()
+                        .into_owned();
+                    if path.len() <= SUN_PATH_MAX {
+                        path
+                    } else {
+                        socket_safe_fallback(&Self::default_data_dir(), "docker")
+                    }
                 }
             }
         }
@@ -422,17 +443,22 @@ impl ZLayerDirs {
     /// since the FHS path doesn't apply.
     pub fn wireguard(&self) -> PathBuf {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            // No FHS convention; always derive.
-            self.data_dir.join("run").join("wireguard")
-        }
+        let natural = self.data_dir.join("run").join("wireguard");
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            if self.data_dir == Self::default_data_dir() {
-                PathBuf::from("/var/run/wireguard")
-            } else {
-                self.data_dir.join("run").join("wireguard")
-            }
+        let natural = if self.data_dir == Self::default_data_dir() {
+            PathBuf::from("/var/run/wireguard")
+        } else {
+            self.data_dir.join("run").join("wireguard")
+        };
+        // 1 byte separator + IFNAMSIZ (15) + ".sock" (5) = 21
+        const WG_DIR_MAX: usize = SUN_PATH_MAX - 21;
+        if natural.to_string_lossy().len() <= WG_DIR_MAX {
+            natural
+        } else {
+            PathBuf::from(format!(
+                "/tmp/zlayer-wg-{:016x}",
+                hash_for_socket(&self.data_dir, "wg")
+            ))
         }
     }
 }
@@ -470,6 +496,47 @@ pub(crate) fn platform_default_data_dir() -> PathBuf {
             home_dir_or_fallback().join(".zlayer")
         }
     }
+}
+
+/// Max usable bytes in `sockaddr_un.sun_path` across our supported Unix
+/// targets. Linux's `sun_path` is `char[108]`; macOS's is `char[104]`.
+/// Pick the lower bound and reserve one byte for the trailing NUL so the
+/// check is trivial on both platforms.
+const SUN_PATH_MAX: usize = 103;
+
+/// FNV-1a hash of `data_dir`'s bytes plus a label. Dependency-free and
+/// deterministic across processes (unlike `DefaultHasher` which is
+/// keyed per-process). The daemon and any CLI client passing the same
+/// `data_dir` resolve to byte-identical paths.
+fn hash_for_socket(data_dir: &Path, label: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data_dir.to_string_lossy().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for b in label.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Short, deterministic UDS path for callers whose natural
+/// `{data_dir}/run/...` path would overflow `sun_path`.
+///
+/// **Scope guardrail:** `/tmp` is acceptable here ONLY because a UDS
+/// endpoint file is just an inode (kernel metadata, no payload). Daemon
+/// state — databases, logs, blob caches, image rootfs, anything the
+/// daemon reads back later — must NEVER use `/tmp`, even as a fallback.
+/// Most modern Linux distros mount `/tmp` as tmpfs (RAM-backed) and
+/// silently landing state there courts OOM under load. Sockets are the
+/// narrow exception because the file itself stores ~256 bytes of inode
+/// metadata.
+fn socket_safe_fallback(data_dir: &Path, label: &str) -> String {
+    format!(
+        "/tmp/zlayer-{label}-{:016x}.sock",
+        hash_for_socket(data_dir, label)
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -837,5 +904,52 @@ mod tests {
         let kept = f.path().to_path_buf();
         drop(f);
         assert!(!kept.exists());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_for_falls_back_when_path_too_long() {
+        let deep = PathBuf::from(
+            "/var/lib/forgejo-runner/workdir/9dbc274201705d7d/hostexecutor/target/zlayer-e2e/cluster_3node/node1/data",
+        );
+        let result = ZLayerDirs::default_socket_path_for(&deep);
+        assert!(
+            result.len() <= SUN_PATH_MAX,
+            "fallback path overflows sun_path: len={} path={}",
+            result.len(),
+            result,
+        );
+        // Determinism.
+        assert_eq!(result, ZLayerDirs::default_socket_path_for(&deep));
+        // Distinct from another data_dir.
+        let other = deep.parent().unwrap().to_path_buf();
+        assert_ne!(result, ZLayerDirs::default_socket_path_for(&other));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_for_keeps_natural_path_when_short() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let short = tmp.path().to_path_buf();
+        assert!(short.to_string_lossy().len() < 80);
+        let result = ZLayerDirs::default_socket_path_for(&short);
+        assert!(result.ends_with("/run/zlayer.sock"));
+        assert!(result.starts_with(&*short.to_string_lossy()));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn wireguard_dir_falls_back_when_path_too_long() {
+        let deep = PathBuf::from(
+            "/var/lib/forgejo-runner/workdir/9dbc274201705d7d/hostexecutor/target/zlayer-e2e/cluster_3node/node1/data",
+        );
+        let dirs = ZLayerDirs::new(&deep);
+        let wg = dirs.wireguard();
+        // 21 = "/" + IFNAMSIZ(15) + ".sock"(5)
+        assert!(
+            wg.to_string_lossy().len() + 21 <= SUN_PATH_MAX,
+            "wireguard dir + ifname overflows: dir={}",
+            wg.display(),
+        );
     }
 }
