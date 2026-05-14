@@ -60,9 +60,12 @@ pub struct YoukiConfig {
     pub deployment_name: Option<String>,
 }
 
-impl Default for YoukiConfig {
-    fn default() -> Self {
-        let dirs = zlayer_paths::ZLayerDirs::system_default();
+impl YoukiConfig {
+    /// Build a `YoukiConfig` whose subdirectories are scoped to the given
+    /// data directory, with the existing per-directory `ZLAYER_*_DIR` env
+    /// var overrides honored as escape hatches.
+    pub fn from_data_dir(data_dir: &std::path::Path) -> Self {
+        let dirs = zlayer_paths::ZLayerDirs::new(data_dir);
         Self {
             state_dir: std::env::var("ZLAYER_STATE_DIR")
                 .map_or_else(|_| dirs.containers(), PathBuf::from),
@@ -80,6 +83,12 @@ impl Default for YoukiConfig {
             log_base_dir: None,
             deployment_name: None,
         }
+    }
+}
+
+impl Default for YoukiConfig {
+    fn default() -> Self {
+        Self::from_data_dir(&zlayer_paths::ZLayerDirs::default_data_dir())
     }
 }
 
@@ -4187,5 +4196,16 @@ mod tests {
             matches!(err, AgentError::InvalidSpec(_)),
             "expected InvalidSpec, got {err:?}"
         );
+    }
+
+    #[test]
+    fn from_data_dir_scopes_all_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = YoukiConfig::from_data_dir(tmp.path());
+        assert!(cfg.cache_dir.starts_with(tmp.path()));
+        assert!(cfg.state_dir.starts_with(tmp.path()));
+        assert!(cfg.rootfs_dir.starts_with(tmp.path()));
+        assert!(cfg.bundle_dir.starts_with(tmp.path()));
+        assert!(cfg.volume_dir.starts_with(tmp.path()));
     }
 }

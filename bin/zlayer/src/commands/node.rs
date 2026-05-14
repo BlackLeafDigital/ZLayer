@@ -646,6 +646,7 @@ pub(crate) async fn handle_node_init(
         node_id: raft_node_id,
         address: format!("{advertise_addr}:{raft_port}"),
         raft_port,
+        data_dir: data_dir.join("raft"),
         ..Default::default()
     };
 
@@ -866,6 +867,7 @@ pub(crate) async fn handle_node_init(
         node_id: raft_node_id,
         address: format!("{advertise_addr}:{raft_port}"),
         raft_port,
+        data_dir: data_dir.join("raft"),
         ..Default::default()
     };
 

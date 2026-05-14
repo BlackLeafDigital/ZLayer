@@ -37,22 +37,7 @@ impl ZLayerDirs {
                 return PathBuf::from(env_dir);
             }
         }
-        #[cfg(target_os = "macos")]
-        {
-            home_dir_or_fallback().join(".zlayer")
-        }
-        #[cfg(target_os = "windows")]
-        {
-            windows_program_data_root()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            if is_root() {
-                PathBuf::from("/var/lib/zlayer")
-            } else {
-                home_dir_or_fallback().join(".zlayer")
-            }
-        }
+        platform_default_data_dir()
     }
 
     /// Detect the data directory of an existing installation.
@@ -99,7 +84,7 @@ impl ZLayerDirs {
     /// `{data_dir}/run`. This preserves the FHS layout for stock installs while
     /// letting `--data-dir /tmp/foo` get a fully isolated runtime directory.
     pub fn default_run_dir_for(data_dir: &Path) -> PathBuf {
-        let system_default = Self::default_data_dir();
+        let system_default = platform_default_data_dir();
         if data_dir == system_default.as_path() {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -129,7 +114,7 @@ impl ZLayerDirs {
     /// `{data_dir}/logs`. This preserves the FHS layout for stock installs
     /// while letting `--data-dir /tmp/foo` get a fully isolated log directory.
     pub fn default_log_dir_for(data_dir: &Path) -> PathBuf {
-        let system_default = Self::default_data_dir();
+        let system_default = platform_default_data_dir();
         if data_dir == system_default.as_path() {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -168,7 +153,7 @@ impl ZLayerDirs {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let system_default = Self::default_data_dir();
+            let system_default = platform_default_data_dir();
             if data_dir == system_default.as_path() {
                 #[cfg(target_os = "macos")]
                 {
@@ -460,6 +445,33 @@ pub fn default_admin_bearer_path() -> PathBuf {
 
 // -- Internal helpers --------------------------------------------------------
 
+/// Platform-default data directory, ignoring `$ZLAYER_DATA_DIR`.
+///
+/// Mirrors [`ZLayerDirs::default_data_dir`] but skips the env-var override so
+/// `default_run_dir_for` / `default_log_dir_for` / `default_socket_path_for`
+/// can compare a caller-supplied `data_dir` against the platform-hardcoded
+/// default rather than against whatever the env var currently resolves to
+/// (which would make both sides of the comparison identical when the env var
+/// is set, falsely triggering the FHS branch).
+pub(crate) fn platform_default_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir_or_fallback().join(".zlayer")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_program_data_root()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if is_root() {
+            PathBuf::from("/var/lib/zlayer")
+        } else {
+            home_dir_or_fallback().join(".zlayer")
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn home_dir_or_fallback() -> PathBuf {
     // Falls back to the FHS system data dir rather than /tmp because /tmp is
@@ -521,12 +533,12 @@ pub fn is_root() -> bool {
 mod tests {
     use super::*;
 
-    // Windows tests below mutate the `PROGRAMDATA` env var to exercise
-    // platform-default path resolution. Cargo runs tests concurrently,
-    // so readers (`system_default`, `default_admin_bearer_path`) must
-    // serialize against the mutators or they race and observe a mix of
-    // pre- and post-mutation env state.
-    #[cfg(target_os = "windows")]
+    // Tests below mutate environment variables (`PROGRAMDATA` on Windows,
+    // `ZLAYER_DATA_DIR` on Linux/macOS) to exercise platform-default and
+    // env-override path resolution. Cargo runs tests concurrently, so
+    // readers (`system_default`, `default_admin_bearer_path`, the
+    // `default_*_for` helpers) must serialize against the mutators or
+    // they race and observe a mix of pre- and post-mutation env state.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -563,7 +575,6 @@ mod tests {
 
     #[test]
     fn system_default_uses_default_data_dir() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
@@ -580,7 +591,6 @@ mod tests {
 
     #[test]
     fn default_admin_bearer_path_matches_system_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         assert_eq!(
             default_admin_bearer_path(),
@@ -620,7 +630,6 @@ mod tests {
 
     #[test]
     fn default_log_dir_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_log_dir_for(&system_default);
@@ -629,6 +638,7 @@ mod tests {
 
     #[test]
     fn default_log_dir_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_log_dir_for(&custom);
@@ -639,7 +649,6 @@ mod tests {
 
     #[test]
     fn default_run_dir_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_run_dir_for(&system_default);
@@ -648,6 +657,7 @@ mod tests {
 
     #[test]
     fn default_run_dir_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_run_dir_for(&custom);
@@ -657,7 +667,6 @@ mod tests {
 
     #[test]
     fn default_socket_path_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_socket_path_for(&system_default);
@@ -667,6 +676,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn default_socket_path_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_socket_path_for(&custom);
@@ -690,6 +700,48 @@ mod tests {
             ZLayerDirs::default_socket_path_for(&custom),
             "tcp://127.0.0.1:3669"
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_uses_data_subdir_when_env_var_overrides() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("ZLAYER_DATA_DIR");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let custom = tmp.path().to_path_buf();
+        std::env::set_var("ZLAYER_DATA_DIR", &custom);
+
+        let result = ZLayerDirs::default_socket_path();
+        let expected = custom
+            .join("run")
+            .join("zlayer.sock")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(result, expected);
+
+        match prev {
+            Some(v) => std::env::set_var("ZLAYER_DATA_DIR", v),
+            None => std::env::remove_var("ZLAYER_DATA_DIR"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_socket_path_uses_data_subdir_when_env_var_overrides() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        // On Windows the socket is always TCP loopback regardless of
+        // `ZLAYER_DATA_DIR`.
+        let prev = std::env::var_os("ZLAYER_DATA_DIR");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let custom = tmp.path().to_path_buf();
+        std::env::set_var("ZLAYER_DATA_DIR", &custom);
+
+        assert_eq!(ZLayerDirs::default_socket_path(), "tcp://127.0.0.1:3669");
+
+        match prev {
+            Some(v) => std::env::set_var("ZLAYER_DATA_DIR", v),
+            None => std::env::remove_var("ZLAYER_DATA_DIR"),
+        }
     }
 
     #[cfg(target_os = "windows")]

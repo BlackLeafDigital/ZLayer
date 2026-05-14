@@ -511,13 +511,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             use zlayer_agent::YoukiConfig;
             match config.runtime_config.clone() {
                 RuntimeConfig::Auto => {
-                    // Override Auto with an explicitly configured Youki runtime
-                    // so that the log directory settings are propagated.
-                    let youki_cfg = YoukiConfig {
-                        log_base_dir: Some(config.log_dir.clone()),
-                        deployment_name: Some(config.deployment_name.clone()),
-                        ..Default::default()
-                    };
+                    // Override Auto with an explicitly configured Youki runtime so the
+                    // subdirectories (cache_dir, state_dir, etc.) land under the
+                    // daemon's configured data_dir rather than the platform default,
+                    // and the log directory + deployment name are propagated.
+                    let mut youki_cfg = YoukiConfig::from_data_dir(&config.data_dir);
+                    youki_cfg.log_base_dir = Some(config.log_dir.clone());
+                    youki_cfg.deployment_name = Some(config.deployment_name.clone());
                     RuntimeConfig::Youki(youki_cfg)
                 }
                 RuntimeConfig::Youki(mut youki_cfg) => {
@@ -1152,6 +1152,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             raft: RaftConfig {
                 node_id: node_config.raft_node_id,
                 address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
+                data_dir: config.data_dir.join("raft"),
                 ..Default::default()
             },
             ..Default::default()
