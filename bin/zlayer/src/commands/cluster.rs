@@ -103,5 +103,12 @@ pub(crate) async fn handle_cluster(
                 node::handle_cluster_trust_bundle_remove(cluster_domain.clone()).await
             }
         },
+        ClusterCommands::MigrateJwtToEddsa { grace } => {
+            node::handle_cluster_migrate_jwt_to_eddsa(*grace).await
+        }
+        ClusterCommands::DecommissionHs256 { vacuum_secret } => {
+            node::handle_cluster_decommission_hs256(*vacuum_secret).await
+        }
+        ClusterCommands::JwtStatus {} => node::handle_cluster_jwt_status().await,
     }
 }

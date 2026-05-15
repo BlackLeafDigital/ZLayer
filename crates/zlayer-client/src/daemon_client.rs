@@ -4993,6 +4993,43 @@ impl DaemonClient {
     }
 
     // ------------------------------------------------------------------
+    // Cluster JWT algorithm policy (Wave 11C+D)
+    // ------------------------------------------------------------------
+
+    /// Set the cluster JWT algorithm policy.
+    pub async fn cluster_set_jwt_algorithm(
+        &self,
+        algorithm: zlayer_types::api::cluster::JwtAlgorithm,
+    ) -> Result<()> {
+        let req = zlayer_types::api::cluster::SetJwtAlgorithmRequest { algorithm };
+        let body =
+            serde_json::to_string(&req).context("Failed to serialize SetJwtAlgorithmRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/jwt-algorithm", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Get the cluster JWT algorithm status.
+    pub async fn cluster_jwt_status(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::JwtStatusResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/jwt-status").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Schedule a cluster-wide wipe of `{data_dir}/join_secret`.
+    pub async fn cluster_wipe_join_secret(&self) -> Result<()> {
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/wipe-join-secret", "")
+            .await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Overlay (typed)
     // ------------------------------------------------------------------
 

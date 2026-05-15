@@ -51,6 +51,23 @@ pub struct SecretsState {
     /// existed restore with an empty map.
     #[serde(default)]
     pub trusted_bundles: HashMap<String, zlayer_types::api::cluster::TrustBundle>,
+
+    /// Cluster-wide JWT algorithm policy. Drives which join-token
+    /// formats `cluster_join` accepts. Default `Both` for safety —
+    /// the daemon's bootstrap may override based on whether
+    /// `{data_dir}/join_secret` is already present on first start.
+    ///
+    /// `#[serde(default)]` so pre-Wave-11 snapshots restore cleanly.
+    #[serde(default)]
+    pub jwt_algorithm: zlayer_types::api::cluster::JwtAlgorithm,
+
+    /// Timestamp when `WipeJoinSecret` last applied (None = never).
+    /// Used by the daemon's startup check to skip the wipe if it
+    /// already happened in a prior boot.
+    ///
+    /// `#[serde(default)]` for pre-Wave-11 snapshots.
+    #[serde(default)]
+    pub join_secret_wiped_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl SecretsState {
@@ -132,6 +149,20 @@ impl SecretsState {
                 self.trusted_bundles.remove(&cluster_domain);
                 Ok(())
             }
+            SecretsRaftOp::SetJwtAlgorithm { algorithm } => {
+                self.jwt_algorithm = algorithm;
+                Ok(())
+            }
+            SecretsRaftOp::WipeJoinSecret => {
+                // Record the wipe instant. Local filesystem cleanup
+                // is the daemon's responsibility — followers consult
+                // `join_secret_wiped_at` on boot to know if their
+                // copy of the file should already be gone.
+                if self.join_secret_wiped_at.is_none() {
+                    self.join_secret_wiped_at = Some(Utc::now());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -178,6 +209,18 @@ impl SecretsState {
         cluster_domain: &str,
     ) -> Option<&zlayer_types::api::cluster::TrustBundle> {
         self.trusted_bundles.get(cluster_domain)
+    }
+
+    /// Return the current JWT algorithm policy.
+    #[must_use]
+    pub fn jwt_algorithm(&self) -> zlayer_types::api::cluster::JwtAlgorithm {
+        self.jwt_algorithm
+    }
+
+    /// `true` if `WipeJoinSecret` has been applied at least once.
+    #[must_use]
+    pub fn join_secret_wiped(&self) -> bool {
+        self.join_secret_wiped_at.is_some()
     }
 }
 
@@ -568,5 +611,67 @@ mod tests {
             })
             .unwrap();
         // No assertion needed — the test verifies apply doesn't error.
+    }
+
+    #[test]
+    fn set_jwt_algorithm_default_is_both() {
+        let state = SecretsState::default();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Both,
+            "default policy is Both for safety during migration"
+        );
+    }
+
+    #[test]
+    fn set_jwt_algorithm_flips_policy() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Eddsa,
+            })
+            .unwrap();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Eddsa
+        );
+    }
+
+    #[test]
+    fn set_jwt_algorithm_is_idempotent() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Hs256,
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Hs256,
+            })
+            .unwrap();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Hs256
+        );
+    }
+
+    #[test]
+    fn wipe_join_secret_records_timestamp() {
+        let mut state = SecretsState::default();
+        assert!(!state.join_secret_wiped());
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        assert!(state.join_secret_wiped());
+        assert!(state.join_secret_wiped_at.is_some());
+    }
+
+    #[test]
+    fn wipe_join_secret_is_idempotent_preserves_first_timestamp() {
+        let mut state = SecretsState::default();
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        let first = state.join_secret_wiped_at.unwrap();
+        // Re-apply: timestamp must NOT update (preserves audit trail).
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        assert_eq!(state.join_secret_wiped_at.unwrap(), first);
     }
 }

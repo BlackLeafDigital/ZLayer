@@ -3024,6 +3024,74 @@ pub(crate) async fn handle_cluster_trust_bundle_remove(
     Ok(())
 }
 
+/// Handler for `zlayer cluster migrate-jwt-to-eddsa`.
+pub(crate) async fn handle_cluster_migrate_jwt_to_eddsa(
+    _grace: Option<humantime::Duration>,
+) -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    client
+        .cluster_set_jwt_algorithm(zlayer_types::api::cluster::JwtAlgorithm::Both)
+        .await
+        .context("POST /api/v1/cluster/jwt-algorithm")?;
+    println!("JWT algorithm policy is now `both` (HS256 + EdDSA accepted).");
+    println!(
+        "Re-issue tokens with `zlayer node generate-join-token`; new tokens default to EdDSA."
+    );
+    println!("When you're confident no HS256 tokens are still in flight, run:");
+    println!("  zlayer cluster decommission-hs256 --vacuum-secret");
+    Ok(())
+}
+
+/// Handler for `zlayer cluster decommission-hs256`.
+pub(crate) async fn handle_cluster_decommission_hs256(vacuum_secret: bool) -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    client
+        .cluster_set_jwt_algorithm(zlayer_types::api::cluster::JwtAlgorithm::Eddsa)
+        .await
+        .context("POST /api/v1/cluster/jwt-algorithm")?;
+    println!("JWT algorithm policy is now `eddsa`. HS256 tokens will be rejected.");
+    if vacuum_secret {
+        client
+            .cluster_wipe_join_secret()
+            .await
+            .context("POST /api/v1/cluster/wipe-join-secret")?;
+        println!("Scheduled cluster-wide wipe of {{data_dir}}/join_secret.");
+    } else {
+        println!(
+            "{{data_dir}}/join_secret is still present on each node. Pass --vacuum-secret \
+             to remove it now."
+        );
+    }
+    Ok(())
+}
+
+/// Handler for `zlayer cluster jwt-status`.
+pub(crate) async fn handle_cluster_jwt_status() -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let resp = client
+        .cluster_jwt_status()
+        .await
+        .context("GET /api/v1/cluster/jwt-status")?;
+    println!("JWT algorithm policy: {}", resp.algorithm);
+    match resp.join_secret_wiped_at {
+        Some(when) => println!("join_secret wiped at:  {when}"),
+        None => println!("join_secret wiped at:  (never)"),
+    }
+    Ok(())
+}
+
 /// Try to discover the deployment name from a `.zlayer.yml` / `*.zlayer.yml` spec
 /// in the current working directory.  Returns `None` if nothing is found.
 fn try_discover_deployment_name() -> Option<String> {

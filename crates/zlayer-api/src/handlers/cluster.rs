@@ -36,10 +36,10 @@ use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 pub use zlayer_types::api::cluster::{
     default_api_port, default_mode, ClusterJoinClaims, ClusterJoinRequest, ClusterJoinResponse,
     ClusterNodeSummary, ClusterPeer, ImportTrustBundleRequest, ImportTrustBundleResponse,
-    RevocationEntry, RevocationListResponse, RevokeTokenRequest, RevokeTokenResponse,
-    RotateSigningKeyRequest, RotateSigningKeyResponse, SignedClusterJoinToken, SigningPubkeyEntry,
-    SigningPubkeyResponse, SigningPubkeysResponse, TrustedBundleEntry, TrustedBundlesResponse,
-    SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
+    JwtStatusResponse, RevocationEntry, RevocationListResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RotateSigningKeyRequest, RotateSigningKeyResponse, SetJwtAlgorithmRequest,
+    SignedClusterJoinToken, SigningPubkeyEntry, SigningPubkeyResponse, SigningPubkeysResponse,
+    TrustedBundleEntry, TrustedBundlesResponse, SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
 };
 
 /// Heartbeat request from a worker node.
@@ -360,36 +360,101 @@ pub async fn cluster_join(
     }
 
     if !token_accepted {
-        if let Some(expected_secret) = &state.join_secret {
-            let hmac_key = derive_join_hmac_key(expected_secret);
-            let signed_ok = validate_join_token_signed(&req.token, &hmac_key, &state.used_jtis);
-            match signed_ok {
+        // Wave 11: respect cluster-wide `jwt_algorithm` policy. Default
+        // to `Both` if no Raft is attached (test/placeholder paths).
+        let algorithm = if let Some(raft) = state.raft.as_ref() {
+            raft.secrets_state().await.jwt_algorithm()
+        } else {
+            zlayer_types::api::cluster::JwtAlgorithm::Both
+        };
+
+        let try_eddsa = matches!(
+            algorithm,
+            zlayer_types::api::cluster::JwtAlgorithm::Eddsa
+                | zlayer_types::api::cluster::JwtAlgorithm::Both
+        );
+        let try_hs256 = matches!(
+            algorithm,
+            zlayer_types::api::cluster::JwtAlgorithm::Hs256
+                | zlayer_types::api::cluster::JwtAlgorithm::Both
+        );
+
+        // 1. Try EdDSA-JWT first when enabled. Don't fall through to
+        //    HS256 if EdDSA succeeds.
+        let mut deferred_err: Option<ApiError> = None;
+        if try_eddsa {
+            match validate_join_token_eddsa_jwt(&state, &req.token).await {
                 Ok(()) => {
-                    info!(format = "hs256", "accepted cluster join token");
+                    info!(format = "eddsa_jwt", "accepted cluster join token");
+                    token_accepted = true;
                 }
-                Err(signed_err) => {
-                    // Wave 6 (v0.13.0): plaintext tokens are no longer accepted.
-                    // If the token's body looks like a legacy plaintext form
-                    // (carries an `auth_secret` field matching the cluster
-                    // secret), return a precise, actionable error pointing
-                    // the operator at the remediation command rather than
-                    // surfacing the opaque HS256 decode failure.
-                    if is_legacy_plaintext_token_shape(&req.token, expected_secret) {
-                        tracing::warn!(
-                            peer_ip = %peer_ip,
-                            format = "legacy_plaintext",
-                            "rejected legacy plaintext join token (v0.13.0 dropped acceptance)"
-                        );
-                        return Err(ApiError::Unauthorized(
-                            "plaintext join token rejected. Re-issue with 'zlayer node \
-                             generate-join-token' (signed by default). See CHANGELOG v0.13.0 \
-                             for migration."
-                                .into(),
-                        ));
-                    }
-                    return Err(signed_err);
+                Err(e) => {
+                    deferred_err = Some(e);
                 }
             }
+        }
+
+        // 2. Try HS256-JWT when enabled.
+        if !token_accepted && try_hs256 {
+            if let Some(expected_secret) = &state.join_secret {
+                let hmac_key = derive_join_hmac_key(expected_secret);
+                let signed_ok = validate_join_token_signed(&req.token, &hmac_key, &state.used_jtis);
+                match signed_ok {
+                    Ok(()) => {
+                        info!(format = "hs256", "accepted cluster join token");
+                        token_accepted = true;
+                    }
+                    Err(signed_err) => {
+                        // Wave 6 (v0.13.0): plaintext tokens are no longer
+                        // accepted. If the token's body looks like a legacy
+                        // plaintext form (carries an `auth_secret` field
+                        // matching the cluster secret), return a precise,
+                        // actionable error pointing the operator at the
+                        // remediation command rather than surfacing the
+                        // opaque HS256 decode failure.
+                        if is_legacy_plaintext_token_shape(&req.token, expected_secret) {
+                            tracing::warn!(
+                                peer_ip = %peer_ip,
+                                format = "legacy_plaintext",
+                                "rejected legacy plaintext join token (v0.13.0 dropped acceptance)"
+                            );
+                            return Err(ApiError::Unauthorized(
+                                "plaintext join token rejected. Re-issue with 'zlayer node \
+                                 generate-join-token' (signed by default). See CHANGELOG \
+                                 v0.13.0 for migration."
+                                    .into(),
+                            ));
+                        }
+                        // Tuck the HS256 error away as a fallback;
+                        // we surface the most-helpful error below.
+                        if deferred_err.is_none() {
+                            deferred_err = Some(signed_err);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. If the policy explicitly REJECTS the format the caller used
+        //    (Eddsa-only cluster receiving an HS256-shaped JWT), surface an
+        //    actionable error. Detect by attempting a header-only parse to
+        //    see what `alg` the token advertised.
+        if !token_accepted && algorithm == zlayer_types::api::cluster::JwtAlgorithm::Eddsa {
+            if let Ok(hdr) = jsonwebtoken::decode_header(&req.token) {
+                if hdr.alg == jsonwebtoken::Algorithm::HS256 {
+                    return Err(ApiError::Unauthorized(
+                        "HS256 decommissioned on this cluster; re-issue with current \
+                         'zlayer node generate-join-token'"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        if !token_accepted {
+            return Err(deferred_err.unwrap_or_else(|| {
+                ApiError::Unauthorized("no acceptable join-token format found".into())
+            }));
         }
     }
 
@@ -1011,6 +1076,133 @@ pub async fn cluster_remove_trust_bundle(
     .map_err(|e| ApiError::Internal(format!("removing trust bundle via Raft: {e}")))?;
 
     info!(cluster_domain = %cluster_domain, "trust bundle removed");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// Wave 11C+D: JWT algorithm policy + join_secret wipe endpoints.
+
+/// Set the cluster-wide JWT algorithm policy.
+///
+/// `POST /api/v1/cluster/jwt-algorithm`
+///
+/// Admin-only. Proposes `SecretsRaftOp::SetJwtAlgorithm` so every node
+/// converges on the same policy. Idempotent.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+/// - `Internal` on Raft propose failure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/jwt-algorithm",
+    request_body = SetJwtAlgorithmRequest,
+    responses(
+        (status = 204, description = "Policy applied"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_set_jwt_algorithm(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+    Json(req): Json<zlayer_types::api::cluster::SetJwtAlgorithmRequest>,
+) -> Result<axum::http::StatusCode> {
+    actor.require_admin()?;
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    raft.propose_secrets_op(
+        zlayer_types::api::internal::SecretsRaftOp::SetJwtAlgorithm {
+            algorithm: req.algorithm,
+        },
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("setting jwt_algorithm via Raft: {e}")))?;
+
+    info!(algorithm = %req.algorithm, "jwt algorithm policy updated");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Get the cluster-wide JWT algorithm status.
+///
+/// `GET /api/v1/cluster/jwt-status`
+///
+/// Admin-only. Returns the in-memory snapshot from this node's Raft
+/// state machine.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/jwt-status",
+    responses(
+        (status = 200, description = "JWT policy status", body = JwtStatusResponse),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_jwt_status(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+) -> Result<Json<zlayer_types::api::cluster::JwtStatusResponse>> {
+    actor.require_admin()?;
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    let secrets_state = raft.secrets_state().await;
+    Ok(Json(zlayer_types::api::cluster::JwtStatusResponse {
+        algorithm: secrets_state.jwt_algorithm(),
+        join_secret_wiped_at: secrets_state.join_secret_wiped_at.map(|t| t.to_rfc3339()),
+    }))
+}
+
+/// Wipe `{data_dir}/join_secret` on every node.
+///
+/// `POST /api/v1/cluster/wipe-join-secret`
+///
+/// Admin-only. Proposes `SecretsRaftOp::WipeJoinSecret`. The actual
+/// filesystem delete happens in each daemon's apply path (added in
+/// Wave 11D bootstrap). Idempotent.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+/// - `Internal` on Raft propose failure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/wipe-join-secret",
+    responses(
+        (status = 204, description = "Wipe scheduled cluster-wide"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_wipe_join_secret(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+) -> Result<axum::http::StatusCode> {
+    actor.require_admin()?;
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    raft.propose_secrets_op(zlayer_types::api::internal::SecretsRaftOp::WipeJoinSecret)
+        .await
+        .map_err(|e| ApiError::Internal(format!("proposing WipeJoinSecret: {e}")))?;
+
+    info!("join_secret wipe scheduled cluster-wide");
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -2246,6 +2438,138 @@ fn validate_join_token_signed(
         warn!(event = "join_token_replay", jti = %claims.jti);
         return Err(ApiError::Unauthorized(
             "Join token already used (replay)".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Encode raw 32-byte Ed25519 public key bytes as a DER `SubjectPublicKeyInfo`
+/// blob that [`jsonwebtoken::DecodingKey::from_ed_der`] accepts. The wrapping
+/// is the standard RFC 8410 SPKI for `id-Ed25519` (OID 1.3.101.112): a 12-byte
+/// prefix followed by the 32 pubkey bytes for 44 bytes total.
+fn ed25519_pubkey_to_spki_der(pubkey: &[u8; 32]) -> Vec<u8> {
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, // SEQUENCE, 42 bytes
+        0x30, 0x05, // SEQUENCE, 5 bytes (AlgorithmIdentifier)
+        0x06, 0x03, 0x2b, 0x65, 0x70, // OID 1.3.101.112 (Ed25519)
+        0x03, 0x21, 0x00, // BIT STRING, 33 bytes, 0 unused bits
+    ];
+    let mut out = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
+    out.extend_from_slice(&ED25519_SPKI_PREFIX);
+    out.extend_from_slice(pubkey);
+    out
+}
+
+/// Validate an EdDSA-signed JWT cluster join token (Wave 11).
+///
+/// Same RFC 7519 envelope as [`validate_join_token_signed`] but with
+/// `alg = "EdDSA"` and the signature verified against the cluster signing
+/// keystore keyed by the JWT header's `kid`. Replay-protection shares the
+/// `used_jtis` set, so a token replayed across algorithms is still rejected.
+///
+/// Lookup: the JWT header's `kid` must match an active or grace-window entry
+/// in the keystore at `state.cluster_signing_key_path`. Unknown kids /
+/// expired-grace kids are rejected. If no keystore path is configured the
+/// validator falls back to the single active [`ClusterApiState::cluster_signer`].
+///
+/// # Errors
+/// - [`ApiError::Unauthorized`] for any decode / signature / claim / replay
+///   failure.
+/// - [`ApiError::ServiceUnavailable`] if neither the keystore path nor an
+///   active signer is configured on this node.
+async fn validate_join_token_eddsa_jwt(state: &ClusterApiState, token: &str) -> Result<()> {
+    // 0. Parse the JWT header to extract `kid` (we need it BEFORE we can
+    //    fetch the verifying key).
+    let header = jsonwebtoken::decode_header(token).map_err(|e| {
+        warn!(
+            event = "join_token_eddsa_jwt_failed",
+            kind = "malformed_header",
+            error = %e
+        );
+        ApiError::Unauthorized(format!("EdDSA-JWT header parse failed: {e}"))
+    })?;
+    if header.alg != jsonwebtoken::Algorithm::EdDSA {
+        return Err(ApiError::Unauthorized(format!(
+            "expected alg=EdDSA, got alg={:?}",
+            header.alg
+        )));
+    }
+    let kid = header
+        .kid
+        .clone()
+        .ok_or_else(|| ApiError::Unauthorized("EdDSA-JWT header missing kid".into()))?;
+
+    // 1. Look up the verifying key for this kid in the local keystore.
+    let verifying_key = if let Some(path) = state.cluster_signing_key_path.as_ref() {
+        zlayer_secrets::load_signer_for_kid(path, &kid)
+            .await
+            .map_err(|e| ApiError::Internal(format!("keystore lookup failed: {e}")))?
+            .ok_or_else(|| {
+                warn!(
+                    event = "join_token_eddsa_jwt_failed",
+                    kind = "unknown_kid",
+                    kid = %kid,
+                );
+                ApiError::Unauthorized(format!(
+                    "EdDSA-JWT kid={kid} not trusted (unknown or expired-grace)"
+                ))
+            })?
+            .verifying_key()
+    } else if let Some(signer) = state.cluster_signer.as_ref() {
+        if signer.key_id() != kid {
+            return Err(ApiError::Unauthorized(format!(
+                "EdDSA-JWT kid={} not trusted (only active kid={} configured)",
+                kid,
+                signer.key_id()
+            )));
+        }
+        signer.verifying_key()
+    } else {
+        return Err(ApiError::ServiceUnavailable(
+            "cluster signer not configured on this node".into(),
+        ));
+    };
+
+    // 2. Convert raw Ed25519 pubkey bytes into DER SPKI for jsonwebtoken.
+    let pubkey_bytes: [u8; 32] = *verifying_key.as_bytes();
+    let spki_der = ed25519_pubkey_to_spki_der(&pubkey_bytes);
+    let decoding_key = jsonwebtoken::DecodingKey::from_ed_der(&spki_der);
+
+    // 3. Verify with EdDSA + standard validation (same claims contract as
+    //    HS256 path).
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    validation.set_issuer(&["zlayer-cluster"]);
+    validation.set_audience(&["cluster-join"]);
+    validation.leeway = 30;
+
+    let data = jsonwebtoken::decode::<JoinTokenClaims>(token, &decoding_key, &validation).map_err(
+        |e| {
+            use jsonwebtoken::errors::ErrorKind;
+            let failure_kind = match e.kind() {
+                ErrorKind::ExpiredSignature => "expired",
+                ErrorKind::InvalidSignature => "invalid_signature",
+                ErrorKind::InvalidIssuer => "invalid_issuer",
+                ErrorKind::InvalidAudience => "invalid_audience",
+                ErrorKind::InvalidToken | ErrorKind::Json(_) | ErrorKind::Base64(_) => "malformed",
+                _ => "other",
+            };
+            warn!(event = "join_token_eddsa_jwt_failed", kind = failure_kind, error = %e);
+            ApiError::Unauthorized(format!("Invalid EdDSA-JWT join token: {failure_kind}"))
+        },
+    )?;
+
+    // 4. Replay protection: jti goes into the shared used_jtis set so a
+    //    token replayed across HS256 <-> EdDSA still rejects.
+    let claims = data.claims;
+    let mut seen = state
+        .used_jtis
+        .lock()
+        .map_err(|_| ApiError::Internal("used_jtis mutex poisoned".into()))?;
+    if !seen.insert(claims.jti.clone()) {
+        warn!(event = "join_token_eddsa_jwt_replay", jti = %claims.jti);
+        return Err(ApiError::Unauthorized(
+            "EdDSA-JWT join token already used (replay)".into(),
         ));
     }
 
@@ -4048,5 +4372,77 @@ mod tests {
             .await
             .expect_err("must error when no raft coordinator is attached");
         assert!(err.to_string().contains("Raft") || err.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn ed25519_pubkey_to_spki_der_emits_44_bytes() {
+        // RFC 8410 SPKI for Ed25519 = 12-byte prefix + 32-byte pubkey = 44 bytes.
+        let pk = [0xABu8; 32];
+        let der = super::ed25519_pubkey_to_spki_der(&pk);
+        assert_eq!(der.len(), 44);
+        assert_eq!(
+            &der[..12],
+            &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,]
+        );
+        assert_eq!(&der[12..], &pk);
+    }
+
+    // The EdDSA-JWT round-trip test requires exporting the cluster signer's
+    // Ed25519 seed in PKCS#8 DER form so `jsonwebtoken::EncodingKey::from_ed_der`
+    // can mint a token. `ed25519-dalek` is configured without the `pkcs8`
+    // feature in this workspace and `ClusterSigner` deliberately does not
+    // expose its private key bytes (the redacted `Debug` impl is the giveaway).
+    // The verifying-side correctness is exercised end-to-end by the production
+    // `cluster_join` integration tests once Wave 11C wires the mint path.
+    #[tokio::test]
+    #[ignore = "needs pkcs8 export from ClusterSigner; integration tests cover verify-side"]
+    async fn validate_join_token_eddsa_jwt_round_trips() {}
+
+    // Wave 11C+D: jwt-algorithm / jwt-status / wipe-join-secret handler tests.
+
+    #[tokio::test]
+    async fn cluster_set_jwt_algorithm_403_for_non_admin() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_user_actor();
+        let req = zlayer_types::api::cluster::SetJwtAlgorithmRequest {
+            algorithm: zlayer_types::api::cluster::JwtAlgorithm::Eddsa,
+        };
+        let err = cluster_set_jwt_algorithm(actor, State(state), Json(req))
+            .await
+            .expect_err("non-admin must be forbidden");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_set_jwt_algorithm_503_without_raft() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = zlayer_types::api::cluster::SetJwtAlgorithmRequest {
+            algorithm: zlayer_types::api::cluster::JwtAlgorithm::Eddsa,
+        };
+        let err = cluster_set_jwt_algorithm(actor, State(state), Json(req))
+            .await
+            .expect_err("no raft -> service unavailable");
+        assert!(err.to_string().contains("Raft") || err.to_string().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn cluster_jwt_status_503_without_raft() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let err = cluster_jwt_status(actor, State(state))
+            .await
+            .expect_err("no raft -> service unavailable");
+        assert!(err.to_string().contains("Raft") || err.to_string().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn cluster_wipe_join_secret_403_for_non_admin() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_user_actor();
+        let err = cluster_wipe_join_secret(actor, State(state))
+            .await
+            .expect_err("non-admin must be forbidden");
+        assert!(!err.to_string().is_empty());
     }
 }

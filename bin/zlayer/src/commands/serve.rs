@@ -1633,6 +1633,19 @@ pub(crate) async fn serve_with_external_shutdown(
         Some(std::sync::Arc::new(ca))
     };
 
+    // Wave 11D: if a prior operator command set the cluster JWT
+    // algorithm to `Eddsa` but `{data_dir}/join_secret` is still
+    // present, surface a warning suggesting the cleanup. This is
+    // BEST-EFFORT — Raft state isn't directly readable here, so we
+    // only check the local file existence and rely on the next
+    // operator interaction to surface the policy.
+    if config.data_dir.join("join_secret").exists() {
+        tracing::info!(
+            "{{data_dir}}/join_secret is present; if you've migrated to EdDSA, run \
+             `zlayer cluster decommission-hs256 --vacuum-secret` to remove it"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 3b'. Load (or generate + persist) the daemon UUID. This stamps every
     // hex container ID minted via `ContainerIdMap::compute_hex` so the same

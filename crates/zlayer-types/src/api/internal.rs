@@ -145,4 +145,22 @@ pub enum SecretsRaftOp {
         /// Cluster domain of the bundle to remove.
         cluster_domain: String,
     },
+
+    /// Set the cluster-wide JWT algorithm policy.
+    ///
+    /// Replicated through Raft so every node enforces the same policy
+    /// within one commit. Idempotent — re-applying with the same value
+    /// is a no-op.
+    SetJwtAlgorithm {
+        /// New policy.
+        algorithm: crate::api::cluster::JwtAlgorithm,
+    },
+
+    /// Mark `{data_dir}/join_secret` as wiped on every node.
+    ///
+    /// Operator-driven cleanup after migrating to `eddsa`. The actual
+    /// file-system delete happens locally on each node when this op
+    /// applies; the state machine records the wipe timestamp so
+    /// re-applies are no-ops. Idempotent.
+    WipeJoinSecret,
 }

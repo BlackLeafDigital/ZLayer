@@ -448,6 +448,68 @@ pub struct RevocationListResponse {
     pub revocations: Vec<RevocationEntry>,
 }
 
+/// The JWT algorithm policy a cluster enforces for join tokens.
+///
+/// Phases of the HS256 → `EdDSA` migration:
+/// - **`Hs256`**: accept HS256-JWT and Ed25519-signed-envelope tokens.
+///   EdDSA-JWT is rejected (fresh tokens have nowhere to come from
+///   in this phase).
+/// - **`Both`**: accept all three modern formats. Operators run their
+///   cluster here for a migration grace window so in-flight HS256
+///   tokens remain valid while clients re-issue under `EdDSA`.
+/// - **`Eddsa`**: accept EdDSA-JWT and Ed25519-signed-envelope.
+///   HS256-JWT is rejected with an actionable error. The symmetric
+///   `{data_dir}/join_secret` may be wiped via `WipeJoinSecret` at
+///   this point — it's no longer load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum JwtAlgorithm {
+    /// HS256-only (legacy default for clusters created before Wave 11).
+    Hs256,
+    /// Both algorithms accepted (migration window).
+    #[default]
+    Both,
+    /// EdDSA-only. The cluster has decommissioned its symmetric secret.
+    Eddsa,
+}
+
+impl JwtAlgorithm {
+    /// Return the canonical lowercase identifier.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hs256 => "hs256",
+            Self::Both => "both",
+            Self::Eddsa => "eddsa",
+        }
+    }
+}
+
+impl std::fmt::Display for JwtAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Request body for `POST /api/v1/cluster/jwt-algorithm`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetJwtAlgorithmRequest {
+    /// New algorithm policy to enforce cluster-wide.
+    pub algorithm: JwtAlgorithm,
+}
+
+/// Response body for `GET /api/v1/cluster/jwt-status`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JwtStatusResponse {
+    /// Currently-enforced algorithm policy.
+    pub algorithm: JwtAlgorithm,
+    /// RFC3339 timestamp when this node believes `{data_dir}/join_secret`
+    /// was last wiped via `SecretsRaftOp::WipeJoinSecret`. `None` if it
+    /// has never been wiped (the file may still exist on disk for HS256).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_secret_wiped_at: Option<String>,
+}
+
 /// Summary of a cluster node for listing.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterNodeSummary {

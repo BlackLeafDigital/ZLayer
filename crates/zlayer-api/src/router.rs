@@ -1317,6 +1317,15 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             "/revocations",
             get(handlers::cluster::cluster_list_revocations),
         )
+        .route(
+            "/jwt-algorithm",
+            post(handlers::cluster::cluster_set_jwt_algorithm),
+        )
+        .route("/jwt-status", get(handlers::cluster::cluster_jwt_status))
+        .route(
+            "/wipe-join-secret",
+            post(handlers::cluster::cluster_wipe_join_secret),
+        )
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
         .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .route(

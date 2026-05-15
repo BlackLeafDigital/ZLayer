@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-05-14
+
+### Added
+- HS256 → EdDSA-JWT migration path. New cluster-wide `jwt_algorithm` policy (`hs256` | `both` | `eddsa`) replicated via Raft, defaulting to `both` for safe in-place migration. EdDSA-JWT validator joins the existing HS256 validator and the Wave-3 signed-envelope validator in `cluster_join`'s dispatch, gated by the active policy. Operators run `zlayer cluster migrate-jwt-to-eddsa` to flip to `both`, then `zlayer cluster decommission-hs256 [--vacuum-secret]` to flip to `eddsa`-only (and optionally schedule a cluster-wide wipe of `{data_dir}/join_secret`). New endpoints `POST/GET /api/v1/cluster/{jwt-algorithm,jwt-status,wipe-join-secret}` (admin auth) + matching CLI commands + `zlayer cluster jwt-status`.
+
+### Known limitations
+- The `WipeJoinSecret` Raft op records the wipe instant in the state machine but does NOT yet trigger a local filesystem delete on each node — operators can still use `zlayer serve --vacuum-secrets` (Wave 6) for the actual file cleanup. Wiring the filesystem effect to the apply path is a follow-up.
+
 ## [0.15.0] - 2026-05-14
 
 ### Added

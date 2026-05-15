@@ -3066,6 +3066,39 @@ pub(crate) enum ClusterCommands {
     /// validates their signed join tokens.
     #[command(subcommand, name = "trust-bundle")]
     TrustBundle(TrustBundleCommands),
+
+    /// Begin the HS256 -> Ed25519-JWT migration.
+    ///
+    /// Sets the cluster JWT algorithm policy to `both` so new tokens
+    /// minted as `EdDSA` work while in-flight HS256 tokens stay valid.
+    /// Operators run this BEFORE re-issuing tokens.
+    #[command(name = "migrate-jwt-to-eddsa", verbatim_doc_comment)]
+    MigrateJwtToEddsa {
+        /// Reserved for future use. The `--grace` knob will become
+        /// meaningful when the migration command also issues a fresh
+        /// signing-key rotation; for now it's accepted and recorded
+        /// for symmetry with the eventual flow.
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
+    },
+
+    /// Complete the HS256 -> Ed25519-JWT migration.
+    ///
+    /// Flips the cluster JWT algorithm policy to `eddsa`. HS256-JWT
+    /// tokens are rejected after this completes. With
+    /// `--vacuum-secret`, also wipes `{data_dir}/join_secret` on every
+    /// node via a separate Raft op so the symmetric secret is gone.
+    #[command(name = "decommission-hs256", verbatim_doc_comment)]
+    DecommissionHs256 {
+        /// If set, also schedule a cluster-wide wipe of
+        /// `{data_dir}/join_secret`.
+        #[arg(long)]
+        vacuum_secret: bool,
+    },
+
+    /// Show the cluster JWT algorithm status.
+    #[command(name = "jwt-status", verbatim_doc_comment)]
+    JwtStatus {},
 }
 
 /// Subcommands for `zlayer cluster trust-bundle <...>`.
