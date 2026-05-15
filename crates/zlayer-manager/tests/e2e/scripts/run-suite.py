@@ -1501,6 +1501,19 @@ def parse_args() -> argparse.Namespace:
         "--no-build", dest="no_build", action="store_true",
         help="Skip cargo build + cargo leptos build.",
     )
+    parser.add_argument(
+        "--overlay-mode",
+        choices=("loopback", "container"),
+        default="loopback",
+        help=(
+            "loopback (default): boot daemons as raw processes on 127.0.0.1, "
+            "no TUN, fast. container: boot each test node in a "
+            "privileged container with --cap-add NET_ADMIN --device /dev/net/tun "
+            "so signed-token joins, rotation, and revocation exercise the real "
+            "boringtun overlay. The container mode REQUIRES the "
+            "ZLAYER_E2E_PRIVILEGED=1 env var; see docs/operating/e2e-privileged.md."
+        ),
+    )
     ns = parser.parse_args()
     # Resolve positional/flag suite name → ns.suite (positional wins).
     if ns.suite is None:
@@ -1510,6 +1523,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    # Overlay-mode gate. `loopback` (default) is the historical raw-process
+    # path and falls through. `container` is the privileged-container
+    # harness scaffolded in Wave 10; the launch driver is the next
+    # iteration, so today we short-circuit BEFORE any daemon-setup runs.
+    if args.overlay_mode == "container":
+        if os.environ.get("ZLAYER_E2E_PRIVILEGED") != "1":
+            sys.stderr.write(
+                "skipping overlay scenarios -- set ZLAYER_E2E_PRIVILEGED=1 to enable "
+                "(requires --privileged container host; see "
+                "docs/operating/e2e-privileged.md for setup)\n"
+            )
+            sys.exit(0)
+        # Container-mode driver lives in a sibling module on a future
+        # iteration; for now this branch is a TODO-stub that fails loudly
+        # so an operator who tries to use it gets actionable feedback.
+        sys.stderr.write(
+            "ERROR: --overlay-mode container is scaffolded but not yet "
+            "fully wired. Image (images/ZImagefile.zlayer-e2e-node), pipeline "
+            "registration, and CI gate are in place. The container-launch "
+            "logic itself is the next iteration -- contributions welcome.\n"
+            "See docs/operating/e2e-privileged.md for the full design.\n"
+        )
+        sys.exit(2)
 
     # Cluster suites do not use the manager fixture pipeline below; dispatch
     # them up-front and return their exit code directly.
