@@ -40,6 +40,17 @@ pub struct SecretsState {
     /// of the full token b64 envelope). Auto-pruned during apply: any
     /// `RevokeToken` op also sweeps entries whose `expires_at < now()`.
     pub revoked_tokens: HashMap<String, chrono::DateTime<chrono::Utc>>,
+
+    /// Trusted foreign-cluster trust bundles, keyed by `cluster_domain`.
+    /// Imported via [`SecretsRaftOp::ImportTrustBundle`] and consulted
+    /// by [`crate::cluster_signer::ClusterCa::verify_ca_cert`] when a
+    /// v=2 signed token carries a `ca_chain` whose `cluster_domain`
+    /// is not the local cluster's.
+    ///
+    /// `#[serde(default)]` so snapshots written before this field
+    /// existed restore with an empty map.
+    #[serde(default)]
+    pub trusted_bundles: HashMap<String, zlayer_types::api::cluster::TrustBundle>,
 }
 
 impl SecretsState {
@@ -105,6 +116,22 @@ impl SecretsState {
                 self.revoked_tokens.retain(|_, exp| *exp > now);
                 Ok(())
             }
+            SecretsRaftOp::ImportTrustBundle { bundle } => {
+                // Idempotent: replacing an existing bundle with the
+                // same `cluster_domain` overwrites in place. Operators
+                // re-importing after a key rotation in the source
+                // cluster do this; the trust relationship stays one
+                // entry per foreign cluster.
+                self.trusted_bundles
+                    .insert(bundle.cluster_domain.clone(), bundle);
+                Ok(())
+            }
+            SecretsRaftOp::RemoveTrustBundle { cluster_domain } => {
+                // Removal is also idempotent — silently no-op if the
+                // entry is already absent.
+                self.trusted_bundles.remove(&cluster_domain);
+                Ok(())
+            }
         }
     }
 
@@ -142,6 +169,15 @@ impl SecretsState {
     #[must_use]
     pub fn token_revoked(&self, token_hash: &str) -> bool {
         self.revoked_tokens.contains_key(token_hash)
+    }
+
+    /// Look up a trusted foreign cluster's bundle by domain.
+    #[must_use]
+    pub fn trust_bundle_for(
+        &self,
+        cluster_domain: &str,
+    ) -> Option<&zlayer_types::api::cluster::TrustBundle> {
+        self.trusted_bundles.get(cluster_domain)
     }
 }
 
@@ -457,5 +493,80 @@ mod tests {
             .unwrap();
         assert!(state.token_revoked("fresh"));
         assert!(!state.token_revoked("stale"));
+    }
+
+    fn make_trust_bundle(
+        cluster_domain: &str,
+        ca_kid: &str,
+    ) -> zlayer_types::api::cluster::TrustBundle {
+        zlayer_types::api::cluster::TrustBundle {
+            v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+            cluster_domain: cluster_domain.to_string(),
+            ca_public_key_b64: format!("pubkey-of-{cluster_domain}"),
+            ca_kid: ca_kid.to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn import_trust_bundle_inserts_entry() {
+        let mut state = SecretsState::default();
+        let bundle = make_trust_bundle("prod-east", "deadbeef");
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: bundle.clone(),
+            })
+            .unwrap();
+        let got = state
+            .trust_bundle_for("prod-east")
+            .expect("must be present");
+        assert_eq!(got.cluster_domain, "prod-east");
+        assert_eq!(got.ca_kid, "deadbeef");
+        assert!(state.trust_bundle_for("prod-west").is_none());
+    }
+
+    #[test]
+    fn import_trust_bundle_is_idempotent_overwriting_in_place() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "deadbeef"),
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "newkid12"),
+            })
+            .unwrap();
+        let got = state.trust_bundle_for("prod-east").unwrap();
+        assert_eq!(got.ca_kid, "newkid12", "re-import must overwrite in place");
+        assert_eq!(state.trusted_bundles.len(), 1);
+    }
+
+    #[test]
+    fn remove_trust_bundle_drops_entry() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "deadbeef"),
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::RemoveTrustBundle {
+                cluster_domain: "prod-east".into(),
+            })
+            .unwrap();
+        assert!(state.trust_bundle_for("prod-east").is_none());
+    }
+
+    #[test]
+    fn remove_trust_bundle_is_idempotent_for_unknown_domain() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::RemoveTrustBundle {
+                cluster_domain: "never-imported".into(),
+            })
+            .unwrap();
+        // No assertion needed — the test verifies apply doesn't error.
     }
 }

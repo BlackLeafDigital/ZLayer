@@ -125,4 +125,24 @@ pub enum SecretsRaftOp {
         #[schema(value_type = String, format = "date-time")]
         expires_at: chrono::DateTime<chrono::Utc>,
     },
+
+    /// Import a foreign cluster's trust bundle so its tokens can be
+    /// accepted by validators on this cluster.
+    ///
+    /// Idempotent: re-importing the same `cluster_domain` overwrites
+    /// the previous entry. Keyed by `cluster_domain` to enforce one
+    /// trust relationship per foreign cluster.
+    ImportTrustBundle {
+        /// The bundle to record in `SecretsState::trusted_bundles`.
+        bundle: crate::api::cluster::TrustBundle,
+    },
+
+    /// Remove a previously-imported trust bundle.
+    ///
+    /// No-op if `cluster_domain` was not present. Used by the operator
+    /// when revoking trust in a federated cluster.
+    RemoveTrustBundle {
+        /// Cluster domain of the bundle to remove.
+        cluster_domain: String,
+    },
 }

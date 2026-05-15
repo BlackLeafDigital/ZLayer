@@ -247,15 +247,35 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
 pub fn mint_signed_cluster_join_token(
     claims: &ClusterJoinClaims,
     signer: &zlayer_secrets::ClusterSigner,
+    ca_context: Option<(&zlayer_secrets::ClusterCa, &str, std::time::Duration)>,
 ) -> Result<String> {
     let claims_bytes =
         serde_json::to_vec(claims).context("serializing cluster join claims for signing")?;
     let sig_bytes = signer.sign(&claims_bytes);
+
+    // v=2 emit when caller supplies a CA + cluster_domain + cert
+    // validity. Otherwise emit v=1 (wire-compatible: `ca_chain: None`
+    // is skipped by serde).
+    let (v, ca_chain) = if let Some((ca, cluster_domain, validity)) = ca_context {
+        let cert = ca
+            .issue_ca_cert(
+                signer.key_id(),
+                signer.public_key_b64(),
+                cluster_domain.to_string(),
+                validity,
+            )
+            .context("issuing CaCert for v=2 token mint")?;
+        (zlayer_types::api::cluster::SIGNED_TOKEN_V_WAVE9, Some(cert))
+    } else {
+        (SIGNED_TOKEN_V_WAVE3, None)
+    };
+
     let envelope = SignedClusterJoinToken {
-        v: SIGNED_TOKEN_V_WAVE3,
+        v,
         kid: signer.key_id(),
         claims: claims.clone(),
         sig: URL_SAFE_NO_PAD.encode(sig_bytes),
+        ca_chain,
     };
     let envelope_bytes =
         serde_json::to_vec(&envelope).context("serializing signed cluster join token envelope")?;
@@ -2874,6 +2894,136 @@ pub(crate) async fn handle_cluster_list_revocations() -> Result<()> {
     Ok(())
 }
 
+/// Handler for `zlayer cluster trust-bundle export [--out FILE]`.
+pub(crate) async fn handle_cluster_trust_bundle_export(
+    out: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let bundle = client
+        .cluster_export_trust_bundle()
+        .await
+        .context("fetching /api/v1/cluster/trust-bundle")?;
+    let json = serde_json::to_string_pretty(&bundle).context("serializing TrustBundle to JSON")?;
+    if let Some(path) = out {
+        tokio::fs::write(&path, &json)
+            .await
+            .with_context(|| format!("writing trust bundle to {}", path.display()))?;
+        println!("Wrote trust bundle to {}", path.display());
+        println!("  cluster_domain: {}", bundle.cluster_domain);
+        println!("  ca_kid:         {}", bundle.ca_kid);
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+/// Handler for `zlayer cluster trust-bundle import <SOURCE> [--source-url URL]`.
+pub(crate) async fn handle_cluster_trust_bundle_import(
+    source: String,
+    source_url: Option<String>,
+) -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    // Decide whether SOURCE is a URL or a file path. URLs MUST be https://
+    // to mitigate trivial MitM of the trust-bundle fetch — the bundle is
+    // the very thing that bootstraps trust.
+    let (bundle_json, derived_source_url): (String, Option<String>) =
+        if source.starts_with("https://") {
+            let resp = reqwest::get(&source)
+                .await
+                .with_context(|| format!("fetching trust bundle from {source}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("trust bundle URL returned HTTP {status}");
+            }
+            let text = resp
+                .text()
+                .await
+                .context("reading trust bundle response body")?;
+            (text, Some(source.clone()))
+        } else if source.starts_with("http://") {
+            anyhow::bail!(
+            "refusing to fetch trust bundle over plaintext http://; use https:// or a local file"
+        );
+        } else {
+            let path = std::path::Path::new(&source);
+            let text = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("reading trust bundle file {}", path.display()))?;
+            (text, source_url.clone())
+        };
+
+    let bundle: zlayer_types::api::cluster::TrustBundle = serde_json::from_str(&bundle_json)
+        .with_context(|| format!("parsing TrustBundle JSON from {source}"))?;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let req = zlayer_types::api::cluster::ImportTrustBundleRequest {
+        bundle,
+        source_url: derived_source_url.or(source_url),
+    };
+    let resp = client
+        .cluster_import_trust_bundle(&req)
+        .await
+        .context("POST /api/v1/cluster/trust-imports")?;
+    println!("Imported trust bundle");
+    println!("  cluster_domain: {}", resp.cluster_domain);
+    println!("  ca_kid:         {}", resp.ca_kid);
+    println!(
+        "Replicated through Raft \u{2014} every node will now accept tokens minted by this cluster"
+    );
+    Ok(())
+}
+
+/// Handler for `zlayer cluster trust-bundle list`.
+pub(crate) async fn handle_cluster_trust_bundle_list() -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let resp = client
+        .cluster_list_trust_bundles()
+        .await
+        .context("GET /api/v1/cluster/trust-bundles")?;
+    if resp.bundles.is_empty() {
+        println!("(no trusted foreign-cluster bundles)");
+    } else {
+        println!("Trusted foreign-cluster bundles ({}):", resp.bundles.len());
+        for b in &resp.bundles {
+            println!("  cluster_domain: {}", b.cluster_domain);
+            println!("    ca_kid:        {}", b.ca_kid);
+            println!("    generated_at:  {}", b.generated_at);
+            if let Some(src) = &b.source_url {
+                println!("    source_url:    {src}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handler for `zlayer cluster trust-bundle remove <cluster_domain>`.
+pub(crate) async fn handle_cluster_trust_bundle_remove(
+    cluster_domain: String,
+) -> anyhow::Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    client
+        .cluster_remove_trust_bundle(&cluster_domain)
+        .await
+        .with_context(|| format!("DELETE /api/v1/cluster/trust-imports/{cluster_domain}"))?;
+    println!("Removed trust bundle for cluster_domain: {cluster_domain}");
+    Ok(())
+}
+
 /// Try to discover the deployment name from a `.zlayer.yml` / `*.zlayer.yml` spec
 /// in the current working directory.  Returns `None` if nothing is found.
 fn try_discover_deployment_name() -> Option<String> {
@@ -3046,7 +3196,7 @@ pub(crate) async fn handle_node_generate_join_token(
         iat: now.to_rfc3339(),
         iss: node_config.node_id.clone(),
     };
-    let signed_token = mint_signed_cluster_join_token(&claims, &signer)
+    let signed_token = mint_signed_cluster_join_token(&claims, &signer, None)
         .context("minting signed cluster join token")?;
 
     // --- Build the HS256 JWT (modern alternative) ---
@@ -3836,6 +3986,7 @@ mod signed_token_tests {
         SIGNED_TOKEN_V_WAVE3, STANDARD, URL_SAFE_NO_PAD,
     };
     use base64::Engine as _;
+    use zlayer_types::api::cluster::SIGNED_TOKEN_V_WAVE9;
 
     fn sample_claims() -> ClusterJoinClaims {
         sample_claims_with_exp(chrono::Utc::now() + chrono::Duration::hours(1))
@@ -3857,7 +4008,7 @@ mod signed_token_tests {
     fn mint_then_parse_round_trip() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
         assert_eq!(parsed.v, SIGNED_TOKEN_V_WAVE3);
         assert_eq!(parsed.kid, signer.key_id());
@@ -3874,7 +4025,7 @@ mod signed_token_tests {
     fn minted_token_is_single_line_ascii() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         assert!(
             token_str
                 .chars()
@@ -3887,7 +4038,7 @@ mod signed_token_tests {
     fn verify_accepts_freshly_minted_token() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims_with_exp(chrono::Utc::now() + chrono::Duration::hours(1));
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
         let verified =
             verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), &signer.key_id())
@@ -3900,7 +4051,7 @@ mod signed_token_tests {
     fn verify_rejects_when_kid_mismatches() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
 
         let err = verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), "deadbeef")
@@ -3916,7 +4067,7 @@ mod signed_token_tests {
     fn verify_rejects_when_signature_tampered() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let mut parsed = parse_signed_cluster_join_token(&token_str).unwrap();
 
         // Flip a byte in the signature (the signature is base64 of 64 bytes).
@@ -3938,7 +4089,7 @@ mod signed_token_tests {
     fn verify_rejects_when_claims_tampered() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let mut parsed = parse_signed_cluster_join_token(&token_str).unwrap();
 
         // Modify the api_endpoint after minting — signature should no longer
@@ -3959,7 +4110,7 @@ mod signed_token_tests {
     fn verify_rejects_when_expired() {
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims_with_exp(chrono::Utc::now() - chrono::Duration::hours(1));
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
 
         let err =
@@ -3984,6 +4135,7 @@ mod signed_token_tests {
             kid: signer.key_id(),
             claims: claims.clone(),
             sig: URL_SAFE_NO_PAD.encode(sig_bytes),
+            ca_chain: None,
         };
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let token_str = URL_SAFE_NO_PAD.encode(envelope_bytes);
@@ -4022,7 +4174,7 @@ mod signed_token_tests {
             iat: now.to_rfc3339(),
             iss: "node-uuid-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
         };
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
 
         let parsed_iat = chrono::DateTime::parse_from_rfc3339(&parsed.claims.iat).unwrap();
@@ -4040,12 +4192,75 @@ mod signed_token_tests {
         // instead of URL_SAFE_NO_PAD to confirm parse handles both.
         let signer = zlayer_secrets::ClusterSigner::generate();
         let claims = sample_claims();
-        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
         // Decode with URL_SAFE_NO_PAD, re-encode with STANDARD.
         let envelope_bytes = URL_SAFE_NO_PAD.decode(token_str.as_bytes()).unwrap();
         let standard_token = STANDARD.encode(&envelope_bytes);
         let parsed = parse_signed_cluster_join_token(&standard_token)
             .expect("STANDARD-encoded envelope must parse");
         assert_eq!(parsed.kid, signer.key_id());
+    }
+
+    /// Wave 9D-iii: when no CA context is supplied, the mint MUST
+    /// emit a v=1 envelope with `ca_chain: None` — wire-compatible
+    /// with every pre-Wave-9 validator.
+    #[test]
+    fn mint_signed_cluster_join_token_v1_when_ca_context_absent() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = ClusterJoinClaims {
+            api_endpoint: "http://127.0.0.1:3669".into(),
+            raft_endpoint: "127.0.0.1:3670".into(),
+            leader_wg_pubkey: "ignored-pubkey".into(),
+            overlay_cidr: "10.42.0.0/16".into(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            iat: chrono::Utc::now().to_rfc3339(),
+            iss: "test-node".into(),
+        };
+        let token = mint_signed_cluster_join_token(&claims, &signer, None).unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let parsed: SignedClusterJoinToken = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.v, SIGNED_TOKEN_V_WAVE3);
+        assert!(parsed.ca_chain.is_none(), "v=1 mints must omit ca_chain");
+    }
+
+    /// Wave 9D-iii: when a CA + `cluster_domain` + cert-validity are
+    /// supplied, the mint MUST emit a v=2 envelope whose `ca_chain`
+    /// is a fresh `CaCert` signed by the CA, with `active_kid` /
+    /// `active_pubkey_b64` matching the signer.
+    #[tokio::test]
+    async fn mint_signed_cluster_join_token_v2_when_ca_context_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let ca = zlayer_secrets::ClusterCa::load_or_generate(&dir.path().join("ca.key"))
+            .await
+            .unwrap();
+        let claims = ClusterJoinClaims {
+            api_endpoint: "http://127.0.0.1:3669".into(),
+            raft_endpoint: "127.0.0.1:3670".into(),
+            leader_wg_pubkey: "ignored-pubkey".into(),
+            overlay_cidr: "10.42.0.0/16".into(),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            iat: chrono::Utc::now().to_rfc3339(),
+            iss: "test-node".into(),
+        };
+        let token = mint_signed_cluster_join_token(
+            &claims,
+            &signer,
+            Some((
+                &ca,
+                "test-cluster-domain",
+                std::time::Duration::from_secs(3600),
+            )),
+        )
+        .unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let parsed: SignedClusterJoinToken = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.v, SIGNED_TOKEN_V_WAVE9);
+        let cert = parsed.ca_chain.expect("v=2 mints must include ca_chain");
+        assert_eq!(cert.cluster_domain, "test-cluster-domain");
+        assert_eq!(cert.active_kid, signer.key_id());
+
+        // CA-signed cert must verify under its own CA pubkey.
+        zlayer_secrets::ClusterCa::verify_ca_cert(&ca.ca_public_key_b64(), &cert).unwrap();
     }
 }

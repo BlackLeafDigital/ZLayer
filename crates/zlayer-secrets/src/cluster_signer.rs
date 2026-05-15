@@ -269,7 +269,7 @@ impl ClusterSigner {
                     let signing = SigningKey::from_bytes(&seed);
                     let public = signing.verifying_key();
                     let digest = Sha256::digest(public.as_bytes());
-                    let kid = hex::encode(&digest[..4]);
+                    let kid = hex_short(&digest);
                     let entry = KeyEntry {
                         id: kid.clone(),
                         seed_b64: URL_SAFE_NO_PAD.encode(seed),
@@ -406,7 +406,7 @@ impl ClusterSigner {
     #[must_use]
     pub fn key_id(&self) -> String {
         let digest = Sha256::digest(self.public.as_bytes());
-        hex::encode(&digest[..4])
+        hex_short(&digest)
     }
 
     /// Sign a message. Returns the raw 64-byte Ed25519 signature.
@@ -415,6 +415,13 @@ impl ClusterSigner {
         let sig: Signature = self.signing.sign(msg);
         sig.to_bytes()
     }
+}
+
+/// Lowercase hex of the first 4 bytes of `digest`. The result is 8 hex
+/// chars — the short, greppable `kid` form used in log lines, token
+/// headers, and `CaCert::active_kid`.
+fn hex_short(digest: &[u8]) -> String {
+    hex::encode(&digest[..4])
 }
 
 /// Build the temp-file path used during atomic keystore writes.
@@ -537,7 +544,7 @@ pub async fn rotate_keystore(
     let public = signing.verifying_key();
     let new_kid = {
         let digest = Sha256::digest(public.as_bytes());
-        hex::encode(&digest[..4])
+        hex_short(&digest)
     };
     let new_pub_b64 = URL_SAFE_NO_PAD.encode(public.as_bytes());
 
@@ -776,6 +783,231 @@ pub async fn prune_expired_grace(path: &Path) -> Result<usize, SecretsError> {
 
     ClusterSigner::write_keystore(path, &store).await?;
     Ok(pruned)
+}
+
+/// Long-lived cluster CA keypair.
+///
+/// Identifies this cluster across the entire federation. NEVER
+/// rotated — rotation would invalidate every `CaCert` this cluster has
+/// ever issued and break federation trust. Stored as a raw 32-byte
+/// Ed25519 seed at `{data_dir}/cluster_ca.key` (0600).
+///
+/// The per-rotation signing keys (see [`ClusterSigner`]) live in a
+/// separate JSON keystore at `cluster_signing.key`. The CA key is
+/// deliberately not part of that keystore so it survives the
+/// rotation-and-prune machinery.
+pub struct ClusterCa {
+    signing: ed25519_dalek::SigningKey,
+    public: ed25519_dalek::VerifyingKey,
+}
+
+impl std::fmt::Debug for ClusterCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterCa")
+            .field("ca_kid", &self.ca_kid())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClusterCa {
+    /// Generate a fresh CA keypair using the OS CSPRNG.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG fails — same fail-loud behavior as
+    /// [`ClusterSigner::generate`].
+    #[must_use]
+    pub fn generate() -> Self {
+        use rand::TryRngCore;
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut seed)
+            .expect("OS CSPRNG must be available to generate a cluster CA key");
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public = signing.verifying_key();
+        Self { signing, public }
+    }
+
+    /// Load the CA seed from `path`, or generate + persist a fresh one
+    /// if the file does not exist.
+    ///
+    /// On creation the file is written atomically (tmp + rename) with
+    /// mode 0600 on Unix. The 32-byte seed is the entirety of the
+    /// file — no JSON, no headers; this is intentionally a simpler
+    /// format than the signing keystore because the CA key never
+    /// rotates.
+    ///
+    /// # Errors
+    ///
+    /// - [`SecretsError::Storage`] for any IO error reading or writing
+    ///   the file, or if an existing file has the wrong length.
+    pub async fn load_or_generate(path: &std::path::Path) -> Result<Self, SecretsError> {
+        if tokio::fs::try_exists(path)
+            .await
+            .map_err(|e| SecretsError::Storage(format!("checking {}: {e}", path.display())))?
+        {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| SecretsError::Storage(format!("reading {}: {e}", path.display())))?;
+            if bytes.len() != 32 {
+                return Err(SecretsError::Storage(format!(
+                    "cluster_ca.key at {} has wrong length: expected 32 bytes, got {}",
+                    path.display(),
+                    bytes.len()
+                )));
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let public = signing.verifying_key();
+            return Ok(Self { signing, public });
+        }
+
+        let ca = Self::generate();
+        let seed = ca.signing.to_bytes();
+        let tmp_path = path.with_extension("ca.tmp");
+        tokio::fs::write(&tmp_path, &seed[..])
+            .await
+            .map_err(|e| SecretsError::Storage(format!("writing tmp ca file: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&tmp_path, perms)
+                .await
+                .map_err(|e| SecretsError::Storage(format!("chmod 0600 ca tmp: {e}")))?;
+        }
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .map_err(|e| SecretsError::Storage(format!("rename ca tmp to final: {e}")))?;
+        Ok(ca)
+    }
+
+    /// CA verifying key as URL-safe no-pad base64.
+    #[must_use]
+    pub fn ca_public_key_b64(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.public.as_bytes())
+    }
+
+    /// Short CA key id: first 8 hex chars of SHA-256(CA verifying key bytes).
+    #[must_use]
+    pub fn ca_kid(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.public.as_bytes());
+        let digest = hasher.finalize();
+        hex_short(&digest)
+    }
+
+    /// CA verifying key for verification (not exported through trait).
+    #[must_use]
+    pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
+        self.public
+    }
+
+    /// Build a [`CaCert`] binding `active_kid` (whose verifying-key
+    /// base64 is `active_pubkey_b64`) to `cluster_domain` for the
+    /// window `[now, now + grace]`. The result's `sig_by_ca` is the
+    /// CA's Ed25519 signature over the canonical bytes of the body.
+    ///
+    /// "Canonical bytes" = `serde_json::to_vec` of a `CaCert` with the
+    /// signature field cleared (`""`). Verifiers must do the same
+    /// transformation before calling `verify_strict`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SecretsError::Provider`] if serializing the canonical body
+    ///   fails (should not happen with the well-formed `CaCert` struct).
+    pub fn issue_ca_cert(
+        &self,
+        active_kid: String,
+        active_pubkey_b64: String,
+        cluster_domain: String,
+        grace: std::time::Duration,
+    ) -> Result<zlayer_types::api::cluster::CaCert, SecretsError> {
+        use ed25519_dalek::Signer;
+
+        let now = chrono::Utc::now();
+        let issued_at = now.to_rfc3339();
+        let expires_at = (now
+            + chrono::Duration::from_std(grace)
+                .map_err(|e| SecretsError::Provider(format!("grace out of range: {e}")))?)
+        .to_rfc3339();
+
+        let mut cert = zlayer_types::api::cluster::CaCert {
+            v: zlayer_types::api::cluster::CA_CERT_FORMAT_VERSION,
+            active_kid,
+            active_pubkey_b64,
+            issued_at,
+            expires_at,
+            cluster_domain,
+            sig_by_ca: String::new(),
+        };
+        let body_bytes = serde_json::to_vec(&cert).map_err(|e| {
+            SecretsError::Provider(format!("serializing CaCert body for signing: {e}"))
+        })?;
+        let sig = self.signing.sign(&body_bytes);
+        cert.sig_by_ca = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        Ok(cert)
+    }
+
+    /// Verify a `CaCert` against a CA public key.
+    ///
+    /// The CA public key is the bytes that an importer obtained
+    /// out-of-band from a [`crate::TrustBundle`]. Verification:
+    /// 1. Decodes the `sig_by_ca` base64.
+    /// 2. Recomputes the canonical body bytes (`sig_by_ca` cleared).
+    /// 3. Calls `verify_strict` on the CA pubkey.
+    /// 4. Checks `expires_at > now` so an expired cert is rejected.
+    ///
+    /// Does NOT check `cluster_domain` — that's the caller's job
+    /// (typically: "does the cert's `cluster_domain` match the
+    /// `TrustBundle` we looked up by domain?").
+    ///
+    /// # Errors
+    ///
+    /// - [`SecretsError::Provider`] for any decode/verification/expiry
+    ///   failure with an actionable message.
+    pub fn verify_ca_cert(
+        ca_pubkey_b64: &str,
+        cert: &zlayer_types::api::cluster::CaCert,
+    ) -> Result<(), SecretsError> {
+        let ca_pubkey_bytes = URL_SAFE_NO_PAD
+            .decode(ca_pubkey_b64.as_bytes())
+            .map_err(|e| SecretsError::Provider(format!("CA pubkey base64 decode: {e}")))?;
+        let ca_pubkey_arr: [u8; 32] = ca_pubkey_bytes.as_slice().try_into().map_err(|_| {
+            SecretsError::Provider(format!("CA pubkey wrong length: {}", ca_pubkey_bytes.len()))
+        })?;
+        let ca_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&ca_pubkey_arr)
+            .map_err(|e| SecretsError::Provider(format!("invalid CA pubkey: {e}")))?;
+
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(cert.sig_by_ca.as_bytes())
+            .map_err(|e| SecretsError::Provider(format!("sig_by_ca base64 decode: {e}")))?;
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+            SecretsError::Provider(format!("sig_by_ca wrong length: {}", sig_bytes.len()))
+        })?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+        let mut body = cert.clone();
+        body.sig_by_ca = String::new();
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+            SecretsError::Provider(format!("recomputing CaCert canonical body: {e}"))
+        })?;
+        ca_pubkey.verify_strict(&body_bytes, &sig).map_err(|e| {
+            SecretsError::Provider(format!("CA signature verification failed: {e}"))
+        })?;
+
+        let exp = chrono::DateTime::parse_from_rfc3339(&cert.expires_at)
+            .map_err(|e| SecretsError::Provider(format!("CaCert expires_at parse: {e}")))?
+            .with_timezone(&chrono::Utc);
+        if chrono::Utc::now() >= exp {
+            return Err(SecretsError::Provider(format!(
+                "CaCert expired at {}",
+                cert.expires_at
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,5 +1731,117 @@ mod tests {
         let _ = backend.active_key_id().await.unwrap(); // seed
         let unknown = backend.public_key_b64("deadbeef").await.unwrap();
         assert!(unknown.is_none(), "unknown kid must resolve to None");
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 9B — long-lived ClusterCa + CaCert issue/verify.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_ca_load_or_generate_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster_ca.key");
+
+        // First load creates the file.
+        let ca1 = ClusterCa::load_or_generate(&path).await.unwrap();
+        let kid1 = ca1.ca_kid();
+        let pubkey1 = ca1.ca_public_key_b64();
+        assert_eq!(kid1.len(), 8);
+        assert!(!pubkey1.is_empty());
+
+        // Second load reads back the same key — kid and pubkey are stable.
+        let ca2 = ClusterCa::load_or_generate(&path).await.unwrap();
+        assert_eq!(ca2.ca_kid(), kid1);
+        assert_eq!(ca2.ca_public_key_b64(), pubkey1);
+
+        // File is 32 bytes exactly.
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_issues_and_verifies_ca_cert() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("cluster_ca.key");
+        let ca = ClusterCa::load_or_generate(&ca_path).await.unwrap();
+
+        let active_kid = "deadbeef".to_string();
+        let active_pubkey_b64 = "Y29udGVudG9mYV9ub25fcGtfYi02NF9zaWduZWRfa2V5Xw".to_string();
+        let cluster_domain = "test-cluster".to_string();
+
+        let cert = ca
+            .issue_ca_cert(
+                active_kid.clone(),
+                active_pubkey_b64.clone(),
+                cluster_domain.clone(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+        assert_eq!(cert.active_kid, active_kid);
+        assert_eq!(cert.cluster_domain, cluster_domain);
+        assert_eq!(cert.v, zlayer_types::api::cluster::CA_CERT_FORMAT_VERSION);
+        assert!(!cert.sig_by_ca.is_empty());
+
+        // Verification round-trips against the CA's own pubkey.
+        ClusterCa::verify_ca_cert(&ca.ca_public_key_b64(), &cert).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_cert_verification_fails_under_wrong_pubkey() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = ClusterCa::load_or_generate(&dir.path().join("ca1.key"))
+            .await
+            .unwrap();
+        let other = ClusterCa::load_or_generate(&dir.path().join("ca2.key"))
+            .await
+            .unwrap();
+
+        let cert = ca
+            .issue_ca_cert(
+                "abcd1234".into(),
+                "ignored-for-this-test-xx".into(),
+                "test-cluster".into(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Wrong CA pubkey must reject.
+        let err = ClusterCa::verify_ca_cert(&other.ca_public_key_b64(), &cert).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verification failed") || msg.contains("signature"),
+            "expected sig-verification error; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_cert_verification_fails_when_expired() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = ClusterCa::load_or_generate(&dir.path().join("ca.key"))
+            .await
+            .unwrap();
+
+        // Issue a cert with negligible grace; it expires before we can verify.
+        let cert = ca
+            .issue_ca_cert(
+                "abcd1234".into(),
+                "ignored-for-this-test-xx".into(),
+                "test".into(),
+                Duration::from_millis(1),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = ClusterCa::verify_ca_cert(&ca.ca_public_key_b64(), &cert).unwrap_err();
+        assert!(
+            err.to_string().contains("expired"),
+            "expected expired-cert error; got {err}"
+        );
     }
 }

@@ -1290,6 +1290,22 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             get(handlers::cluster::cluster_signing_pubkeys),
         )
         .route(
+            "/trust-bundle",
+            get(handlers::cluster::cluster_trust_bundle),
+        )
+        .route(
+            "/trust-imports",
+            post(handlers::cluster::cluster_import_trust_bundle),
+        )
+        .route(
+            "/trust-bundles",
+            get(handlers::cluster::cluster_list_trust_bundles),
+        )
+        .route(
+            "/trust-imports/{cluster_domain}",
+            delete(handlers::cluster::cluster_remove_trust_bundle),
+        )
+        .route(
             "/rotate-signing-key",
             post(handlers::cluster::cluster_rotate_signing_key),
         )

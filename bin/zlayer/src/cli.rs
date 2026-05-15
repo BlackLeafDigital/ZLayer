@@ -3057,6 +3057,45 @@ pub(crate) enum ClusterCommands {
     /// shows revocations that are still load-bearing for validation.
     #[command(name = "list-revocations", verbatim_doc_comment)]
     ListRevocations {},
+
+    /// Manage cluster trust bundles for federation.
+    ///
+    /// Subcommands let operators export this cluster's own trust
+    /// bundle (for sharing out-of-band with peer clusters) and
+    /// manage imports of foreign-cluster bundles so this cluster
+    /// validates their signed join tokens.
+    #[command(subcommand, name = "trust-bundle")]
+    TrustBundle(TrustBundleCommands),
+}
+
+/// Subcommands for `zlayer cluster trust-bundle <...>`.
+#[derive(clap::Subcommand)]
+pub(crate) enum TrustBundleCommands {
+    /// Print this cluster's trust bundle as JSON for out-of-band
+    /// transport to a peer cluster.
+    Export {
+        /// Optional file path to write the bundle to. If omitted,
+        /// the JSON is printed to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Import a foreign cluster's trust bundle from a file or URL.
+    Import {
+        /// Path to a JSON file containing a `TrustBundle`, OR an
+        /// `https://` URL to fetch (over TLS).
+        source: String,
+        /// Optional source-URL annotation recorded server-side for
+        /// audit; defaults to the supplied URL when `source` is a URL.
+        #[arg(long)]
+        source_url: Option<String>,
+    },
+    /// List all currently-trusted foreign-cluster bundles.
+    List {},
+    /// Remove a previously-imported trust bundle.
+    Remove {
+        /// The `cluster_domain` of the bundle to forget.
+        cluster_domain: String,
+    },
 }
 
 /// Token management subcommands

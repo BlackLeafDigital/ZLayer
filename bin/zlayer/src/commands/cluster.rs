@@ -89,5 +89,19 @@ pub(crate) async fn handle_cluster(
             reason,
         } => node::handle_cluster_revoke_token(token_or_hash.clone(), reason.clone()).await,
         ClusterCommands::ListRevocations {} => node::handle_cluster_list_revocations().await,
+        ClusterCommands::TrustBundle(sub) => match sub {
+            crate::cli::TrustBundleCommands::Export { out } => {
+                node::handle_cluster_trust_bundle_export(out.clone()).await
+            }
+            crate::cli::TrustBundleCommands::Import { source, source_url } => {
+                node::handle_cluster_trust_bundle_import(source.clone(), source_url.clone()).await
+            }
+            crate::cli::TrustBundleCommands::List {} => {
+                node::handle_cluster_trust_bundle_list().await
+            }
+            crate::cli::TrustBundleCommands::Remove { cluster_domain } => {
+                node::handle_cluster_trust_bundle_remove(cluster_domain.clone()).await
+            }
+        },
     }
 }

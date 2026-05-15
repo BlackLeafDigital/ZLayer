@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-05-14
+
+### Added
+- Cluster CA + SPIFFE-style federation (Wave 9). Each cluster generates a long-lived `cluster_ca.key` at first daemon start (never rotated). Tokens may be minted as `v=2` carrying a `ca_chain` (`CaCert`) signed by the cluster CA, binding the per-rotation `kid` to a `cluster_domain`. Operators export this cluster's `TrustBundle` (CA pubkey + domain) via `GET /api/v1/cluster/trust-bundle` (unauthed by design), transport it out-of-band, and `zlayer cluster trust-bundle import <FILE-OR-URL>` it into a peer cluster. Imports replicate via Raft (`SecretsRaftOp::ImportTrustBundle` / `RemoveTrustBundle`). Validators now accept v=2 tokens whose `kid` is unknown locally if `ca_chain.cluster_domain` is in the imported trusted-bundles set and the CaCert verifies under that bundle's CA pubkey. New endpoints: `POST /api/v1/cluster/trust-imports`, `GET /api/v1/cluster/trust-bundles`, `DELETE /api/v1/cluster/trust-imports/{cluster_domain}` (all admin auth). New CLI: `zlayer cluster trust-bundle {export, import, list, remove}`. HTTPS-only fetch when importing from URLs.
+
 ## [0.14.0] - 2026-05-14
 
 ### Added

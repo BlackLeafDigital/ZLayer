@@ -183,11 +183,63 @@ pub struct SignedClusterJoinToken {
     /// Ed25519 signature over `serde_json::to_vec(&claims)`, encoded as
     /// URL-safe no-pad base64.
     pub sig: String,
+    /// Optional CA chain binding the `kid` to a foreign cluster. Set
+    /// to `Some(...)` only on v=2 tokens minted for cross-cluster
+    /// federation; same-cluster v=2 tokens may omit it. v=1 tokens
+    /// MUST have this field absent (`skip_serializing_if` guarantees the
+    /// JSON shape stays compatible with v=1 parsers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_chain: Option<CaCert>,
 }
 
 /// Current envelope version Wave-3 mints. Re-export so mint and verify
 /// stay in lockstep without a stringly-typed constant elsewhere.
 pub const SIGNED_TOKEN_V_WAVE3: u32 = 1;
+
+/// Wave 9 envelope version: extends Wave 3 with an optional `ca_chain`
+/// so a foreign-issued token can carry the CA-signed binding that
+/// proves its `kid` was issued by the cluster identified in
+/// `ca_chain.cluster_domain`. v=1 tokens still parse — `ca_chain` is
+/// just absent in their JSON.
+pub const SIGNED_TOKEN_V_WAVE9: u32 = 2;
+
+/// "CA certificate" minted by the cluster CA at every rotation of the
+/// active signing key.
+///
+/// Provides the binding: `active_kid` was issued by the cluster whose
+/// `ca_public_key_b64` is published in this cluster's `TrustBundle`.
+/// The signature `sig_by_ca` is the CA's Ed25519 signature over
+/// `serde_json::to_vec(&CaCertCore { active_kid, active_pubkey_b64,
+/// issued_at, expires_at, cluster_domain })` (i.e. the same struct
+/// with the `sig_by_ca` field stripped).
+///
+/// Field declaration order is canonical for signing. Do NOT reorder
+/// without bumping `CA_CERT_FORMAT_VERSION` and adding a migration.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CaCert {
+    /// Format version for the CA cert body. `1` today.
+    pub v: u32,
+    /// `kid` of the active signing key this cert is binding.
+    pub active_kid: String,
+    /// URL-safe no-pad base64 of the active signing key's verifying key.
+    pub active_pubkey_b64: String,
+    /// RFC3339 timestamp when this cert was issued.
+    pub issued_at: String,
+    /// RFC3339 timestamp when this cert expires. Should match the
+    /// active key's own grace expiry so the cert and key share a
+    /// retirement clock.
+    pub expires_at: String,
+    /// Cluster identity this cert binds to. Defaults to the cluster's
+    /// UUID; operators may override to a DNS-style name like
+    /// `prod.zlayer.example`.
+    pub cluster_domain: String,
+    /// Ed25519 signature of the CA over `serde_json::to_vec(&self
+    /// with sig_by_ca cleared)`. URL-safe no-pad base64.
+    pub sig_by_ca: String,
+}
+
+/// Current `CaCert::v` value the issuer emits.
+pub const CA_CERT_FORMAT_VERSION: u32 = 1;
 
 /// Response body for `GET /api/v1/cluster/signing-pubkey`.
 ///
@@ -264,6 +316,85 @@ pub struct RotateSigningKeyResponse {
     pub previous_kid: String,
     /// RFC3339 timestamp when the previous key's grace expires.
     pub previous_grace_until: String,
+}
+
+/// Public trust bundle for a cluster, distributable out-of-band so
+/// other clusters can import it and accept this cluster's tokens.
+///
+/// Contains the long-lived cluster CA pubkey (not the per-rotation
+/// signing key). Federation works by:
+///   1. Cluster A exports its bundle (`GET /api/v1/cluster/trust-bundle`).
+///   2. Operator transports the bundle to cluster B (out-of-band).
+///   3. Cluster B imports it via the admin endpoint, replicated through
+///      Raft so every node converges.
+///   4. Tokens minted by A's per-rotation key, carrying A's `ca_chain`,
+///      now validate against A's CA pubkey in B's trusted-bundles map.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrustBundle {
+    /// Format version. `1` today.
+    pub v: u32,
+    /// Cluster identity this bundle represents (defaults to cluster UUID;
+    /// may be a DNS-style domain like `prod.zlayer.example`).
+    pub cluster_domain: String,
+    /// URL-safe no-pad base64 of the cluster CA's Ed25519 verifying key.
+    pub ca_public_key_b64: String,
+    /// Short kid of the CA verifying key (8 hex chars).
+    pub ca_kid: String,
+    /// RFC3339 timestamp of when this bundle snapshot was generated.
+    /// Imports may compare timestamps to spot stale bundles.
+    pub generated_at: String,
+}
+
+/// Current `TrustBundle::v` value.
+pub const TRUST_BUNDLE_FORMAT_VERSION: u32 = 1;
+
+/// Request body for `POST /api/v1/cluster/trust-imports`.
+///
+/// The operator supplies a parsed [`TrustBundle`]. The handler proposes
+/// a Raft op so the import is replicated to every node before returning
+/// success.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportTrustBundleRequest {
+    /// The bundle to import. Must be well-formed (parseable + non-empty
+    /// `cluster_domain` + valid base64 pubkey of correct length).
+    pub bundle: TrustBundle,
+    /// Optional URL the bundle was fetched from. Recorded server-side
+    /// for audit; not validated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+/// Response body for `POST /api/v1/cluster/trust-imports`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportTrustBundleResponse {
+    /// The `cluster_domain` of the imported bundle (echoed for clarity).
+    pub cluster_domain: String,
+    /// CA kid of the imported bundle.
+    pub ca_kid: String,
+}
+
+/// One entry in the trusted-bundle listing.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TrustedBundleEntry {
+    /// Cluster domain.
+    pub cluster_domain: String,
+    /// CA kid.
+    pub ca_kid: String,
+    /// CA pubkey (URL-safe no-pad base64).
+    pub ca_public_key_b64: String,
+    /// RFC3339 timestamp when this bundle was originally generated by
+    /// the source cluster.
+    pub generated_at: String,
+    /// Optional source URL captured at import time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+/// Response body for `GET /api/v1/cluster/trust-bundles`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct TrustedBundlesResponse {
+    /// All imported bundles, sorted by `cluster_domain` for stability.
+    pub bundles: Vec<TrustedBundleEntry>,
 }
 
 /// Request body for `POST /api/v1/cluster/revoke-token`.

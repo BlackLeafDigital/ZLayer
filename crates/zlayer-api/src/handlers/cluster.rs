@@ -35,9 +35,11 @@ use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 // (the `cluster_join` handler, the test module) keep compiling.
 pub use zlayer_types::api::cluster::{
     default_api_port, default_mode, ClusterJoinClaims, ClusterJoinRequest, ClusterJoinResponse,
-    ClusterNodeSummary, ClusterPeer, RevocationEntry, RevocationListResponse, RevokeTokenRequest,
-    RevokeTokenResponse, RotateSigningKeyRequest, RotateSigningKeyResponse, SignedClusterJoinToken,
-    SigningPubkeyEntry, SigningPubkeyResponse, SigningPubkeysResponse, SIGNED_TOKEN_V_WAVE3,
+    ClusterNodeSummary, ClusterPeer, ImportTrustBundleRequest, ImportTrustBundleResponse,
+    RevocationEntry, RevocationListResponse, RevokeTokenRequest, RevokeTokenResponse,
+    RotateSigningKeyRequest, RotateSigningKeyResponse, SignedClusterJoinToken, SigningPubkeyEntry,
+    SigningPubkeyResponse, SigningPubkeysResponse, TrustedBundleEntry, TrustedBundlesResponse,
+    SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
 };
 
 /// Heartbeat request from a worker node.
@@ -104,6 +106,18 @@ pub struct ClusterApiState {
     /// should set this to `Some({data_dir}/cluster_signing.key)` after
     /// constructing the state, since the field is `pub`.
     pub cluster_signing_key_path: Option<std::path::PathBuf>,
+    /// Long-lived cluster CA keypair, used to issue [`CaCert`]s
+    /// embedded in v=2 signed join tokens for cross-cluster
+    /// federation. `None` if the daemon is running without
+    /// federation enabled (the CA file at
+    /// `{data_dir}/cluster_ca.key` is auto-generated on first start
+    /// of any daemon that has CA support compiled in — Wave 9).
+    pub cluster_ca: Option<Arc<zlayer_secrets::ClusterCa>>,
+    /// Cluster identity for federation. Defaults to the local node
+    /// UUID at daemon start. Operators may override at deploy time
+    /// to a DNS-style name like `prod.zlayer.example` via a future
+    /// `--cluster-domain` flag.
+    pub cluster_domain: Option<String>,
     /// IP allocator for overlay network addresses (CIDR-aware, collision-safe)
     pub ip_allocator: Arc<RwLock<IpAllocator>>,
     /// Path for persisting IP allocator state
@@ -158,6 +172,8 @@ impl ClusterApiState {
             join_secret,
             cluster_signer: None,
             cluster_signing_key_path: None,
+            cluster_ca: None,
+            cluster_domain: None,
             ip_allocator,
             ip_allocator_path,
             internal_token: None,
@@ -187,6 +203,8 @@ impl ClusterApiState {
             join_secret,
             cluster_signer,
             cluster_signing_key_path: None,
+            cluster_ca: None,
+            cluster_domain: None,
             ip_allocator,
             ip_allocator_path,
             internal_token: Some(internal_token),
@@ -221,6 +239,8 @@ impl ClusterApiState {
             join_secret: None,
             cluster_signer: None,
             cluster_signing_key_path: None,
+            cluster_ca: None,
+            cluster_domain: None,
             ip_allocator: Arc::new(RwLock::new(allocator)),
             ip_allocator_path: None,
             internal_token: None,
@@ -720,6 +740,278 @@ pub async fn cluster_signing_pubkey(
         public_key_b64: signer.public_key_b64(),
         kid: signer.key_id(),
     }))
+}
+
+/// Public trust bundle for this cluster.
+///
+/// `GET /api/v1/cluster/trust-bundle`
+///
+/// Returns the cluster's long-lived CA pubkey plus cluster domain.
+/// Intentionally unauthenticated — the data is a public key, and
+/// federation requires importers to be able to fetch the bundle
+/// without first establishing trust.
+///
+/// # Errors
+///
+/// - [`ApiError::ServiceUnavailable`] if no CA is attached on this
+///   node (`cluster_ca` is `None`).
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/trust-bundle",
+    responses(
+        (status = 200, description = "Cluster trust bundle", body = zlayer_types::api::cluster::TrustBundle),
+        (status = 503, description = "CA not configured on this node"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_trust_bundle(
+    State(state): State<ClusterApiState>,
+) -> Result<Json<zlayer_types::api::cluster::TrustBundle>> {
+    let ca = state.cluster_ca.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("cluster CA not configured on this node".into())
+    })?;
+    let cluster_domain = state
+        .cluster_domain
+        .clone()
+        .ok_or_else(|| ApiError::ServiceUnavailable("cluster_domain not configured".into()))?;
+    Ok(Json(zlayer_types::api::cluster::TrustBundle {
+        v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+        cluster_domain,
+        ca_public_key_b64: ca.ca_public_key_b64(),
+        ca_kid: ca.ca_kid(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+// =============================================================================
+// Wave 9D-ii: federated trust-bundle admin endpoints
+// =============================================================================
+
+/// Import a foreign cluster's trust bundle.
+///
+/// `POST /api/v1/cluster/trust-imports`
+///
+/// Admin-only. Proposes `SecretsRaftOp::ImportTrustBundle` so every
+/// node in this cluster converges on the same federated trust set
+/// within one Raft commit. Idempotent at the state-machine layer —
+/// re-importing the same `cluster_domain` overwrites in place.
+///
+/// Basic shape validation runs leader-side BEFORE proposing (saves a
+/// commit when the bundle is obviously malformed): non-empty
+/// `cluster_domain`, `v == TRUST_BUNDLE_FORMAT_VERSION`,
+/// `ca_kid.len() == 8`, `ca_public_key_b64` decodes to exactly 32
+/// bytes. Deep cryptographic validation (does this pubkey actually
+/// belong to that domain?) is out of scope — the operator is trusting
+/// the bundle by importing it; the validator pipeline will reject any
+/// `CaCert` that doesn't verify against the imported pubkey.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `BadRequest` for shape failures.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+/// - `Internal` on Raft propose failure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/trust-imports",
+    request_body = ImportTrustBundleRequest,
+    responses(
+        (status = 200, description = "Import accepted", body = ImportTrustBundleResponse),
+        (status = 400, description = "Malformed bundle"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_import_trust_bundle(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+    Json(req): Json<zlayer_types::api::cluster::ImportTrustBundleRequest>,
+) -> Result<Json<zlayer_types::api::cluster::ImportTrustBundleResponse>> {
+    use base64::Engine;
+
+    actor.require_admin()?;
+
+    let bundle = req.bundle;
+
+    if bundle.cluster_domain.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "cluster_domain must be non-empty".into(),
+        ));
+    }
+    if bundle.v != zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported TrustBundle version: got {}, expected {}",
+            bundle.v,
+            zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION
+        )));
+    }
+    if bundle.ca_kid.len() != 8
+        || !bundle
+            .ca_kid
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(ApiError::BadRequest(
+            "ca_kid must be exactly 8 lowercase hex chars".into(),
+        ));
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(bundle.ca_public_key_b64.as_bytes())
+        .map_err(|e| ApiError::BadRequest(format!("ca_public_key_b64 base64 decode: {e}")))?;
+    if decoded.len() != 32 {
+        return Err(ApiError::BadRequest(format!(
+            "ca_public_key_b64 wrong length: expected 32 bytes, got {}",
+            decoded.len()
+        )));
+    }
+    // Sanity check: ca_kid should match SHA-256(pubkey)[..4] hex.
+    {
+        let mut hasher = Sha256::new();
+        hasher.update(&decoded);
+        let digest = hasher.finalize();
+        let expected_kid: String = hex::encode(&digest[..4]);
+        if expected_kid != bundle.ca_kid {
+            return Err(ApiError::BadRequest(format!(
+                "ca_kid {} does not match SHA-256(pubkey)[..4]={}",
+                bundle.ca_kid, expected_kid
+            )));
+        }
+    }
+
+    let cluster_domain = bundle.cluster_domain.clone();
+    let ca_kid = bundle.ca_kid.clone();
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    raft.propose_secrets_op(
+        zlayer_types::api::internal::SecretsRaftOp::ImportTrustBundle { bundle },
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("importing trust bundle via Raft: {e}")))?;
+
+    info!(
+        cluster_domain = %cluster_domain,
+        ca_kid = %ca_kid,
+        source_url = ?req.source_url,
+        "trust bundle imported"
+    );
+
+    Ok(Json(
+        zlayer_types::api::cluster::ImportTrustBundleResponse {
+            cluster_domain,
+            ca_kid,
+        },
+    ))
+}
+
+/// List currently-trusted foreign-cluster bundles.
+///
+/// `GET /api/v1/cluster/trust-bundles`
+///
+/// Admin-only. Reads `trusted_bundles` from the local Raft state
+/// machine snapshot, sorted by `cluster_domain` for stability.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/trust-bundles",
+    responses(
+        (status = 200, description = "Trusted bundles listing", body = TrustedBundlesResponse),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_list_trust_bundles(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+) -> Result<Json<zlayer_types::api::cluster::TrustedBundlesResponse>> {
+    actor.require_admin()?;
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    let secrets_state = raft.secrets_state().await;
+
+    let mut bundles: Vec<zlayer_types::api::cluster::TrustedBundleEntry> = secrets_state
+        .trusted_bundles
+        .values()
+        .map(|b| zlayer_types::api::cluster::TrustedBundleEntry {
+            cluster_domain: b.cluster_domain.clone(),
+            ca_kid: b.ca_kid.clone(),
+            ca_public_key_b64: b.ca_public_key_b64.clone(),
+            generated_at: b.generated_at.clone(),
+            source_url: None,
+        })
+        .collect();
+    bundles.sort_by(|a, b| a.cluster_domain.cmp(&b.cluster_domain));
+
+    Ok(Json(zlayer_types::api::cluster::TrustedBundlesResponse {
+        bundles,
+    }))
+}
+
+/// Remove a previously-imported trust bundle.
+///
+/// `DELETE /api/v1/cluster/trust-imports/{cluster_domain}`
+///
+/// Admin-only. Proposes `SecretsRaftOp::RemoveTrustBundle`. Idempotent
+/// — removing an unknown domain is a no-op success.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the actor lacks admin role.
+/// - `BadRequest` if `cluster_domain` path param is empty.
+/// - `ServiceUnavailable` if no Raft coordinator is attached.
+/// - `Internal` on Raft propose failure.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/cluster/trust-imports/{cluster_domain}",
+    params(
+        ("cluster_domain" = String, Path, description = "Cluster domain to forget")
+    ),
+    responses(
+        (status = 204, description = "Removed (or was already absent)"),
+        (status = 400, description = "Empty cluster_domain"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_remove_trust_bundle(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(cluster_domain): axum::extract::Path<String>,
+) -> Result<axum::http::StatusCode> {
+    actor.require_admin()?;
+
+    if cluster_domain.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "cluster_domain must be non-empty".into(),
+        ));
+    }
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    raft.propose_secrets_op(
+        zlayer_types::api::internal::SecretsRaftOp::RemoveTrustBundle {
+            cluster_domain: cluster_domain.clone(),
+        },
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("removing trust bundle via Raft: {e}")))?;
+
+    info!(cluster_domain = %cluster_domain, "trust bundle removed");
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/cluster/signing-pubkeys` — return ALL currently-trusted
@@ -2021,52 +2313,133 @@ async fn validate_join_token_ed25519(
     // 2. Parse as SignedClusterJoinToken.
     let envelope: SignedClusterJoinToken = serde_json::from_slice(&bytes)
         .map_err(|e| ApiError::Unauthorized(format!("token envelope parse failed: {e}")))?;
-    if envelope.v != SIGNED_TOKEN_V_WAVE3 {
+    if envelope.v != SIGNED_TOKEN_V_WAVE3 && envelope.v != SIGNED_TOKEN_V_WAVE9 {
         return Err(ApiError::Unauthorized(format!(
-            "unsupported signed token version: got v={}, expected v={}",
-            envelope.v, SIGNED_TOKEN_V_WAVE3
+            "unsupported signed token version: got v={}, expected v={} or v={}",
+            envelope.v, SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
         )));
     }
 
     // 3. Resolve the verifying key for `envelope.kid`.
-    //    - With a keystore path: `load_signer_for_kid` returns `None` for
-    //      unknown kids OR kids whose grace has expired. Either way, reject.
-    //      No explicit kid-mismatch check is needed because the lookup
-    //      itself acts as the filter.
-    //    - Without a keystore path: fall back to active-signer-only behavior.
-    let verifying_key = if let Some(path) = state.cluster_signing_key_path.as_ref() {
-        match zlayer_secrets::load_signer_for_kid(path, &envelope.kid).await {
-            Ok(Some(s)) => s.verifying_key(),
-            Ok(None) => {
+    //
+    // Two-path resolution (Wave 9D-iii):
+    //   - **Local path (v=1 always, v=2 same-cluster):** look up `kid`
+    //     in our own keystore (or fall back to the active single
+    //     signer). If found, this is a token minted by us; use that
+    //     verifying key.
+    //   - **Federation path (v=2 only):** when local resolution returns
+    //     "kid not trusted" AND the envelope carries a `ca_chain`,
+    //     consult our imported `trusted_bundles` (via Raft) to verify
+    //     the cert against a known CA pubkey, then trust the leaf
+    //     pubkey carried by the cert. The cert's `active_kid` must
+    //     match `envelope.kid` and the cert must not be expired.
+    let local_verifying_key: Option<ed25519_dalek::VerifyingKey> =
+        if let Some(path) = state.cluster_signing_key_path.as_ref() {
+            match zlayer_secrets::load_signer_for_kid(path, &envelope.kid).await {
+                Ok(Some(s)) => Some(s.verifying_key()),
+                Ok(None) => None,
+                Err(e) => {
+                    return Err(ApiError::Internal(format!(
+                        "cluster signing keystore lookup failed: {e}"
+                    )));
+                }
+            }
+        } else if let Some(signer) = state.cluster_signer.as_ref() {
+            if envelope.kid == signer.key_id() {
+                Some(signer.verifying_key())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let (verifying_key, federation_meta) = if let Some(key) = local_verifying_key {
+        (key, None)
+    } else if envelope.v == SIGNED_TOKEN_V_WAVE9 {
+        // Federation path. The kid is unknown locally; the token must
+        // carry a CaCert binding it to a foreign cluster whose
+        // TrustBundle we've imported.
+        let cert = envelope.ca_chain.as_ref().ok_or_else(|| {
+            warn!(
+                event = "join_token_ed25519_failed",
+                kind = "v2_missing_ca_chain",
+                kid = %envelope.kid,
+                peer_ip = %peer_ip,
+            );
+            ApiError::Unauthorized(
+                "v=2 token rejected: kid not local and ca_chain is absent".into(),
+            )
+        })?;
+        let raft = state.raft.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "Raft coordinator unavailable; cannot consult trust bundles".into(),
+            )
+        })?;
+        let secrets_state = raft.secrets_state().await;
+        let bundle = secrets_state
+            .trust_bundle_for(&cert.cluster_domain)
+            .ok_or_else(|| {
                 warn!(
                     event = "join_token_ed25519_failed",
-                    kind = "kid_not_trusted",
+                    kind = "unknown_cluster_domain",
+                    cluster_domain = %cert.cluster_domain,
                     kid = %envelope.kid,
                     peer_ip = %peer_ip,
                 );
-                return Err(ApiError::Unauthorized(format!(
-                    "signed token kid={} not trusted (unknown kid, expired grace, or never issued)",
-                    envelope.kid
-                )));
-            }
-            Err(e) => {
-                return Err(ApiError::Internal(format!(
-                    "cluster signing keystore lookup failed: {e}"
-                )));
-            }
-        }
-    } else {
-        let signer = state.cluster_signer.as_ref().ok_or_else(|| {
-            ApiError::ServiceUnavailable("cluster signer not configured on this node".into())
-        })?;
-        if envelope.kid != signer.key_id() {
+                ApiError::Unauthorized(format!(
+                    "v=2 token's ca_chain.cluster_domain={} is not in this cluster's trusted bundles",
+                    cert.cluster_domain
+                ))
+            })?;
+        zlayer_secrets::ClusterCa::verify_ca_cert(&bundle.ca_public_key_b64, cert).map_err(
+            |e| {
+                warn!(
+                    event = "join_token_ed25519_failed",
+                    kind = "ca_cert_invalid",
+                    cluster_domain = %cert.cluster_domain,
+                    kid = %envelope.kid,
+                    peer_ip = %peer_ip,
+                    error = %e,
+                );
+                ApiError::Unauthorized(format!("v=2 token's ca_chain failed CA verification: {e}"))
+            },
+        )?;
+        if cert.active_kid != envelope.kid {
             return Err(ApiError::Unauthorized(format!(
-                "kid mismatch: token says {}, expected {}",
-                envelope.kid,
-                signer.key_id()
+                "v=2 token: ca_chain.active_kid={} does not match envelope.kid={}",
+                cert.active_kid, envelope.kid
             )));
         }
-        signer.verifying_key()
+        // Decode the CA-asserted active pubkey for leaf-sig
+        // verification. The CA's signature (verified just above) is
+        // what makes this pubkey trustworthy.
+        let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cert.active_pubkey_b64.as_bytes())
+            .map_err(|e| {
+                ApiError::Unauthorized(format!("ca_chain.active_pubkey_b64 base64 decode: {e}"))
+            })?;
+        let pubkey_arr: [u8; 32] = pubkey_bytes.as_slice().try_into().map_err(|_| {
+            ApiError::Unauthorized(format!(
+                "ca_chain.active_pubkey_b64 wrong length: {}",
+                pubkey_bytes.len()
+            ))
+        })?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr).map_err(|e| {
+            ApiError::Unauthorized(format!("ca_chain.active_pubkey_b64 invalid: {e}"))
+        })?;
+        (key, Some(cert.cluster_domain.clone()))
+    } else {
+        warn!(
+            event = "join_token_ed25519_failed",
+            kind = "kid_not_trusted",
+            kid = %envelope.kid,
+            peer_ip = %peer_ip,
+        );
+        return Err(ApiError::Unauthorized(format!(
+            "signed token kid={} not trusted (unknown kid, expired grace, or never issued)",
+            envelope.kid
+        )));
     };
 
     // 4. Verify Ed25519 signature over `serde_json::to_vec(&envelope.claims)`.
@@ -2136,9 +2509,14 @@ async fn validate_join_token_ed25519(
     }
 
     info!(
-        format = "ed25519",
+        format = if envelope.v == SIGNED_TOKEN_V_WAVE9 {
+            "ed25519_v2"
+        } else {
+            "ed25519"
+        },
         kid = %envelope.kid,
         iss = %envelope.claims.iss,
+        federated_from = ?federation_meta,
         peer_ip = %peer_ip,
         "accepted cluster join token"
     );
@@ -2682,6 +3060,7 @@ mod tests {
             kid: signer.key_id(),
             claims: claims.clone(),
             sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+            ca_chain: None,
         };
         let envelope_bytes = serde_json::to_vec(&envelope).expect("serialize envelope");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes)
@@ -2787,9 +3166,14 @@ mod tests {
             .await
             .expect_err("kid mismatch must be rejected");
         match err {
+            // Wave 9D-iii: the no-keystore-path branch now treats a
+            // kid mismatch identically to "kid not trusted" (since
+            // both mean "we have no verifying key for this kid").
+            // Semantically equivalent rejection; message wording
+            // changed.
             ApiError::Unauthorized(msg) => assert!(
-                msg.contains("kid mismatch"),
-                "expected kid-mismatch error; got {msg:?}"
+                msg.contains("not trusted") && msg.contains(&signer_a.key_id()),
+                "expected kid-not-trusted error citing the unknown kid; got {msg:?}"
             ),
             other => panic!("expected Unauthorized; got {other:?}"),
         }
@@ -2816,6 +3200,7 @@ mod tests {
             kid: signer.key_id(),
             claims: tampered_claims,
             sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+            ca_chain: None,
         };
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes);
@@ -2863,6 +3248,7 @@ mod tests {
             kid: signer.key_id(),
             claims: claims.clone(),
             sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+            ca_chain: None,
         };
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes);
@@ -3551,5 +3937,116 @@ mod tests {
             (23 * 60..=25 * 60).contains(&delta),
             "expected ~24h fallback expiry for garbage; got delta_min={delta}"
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_trust_bundle_returns_503_when_ca_unconfigured() {
+        let state = ClusterApiState::placeholder();
+        let err = cluster_trust_bundle(State(state))
+            .await
+            .expect_err("must error when no CA is attached");
+        assert!(
+            err.to_string().contains("CA not configured")
+                || err.to_string().contains("unavailable"),
+            "expected ServiceUnavailable; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_trust_bundle_returns_well_formed_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("cluster_ca.key");
+        let ca = std::sync::Arc::new(
+            zlayer_secrets::ClusterCa::load_or_generate(&ca_path)
+                .await
+                .unwrap(),
+        );
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_ca = Some(ca.clone());
+        state.cluster_domain = Some("test-cluster-domain".into());
+
+        let resp = cluster_trust_bundle(State(state)).await.unwrap();
+        let bundle = resp.0;
+        assert_eq!(bundle.cluster_domain, "test-cluster-domain");
+        assert_eq!(bundle.ca_kid, ca.ca_kid());
+        assert_eq!(bundle.ca_public_key_b64, ca.ca_public_key_b64());
+        assert_eq!(
+            bundle.v,
+            zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave 9D-ii: federated trust-bundle admin endpoints
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_import_trust_bundle_403_for_non_admin() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_user_actor();
+        let req = zlayer_types::api::cluster::ImportTrustBundleRequest {
+            bundle: zlayer_types::api::cluster::TrustBundle {
+                v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+                cluster_domain: "x".into(),
+                ca_public_key_b64: "AAAA".into(),
+                ca_kid: "deadbeef".into(),
+                generated_at: chrono::Utc::now().to_rfc3339(),
+            },
+            source_url: None,
+        };
+        let err = cluster_import_trust_bundle(actor, State(state), Json(req))
+            .await
+            .expect_err("non-admin must be forbidden");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_import_trust_bundle_400_for_empty_domain() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = zlayer_types::api::cluster::ImportTrustBundleRequest {
+            bundle: zlayer_types::api::cluster::TrustBundle {
+                v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+                cluster_domain: "  ".into(),
+                ca_public_key_b64: "AAAA".into(),
+                ca_kid: "deadbeef".into(),
+                generated_at: chrono::Utc::now().to_rfc3339(),
+            },
+            source_url: None,
+        };
+        let err = cluster_import_trust_bundle(actor, State(state), Json(req))
+            .await
+            .expect_err("empty domain must be rejected");
+        assert!(err.to_string().contains("cluster_domain"));
+    }
+
+    #[tokio::test]
+    async fn cluster_import_trust_bundle_400_for_bad_pubkey_length() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = zlayer_types::api::cluster::ImportTrustBundleRequest {
+            bundle: zlayer_types::api::cluster::TrustBundle {
+                v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+                cluster_domain: "test".into(),
+                ca_public_key_b64: "AAAA".into(), // decodes to 3 bytes, not 32
+                ca_kid: "deadbeef".into(),
+                generated_at: chrono::Utc::now().to_rfc3339(),
+            },
+            source_url: None,
+        };
+        let err = cluster_import_trust_bundle(actor, State(state), Json(req))
+            .await
+            .expect_err("short pubkey must be rejected");
+        assert!(err.to_string().contains("32 bytes") || err.to_string().contains("wrong length"));
+    }
+
+    #[tokio::test]
+    async fn cluster_list_trust_bundles_503_when_no_raft() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let err = cluster_list_trust_bundles(actor, State(state))
+            .await
+            .expect_err("must error when no raft coordinator is attached");
+        assert!(err.to_string().contains("Raft") || err.to_string().contains("unavailable"));
     }
 }

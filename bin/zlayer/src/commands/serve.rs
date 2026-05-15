@@ -1620,6 +1620,19 @@ pub(crate) async fn serve_with_external_shutdown(
         Arc::new(signer)
     };
 
+    // Wave 9: long-lived cluster CA. Generated once per cluster at
+    // first daemon start; NEVER rotated. Used to issue CaCerts
+    // embedded in v=2 signed join tokens so foreign clusters that
+    // imported this cluster's TrustBundle can validate them.
+    let cluster_ca = {
+        let path = config.data_dir.join("cluster_ca.key");
+        let ca = zlayer_secrets::ClusterCa::load_or_generate(&path)
+            .await
+            .context("loading or generating cluster CA")?;
+        info!(ca_kid = %ca.ca_kid(), path = %path.display(), "loaded cluster CA");
+        Some(std::sync::Arc::new(ca))
+    };
+
     // -----------------------------------------------------------------------
     // 3b'. Load (or generate + persist) the daemon UUID. This stamps every
     // hex container ID minted via `ContainerIdMap::compute_hex` so the same
@@ -2130,6 +2143,8 @@ pub(crate) async fn serve_with_external_shutdown(
     // (Wave 5A.3) and `cluster_rotate_signing_key` (Wave 5B.4) can look
     // up signers by `kid` and rotate the keystore on demand.
     cluster_state.cluster_signing_key_path = Some(config.data_dir.join("cluster_signing.key"));
+    cluster_state.cluster_ca.clone_from(&cluster_ca);
+    cluster_state.cluster_domain = Some(node_config.node_id.clone());
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 

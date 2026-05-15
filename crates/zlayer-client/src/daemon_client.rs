@@ -4932,6 +4932,66 @@ impl DaemonClient {
         Self::parse_json(&resp)
     }
 
+    /// Fetch this cluster's public trust bundle.
+    ///
+    /// `GET /api/v1/cluster/trust-bundle` (unauthenticated by design — the
+    /// data is a public key). Returns the local cluster's CA pubkey +
+    /// `cluster_domain` in a form that can be transported out-of-band to
+    /// a peer cluster and imported there.
+    pub async fn cluster_export_trust_bundle(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::TrustBundle> {
+        let (status, resp) = self.get("/api/v1/cluster/trust-bundle").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Import a foreign cluster's trust bundle.
+    ///
+    /// `POST /api/v1/cluster/trust-imports` (admin auth required). The
+    /// server validates shape, then proposes a Raft op so the import
+    /// is replicated to every node before this method returns.
+    pub async fn cluster_import_trust_bundle(
+        &self,
+        req: &zlayer_types::api::cluster::ImportTrustBundleRequest,
+    ) -> Result<zlayer_types::api::cluster::ImportTrustBundleResponse> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialize ImportTrustBundleRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/trust-imports", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// List currently-trusted foreign-cluster bundles.
+    ///
+    /// `GET /api/v1/cluster/trust-bundles` (admin auth required).
+    /// Returns a point-in-time view of `SecretsState::trusted_bundles`
+    /// on this node — sorted by `cluster_domain` for stability.
+    pub async fn cluster_list_trust_bundles(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::TrustedBundlesResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/trust-bundles").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Remove a previously-imported trust bundle.
+    ///
+    /// `DELETE /api/v1/cluster/trust-imports/{cluster_domain}` (admin
+    /// auth required). Idempotent — removing an unknown domain is a
+    /// no-op success.
+    pub async fn cluster_remove_trust_bundle(&self, cluster_domain: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/cluster/trust-imports/{}",
+            urlencoding(cluster_domain)
+        );
+        let (status, resp) = self.delete(&path).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Overlay (typed)
     // ------------------------------------------------------------------

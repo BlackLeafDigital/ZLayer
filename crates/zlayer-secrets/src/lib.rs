@@ -46,8 +46,8 @@ mod vault;
 
 pub use cluster_dek::ClusterDek;
 pub use cluster_signer::{
-    list_valid_pubkeys, load_signer_for_kid, prune_expired_grace, rotate_keystore, ClusterSigner,
-    FileBackend, KeystoreRotationResult, PubkeyInfo, PubkeyStatus, SigningBackend,
+    list_valid_pubkeys, load_signer_for_kid, prune_expired_grace, rotate_keystore, ClusterCa,
+    ClusterSigner, FileBackend, KeystoreRotationResult, PubkeyInfo, PubkeyStatus, SigningBackend,
 };
 pub use encryption::EncryptionKey;
 pub use error::{Result, SecretsError};
