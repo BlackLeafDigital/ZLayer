@@ -28,6 +28,7 @@ use zlayer_api::{
 use zlayer_overlay::NatConfig;
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
+use zlayer_scheduler::raft::{BootstrapState, CoordinatorInit};
 use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
@@ -309,6 +310,14 @@ pub struct DaemonState {
 
     /// Background task for log rotation (hourly).
     pub log_rotator_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Handle for the background task that periodically prunes expired
+    /// grace entries from the cluster signing keystore (Wave 5A.5).
+    /// Spawned once at init; never cancelled during normal operation.
+    /// The `JoinHandle` is retained on `DaemonState` so the task lives for the
+    /// lifetime of the daemon and is aborted during shutdown (see
+    /// `commands/serve.rs` teardown sequence).
+    pub keystore_pruner_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Background task for L4 stream backend health checking.
     pub health_checker_handle: Option<tokio::task::JoinHandle<()>>,
@@ -924,6 +933,17 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     info!("Log rotation background task started");
 
     // -----------------------------------------------------------------------
+    // Phase 12b: Cluster signing keystore prune background task (Wave 5A.5)
+    // -----------------------------------------------------------------------
+    let keystore_pruner_handle = {
+        let path = config.data_dir.join("cluster_signing.key");
+        Some(tokio::spawn(async move {
+            keystore_prune_loop(path).await;
+        }))
+    };
+    info!("Cluster signing keystore prune background task started");
+
+    // -----------------------------------------------------------------------
     // Phase 13: Node configuration (auto-init if first run)
     // -----------------------------------------------------------------------
     let mut node_config = load_or_init_node_config(&config.data_dir).await?;
@@ -985,21 +1005,26 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         )
         .await
         {
-            Ok(coordinator) => {
-                // Bootstrap as single-node cluster if this is the leader (first node)
+            Ok(CoordinatorInit {
+                coordinator,
+                bootstrap_state,
+            }) => {
+                // Bootstrap as single-node cluster if this is the leader AND we
+                // didn't just load existing state from disk. The scheduler reports
+                // BootstrapState::Resuming after detecting prior raft-log/raft-sm
+                // files at construction time — calling bootstrap() in that case
+                // would trigger openraft's internal `error!("Can not initialize")`
+                // even though the daemon would still recover. Gating here keeps
+                // restart logs clean.
                 if node_config.is_leader {
-                    // Check metrics before bootstrapping to avoid openraft's
-                    // internal ERROR log ("Can not initialize") on restart.
-                    let metrics = coordinator.metrics();
-                    if metrics.current_term > 0 {
-                        info!("Raft already bootstrapped (resuming from persisted state)");
-                    } else {
-                        match coordinator.bootstrap().await {
-                            Ok(()) => info!("Raft single-node cluster bootstrapped"),
-                            Err(e) => {
-                                info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
-                            }
+                    match bootstrap_state {
+                        BootstrapState::Resuming => {
+                            info!("Raft already bootstrapped (resuming from persisted state)");
                         }
+                        BootstrapState::Fresh => match coordinator.bootstrap().await {
+                            Ok(()) => info!("Raft single-node cluster bootstrapped"),
+                            Err(e) => warn!("Raft bootstrap failed unexpectedly: {e}"),
+                        },
                     }
 
                     // Register the leader node in the Raft state machine so it
@@ -1364,6 +1389,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         stream_registry,
         cert_manager,
         log_rotator_handle,
+        keystore_pruner_handle,
         health_checker_handle: Some(health_checker_handle),
         nat_maintenance_handle,
         node_config,
@@ -1682,6 +1708,46 @@ async fn log_rotation_loop(log_dir: &std::path::Path, data_dir: &std::path::Path
         // Phase 3: Clean up old log files in the daemon log directory
         if let Err(e) = cleanup_old_logs(log_dir).await {
             warn!(error = %e, "Log cleanup encountered an error");
+        }
+    }
+}
+
+/// Background task: every hour, prune expired grace entries from the
+/// cluster signing keystore.
+///
+/// Mirrors the pattern of [`log_rotation_loop`]: infinite loop, sleep,
+/// do work, log warnings on error, continue. Spawned once during daemon
+/// init (Phase 12b) and held alive via
+/// [`DaemonState::keystore_pruner_handle`].
+///
+/// The actual pruning logic lives in [`zlayer_secrets::prune_expired_grace`],
+/// which removes any `retired_grace_until` entries whose timestamp has passed
+/// and the matching `keys` entries, persisting if anything changed.
+async fn keystore_prune_loop(keystore_path: std::path::PathBuf) {
+    const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+    loop {
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+        match zlayer_secrets::prune_expired_grace(&keystore_path).await {
+            Ok(0) => {
+                tracing::debug!(
+                    path = %keystore_path.display(),
+                    "cluster signing keystore prune: no expired grace entries"
+                );
+            }
+            Ok(n) => {
+                tracing::info!(
+                    path = %keystore_path.display(),
+                    pruned = n,
+                    "cluster signing keystore prune: removed expired grace entries"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %keystore_path.display(),
+                    error = %e,
+                    "cluster signing keystore prune failed; will retry next interval"
+                );
+            }
         }
     }
 }

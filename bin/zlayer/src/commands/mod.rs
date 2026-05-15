@@ -15,6 +15,7 @@ pub mod windows;
 
 pub mod audit_cmd;
 pub mod auth;
+pub mod cluster;
 pub mod container;
 pub mod credential;
 pub mod daemon;

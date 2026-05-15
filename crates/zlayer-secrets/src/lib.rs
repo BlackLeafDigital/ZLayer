@@ -15,6 +15,7 @@
 //! - `$secret://<env>/<KEY>/<field>` - With JSON field extraction
 
 pub mod cluster_dek;
+mod cluster_signer;
 mod encryption;
 mod error;
 mod jwt;
@@ -44,6 +45,10 @@ pub mod git_credentials;
 mod vault;
 
 pub use cluster_dek::ClusterDek;
+pub use cluster_signer::{
+    list_valid_pubkeys, load_signer_for_kid, prune_expired_grace, rotate_keystore, ClusterSigner,
+    FileBackend, KeystoreRotationResult, PubkeyInfo, PubkeyStatus, SigningBackend,
+};
 pub use encryption::EncryptionKey;
 pub use error::{Result, SecretsError};
 pub use jwt::{JwtSecretManager, ENV_JWT_SECRET};

@@ -4870,6 +4870,68 @@ impl DaemonClient {
         Self::parse_json(&resp)
     }
 
+    /// Trigger a cluster signing-key rotation.
+    ///
+    /// `POST /api/v1/cluster/rotate-signing-key`. The daemon owns the
+    /// leader-vs-worker decision: when this method is invoked on a worker
+    /// node the daemon forwards the request to the current Raft leader; on
+    /// the leader it rotates the on-disk keystore in place. The previously
+    /// active key is moved into a grace window (caller-controlled via
+    /// [`RotateSigningKeyRequest::grace`], default `7d`) where it continues
+    /// to verify in-flight join tokens until expiry.
+    ///
+    /// Wave 5B.4 added the server-side handler; Wave 5B.3 added this client
+    /// wrapper and the matching `zlayer node|cluster rotate-signing-key`
+    /// CLI subcommands so admins can drive the rotation without hand-rolling
+    /// curl invocations.
+    pub async fn cluster_rotate_signing_key(
+        &self,
+        req: &zlayer_types::api::cluster::RotateSigningKeyRequest,
+    ) -> Result<zlayer_types::api::cluster::RotateSigningKeyResponse> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialize RotateSigningKeyRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/rotate-signing-key", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Revoke a previously-issued cluster join token.
+    ///
+    /// `POST /api/v1/cluster/revoke-token` (admin auth required). The
+    /// server hashes the supplied `token_or_hash` to its canonical form
+    /// before proposing a `SecretsRaftOp::RevokeToken`, so every node
+    /// converges on the same revocation set within one Raft commit.
+    ///
+    /// Wave 7.4 added the server-side handler; Wave 7.6 added this
+    /// client wrapper and the matching `zlayer cluster revoke-token`
+    /// CLI subcommand.
+    pub async fn cluster_revoke_token(
+        &self,
+        req: &zlayer_types::api::cluster::RevokeTokenRequest,
+    ) -> Result<zlayer_types::api::cluster::RevokeTokenResponse> {
+        let body = serde_json::to_string(req).context("Failed to serialize RevokeTokenRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/revoke-token", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// List currently-active token revocations.
+    ///
+    /// `GET /api/v1/cluster/revocations` (admin auth required). Returns
+    /// a point-in-time view of the local Raft state machine's
+    /// un-expired revocations; entries auto-prune at apply time.
+    pub async fn cluster_list_revocations(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::RevocationListResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/revocations").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
     // ------------------------------------------------------------------
     // Overlay (typed)
     // ------------------------------------------------------------------

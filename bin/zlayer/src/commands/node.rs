@@ -1,7 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+use zlayer_types::api::cluster::{ClusterJoinClaims, SignedClusterJoinToken, SIGNED_TOKEN_V_WAVE3};
 
 #[cfg(not(unix))]
 use crate::ui::consent::ConsentMode;
@@ -19,6 +22,14 @@ pub(crate) use crate::daemon::{
 };
 
 /// Join token payload
+///
+/// Wave 6 (v0.13.0): the `auth_secret` field is no longer part of the type.
+/// Plaintext tokens are no longer accepted server-side; this struct survives
+/// only as a parser for the modern (Ed25519 + HS256) token formats' shared
+/// metadata (endpoint/CIDR/pubkey). Extra fields encountered during decode
+/// (e.g. `auth_secret` in a stale v0.11.x-minted plaintext token) are
+/// tolerated by `serde_json` and silently dropped — the token still won't
+/// authenticate because the server-side acceptance gate is gone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClusterJoinToken {
     /// Leader's API endpoint
@@ -29,8 +40,6 @@ struct ClusterJoinToken {
     leader_wg_pubkey: String,
     /// Overlay network CIDR
     overlay_cidr: String,
-    /// Cluster authentication secret
-    auth_secret: String,
     /// Token creation timestamp
     created_at: String,
 }
@@ -132,7 +141,13 @@ struct NodeStatus {
 // Helper functions
 // =============================================================================
 
-/// Generate a secure random token
+/// Generate a secure random token.
+///
+/// Wave 6 (v0.13.0): runtime callers no longer mint random join secrets
+/// from the CLI — the daemon owns `{data_dir}/join_secret` (HS256) and
+/// the Ed25519 signer (`cluster_signing.key`). Kept for the unit tests
+/// in `#[cfg(test)] mod tests` that round-trip the parser.
+#[cfg(test)]
 fn generate_secure_token() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -171,7 +186,14 @@ pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConf
     }
 }
 
-/// Generate a join token for the cluster
+/// Generate a join token for the cluster.
+///
+/// Wave 6 (v0.13.0): used only by the round-trip test harness. The runtime
+/// CLI no longer mints plaintext tokens — `handle_node_generate_join_token`
+/// emits Ed25519 + HS256 only. This helper survives so the existing parser
+/// tests in `#[cfg(test)] mod tests` can keep verifying that
+/// `parse_cluster_join_token` still round-trips a self-encoded payload.
+#[cfg(test)]
 fn generate_join_token_data(
     advertise_addr: &str,
     api_port: u16,
@@ -184,7 +206,6 @@ fn generate_join_token_data(
         raft_endpoint: format!("{advertise_addr}:{raft_port}"),
         leader_wg_pubkey: wg_public_key.to_string(),
         overlay_cidr: overlay_cidr.to_string(),
-        auth_secret: generate_secure_token(),
         created_at: current_timestamp(),
     };
 
@@ -206,6 +227,127 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
         serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
 
     Ok(token_data)
+}
+
+/// Mint a Wave-3 signed cluster join token.
+///
+/// Produces the base64 url-safe-no-pad encoding of a `SignedClusterJoinToken`
+/// envelope:
+///   1. Canonically serialize `claims` to JSON bytes (declaration order).
+///   2. Sign with the cluster's `ClusterSigner`.
+///   3. Wrap claims + sig + kid + v=1 in an envelope.
+///   4. JSON-serialize the envelope and base64url-no-pad encode it.
+///
+/// The output is safe to copy-paste into chat/email/wiki: a single ASCII
+/// string, no line wraps, ~340 chars.
+///
+/// Wired into `handle_node_generate_join_token` (Wave 3.3); the server-side
+/// validator (Wave 3.4) and join-CLI (Wave 4) hold the matching parse/verify
+/// helpers below.
+pub fn mint_signed_cluster_join_token(
+    claims: &ClusterJoinClaims,
+    signer: &zlayer_secrets::ClusterSigner,
+) -> Result<String> {
+    let claims_bytes =
+        serde_json::to_vec(claims).context("serializing cluster join claims for signing")?;
+    let sig_bytes = signer.sign(&claims_bytes);
+    let envelope = SignedClusterJoinToken {
+        v: SIGNED_TOKEN_V_WAVE3,
+        kid: signer.key_id(),
+        claims: claims.clone(),
+        sig: URL_SAFE_NO_PAD.encode(sig_bytes),
+    };
+    let envelope_bytes =
+        serde_json::to_vec(&envelope).context("serializing signed cluster join token envelope")?;
+    Ok(URL_SAFE_NO_PAD.encode(envelope_bytes))
+}
+
+/// Parse a Wave-3 signed cluster join token from its base64 envelope form.
+///
+/// Does NOT verify the signature — that's `verify_signed_cluster_join_token`.
+/// Returns `Err` with an actionable message if the input isn't a well-formed
+/// envelope (wrong base64, wrong JSON shape, unsupported version).
+///
+/// `#[allow(dead_code)]` because Wave 3.2 only ships the helper; the
+/// server-side validator (Agent 3.4) and CLI join path (Wave 4) call it.
+#[allow(dead_code)]
+pub fn parse_signed_cluster_join_token(s: &str) -> Result<SignedClusterJoinToken> {
+    let s = s.trim();
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s)
+        .or_else(|_| STANDARD.decode(s))
+        .with_context(|| {
+            format!(
+                "decoding signed cluster join token base64 (len={})",
+                s.len()
+            )
+        })?;
+    let envelope: SignedClusterJoinToken = serde_json::from_slice(&bytes)
+        .context("parsing signed cluster join token envelope JSON")?;
+    if envelope.v != SIGNED_TOKEN_V_WAVE3 {
+        bail!(
+            "unsupported signed cluster join token version: got v={}, expected v={}",
+            envelope.v,
+            SIGNED_TOKEN_V_WAVE3,
+        );
+    }
+    Ok(envelope)
+}
+
+/// Verify a parsed signed cluster join token against a verifying key.
+///
+/// Checks:
+///   1. The `kid` in the envelope matches the verifying key's id.
+///   2. The signature decodes from base64.
+///   3. The signature validates against `serde_json::to_vec(&claims)` bytes.
+///   4. The `exp` timestamp is in the future (RFC3339 parse).
+///
+/// Replay protection (`(kid, iat, iss)` tuple deduplication) is the caller's
+/// responsibility — this helper is a pure cryptographic check.
+///
+/// `#[allow(dead_code)]` because Wave 3.2 only ships the helper; Wave 3.4
+/// will call it from the server-side validate path.
+#[allow(dead_code)]
+pub fn verify_signed_cluster_join_token<'a>(
+    token: &'a SignedClusterJoinToken,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    expected_kid: &str,
+) -> Result<&'a ClusterJoinClaims> {
+    if token.kid != expected_kid {
+        bail!(
+            "kid mismatch: token says {}, expected {}",
+            token.kid,
+            expected_kid
+        );
+    }
+    let sig_bytes_vec = URL_SAFE_NO_PAD
+        .decode(&token.sig)
+        .or_else(|_| STANDARD.decode(&token.sig))
+        .context("decoding signed cluster join token signature base64")?;
+    let sig_array: [u8; 64] = sig_bytes_vec.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "signature has wrong length: expected 64, got {}",
+            sig_bytes_vec.len()
+        )
+    })?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
+    let claims_bytes = serde_json::to_vec(&token.claims)
+        .context("re-serializing claims for signature verification")?;
+    verifying_key
+        .verify_strict(&claims_bytes, &sig)
+        .context("Ed25519 signature verification failed")?;
+    let now = chrono::Utc::now();
+    let exp = chrono::DateTime::parse_from_rfc3339(&token.claims.exp)
+        .with_context(|| format!("parsing token exp timestamp: {}", token.claims.exp))?
+        .with_timezone(&chrono::Utc);
+    if now >= exp {
+        bail!(
+            "signed cluster join token expired at {} (now {})",
+            token.claims.exp,
+            now.to_rfc3339()
+        );
+    }
+    Ok(&token.claims)
 }
 
 /// Write `bytes` to `path`, creating the file with restrictive permissions
@@ -416,6 +558,7 @@ pub(crate) async fn handle_node(
             handle_node_label(node_id.clone(), label.clone(), cli_data_dir).await
         }
         NodeCommands::ForceLeader { api_addr } => handle_node_force_leader(api_addr.clone()).await,
+        NodeCommands::RotateSigningKey { grace } => handle_node_rotate_signing_key(*grace).await,
         NodeCommands::Upgrade {
             version,
             cooldown_secs,
@@ -438,6 +581,7 @@ pub(crate) async fn handle_node(
             api,
             service,
             data_dir,
+            ttl,
         } => {
             let resolved_dir = data_dir
                 .clone()
@@ -447,6 +591,7 @@ pub(crate) async fn handle_node(
                 api.clone(),
                 service.clone(),
                 resolved_dir,
+                *ttl,
             )
             .await
         }
@@ -704,16 +849,11 @@ pub(crate) async fn handle_node_init(
         );
     }
 
-    // 11. Generate join token.
-    let join_token = generate_join_token_data(
-        &advertise_addr,
-        api_port,
-        raft_port,
-        &public_key,
-        &overlay_cidr,
-    )?;
-
-    // 12. Print success message.
+    // 11. Print success message.
+    //
+    // Wave 6 (v0.13.0): see the Unix init body above — plaintext join
+    // tokens are no longer minted at init time. Operator runs
+    // `zlayer node generate-join-token` after starting the daemon.
     println!();
     println!("Node initialized successfully!");
     println!();
@@ -736,11 +876,11 @@ pub(crate) async fn handle_node_init(
         }
     }
     println!();
-    println!("To join other nodes to this cluster, run:");
-    println!();
-    println!(
-        "  zlayer node join {advertise_addr}:{api_port} --token {join_token} --advertise-addr <NODE_IP>"
-    );
+    println!("Next steps:");
+    println!("  1. Start the API server:        zlayer serve --daemon");
+    println!("  2. Mint a signed join token:    zlayer node generate-join-token");
+    println!("  3. Run that command's output on other nodes:");
+    println!("       zlayer node join {advertise_addr}:{api_port} --token <TOKEN> --advertise-addr <NODE_IP>");
     println!();
     println!("Note: The API server starts automatically when deploying with 'zlayer deploy' or 'zlayer up'.");
 
@@ -910,16 +1050,14 @@ pub(crate) async fn handle_node_init(
     .await
     .context("Failed to register leader in Raft state")?;
 
-    // 8. Generate join token
-    let join_token = generate_join_token_data(
-        &advertise_addr,
-        api_port,
-        raft_port,
-        &public_key,
-        &overlay_cidr,
-    )?;
-
-    // 9. Print success message
+    // 8. Print success message.
+    //
+    // Wave 6 (v0.13.0): we no longer mint a plaintext join token inline.
+    // The daemon owns the cluster `join_secret` (created on first `zlayer
+    // serve` boot) and the Ed25519 signing key, so the join token must be
+    // requested via `zlayer node generate-join-token` AFTER the daemon
+    // starts. Printing a fake plaintext token here would be rejected by
+    // every server post-v0.13.0.
     println!();
     println!("Node initialized successfully!");
     println!();
@@ -942,11 +1080,11 @@ pub(crate) async fn handle_node_init(
         }
     }
     println!();
-    println!("To join other nodes to this cluster, run:");
-    println!();
-    println!(
-        "  zlayer node join {advertise_addr}:{api_port} --token {join_token} --advertise-addr <NODE_IP>"
-    );
+    println!("Next steps:");
+    println!("  1. Start the API server:        zlayer serve --daemon");
+    println!("  2. Mint a signed join token:    zlayer node generate-join-token");
+    println!("  3. Run that command's output on other nodes:");
+    println!("       zlayer node join {advertise_addr}:{api_port} --token <TOKEN> --advertise-addr <NODE_IP>");
     println!();
     println!("Note: The API server starts automatically when deploying with 'zlayer deploy' or 'zlayer up'.");
 
@@ -2577,7 +2715,7 @@ pub(crate) async fn handle_node_label(
 /// Sends a POST to the local API server's force-leader endpoint. Use this when
 /// the original leader is permanently lost and the surviving learner needs to
 /// take over the cluster.
-async fn handle_node_force_leader(api_addr: String) -> Result<()> {
+pub(crate) async fn handle_node_force_leader(api_addr: String) -> Result<()> {
     use std::time::Duration;
 
     println!("WARNING: Force-leader will make this node the new cluster leader.");
@@ -2621,6 +2759,121 @@ async fn handle_node_force_leader(api_addr: String) -> Result<()> {
     Ok(())
 }
 
+/// Rotate the cluster's Ed25519 signing keypair via the local daemon.
+///
+/// Sends `POST /api/v1/cluster/rotate-signing-key`. The daemon owns the
+/// leader-vs-worker decision: workers forward to the current Raft leader,
+/// the leader rotates in place. The previously active key is moved into a
+/// grace window controlled by `--grace` (default 7d on the server when
+/// omitted) so in-flight join tokens minted under the prior key continue
+/// to validate until the grace expires.
+///
+/// Wave 5B.3 wires this handler; the server-side endpoint shipped in
+/// Wave 5B.4 (`crates/zlayer-api/src/handlers/cluster.rs`). The same handler
+/// services both the dedicated `zlayer cluster rotate-signing-key` invocation
+/// and the alias `zlayer node rotate-signing-key`.
+pub(crate) async fn handle_node_rotate_signing_key(
+    grace: Option<humantime::Duration>,
+) -> Result<()> {
+    use zlayer_client::DaemonClient;
+    use zlayer_types::api::cluster::RotateSigningKeyRequest;
+
+    let req = RotateSigningKeyRequest {
+        // Humantime's `Display` impl matches the server-side parser, so a
+        // round-trip through `format_duration` keeps the on-wire string in
+        // the exact shape the daemon expects.
+        grace: grace.map(|d| humantime::format_duration(*d).to_string()),
+    };
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let resp = client
+        .cluster_rotate_signing_key(&req)
+        .await
+        .context("calling /api/v1/cluster/rotate-signing-key")?;
+
+    println!("Cluster signing key rotated.");
+    println!("  New active kid:        {}", resp.kid);
+    println!("  New public key (b64):  {}", resp.public_key_b64);
+    println!("  Previous kid (grace):  {}", resp.previous_kid);
+    println!("  Grace expires at:      {}", resp.previous_grace_until);
+    println!();
+    println!("In-flight tokens signed under the previous key will continue to validate");
+    println!("until the grace expiration above. After that, they are rejected.");
+    Ok(())
+}
+
+/// Handler for `zlayer cluster revoke-token <token-or-hash> [--reason ...]`.
+///
+/// Builds a [`RevokeTokenRequest`] and forwards to the daemon. The daemon
+/// hashes the input to its canonical form, proposes a
+/// `SecretsRaftOp::RevokeToken`, and the entry replicates to every node
+/// via Raft. On success this prints the canonical hash and pruning
+/// timestamp so the operator can correlate with subsequent
+/// `list-revocations` output.
+pub(crate) async fn handle_cluster_revoke_token(
+    token_or_hash: String,
+    reason: Option<String>,
+) -> Result<()> {
+    use zlayer_client::DaemonClient;
+    use zlayer_types::api::cluster::RevokeTokenRequest;
+
+    let req = RevokeTokenRequest {
+        token_or_hash,
+        reason,
+    };
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let resp = client
+        .cluster_revoke_token(&req)
+        .await
+        .context("calling /api/v1/cluster/revoke-token")?;
+
+    println!("Revoked join token");
+    println!("  token_hash: {}", resp.token_hash);
+    println!("  expires_at: {}", resp.expires_at);
+    println!(
+        "Propagated through Raft — every node will reject this hash until \
+         the entry is pruned at the listed expiry."
+    );
+    Ok(())
+}
+
+/// Handler for `zlayer cluster list-revocations`.
+///
+/// Reads the daemon's view of the Raft-replicated revocation list.
+/// Sorted soonest-to-prune first by the server; this just renders the
+/// list. Empty output ("(no revocations)") indicates the list is clean
+/// — either no revocations have ever been issued, or every prior one
+/// has already auto-pruned past its natural expiry.
+pub(crate) async fn handle_cluster_list_revocations() -> Result<()> {
+    use zlayer_client::DaemonClient;
+
+    let client = DaemonClient::connect()
+        .await
+        .context("Failed to connect to local zlayer daemon")?;
+    let resp = client
+        .cluster_list_revocations()
+        .await
+        .context("calling /api/v1/cluster/revocations")?;
+
+    if resp.revocations.is_empty() {
+        println!("(no revocations)");
+    } else {
+        println!(
+            "Active token revocations ({} total):",
+            resp.revocations.len()
+        );
+        for entry in &resp.revocations {
+            println!("  {}  expires_at={}", entry.token_hash, entry.expires_at);
+        }
+    }
+    Ok(())
+}
+
 /// Try to discover the deployment name from a `.zlayer.yml` / `*.zlayer.yml` spec
 /// in the current working directory.  Returns `None` if nothing is found.
 fn try_discover_deployment_name() -> Option<String> {
@@ -2629,69 +2882,280 @@ fn try_discover_deployment_name() -> Option<String> {
     Some(spec.deployment)
 }
 
-/// Handle node generate-join-token command
+/// Build a `ClusterJoinToken` from this node's on-disk state.
 ///
-/// When `api` or `deployment` are `None`, the function attempts to infer them:
-///   - `api`: read from the node config at `data_dir/node_config.json`.
-///     If no config exists, auto-initialize the node with sensible defaults.
-///   - `deployment`: discover from `*.zlayer.yml` / `.zlayer.yml` in the cwd.
-///     Falls back to `"default"` if nothing is found.
+/// Reads `node_config.json` (via [`load_or_init_node_config`]) and the
+/// `join_secret` file from `data_dir`. Returns an actionable error when the
+/// join secret is missing — that file is owned by the daemon and only
+/// materializes after `zlayer serve` runs at least once.
+///
+/// Returns a tuple of (`ClusterJoinToken`, `join_secret`). The token carries
+/// the public cluster metadata (endpoint, CIDR, leader pubkey, timestamp);
+/// the `join_secret` is the HMAC root used to mint the HS256 JWT alongside
+/// the Ed25519-signed token. Wave 6 (v0.13.0) split these because the
+/// plaintext format that used to bake the secret INTO the token body was
+/// removed — the caller threads `join_secret` directly into
+/// `mint_hs256_cluster_join_token` and does not embed it in any output.
+///
+/// Pulled out as a pure helper so unit tests can construct a token from a
+/// scratch data directory and round-trip it through
+/// [`parse_cluster_join_token`] without going through the `println!`-bearing
+/// CLI handler.
+async fn build_cluster_join_token_from_disk(
+    data_dir: &Path,
+    api_override: Option<String>,
+) -> Result<(ClusterJoinToken, String)> {
+    let node_config = load_or_init_node_config(data_dir).await?;
+
+    // The API endpoint embedded in the token is a bare `host:port`. When the
+    // caller passes an `--api` override it wins verbatim — that mirrors the
+    // documented behavior of the `--api` CLI flag.
+    let api_endpoint = api_override
+        .unwrap_or_else(|| format!("{}:{}", node_config.advertise_addr, node_config.api_port));
+
+    let raft_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.raft_port);
+
+    // The join secret is persisted by the daemon at `data_dir/join_secret`
+    // (see `bin/zlayer/src/commands/serve.rs`). If it doesn't exist the user
+    // has not yet started the daemon on this node, so there is no cluster
+    // secret to mint an HS256 token against — and silently generating one
+    // here would diverge from whatever the daemon mints on first boot,
+    // breaking every join attempt. Surface a precise, actionable error.
+    let join_secret_path = data_dir.join("join_secret");
+    let join_secret = match tokio::fs::read_to_string(&join_secret_path).await {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "join secret not found at {}; start the daemon (zlayer serve) at least once on this node before generating a join token",
+                join_secret_path.display()
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to read join secret at {}",
+                    join_secret_path.display()
+                )
+            });
+        }
+    };
+
+    if join_secret.is_empty() {
+        anyhow::bail!(
+            "join secret file at {} is empty; remove it and restart the daemon to regenerate it",
+            join_secret_path.display()
+        );
+    }
+
+    Ok((
+        ClusterJoinToken {
+            api_endpoint,
+            raft_endpoint,
+            leader_wg_pubkey: node_config.wireguard_public_key,
+            overlay_cidr: node_config.overlay_cidr,
+            created_at: current_timestamp(),
+        },
+        join_secret,
+    ))
+}
+
+/// Handle node generate-join-token command.
+///
+/// Emits the two modern formats unconditionally:
+///   1. **Signed (recommended)** — Wave-3 Ed25519-signed envelope
+///      (`SignedClusterJoinToken`). Carries an `exp` claim (`now() + ttl`)
+///      and is verified by the leader's `ClusterSigner` public key.
+///   2. **HS256 (modern alternative)** — HS256 JWT over an HMAC key derived
+///      from the cluster's `join_secret` (matches the
+///      `JoinTokenClaims` shape consumed by the leader's
+///      `validate_join_token_signed` in `zlayer-api`). Single-use via the
+///      embedded `jti`; the same `--ttl` controls its `exp`.
+///
+/// Wave 6 (v0.13.0): the legacy plaintext token format (`ClusterJoinToken`
+/// base64 of JSON with an embedded `auth_secret`) is no longer emitted —
+/// servers reject it outright. The `--legacy-plaintext` opt-in flag was
+/// also removed in the same wave.
+///
+/// `deployment` and `service` are no longer load-bearing — cluster joining is
+/// per-cluster, not per-deployment — but they are preserved as informational
+/// header output so existing invocations keep working without surprising the
+/// user. `api` continues to act as an override for the API endpoint embedded
+/// in the token; when omitted, the value is reconstructed from the on-disk
+/// `node_config.json`. `ttl` controls both the signed envelope's `exp` claim
+/// and the HS256 token's `exp`.
 pub(crate) async fn handle_node_generate_join_token(
     deployment: Option<String>,
     api: Option<String>,
     service: Option<String>,
     data_dir: PathBuf,
+    ttl: humantime::Duration,
 ) -> Result<()> {
-    use base64::Engine;
-
-    // --- Resolve the API endpoint ---
-    let api_endpoint = if let Some(a) = api {
-        a
-    } else {
-        let node_config = load_or_init_node_config(&data_dir).await?;
-        format!(
-            "http://{}:{}",
-            node_config.advertise_addr, node_config.api_port
-        )
-    };
-
-    // --- Resolve the deployment name ---
+    // --- Resolve the deployment name (informational only) ---
     let deployment_name = match deployment {
-        Some(d) => d,
+        Some(d) => Some(d),
         None => {
-            // Try to discover from spec files in the current directory
+            // Try to discover from spec files in the current directory. Unlike
+            // the previous implementation we do not fall back to "default" --
+            // the deployment field is purely informational now, so leaving it
+            // absent is cleaner than fabricating a meaningless placeholder.
             if let Some(name) = try_discover_deployment_name() {
                 info!(deployment = %name, "Auto-discovered deployment name from spec");
-                name
+                Some(name)
             } else {
-                warn!("No deployment spec found in current directory, using 'default'");
-                "default".to_string()
+                None
             }
         }
     };
 
-    let token_data = serde_json::json!({
-        "deployment": deployment_name,
-        "api_endpoint": api_endpoint,
-        "service": service,
-    });
+    // --- Build the underlying token data (also resolves the HMAC root for
+    //     the HS256 path). `build_cluster_join_token_from_disk` loads the
+    //     cluster's `join_secret` -- that same secret is the HMAC root for
+    //     the HS256 token below, so both modern formats describe the same
+    //     cluster in lockstep with the Ed25519-signed envelope.
+    let (token_data, join_secret) = build_cluster_join_token_from_disk(&data_dir, api).await?;
 
-    let json = serde_json::to_string(&token_data)?;
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json);
+    // --- Build the Wave-3 signed token ---
+    //
+    // Reuse the builder's resolved endpoint/CIDR/leader-WG fields so the
+    // two tokens describe the same cluster in lockstep. Load (or generate
+    // first-time) the signing key from the same on-disk path the daemon uses
+    // in `serve.rs`. We deliberately call `load_or_generate` here instead of
+    // talking to the daemon: this CLI is typically run on the leader host
+    // where the on-disk key is canonical, and it works even when the daemon
+    // is offline.
+    let signer =
+        zlayer_secrets::ClusterSigner::load_or_generate(&data_dir.join("cluster_signing.key"))
+            .await
+            .context("loading cluster signing key for signed-token mint")?;
 
+    // `iss` is the issuing node's UUID. We don't auto-init the node config
+    // here: if it's missing, the builder above would already have failed,
+    // so by this point we know `load_node_config` succeeds.
+    let node_config = load_node_config(&data_dir).await?;
+
+    let now = chrono::Utc::now();
+    let exp = now
+        + chrono::Duration::from_std(ttl.into())
+            .context("converting --ttl into chrono::Duration (overflow — try a shorter ttl)")?;
+    let claims = ClusterJoinClaims {
+        api_endpoint: token_data.api_endpoint.clone(),
+        raft_endpoint: token_data.raft_endpoint.clone(),
+        leader_wg_pubkey: token_data.leader_wg_pubkey.clone(),
+        overlay_cidr: token_data.overlay_cidr.clone(),
+        exp: exp.to_rfc3339(),
+        iat: now.to_rfc3339(),
+        iss: node_config.node_id.clone(),
+    };
+    let signed_token = mint_signed_cluster_join_token(&claims, &signer)
+        .context("minting signed cluster join token")?;
+
+    // --- Build the HS256 JWT (modern alternative) ---
+    //
+    // The leader's `validate_join_token_signed` (in
+    // `crates/zlayer-api/src/handlers/cluster.rs`) accepts HS256 JWTs whose
+    // claims are `{ iss: "zlayer-cluster", aud: "cluster-join", jti, exp,
+    // iat }`, signed with `SHA256("zlayer-join-token-v1\0" || join_secret)`
+    // as the HMAC key. We mirror that derivation here so the CLI doesn't
+    // need a daemon round-trip.
+    //
+    // `chrono::DateTime::timestamp()` returns `i64` (Unix seconds, signed
+    // to allow pre-epoch dates). Both values come from `Utc::now()` plus a
+    // non-negative `chrono::Duration`, so they're always >= 0 here, but we
+    // round-trip through `u64::try_from` to keep clippy::cast_sign_loss
+    // happy and to be defensive about a future code change to `now`'s
+    // source.
+    let iat_u64 = u64::try_from(now.timestamp())
+        .context("Unix timestamp for HS256 `iat` claim was negative; system clock is pre-1970")?;
+    let exp_u64 = u64::try_from(exp.timestamp()).context(
+        "Unix timestamp for HS256 `exp` claim was negative; --ttl underflowed the epoch",
+    )?;
+    let hs256_token = mint_hs256_cluster_join_token(&join_secret, iat_u64, exp_u64)
+        .context("minting HS256 cluster join token")?;
+
+    // --- Output ---
     println!("Join Token Generated");
     println!("====================\n");
-    println!("Deployment: {deployment_name}");
-    println!("API: {api_endpoint}");
-    if let Some(svc) = &service {
-        println!("Service: {svc}");
+    if let Some(d) = &deployment_name {
+        println!("Deployment (informational): {d}");
     }
-    println!("\nToken:");
-    println!("{token}");
+    println!("API: {}", token_data.api_endpoint);
+    println!("Raft: {}", token_data.raft_endpoint);
+    if let Some(svc) = &service {
+        println!("Service (informational): {svc}");
+    }
+
+    println!(
+        "\nSigned token (recommended, expires {}):",
+        exp.to_rfc3339()
+    );
+    println!("  kid: {}", signer.key_id());
+    println!("  {signed_token}");
+    println!();
+    println!("HS256 token (modern alternative):");
+    println!("  {hs256_token}");
+
     println!("\nUsage:");
-    println!("  zlayer node join <leader-addr> --token {token}");
+    println!("  zlayer node join <leader-addr> --token {signed_token}");
 
     Ok(())
+}
+
+/// Mint an HS256 cluster-join JWT matching the shape accepted by the leader's
+/// `validate_join_token_signed` validator.
+///
+/// Claims layout (must stay in lockstep with `JoinTokenClaims` in
+/// `crates/zlayer-api/src/handlers/cluster.rs`):
+/// * `iss` = `"zlayer-cluster"`
+/// * `aud` = `"cluster-join"`
+/// * `jti` = freshly minted UUID v4 (single-use, recorded in the leader's
+///   `used_jtis` after first redemption)
+/// * `iat`, `exp` = Unix seconds
+///
+/// HMAC key derivation matches `derive_join_hmac_key`:
+/// `SHA256("zlayer-join-token-v1\0" || join_secret)`. Keeping the derivation
+/// inline (rather than reaching into `zlayer-api` for a public helper)
+/// avoids pulling the API crate's full transitive graph into the CLI just
+/// for token minting; the two implementations are guarded by the unit tests
+/// below and the leader-side validation tests in `cluster.rs`.
+fn mint_hs256_cluster_join_token(
+    join_secret: &str,
+    iat_secs: u64,
+    exp_secs: u64,
+) -> Result<String> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use sha2::{Digest, Sha256};
+
+    #[derive(Serialize)]
+    struct Hs256JoinClaims {
+        iss: String,
+        aud: String,
+        jti: String,
+        exp: u64,
+        iat: u64,
+    }
+
+    let hmac_key = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zlayer-join-token-v1\0");
+        hasher.update(join_secret.as_bytes());
+        let out: [u8; 32] = hasher.finalize().into();
+        out
+    };
+
+    let claims = Hs256JoinClaims {
+        iss: "zlayer-cluster".to_string(),
+        aud: "cluster-join".to_string(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        exp: exp_secs,
+        iat: iat_secs,
+    };
+
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(&hmac_key),
+    )
+    .context("encoding HS256 cluster-join JWT")
 }
 
 // =============================================================================
@@ -2833,6 +3297,62 @@ mod tests {
             }
             _ => panic!("Expected Node Join command"),
         }
+    }
+
+    #[test]
+    fn test_cli_node_generate_join_token_default_ttl_is_24h() {
+        // Wave 3.3: `--ttl` defaults to `24h` (humantime), so omitting the flag
+        // should parse out a Duration equal to 24 hours.
+        let cli = Cli::try_parse_from(["zlayer", "node", "generate-join-token"]).unwrap();
+
+        match cli.command {
+            Some(Commands::Node(NodeCommands::GenerateJoinToken { ttl, .. })) => {
+                let expected = std::time::Duration::from_secs(24 * 60 * 60);
+                assert_eq!(
+                    std::time::Duration::from(ttl),
+                    expected,
+                    "default --ttl must be 24h"
+                );
+            }
+            _ => panic!("Expected Node GenerateJoinToken command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_node_generate_join_token_custom_ttl_parses() {
+        // Wave 3.3: `--ttl 1h` should propagate end-to-end into the parsed
+        // value (later mapped onto the signed token's `exp` claim).
+        let cli =
+            Cli::try_parse_from(["zlayer", "node", "generate-join-token", "--ttl", "1h"]).unwrap();
+
+        match cli.command {
+            Some(Commands::Node(NodeCommands::GenerateJoinToken { ttl, .. })) => {
+                assert_eq!(
+                    std::time::Duration::from(ttl),
+                    std::time::Duration::from_secs(3600),
+                    "--ttl 1h must parse to one hour"
+                );
+            }
+            _ => panic!("Expected Node GenerateJoinToken command"),
+        }
+    }
+
+    #[test]
+    fn generate_join_token_rejects_legacy_plaintext_flag() {
+        // Wave 6 (v0.13.0): the `--legacy-plaintext` opt-in (Wave 4.1) is
+        // gone. Clap must hard-reject it as an unknown flag so operators
+        // calling old playbooks see a clear failure instead of silently
+        // missing the deprecated emergency-rollback form they expected.
+        let result = Cli::try_parse_from([
+            "zlayer",
+            "node",
+            "generate-join-token",
+            "--legacy-plaintext",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected --legacy-plaintext to be rejected after Wave 6 removal"
+        );
     }
 
     #[test]
@@ -3000,7 +3520,7 @@ mod tests {
         assert_eq!(parsed.raft_endpoint, "192.168.1.1:9000");
         assert_eq!(parsed.leader_wg_pubkey, "test-public-key");
         assert_eq!(parsed.overlay_cidr, "10.200.0.0/16");
-        assert!(!parsed.auth_secret.is_empty());
+        assert!(!parsed.created_at.is_empty());
     }
 
     #[test]
@@ -3141,6 +3661,134 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "expected mode 0600, got {mode:o}");
     }
 
+    /// `handle_node_generate_join_token` must mint a token that survives a
+    /// round trip through `parse_cluster_join_token` (the same parser
+    /// `zlayer node join` runs). This is a regression test for a bug where
+    /// the generator produced a 3-field `{deployment, api_endpoint, service}`
+    /// JSON blob instead of the 6-field `ClusterJoinToken` the parser
+    /// expects — every join attempt failed with
+    /// "Invalid join token: not valid JSON: missing field `raft_endpoint`".
+    #[tokio::test]
+    async fn cluster_join_token_built_from_disk_round_trips_through_parse() {
+        use base64::Engine;
+
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("cluster-join-token-round-trip-")
+            .expect("tempdir");
+        let data_dir = tmp.path().to_path_buf();
+
+        // Seed a minimal node_config.json that mirrors the shape
+        // `save_node_config` writes -- pretty-printed JSON with every field
+        // populated. We use values that are easy to recognize in the
+        // assertions below.
+        let node_config = super::NodeConfig {
+            node_id: "node-test-uuid".to_string(),
+            raft_node_id: 1,
+            advertise_addr: "10.0.0.7".to_string(),
+            api_port: 3669,
+            raft_port: 9000,
+            overlay_port: zlayer_core::DEFAULT_WG_PORT,
+            overlay_cidr: "10.200.0.0/16".to_string(),
+            wireguard_private_key: "test-priv-key-base64".to_string(),
+            wireguard_public_key: "test-pub-key-base64".to_string(),
+            is_leader: true,
+            created_at: super::current_timestamp(),
+        };
+        super::save_node_config(&data_dir, &node_config)
+            .await
+            .expect("save_node_config");
+
+        // Seed the join secret the way the daemon does (plain text, no
+        // trailing newline -- matches `commands/serve.rs:~1429`).
+        let join_secret = "deadbeefcafef00d".to_string();
+        std::fs::write(data_dir.join("join_secret"), &join_secret).expect("write join_secret");
+
+        // Build the token directly via the pure helper and assert each field
+        // matches what we seeded. Wave 6 (v0.13.0): the helper now returns
+        // (token, join_secret) — the secret is no longer baked into the
+        // token body but is still threaded out separately to feed the
+        // HS256 mint path.
+        let (built, built_secret) = super::build_cluster_join_token_from_disk(&data_dir, None)
+            .await
+            .expect("build_cluster_join_token_from_disk");
+
+        assert_eq!(built.api_endpoint, "10.0.0.7:3669");
+        assert_eq!(built.raft_endpoint, "10.0.0.7:9000");
+        assert_eq!(built.leader_wg_pubkey, "test-pub-key-base64");
+        assert_eq!(built.overlay_cidr, "10.200.0.0/16");
+        assert_eq!(built_secret, join_secret);
+        assert!(!built.created_at.is_empty(), "created_at must be populated");
+
+        // Encode the same way the handler does and re-parse it through the
+        // exact function `node join` calls. This is the load-bearing
+        // assertion -- if `parse_cluster_join_token` rejects the output
+        // (e.g. because a required field is missing) the bug is back.
+        let json = serde_json::to_string(&built).expect("serialize token");
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+        let parsed = super::parse_cluster_join_token(&encoded)
+            .expect("parse_cluster_join_token must accept the freshly minted token");
+
+        assert_eq!(parsed.api_endpoint, built.api_endpoint);
+        assert_eq!(parsed.raft_endpoint, built.raft_endpoint);
+        assert_eq!(parsed.leader_wg_pubkey, built.leader_wg_pubkey);
+        assert_eq!(parsed.overlay_cidr, built.overlay_cidr);
+        assert_eq!(parsed.created_at, built.created_at);
+
+        // The `api` override must win verbatim when supplied -- mirrors the
+        // documented behaviour of the `--api` CLI flag.
+        let (override_built, _) = super::build_cluster_join_token_from_disk(
+            &data_dir,
+            Some("api.example.com:8443".to_string()),
+        )
+        .await
+        .expect("build_cluster_join_token_from_disk with override");
+        assert_eq!(override_built.api_endpoint, "api.example.com:8443");
+        // Raft endpoint is still sourced from node_config -- the override
+        // applies only to the API surface.
+        assert_eq!(override_built.raft_endpoint, "10.0.0.7:9000");
+    }
+
+    /// Missing `join_secret` file must produce an actionable error rather than
+    /// silently fabricating a fresh secret (which would never match what the
+    /// daemon eventually mints on first boot).
+    #[tokio::test]
+    async fn cluster_join_token_errors_when_join_secret_missing() {
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("cluster-join-token-missing-secret-")
+            .expect("tempdir");
+        let data_dir = tmp.path().to_path_buf();
+
+        let node_config = super::NodeConfig {
+            node_id: "node-test-uuid".to_string(),
+            raft_node_id: 1,
+            advertise_addr: "10.0.0.7".to_string(),
+            api_port: 3669,
+            raft_port: 9000,
+            overlay_port: zlayer_core::DEFAULT_WG_PORT,
+            overlay_cidr: "10.200.0.0/16".to_string(),
+            wireguard_private_key: "test-priv-key-base64".to_string(),
+            wireguard_public_key: "test-pub-key-base64".to_string(),
+            is_leader: true,
+            created_at: super::current_timestamp(),
+        };
+        super::save_node_config(&data_dir, &node_config)
+            .await
+            .expect("save_node_config");
+
+        let err = super::build_cluster_join_token_from_disk(&data_dir, None)
+            .await
+            .expect_err("must fail when join_secret is absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("join secret not found"),
+            "error must mention the missing secret: {msg}"
+        );
+        assert!(
+            msg.contains("zlayer serve"),
+            "error must point the user at the daemon: {msg}"
+        );
+    }
+
     /// `write_secure` must overwrite an existing file's content **and** ensure
     /// its mode is reset to 0600 — covering the case where a pre-existing file
     /// at the path was created with a more permissive mode (`mode_t` passed
@@ -3173,5 +3821,231 @@ mod tests {
             0o600,
             "overwrite must reset mode to 0600, got {mode:o}"
         );
+    }
+}
+
+// =============================================================================
+// Signed cluster join token tests (Wave 3.2)
+// =============================================================================
+
+#[cfg(test)]
+mod signed_token_tests {
+    use super::{
+        mint_signed_cluster_join_token, parse_signed_cluster_join_token,
+        verify_signed_cluster_join_token, ClusterJoinClaims, SignedClusterJoinToken,
+        SIGNED_TOKEN_V_WAVE3, STANDARD, URL_SAFE_NO_PAD,
+    };
+    use base64::Engine as _;
+
+    fn sample_claims() -> ClusterJoinClaims {
+        sample_claims_with_exp(chrono::Utc::now() + chrono::Duration::hours(1))
+    }
+
+    fn sample_claims_with_exp(exp: chrono::DateTime<chrono::Utc>) -> ClusterJoinClaims {
+        ClusterJoinClaims {
+            api_endpoint: "https://leader.example.com:3669".to_string(),
+            raft_endpoint: "10.0.0.1:9000".to_string(),
+            leader_wg_pubkey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            overlay_cidr: "10.200.0.0/16".to_string(),
+            exp: exp.to_rfc3339(),
+            iat: chrono::Utc::now().to_rfc3339(),
+            iss: "node-uuid-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        }
+    }
+
+    #[test]
+    fn mint_then_parse_round_trip() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+        assert_eq!(parsed.v, SIGNED_TOKEN_V_WAVE3);
+        assert_eq!(parsed.kid, signer.key_id());
+        assert_eq!(parsed.claims.api_endpoint, claims.api_endpoint);
+        assert_eq!(parsed.claims.raft_endpoint, claims.raft_endpoint);
+        assert_eq!(parsed.claims.leader_wg_pubkey, claims.leader_wg_pubkey);
+        assert_eq!(parsed.claims.overlay_cidr, claims.overlay_cidr);
+        assert_eq!(parsed.claims.exp, claims.exp);
+        assert_eq!(parsed.claims.iat, claims.iat);
+        assert_eq!(parsed.claims.iss, claims.iss);
+    }
+
+    #[test]
+    fn minted_token_is_single_line_ascii() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        assert!(
+            token_str
+                .chars()
+                .all(|c| c.is_ascii() && !c.is_whitespace()),
+            "minted token must be pure ASCII with no whitespace"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_freshly_minted_token() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims_with_exp(chrono::Utc::now() + chrono::Duration::hours(1));
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+        let verified =
+            verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), &signer.key_id())
+                .expect("freshly-minted token must verify against its signer");
+        assert_eq!(verified.api_endpoint, claims.api_endpoint);
+        assert_eq!(verified.iss, claims.iss);
+    }
+
+    #[test]
+    fn verify_rejects_when_kid_mismatches() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+
+        let err = verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), "deadbeef")
+            .expect_err("kid mismatch must fail verification");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kid mismatch"),
+            "error must mention kid mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_signature_tampered() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let mut parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+
+        // Flip a byte in the signature (the signature is base64 of 64 bytes).
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(&parsed.sig).unwrap();
+        sig_bytes[0] ^= 0x01;
+        parsed.sig = URL_SAFE_NO_PAD.encode(&sig_bytes);
+
+        let err =
+            verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), &signer.key_id())
+                .expect_err("tampered signature must fail verification");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Ed25519 signature verification failed"),
+            "error must mention signature failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_claims_tampered() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let mut parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+
+        // Modify the api_endpoint after minting — signature should no longer
+        // be valid because it was computed over the original claims bytes.
+        parsed.claims.api_endpoint = "https://attacker.example.com:3669".to_string();
+
+        let err =
+            verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), &signer.key_id())
+                .expect_err("tampered claims must fail verification");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Ed25519 signature verification failed"),
+            "error must mention signature failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_expired() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims_with_exp(chrono::Utc::now() - chrono::Duration::hours(1));
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+
+        let err =
+            verify_signed_cluster_join_token(&parsed, &signer.verifying_key(), &signer.key_id())
+                .expect_err("expired token must fail verification");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expired"),
+            "error must mention expiration: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_version() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        // Hand-craft an envelope with v=99.
+        let claims_bytes = serde_json::to_vec(&claims).unwrap();
+        let sig_bytes = signer.sign(&claims_bytes);
+        let envelope = SignedClusterJoinToken {
+            v: 99,
+            kid: signer.key_id(),
+            claims: claims.clone(),
+            sig: URL_SAFE_NO_PAD.encode(sig_bytes),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+        let token_str = URL_SAFE_NO_PAD.encode(envelope_bytes);
+
+        let err = parse_signed_cluster_join_token(&token_str).expect_err("v=99 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("version"), "error must mention version: {msg}");
+    }
+
+    #[test]
+    fn parse_rejects_garbage_base64() {
+        let err = parse_signed_cluster_join_token("not-valid-base64!!!!")
+            .expect_err("garbage must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("base64"),
+            "error must mention base64 decoding: {msg}"
+        );
+    }
+
+    #[test]
+    fn mint_propagates_ttl_into_exp_claim() {
+        // Wave 3.3: when the CLI handler builds claims as
+        // `exp = now() + ttl`, round-tripping through mint/parse should
+        // preserve the gap. We exercise that directly with a 1h ttl.
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let ttl = chrono::Duration::hours(1);
+        let now = chrono::Utc::now();
+        let exp = now + ttl;
+        let claims = ClusterJoinClaims {
+            api_endpoint: "https://leader.example.com:3669".to_string(),
+            raft_endpoint: "10.0.0.1:9000".to_string(),
+            leader_wg_pubkey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            overlay_cidr: "10.200.0.0/16".to_string(),
+            exp: exp.to_rfc3339(),
+            iat: now.to_rfc3339(),
+            iss: "node-uuid-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        };
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        let parsed = parse_signed_cluster_join_token(&token_str).unwrap();
+
+        let parsed_iat = chrono::DateTime::parse_from_rfc3339(&parsed.claims.iat).unwrap();
+        let parsed_exp = chrono::DateTime::parse_from_rfc3339(&parsed.claims.exp).unwrap();
+        let gap = parsed_exp - parsed_iat;
+        assert_eq!(
+            gap, ttl,
+            "exp - iat must equal the ttl that was used to build the claims"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_standard_base64_too() {
+        // Mint a token, then re-encode the envelope using STANDARD base64
+        // instead of URL_SAFE_NO_PAD to confirm parse handles both.
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = sample_claims();
+        let token_str = mint_signed_cluster_join_token(&claims, &signer).unwrap();
+        // Decode with URL_SAFE_NO_PAD, re-encode with STANDARD.
+        let envelope_bytes = URL_SAFE_NO_PAD.decode(token_str.as_bytes()).unwrap();
+        let standard_token = STANDARD.encode(&envelope_bytes);
+        let parsed = parse_signed_cluster_join_token(&standard_token)
+            .expect("STANDARD-encoded envelope must parse");
+        assert_eq!(parsed.kid, signer.key_id());
     }
 }

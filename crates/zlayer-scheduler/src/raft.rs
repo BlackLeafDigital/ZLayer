@@ -683,6 +683,32 @@ impl Default for RaftConfig {
 // Raft Coordinator
 // =============================================================================
 
+/// Whether the coordinator just created fresh raft state or loaded
+/// existing state from disk.
+///
+/// Surfaces the "is this a restart?" signal to callers so they can
+/// skip `bootstrap()` on resume — avoiding openraft's internal
+/// `error!("Can not initialize ...")` that would otherwise fire when
+/// bootstrap is invoked on already-initialised state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapState {
+    /// No prior raft state on disk; cluster will be bootstrapped if
+    /// this node is the leader.
+    Fresh,
+    /// Prior raft state was loaded from disk; caller should NOT call
+    /// `bootstrap()`.
+    Resuming,
+}
+
+/// Result of constructing a coordinator: the coordinator itself plus
+/// the bootstrap state observed at construction time.
+pub struct CoordinatorInit {
+    /// The freshly constructed coordinator.
+    pub coordinator: RaftCoordinator,
+    /// Whether on-disk raft state was present at construction time.
+    pub bootstrap_state: BootstrapState,
+}
+
 /// High-level coordinator for Raft consensus
 ///
 /// Wraps `zlayer_consensus::ConsensusNode` and provides a simpler API for:
@@ -735,12 +761,17 @@ pub enum RotateReason {
 impl RaftCoordinator {
     /// Create a new Raft coordinator without auth.
     ///
+    /// Discards [`BootstrapState`]. Use [`Self::with_auth_and_secrets`] directly
+    /// when you need to know whether this is a fresh cluster or a resumption.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn new(config: RaftConfig) -> Result<Self> {
-        Self::with_auth_and_secrets(config, None, None, None).await
+        Ok(Self::with_auth_and_secrets(config, None, None, None)
+            .await?
+            .coordinator)
     }
 
     /// Create a new Raft coordinator with an optional bearer token for RPC auth.
@@ -752,12 +783,17 @@ impl RaftCoordinator {
     /// [`Self::with_auth_and_secrets`] when the daemon also needs to drive
     /// the cluster secrets state machine.
     ///
+    /// Discards [`BootstrapState`]. Use [`Self::with_auth_and_secrets`] directly
+    /// when you need to know whether this is a fresh cluster or a resumption.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
-        Self::with_auth_and_secrets(config, auth_token, None, None).await
+        Ok(Self::with_auth_and_secrets(config, auth_token, None, None)
+            .await?
+            .coordinator)
     }
 
     /// Create a new Raft coordinator with optional auth and optional secrets
@@ -779,7 +815,7 @@ impl RaftCoordinator {
         auth_token: Option<String>,
         node_priv: Option<RecipientPrivateKey>,
         node_uuid: Option<String>,
-    ) -> Result<Self> {
+    ) -> Result<CoordinatorInit> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
             heartbeat_interval_ms: config.heartbeat_interval_ms,
@@ -792,6 +828,33 @@ impl RaftCoordinator {
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| SchedulerError::Raft(format!("Failed to create raft data dir: {e}")))?;
+
+        // Detect whether raft state already exists on disk BEFORE opening
+        // the redb files (since `redb::Database::create` will create the
+        // files if absent, after which existence is no longer a signal).
+        //
+        // The redb crate writes the file header eagerly on `create`, so a
+        // mere presence check is ambiguous; require non-zero length to
+        // distinguish "openraft has actually persisted state" from "we
+        // just opened an empty database in a prior aborted run".
+        #[cfg(feature = "persistent")]
+        let bootstrap_state = {
+            let log_path = config.data_dir.join("raft-log");
+            let sm_path = config.data_dir.join("raft-sm");
+            let has_log = std::fs::metadata(&log_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            let has_sm = std::fs::metadata(&sm_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if has_log || has_sm {
+                BootstrapState::Resuming
+            } else {
+                BootstrapState::Fresh
+            }
+        };
+        #[cfg(not(feature = "persistent"))]
+        let bootstrap_state = BootstrapState::Fresh;
 
         // Create storage (persistent redb or in-memory depending on feature)
         #[cfg(feature = "persistent")]
@@ -841,12 +904,15 @@ impl RaftCoordinator {
             _ => (None, None),
         };
 
-        Ok(Self {
-            node,
-            sm_data,
-            config,
-            node_priv,
-            node_uuid,
+        Ok(CoordinatorInit {
+            coordinator: Self {
+                node,
+                sm_data,
+                config,
+                node_priv,
+                node_uuid,
+            },
+            bootstrap_state,
         })
     }
 
@@ -2048,5 +2114,60 @@ mod tests {
             RotateReason::NodeRevoked { node_id } => assert_eq!(node_id, "revoked-uuid"),
             RotateReason::Scheduled | RotateReason::Manual => panic!("wrong variant"),
         }
+    }
+
+    /// Constructing a coordinator twice in the same data directory must
+    /// report `Fresh` on the first open (no files on disk) and `Resuming`
+    /// on the second open (after `bootstrap()` has persisted state).
+    ///
+    /// This is the signal `daemon.rs` uses to decide whether to call
+    /// `bootstrap()` — the previous `metrics.current_term > 0` probe was
+    /// racy because the freshly constructed `RaftCore` hadn't finished its
+    /// async state-load when the daemon probed it, so we'd incorrectly
+    /// re-bootstrap and trigger openraft's internal
+    /// `error!("Can not initialize ...")` line.
+    #[cfg(feature = "persistent")]
+    #[tokio::test]
+    async fn coordinator_reports_fresh_then_resuming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = RaftConfig {
+            node_id: 1,
+            address: "127.0.0.1:0".to_string(),
+            data_dir: tmp.path().to_path_buf(),
+            ..RaftConfig::default()
+        };
+
+        // First open: no files on disk → Fresh.
+        let init1 = RaftCoordinator::with_auth_and_secrets(config.clone(), None, None, None)
+            .await
+            .expect("first coordinator construction");
+        assert_eq!(init1.bootstrap_state, BootstrapState::Fresh);
+
+        // Trigger a disk write that populates raft-log/raft-sm. Calling
+        // `bootstrap()` writes the initial membership entry.
+        init1
+            .coordinator
+            .bootstrap()
+            .await
+            .expect("bootstrap on fresh coordinator");
+        init1
+            .coordinator
+            .shutdown()
+            .await
+            .expect("shutdown first coordinator");
+        drop(init1);
+        // Give background tasks (raft tick loop, state-machine worker) a beat
+        // to release the redb file lock. Redb releases the OS-level lock when
+        // its last in-process handle drops; the consensus node holds those
+        // handles inside spawned tasks that finish a tick or two after
+        // `shutdown()` returns.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Second open: files exist and are non-empty → Resuming.
+        let init2 = RaftCoordinator::with_auth_and_secrets(config, None, None, None)
+            .await
+            .expect("second coordinator construction");
+        assert_eq!(init2.bootstrap_state, BootstrapState::Resuming);
+        init2.coordinator.shutdown().await.ok();
     }
 }

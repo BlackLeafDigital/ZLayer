@@ -108,4 +108,21 @@ pub enum SecretsRaftOp {
         /// `"{scope}:{name}"` storage key, same shape as elsewhere.
         storage_key: String,
     },
+
+    /// Revoke a specific issued join token (cannot be unrevoked).
+    ///
+    /// The token is identified by `token_hash`, which is the lowercase
+    /// hex SHA-256 of the full token envelope b64 string (same hash form
+    /// regardless of token format — Ed25519-signed envelope, HS256-JWT,
+    /// or future EdDSA-JWT). The entry auto-expires at `expires_at` so
+    /// the revocation table stays bounded by the un-expired token horizon.
+    RevokeToken {
+        /// Lowercase hex SHA-256 of the full token b64 envelope string.
+        token_hash: String,
+        /// Wall-clock instant at which the revocation entry may be pruned.
+        /// Should match the token's own `exp` claim so the entry is no
+        /// longer needed once the token would have expired anyway.
+        #[schema(value_type = String, format = "date-time")]
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
 }

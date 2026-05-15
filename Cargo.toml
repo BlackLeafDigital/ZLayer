@@ -96,6 +96,11 @@ tower-http = { version = "0.6", features = ["full"] }
 # Web framework (for API)
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
+# `axum-server` adds TLS-terminated `axum::Router` serving on top of the
+# same rustls + tokio-rustls stack used by the proxy. Used by zlayer-api to
+# wrap the daemon's TCP listener with TLS when `--api-tls-cert/--api-tls-key`
+# or `--api-tls-acme` are set.
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # JWT Authentication
 jsonwebtoken = "9"
@@ -143,6 +148,7 @@ async-trait = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
 
 # Cryptography
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 blake2 = "0.10"
 sha2 = "0.10"

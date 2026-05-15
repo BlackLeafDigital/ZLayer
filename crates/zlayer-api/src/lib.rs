@@ -39,7 +39,7 @@ pub use auth::{
     create_token, parse_env_id_from_scope, require_secret_perm, resolve_registry_auth_async,
     secret_storage_key, verify_token, AuthState, AuthUser, Claims, OptionalAuthUser,
 };
-pub use config::ApiConfig;
+pub use config::{ApiConfig, ApiTlsConfig};
 pub use error::{ApiError, Result};
 pub use event_bus::{
     ContainerEvent, ContainerEventBus, ContainerEventKind, DaemonEvent, DaemonEventBus, ImageEvent,

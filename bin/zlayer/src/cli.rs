@@ -592,6 +592,15 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 30)]
     Node(NodeCommands),
 
+    /// Cluster-level administration commands.
+    ///
+    /// In v0.12.0 these commands were promoted from `zlayer node <…>` to
+    /// their own top-level subgroup. The original `zlayer node <…>`
+    /// invocations still work and dispatch to the same handlers (with a
+    /// deprecation note in their `--help` output, see Wave 5B.5).
+    #[command(subcommand, display_order = 30)]
+    Cluster(ClusterCommands),
+
     /// Start the API server
     #[command(display_order = 31)]
     Serve {
@@ -694,6 +703,42 @@ pub(crate) enum Commands {
         #[clap(long, env = "ZLAYER_TUNNEL_TLS_KEY")]
         tunnel_tls_key: Option<std::path::PathBuf>,
 
+        /// Enable TLS on the daemon API listener by loading a static
+        /// certificate from disk. Requires `--api-tls-key`.
+        ///
+        /// When set, the daemon API binds HTTPS instead of HTTP. The
+        /// cert+key are loaded once at startup. Use `--api-tls-acme` for
+        /// hot-reloading ACME-managed certs instead.
+        #[clap(
+            long,
+            value_name = "PATH",
+            env = "ZLAYER_API_TLS_CERT",
+            requires = "api_tls_key",
+            conflicts_with = "api_tls_acme"
+        )]
+        api_tls_cert: Option<std::path::PathBuf>,
+
+        /// Private key paired with `--api-tls-cert`. PEM-encoded.
+        #[clap(
+            long,
+            value_name = "PATH",
+            env = "ZLAYER_API_TLS_KEY",
+            requires = "api_tls_cert",
+            conflicts_with = "api_tls_acme"
+        )]
+        api_tls_key: Option<std::path::PathBuf>,
+
+        /// Enable TLS on the daemon API listener using the proxy's
+        /// ACME-capable `CertManager`. The same cert pool the reverse proxy
+        /// uses for L7 routes will be served on the daemon API. Mutually
+        /// exclusive with `--api-tls-cert`/`--api-tls-key`.
+        #[clap(
+            long,
+            env = "ZLAYER_API_TLS_ACME",
+            conflicts_with_all = ["api_tls_cert", "api_tls_key"]
+        )]
+        api_tls_acme: bool,
+
         /// Disable the daemon-side tunnel server entirely. Endpoints under
         /// `POST /api/v1/tunnels/access/sessions` will return 503.
         #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
@@ -704,6 +749,16 @@ pub(crate) enum Commands {
         /// the daemon. Used by `zlayer self-update`-driven cluster upgrades.
         #[arg(long, env = "ZLAYER_RESTART_ON_EXIT")]
         restart_on_exit: bool,
+
+        /// Wipe `{data_dir}/join_secret` at daemon startup so the HMAC key for
+        /// HS256-JWT join tokens is regenerated.
+        ///
+        /// Use this if you suspect the symmetric secret has leaked. Existing
+        /// HS256 tokens will fail to validate after vacuum (which is the point),
+        /// but new tokens can be issued immediately and the cluster keeps running.
+        /// Ed25519-signed tokens are unaffected.
+        #[clap(long, env = "ZLAYER_VACUUM_SECRETS")]
+        vacuum_secrets: bool,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
@@ -2707,6 +2762,184 @@ pub(crate) enum NodeCommands {
         install_wsl: InstallWslArgs,
     },
 
+    /// [deprecated: use `zlayer cluster list` — `zlayer node list` will be removed in v0.13.0]
+    ///
+    /// List all nodes in the cluster
+    #[command(verbatim_doc_comment)]
+    List {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// [deprecated: use `zlayer cluster status` — `zlayer node status` will be removed in v0.13.0]
+    ///
+    /// Show detailed status of a node
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// Node ID (default: this node)
+        node_id: Option<String>,
+    },
+
+    /// [deprecated: use `zlayer cluster remove` — `zlayer node remove` will be removed in v0.13.0]
+    ///
+    /// Remove a node from the cluster
+    #[command(verbatim_doc_comment)]
+    Remove {
+        /// Node ID to remove
+        node_id: String,
+
+        /// Force removal without migrating services
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// [deprecated: use `zlayer cluster set-mode` — `zlayer node set-mode` will be removed in v0.13.0]
+    ///
+    /// Set node resource mode
+    #[command(verbatim_doc_comment)]
+    SetMode {
+        /// Node ID
+        node_id: String,
+
+        /// Mode: full, dedicated, or replicate
+        #[arg(long)]
+        mode: String,
+
+        /// Services for dedicated/replicate mode
+        #[arg(long)]
+        services: Option<Vec<String>>,
+    },
+
+    /// [deprecated: use `zlayer cluster label` — `zlayer node label` will be removed in v0.13.0]
+    ///
+    /// Add label to a node
+    #[command(verbatim_doc_comment)]
+    Label {
+        /// Node ID
+        node_id: String,
+
+        /// Label in key=value format
+        label: String,
+    },
+
+    /// Generate a join token for worker nodes
+    ///
+    /// Creates a base64-encoded token that workers can use to join this cluster.
+    /// If no API endpoint is provided, reads it from the node config.
+    /// If the node hasn't been initialized, auto-initializes with defaults.
+    /// If no deployment name is provided, tries to discover it from .zlayer.yml.
+    ///
+    /// Examples:
+    ///   zlayer node generate-join-token
+    ///   zlayer node generate-join-token my-deploy
+    ///   zlayer node generate-join-token my-deploy -a <http://10.0.0.1:3669>
+    #[command(verbatim_doc_comment)]
+    GenerateJoinToken {
+        /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
+        deployment: Option<String>,
+
+        /// API endpoint URL (inferred from node config if not given)
+        #[arg(short, long)]
+        api: Option<String>,
+
+        /// Service name (optional)
+        #[arg(short, long)]
+        service: Option<String>,
+
+        /// Data directory (where `node_config.json` lives, defaults to platform default)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Token expiration as a duration from now. Defaults to 24h.
+        ///
+        /// Accepts humantime syntax: `1h`, `30m`, `24h`, `7d`, `1week`.
+        /// The signed token's `exp` claim is set to `now() + ttl`. The HS256
+        /// JWT's `exp` claim is set identically. (The legacy plaintext format
+        /// was removed in v0.13.0.)
+        #[arg(long, value_name = "DURATION", default_value = "24h")]
+        ttl: humantime::Duration,
+    },
+
+    /// [deprecated: use `zlayer cluster upgrade` — `zlayer node upgrade` will be removed in v0.13.0]
+    ///
+    /// Roll a new zlayer version across every node in the cluster.
+    ///
+    /// Followers self-update one at a time (deterministic, ascending
+    /// `node_id` order). After the follower walk, the leader self-upgrades
+    /// last: its daemon exits with code 75 and the OS supervisor
+    /// (launchd / systemd) respawns it on the new binary. Pass
+    /// `--skip-leader` to keep the legacy behaviour of leaving the
+    /// leader untouched.
+    #[command(name = "upgrade", verbatim_doc_comment)]
+    Upgrade {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Pause between followers (after each comes back healthy) to let
+        /// observability soak. Default 30s.
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
+        /// Abort the rollout if any follower fails to come back healthy.
+        #[arg(long)]
+        strict: bool,
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Don't auto-upgrade the leader. Use when the operator wants to
+        /// upgrade the leader manually (e.g. to time a deliberate
+        /// failover window).
+        #[arg(long)]
+        skip_leader: bool,
+    },
+
+    /// [deprecated: use `zlayer cluster force-leader` — `zlayer node force-leader` will be removed in v0.13.0]
+    ///
+    /// Force this node to become cluster leader (disaster recovery)
+    ///
+    /// Use when the original leader is permanently lost in a 2-node cluster.
+    /// The surviving learner node will take over with preserved state.
+    /// Requires daemon restart after execution.
+    ///
+    /// Examples:
+    ///   zlayer node force-leader
+    ///   zlayer node force-leader --api-addr 127.0.0.1:3669
+    #[command(verbatim_doc_comment)]
+    ForceLeader {
+        /// API address of this node (host:port)
+        #[arg(long, default_value = "127.0.0.1:3669")]
+        api_addr: String,
+    },
+
+    /// [deprecated: use `zlayer cluster rotate-signing-key` — `zlayer node rotate-signing-key` will be removed in v0.13.0]
+    ///
+    /// Rotate the cluster signing keypair (alias for `zlayer cluster rotate-signing-key`).
+    ///
+    /// If this node is a worker, the daemon forwards the request to the leader.
+    /// If this node is a leader, rotates locally and writes the new keystore.
+    ///
+    /// The previous active key is moved into a grace window (default 7d,
+    /// configurable via --grace) where it continues to verify in-flight
+    /// join tokens.
+    #[command(name = "rotate-signing-key", verbatim_doc_comment)]
+    RotateSigningKey {
+        /// Grace duration before the previous active key is purged.
+        /// Humantime syntax (`24h`, `7d`).
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
+    },
+}
+
+/// Cluster-level administration subcommands.
+///
+/// In v0.12.0 these were promoted out of `zlayer node <…>` into a dedicated
+/// `zlayer cluster <…>` namespace. Every variant here corresponds 1:1 to a
+/// `NodeCommands` variant of the same name and delegates to the same
+/// underlying handler (see `commands/cluster.rs`). `RotateSigningKey` is the
+/// lone exception: it is brand new with the Ed25519 join-token work and has
+/// no `NodeCommands` equivalent. Wave 5B.3 wires its dedicated handler.
+#[derive(Subcommand)]
+pub(crate) enum ClusterCommands {
     /// List all nodes in the cluster
     List {
         /// Output format (table or json)
@@ -2753,43 +2986,15 @@ pub(crate) enum NodeCommands {
         label: String,
     },
 
-    /// Generate a join token for worker nodes
-    ///
-    /// Creates a base64-encoded token that workers can use to join this cluster.
-    /// If no API endpoint is provided, reads it from the node config.
-    /// If the node hasn't been initialized, auto-initializes with defaults.
-    /// If no deployment name is provided, tries to discover it from .zlayer.yml.
-    ///
-    /// Examples:
-    ///   zlayer node generate-join-token
-    ///   zlayer node generate-join-token my-deploy
-    ///   zlayer node generate-join-token my-deploy -a <http://10.0.0.1:3669>
+    /// Force a specific node to become cluster leader (disaster recovery)
     #[command(verbatim_doc_comment)]
-    GenerateJoinToken {
-        /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
-        deployment: Option<String>,
-
-        /// API endpoint URL (inferred from node config if not given)
-        #[arg(short, long)]
-        api: Option<String>,
-
-        /// Service name (optional)
-        #[arg(short, long)]
-        service: Option<String>,
-
-        /// Data directory (where `node_config.json` lives, defaults to platform default)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
+    ForceLeader {
+        /// API address of this node (host:port)
+        #[arg(long, default_value = "127.0.0.1:3669")]
+        api_addr: String,
     },
 
     /// Roll a new zlayer version across every node in the cluster.
-    ///
-    /// Followers self-update one at a time (deterministic, ascending
-    /// `node_id` order). After the follower walk, the leader self-upgrades
-    /// last: its daemon exits with code 75 and the OS supervisor
-    /// (launchd / systemd) respawns it on the new binary. Pass
-    /// `--skip-leader` to keep the legacy behaviour of leaving the
-    /// leader untouched.
     #[command(name = "upgrade")]
     Upgrade {
         /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
@@ -2805,28 +3010,53 @@ pub(crate) enum NodeCommands {
         /// Skip the confirmation prompt and apply immediately.
         #[arg(short = 'y', long)]
         yes: bool,
-        /// Don't auto-upgrade the leader. Use when the operator wants to
-        /// upgrade the leader manually (e.g. to time a deliberate
-        /// failover window).
+        /// Don't auto-upgrade the leader.
         #[arg(long)]
         skip_leader: bool,
     },
 
-    /// Force this node to become cluster leader (disaster recovery)
+    /// Rotate the cluster's Ed25519 signing keypair.
     ///
-    /// Use when the original leader is permanently lost in a 2-node cluster.
-    /// The surviving learner node will take over with preserved state.
-    /// Requires daemon restart after execution.
-    ///
-    /// Examples:
-    ///   zlayer node force-leader
-    ///   zlayer node force-leader --api-addr 127.0.0.1:3669
-    #[command(verbatim_doc_comment)]
-    ForceLeader {
-        /// API address of this node (host:port)
-        #[arg(long, default_value = "127.0.0.1:3669")]
-        api_addr: String,
+    /// Generates a fresh keypair, promotes it to the active slot, and demotes
+    /// the previous key into a verification-only grace window. Workers can
+    /// still validate tokens minted with the old key during the grace period
+    /// — useful for staggered rollouts. Wave 5B.3 wires the dedicated
+    /// handler; this scaffolding only reserves the CLI surface.
+    #[command(name = "rotate-signing-key", verbatim_doc_comment)]
+    RotateSigningKey {
+        /// How long the previous active key continues verifying tokens.
+        /// Humantime syntax (`24h`, `7d`). Defaults to 7d.
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
     },
+
+    /// Revoke a previously-issued cluster join token.
+    ///
+    /// Adds the token to the cluster-wide Raft-replicated revocation
+    /// list so every node rejects subsequent uses. Accepts either the
+    /// raw token b64 envelope OR a pre-computed 64-char lowercase hex
+    /// SHA-256 of one. The actual token bytes never enter replicated
+    /// state — only the hash leaves the local node.
+    ///
+    /// Entries auto-prune at the token's natural expiry (or `now()+24h`
+    /// when only a hash was supplied) so the list stays bounded.
+    #[command(name = "revoke-token", verbatim_doc_comment)]
+    RevokeToken {
+        /// Raw token (b64 envelope from `zlayer node generate-join-token`)
+        /// OR lowercase hex SHA-256 of one.
+        token_or_hash: String,
+        /// Optional human-readable reason recorded server-side for audit.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// List currently-active token revocations.
+    ///
+    /// Returns the un-expired revocations replicated through Raft on
+    /// this node. Entries auto-prune at apply time so the listing only
+    /// shows revocations that are still load-bearing for validation.
+    #[command(name = "list-revocations", verbatim_doc_comment)]
+    ListRevocations {},
 }
 
 /// Token management subcommands
@@ -3658,6 +3888,102 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_serve_accepts_api_tls_cert_and_key() {
+        let cli = Cli::try_parse_from([
+            "zlayer",
+            "serve",
+            "--api-tls-cert",
+            "/tmp/c.pem",
+            "--api-tls-key",
+            "/tmp/k.pem",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                api_tls_cert,
+                api_tls_key,
+                api_tls_acme,
+                ..
+            }) => {
+                assert_eq!(api_tls_cert, Some(std::path::PathBuf::from("/tmp/c.pem")));
+                assert_eq!(api_tls_key, Some(std::path::PathBuf::from("/tmp/k.pem")));
+                assert!(!api_tls_acme);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_rejects_api_tls_cert_without_key() {
+        assert!(Cli::try_parse_from(["zlayer", "serve", "--api-tls-cert", "/tmp/c.pem"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_serve_rejects_api_tls_cert_with_acme() {
+        assert!(Cli::try_parse_from([
+            "zlayer",
+            "serve",
+            "--api-tls-cert",
+            "/tmp/c.pem",
+            "--api-tls-key",
+            "/tmp/k.pem",
+            "--api-tls-acme",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn vacuum_secrets_flag_parses() {
+        // Wave 6 (v0.13.0): `--vacuum-secrets` opts a daemon into wiping
+        // its on-disk HS256 join_secret on startup. Verify clap accepts
+        // the flag and surfaces it on `Commands::Serve`.
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--vacuum-secrets"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { vacuum_secrets, .. }) => {
+                assert!(
+                    vacuum_secrets,
+                    "--vacuum-secrets must parse to true when supplied"
+                );
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn vacuum_secrets_defaults_to_false() {
+        // Defensive: a fresh `zlayer serve` invocation must not silently
+        // vacuum the secret. The flag has to be opted into explicitly.
+        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { vacuum_secrets, .. }) => {
+                assert!(
+                    !vacuum_secrets,
+                    "--vacuum-secrets must default to false (preserve HS256 key across restart)"
+                );
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_accepts_api_tls_acme_alone() {
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--api-tls-acme"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                api_tls_cert,
+                api_tls_key,
+                api_tls_acme,
+                ..
+            }) => {
+                assert!(api_tls_cert.is_none());
+                assert!(api_tls_key.is_none());
+                assert!(api_tls_acme);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
     fn test_cli_serve_command_daemon_and_socket() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -3859,5 +4185,171 @@ mod tests {
             }
             _ => panic!("Expected Build command"),
         }
+    }
+
+    // ── Wave 5B.1+5B.2: `zlayer cluster <…>` scaffolding ────────────────
+    //
+    // These tests confirm:
+    //   1. The new top-level `cluster` subgroup is reachable through clap.
+    //   2. Specific subcommands parse into the expected `ClusterCommands`
+    //      variants (including the new `RotateSigningKey` with `--grace`).
+    //   3. The legacy `zlayer node <…>` invocations STILL parse to
+    //      `Commands::Node(NodeCommands::…)` — i.e. we have not regressed
+    //      the alias surface that ships through one more release.
+
+    #[test]
+    fn cli_recognizes_top_level_cluster_subcommand() {
+        // `--help` causes try_parse_from to return Err with DisplayHelp.
+        // We're checking the subcommand is REACHABLE in the clap tree,
+        // not that help actually renders successfully here.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "--help"]);
+        match cli {
+            Err(e) if matches!(e.kind(), clap::error::ErrorKind::DisplayHelp) => {}
+            Err(e) => panic!("unexpected clap error: {e}"),
+            Ok(_) => panic!("expected DisplayHelp"),
+        }
+    }
+
+    #[test]
+    fn cli_cluster_list_parses() {
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cluster(ClusterCommands::List { .. }))
+        ));
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_parses_with_grace() {
+        let cli =
+            Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key", "--grace", "24h"])
+                .unwrap();
+        let Some(Commands::Cluster(ClusterCommands::RotateSigningKey { grace })) = cli.command
+        else {
+            panic!("expected Commands::Cluster(ClusterCommands::RotateSigningKey {{ .. }})")
+        };
+        assert_eq!(
+            *grace.expect("--grace was provided"),
+            std::time::Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_parses_without_grace() {
+        // No --grace flag → field should be None; the actual default is
+        // applied by the Wave 5B.3 handler, not by clap.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key"]).unwrap();
+        let Some(Commands::Cluster(ClusterCommands::RotateSigningKey { grace })) = cli.command
+        else {
+            panic!("expected Commands::Cluster(ClusterCommands::RotateSigningKey {{ .. }})")
+        };
+        assert!(grace.is_none());
+    }
+
+    #[test]
+    fn cli_node_list_still_works_as_alias() {
+        // Regression check: existing `zlayer node list` invocation must
+        // still parse to NodeCommands::List unchanged.
+        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node(NodeCommands::List { .. }))
+        ));
+    }
+
+    // ── Wave 5B.3: `zlayer node rotate-signing-key` alias ───────────────
+    //
+    // The dedicated `zlayer cluster rotate-signing-key` surface (covered by
+    // the tests above) ships alongside an alias on `zlayer node …` so the
+    // historic single-namespace muscle memory still works. These tests
+    // confirm both invocations parse, with and without `--grace`.
+
+    #[test]
+    fn cli_node_rotate_signing_key_parses_with_grace() {
+        let cli =
+            Cli::try_parse_from(["zlayer", "node", "rotate-signing-key", "--grace", "1h"]).unwrap();
+        let Some(Commands::Node(NodeCommands::RotateSigningKey { grace })) = cli.command else {
+            panic!("expected Commands::Node(NodeCommands::RotateSigningKey {{ .. }})")
+        };
+        assert_eq!(
+            *grace.expect("--grace was provided"),
+            std::time::Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn cli_node_rotate_signing_key_parses_without_grace() {
+        // No --grace flag → field should be None; the actual default is
+        // applied server-side by the rotate-signing-key handler, not by
+        // clap. Mirrors the cluster-namespace test above.
+        let cli = Cli::try_parse_from(["zlayer", "node", "rotate-signing-key"]).unwrap();
+        let Some(Commands::Node(NodeCommands::RotateSigningKey { grace })) = cli.command else {
+            panic!("expected Commands::Node(NodeCommands::RotateSigningKey {{ .. }})")
+        };
+        assert!(grace.is_none());
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_alias_still_parses() {
+        // Sanity check that the original cluster-namespace surface is
+        // unchanged by the Wave 5B.3 NodeCommands addition. Tested in the
+        // 5B.1+5B.2 block above, repeated here to anchor the alias
+        // contract.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key", "--grace", "1h"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cluster(ClusterCommands::RotateSigningKey { .. }))
+        ));
+    }
+
+    // ── Wave 5B.5: deprecation notices on promoted NodeCommands variants ──
+    //
+    // The eight variants that have been promoted into the `zlayer cluster
+    // <…>` namespace (List, Status, Remove, SetMode, Label, ForceLeader,
+    // Upgrade, RotateSigningKey) carry a docstring deprecation note that
+    // surfaces in `zlayer node <variant> --help`. The three variants that
+    // remain node-level (Init, Join, GenerateJoinToken) MUST NOT carry a
+    // deprecation note. These tests pin both contracts.
+
+    #[test]
+    fn node_list_help_includes_deprecation_note() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let node_help = cmd
+            .find_subcommand("node")
+            .expect("`node` subcommand")
+            .find_subcommand("list")
+            .expect("`node list` subcommand");
+        let long_about_or_about = node_help
+            .get_long_about()
+            .or_else(|| node_help.get_about())
+            .expect("help text on `node list`")
+            .to_string();
+        assert!(
+            long_about_or_about.contains("deprecated")
+                && long_about_or_about.contains("zlayer cluster list"),
+            "expected deprecation note in `zlayer node list --help`, got: {long_about_or_about}"
+        );
+    }
+
+    #[test]
+    fn node_init_help_does_not_mention_deprecation() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let node_help = cmd
+            .find_subcommand("node")
+            .expect("`node` subcommand")
+            .find_subcommand("init")
+            .expect("`node init` subcommand");
+        let long_about_or_about = node_help
+            .get_long_about()
+            .or_else(|| node_help.get_about())
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            !long_about_or_about.to_lowercase().contains("deprecated"),
+            "zlayer node init should NOT carry a deprecation note (it stays node-level), got: {long_about_or_about}"
+        );
     }
 }

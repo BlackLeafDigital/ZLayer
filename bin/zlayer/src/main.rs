@@ -725,8 +725,12 @@ async fn run(
             tunnel_bind,
             tunnel_tls_cert,
             tunnel_tls_key,
+            api_tls_cert,
+            api_tls_key,
+            api_tls_acme,
             no_tunnel_server,
             restart_on_exit,
+            vacuum_secrets,
             ..
         } => {
             // Spawn Docker API socket server if enabled. On Unix this is a
@@ -756,6 +760,25 @@ async fn run(
                 tls_key: tunnel_tls_key.clone(),
             };
             commands::serve::set_pending_tunnel_overrides(tunnel_overrides);
+
+            // Stash CLI-level daemon-API TLS overrides. The daemon reads
+            // them inside `serve_with_external_shutdown` and translates them
+            // into a `zlayer_api::config::ApiTlsConfig` that is set on
+            // `ApiConfig::tls` before the API listener binds. Clap's
+            // `requires` / `conflicts_with` constraints (in `cli.rs`) keep
+            // these three flags in a valid combination.
+            let api_tls_overrides = commands::serve::ApiTlsCliOverrides {
+                cert: api_tls_cert.clone(),
+                key: api_tls_key.clone(),
+                acme: *api_tls_acme,
+            };
+            commands::serve::set_pending_api_tls_overrides(api_tls_overrides);
+
+            // Wave 6 (v0.13.0): stash the `--vacuum-secrets` flag so the
+            // daemon's boot path (`serve_with_external_shutdown`) wipes
+            // `{data_dir}/join_secret` BEFORE the HS256 HMAC key derivation
+            // runs. Defaults to `false`; consumed exactly once per process.
+            commands::serve::set_pending_vacuum_secrets(*vacuum_secrets);
 
             // NAT overrides are gated on the `nat` feature; on builds without
             // it, fall back to the env-var-only path via `serve()`.
@@ -893,6 +916,9 @@ async fn run(
         } => commands::ps::ps(deployment.clone(), *containers, format).await,
         Commands::Node(node_cmd) => {
             commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
+        }
+        Commands::Cluster(cluster_cmd) => {
+            commands::cluster::handle_cluster(cluster_cmd, &cli.effective_data_dir()).await
         }
         Commands::Daemon(action) => {
             commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await

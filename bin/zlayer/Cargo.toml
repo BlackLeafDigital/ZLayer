@@ -133,6 +133,19 @@ zlayer-client.workspace = true
 # `dep:zlayer-docker` and the serve path references `zlayer_init_actions`.
 zlayer-docker = { workspace = true, optional = true }
 zlayer-init-actions.workspace = true
+ed25519-dalek.workspace = true
+
+# Duration parsing for CLI flags like `--ttl 24h` / `--ttl 30m` (signed
+# cluster join token expiry). Already a transitive workspace dep and used
+# directly by `zlayer-types`, `zlayer-api`, and `zlayer-builder`.
+humantime = "2"
+
+# Wave 4.1: HS256 cluster-join token minting alongside the Ed25519-signed
+# envelope. The leader-side validator in `zlayer-api` already accepts
+# HS256 JWTs with `iss=zlayer-cluster`, `aud=cluster-join`, `jti`, `exp`,
+# `iat`; this dep lets the CLI mint matching tokens without round-tripping
+# through the daemon.
+jsonwebtoken = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

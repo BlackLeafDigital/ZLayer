@@ -775,6 +775,101 @@ pub(crate) async fn serve_with_nat_overrides(
     .await
 }
 
+/// CLI overrides for the daemon API listener's TLS configuration.
+///
+/// Resolved inside [`serve_with_external_shutdown`] and translated into a
+/// [`zlayer_api::config::ApiTlsConfig`] that is set on [`ApiConfig::tls`]
+/// before the API listener starts. The three fields encode the three valid
+/// modes:
+///
+/// - `cert = Some, key = Some, acme = false` → [`ApiTlsConfig::Static`].
+/// - `cert = None, key = None, acme = true`  → [`ApiTlsConfig::Managed`],
+///   sharing the proxy's `Arc<CertManager>`.
+/// - `cert = None, key = None, acme = false` → no TLS (plain HTTP).
+///
+/// All other combinations are rejected by clap's `requires` /
+/// `conflicts_with` constraints on `Commands::Serve` (see `cli.rs`), so the
+/// translation logic in [`build_api_tls_config_from_overrides`] uses
+/// `unreachable!` for the unreachable arms.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApiTlsCliOverrides {
+    /// `--api-tls-cert <PATH>`: PEM-encoded certificate chain to load at
+    /// startup. Mutually exclusive with `acme`. Requires `key`.
+    pub cert: Option<std::path::PathBuf>,
+    /// `--api-tls-key <PATH>`: PEM-encoded private key paired with `cert`.
+    pub key: Option<std::path::PathBuf>,
+    /// `--api-tls-acme`: delegate cert resolution to the proxy's
+    /// `Arc<CertManager>` instead of loading static files.
+    pub acme: bool,
+}
+
+/// Process-global slot for the most recently parsed [`ApiTlsCliOverrides`].
+///
+/// Mirrors the [`PENDING_TUNNEL_OVERRIDES`] / [`PENDING_NAT_OVERRIDES`]
+/// pattern: `main.rs` calls [`set_pending_api_tls_overrides`] before
+/// dispatching to `serve()`, and [`serve_with_external_shutdown`] calls
+/// [`take_pending_api_tls_overrides`] to pick the value back up. Keeping
+/// the overrides in a process-global slot avoids extending
+/// `serve_with_external_shutdown`'s public signature (which the Windows
+/// Service host pins for back-compat).
+static PENDING_API_TLS_OVERRIDES: std::sync::Mutex<Option<ApiTlsCliOverrides>> =
+    std::sync::Mutex::new(None);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_api_tls_overrides(overrides: ApiTlsCliOverrides) {
+    if let Ok(mut slot) = PENDING_API_TLS_OVERRIDES.lock() {
+        *slot = Some(overrides);
+    }
+}
+
+fn take_pending_api_tls_overrides() -> ApiTlsCliOverrides {
+    PENDING_API_TLS_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default()
+}
+
+/// Translate parsed `--api-tls-*` CLI overrides into an [`ApiTlsConfig`].
+///
+/// `cert_manager` is the proxy's `Arc<CertManager>` (always constructed by
+/// `init_daemon`), shared with the `Managed` variant when `--api-tls-acme`
+/// is set so the daemon API serves the same cert pool the reverse proxy
+/// uses for L7 routes.
+///
+/// Clap's `requires` / `conflicts_with` constraints on `Commands::Serve`
+/// guarantee that only three combinations of the three fields are
+/// reachable; all others trip the `unreachable!` arm and indicate a
+/// regression in the CLI definition rather than user input.
+fn build_api_tls_config_from_overrides(
+    overrides: &ApiTlsCliOverrides,
+    cert_manager: &Arc<zlayer_proxy::CertManager>,
+) -> Option<zlayer_api::config::ApiTlsConfig> {
+    match (
+        overrides.cert.clone(),
+        overrides.key.clone(),
+        overrides.acme,
+    ) {
+        (Some(cert_path), Some(key_path), false) => {
+            Some(zlayer_api::config::ApiTlsConfig::Static {
+                cert_path,
+                key_path,
+            })
+        }
+        (None, None, true) => Some(zlayer_api::config::ApiTlsConfig::Managed {
+            cert_manager: Arc::clone(cert_manager),
+        }),
+        (None, None, false) => None,
+        // Clap's `requires`/`conflicts_with` make all other combinations
+        // unreachable. If we ever hit this, the CLI definition has drifted.
+        _ => unreachable!(
+            "clap should have rejected this combination of --api-tls-* flags; \
+             got cert={:?}, key={:?}, acme={}",
+            overrides.cert, overrides.key, overrides.acme,
+        ),
+    }
+}
+
 /// CLI overrides for the daemon-side tunnel server.
 ///
 /// Resolved in `serve()` against environment variables (`ZLAYER_TUNNEL_*`) and
@@ -829,6 +924,30 @@ pub(crate) fn set_pending_restart_on_exit(restart: bool) {
 
 fn take_pending_restart_on_exit() -> bool {
     PENDING_RESTART_ON_EXIT.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Pending `--vacuum-secrets` flag (Wave 6, v0.13.0).
+///
+/// When the daemon is launched with `--vacuum-secrets` (or
+/// `ZLAYER_VACUUM_SECRETS=true`), the boot path wipes
+/// `{data_dir}/join_secret` before the HS256 derivation reads it, forcing
+/// the HMAC key to regenerate. Useful when an operator suspects the
+/// symmetric secret has leaked. Ed25519-signed tokens are unaffected.
+///
+/// Stored in a process-global slot so `serve()`/`serve_with_nat_overrides()`
+/// can stash the parsed CLI value before delegating to
+/// `serve_with_external_shutdown()` (whose public signature is pinned by the
+/// Windows Service host in `daemon_service.rs`).
+static PENDING_VACUUM_SECRETS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_vacuum_secrets(vacuum: bool) {
+    PENDING_VACUUM_SECRETS.store(vacuum, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_vacuum_secrets() -> bool {
+    PENDING_VACUUM_SECRETS.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Resolve the tunnel daemon config from CLI overrides + env vars + defaults.
@@ -1208,6 +1327,12 @@ pub(crate) async fn serve_with_external_shutdown(
     // Pick up tunnel-server CLI overrides + ZLAYER_TUNNEL_* env vars.
     let tunnel_overrides = take_pending_tunnel_overrides();
     let tunnel_config = build_tunnel_config_from_overrides(&tunnel_overrides);
+
+    // Pick up daemon-API TLS CLI overrides. Translated below into an
+    // `ApiTlsConfig` once `cert_manager` is in scope (`init_daemon` always
+    // constructs one, so the `Managed` ACME path never lacks a backing
+    // resolver and we don't need a no-proxy guard here).
+    let api_tls_overrides = take_pending_api_tls_overrides();
     // Resolve the JWT signing secret. Priority is:
     //   1. Explicit `--jwt-secret` flag / `ZLAYER_JWT_SECRET` env var
     //      (clap reads both into the `jwt_secret` parameter).
@@ -1346,6 +1471,7 @@ pub(crate) async fn serve_with_external_shutdown(
         stream_registry,
         cert_manager,
         log_rotator_handle,
+        keystore_pruner_handle,
         health_checker_handle,
         nat_maintenance_handle,
         node_config,
@@ -1386,6 +1512,33 @@ pub(crate) async fn serve_with_external_shutdown(
             )
         })?;
     info!(path = %metadata_path.display(), "Daemon metadata written");
+
+    // -----------------------------------------------------------------------
+    // 3a'. Wave 6 (v0.13.0): `--vacuum-secrets` wipes the cluster
+    // `join_secret` BEFORE the loader runs so the HS256 HMAC key
+    // regenerates on the very next step. Ed25519 signing material (under
+    // `cluster_signing.key`) is intentionally untouched. The flag is
+    // consumed exactly once (the static slot is swapped to false) so a
+    // supervisor-driven respawn after this run does not vacuum a fresh
+    // secret on every restart.
+    // -----------------------------------------------------------------------
+    if take_pending_vacuum_secrets() {
+        let path = config.data_dir.join("join_secret");
+        if path.exists() {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("removing {} per --vacuum-secrets", path.display()))?;
+            tracing::warn!(
+                path = %path.display(),
+                "removed cluster join_secret per --vacuum-secrets; HS256 HMAC key will regenerate"
+            );
+        } else {
+            info!(
+                path = %path.display(),
+                "--vacuum-secrets requested but join_secret was already absent; nothing to remove"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 3b. Generate or load the cluster join secret
@@ -1440,6 +1593,31 @@ pub(crate) async fn serve_with_external_shutdown(
         }
 
         secret
+    };
+
+    // Wave 1: Ed25519 signer for signed cluster join tokens.
+    //
+    // We persist the signing seed at {data_dir}/cluster_signing.key (mode 0600).
+    // The public key is exposed via GET /api/v1/cluster/signing-pubkey (Agent 1.3).
+    // HS256 (using join_secret above) and plaintext tokens remain accepted; the
+    // signer is plumbed but no token-format changes happen until Wave 3.
+    let cluster_signer = {
+        let path = config.data_dir.join("cluster_signing.key");
+        let signer = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to load or generate cluster signing keypair at {}",
+                    path.display()
+                )
+            })?;
+        info!(
+            kid = %signer.key_id(),
+            public_key_b64 = %signer.public_key_b64(),
+            path = %path.display(),
+            "Loaded cluster signing keypair"
+        );
+        Arc::new(signer)
     };
 
     // -----------------------------------------------------------------------
@@ -1554,8 +1732,36 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     // 4. Build the full API router
     // -----------------------------------------------------------------------
+    // Translate the parsed `--api-tls-*` CLI overrides into an
+    // `ApiTlsConfig`. `cert_manager` is the proxy's `Arc<CertManager>`
+    // destructured from `DaemonState` above; sharing it with the daemon
+    // API listener means ACME-managed certs hot-reload uniformly across the
+    // proxy and the API. `init_daemon` unconditionally builds a
+    // `CertManager`, so the ACME path always has a backing resolver here
+    // and no "no-proxy" guard is required.
+    let api_tls = build_api_tls_config_from_overrides(&api_tls_overrides, &cert_manager);
+    match &api_tls {
+        Some(zlayer_api::config::ApiTlsConfig::Static {
+            cert_path,
+            key_path,
+        }) => {
+            info!(
+                cert = %cert_path.display(),
+                key = %key_path.display(),
+                "Daemon API listener will use static TLS",
+            );
+        }
+        Some(zlayer_api::config::ApiTlsConfig::Managed { .. }) => {
+            info!("Daemon API listener will use ACME/CertManager TLS");
+        }
+        None => {
+            info!("Daemon API listener will use plain HTTP (no TLS configured)");
+        }
+    }
+
     let api_config = ApiConfig {
         bind: bind_addr,
+        tls: api_tls,
         jwt_secret,
         swagger_enabled: !no_swagger,
         credential_store: Some(credential_store),
@@ -1909,7 +2115,7 @@ pub(crate) async fn serve_with_external_shutdown(
     };
     let slice_allocator = Arc::new(RwLock::new(slice_allocator));
 
-    let cluster_state = ClusterApiState::with_internal_token(
+    let mut cluster_state = ClusterApiState::with_internal_token(
         _raft.clone(),
         Some(join_secret),
         ip_allocator,
@@ -1918,7 +2124,12 @@ pub(crate) async fn serve_with_external_shutdown(
         Some(slice_allocator_path),
         internal_token,
         Some(config.data_dir.clone()),
+        Some(cluster_signer.clone()),
     );
+    // Wire the on-disk keystore path so `validate_join_token_ed25519`
+    // (Wave 5A.3) and `cluster_rotate_signing_key` (Wave 5B.4) can look
+    // up signers by `kid` and rotate the keystore on demand.
+    cluster_state.cluster_signing_key_path = Some(config.data_dir.join("cluster_signing.key"));
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
@@ -2164,6 +2375,13 @@ pub(crate) async fn serve_with_external_shutdown(
         let _ = handle.await;
     }
     info!("Log rotator stopped");
+
+    // Stop cluster signing keystore pruner (Wave 5A.5)
+    if let Some(handle) = keystore_pruner_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    info!("Cluster signing keystore pruner stopped");
 
     // Stop container supervisor
     supervisor.shutdown();

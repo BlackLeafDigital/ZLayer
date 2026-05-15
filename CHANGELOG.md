@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-05-14
+
+### Added
+- Cluster-wide token revocation list (Wave 7). New `POST /api/v1/cluster/revoke-token` and `GET /api/v1/cluster/revocations` endpoints (both admin auth) plus matching CLI commands `zlayer cluster revoke-token <token-or-hash> [--reason ...]` and `zlayer cluster list-revocations`. Revocations replicate through Raft via the new `SecretsRaftOp::RevokeToken`; entries auto-prune at apply time so the table stays bounded by the un-expired token horizon. Token hashes (lowercase hex SHA-256 of the b64 envelope) are the replicated identifier — raw token bytes never enter cluster state. Applies to both Ed25519-signed and HS256-JWT tokens — the check runs in `cluster_join` before format-specific validators.
+- `SigningBackend` trait + `FileBackend` adapter in `zlayer-secrets` (Wave 8, minimal). Abstracts the cluster signing keystore behind a trait so future TPM/YubiHSM/KMS impls can swap in without touching call sites. Current shipping implementation is the existing JSON keystore on disk (`FileBackend`); the trait reports `is_hardware_backed() = false`. Hardware-backed impls (TPM 2.0, YubiHSM 2) are deliberately deferred — the trait is the extension point only.
+
+## [0.13.0] - 2026-05-14
+
+### Removed
+- Plaintext cluster join token format. Servers no longer accept tokens with `auth_secret` baked into the body; CLI no longer emits them. Re-issue any plaintext tokens by running `zlayer node generate-join-token`. Ed25519-signed and HS256 formats are unaffected.
+- `--legacy-plaintext` CLI flag on `zlayer node generate-join-token` (was an emergency rollback escape hatch in v0.12.0).
+
+### Added
+- `--vacuum-secrets` flag on `zlayer serve`. When set at startup, wipes `{data_dir}/join_secret` so the HS256 HMAC key regenerates. Use after suspected symmetric-secret leak. Default off.
+
+### Migration
+- Before upgrading: have all clients re-issue join tokens using `zlayer node generate-join-token` from a v0.12.x daemon. The output's signed and HS256 tokens both validate against v0.13.0 servers. Plaintext tokens issued under v0.11.x or earlier MUST be re-issued.
+
+## [0.12.0] - 2026-05-14
+
+### Added
+- Begin signed-join-token work — added `ed25519-dalek = "2"` to workspace deps (no behavior change yet; Wave 1 will introduce the signing keypair). See docs/adr/0001-signed-join-tokens.md.
+- `zlayer node generate-join-token --ttl <DURATION>` (default `24h`,
+  humantime syntax accepted). Drives the new Wave-3 signed cluster join
+  token's `exp` claim (`now() + ttl`). The handler now emits a signed
+  token (Ed25519, recommended) alongside the existing legacy plaintext
+  token (deprecated; removed in Wave 6). Legacy token unchanged. The
+  signed-token issuer (`iss`) is the local node UUID from
+  `node_config.json`; the signer is loaded from
+  `{data_dir}/cluster_signing.key` (same path as the daemon).
+- Ed25519-signed cluster join tokens (Wave 3). New `zlayer node generate-join-token --ttl <duration>` mints a signed token with explicit expiration; default ttl is 24h. The signed format coexists with the existing HS256-JWT and plaintext formats; servers try Ed25519 → HS256 → plaintext.
+- TLS for the daemon API listener (Wave 2). New `--api-tls-cert`/`--api-tls-key` flags load static PEM certs; `--api-tls-acme` delegates to the proxy's ACME-capable `CertManager`. Default off.
+- `GET /api/v1/cluster/signing-pubkey` endpoint (Wave 1, unauthenticated by design). Returns the cluster's active Ed25519 verifying key + kid for joining nodes to fetch.
+
+### Changed
+- `zlayer node generate-join-token` no longer emits the legacy plaintext token by default (Wave 4). Pass `--legacy-plaintext` if you specifically need it for backward compat with un-upgraded peers; the flag is deprecated and removed in v0.13.0.
+
+### Deprecated
+- Plaintext join tokens. Servers still accept them but now emit a warning both server-side (`tracing::warn`) and in the API response body. Removal scheduled for v0.13.0 (Wave 6).
+
 ## [0.11.24] - 2026-05-12
 
 ### Added

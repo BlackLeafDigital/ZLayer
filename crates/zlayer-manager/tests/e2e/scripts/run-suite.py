@@ -232,15 +232,38 @@ def start_throwaway_daemon(
         _kill_pg(proc, "daemon (failed startup)", sudo=sudo)
         die(f"throwaway daemon never came up on 127.0.0.1:{API_PORT}")
 
-    sock = data_dir / "run" / "zlayer.sock"
+    # Read the bound socket path from daemon.json rather than synthesising
+    # it. The daemon's path resolver substitutes `/tmp/zlayer-daemon-<hash>.sock`
+    # when `{data_dir}/run/zlayer.sock` would overflow `sockaddr_un.sun_path`
+    # (Linux 108 / macOS 104); only the daemon knows which path actually got
+    # bound, so we trust daemon.json (struct DaemonMetadata in
+    # bin/zlayer/src/commands/serve.rs, field `socket_path`).
+    meta_path = data_dir / "daemon.json"
     deadline = time.monotonic() + SOCKET_WAIT_S
+    sock: Optional[Path] = None
     while time.monotonic() < deadline:
-        if is_socket(sock):
-            return proc, sock
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = None
+            if isinstance(meta, dict):
+                sp = meta.get("socket_path")
+                if isinstance(sp, str) and sp:
+                    candidate = Path(sp)
+                    if is_socket(candidate):
+                        sock = candidate
+                        break
         time.sleep(1)
-    _kill_pg(proc, "daemon (no socket)", sudo=sudo)
-    die(f"throwaway daemon socket never appeared at {sock}")
-    raise RuntimeError("unreachable")  # for type checkers
+    if sock is None:
+        _kill_pg(proc, "daemon (no socket)", sudo=sudo)
+        die(
+            "throwaway daemon socket never appeared "
+            f"(daemon.json at {meta_path} missing or socket_path stale; "
+            "see daemon stderr above)"
+        )
+        raise RuntimeError("unreachable")  # for type checkers
+    return proc, sock
 
 
 def create_fixture_user(

@@ -532,6 +532,7 @@ fn hash_for_socket(data_dir: &Path, label: &str) -> u64 {
 /// silently landing state there courts OOM under load. Sockets are the
 /// narrow exception because the file itself stores ~256 bytes of inode
 /// metadata.
+#[cfg(not(target_os = "windows"))]
 fn socket_safe_fallback(data_dir: &Path, label: &str) -> String {
     format!(
         "/tmp/zlayer-{label}-{:016x}.sock",

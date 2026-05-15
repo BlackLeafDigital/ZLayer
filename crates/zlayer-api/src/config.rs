@@ -5,12 +5,66 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// TLS configuration for the daemon API listener.
+///
+/// When `None` (the default), the listener binds plain HTTP on `bind`.
+/// When `Some`, the listener wraps the TCP socket with rustls.
+///
+/// Two mutually-exclusive modes:
+/// - `Static { cert_path, key_path }` — load cert+key from disk once.
+/// - `Managed { cert_manager }` — delegate resolution to the proxy's
+///   `CertManager` (ACME-capable, hot-reloading). Set when operators
+///   pass `--api-tls-acme`.
+#[derive(Clone)]
+pub enum ApiTlsConfig {
+    /// Load cert+key from disk once at startup.
+    Static {
+        /// Path to PEM-encoded certificate chain.
+        cert_path: std::path::PathBuf,
+        /// Path to PEM-encoded private key.
+        key_path: std::path::PathBuf,
+    },
+    /// Delegate certificate resolution to the proxy's `CertManager`
+    /// (ACME-capable, hot-reloading).
+    Managed {
+        /// Shared `CertManager` instance owned by the proxy subsystem.
+        cert_manager: std::sync::Arc<zlayer_proxy::CertManager>,
+    },
+}
+
+impl std::fmt::Debug for ApiTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiTlsConfig::Static {
+                cert_path,
+                key_path,
+            } => f
+                .debug_struct("ApiTlsConfig::Static")
+                .field("cert_path", cert_path)
+                .field("key_path", key_path)
+                .finish(),
+            ApiTlsConfig::Managed { .. } => f
+                .debug_struct("ApiTlsConfig::Managed")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// API server configuration
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Bind address
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+
+    /// Optional TLS configuration. `None` = plain HTTP (current behavior).
+    ///
+    /// Wave 2 of the join-token hardening wires this into the listener so the
+    /// verifying-key endpoint cannot be trivially MitM-ed. Not serialised —
+    /// the `Managed` variant holds an `Arc<CertManager>` which is constructed
+    /// at runtime, not loaded from config files.
+    #[serde(skip)]
+    pub tls: Option<ApiTlsConfig>,
 
     /// JWT secret key (should be at least 32 bytes)
     #[serde(skip_serializing)]
@@ -85,6 +139,7 @@ impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
             .field("bind", &self.bind)
+            .field("tls", &self.tls)
             .field("jwt_secret", &"<redacted>")
             .field("token_expiry", &self.token_expiry)
             .field("swagger_enabled", &self.swagger_enabled)
@@ -102,6 +157,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            tls: None,
             jwt_secret: SecretString::from("CHANGE_ME_IN_PRODUCTION".to_string()),
             token_expiry: default_token_expiry(),
             swagger_enabled: true,

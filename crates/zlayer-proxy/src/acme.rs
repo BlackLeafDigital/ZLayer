@@ -559,6 +559,59 @@ impl CertManager {
         cache.keys().cloned().collect()
     }
 
+    /// Build a `rustls::ServerConfig` from the cert manager's current cache.
+    ///
+    /// Creates a fresh `SniCertResolver`, loads every certificate the manager
+    /// currently has cached into it, and wraps the resolver in a
+    /// `ServerConfig` with no client auth. Intended for callers (e.g. the
+    /// daemon API listener) that want to terminate TLS using the same cert
+    /// pool the proxy serves.
+    ///
+    /// Hot-reload semantics: this is a one-shot snapshot — certs renewed
+    /// after this call are NOT picked up by the returned config. Callers
+    /// that need hot-reload should keep an `Arc<SniCertResolver>` shared
+    /// with the proxy renewal task instead. For the join-token verifying-key
+    /// listener, restarting the daemon on renewal is acceptable since
+    /// certificates renew every ~60-90 days.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading any cached certificate into the SNI
+    /// resolver fails (malformed PEM, key/cert mismatch, etc.).
+    pub async fn build_server_config(
+        &self,
+    ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
+        let resolver = Arc::new(SniCertResolver::new());
+
+        // Pull cached domains and load each into the resolver. We hold the
+        // read lock for the snapshot and release it before calling load_cert
+        // (which takes its own DashMap write lock on the resolver) to avoid
+        // holding two locks at once.
+        let cached: Vec<(String, String, String)> = {
+            let cache = self.cache.read().await;
+            cache
+                .iter()
+                .map(|(domain, (cert, key))| (domain.clone(), cert.clone(), key.clone()))
+                .collect()
+        };
+
+        for (domain, cert_pem, key_pem) in cached {
+            resolver
+                .load_cert(&domain, &cert_pem, &key_pem)
+                .map_err(|e| {
+                    format!(
+                        "Failed to load cached certificate for '{domain}' into SNI resolver: {e}"
+                    )
+                })?;
+        }
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+
+        Ok(Arc::new(server_config))
+    }
+
     // =========================================================================
     // Certificate Metadata Management
     // =========================================================================

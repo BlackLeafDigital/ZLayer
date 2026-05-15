@@ -1281,6 +1281,26 @@ pub fn build_router_with_tunnels(
 pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
     Router::new()
         .route("/join", post(handlers::cluster::cluster_join))
+        .route(
+            "/signing-pubkey",
+            get(handlers::cluster::cluster_signing_pubkey),
+        )
+        .route(
+            "/signing-pubkeys",
+            get(handlers::cluster::cluster_signing_pubkeys),
+        )
+        .route(
+            "/rotate-signing-key",
+            post(handlers::cluster::cluster_rotate_signing_key),
+        )
+        .route(
+            "/revoke-token",
+            post(handlers::cluster::cluster_revoke_token),
+        )
+        .route(
+            "/revocations",
+            get(handlers::cluster::cluster_list_revocations),
+        )
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
         .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .route(

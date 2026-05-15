@@ -38,11 +38,19 @@ zlayer-tunnel.workspace = true
 # Web framework
 axum.workspace = true
 axum-extra.workspace = true
+# `axum-server` is used to wrap the daemon's TCP listener with rustls TLS
+# when operators pass `--api-tls-cert/--api-tls-key` or `--api-tls-acme`.
+# Same rustls + tokio-rustls stack the proxy uses (see zlayer-proxy/src/tls.rs).
+axum-server.workspace = true
 bytes.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+
+# TLS (mirrors zlayer-proxy's stack — rustls 0.23 + rustls-pemfile 2).
+rustls.workspace = true
+rustls-pemfile.workspace = true
 
 # Authentication
 jsonwebtoken.workspace = true
@@ -127,6 +135,7 @@ sqlx.workspace = true
 # enabled by the binary). Kept default-features-off + minimal features to
 # mirror the settings in `zlayer-agent`.
 bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
+ed25519-dalek.workspace = true
 
 [features]
 default = []
@@ -146,6 +155,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # once we hand it a PKCS#1 DER-encoded private key.
 rsa = "0.9"
 jsonwebtoken.workspace = true
+# rcgen generates a self-signed cert + key on the fly for the TLS listener
+# tests in `src/server.rs::tests::load_static_rustls_config_*`. Already a
+# dev-dependency of zlayer-proxy and a workspace pin, so no new TLS stack.
+rcgen.workspace = true
 
 [lints]
 workspace = true

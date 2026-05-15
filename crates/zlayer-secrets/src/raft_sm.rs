@@ -35,6 +35,11 @@ pub struct SecretsState {
 
     /// Replicated secrets, keyed by their `storage_key` (`"{scope}:{name}"`).
     pub secrets: HashMap<String, ReplicatedSecret>,
+
+    /// Revoked join tokens, keyed by `token_hash` (lowercase hex SHA-256
+    /// of the full token b64 envelope). Auto-pruned during apply: any
+    /// `RevokeToken` op also sweeps entries whose `expires_at < now()`.
+    pub revoked_tokens: HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 
 impl SecretsState {
@@ -85,6 +90,21 @@ impl SecretsState {
                 })?;
                 Ok(())
             }
+            SecretsRaftOp::RevokeToken {
+                token_hash,
+                expires_at,
+            } => {
+                // Insert the revocation. Idempotent: replaying the same op is
+                // a no-op overwrite. Trailing expired entries are pruned in
+                // the same pass so the table stays bounded.
+                let now = Utc::now();
+                if expires_at > now {
+                    self.revoked_tokens.insert(token_hash, expires_at);
+                }
+                // Sweep expired entries opportunistically on every revoke apply.
+                self.revoked_tokens.retain(|_, exp| *exp > now);
+                Ok(())
+            }
         }
     }
 
@@ -113,6 +133,15 @@ impl SecretsState {
         self.wrapped_dek
             .as_ref()
             .is_some_and(|w| w.wraps.contains_key(node_id))
+    }
+
+    /// Returns true if the given token hash is currently revoked.
+    ///
+    /// Auto-pruning happens at apply time; callers can rely on the
+    /// in-memory map being a tight view of un-expired revocations.
+    #[must_use]
+    pub fn token_revoked(&self, token_hash: &str) -> bool {
+        self.revoked_tokens.contains_key(token_hash)
     }
 }
 
@@ -369,5 +398,64 @@ mod tests {
             .expect("rotate exclude a");
         assert!(!state.node_can_decrypt("node-a"));
         assert!(state.node_can_decrypt("node-b"));
+    }
+
+    #[test]
+    fn revoke_token_inserts_entry() {
+        let mut state = SecretsState::default();
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "abc123".to_string(),
+                expires_at,
+            })
+            .unwrap();
+        assert!(state.token_revoked("abc123"));
+        assert!(!state.token_revoked("def456"));
+    }
+
+    #[test]
+    fn revoke_token_is_idempotent() {
+        let mut state = SecretsState::default();
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        let op = SecretsRaftOp::RevokeToken {
+            token_hash: "abc123".to_string(),
+            expires_at,
+        };
+        state.apply(op.clone()).unwrap();
+        state.apply(op).unwrap();
+        assert_eq!(state.revoked_tokens.len(), 1);
+    }
+
+    #[test]
+    fn revoke_token_skips_already_expired_input() {
+        let mut state = SecretsState::default();
+        let expired_at = Utc::now() - chrono::Duration::hours(1);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "abc123".to_string(),
+                expires_at: expired_at,
+            })
+            .unwrap();
+        // Already-expired entries are not even inserted.
+        assert!(!state.token_revoked("abc123"));
+    }
+
+    #[test]
+    fn revoke_token_apply_prunes_expired_neighbors() {
+        let mut state = SecretsState::default();
+        // Seed with an expired entry, then apply a fresh revoke; the
+        // expired neighbor should be swept in the same pass.
+        let expired_at = Utc::now() - chrono::Duration::hours(1);
+        state.revoked_tokens.insert("stale".to_string(), expired_at);
+        let fresh_expires = Utc::now() + chrono::Duration::hours(24);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "fresh".to_string(),
+                expires_at: fresh_expires,
+            })
+            .unwrap();
+        assert!(state.token_revoked("fresh"));
+        assert!(!state.token_revoked("stale"));
     }
 }

@@ -22,6 +22,7 @@ use crate::error::{ApiError, Result};
 use crate::handlers::internal::{
     InternalAddPeerRequest, UpgradeStartResponse, INTERNAL_AUTH_HEADER,
 };
+use crate::handlers::users::AuthActor;
 use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 
 // =============================================================================
@@ -33,8 +34,10 @@ use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 // depending on `zlayer-api`. We re-export them here so existing call sites
 // (the `cluster_join` handler, the test module) keep compiling.
 pub use zlayer_types::api::cluster::{
-    default_api_port, default_mode, ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary,
-    ClusterPeer,
+    default_api_port, default_mode, ClusterJoinClaims, ClusterJoinRequest, ClusterJoinResponse,
+    ClusterNodeSummary, ClusterPeer, RevocationEntry, RevocationListResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RotateSigningKeyRequest, RotateSigningKeyResponse, SignedClusterJoinToken,
+    SigningPubkeyEntry, SigningPubkeyResponse, SigningPubkeysResponse, SIGNED_TOKEN_V_WAVE3,
 };
 
 /// Heartbeat request from a worker node.
@@ -82,6 +85,25 @@ pub struct ClusterApiState {
     next_raft_id: Arc<AtomicU64>,
     /// Expected join token secret for validation
     pub join_secret: Option<String>,
+    /// Ed25519 keypair used to sign cluster join tokens (Wave 1).
+    ///
+    /// `None` indicates the daemon has not been wired with a signer yet —
+    /// for example, in unit tests that construct `ClusterApiState` without
+    /// the daemon bootstrap path. Endpoints that need to sign or verify
+    /// Ed25519-signed tokens MUST handle this case explicitly.
+    pub cluster_signer: Option<Arc<zlayer_secrets::ClusterSigner>>,
+    /// Path to the cluster signing keystore on disk (Wave 5A).
+    ///
+    /// Used by [`validate_join_token_ed25519`] to look up signers by `kid`
+    /// so that tokens issued under a now-grace key remain verifiable for
+    /// the duration of their grace window. If `None`, the validator falls
+    /// back to comparing the token's `kid` against the active `cluster_signer`
+    /// only (pre-Wave-5A behavior).
+    ///
+    /// Callers (the daemon bootstrap in `bin/zlayer/src/commands/serve.rs`)
+    /// should set this to `Some({data_dir}/cluster_signing.key)` after
+    /// constructing the state, since the field is `pub`.
+    pub cluster_signing_key_path: Option<std::path::PathBuf>,
     /// IP allocator for overlay network addresses (CIDR-aware, collision-safe)
     pub ip_allocator: Arc<RwLock<IpAllocator>>,
     /// Path for persisting IP allocator state
@@ -134,6 +156,8 @@ impl ClusterApiState {
             raft,
             next_raft_id: Arc::new(AtomicU64::new(2)),
             join_secret,
+            cluster_signer: None,
+            cluster_signing_key_path: None,
             ip_allocator,
             ip_allocator_path,
             internal_token: None,
@@ -155,11 +179,14 @@ impl ClusterApiState {
         slice_allocator_path: Option<PathBuf>,
         internal_token: String,
         data_dir: Option<std::path::PathBuf>,
+        cluster_signer: Option<Arc<zlayer_secrets::ClusterSigner>>,
     ) -> Self {
         Self {
             raft,
             next_raft_id: Arc::new(AtomicU64::new(2)),
             join_secret,
+            cluster_signer,
+            cluster_signing_key_path: None,
             ip_allocator,
             ip_allocator_path,
             internal_token: Some(internal_token),
@@ -192,6 +219,8 @@ impl ClusterApiState {
             raft: None,
             next_raft_id: Arc::new(AtomicU64::new(2)),
             join_secret: None,
+            cluster_signer: None,
+            cluster_signing_key_path: None,
             ip_allocator: Arc::new(RwLock::new(allocator)),
             ip_allocator_path: None,
             internal_token: None,
@@ -246,32 +275,98 @@ pub async fn cluster_join(
         .as_ref()
         .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
 
-    // 2. Validate the join token (if a secret is configured).
+    // 2. Validate the join token.
     //
-    // Phase-1: prefer the signed-token form (HS256 JWT, single-use via
-    // `jti` replay protection). For backward compatibility we keep accepting
-    // the legacy plaintext base64-JSON `auth_secret` form for one release —
-    // a `tracing::warn!` fires when that path is taken so operators can see
-    // when a client still hasn't been upgraded.
+    // Wave 6 (v0.13.0) dispatch order:
+    //   1. Ed25519-signed envelope (preferred — public-key crypto, no shared
+    //      secret needed on the joiner side).
+    //   2. HS256 JWT (Phase-1 form — single-use via `jti` replay protection).
+    //   3. Legacy plaintext base64-JSON `auth_secret` — HARD REJECTED. The
+    //      plaintext-shape detection runs only to surface a clearer error
+    //      ("re-issue with `zlayer node generate-join-token`") than the
+    //      otherwise-opaque HS256 decode failure.
     //
-    // TODO Phase-1.5: drop legacy auth_secret validator entirely once all
-    // CLIs / agents have been re-rolled to mint signed tokens.
-    if let Some(expected_secret) = &state.join_secret {
-        let hmac_key = derive_join_hmac_key(expected_secret);
-        let signed_ok = validate_join_token_signed(&req.token, &hmac_key, &state.used_jtis);
-        match signed_ok {
-            Ok(()) => {}
-            Err(signed_err) => {
-                // Fall back to the legacy validator. Logging the signed-side
-                // failure keeps visibility on tokens that look JWT-shaped but
-                // fail validation (expired, replayed, wrong audience).
-                if validate_join_token(&req.token, expected_secret) {
-                    warn!(
-                        legacy_join_token = true,
-                        "Cluster join used legacy plaintext auth_secret token; \
-                         clients should upgrade to the signed-JWT form"
-                    );
-                } else {
+    // If a token LOOKS like an Ed25519 envelope (has `v`/`kid`/`sig` after
+    // base64-decode) but fails Ed25519 verification, that's an explicit
+    // reject — we DON'T fall through to HS256, because doing so would let
+    // an attacker who mangles a real signed token bypass signature checks.
+    //
+    // The handler doesn't currently extract `ConnectInfo`, so logging uses a
+    // sentinel `0.0.0.0` peer-IP. A future wave that adds the real client IP
+    // will make this field meaningful without changing the log shape.
+
+    // Wave 7.5: revocation check.
+    //
+    // Compute the canonical hash of the raw token and consult the
+    // Raft-replicated revocation list. If the entry is present we
+    // bail out early — every node converges on the same list via
+    // the state machine, so a revoked token is rejected everywhere
+    // within one Raft commit of `cluster_revoke_token`.
+    //
+    // The check runs BEFORE format-specific validators so an operator
+    // who revoked a leaked token doesn't burn replay-protection slots
+    // verifying a token we're going to reject anyway.
+    if let Some(raft) = state.raft.as_ref() {
+        let token_hash = token_canonical_hash(&req.token);
+        let secrets_state = raft.secrets_state().await;
+        if secrets_state.token_revoked(&token_hash) {
+            tracing::warn!(
+                event = "join_token_revoked",
+                token_hash = %token_hash,
+                "rejected revoked join token"
+            );
+            return Err(ApiError::Unauthorized("token revoked".into()));
+        }
+    }
+
+    let peer_ip: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+    let mut token_accepted = false;
+    if state.cluster_signer.is_some() {
+        match validate_join_token_ed25519(&state, &req.token, peer_ip).await {
+            Ok(_claims) => {
+                token_accepted = true;
+            }
+            Err(ed25519_err) => {
+                if is_signed_envelope_shape(&req.token) {
+                    // Explicit reject: token was signed-envelope-shaped but
+                    // failed verification (bad signature, kid mismatch,
+                    // expired, replayed). Do NOT fall through.
+                    return Err(ed25519_err);
+                }
+                // Otherwise the token isn't a Wave-3 envelope — fall through
+                // to the HS256 / plaintext-reject path below.
+            }
+        }
+    }
+
+    if !token_accepted {
+        if let Some(expected_secret) = &state.join_secret {
+            let hmac_key = derive_join_hmac_key(expected_secret);
+            let signed_ok = validate_join_token_signed(&req.token, &hmac_key, &state.used_jtis);
+            match signed_ok {
+                Ok(()) => {
+                    info!(format = "hs256", "accepted cluster join token");
+                }
+                Err(signed_err) => {
+                    // Wave 6 (v0.13.0): plaintext tokens are no longer accepted.
+                    // If the token's body looks like a legacy plaintext form
+                    // (carries an `auth_secret` field matching the cluster
+                    // secret), return a precise, actionable error pointing
+                    // the operator at the remediation command rather than
+                    // surfacing the opaque HS256 decode failure.
+                    if is_legacy_plaintext_token_shape(&req.token, expected_secret) {
+                        tracing::warn!(
+                            peer_ip = %peer_ip,
+                            format = "legacy_plaintext",
+                            "rejected legacy plaintext join token (v0.13.0 dropped acceptance)"
+                        );
+                        return Err(ApiError::Unauthorized(
+                            "plaintext join token rejected. Re-issue with 'zlayer node \
+                             generate-join-token' (signed by default). See CHANGELOG v0.13.0 \
+                             for migration."
+                                .into(),
+                        ));
+                    }
                     return Err(signed_err);
                 }
             }
@@ -518,6 +613,11 @@ pub async fn cluster_join(
         node_jwt,
         wrapped_dek,
         dek_generation,
+        // Wave 6 (v0.13.0): the plaintext-acceptance branch that used to
+        // populate this field is gone. The field itself stays on
+        // `ClusterJoinResponse` so future waves can surface other
+        // operator-facing advisories without another wire-shape change.
+        warnings: None,
     }))
 }
 
@@ -584,6 +684,389 @@ pub async fn cluster_list_nodes(
         .collect();
 
     Ok(Json(nodes))
+}
+
+/// `GET /api/v1/cluster/signing-pubkey` — return the cluster's active
+/// Ed25519 verifying key.
+///
+/// **Unauthenticated by design.** The response is a public key plus a short
+/// id; nothing here leaks anything an attacker doesn't already learn from a
+/// signed token. Joining nodes fetch this before they have any credential.
+///
+/// Returns `503 Service Unavailable` if the daemon was started without a
+/// `cluster_signer` (e.g., in some test harnesses); production daemons
+/// always set one.
+///
+/// # Errors
+///
+/// Returns [`ApiError::ServiceUnavailable`] when the daemon has no
+/// `cluster_signer` configured on its `ClusterApiState`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/signing-pubkey",
+    responses(
+        (status = 200, description = "Active Ed25519 verifying key", body = SigningPubkeyResponse),
+        (status = 503, description = "Cluster signer not configured on this node"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_signing_pubkey(
+    State(state): State<ClusterApiState>,
+) -> Result<Json<SigningPubkeyResponse>> {
+    let signer = state.cluster_signer.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("cluster signer not configured on this node".into())
+    })?;
+    Ok(Json(SigningPubkeyResponse {
+        public_key_b64: signer.public_key_b64(),
+        kid: signer.key_id(),
+    }))
+}
+
+/// `GET /api/v1/cluster/signing-pubkeys` — return ALL currently-trusted
+/// Ed25519 verifying keys (active + in-grace).
+///
+/// **Unauthenticated by design.** Use this when a joining node needs to
+/// verify a token signed under a kid that's no longer the cluster's
+/// active key (i.e., issued shortly before a rotation; still valid
+/// during grace).
+///
+/// When `cluster_signing_key_path` is configured, the response is built
+/// from the on-disk keystore so it includes every active + grace key.
+/// Falls back to the active `cluster_signer` only when the keystore path
+/// is unset (legacy/test configurations).
+///
+/// Returns `503 Service Unavailable` if the daemon has neither a
+/// cluster signer nor a keystore path configured.
+///
+/// # Errors
+///
+/// Returns [`ApiError::ServiceUnavailable`] when the daemon has neither a
+/// `cluster_signer` nor a `cluster_signing_key_path` configured.
+/// Returns [`ApiError::Internal`] if reading the on-disk keystore fails.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/signing-pubkeys",
+    responses(
+        (status = 200, description = "All currently-trusted Ed25519 verifying keys (active + grace)", body = SigningPubkeysResponse),
+        (status = 503, description = "Cluster signing keystore not configured on this node"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_signing_pubkeys(
+    State(state): State<ClusterApiState>,
+) -> Result<Json<SigningPubkeysResponse>> {
+    // Prefer the keystore (rotation-aware) over the single active signer.
+    if let Some(path) = state.cluster_signing_key_path.as_ref() {
+        let infos = zlayer_secrets::list_valid_pubkeys(path)
+            .await
+            .map_err(|e| ApiError::Internal(format!("listing valid pubkeys: {e}")))?;
+        let keys = infos
+            .into_iter()
+            .map(|info| SigningPubkeyEntry {
+                kid: info.kid,
+                public_key_b64: info.public_key_b64,
+                status: match info.status {
+                    zlayer_secrets::PubkeyStatus::Active => "active".to_string(),
+                    zlayer_secrets::PubkeyStatus::Grace => "grace".to_string(),
+                },
+                valid_until: info.valid_until.map(|t| t.to_rfc3339()),
+                created_at: info.created_at.to_rfc3339(),
+            })
+            .collect();
+        return Ok(Json(SigningPubkeysResponse { keys }));
+    }
+
+    // Fallback: only the active signer is available.
+    if let Some(signer) = state.cluster_signer.as_ref() {
+        return Ok(Json(SigningPubkeysResponse {
+            keys: vec![SigningPubkeyEntry {
+                kid: signer.key_id(),
+                public_key_b64: signer.public_key_b64(),
+                status: "active".to_string(),
+                valid_until: None,
+                // No on-disk keystore => no persisted creation time;
+                // report now() as a best-effort approximation.
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }],
+        }));
+    }
+
+    Err(ApiError::ServiceUnavailable(
+        "cluster signing keystore not configured on this node".into(),
+    ))
+}
+
+/// `POST /api/v1/cluster/rotate-signing-key` — generate a fresh Ed25519
+/// signing keypair, set it as active, and move the previous active key
+/// into the grace window. Admin-only.
+///
+/// Default grace is 7 days when `req.grace` is omitted. The previous-active
+/// key continues to verify in-flight tokens during its grace window; this
+/// makes the rotation safe to run while joins are in progress.
+///
+/// # Errors
+///
+/// - [`ApiError::Forbidden`] when the caller is not an admin.
+/// - [`ApiError::ServiceUnavailable`] when the daemon has no
+///   `cluster_signing_key_path` configured.
+/// - [`ApiError::BadRequest`] when `grace` cannot be parsed as a humantime
+///   duration.
+/// - [`ApiError::Internal`] when the underlying keystore rotation fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/rotate-signing-key",
+    request_body = RotateSigningKeyRequest,
+    responses(
+        (status = 200, description = "Keystore rotated; previous-active key moved to grace", body = RotateSigningKeyResponse),
+        (status = 400, description = "Invalid grace duration"),
+        (status = 403, description = "Admin role required"),
+        (status = 503, description = "Cluster signing keystore not configured on this node"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+#[axum::debug_handler]
+pub async fn cluster_rotate_signing_key(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+    Json(req): Json<RotateSigningKeyRequest>,
+) -> Result<Json<RotateSigningKeyResponse>> {
+    actor.require_admin()?;
+
+    let path = state.cluster_signing_key_path.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("cluster signing keystore not configured on this node".into())
+    })?;
+    let grace = parse_grace_or_default(req.grace.as_deref())?;
+    let result = zlayer_secrets::rotate_keystore(path, grace)
+        .await
+        .map_err(|e| ApiError::Internal(format!("rotating cluster signing keystore: {e}")))?;
+
+    info!(
+        new_kid = %result.new_active_kid,
+        previous_kid = %result.previous_kid,
+        previous_grace_until = %result.previous_grace_until,
+        grace_secs = grace.as_secs(),
+        "cluster signing key rotated"
+    );
+
+    Ok(Json(RotateSigningKeyResponse {
+        kid: result.new_active_kid,
+        public_key_b64: result.new_active_public_key_b64,
+        previous_kid: result.previous_kid,
+        previous_grace_until: result.previous_grace_until.to_rfc3339(),
+    }))
+}
+
+/// Parse the optional humantime `grace` field on
+/// [`RotateSigningKeyRequest`], defaulting to 7 days when `None`.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] when the supplied string cannot be
+/// parsed as a humantime duration (e.g. `"potato"`).
+fn parse_grace_or_default(grace: Option<&str>) -> Result<std::time::Duration> {
+    const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 3600; // 7 days
+    match grace {
+        None => Ok(std::time::Duration::from_secs(DEFAULT_GRACE_SECS)),
+        Some(s) => humantime::parse_duration(s)
+            .map_err(|e| ApiError::BadRequest(format!("invalid 'grace' duration {s:?}: {e}"))),
+    }
+}
+
+/// Compute the canonical revocation hash for a join token.
+///
+/// If `raw` is already a 64-char lowercase hex string we accept it
+/// verbatim (operator may supply a pre-computed hash). Otherwise we
+/// SHA-256 the trimmed bytes and emit lowercase hex. This is the
+/// stable identifier under which a token is replicated through
+/// `SecretsRaftOp::RevokeToken` and looked up in `SecretsState::revoked_tokens`.
+///
+/// The raw form is never replicated — only the hash leaves this node.
+fn token_canonical_hash(raw: &str) -> String {
+    use std::fmt::Write;
+    let raw = raw.trim();
+    if raw.len() == 64
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return raw.to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Handle a token revocation request.
+///
+/// `POST /api/v1/cluster/revoke-token`
+///
+/// Hashes the supplied `token_or_hash` to its canonical lowercase hex
+/// SHA-256 form (or accepts it verbatim if it's already a 64-char hex
+/// string) and proposes a `SecretsRaftOp::RevokeToken` so every node in
+/// the cluster rejects subsequent uses of that token. The revocation
+/// entry auto-expires; if the server could parse the token envelope and
+/// extract its `exp` claim it uses that, otherwise it falls back to
+/// `now() + 24h` so the table stays bounded for hash-only inputs.
+///
+/// Leader-only — followers should return 421 + X-Leader-Addr so the CLI
+/// can redirect. (Today `propose_secrets_op` already returns a "not
+/// leader" error which we surface as 503; that's acceptable for this
+/// wave — a future task can wire the proper 421 redirect.)
+///
+/// # Errors
+///
+/// - [`ApiError::Unauthorized`] if the actor lacks admin role.
+/// - [`ApiError::BadRequest`] if `token_or_hash` is empty.
+/// - [`ApiError::ServiceUnavailable`] if no Raft coordinator is attached.
+/// - [`ApiError::Internal`] on Raft propose failure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/revoke-token",
+    request_body = RevokeTokenRequest,
+    responses(
+        (status = 200, description = "Token revoked", body = RevokeTokenResponse),
+        (status = 400, description = "Empty token_or_hash"),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable / not leader"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_revoke_token(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+    Json(req): Json<RevokeTokenRequest>,
+) -> Result<Json<RevokeTokenResponse>> {
+    actor.require_admin()?;
+
+    let raw = req.token_or_hash.trim();
+    if raw.is_empty() {
+        return Err(ApiError::BadRequest(
+            "token_or_hash must not be empty".into(),
+        ));
+    }
+
+    // Detect whether the operator handed us a raw token (b64 envelope)
+    // or a pre-computed lowercase hex SHA-256. The hash form is exactly
+    // 64 chars of `[0-9a-f]`; anything else is hashed before insertion
+    // so we never store or replicate the raw token bytes.
+    let token_hash = token_canonical_hash(raw);
+
+    // Best-effort expiry: try to parse the supplied token as a signed
+    // envelope and reuse its `exp` claim so the revocation entry can be
+    // pruned the moment the token would have expired naturally. If we
+    // can't recover the claim (hash-only input, malformed envelope,
+    // HS256-only path, etc.), fall back to a 24h horizon.
+    let expires_at = derive_revocation_expiry(raw);
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    raft.propose_secrets_op(zlayer_types::api::internal::SecretsRaftOp::RevokeToken {
+        token_hash: token_hash.clone(),
+        expires_at,
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("revoking token via Raft: {e}")))?;
+
+    info!(
+        token_hash = %token_hash,
+        expires_at = %expires_at,
+        reason = ?req.reason,
+        "join token revoked"
+    );
+
+    Ok(Json(RevokeTokenResponse {
+        token_hash,
+        expires_at: expires_at.to_rfc3339(),
+    }))
+}
+
+/// List currently-active revocations.
+///
+/// `GET /api/v1/cluster/revocations`
+///
+/// Reads the in-memory `revoked_tokens` map from the local Raft state
+/// machine snapshot. Entries auto-prune at apply time, so this is a
+/// point-in-time view of un-expired revocations on this node. Admin
+/// auth required because the hashes are sensitive (a leaked hash plus
+/// the original token b64 confirms a leak).
+///
+/// # Errors
+///
+/// - [`ApiError::Unauthorized`] if the actor lacks admin role.
+/// - [`ApiError::ServiceUnavailable`] if no Raft coordinator is attached.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/revocations",
+    responses(
+        (status = 200, description = "List of revocations", body = RevocationListResponse),
+        (status = 401, description = "Unauthenticated"),
+        (status = 403, description = "Not admin"),
+        (status = 503, description = "Raft coordinator unavailable"),
+    ),
+    tag = "Cluster"
+)]
+pub async fn cluster_list_revocations(
+    actor: AuthActor,
+    State(state): State<ClusterApiState>,
+) -> Result<Json<RevocationListResponse>> {
+    actor.require_admin()?;
+
+    let raft = state.raft.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Raft coordinator unavailable on this node".into())
+    })?;
+    let secrets_state = raft.secrets_state().await;
+
+    let mut revocations: Vec<RevocationEntry> = secrets_state
+        .revoked_tokens
+        .iter()
+        .map(|(token_hash, expires_at)| RevocationEntry {
+            token_hash: token_hash.clone(),
+            expires_at: expires_at.to_rfc3339(),
+        })
+        .collect();
+    // Soonest-to-prune first so operators see the most urgent entries.
+    revocations.sort_by(|a, b| a.expires_at.cmp(&b.expires_at));
+
+    Ok(Json(RevocationListResponse { revocations }))
+}
+
+/// Best-effort: parse `raw` as a Wave-3 signed cluster join envelope and
+/// return its `exp` claim. Falls back to `now() + 24h` for any input we
+/// can't recognise (hash-only, HS256-JWT, malformed b64, etc.) so the
+/// revocation entry still gets pruned eventually.
+fn derive_revocation_expiry(raw: &str) -> chrono::DateTime<chrono::Utc> {
+    use base64::Engine;
+    use chrono::{Duration, Utc};
+
+    let fallback = || Utc::now() + Duration::hours(24);
+
+    // The hash form has no recoverable expiry.
+    if raw.len() == 64
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return fallback();
+    }
+
+    // Try the Wave-3 signed envelope shape first.
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw) else {
+        return fallback();
+    };
+    let Ok(envelope) =
+        serde_json::from_slice::<zlayer_types::api::cluster::SignedClusterJoinToken>(&bytes)
+    else {
+        return fallback();
+    };
+    chrono::DateTime::parse_from_rfc3339(&envelope.claims.exp)
+        .map_or_else(|_| fallback(), |dt| dt.with_timezone(&Utc))
 }
 
 /// Handle node heartbeat.
@@ -1477,36 +1960,249 @@ fn validate_join_token_signed(
     Ok(())
 }
 
-/// Validate a join token by decoding the base64 payload and checking `auth_secret`.
-fn validate_join_token(token: &str, expected_secret: &str) -> bool {
+/// Validate a Wave-3 Ed25519-signed cluster join token.
+///
+/// On success returns the verified [`ClusterJoinClaims`]. The envelope's
+/// `kid` and `sig` are discarded after verification.
+///
+/// Rejection paths produce [`ApiError::Unauthorized`] with an actionable
+/// body. Replay protection: inserts `ed25519:<kid>:<iat>:<iss>` into
+/// `state.used_jtis`; if already present, rejects as a replay. The HS256
+/// validator uses the same set for its `jti`, so a replayed token of
+/// either format cannot succeed.
+///
+/// The byte sequence fed to [`ed25519_dalek::VerifyingKey::verify_strict`]
+/// is `serde_json::to_vec(&envelope.claims)` — exactly what
+/// `mint_signed_cluster_join_token` in `bin/zlayer/src/commands/node.rs`
+/// signs. The fields of [`ClusterJoinClaims`] are declared in canonical
+/// order in `zlayer-types`; if that order is ever shuffled both helpers
+/// must be updated in lockstep AND the envelope version bumped.
+/// Verify a Wave-3 Ed25519-signed cluster join token.
+///
+/// Lookup behavior:
+/// - If [`ClusterApiState::cluster_signing_key_path`] is `Some(path)`, the
+///   verifying key is looked up by the token's `kid` via
+///   [`zlayer_secrets::load_signer_for_kid`]. This accepts tokens signed
+///   under either the active key OR any key currently in its retired-grace
+///   window. Unknown kids and kids whose grace has expired are rejected
+///   with `Unauthorized`.
+/// - If the path is `None` (e.g., in tests, or before the daemon bootstrap
+///   wires it), the validator falls back to the pre-Wave-5A behavior:
+///   compare the token's `kid` against the single active
+///   [`ClusterApiState::cluster_signer`].
+///
+/// Configure the path via the daemon bootstrap in
+/// `bin/zlayer/src/commands/serve.rs` for proper rotation-aware verification.
+#[allow(clippy::too_many_lines)]
+async fn validate_join_token_ed25519(
+    state: &ClusterApiState,
+    raw_token: &str,
+    peer_ip: std::net::IpAddr,
+) -> Result<ClusterJoinClaims> {
+    use base64::Engine;
+
+    // 0. Cheap availability check. If neither a keystore path nor an active
+    //    signer is configured on this node, we have nothing to verify
+    //    against — surface 503 before doing any envelope work. Preserves
+    //    the pre-Wave-5A contract for `cluster_signer: None` states (e.g.,
+    //    `ClusterApiState::placeholder()`).
+    if state.cluster_signing_key_path.is_none() && state.cluster_signer.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "cluster signer not configured on this node".into(),
+        ));
+    }
+
+    // 1. Base64-decode the envelope (prefer URL_SAFE_NO_PAD, fall back to STANDARD).
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw_token.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw_token.trim()))
+        .map_err(|e| ApiError::Unauthorized(format!("token base64 decode failed: {e}")))?;
+
+    // 2. Parse as SignedClusterJoinToken.
+    let envelope: SignedClusterJoinToken = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::Unauthorized(format!("token envelope parse failed: {e}")))?;
+    if envelope.v != SIGNED_TOKEN_V_WAVE3 {
+        return Err(ApiError::Unauthorized(format!(
+            "unsupported signed token version: got v={}, expected v={}",
+            envelope.v, SIGNED_TOKEN_V_WAVE3
+        )));
+    }
+
+    // 3. Resolve the verifying key for `envelope.kid`.
+    //    - With a keystore path: `load_signer_for_kid` returns `None` for
+    //      unknown kids OR kids whose grace has expired. Either way, reject.
+    //      No explicit kid-mismatch check is needed because the lookup
+    //      itself acts as the filter.
+    //    - Without a keystore path: fall back to active-signer-only behavior.
+    let verifying_key = if let Some(path) = state.cluster_signing_key_path.as_ref() {
+        match zlayer_secrets::load_signer_for_kid(path, &envelope.kid).await {
+            Ok(Some(s)) => s.verifying_key(),
+            Ok(None) => {
+                warn!(
+                    event = "join_token_ed25519_failed",
+                    kind = "kid_not_trusted",
+                    kid = %envelope.kid,
+                    peer_ip = %peer_ip,
+                );
+                return Err(ApiError::Unauthorized(format!(
+                    "signed token kid={} not trusted (unknown kid, expired grace, or never issued)",
+                    envelope.kid
+                )));
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "cluster signing keystore lookup failed: {e}"
+                )));
+            }
+        }
+    } else {
+        let signer = state.cluster_signer.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable("cluster signer not configured on this node".into())
+        })?;
+        if envelope.kid != signer.key_id() {
+            return Err(ApiError::Unauthorized(format!(
+                "kid mismatch: token says {}, expected {}",
+                envelope.kid,
+                signer.key_id()
+            )));
+        }
+        signer.verifying_key()
+    };
+
+    // 4. Verify Ed25519 signature over `serde_json::to_vec(&envelope.claims)`.
+    //    Byte-identical to `mint_signed_cluster_join_token` in node.rs.
+    let sig_bytes_vec = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&envelope.sig)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&envelope.sig))
+        .map_err(|e| ApiError::Unauthorized(format!("signature base64 decode failed: {e}")))?;
+    let sig_array: [u8; 64] = sig_bytes_vec.as_slice().try_into().map_err(|_| {
+        ApiError::Unauthorized(format!(
+            "signature wrong length: expected 64, got {}",
+            sig_bytes_vec.len()
+        ))
+    })?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
+    let claims_bytes = serde_json::to_vec(&envelope.claims)
+        .map_err(|e| ApiError::Internal(format!("re-serializing claims: {e}")))?;
+    verifying_key
+        .verify_strict(&claims_bytes, &sig)
+        .map_err(|e| {
+            warn!(
+                event = "join_token_ed25519_failed",
+                kind = "invalid_signature",
+                kid = %envelope.kid,
+                peer_ip = %peer_ip,
+                error = %e,
+            );
+            ApiError::Unauthorized(format!("Ed25519 signature verification failed: {e}"))
+        })?;
+
+    // 5. Expiry check (RFC3339; mirror node.rs's `verify_signed_cluster_join_token`).
+    let now = chrono::Utc::now();
+    let exp = chrono::DateTime::parse_from_rfc3339(&envelope.claims.exp)
+        .map_err(|e| ApiError::Unauthorized(format!("token exp parse failed: {e}")))?
+        .with_timezone(&chrono::Utc);
+    if now >= exp {
+        return Err(ApiError::Unauthorized(format!(
+            "signed token expired at {} (now {})",
+            envelope.claims.exp,
+            now.to_rfc3339()
+        )));
+    }
+
+    // 6. Replay protection on `(kid, iat, iss)`.
+    let jti = format!(
+        "ed25519:{}:{}:{}",
+        envelope.kid, envelope.claims.iat, envelope.claims.iss
+    );
+    {
+        let mut guard = state
+            .used_jtis
+            .lock()
+            .map_err(|_| ApiError::Internal("used_jtis mutex poisoned".to_string()))?;
+        if !guard.insert(jti) {
+            warn!(
+                event = "join_token_ed25519_replay",
+                kid = %envelope.kid,
+                iat = %envelope.claims.iat,
+                iss = %envelope.claims.iss,
+                peer_ip = %peer_ip,
+            );
+            return Err(ApiError::Unauthorized(format!(
+                "signed token replay detected for kid={} iat={} iss={}",
+                envelope.kid, envelope.claims.iat, envelope.claims.iss
+            )));
+        }
+    }
+
+    info!(
+        format = "ed25519",
+        kid = %envelope.kid,
+        iss = %envelope.claims.iss,
+        peer_ip = %peer_ip,
+        "accepted cluster join token"
+    );
+    Ok(envelope.claims)
+}
+
+/// Cheap heuristic: does `s` decode to a JSON object with a `"v"` field?
+///
+/// Used by [`cluster_join`] to decide whether a token that fails Ed25519
+/// validation looks like a signed envelope (in which case the failure is
+/// explicit — return the Ed25519 error) versus a legacy HS256/plaintext
+/// token shape (in which case we should fall through to the next validator).
+///
+/// Returns `false` on any decode/parse failure. Cost: one base64 decode and
+/// one `serde_json::from_slice::<Value>` call.
+fn is_signed_envelope_shape(s: &str) -> bool {
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()) {
+        Ok(b) => b,
+        Err(_) => match base64::engine::general_purpose::STANDARD.decode(s.trim()) {
+            Ok(b) => b,
+            Err(_) => return false,
+        },
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value.as_object().is_some_and(|obj| {
+        obj.contains_key("v") && obj.contains_key("sig") && obj.contains_key("kid")
+    })
+}
+
+/// Detect whether `token` is a legacy v0.11.x-style plaintext join token
+/// whose embedded `auth_secret` matches the cluster's `expected_secret`.
+///
+/// Wave 6 (v0.13.0): plaintext tokens are no longer accepted by
+/// [`cluster_join`]. This helper exists ONLY to differentiate "token is a
+/// recognizably plaintext payload — return a precise migration message" from
+/// "token failed HS256 decoding for some other reason — return the generic
+/// HS256 error". It is NOT an authentication path.
+///
+/// Returns `false` on any decode/parse failure or if the `auth_secret`
+/// doesn't match. A `true` result means the token is unambiguously a stale
+/// plaintext form addressed to this cluster.
+fn is_legacy_plaintext_token_shape(token: &str, expected_secret: &str) -> bool {
     use base64::Engine;
 
     let decoded = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) {
         Ok(d) => d,
-        Err(_) => {
-            // Try standard base64 as fallback
-            if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(token) {
-                d
-            } else {
-                warn!("Join token is not valid base64");
-                return false;
-            }
-        }
+        Err(_) => match base64::engine::general_purpose::STANDARD.decode(token) {
+            Ok(d) => d,
+            Err(_) => return false,
+        },
     };
 
-    let value: serde_json::Value = if let Ok(v) = serde_json::from_slice(&decoded) {
-        v
-    } else {
-        warn!("Join token payload is not valid JSON");
-        return false;
+    let value: serde_json::Value = match serde_json::from_slice(&decoded) {
+        Ok(v) => v,
+        Err(_) => return false,
     };
 
-    if let Some(secret) = value.get("auth_secret").and_then(|v| v.as_str()) {
-        secret == expected_secret
-    } else {
-        warn!("Join token missing auth_secret field");
-        false
-    }
+    value
+        .get("auth_secret")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|secret| secret == expected_secret)
 }
 
 // =============================================================================
@@ -1518,7 +2214,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_join_token_valid() {
+    fn is_legacy_plaintext_token_shape_matches_secret() {
+        // Wave 6 (v0.13.0): the helper is no longer an auth path — it only
+        // distinguishes "this is a stale plaintext token addressed to our
+        // cluster, return the actionable migration error" from "garbage,
+        // return the generic HS256 decode error". The acceptance contract
+        // for that disambiguation is unchanged from the pre-Wave-6
+        // `validate_join_token` predicate: returns `true` iff the payload
+        // decodes, is JSON-shaped, and has an `auth_secret` matching
+        // `expected_secret`.
         use base64::Engine;
 
         let payload = serde_json::json!({
@@ -1532,29 +2236,29 @@ mod tests {
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_string(&payload).unwrap());
 
-        assert!(validate_join_token(&token, "my-secret-123"));
-        assert!(!validate_join_token(&token, "wrong-secret"));
+        assert!(is_legacy_plaintext_token_shape(&token, "my-secret-123"));
+        assert!(!is_legacy_plaintext_token_shape(&token, "wrong-secret"));
     }
 
     #[test]
-    fn test_validate_join_token_invalid_base64() {
-        assert!(!validate_join_token("not-valid!!!", "secret"));
+    fn is_legacy_plaintext_token_shape_invalid_base64() {
+        assert!(!is_legacy_plaintext_token_shape("not-valid!!!", "secret"));
     }
 
     #[test]
-    fn test_validate_join_token_invalid_json() {
+    fn is_legacy_plaintext_token_shape_invalid_json() {
         use base64::Engine;
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("not json");
-        assert!(!validate_join_token(&token, "secret"));
+        assert!(!is_legacy_plaintext_token_shape(&token, "secret"));
     }
 
     #[test]
-    fn test_validate_join_token_missing_field() {
+    fn is_legacy_plaintext_token_shape_missing_field() {
         use base64::Engine;
         let payload = serde_json::json!({"foo": "bar"});
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_string(&payload).unwrap());
-        assert!(!validate_join_token(&token, "secret"));
+        assert!(!is_legacy_plaintext_token_shape(&token, "secret"));
     }
 
     #[test]
@@ -1636,11 +2340,18 @@ mod tests {
             node_jwt: None,
             wrapped_dek: None,
             dek_generation: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("uuid-123"));
         assert!(json.contains("10.200.0.2"));
         assert!(json.contains("10.200.16.0/28"));
+        // `warnings = None` must be skipped (kept off the wire) so legacy
+        // clients that don't know the field don't see an unexpected key.
+        assert!(
+            !json.contains("warnings"),
+            "warnings field must be omitted when None; got {json}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1777,19 +2488,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_join_token_legacy_still_accepted() {
-        // The legacy validator is still used as a fallback in the handler.
-        // Confirm that the underlying helper accepts the legacy form so the
-        // fallback path remains functional. (The handler-level fallback is
-        // exercised end-to-end by the integration tests in Task #19; this
-        // test guards the helper itself.)
+    fn legacy_plaintext_token_shape_detector_still_recognises_v011_payloads() {
+        // Wave 6 (v0.13.0): the underlying byte shape produced by old v0.11.x
+        // clients is unchanged. The handler no longer accepts these tokens,
+        // but it must still RECOGNISE them so it returns the actionable
+        // migration error instead of an opaque HS256 decode failure.
         use base64::Engine;
         let payload = serde_json::json!({
             "auth_secret": "legacy-shared-secret",
         });
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_string(&payload).unwrap());
-        assert!(validate_join_token(&token, "legacy-shared-secret"));
+        assert!(is_legacy_plaintext_token_shape(
+            &token,
+            "legacy-shared-secret"
+        ));
     }
 
     #[test]
@@ -1839,6 +2552,1004 @@ mod tests {
         assert!(
             matches!(err, ApiError::ServiceUnavailable(_)),
             "legacy joiner without raft should hit the 503 branch first; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_signing_pubkey_returns_active_key() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let kid = signer.key_id();
+        let pubkey_b64 = signer.public_key_b64();
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signer = Some(signer);
+
+        let resp = cluster_signing_pubkey(State(state))
+            .await
+            .expect("signing-pubkey handler must succeed when signer is configured");
+        assert_eq!(resp.0.public_key_b64, pubkey_b64);
+        assert_eq!(resp.0.kid, kid);
+        assert_eq!(resp.0.kid.len(), 8, "kid must be 8 hex chars");
+    }
+
+    #[tokio::test]
+    async fn cluster_signing_pubkey_returns_503_when_unconfigured() {
+        // Placeholder state has `cluster_signer: None`.
+        let state = ClusterApiState::placeholder();
+        let err = cluster_signing_pubkey(State(state))
+            .await
+            .expect_err("missing signer must yield an error");
+        assert!(
+            matches!(err, ApiError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_signing_pubkeys_returns_only_active_when_no_keystore_path() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signer = Some(signer.clone());
+
+        let resp = cluster_signing_pubkeys(State(state))
+            .await
+            .expect("fallback to active signer must succeed when keystore path is None");
+        assert_eq!(resp.0.keys.len(), 1);
+        assert_eq!(resp.0.keys[0].kid, signer.key_id());
+        assert_eq!(resp.0.keys[0].public_key_b64, signer.public_key_b64());
+        assert_eq!(resp.0.keys[0].status, "active");
+        assert!(resp.0.keys[0].valid_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn cluster_signing_pubkeys_returns_active_and_grace_from_keystore() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cluster_signing.key");
+
+        // Seed the keystore with an initial active signer, then rotate it
+        // so the keystore holds (active + 1 grace) entries.
+        let _ = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("seed initial keystore");
+        let _rotation =
+            zlayer_secrets::rotate_keystore(&path, std::time::Duration::from_secs(3600))
+                .await
+                .expect("rotate keystore");
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signing_key_path = Some(path);
+
+        let resp = cluster_signing_pubkeys(State(state))
+            .await
+            .expect("keystore-backed handler must succeed");
+        assert_eq!(
+            resp.0.keys.len(),
+            2,
+            "expected active + 1 grace entry after one rotation"
+        );
+        assert_eq!(resp.0.keys[0].status, "active");
+        assert_eq!(resp.0.keys[1].status, "grace");
+        assert!(
+            resp.0.keys[1].valid_until.is_some(),
+            "grace entry must carry an RFC3339 valid_until timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_signing_pubkeys_returns_503_when_nothing_configured() {
+        // No cluster_signer, no cluster_signing_key_path.
+        let state = ClusterApiState::placeholder();
+        let err = cluster_signing_pubkeys(State(state))
+            .await
+            .expect_err("nothing configured must yield 503");
+        assert!(
+            matches!(err, ApiError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable; got {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave 3.4: Ed25519-signed cluster join token validator tests
+    //
+    // The mint logic lives in `bin/zlayer/src/commands/node.rs`. We can't
+    // import from a binary crate, so these tests replicate the mint steps
+    // inline. They MUST stay byte-identical to that helper — if you change
+    // one, change the other.
+    // -------------------------------------------------------------------------
+
+    fn make_claims(exp: chrono::DateTime<chrono::Utc>, iss: &str) -> ClusterJoinClaims {
+        ClusterJoinClaims {
+            api_endpoint: "https://leader.test:3669".into(),
+            raft_endpoint: "10.0.0.1:9000".into(),
+            leader_wg_pubkey: "AAAA".into(),
+            overlay_cidr: "10.42.0.0/16".into(),
+            exp: exp.to_rfc3339(),
+            iat: chrono::Utc::now().to_rfc3339(),
+            iss: iss.into(),
+        }
+    }
+
+    /// Inline mint that mirrors `mint_signed_cluster_join_token` in
+    /// `bin/zlayer/src/commands/node.rs`. If the bytes diverge between
+    /// these two paths, every Wave-3 token in production will fail
+    /// validation — that's the load-bearing invariant.
+    fn mint_for_test(claims: &ClusterJoinClaims, signer: &zlayer_secrets::ClusterSigner) -> String {
+        use base64::Engine;
+        let claims_bytes = serde_json::to_vec(claims).expect("serialize claims");
+        let sig_bytes = signer.sign(&claims_bytes);
+        let envelope = SignedClusterJoinToken {
+            v: SIGNED_TOKEN_V_WAVE3,
+            kid: signer.key_id(),
+            claims: claims.clone(),
+            sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).expect("serialize envelope");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes)
+    }
+
+    fn state_with_signer(signer: Arc<zlayer_secrets::ClusterSigner>) -> ClusterApiState {
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signer = Some(signer);
+        state
+    }
+
+    /// **Byte-alignment round-trip test.** If this fails, every signed
+    /// token will fail validation in production. Grep this name to find
+    /// the canonical "mint here, verify there" cross-check.
+    #[tokio::test]
+    async fn validate_join_token_ed25519_mint_handler_byte_roundtrip() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-A",
+        );
+        let token = mint_for_test(&claims, &signer);
+
+        let state = state_with_signer(signer);
+        let validated =
+            validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .expect("freshly minted token must validate");
+        assert_eq!(validated.api_endpoint, claims.api_endpoint);
+        assert_eq!(validated.iss, claims.iss);
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_replay() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-B",
+        );
+        let token = mint_for_test(&claims, &signer);
+
+        let state = state_with_signer(signer);
+        let peer: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+
+        // First use succeeds.
+        validate_join_token_ed25519(&state, &token, peer)
+            .await
+            .expect("first use must succeed");
+
+        // Second use with the same token must error as a replay.
+        let err = validate_join_token_ed25519(&state, &token, peer)
+            .await
+            .expect_err("replay must be rejected");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("replay"),
+                "expected replay-detected error; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_expired() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        // Token already expired one hour ago.
+        let claims = make_claims(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            "node-uuid-C",
+        );
+        let token = mint_for_test(&claims, &signer);
+
+        let state = state_with_signer(signer);
+        let err = validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect_err("expired token must be rejected");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("expired"),
+                "expected expired-token error; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_kid_mismatch() {
+        // Mint with signer A.
+        let signer_a = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-D",
+        );
+        let token = mint_for_test(&claims, &signer_a);
+
+        // Validate against state holding a different signer B.
+        let signer_b = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        // Sanity check — distinct keys, distinct kids.
+        assert_ne!(signer_a.key_id(), signer_b.key_id());
+        let state = state_with_signer(signer_b);
+
+        let err = validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect_err("kid mismatch must be rejected");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("kid mismatch"),
+                "expected kid-mismatch error; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_tampered_signature() {
+        use base64::Engine;
+
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-E",
+        );
+
+        // Mint a real token, then flip a byte in the inner envelope so the
+        // signature no longer matches the (tampered) claims.
+        let claims_bytes = serde_json::to_vec(&claims).unwrap();
+        let sig_bytes = signer.sign(&claims_bytes);
+        let mut tampered_claims = claims.clone();
+        tampered_claims.api_endpoint = "https://attacker.example:3669".into();
+        let envelope = SignedClusterJoinToken {
+            v: SIGNED_TOKEN_V_WAVE3,
+            kid: signer.key_id(),
+            claims: tampered_claims,
+            sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes);
+
+        let state = state_with_signer(signer);
+        let err = validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect_err("tampered claims must invalidate the signature");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("signature verification failed"),
+                "expected signature-verification error; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_returns_503_when_signer_unconfigured() {
+        // Placeholder state has `cluster_signer: None`.
+        let state = ClusterApiState::placeholder();
+        let err =
+            validate_join_token_ed25519(&state, "any-string", std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .expect_err("missing signer must yield an error");
+        assert!(
+            matches!(err, ApiError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_wrong_version() {
+        use base64::Engine;
+
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-F",
+        );
+        let claims_bytes = serde_json::to_vec(&claims).unwrap();
+        let sig_bytes = signer.sign(&claims_bytes);
+        let envelope = SignedClusterJoinToken {
+            v: 99, // unsupported version
+            kid: signer.key_id(),
+            claims: claims.clone(),
+            sig: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes),
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_bytes);
+
+        let state = state_with_signer(signer);
+        let err = validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect_err("v=99 must be rejected");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("unsupported signed token version"),
+                "expected version error; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave 5A.3: rotation-aware kid lookup via the on-disk keystore.
+    //
+    // These tests exercise the new `cluster_signing_key_path` codepath in
+    // `validate_join_token_ed25519`. They write JSON keystores into temp
+    // directories directly so they don't depend on private items in
+    // `zlayer_secrets::cluster_signer`.
+    // -------------------------------------------------------------------------
+
+    /// A token minted under the previously-active key must still validate
+    /// after the keystore is rotated and that key is moved into the grace
+    /// window. This is the load-bearing rotation invariant.
+    #[tokio::test]
+    async fn validate_join_token_ed25519_accepts_token_signed_under_grace_kid() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("cluster_signing.key");
+
+        // 1. Initial keystore: generate via load_or_generate so it has a
+        //    legitimate active key on disk.
+        let original = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("generate initial keystore");
+        let original_kid = original.key_id();
+
+        // 2. Mint a token under that original key.
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-grace",
+        );
+        let token = mint_for_test(&claims, &original);
+
+        // 3. Rotate the keystore. After this, `original_kid` is in grace
+        //    (valid_until = now + 1h) and a new active key has been minted.
+        let rotation = zlayer_secrets::rotate_keystore(&path, std::time::Duration::from_secs(3600))
+            .await
+            .expect("rotate keystore");
+        assert_eq!(
+            rotation.previous_kid, original_kid,
+            "previous_kid should match original signer's kid"
+        );
+        assert_ne!(
+            rotation.new_active_kid, original_kid,
+            "rotation must change the active kid"
+        );
+
+        // 4. Build a ClusterApiState whose `cluster_signer` is now the NEW
+        //    active key, but whose `cluster_signing_key_path` points at the
+        //    real keystore — so the validator can do kid-aware lookup.
+        let new_active = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("re-load post-rotation active signer");
+        let mut state = state_with_signer(Arc::new(new_active));
+        state.cluster_signing_key_path = Some(path.clone());
+
+        // 5. The token (signed under the now-grace kid) must validate.
+        let validated =
+            validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .expect("grace-kid token must validate via keystore lookup");
+        assert_eq!(validated.iss, claims.iss);
+    }
+
+    /// A token whose kid is recorded in `retired_grace_until` with a
+    /// timestamp already in the past must be rejected — even though the
+    /// key material is still on disk.
+    #[tokio::test]
+    async fn validate_join_token_ed25519_rejects_token_signed_under_expired_grace() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("cluster_signing.key");
+
+        // Build a keystore manually so we can put a kid into grace with a
+        // PAST `valid_until`. `rotate_keystore` only ever inserts future
+        // timestamps, so we can't drive this state via the public API —
+        // we have to write the JSON ourselves.
+        //
+        // To get real, on-disk-recoverable seeds without poking at the
+        // private keystore types in `zlayer_secrets`, we drive two scratch
+        // `load_or_generate` calls and copy the persisted base64 seeds
+        // (and matching kids) into a hand-built keystore at `path`.
+
+        // (a) Seed material for the to-be-stale key.
+        let stale_scratch_path = tmp.path().join("scratch.key");
+        let stale_signer = zlayer_secrets::ClusterSigner::load_or_generate(&stale_scratch_path)
+            .await
+            .expect("stale scratch keystore");
+        let stale_kid = stale_signer.key_id();
+        let stale_json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&stale_scratch_path).await.unwrap()).unwrap();
+        let stale_seed_b64 = stale_json["keys"][0]["seed_b64"]
+            .as_str()
+            .expect("stale scratch has seed_b64")
+            .to_string();
+        assert_eq!(stale_json["keys"][0]["id"].as_str().unwrap(), stale_kid);
+
+        // (b) Seed material for the (still-active) other key in the same
+        //     store, so the file is a valid keystore alongside the
+        //     expired-grace entry.
+        let active_scratch_path = tmp.path().join("active_scratch.key");
+        let active_signer = zlayer_secrets::ClusterSigner::load_or_generate(&active_scratch_path)
+            .await
+            .expect("active scratch keystore");
+        let active_kid = active_signer.key_id();
+        let active_json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&active_scratch_path).await.unwrap()).unwrap();
+        let active_seed_b64 = active_json["keys"][0]["seed_b64"]
+            .as_str()
+            .expect("active scratch has seed_b64")
+            .to_string();
+
+        // Sanity: the two scratch keys must differ, otherwise the test
+        // setup is degenerate.
+        assert_ne!(stale_kid, active_kid);
+
+        // Build the keystore JSON by hand: one active key, one entry whose
+        // grace expired one hour ago.
+        let now = chrono::Utc::now();
+        let past = now - chrono::Duration::hours(1);
+        let keystore_json = serde_json::json!({
+            "version": 1,
+            "active": active_kid,
+            "keys": [
+                {
+                    "id": active_kid,
+                    "seed_b64": active_seed_b64,
+                    "created_at": now.to_rfc3339(),
+                },
+                {
+                    "id": stale_kid,
+                    "seed_b64": stale_seed_b64,
+                    "created_at": (now - chrono::Duration::hours(2)).to_rfc3339(),
+                },
+            ],
+            "retired_grace_until": {
+                stale_kid.clone(): past.to_rfc3339(),
+            },
+        });
+        tokio::fs::write(&path, serde_json::to_vec(&keystore_json).unwrap())
+            .await
+            .expect("write hand-crafted keystore");
+
+        // Mint a token under the expired-grace kid using its real seed.
+        let claims = make_claims(now + chrono::Duration::hours(1), "node-uuid-expired-grace");
+        let token = mint_for_test(&claims, &stale_signer);
+        assert_eq!(stale_signer.key_id(), stale_kid);
+
+        // Build state with the new keystore path. `cluster_signer` here is
+        // unused for the keystore-path branch, but `state_with_signer`
+        // needs *something*.
+        let active = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("load active from real keystore");
+        let mut state = state_with_signer(Arc::new(active));
+        state.cluster_signing_key_path = Some(path.clone());
+
+        // Validation must reject — kid is in grace but already expired.
+        let err = validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect_err("expired-grace kid must be rejected");
+        match err {
+            ApiError::Unauthorized(msg) => assert!(
+                msg.contains("not trusted") && msg.contains(&stale_kid),
+                "expected 'not trusted' for the stale kid; got {msg:?}"
+            ),
+            other => panic!("expected Unauthorized; got {other:?}"),
+        }
+    }
+
+    /// When `cluster_signing_key_path` is `None`, the validator must use
+    /// the active-signer comparison path (pre-Wave-5A behavior). This is
+    /// the same contract every existing Wave-3 test relies on — but we
+    /// pin it explicitly so a future refactor that removes the fallback
+    /// branch trips this test instead of a downstream integration test.
+    #[tokio::test]
+    async fn validate_join_token_ed25519_falls_back_to_active_signer_when_no_keystore_path() {
+        let signer = Arc::new(zlayer_secrets::ClusterSigner::generate());
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-fallback",
+        );
+        let token = mint_for_test(&claims, &signer);
+
+        // Explicitly leave `cluster_signing_key_path` as None.
+        let state = state_with_signer(signer);
+        assert!(
+            state.cluster_signing_key_path.is_none(),
+            "fallback test requires no keystore path"
+        );
+
+        let validated =
+            validate_join_token_ed25519(&state, &token, std::net::Ipv4Addr::LOCALHOST.into())
+                .await
+                .expect("active-signer fallback must accept tokens minted under that signer");
+        assert_eq!(validated.iss, claims.iss);
+    }
+
+    #[test]
+    fn is_signed_envelope_shape_detects_real_envelope() {
+        let signer = zlayer_secrets::ClusterSigner::generate();
+        let claims = make_claims(
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            "node-uuid-G",
+        );
+        let token = mint_for_test(&claims, &signer);
+        assert!(is_signed_envelope_shape(&token));
+    }
+
+    #[test]
+    fn is_signed_envelope_shape_rejects_hs256_jwt() {
+        // HS256 JWTs look like `aaa.bbb.ccc` — not base64-of-an-object.
+        let hmac_key = derive_join_hmac_key("operator-secret");
+        let now = now_secs();
+        let claims = JoinTokenClaims {
+            iss: "zlayer-cluster".into(),
+            aud: "cluster-join".into(),
+            jti: "jti-shape-1".into(),
+            exp: now + 3600,
+            iat: now,
+        };
+        let token = sign_token(&claims, &hmac_key);
+        assert!(!is_signed_envelope_shape(&token));
+    }
+
+    #[test]
+    fn is_signed_envelope_shape_rejects_legacy_plaintext() {
+        use base64::Engine;
+        let payload = serde_json::json!({"auth_secret": "shared"});
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&payload).unwrap());
+        assert!(!is_signed_envelope_shape(&token));
+    }
+
+    #[test]
+    fn is_signed_envelope_shape_rejects_garbage() {
+        assert!(!is_signed_envelope_shape("not-base64-at-all!!!"));
+        assert!(!is_signed_envelope_shape(""));
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave 6 (v0.13.0): plaintext-token rejection + warnings-key absence
+    //
+    // The handler can't be tested end-to-end without a live RaftCoordinator
+    // (`placeholder()` state short-circuits with 503 before token validation),
+    // so we test the shape-detector + response-construction directly. The
+    // surrounding mint/validate helpers are covered by their own tests
+    // (`is_legacy_plaintext_token_shape_*`, `validate_join_token_signed_*`,
+    // `is_signed_envelope_shape_*`).
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cluster_join_with_plaintext_token_returns_unauthorized() {
+        // Wave 6 (v0.13.0): the legacy plaintext form is rejected outright.
+        // The shape detector must recognise the v0.11.x payload so the
+        // handler can return the precise migration error rather than the
+        // opaque HS256 decode failure. The end-to-end handler dispatch
+        // (which converts the recognised shape into `ApiError::Unauthorized`)
+        // is exercised by the Phase-1 integration tests; here we guard the
+        // pre-condition the dispatch relies on.
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "api_endpoint": "10.0.0.1:3669",
+            "raft_endpoint": "10.0.0.1:9000",
+            "leader_wg_pubkey": "abc",
+            "overlay_cidr": "10.200.0.0/16",
+            "auth_secret": "cluster-secret-from-v0.11",
+            "created_at": "2025-01-01T00:00:00Z",
+        });
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&payload).unwrap());
+
+        // Detector recognises the shape addressed to this cluster's secret.
+        assert!(
+            is_legacy_plaintext_token_shape(&token, "cluster-secret-from-v0.11"),
+            "detector must catch v0.11.x-shaped plaintext tokens so the handler can return Unauthorized"
+        );
+
+        // A token using a foreign secret is NOT recognised (don't leak
+        // membership of other clusters): the handler falls through to the
+        // generic HS256 error instead of emitting the migration message.
+        assert!(
+            !is_legacy_plaintext_token_shape(&token, "some-other-cluster-secret"),
+            "shape detector must not match across cluster boundaries"
+        );
+
+        // Wire-shape guard: a response built from the rejection path leaves
+        // `warnings` as `None`, which serializes away (skip_serializing_if).
+        // The plaintext-acceptance warning emitted in Wave 4.2 is gone.
+        let resp = ClusterJoinResponse {
+            node_id: "uuid-never-built-on-this-path".into(),
+            raft_node_id: 7,
+            overlay_ip: "10.200.0.7".into(),
+            slice_cidr: "10.200.112.0/28".into(),
+            peers: vec![],
+            role: "voter".into(),
+            node_jwt: None,
+            wrapped_dek: None,
+            dek_generation: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize rejection-path response");
+        assert!(
+            !json.contains("warnings"),
+            "Wave 6 (v0.13.0) wire form must omit `warnings` on plaintext rejection (the path no longer builds a response at all); got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_join_with_ed25519_token_has_no_warning() {
+        // Wave 6 (v0.13.0): the Ed25519 branch never sets a warning. With
+        // `build_join_warnings` removed, the handler hard-codes `warnings:
+        // None`. Verify the field is absent from the wire form.
+        let resp = ClusterJoinResponse {
+            node_id: "uuid-ed25519".into(),
+            raft_node_id: 8,
+            overlay_ip: "10.200.0.8".into(),
+            slice_cidr: "10.200.128.0/28".into(),
+            peers: vec![],
+            role: "voter".into(),
+            node_jwt: None,
+            wrapped_dek: None,
+            dek_generation: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize ed25519 response");
+        assert!(
+            !json.contains("warnings"),
+            "Ed25519 acceptance must produce no `warnings` key; got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_join_with_hs256_token_has_no_warning() {
+        // Wave 6 (v0.13.0): the HS256 branch also hard-codes `warnings:
+        // None`. Same shape guard as the Ed25519 case.
+        let resp = ClusterJoinResponse {
+            node_id: "uuid-hs256".into(),
+            raft_node_id: 9,
+            overlay_ip: "10.200.0.9".into(),
+            slice_cidr: "10.200.144.0/28".into(),
+            peers: vec![],
+            role: "voter".into(),
+            node_jwt: None,
+            wrapped_dek: None,
+            dek_generation: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize hs256 response");
+        assert!(
+            !json.contains("warnings"),
+            "HS256 acceptance must produce no `warnings` key; got {json}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Wave 5B.4: `cluster_rotate_signing_key` handler tests
+    //
+    // These tests construct an `AuthActor` directly (mirroring the
+    // `admin_actor`/`user_actor` helpers in `auth.rs`) and call the handler
+    // with the actor extractor pre-resolved, then verify both the HTTP
+    // response shape and the on-disk side effects on the keystore.
+    // -------------------------------------------------------------------------
+
+    fn rotate_admin_actor() -> AuthActor {
+        AuthActor {
+            user_id: "admin-rotator".into(),
+            roles: vec!["admin".into()],
+            email: None,
+        }
+    }
+
+    fn rotate_user_actor() -> AuthActor {
+        AuthActor {
+            user_id: "regular-user".into(),
+            roles: vec!["user".into()],
+            email: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_rotate_signing_key_creates_new_active_and_graces_old() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cluster_signing.key");
+        let _ = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("seed initial keystore");
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signing_key_path = Some(path.clone());
+
+        let actor = rotate_admin_actor();
+        let req = RotateSigningKeyRequest {
+            grace: Some("1h".into()),
+        };
+
+        let resp = cluster_rotate_signing_key(actor, State(state), Json(req))
+            .await
+            .expect("rotation must succeed for admin caller with a configured keystore");
+        assert_eq!(resp.0.kid.len(), 8, "new active kid must be 8 hex chars");
+        assert_eq!(
+            resp.0.previous_kid.len(),
+            8,
+            "previous-active kid must be 8 hex chars"
+        );
+        assert_ne!(
+            resp.0.kid, resp.0.previous_kid,
+            "rotation must produce a fresh kid"
+        );
+        // RFC3339 timestamps end with either a 'Z' (UTC) or an offset like
+        // `+00:00`. `to_rfc3339()` on a `DateTime<Utc>` produces the offset
+        // form, so check both forms to be robust.
+        assert!(
+            resp.0.previous_grace_until.ends_with('Z') || resp.0.previous_grace_until.contains('+'),
+            "previous_grace_until must be RFC3339; got {:?}",
+            resp.0.previous_grace_until
+        );
+
+        // Confirm the keystore was actually updated on disk.
+        let infos = zlayer_secrets::list_valid_pubkeys(&path)
+            .await
+            .expect("read back keystore");
+        assert_eq!(
+            infos.len(),
+            2,
+            "after one rotation the keystore must hold active + 1 grace key"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_rotate_signing_key_uses_default_grace_when_unset() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cluster_signing.key");
+        let _ = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("seed initial keystore");
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signing_key_path = Some(path);
+
+        let actor = rotate_admin_actor();
+        let req = RotateSigningKeyRequest::default();
+
+        let now = chrono::Utc::now();
+        let resp = cluster_rotate_signing_key(actor, State(state), Json(req))
+            .await
+            .expect("rotation with default grace must succeed");
+
+        let parsed: chrono::DateTime<chrono::FixedOffset> =
+            chrono::DateTime::parse_from_rfc3339(&resp.0.previous_grace_until)
+                .expect("previous_grace_until must parse as RFC3339");
+        let parsed_utc = parsed.with_timezone(&chrono::Utc);
+        let delta = parsed_utc.signed_duration_since(now);
+
+        // Default grace is 7 days. Allow a 60-second window for clock
+        // drift between the precomputed `now` above and when the handler
+        // captured its own `now` inside `rotate_keystore`.
+        let seven_days = chrono::Duration::days(7);
+        let drift = (delta - seven_days).num_seconds().abs();
+        assert!(
+            drift < 60,
+            "expected previous_grace_until ~7 days from now; drift = {drift}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_rotate_signing_key_rejects_invalid_grace_string() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cluster_signing.key");
+        let _ = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("seed initial keystore");
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signing_key_path = Some(path);
+
+        let actor = rotate_admin_actor();
+        let req = RotateSigningKeyRequest {
+            grace: Some("potato".into()),
+        };
+
+        let err = cluster_rotate_signing_key(actor, State(state), Json(req))
+            .await
+            .expect_err("garbage humantime must be rejected");
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "expected BadRequest; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_rotate_signing_key_503_when_keystore_path_unconfigured() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = RotateSigningKeyRequest::default();
+
+        let err = cluster_rotate_signing_key(actor, State(state), Json(req))
+            .await
+            .expect_err("missing keystore path must yield 503");
+        assert!(
+            matches!(err, ApiError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_rotate_signing_key_forbidden_for_non_admin() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("cluster_signing.key");
+        let _ = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .expect("seed initial keystore");
+
+        let mut state = ClusterApiState::placeholder();
+        state.cluster_signing_key_path = Some(path);
+
+        let actor = rotate_user_actor();
+        let req = RotateSigningKeyRequest::default();
+
+        let err = cluster_rotate_signing_key(actor, State(state), Json(req))
+            .await
+            .expect_err("non-admin caller must be rejected");
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "expected Forbidden; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn token_canonical_hash_passes_through_64_hex() {
+        let hash = "a".repeat(64);
+        assert_eq!(super::token_canonical_hash(&hash), hash);
+    }
+
+    #[test]
+    fn token_canonical_hash_sha256s_non_hex_input() {
+        let out = super::token_canonical_hash("hello");
+        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(
+            out,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn token_canonical_hash_trims_whitespace() {
+        let trimmed = super::token_canonical_hash("  hello  ");
+        let no_ws = super::token_canonical_hash("hello");
+        assert_eq!(trimmed, no_ws);
+    }
+
+    #[test]
+    fn token_canonical_hash_short_almost_hex_string_gets_hashed() {
+        // 63 chars (off-by-one from the hash form) must NOT be treated as a hash.
+        let almost = "a".repeat(63);
+        let out = super::token_canonical_hash(&almost);
+        assert_ne!(out, almost);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn cluster_revoke_token_503_when_no_raft_coordinator() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = RevokeTokenRequest {
+            token_or_hash: "deadbeef".repeat(8),
+            reason: None,
+        };
+
+        let err = cluster_revoke_token(actor, State(state), Json(req))
+            .await
+            .expect_err("must error when no raft coordinator is attached");
+        let body = err.to_string();
+        assert!(
+            body.contains("Raft coordinator") || body.contains("unavailable"),
+            "expected ServiceUnavailable about raft; got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_revoke_token_forbidden_for_non_admin() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_user_actor();
+        let req = RevokeTokenRequest {
+            token_or_hash: "deadbeef".repeat(8),
+            reason: None,
+        };
+
+        let err = cluster_revoke_token(actor, State(state), Json(req))
+            .await
+            .expect_err("non-admin must be forbidden");
+        // require_admin produces Forbidden/Unauthorized — accept either.
+        let body = err.to_string();
+        assert!(
+            !body.is_empty(),
+            "non-admin must surface an auth error body"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_revoke_token_400_for_empty_input() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+        let req = RevokeTokenRequest {
+            token_or_hash: "   ".into(),
+            reason: None,
+        };
+
+        let err = cluster_revoke_token(actor, State(state), Json(req))
+            .await
+            .expect_err("empty input must be rejected before any raft lookup");
+        let body = err.to_string();
+        assert!(
+            body.contains("empty") || body.contains("BadRequest") || body.contains("must not"),
+            "expected BadRequest about empty input; got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_list_revocations_503_when_no_raft_coordinator() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_admin_actor();
+
+        let err = cluster_list_revocations(actor, State(state))
+            .await
+            .expect_err("must error when no raft coordinator is attached");
+        let body = err.to_string();
+        assert!(
+            body.contains("Raft coordinator") || body.contains("unavailable"),
+            "expected ServiceUnavailable about raft; got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_list_revocations_forbidden_for_non_admin() {
+        let state = ClusterApiState::placeholder();
+        let actor = rotate_user_actor();
+
+        let err = cluster_list_revocations(actor, State(state))
+            .await
+            .expect_err("non-admin must be forbidden");
+        let body = err.to_string();
+        assert!(
+            !body.is_empty(),
+            "non-admin must surface an auth error body"
+        );
+    }
+
+    #[test]
+    fn derive_revocation_expiry_falls_back_for_hash_input() {
+        // A 64-char lowercase hex string is the "I already have the hash" form.
+        // The expiry helper has nothing to parse, so it must hand back a
+        // sensible fallback (~ now + 24h) so the revocation eventually prunes.
+        let hash = "a".repeat(64);
+        let now = chrono::Utc::now();
+        let expiry = super::derive_revocation_expiry(&hash);
+        let delta = (expiry - now).num_minutes();
+        // Allow generous slop for the 24h fallback so this test isn't flaky.
+        assert!(
+            (23 * 60..=25 * 60).contains(&delta),
+            "expected ~24h fallback expiry for hash input; got delta_min={delta}"
+        );
+    }
+
+    #[test]
+    fn derive_revocation_expiry_falls_back_for_garbage_input() {
+        // Non-base64 garbage that's not 64-char hex still gets a fallback.
+        let now = chrono::Utc::now();
+        let expiry = super::derive_revocation_expiry("!!! not a token !!!");
+        let delta = (expiry - now).num_minutes();
+        assert!(
+            (23 * 60..=25 * 60).contains(&delta),
+            "expected ~24h fallback expiry for garbage; got delta_min={delta}"
         );
     }
 }
