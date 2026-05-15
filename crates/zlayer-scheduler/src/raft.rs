@@ -22,7 +22,7 @@ use zlayer_consensus::storage::redb_store::{RedbLogStore, RedbSmCache, RedbState
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
 use zlayer_secrets::cluster_dek::ClusterDek;
 use zlayer_secrets::sealed::{RecipientPrivateKey, RecipientPublicKey};
-use zlayer_secrets::{SecretsError, SecretsState};
+use zlayer_secrets::{NodeSideEffects, SecretsError, SecretsState};
 use zlayer_types::api::internal::SecretsRaftOp;
 use zlayer_types::storage::{NodeIdentity, ReplicatedSecret};
 
@@ -758,6 +758,22 @@ pub enum RotateReason {
     Manual,
 }
 
+/// Post-apply node-effect dispatch for the state-machine apply wrapper.
+///
+/// Pure inspection of the `(Request, Response)` pair: fires the matching
+/// notify on `effects` when an op that requires per-node side action
+/// applies successfully. Exposed as a free function for unit testing —
+/// the actual closure handed to the openraft state machine in
+/// [`RaftCoordinator::with_auth_secrets_and_effects`] is a thin wrapper
+/// around `state.apply(req)` + a call to this helper.
+fn dispatch_node_effects(effects: Option<&NodeSideEffects>, req: &Request, resp: &Response) {
+    if let (Some(effects), Request::Secrets(SecretsRaftOp::WipeJoinSecret)) = (effects, req) {
+        if matches!(resp, Response::Success { .. }) {
+            effects.fire_wipe_join_secret();
+        }
+    }
+}
+
 impl RaftCoordinator {
     /// Create a new Raft coordinator without auth.
     ///
@@ -816,6 +832,27 @@ impl RaftCoordinator {
         node_priv: Option<RecipientPrivateKey>,
         node_uuid: Option<String>,
     ) -> Result<CoordinatorInit> {
+        Self::with_auth_secrets_and_effects(config, auth_token, node_priv, node_uuid, None).await
+    }
+
+    /// Like [`Self::with_auth_and_secrets`] but additionally accepts a
+    /// [`NodeSideEffects`] handle. The apply wrapper consults this handle
+    /// post-apply: when a `SecretsRaftOp::WipeJoinSecret` op applies
+    /// successfully it calls [`NodeSideEffects::fire_wipe_join_secret`],
+    /// waking the daemon's watcher to delete `{data_dir}/join_secret` on
+    /// this node. `None` keeps the apply path effect-free (used by tests
+    /// and the no-secrets-capability constructor shorthands).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::with_auth_and_secrets`].
+    pub async fn with_auth_secrets_and_effects(
+        config: RaftConfig,
+        auth_token: Option<String>,
+        node_priv: Option<RecipientPrivateKey>,
+        node_uuid: Option<String>,
+        node_effects: Option<Arc<NodeSideEffects>>,
+    ) -> Result<CoordinatorInit> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
             heartbeat_interval_ms: config.heartbeat_interval_ms,
@@ -856,6 +893,19 @@ impl RaftCoordinator {
         #[cfg(not(feature = "persistent"))]
         let bootstrap_state = BootstrapState::Fresh;
 
+        // Apply wrapper: invokes the pure `ClusterState::apply` then dispatches
+        // node-local side effects (e.g. filesystem delete of `join_secret` after
+        // `WipeJoinSecret`). When `node_effects` is `None` the closure degenerates
+        // to a thin wrapper over `state.apply`, matching the pre-effects behavior.
+        let apply_fn = {
+            let effects = node_effects.clone();
+            move |state: &mut ClusterState, req: &Request| -> Response {
+                let resp = state.apply(req);
+                dispatch_node_effects(effects.as_deref(), req, &resp);
+                resp
+            }
+        };
+
         // Create storage (persistent redb or in-memory depending on feature)
         #[cfg(feature = "persistent")]
         let (log_store, state_machine, sm_data) = {
@@ -864,8 +914,7 @@ impl RaftCoordinator {
             let log_store = RedbLogStore::<TypeConfig>::new(&log_path)
                 .map_err(|e| SchedulerError::Raft(format!("Failed to open raft log store: {e}")))?;
             let state_machine = RedbStateMachine::<TypeConfig, ClusterState, _>::new(
-                &sm_path,
-                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+                &sm_path, apply_fn,
             )
             .map_err(|e| SchedulerError::Raft(format!("Failed to open raft state machine: {e}")))?;
             let sm_data = state_machine.state();
@@ -874,9 +923,7 @@ impl RaftCoordinator {
         #[cfg(not(feature = "persistent"))]
         let (log_store, state_machine, sm_data) = {
             let log_store = MemLogStore::<TypeConfig>::default();
-            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
-                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
-            );
+            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(apply_fn);
             let sm_data = state_machine.data();
             (log_store, state_machine, sm_data)
         };
@@ -2169,5 +2216,88 @@ mod tests {
             .expect("second coordinator construction");
         assert_eq!(init2.bootstrap_state, BootstrapState::Resuming);
         init2.coordinator.shutdown().await.ok();
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_fires_on_successful_wipe_join_secret() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::WipeJoinSecret),
+            &Response::Success { data: None },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s of fire")
+            .expect("waiter task did not panic");
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_does_not_fire_on_error_response() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::WipeJoinSecret),
+            &Response::Error {
+                message: "simulated".into(),
+            },
+        );
+
+        // Notify must NOT have fired — waiter should still be parked.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await;
+        assert!(
+            result.is_err(),
+            "dispatch_node_effects must not fire on Response::Error",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_does_not_fire_for_other_ops() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        // A different SecretsRaftOp — should not fire.
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::DeleteSecret {
+                storage_key: "dep:nope".into(),
+            }),
+            &Response::Success { data: None },
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await;
+        assert!(
+            result.is_err(),
+            "dispatch_node_effects must only fire for WipeJoinSecret",
+        );
     }
 }

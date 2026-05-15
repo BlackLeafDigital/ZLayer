@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.50.0] - 2026-05-15
+
+### Fixed
+- `WipeJoinSecret` Raft op now triggers a local filesystem delete of `{data_dir}/join_secret` on every node when it applies (resolves the Known Limitation called out in v0.16.0). The Raft apply wrapper in `zlayer_scheduler::raft::ClusterState` fires `zlayer_secrets::NodeSideEffects::fire_wipe_join_secret` on a successful apply; the daemon spawns a watcher in `zlayer serve` that drains the notify and runs the wipe (sub-second on the leader, propagates to followers as the op replicates). A boot-time reconcile in `zlayer serve` additionally consults `SecretsState::join_secret_wiped_at` at startup and forces the delete if `Some(_)`, covering the snapshot-restore path on followers that joined after the original apply. End-to-end idempotent; replaying the op preserves the first-applied timestamp for audit. `zlayer serve --vacuum-secrets` remains as an out-of-band escape hatch for operator-driven cleanup.
+
+### Added
+- `zlayer_secrets::NodeSideEffects` — first cross-cutting channel for Raft ops that need per-node filesystem/network effects. The handle is plumbed through the new `RaftCoordinator::with_auth_secrets_and_effects` constructor; existing constructors (`new`, `with_auth`, `with_auth_and_secrets`) delegate with `None` for backwards compatibility. Future ops needing similar behavior should add a matching `tokio::sync::Notify` field plus `fire_…` / `wait_…` accessors here rather than fanning out into per-op types.
+
 ## [0.16.0] - 2026-05-14
 
 ### Added

@@ -62,8 +62,17 @@ pub struct SecretsState {
     pub jwt_algorithm: zlayer_types::api::cluster::JwtAlgorithm,
 
     /// Timestamp when `WipeJoinSecret` last applied (None = never).
-    /// Used by the daemon's startup check to skip the wipe if it
-    /// already happened in a prior boot.
+    ///
+    /// Two daemon mechanisms consult this field:
+    /// - The apply-time wrapper in `zlayer_scheduler::raft::ClusterState`
+    ///   fires `NodeSideEffects::fire_wipe_join_secret`, which the daemon's
+    ///   watcher task drains to delete `{data_dir}/join_secret`.
+    /// - The boot-time reconcile in `zlayer serve` checks this field on
+    ///   startup; if `Some(_)` and the file still exists locally (e.g. the
+    ///   node restored from a snapshot where the wipe already happened),
+    ///   the file is removed before the HS256 HMAC loader runs.
+    ///
+    /// Both paths are idempotent.
     ///
     /// `#[serde(default)]` for pre-Wave-11 snapshots.
     #[serde(default)]
@@ -154,10 +163,15 @@ impl SecretsState {
                 Ok(())
             }
             SecretsRaftOp::WipeJoinSecret => {
-                // Record the wipe instant. Local filesystem cleanup
-                // is the daemon's responsibility — followers consult
-                // `join_secret_wiped_at` on boot to know if their
-                // copy of the file should already be gone.
+                // Record the wipe instant. The actual filesystem delete
+                // happens outside this pure-sync apply path: the wrapper
+                // closure in `zlayer_scheduler::raft::ClusterState` fires
+                // `NodeSideEffects::fire_wipe_join_secret` post-apply, and
+                // the daemon's watcher in `zlayer serve` drains the notify
+                // to `remove_file({data_dir}/join_secret)`. The boot-time
+                // reconcile in `zlayer serve` covers the snapshot-install
+                // path on followers. All three are idempotent; replaying
+                // this op preserves the first-applied timestamp for audit.
                 if self.join_secret_wiped_at.is_none() {
                     self.join_secret_wiped_at = Some(Utc::now());
                 }

@@ -950,6 +950,37 @@ fn take_pending_vacuum_secrets() -> bool {
     PENDING_VACUUM_SECRETS.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Idempotently delete `{data_dir}/join_secret`.
+///
+/// Used by three call sites: the `--vacuum-secrets` flag at startup, the
+/// boot-time reconcile that consults `SecretsState::join_secret_wiped_at`,
+/// and the long-lived watcher task that drains
+/// [`zlayer_secrets::NodeSideEffects::wait_wipe_join_secret`] (fired by the
+/// Raft apply wrapper). `reason` is included in the log line so operators
+/// can correlate the delete with its trigger.
+async fn wipe_join_secret_file(data_dir: &std::path::Path, reason: &str) -> anyhow::Result<()> {
+    let path = data_dir.join("join_secret");
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                reason,
+                "removed cluster join_secret",
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %path.display(),
+                reason,
+                "join_secret already absent; nothing to remove",
+            );
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 /// Resolve the tunnel daemon config from CLI overrides + env vars + defaults.
 fn build_tunnel_config_from_overrides(
     overrides: &TunnelCliOverrides,
@@ -1481,6 +1512,7 @@ pub(crate) async fn serve_with_external_shutdown(
         dead_node_detection_handle,
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
+        node_effects,
         replicator,
         job_executor,
         cron_scheduler,
@@ -1523,21 +1555,50 @@ pub(crate) async fn serve_with_external_shutdown(
     // secret on every restart.
     // -----------------------------------------------------------------------
     if take_pending_vacuum_secrets() {
-        let path = config.data_dir.join("join_secret");
-        if path.exists() {
-            tokio::fs::remove_file(&path)
-                .await
-                .with_context(|| format!("removing {} per --vacuum-secrets", path.display()))?;
-            tracing::warn!(
-                path = %path.display(),
-                "removed cluster join_secret per --vacuum-secrets; HS256 HMAC key will regenerate"
-            );
-        } else {
-            info!(
-                path = %path.display(),
-                "--vacuum-secrets requested but join_secret was already absent; nothing to remove"
-            );
+        wipe_join_secret_file(&config.data_dir, "--vacuum-secrets flag").await?;
+    }
+
+    // -----------------------------------------------------------------------
+    // 3a''. Boot reconcile: if a prior cluster-wide `WipeJoinSecret` Raft op
+    // already applied (state machine has `join_secret_wiped_at = Some(_)`)
+    // and this node still has a local copy (e.g. it restored from a snapshot
+    // where the wipe happened while this node was offline), delete it now
+    // before the HS256 HMAC loader runs. Idempotent; the helper is a no-op
+    // if the file is already absent.
+    //
+    // `_raft` may be `None` if Raft failed to initialize in `init_daemon`;
+    // in that case there is no cluster consensus to consult and we skip
+    // the reconcile entirely.
+    // -----------------------------------------------------------------------
+    if let Some(raft) = _raft.as_ref() {
+        let secrets_state = raft.secrets_state().await;
+        if secrets_state.join_secret_wiped_at.is_some() {
+            wipe_join_secret_file(&config.data_dir, "WipeJoinSecret applied in prior boot").await?;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3a'''. Watcher: drain `NodeSideEffects::wait_wipe_join_secret` and
+    // delete `{data_dir}/join_secret` on each fire. The Raft apply wrapper
+    // in `zlayer_scheduler::raft::ClusterState` calls `fire_wipe_join_secret`
+    // whenever `SecretsRaftOp::WipeJoinSecret` applies successfully, so
+    // this is the live (sub-second) path. The task lives for the daemon's
+    // lifetime; we keep the JoinHandle for shutdown.
+    // -----------------------------------------------------------------------
+    // The watcher is fire-and-forget for the daemon's lifetime; the
+    // `JoinHandle` is dropped immediately and the task runs detached.
+    // Graceful shutdown reaps it via the process exit.
+    {
+        let data_dir = config.data_dir.clone();
+        let effects = std::sync::Arc::clone(&node_effects);
+        std::mem::drop(tokio::spawn(async move {
+            loop {
+                effects.wait_wipe_join_secret().await;
+                if let Err(e) = wipe_join_secret_file(&data_dir, "WipeJoinSecret notify").await {
+                    tracing::error!(error = %e, "join_secret watcher: wipe failed");
+                }
+            }
+        }));
     }
 
     // -----------------------------------------------------------------------

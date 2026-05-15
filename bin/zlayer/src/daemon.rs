@@ -33,8 +33,8 @@ use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
 use zlayer_secrets::{
-    load_or_generate_node_keypair, CredentialStore, KeyManager, PersistentSecretsStore,
-    RaftSecretsHandle, RaftSecretsStore, RecipientPrivateKey, SecretsStore,
+    load_or_generate_node_keypair, CredentialStore, KeyManager, NodeSideEffects,
+    PersistentSecretsStore, RaftSecretsHandle, RaftSecretsStore, RecipientPrivateKey, SecretsStore,
 };
 use zlayer_tunnel::{
     AccessManager, ControlHandler, ListenerManager, NodeTunnelManager, TokenValidator, TunnelError,
@@ -349,6 +349,16 @@ pub struct DaemonState {
     /// Internal authentication token shared between the scheduler and the API.
     /// Needed by serve.rs to create `InternalState` with the same token.
     pub internal_token: String,
+
+    /// Per-node side-effect channel fired by the Raft apply wrapper.
+    ///
+    /// `serve.rs` clones this handle into a watcher task that awaits
+    /// [`NodeSideEffects::wait_wipe_join_secret`] and runs the local
+    /// filesystem delete of `{data_dir}/join_secret` on every wake.
+    /// `serve.rs` also consults `coordinator.secrets_state()` at boot
+    /// and forces the same delete if `join_secret_wiped_at` is already
+    /// `Some(_)` (covers the snapshot-restore path on followers).
+    pub node_effects: Arc<NodeSideEffects>,
 
     /// `SQLite` replicator for deployment DB backup to S3.
     /// `None` when S3 storage is not configured.
@@ -977,6 +987,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         node_config.raft_node_id = 1;
     }
 
+    // Per-node side-effect channel for Raft apply: shared between the
+    // coordinator's apply wrapper (fires the notify) and the watcher task
+    // spawned in `serve.rs` (drains it). Constructed unconditionally so the
+    // handle exists on DaemonState even when Raft fails to initialize — in
+    // that case the watcher never wakes, which is correct.
+    let node_effects = NodeSideEffects::new();
+
     // -----------------------------------------------------------------------
     // Phase 15: Raft distributed consensus
     // -----------------------------------------------------------------------
@@ -997,11 +1014,12 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         // disable the secrets helpers entirely.
         let raft_node_priv: RecipientPrivateKey = (*node_priv).clone();
         let raft_node_uuid = node_config.node_id.clone();
-        match RaftCoordinator::with_auth_and_secrets(
+        match RaftCoordinator::with_auth_secrets_and_effects(
             raft_cfg,
             Some(internal_token.clone()),
             Some(raft_node_priv),
             Some(raft_node_uuid),
+            Some(Arc::clone(&node_effects)),
         )
         .await
         {
@@ -1399,6 +1417,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         dead_node_detection_handle,
         scheduler,
         internal_token,
+        node_effects,
         replicator,
         job_executor,
         cron_scheduler,
