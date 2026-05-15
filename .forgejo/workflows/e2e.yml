@@ -54,7 +54,7 @@ jobs:
     name: E2E Tests (Youki)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'youki'
     steps:
@@ -140,7 +140,7 @@ jobs:
     name: E2E Tests (WASM)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'wasm'
     steps:
@@ -208,7 +208,7 @@ jobs:
     name: E2E Tests (Docker)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
     if: inputs.test == '' || inputs.test == 'docker'
     steps:
@@ -280,7 +280,7 @@ jobs:
     name: E2E Tests (Manager)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'manager-unit'
     steps:
@@ -355,7 +355,7 @@ jobs:
     name: E2E Tests (Manager Intellitester)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
@@ -520,7 +520,7 @@ jobs:
     name: E2E Tests (Raft)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
@@ -626,7 +626,7 @@ jobs:
     name: Unit Tests (Scheduler)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:24.04
+      image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'scheduler-unit'
     steps:
