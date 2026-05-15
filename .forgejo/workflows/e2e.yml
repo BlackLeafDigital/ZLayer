@@ -53,6 +53,9 @@ jobs:
   e2e-tests:
     name: E2E Tests (Youki)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'youki'
     steps:
       - name: Checkout
@@ -74,8 +77,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -102,29 +105,21 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: |
           # Clean up any leftover state from previous runs
-          sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
+          rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
           # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
 
       - name: Run E2E tests
         if: steps.check.outputs.completed != 'true'
-        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
+        run: cargo test --package zlayer-agent --test youki_e2e -- --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
 
-      - name: Fix permissions after sudo test
-        if: always()
-        run: |
-          # sudo cargo test creates root-owned files in CARGO_HOME and CARGO_TARGET_DIR
-          # The runner's cache mechanism can't tar them up without this
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_HOME}" 2>/dev/null || true
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_TARGET_DIR}" 2>/dev/null || true
-
       - name: Cleanup
         if: always()
         run: |
-          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
+          rm -rf /var/lib/zlayer/* 2>/dev/null || true
           rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
 
       - name: Mark step complete
@@ -144,6 +139,9 @@ jobs:
   wasm-e2e-tests:
     name: E2E Tests (WASM)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'wasm'
     steps:
       - name: Checkout
@@ -165,8 +163,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          apt-get update
+          apt-get install -y protobuf-compiler
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -209,6 +207,9 @@ jobs:
   docker-e2e-tests:
     name: E2E Tests (Docker)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
     if: inputs.test == '' || inputs.test == 'docker'
     steps:
       - name: Checkout
@@ -230,8 +231,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev docker.io
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -278,6 +279,9 @@ jobs:
   manager-tests:
     name: E2E Tests (Manager)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'manager-unit'
     steps:
       - name: Checkout
@@ -299,8 +303,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -350,6 +354,9 @@ jobs:
   manager-intellitester-tests:
     name: E2E Tests (Manager Intellitester)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
       inputs.test == 'manager-intellitester' ||
@@ -374,8 +381,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev sqlite3
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev sqlite3
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -451,11 +458,9 @@ jobs:
             manager-intellitester:*) ONLY="${YAML#manager-intellitester:}" ;;
             *) ONLY="" ;;
           esac
-          # The throwaway daemon runs unprivileged: overlay/TUN init logs a
-          # CAP_NET_ADMIN warning and degrades to "cross-node networking
-          # disabled", which is harmless for the auth/manager intellitester
-          # flow. Pass --sudo-daemon only if the runner image starts
-          # requiring elevated daemon caps.
+          # Container has CAP_NET_ADMIN + /dev/net/tun via the privileged
+          # block above, so the throwaway daemon's overlay/TUN init no
+          # longer degrades. --sudo-daemon is not needed.
           if [ -n "$ONLY" ]; then
             uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py \
               --throwaway --only "$ONLY"
@@ -514,6 +519,9 @@ jobs:
   raft-e2e-tests:
     name: E2E Tests (Raft)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
@@ -538,8 +546,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -571,19 +579,25 @@ jobs:
       - name: Run raft cluster suite(s)
         if: steps.check.outputs.completed != 'true'
         run: |
+          set -eo pipefail
           YAML="${{ inputs.test }}"
           case "$YAML" in
             raft-e2e:*) SUITE="${YAML#raft-e2e:}" ;;
             *) SUITE="cluster_3node" ;;
           esac
-          # For the bare `raft-e2e` option (or an empty test input meaning
-          # "run everything"), iterate all four cluster suites. Otherwise
-          # run the single suite resolved above.
           if [ "$YAML" = "raft-e2e" ] || [ -z "$YAML" ]; then
+            worst=0
             for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade cluster_node_upgrade; do
               echo "=== Running suite: $s ==="
-              uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"
+              if uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"; then
+                echo "=== Suite $s OK ==="
+              else
+                rc=$?
+                echo "=== Suite $s FAILED (rc=$rc) ==="
+                worst=$rc
+              fi
             done
+            exit $worst
           else
             uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$SUITE"
           fi
@@ -611,6 +625,9 @@ jobs:
   scheduler-unit-tests:
     name: Unit Tests (Scheduler)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'scheduler-unit'
     steps:
       - name: Checkout
@@ -632,8 +649,8 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'

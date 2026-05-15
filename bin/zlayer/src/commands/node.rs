@@ -4,7 +4,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
-use zlayer_types::api::cluster::{ClusterJoinClaims, SignedClusterJoinToken, SIGNED_TOKEN_V_WAVE3};
+use zlayer_types::api::cluster::{
+    ClusterJoinClaims, SignedClusterJoinToken, SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
+};
 
 #[cfg(not(unix))]
 use crate::ui::consent::ConsentMode;
@@ -218,11 +220,42 @@ fn generate_join_token_data(
 }
 
 /// Parse a join token
+///
+/// Accepts both the Wave-3+ signed envelope (`SignedClusterJoinToken`,
+/// versions v=1 and v=2) and the legacy plaintext flat-JSON
+/// `ClusterJoinToken` shape. The signed envelope is attempted first; on
+/// parse failure we fall back to the legacy shape.
+///
+/// Signature verification is NOT performed here: the joiner does not yet
+/// hold the cluster's verifying key. The leader verifies the signature
+/// on receipt of the join request.
 fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, token)
         .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token))
         .context("Invalid join token: not valid base64")?;
 
+    // Try the signed-envelope shape first (Wave-3+ default).
+    if let Ok(envelope) = serde_json::from_slice::<SignedClusterJoinToken>(&decoded) {
+        if envelope.v != SIGNED_TOKEN_V_WAVE3 && envelope.v != SIGNED_TOKEN_V_WAVE9 {
+            bail!(
+                "Invalid join token: unsupported signed envelope version v={} \
+                 (expected {} or {})",
+                envelope.v,
+                SIGNED_TOKEN_V_WAVE3,
+                SIGNED_TOKEN_V_WAVE9,
+            );
+        }
+        let claims = envelope.claims;
+        return Ok(ClusterJoinToken {
+            api_endpoint: claims.api_endpoint,
+            raft_endpoint: claims.raft_endpoint,
+            leader_wg_pubkey: claims.leader_wg_pubkey,
+            overlay_cidr: claims.overlay_cidr,
+            created_at: claims.iat,
+        });
+    }
+
+    // Fall back to the legacy plaintext flat-JSON shape.
     let token_data: ClusterJoinToken =
         serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
 
@@ -3756,6 +3789,48 @@ mod tests {
         let result = super::parse_cluster_join_token(&invalid_json);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("JSON"));
+    }
+
+    /// `parse_cluster_join_token` must accept the Wave-3+ signed envelope
+    /// shape that `mint_signed_cluster_join_token` emits, surfacing the
+    /// inner `claims` fields as a flat `ClusterJoinToken` for the rest
+    /// of the join path. Regression test for the e2e `cluster_3node` suite
+    /// where the CLI rejected its own freshly-minted token.
+    #[test]
+    fn test_parse_signed_envelope_join_token() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use zlayer_types::api::cluster::{
+            ClusterJoinClaims, SignedClusterJoinToken, SIGNED_TOKEN_V_WAVE3,
+        };
+
+        let claims = ClusterJoinClaims {
+            api_endpoint: "host:3669".to_string(),
+            raft_endpoint: "host:9000".to_string(),
+            leader_wg_pubkey: "test-pubkey".to_string(),
+            overlay_cidr: "10.200.0.0/16".to_string(),
+            exp: "2026-12-31T23:59:59Z".to_string(),
+            iat: "2026-05-15T17:55:00Z".to_string(),
+            iss: "node-uuid-1234".to_string(),
+        };
+        let envelope = SignedClusterJoinToken {
+            v: SIGNED_TOKEN_V_WAVE3,
+            kid: "deadbeef".to_string(),
+            claims: claims.clone(),
+            sig: "AAAA".to_string(),
+            ca_chain: None,
+        };
+        let envelope_bytes =
+            serde_json::to_vec(&envelope).expect("serialize signed envelope for test");
+        let token = URL_SAFE_NO_PAD.encode(envelope_bytes);
+
+        let parsed = super::parse_cluster_join_token(&token).expect("parse signed envelope");
+
+        assert_eq!(parsed.api_endpoint, claims.api_endpoint);
+        assert_eq!(parsed.raft_endpoint, claims.raft_endpoint);
+        assert_eq!(parsed.leader_wg_pubkey, claims.leader_wg_pubkey);
+        assert_eq!(parsed.overlay_cidr, claims.overlay_cidr);
+        assert_eq!(parsed.created_at, claims.iat);
     }
 
     /// On a non-admin Windows shell, `handle_node_init` should refuse to do any

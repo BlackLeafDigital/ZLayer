@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.50.1] - 2026-05-15
+
+### Fixed
+- `zlayer node join` now accepts the Wave-3+ signed envelope (`SignedClusterJoinToken` v=1 and v=2) that `zlayer node generate-join-token` has been emitting by default. Previously `parse_cluster_join_token` only knew the legacy plaintext flat-JSON shape and bailed with `Invalid join token: not valid JSON: missing field 'api_endpoint'` when handed a freshly-minted signed token — the CLI was rejecting its own output. The parser now tries the signed envelope first (lifting `api_endpoint`/`raft_endpoint`/`leader_wg_pubkey`/`overlay_cidr` out of `claims`, and using `claims.iat` as the legacy `created_at` field) and falls back to the legacy shape on parse failure. Signature verification stays on the leader — the joiner does not hold the verifying key. Regression-tested by `test_parse_signed_envelope_join_token`. Unblocks the `cluster_3node` / `cluster_failover` / `cluster_scaling` / `cluster_upgrade` / `cluster_node_upgrade` e2e suites.
+- E2E `login.test.yaml` final `waitForSelector` now names the specific Dashboard heading (`{ role: heading, name: "Dashboard" }`) instead of the ambiguous `{ role: heading }` that violated Playwright strict mode (Dashboard renders 3 `<h*>` tags).
+- `raft-e2e-tests` workflow step in `.forgejo/workflows/e2e.yml` no longer silently swallows per-suite failures. The cluster-suite loop previously used `if ! cmd; then rc=$?; …` which always captured `$?` as `0` (the negated test) so `worst` never accumulated a non-zero exit code; rewritten as `if cmd; then …; else rc=$?; worst=$rc; fi` and explicit `set -eo pipefail` at the top of the script.
+
+### Changed
+- Every Linux job in `.forgejo/workflows/e2e.yml` (`e2e-tests`, `wasm-e2e-tests`, `docker-e2e-tests`, `manager-tests`, `manager-intellitester-tests`, `raft-e2e-tests`, `scheduler-unit-tests`) now runs inside a privileged `ubuntu:24.04` container with `--privileged --cap-add=NET_ADMIN --device=/dev/net/tun`. The throwaway daemon's overlay/TUN init no longer degrades to `Global overlay failed (cross-node networking disabled)`. `docker-e2e-tests` additionally mounts `/var/run/docker.sock` and installs `docker.io`. The `macos-sandbox-e2e` and `dispatch-build` jobs are unchanged. Sudo prefixes were dropped from steps that run as root in the container, and the now-obsolete "Fix permissions after sudo test" step in `e2e-tests` was removed. Per-test-node container mode (`run-suite.py --overlay-mode container`) remains scaffolded — see `docs/operating/e2e-privileged.md`.
+
 ## [0.50.0] - 2026-05-15
 
 ### Fixed
