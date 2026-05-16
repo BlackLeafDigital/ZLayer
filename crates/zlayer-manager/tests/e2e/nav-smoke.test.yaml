@@ -25,7 +25,7 @@ steps:
     target: { role: button, name: "Sign in" }
 
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
     timeout: 15000
 
@@ -39,7 +39,7 @@ steps:
   - type: navigate
     value: /
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-dashboard.png
@@ -47,7 +47,7 @@ steps:
   - type: navigate
     value: /nodes
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-nodes.png
@@ -55,7 +55,7 @@ steps:
   - type: navigate
     value: /deployments
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-deployments.png
@@ -63,7 +63,7 @@ steps:
   - type: navigate
     value: /networking
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-networking.png
@@ -71,7 +71,7 @@ steps:
   - type: navigate
     value: /networks
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-networks.png
@@ -79,7 +79,7 @@ steps:
   - type: navigate
     value: /overlay
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-overlay.png
@@ -87,7 +87,7 @@ steps:
   - type: navigate
     value: /proxy
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-proxy.png
@@ -95,7 +95,7 @@ steps:
   - type: navigate
     value: /ssh-tunnels
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-ssh-tunnels.png
@@ -103,7 +103,7 @@ steps:
   - type: navigate
     value: /git
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-git.png
@@ -111,7 +111,7 @@ steps:
   - type: navigate
     value: /builds
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-builds.png
@@ -119,7 +119,7 @@ steps:
   - type: navigate
     value: /jobs
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-jobs.png
@@ -127,7 +127,7 @@ steps:
   - type: navigate
     value: /users
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-users.png
@@ -135,7 +135,7 @@ steps:
   - type: navigate
     value: /groups
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-groups.png
@@ -143,7 +143,7 @@ steps:
   - type: navigate
     value: /variables
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-variables.png
@@ -151,7 +151,7 @@ steps:
   - type: navigate
     value: /secrets
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-secrets.png
@@ -159,7 +159,7 @@ steps:
   - type: navigate
     value: /tasks
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-tasks.png
@@ -167,7 +167,7 @@ steps:
   - type: navigate
     value: /workflows
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-workflows.png
@@ -175,7 +175,7 @@ steps:
   - type: navigate
     value: /notifiers
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-notifiers.png
@@ -183,7 +183,7 @@ steps:
   - type: navigate
     value: /permissions
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-permissions.png
@@ -191,7 +191,7 @@ steps:
   - type: navigate
     value: /projects
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-projects.png
@@ -199,7 +199,7 @@ steps:
   - type: navigate
     value: /audit
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-audit.png
@@ -207,7 +207,7 @@ steps:
   - type: navigate
     value: /settings
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
   - type: screenshot
     name: nav-settings.png

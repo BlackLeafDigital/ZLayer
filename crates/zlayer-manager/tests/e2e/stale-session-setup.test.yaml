@@ -34,7 +34,7 @@ steps:
 
   # Successful login lands on "/" with the dashboard shell loaded.
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
     timeout: 15000
 

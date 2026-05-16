@@ -11,6 +11,30 @@ use zlayer_types::api::cluster::{
 #[cfg(not(unix))]
 use crate::ui::consent::ConsentMode;
 
+/// Normalize an `api_endpoint` string to bare `host:port` form.
+///
+/// Strips a leading `http://` / `https://` (case-insensitive) and any
+/// trailing `/`. Every callsite in this file builds URLs via
+/// `format!("http://{api_endpoint}/...")`, so the canonical in-memory
+/// shape is scheme-less. Operators sometimes pass `--api/-a http://...`
+/// (or copy-paste a browser URL); this helper keeps the wire format
+/// stable regardless.
+fn normalize_api_endpoint(s: &str) -> String {
+    let trimmed = s.trim();
+    let stripped = if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("HTTP://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("HTTPS://") {
+        rest
+    } else {
+        trimmed
+    };
+    stripped.trim_end_matches('/').to_string()
+}
+
 // =============================================================================
 // Node management types
 // =============================================================================
@@ -247,7 +271,7 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
         }
         let claims = envelope.claims;
         return Ok(ClusterJoinToken {
-            api_endpoint: claims.api_endpoint,
+            api_endpoint: normalize_api_endpoint(&claims.api_endpoint),
             raft_endpoint: claims.raft_endpoint,
             leader_wg_pubkey: claims.leader_wg_pubkey,
             overlay_cidr: claims.overlay_cidr,
@@ -256,9 +280,9 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
     }
 
     // Fall back to the legacy plaintext flat-JSON shape.
-    let token_data: ClusterJoinToken =
+    let mut token_data: ClusterJoinToken =
         serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
-
+    token_data.api_endpoint = normalize_api_endpoint(&token_data.api_endpoint);
     Ok(token_data)
 }
 
@@ -3161,8 +3185,10 @@ async fn build_cluster_join_token_from_disk(
     // The API endpoint embedded in the token is a bare `host:port`. When the
     // caller passes an `--api` override it wins verbatim — that mirrors the
     // documented behavior of the `--api` CLI flag.
-    let api_endpoint = api_override
-        .unwrap_or_else(|| format!("{}:{}", node_config.advertise_addr, node_config.api_port));
+    let api_endpoint = normalize_api_endpoint(
+        &api_override
+            .unwrap_or_else(|| format!("{}:{}", node_config.advertise_addr, node_config.api_port)),
+    );
 
     let raft_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.raft_port);
 
@@ -3805,7 +3831,7 @@ mod tests {
         };
 
         let claims = ClusterJoinClaims {
-            api_endpoint: "host:3669".to_string(),
+            api_endpoint: "http://host:3669".to_string(),
             raft_endpoint: "host:9000".to_string(),
             leader_wg_pubkey: "test-pubkey".to_string(),
             overlay_cidr: "10.200.0.0/16".to_string(),
@@ -3826,11 +3852,36 @@ mod tests {
 
         let parsed = super::parse_cluster_join_token(&token).expect("parse signed envelope");
 
-        assert_eq!(parsed.api_endpoint, claims.api_endpoint);
+        assert_eq!(parsed.api_endpoint, "host:3669");
         assert_eq!(parsed.raft_endpoint, claims.raft_endpoint);
         assert_eq!(parsed.leader_wg_pubkey, claims.leader_wg_pubkey);
         assert_eq!(parsed.overlay_cidr, claims.overlay_cidr);
         assert_eq!(parsed.created_at, claims.iat);
+    }
+
+    #[test]
+    fn test_normalize_api_endpoint() {
+        use super::normalize_api_endpoint;
+
+        assert_eq!(normalize_api_endpoint("127.0.0.1:19110"), "127.0.0.1:19110");
+        assert_eq!(
+            normalize_api_endpoint("http://127.0.0.1:19110"),
+            "127.0.0.1:19110"
+        );
+        assert_eq!(
+            normalize_api_endpoint("https://leader.prod:3669/"),
+            "leader.prod:3669"
+        );
+        assert_eq!(
+            normalize_api_endpoint("HTTPS://leader.prod:3669"),
+            "leader.prod:3669"
+        );
+        assert_eq!(
+            normalize_api_endpoint("  http://10.0.0.1:8080  "),
+            "10.0.0.1:8080"
+        );
+        // Already-bare endpoint with trailing slash gets the slash stripped.
+        assert_eq!(normalize_api_endpoint("host:9000/"), "host:9000");
     }
 
     /// On a non-admin Windows shell, `handle_node_init` should refuse to do any
