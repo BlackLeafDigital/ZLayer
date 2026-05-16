@@ -76,9 +76,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -162,9 +162,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -230,9 +230,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev docker.io
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev docker.io'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -302,9 +302,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -380,9 +380,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev sqlite3
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev sqlite3'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -545,9 +545,12 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          # psmisc (fuser) + lsof power the port-clearing fallback in
+          # run-suite.py that prevents cross-suite contamination between
+          # the five cluster suites sharing ports 19110/19120/19130.
+          packages: 'sudo protobuf-compiler libseccomp-dev psmisc lsof'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -648,9 +651,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'

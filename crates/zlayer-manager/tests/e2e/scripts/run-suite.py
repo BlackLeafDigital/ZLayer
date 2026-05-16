@@ -27,6 +27,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -132,6 +133,81 @@ def _kill_pg(proc: subprocess.Popen, name: str, *, sudo: bool = False) -> None:
     _send(signal.SIGKILL)
     with suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=TERM_GRACE_S)
+
+
+def _ports_in_use(ports: list[int]) -> list[int]:
+    """Return the subset of `ports` that cannot currently be bound on 127.0.0.1.
+
+    Exists because cluster suites share fixed ports (CLUSTER_NODES); a daemon
+    from a previous suite that hasn't fully released its listening socket
+    will cause the next suite to silently talk to the leftover daemon.
+    """
+    busy: list[int] = []
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                busy.append(port)
+        finally:
+            with suppress(OSError):
+                s.close()
+    return busy
+
+
+def _wait_ports_free(ports: list[int], timeout_s: float = 10.0) -> list[int]:
+    """Poll `_ports_in_use` every 250ms until empty or timeout; return still-busy.
+
+    Used between cluster suites so the next suite's bootstrap doesn't race a
+    half-dead daemon whose TCP listener hasn't yet been reaped by the kernel
+    (root cause of the cross-suite "join secret not found" contamination).
+    """
+    deadline = time.monotonic() + timeout_s
+    busy = _ports_in_use(ports)
+    while busy and time.monotonic() < deadline:
+        time.sleep(0.25)
+        busy = _ports_in_use(ports)
+    return busy
+
+
+def _force_kill_port_owners(ports: list[int]) -> None:
+    """Best-effort SIGKILL whoever still owns each port (fuser → lsof → warn).
+
+    Last-resort hammer for cluster-suite port leaks: if a previous suite's
+    daemon survived `_kill_pg` (rare but observed), the next suite would
+    bind-fail on 19110/19120/19130 and answer to the wrong data-dir.
+    """
+    fuser = shutil.which("fuser")
+    lsof = shutil.which("lsof")
+    for port in ports:
+        killed = False
+        if fuser:
+            res = subprocess.run(
+                ["fuser", "-k", "-KILL", "-n", "tcp", str(port)],
+                check=False, capture_output=True,
+            )
+            if res.returncode == 0:
+                killed = True
+        if not killed and lsof:
+            res = subprocess.run(
+                ["lsof", "-ti", f"tcp:{port}"],
+                check=False, capture_output=True, text=True,
+            )
+            pids = [
+                int(line) for line in res.stdout.splitlines()
+                if line.strip().isdigit()
+            ]
+            for pid in pids:
+                with suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(pid, signal.SIGKILL)
+                    killed = True
+        if not killed and not fuser and not lsof:
+            log(
+                f"_force_kill_port_owners: neither fuser nor lsof available; "
+                f"cannot force-free port {port}"
+            )
 
 
 def _maybe_sudo(argv: list[str], *, sudo: bool) -> list[str]:
@@ -357,7 +433,10 @@ def run_intellitester(
     extra_args: Optional[list[str]] = None,
     env_extras: Optional[dict[str, str]] = None,
 ) -> None:
-    argv = ["pnpm", "dlx", "--silent", INTELLITESTER_PIN, "run"]
+    # `--silent` must come BEFORE `dlx`: it's a top-level pnpm flag,
+    # and modern pnpm parses post-`dlx` args strictly as <package> [args],
+    # so `dlx --silent <pkg>` makes `--silent` the package name and 404s.
+    argv = ["pnpm", "--silent", "dlx", INTELLITESTER_PIN, "run"]
     if extra_args:
         argv.extend(extra_args)
     argv.append(str(yaml_path))
@@ -491,6 +570,30 @@ def _bootstrap_3node_cluster(
     Returns (procs, data_dirs, api_ports). Caller is responsible for
     `_kill_pg`-ing every proc in `procs` in its `finally:` block.
     """
+    # Pre-flight: refuse to start on a polluted port set. Belt-and-suspenders
+    # for the case where the previous suite's `_cleanup_cluster` didn't run
+    # (CI worker died, KEEP_E2E_ARTIFACTS, manual reruns). Without this we
+    # would silently bind-fail on node1 and the suite would talk to the
+    # leftover daemon → confusing "join secret not found" elsewhere.
+    all_cluster_ports = [
+        p for n in CLUSTER_NODES for p in (n["api"], n["raft"])
+    ]
+    busy = _wait_ports_free(all_cluster_ports, timeout_s=2.0)
+    if busy:
+        log(
+            f"cluster bootstrap: ports {busy} already in use; "
+            "force-killing leftover listeners"
+        )
+        _force_kill_port_owners(busy)
+        busy = _wait_ports_free(busy, timeout_s=5.0)
+        if busy:
+            die(
+                f"cluster bootstrap: ports {busy} are still in use after "
+                "force-kill; another zlayer daemon or test harness is bound "
+                "to them — clean up manually (e.g. "
+                "`fuser -k -n tcp 19110 19120 19130`)"
+            )
+
     data_dirs: list[Path] = []
     for i in range(3):
         d = root_dir / f"node{i + 1}" / "data"
@@ -620,6 +723,26 @@ def _cleanup_cluster(
 ) -> None:
     for i, p in enumerate(procs):
         _kill_pg(p, f"cluster-node{i + 1}")
+    # Wait for the kernel to actually release the cluster ports before the
+    # next suite's bootstrap tries to bind them. Without this, suite N+1
+    # silently talks to suite N's leftover daemon (cross-suite contamination
+    # → confusing "join secret not found" errors downstream).
+    all_cluster_ports = [
+        p for n in CLUSTER_NODES for p in (n["api"], n["raft"])
+    ]
+    still_busy = _wait_ports_free(all_cluster_ports, timeout_s=10.0)
+    if still_busy:
+        log(
+            f"cluster cleanup: ports {still_busy} still bound after _kill_pg; "
+            "force-killing remaining listeners"
+        )
+        _force_kill_port_owners(still_busy)
+        still_busy = _wait_ports_free(still_busy, timeout_s=3.0)
+        if still_busy:
+            log(
+                f"cluster cleanup: ports {still_busy} STILL bound after "
+                "force-kill; next suite's bootstrap will fail loudly"
+            )
     if os.environ.get("KEEP_E2E_ARTIFACTS") == "1":
         log(f"cluster: KEEP_E2E_ARTIFACTS=1 → leaving {root_dir} in place")
         return
