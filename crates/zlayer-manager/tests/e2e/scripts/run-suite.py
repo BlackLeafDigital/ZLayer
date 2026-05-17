@@ -453,11 +453,14 @@ def run_intellitester(
 # 3-node bootstrap path via `_bootstrap_3node_cluster`.
 
 # Per-node ports for the local 3-node throwaway cluster. Picked above the
-# manager-suite range so the two cannot collide.
+# manager-suite range so the two cannot collide. Overlay UDP ports kept
+# clear of 51820 (WireGuard default) and the production zlayer daemon's
+# default range (5141x–5143x) so a running system daemon does not steal
+# a throwaway node's WireGuard port mid-suite.
 CLUSTER_NODES: list[dict[str, int]] = [
-    {"api": 19110, "raft": 19111, "overlay": 51410},
-    {"api": 19120, "raft": 19121, "overlay": 51420},
-    {"api": 19130, "raft": 19131, "overlay": 51430},
+    {"api": 19110, "raft": 19111, "overlay": 59410},
+    {"api": 19120, "raft": 19121, "overlay": 59420},
+    {"api": 19130, "raft": 19131, "overlay": 59430},
 ]
 CLUSTER_DEPLOYMENT = "zlayer-e2e-cluster"
 CLUSTER_NODES_READY_TIMEOUT_S = 60
@@ -542,9 +545,16 @@ def _fetch_cluster_nodes(api_port: int) -> list[dict]:
 
 
 def _spawn_node_serve(
-    zlayer_bin: Path, data_dir: Path, api_port: int,
+    zlayer_bin: Path, data_dir: Path, api_port: int, *, sudo: bool = False,
 ) -> subprocess.Popen:
-    """Spawn `zlayer serve` for a cluster node (no --daemon, killable group)."""
+    """Spawn `zlayer serve` for a cluster node (no --daemon, killable group).
+
+    `sudo=True` wraps argv in `sudo -E env PATH=... HOME=...` so the daemon
+    runs as root. Required locally when the developer host lacks rootless
+    container infra (idmapped mounts, working /etc/subuid+/etc/subgid for
+    the daemon user, etc). CI's `node:20-bullseye --privileged` containers
+    already run as root so this is a no-op there.
+    """
     env = {
         **os.environ,
         "ZLAYER_JWT_SECRET": os.environ.get(
@@ -552,18 +562,21 @@ def _spawn_node_serve(
             "e2e-secret-do-not-use-in-prod-do-not-share-this-key-1234567890",
         ),
     }
-    argv = [
-        str(zlayer_bin),
-        "--data-dir", str(data_dir),
-        "serve",
-        "--bind", f"127.0.0.1:{api_port}",
-        "--deployment-name", CLUSTER_DEPLOYMENT,
-    ]
+    argv = _maybe_sudo(
+        [
+            str(zlayer_bin),
+            "--data-dir", str(data_dir),
+            "serve",
+            "--bind", f"127.0.0.1:{api_port}",
+            "--deployment-name", CLUSTER_DEPLOYMENT,
+        ],
+        sudo=sudo,
+    )
     return subprocess.Popen(argv, cwd=REPO_ROOT, env=env, start_new_session=True)
 
 
 def _bootstrap_3node_cluster(
-    zlayer_bin: Path, root_dir: Path,
+    zlayer_bin: Path, root_dir: Path, *, sudo: bool = False,
 ) -> tuple[list[subprocess.Popen], list[Path], list[int]]:
     """Stand up a 3-node loopback cluster.
 
@@ -620,42 +633,46 @@ def _bootstrap_3node_cluster(
 
     # --- Node 1: serve in the background -----------------------------------
     log(f"cluster: starting node1 serve on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
-    n1 = _spawn_node_serve(zlayer_bin, data_dirs[0], CLUSTER_NODES[0]["api"])
+    n1 = _spawn_node_serve(
+        zlayer_bin, data_dirs[0], CLUSTER_NODES[0]["api"], sudo=sudo,
+    )
     procs.append(n1)
     if not _wait_http_ok(
         f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/health/ready", 30,
     ):
         die(f"node1 never came up on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
 
-    # --- Generate join token from the leader -------------------------------
-    log("cluster: generating join token on node1")
-    try:
-        gen = subprocess.run(
-            [
-                str(zlayer_bin),
-                "--data-dir", str(data_dirs[0]),
-                "node", "generate-join-token",
-                CLUSTER_DEPLOYMENT,
-                "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
-            ],
-            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
-        )
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            sys.stderr.write(
-                f"--- node generate-join-token stdout ---\n{exc.stdout}\n"
-            )
-        if exc.stderr:
-            sys.stderr.write(
-                f"--- node generate-join-token stderr ---\n{exc.stderr}\n"
-            )
-        raise
-    token = _parse_join_token(gen.stdout)
-    log(f"cluster: join token ({len(token)} chars) acquired")
-
-    # --- Nodes 2 & 3: join + serve -----------------------------------------
+    # --- Nodes 2 & 3: mint a fresh join token per joiner, then join + serve.
+    # Signed cluster join tokens (commit ce8a53a) are single-use: the leader
+    # records (kid, iat, iss) on first acceptance and rejects replays. Mint
+    # one token per node here rather than reusing.
     for i in (1, 2):
         cfg = CLUSTER_NODES[i]
+        log(f"cluster: generating join token on node1 for node{i + 1}")
+        try:
+            gen = subprocess.run(
+                [
+                    str(zlayer_bin),
+                    "--data-dir", str(data_dirs[0]),
+                    "node", "generate-join-token",
+                    CLUSTER_DEPLOYMENT,
+                    "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
+                ],
+                capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            if exc.stdout:
+                sys.stderr.write(
+                    f"--- node generate-join-token stdout ---\n{exc.stdout}\n"
+                )
+            if exc.stderr:
+                sys.stderr.write(
+                    f"--- node generate-join-token stderr ---\n{exc.stderr}\n"
+                )
+            raise
+        token = _parse_join_token(gen.stdout)
+        log(f"cluster: join token for node{i + 1} ({len(token)} chars) acquired")
+
         log(
             f"cluster: joining node{i + 1} via 127.0.0.1:{CLUSTER_NODES[0]['api']} "
             f"(advertise=127.0.0.1, api={cfg['api']})"
@@ -675,7 +692,7 @@ def _bootstrap_3node_cluster(
             check=True, cwd=REPO_ROOT,
         )
         log(f"cluster: starting node{i + 1} serve on 127.0.0.1:{cfg['api']}")
-        p = _spawn_node_serve(zlayer_bin, data_dirs[i], cfg["api"])
+        p = _spawn_node_serve(zlayer_bin, data_dirs[i], cfg["api"], sudo=sudo)
         procs.append(p)
         if not _wait_http_ok(
             f"http://127.0.0.1:{cfg['api']}/health/ready", 30,
@@ -719,10 +736,10 @@ def _wait_for_ready_cluster(
 
 
 def _cleanup_cluster(
-    procs: list[subprocess.Popen], root_dir: Path,
+    procs: list[subprocess.Popen], root_dir: Path, *, sudo: bool = False,
 ) -> None:
     for i, p in enumerate(procs):
-        _kill_pg(p, f"cluster-node{i + 1}")
+        _kill_pg(p, f"cluster-node{i + 1}", sudo=sudo)
     # Wait for the kernel to actually release the cluster ports before the
     # next suite's bootstrap tries to bind them. Without this, suite N+1
     # silently talks to suite N's leftover daemon (cross-suite contamination
@@ -765,7 +782,7 @@ def run_cluster_3node(args: argparse.Namespace) -> int:
     procs: list[subprocess.Popen] = []
     try:
         procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir,
+            zlayer_bin, root_dir, sudo=args.sudo_daemon,
         )
         log("cluster_3node: waiting for cluster to converge")
         nodes = _wait_for_ready_cluster(
@@ -783,7 +800,7 @@ def run_cluster_3node(args: argparse.Namespace) -> int:
         print(f"cluster_3node: FAIL — {e!r}", file=sys.stderr, flush=True)
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir)
+        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
 
 
 def run_cluster_failover(args: argparse.Namespace) -> int:
@@ -806,7 +823,7 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
     procs: list[subprocess.Popen] = []
     try:
         procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir,
+            zlayer_bin, root_dir, sudo=args.sudo_daemon,
         )
         leader_api = api_ports[0]
         log("cluster_failover: waiting for cluster to converge")
@@ -841,7 +858,11 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
         )
 
         # 1. Kill the worker.
-        _kill_pg(procs[worker_idx], f"cluster-node{worker_idx + 1} (kill)")
+        _kill_pg(
+            procs[worker_idx],
+            f"cluster-node{worker_idx + 1} (kill)",
+            sudo=args.sudo_daemon,
+        )
 
         # 2. Poll for `dead`.
         log(
@@ -879,6 +900,7 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
         log(f"cluster_failover: restarting node{worker_idx + 1}")
         procs[worker_idx] = _spawn_node_serve(
             zlayer_bin, data_dirs[worker_idx], api_ports[worker_idx],
+            sudo=args.sudo_daemon,
         )
         if not _wait_http_ok(
             f"http://127.0.0.1:{api_ports[worker_idx]}/health/ready", 30,
@@ -926,7 +948,7 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
         print(f"cluster_failover: FAIL — {e!r}", file=sys.stderr, flush=True)
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir)
+        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,7 +1161,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
     procs: list[subprocess.Popen] = []
     try:
         procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir,
+            zlayer_bin, root_dir, sudo=args.sudo_daemon,
         )
         log("cluster_scaling: waiting for cluster to converge")
         _wait_for_ready_cluster(
@@ -1158,7 +1180,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
                 [
                     str(zlayer_bin),
                     "--data-dir", str(leader_data_dir),
-                    "deploy", str(spec_1r),
+                    "deploy", "--detach", str(spec_1r),
                 ],
                 check=True, cwd=REPO_ROOT,
             )
@@ -1180,7 +1202,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
                 [
                     str(zlayer_bin),
                     "--data-dir", str(leader_data_dir),
-                    "deploy", str(spec_3r),
+                    "deploy", "--detach", str(spec_3r),
                 ],
                 check=True, cwd=REPO_ROOT,
             )
@@ -1214,7 +1236,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
                 [
                     str(zlayer_bin),
                     "--data-dir", str(leader_data_dir),
-                    "deploy", str(spec_1r),
+                    "deploy", "--detach", str(spec_1r),
                 ],
                 check=True, cwd=REPO_ROOT,
             )
@@ -1234,7 +1256,7 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
         print(f"cluster_scaling: FAIL — {e!r}", file=sys.stderr, flush=True)
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir)
+        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
 
 
 def run_cluster_upgrade(args: argparse.Namespace) -> int:
@@ -1252,7 +1274,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
     procs: list[subprocess.Popen] = []
     try:
         procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir,
+            zlayer_bin, root_dir, sudo=args.sudo_daemon,
         )
         log("cluster_upgrade: waiting for cluster to converge")
         _wait_for_ready_cluster(
@@ -1271,7 +1293,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
                 [
                     str(zlayer_bin),
                     "--data-dir", str(leader_data_dir),
-                    "deploy", str(spec_v1),
+                    "deploy", "--detach", str(spec_v1),
                 ],
                 check=True, cwd=REPO_ROOT,
             )
@@ -1294,7 +1316,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
                 [
                     str(zlayer_bin),
                     "--data-dir", str(leader_data_dir),
-                    "deploy", str(spec_v2),
+                    "deploy", "--detach", str(spec_v2),
                 ],
                 check=True, cwd=REPO_ROOT,
             )
@@ -1321,7 +1343,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
         print(f"cluster_upgrade: FAIL — {e!r}", file=sys.stderr, flush=True)
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir)
+        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
 
 
 # ---------------------------------------------------------------------------
@@ -1357,7 +1379,7 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
     procs: list[subprocess.Popen] = []
     try:
         procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir,
+            zlayer_bin, root_dir, sudo=args.sudo_daemon,
         )
         log("cluster_node_upgrade: waiting for cluster to converge")
         nodes = _wait_for_ready_cluster(
@@ -1531,7 +1553,7 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
         )
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir)
+        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
 
 
 # ---------------------------------------------------------------------------

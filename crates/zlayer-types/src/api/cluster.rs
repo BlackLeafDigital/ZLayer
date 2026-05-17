@@ -101,6 +101,11 @@ pub struct ClusterJoinResponse {
     /// rotated the cluster DEK. `None` when `wrapped_dek` is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dek_generation: Option<u64>,
+    /// Cluster-wide HMAC join secret. Returned to authenticated joiners
+    /// so they can derive the same internal RPC bearer as the leader.
+    /// `None` on legacy responses from older leaders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_secret: Option<String>,
     /// Server-side advisory warnings to surface to the operator/CLI.
     ///
     /// Examples: "your token format is deprecated and will be removed in
@@ -519,6 +524,10 @@ pub struct ClusterNodeSummary {
     pub address: String,
     /// Advertise address (public IP)
     pub advertise_addr: String,
+    /// API endpoint as `advertise_addr:api_port` (e.g., "127.0.0.1:19110").
+    /// Distinct from `address` which holds the Raft RPC endpoint.
+    #[serde(default)]
+    pub api_endpoint: String,
     /// Current status (e.g. "ready", "draining", "dead")
     pub status: String,
     /// Role in the Raft cluster: "leader", "voter", or "learner"

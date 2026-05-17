@@ -609,6 +609,7 @@ mod tests {
             id: id.to_string(),
             address: format!("{id}:7000"),
             advertise_addr: format!("{id}:7001"),
+            api_endpoint: format!("{id}:3669"),
             status: "ready".to_string(),
             role: role.to_string(),
             mode: "full".to_string(),

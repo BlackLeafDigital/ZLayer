@@ -53,8 +53,19 @@ use zlayer_types::storage::{StoredEnvironment, StoredVariable};
 /// On macOS: `~/.zlayer/run/zlayer.sock` (Unix-domain socket path).
 /// On Linux: `/var/run/zlayer.sock` (Unix-domain socket path).
 /// On Windows: `tcp://127.0.0.1:3669` (TCP loopback URL).
+///
+/// When the `ZLAYER_DATA_DIR` environment variable is set, the path is
+/// resolved via [`zlayer_paths::ZLayerDirs::default_socket_path_for`]
+/// for that data dir instead — this lets `zlayer --data-dir /foo`
+/// reach a daemon listening at `/foo/run/zlayer.sock` rather than the
+/// system default. The main binary sets this variable right after
+/// CLI parse, so any in-process `DaemonClient::connect()` call (and
+/// any subprocess inheriting the env) lands on the matching socket.
 #[must_use]
 pub fn default_socket_path() -> String {
+    if let Some(data_dir) = std::env::var_os("ZLAYER_DATA_DIR") {
+        return zlayer_paths::ZLayerDirs::default_socket_path_for(std::path::Path::new(&data_dir));
+    }
     zlayer_paths::ZLayerDirs::default_socket_path()
 }
 
@@ -681,6 +692,28 @@ impl DaemonClient {
         Self::connect_to(raw).await
     }
 
+    /// Connect to the daemon associated with the given `data_dir`.
+    ///
+    /// On Unix: resolves the socket path via
+    /// `ZLayerDirs::default_socket_path_for(data_dir)`, then auto-spawns
+    /// the daemon with a matching `--data-dir` if it's not running.
+    /// On Windows: identical behavior to `connect()` since the daemon
+    /// listens on TCP loopback regardless of `data_dir`.
+    #[cfg(unix)]
+    pub async fn connect_for_data_dir(data_dir: &Path) -> Result<Self> {
+        let socket_path = zlayer_paths::ZLayerDirs::default_socket_path_for(data_dir);
+        Self::connect_to_with_data_dir(socket_path, Some(data_dir)).await
+    }
+
+    /// Connect to the daemon associated with the given `data_dir`.
+    ///
+    /// On Windows the daemon listens on TCP loopback regardless of
+    /// `data_dir`, so this is identical to [`connect`](Self::connect).
+    #[cfg(windows)]
+    pub async fn connect_for_data_dir(_data_dir: &std::path::Path) -> Result<Self> {
+        Self::connect().await
+    }
+
     /// Try to connect to a running daemon without auto-starting.
     ///
     /// Returns `Ok(Some(client))` if the daemon is running and healthy,
@@ -845,6 +878,31 @@ impl DaemonClient {
             .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
     }
 
+    /// Like `connect_to` but threads an explicit `data_dir` to the
+    /// auto-spawn helper so the spawned daemon's data directory matches
+    /// the caller's expectation. Used by `connect_for_data_dir`.
+    #[cfg(unix)]
+    async fn connect_to_with_data_dir(
+        socket_path: impl AsRef<Path>,
+        data_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+
+        if socket_path.exists() {
+            if let Ok(client) = Self::try_build(&socket_path).await {
+                return Ok(client);
+            }
+        }
+
+        info!("Daemon not running, auto-starting...");
+        eprintln!("ZLayer daemon not running. Starting...");
+        Self::auto_start_daemon_with_data_dir(&socket_path, data_dir).await?;
+
+        Self::try_build(&socket_path)
+            .await
+            .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
+    }
+
     /// Like [`connect`](Self::connect) but with a custom TCP endpoint.
     ///
     /// Accepts either `tcp://127.0.0.1:3669` or bare `127.0.0.1:3669`.
@@ -922,18 +980,32 @@ impl DaemonClient {
     /// exponential backoff until the daemon is reachable or we give up.
     #[cfg(unix)]
     async fn auto_start_daemon(socket_path: &Path) -> Result<()> {
+        Self::auto_start_daemon_with_data_dir(socket_path, None).await
+    }
+
+    /// Like `auto_start_daemon` but allows the caller to override the
+    /// child daemon's `--data-dir`. When `data_dir_override` is `None`
+    /// the existing environment-based detection is used.
+    #[cfg(unix)]
+    async fn auto_start_daemon_with_data_dir(
+        socket_path: &Path,
+        data_dir_override: Option<&Path>,
+    ) -> Result<()> {
         let runtime_bin = Self::find_self_binary()?;
 
         debug!(binary = %runtime_bin.display(), "Spawning daemon");
 
         let mut cmd = std::process::Command::new(&runtime_bin);
 
-        // Ensure the child process knows the correct data directory.
-        // If ZLAYER_DATA_DIR is already set in the environment it will be
-        // inherited automatically (clap picks it up via `env = "ZLAYER_DATA_DIR"`).
-        // Otherwise, explicitly pass --data-dir so the child doesn't fall back
-        // to /var/lib/zlayer when $HOME is unavailable (e.g. launchd context).
-        if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
+        // Decide the data directory for the spawned child.
+        // 1. If caller passed an explicit override, use that (always wins).
+        // 2. Else if ZLAYER_DATA_DIR is set in the env, the child inherits it.
+        // 3. Else fall back to ZLayerDirs::detect_data_dir() so the child
+        //    doesn't drift to /var/lib/zlayer when $HOME is unavailable
+        //    (e.g. launchd context).
+        if let Some(dd) = data_dir_override {
+            cmd.arg("--data-dir").arg(dd.as_os_str());
+        } else if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
             let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
             cmd.arg("--data-dir").arg(&data_dir);
         }
@@ -5741,6 +5813,20 @@ mod tests {
         // current_exe() should always succeed in a test runner.
         let result = DaemonClient::find_self_binary();
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_resolves_from_data_dir() {
+        use std::path::PathBuf;
+
+        // Pick a non-system data dir.
+        let tmp = std::env::temp_dir().join("zlayer-client-test-xyz");
+        let resolved = zlayer_paths::ZLayerDirs::default_socket_path_for(&tmp);
+        // On Linux & macOS for a non-system data_dir we expect:
+        //   {tmp}/run/zlayer.sock
+        let expected: PathBuf = tmp.join("run").join("zlayer.sock");
+        assert_eq!(resolved, expected.to_string_lossy());
     }
 
     /// Round-trip the wire shape exercised by [`DaemonClient::create_container`]:

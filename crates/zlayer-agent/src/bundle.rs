@@ -9,9 +9,9 @@ use crate::error::{AgentError, Result};
 use crate::runtime::ContainerId;
 use oci_spec::runtime::{
     Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceBuilder,
-    LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxMemoryBuilder, LinuxNamespaceBuilder,
-    LinuxNamespaceType, LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder,
-    Spec, SpecBuilder, UserBuilder,
+    LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxIdMappingBuilder, LinuxMemoryBuilder,
+    LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount, MountBuilder,
+    ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -219,6 +219,55 @@ impl std::fmt::Debug for BundleBuilder {
             .field("socket_path", &self.socket_path)
             .finish()
     }
+}
+
+/// Build OCI `uid_mappings` (or `gid_mappings` — same structure) for a rootless
+/// container. Always emits a single-id mapping (container 0 → `host_id`, size 1).
+/// If `username` has an entry in `subid_path` (e.g. /etc/subuid), appends a
+/// range mapping (container 1 → range start, size = range count).
+fn build_rootless_id_mappings(
+    host_id: u32,
+    subid_path: &str,
+    username: &str,
+) -> Vec<oci_spec::runtime::LinuxIdMapping> {
+    let mut mappings = vec![LinuxIdMappingBuilder::default()
+        .container_id(0_u32)
+        .host_id(host_id)
+        .size(1_u32)
+        .build()
+        .unwrap()];
+    if !username.is_empty() {
+        if let Some((start, count)) = read_subid_range(subid_path, username) {
+            mappings.push(
+                LinuxIdMappingBuilder::default()
+                    .container_id(1_u32)
+                    .host_id(start)
+                    .size(count)
+                    .build()
+                    .unwrap(),
+            );
+        }
+    }
+    mappings
+}
+
+/// Read /etc/subuid (or /etc/subgid) and return the (start, count) range
+/// allocated to the given username, if any. Returns None on any I/O error
+/// or when the user has no entry — callers must fall back to a single-id
+/// mapping in that case.
+fn read_subid_range(path: &str, username: &str) -> Option<(u32, u32)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let mut parts = line.splitn(3, ':');
+        let user = parts.next()?;
+        if user != username {
+            continue;
+        }
+        let start: u32 = parts.next()?.parse().ok()?;
+        let count: u32 = parts.next()?.parse().ok()?;
+        return Some((start, count));
+    }
+    None
 }
 
 impl BundleBuilder {
@@ -1157,6 +1206,7 @@ impl BundleBuilder {
     }
 
     /// Build Linux-specific configuration
+    #[allow(clippy::similar_names)] // euid/egid are POSIX-standard paired names
     fn build_linux_config(&self, spec: &ServiceSpec) -> Result<oci_spec::runtime::Linux> {
         // Build namespaces
         let mut namespaces = vec![
@@ -1190,7 +1240,39 @@ impl BundleBuilder {
             );
         }
 
+        let euid = nix::unistd::geteuid();
+        let egid = nix::unistd::getegid();
+        let rootless = !euid.is_root();
+
+        if rootless {
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::User)
+                    .build()
+                    .unwrap(),
+            );
+        }
+
         let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
+
+        if rootless {
+            let username = nix::unistd::User::from_uid(euid)
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_default();
+            linux_builder = linux_builder
+                .uid_mappings(build_rootless_id_mappings(
+                    euid.as_raw(),
+                    "/etc/subuid",
+                    &username,
+                ))
+                .gid_mappings(build_rootless_id_mappings(
+                    egid.as_raw(),
+                    "/etc/subgid",
+                    &username,
+                ));
+        }
 
         // Build resources (CPU, memory, devices)
         let resources = self.build_resources(spec)?;
@@ -2449,5 +2531,40 @@ services:
         assert!(destinations.contains(&"/dev".to_string())); // default
         assert!(destinations.contains(&"/app/data".to_string())); // storage bind
         assert!(destinations.contains(&"/app/tmp".to_string())); // storage tmpfs
+    }
+
+    mod subid_tests {
+        use super::super::read_subid_range;
+        use std::io::Write;
+
+        #[test]
+        fn read_subid_range_returns_range_for_user() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            writeln!(tmp, "alice:100000:65536").unwrap();
+            writeln!(tmp, "bob:165536:65536").unwrap();
+            tmp.flush().unwrap();
+            let path = tmp.path().to_str().unwrap();
+            assert_eq!(read_subid_range(path, "bob"), Some((165_536, 65_536)));
+            assert_eq!(read_subid_range(path, "alice"), Some((100_000, 65_536)));
+        }
+
+        #[test]
+        fn read_subid_range_returns_none_for_unknown_user() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            writeln!(tmp, "alice:100000:65536").unwrap();
+            tmp.flush().unwrap();
+            assert_eq!(
+                read_subid_range(tmp.path().to_str().unwrap(), "carol"),
+                None
+            );
+        }
+
+        #[test]
+        fn read_subid_range_returns_none_on_missing_file() {
+            assert_eq!(
+                read_subid_range("/this/path/does/not/exist/subuid", "anyone"),
+                None
+            );
+        }
     }
 }

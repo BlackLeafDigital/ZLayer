@@ -72,7 +72,7 @@ pub struct InternalAddPeerResponse {
 /// [`crate::storage::ReplicatedSecret`] so the wire shape is identical to
 /// the stored shape.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum SecretsRaftOp {
     /// Register a new node. Triggers an automatic re-wrap of the current
     /// DEK so the new node can decrypt secrets going forward.

@@ -66,6 +66,7 @@ utoipa.workspace = true
 tempfile = "3"
 wiremock = "0.6"
 chrono.workspace = true
+postcard2 = { workspace = true }
 
 [features]
 test-skip-http = []

@@ -42,6 +42,11 @@ pub use zlayer_types::api::cluster::{
     TrustedBundleEntry, TrustedBundlesResponse, SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
 };
 
+/// Worker nodes whose `last_heartbeat` is older than this threshold are
+/// reported as `"dead"` regardless of their raft-stored `status` field.
+/// See the comment in `cluster_list_nodes` for the openraft hang context.
+const STALE_HEARTBEAT_DEAD_MS: u64 = 30_000;
+
 /// Heartbeat request from a worker node.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
@@ -698,6 +703,11 @@ pub async fn cluster_join(
         node_jwt,
         wrapped_dek,
         dek_generation,
+        // Propagate the cluster HMAC `join_secret` to the joiner so it can
+        // derive the same internal Raft bearer token as the leader. Without
+        // this, cross-node Raft RPCs 401 because each daemon would otherwise
+        // mint a per-process random `internal_token`.
+        join_secret: state.join_secret.clone(),
         // Wave 6 (v0.13.0): the plaintext-acceptance branch that used to
         // populate this field is gone. The field itself stays on
         // `ClusterJoinResponse` so future waves can surface other
@@ -737,6 +747,15 @@ pub async fn cluster_list_nodes(
     let voter_ids: std::collections::BTreeSet<u64> =
         metrics.membership_config.voter_ids().collect();
 
+    // Stale-heartbeat → dead override. See `STALE_HEARTBEAT_DEAD_MS` at
+    // module scope for the openraft hang context that motivates this
+    // override.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let self_id = raft.node_id();
+
     let nodes: Vec<ClusterNodeSummary> = cluster_state
         .nodes
         .values()
@@ -749,11 +768,23 @@ pub async fn cluster_list_nodes(
                 "learner".to_string()
             };
 
+            // Apply stale-heartbeat override. Never override self
+            // (the daemon serving this request is by definition alive).
+            let status = if n.node_id != self_id
+                && n.status != "dead"
+                && now_ms.saturating_sub(n.last_heartbeat) > STALE_HEARTBEAT_DEAD_MS
+            {
+                "dead".to_string()
+            } else {
+                n.status.clone()
+            };
+
             ClusterNodeSummary {
                 id: format!("{}", n.node_id),
                 address: n.address.clone(),
                 advertise_addr: n.advertise_addr.clone(),
-                status: n.status.clone(),
+                api_endpoint: format!("{}:{}", n.advertise_addr, n.api_port),
+                status,
                 role,
                 mode: n.mode.clone(),
                 is_leader: Some(n.node_id) == leader_id,
@@ -3042,6 +3073,7 @@ mod tests {
             node_jwt: None,
             wrapped_dek: None,
             dek_generation: None,
+            join_secret: None,
             warnings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -3886,6 +3918,7 @@ mod tests {
             node_jwt: None,
             wrapped_dek: None,
             dek_generation: None,
+            join_secret: None,
             warnings: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize rejection-path response");
@@ -3910,6 +3943,7 @@ mod tests {
             node_jwt: None,
             wrapped_dek: None,
             dek_generation: None,
+            join_secret: None,
             warnings: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize ed25519 response");
@@ -3933,6 +3967,7 @@ mod tests {
             node_jwt: None,
             wrapped_dek: None,
             dek_generation: None,
+            join_secret: None,
             warnings: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize hs256 response");

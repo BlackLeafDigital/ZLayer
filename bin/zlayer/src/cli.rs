@@ -110,6 +110,18 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) host_network: bool,
 
+    /// Daemon instance name. When set, scopes per-daemon resources (HCS
+    /// owner tag, HCN overlay network name, systemd unit, SCM service
+    /// name, install paths) so multiple `zlayer` daemons can run
+    /// side-by-side on one host. Defaults to the basename of the running
+    /// binary (`current_exe()` filename, with a `.exe` suffix stripped on
+    /// Windows), with a final fallback to `"zlayer"`. This is the single
+    /// source of truth for the daemon's identity at runtime — `daemon
+    /// install` / `serve` / `status` all consult it via
+    /// [`resolve_daemon_name`].
+    #[arg(long, global = true)]
+    pub(crate) daemon_name: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -763,8 +775,12 @@ pub(crate) enum Commands {
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
     /// macOS, SCM on Windows).
-    #[command(subcommand, display_order = 32)]
-    Daemon(DaemonAction),
+    ///
+    /// Wraps [`DaemonAction`] alongside a global `--daemon-name` flag so the
+    /// same host can host multiple side-by-side zlayer daemons under
+    /// distinct names. See [`DaemonArgs`] for details.
+    #[command(display_order = 32)]
+    Daemon(DaemonArgs),
 
     /// Windows-only maintenance commands (WSL2 distro management)
     #[cfg(all(target_os = "windows", feature = "wsl"))]
@@ -1083,6 +1099,12 @@ pub(crate) struct InstallArgs {
     #[arg(long, default_value = "0.0.0.0:3669")]
     pub(crate) bind: String,
 
+    /// Optional override for the daemon UDS socket path. Defaults to
+    /// `/var/run/<daemon-name>.sock`. When set, the installed systemd unit's
+    /// `ExecStart` appends `--socket <PATH>`.
+    #[arg(long)]
+    pub(crate) socket: Option<std::path::PathBuf>,
+
     /// JWT secret for API authentication
     #[arg(long, env = "ZLAYER_JWT_SECRET")]
     pub(crate) jwt_secret: Option<String>,
@@ -1153,14 +1175,60 @@ pub(crate) struct InstallArgs {
     pub(crate) no_tunnel_server: bool,
 }
 
+/// Wrapper struct for the `daemon` subcommand. The daemon's instance name
+/// is read from the top-level [`Cli::daemon_name`] field (a global
+/// `--daemon-name <NAME>` flag) so the same flag controls install paths,
+/// systemd / SCM unit names, the default socket location, and the
+/// HCS/HCN tags the running daemon stamps on its resources. This struct
+/// only carries the [`DaemonAction`] subcommand.
+///
+/// When `--daemon-name` is unset, [`resolve_daemon_name`] derives the
+/// effective name from `current_exe()`'s file stem so a binary copied as
+/// `zlayer-dev` defaults to a `zlayer-dev` instance, with `"zlayer"` as
+/// the final fallback.
+#[derive(Args, Debug)]
+pub(crate) struct DaemonArgs {
+    #[command(subcommand)]
+    pub(crate) action: DaemonAction,
+}
+
+/// Resolve the effective daemon name. CLI flag wins; otherwise we take the
+/// basename of `current_exe()` and strip a trailing `.exe` (Windows
+/// friendliness, no-op on Linux). Final fallback is `"zlayer"`.
+pub(crate) fn resolve_daemon_name(explicit: Option<&str>) -> String {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "zlayer".to_string())
+}
+
 /// Daemon lifecycle actions
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum DaemonAction {
     /// Install zlayer as a system service (launchd on macOS, systemd on Linux)
     Install(Box<InstallArgs>),
 
-    /// Uninstall the zlayer system service
-    Uninstall,
+    /// Uninstall the zlayer system service.
+    Uninstall {
+        /// Also delete the installed binary at the resolved
+        /// `${bin_dir}/<daemon-name>` path. Default off.
+        #[arg(long)]
+        remove_binary: bool,
+
+        /// Also delete shell-completion files installed under the
+        /// daemon-name (bash/zsh/fish). Default off.
+        #[arg(long)]
+        remove_completions: bool,
+
+        /// Also delete the data directory. DESTRUCTIVE — wipes
+        /// containers, secrets, raft state, everything under
+        /// `--data-dir`. Default off.
+        #[arg(long)]
+        purge_data: bool,
+    },
 
     /// Start the daemon service
     Start,

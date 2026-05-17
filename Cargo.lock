@@ -12752,6 +12752,7 @@ dependencies = [
  "metrics",
  "num_cpus",
  "openraft",
+ "postcard2",
  "prometheus",
  "reqwest 0.13.2",
  "serde",

@@ -609,6 +609,7 @@ mod tests {
             id: "1".to_string(),
             address: "10.0.0.1:9090".to_string(),
             advertise_addr: "10.0.0.1".to_string(),
+            api_endpoint: "10.0.0.1:3669".to_string(),
             status: "ready".to_string(),
             role: "leader".to_string(),
             mode: "full".to_string(),

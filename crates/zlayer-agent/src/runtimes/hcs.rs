@@ -93,16 +93,41 @@ use zlayer_hcs::schema::{
 };
 use zlayer_hcs::system::ComputeSystem;
 
-/// Owner tag stamped onto every compute system this runtime creates. Used at
-/// startup to discover zombie systems from a previous agent run, and as the
-/// filter for [`enumerate::list_by_owner`].
-pub const OWNER_TAG: &str = "zlayer";
+/// Owner tag stamped onto every compute system + HCN endpoint this runtime
+/// creates. Used at startup to discover zombie systems from a previous agent
+/// run, and as the filter for [`enumerate::list_by_owner`].
+///
+/// The legacy single-instance value is `"zlayer"`. To keep that install
+/// stable, [`owner_tag`] returns `"zlayer"` verbatim when `daemon_name` is
+/// `"zlayer"`; any other name is used as-is so two daemons running
+/// side-by-side never sweep each other's compute systems.
+#[must_use]
+pub fn owner_tag(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "zlayer".to_string()
+    } else {
+        daemon_name.to_string()
+    }
+}
 
-/// Name used for the per-daemon HCN Transparent overlay network on the host.
-/// Every `ZLayer` container on this node attaches an endpoint into this
-/// network; the network's IPAM subnet is the node's per-node `/28` slice of
-/// the cluster CIDR (no longer a constant — see [`HcsConfig::slice_cidr`]).
-const OVERLAY_NETWORK_NAME: &str = "zlayer-overlay";
+/// Name of the per-daemon HCN Transparent overlay network on the host. Every
+/// `ZLayer` container on this node attaches an endpoint into this network;
+/// the network's IPAM subnet is the node's per-node `/28` slice of the
+/// cluster CIDR (see [`HcsConfig::slice_cidr`]).
+///
+/// The legacy single-instance value is `"zlayer-overlay"`. To keep that
+/// install stable, [`overlay_network_name`] returns `"zlayer-overlay"`
+/// verbatim when `daemon_name` is `"zlayer"`; any other name becomes
+/// `"<daemon_name>-overlay"` so multiple daemons each get their own
+/// network handle.
+#[must_use]
+pub fn overlay_network_name(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "zlayer-overlay".to_string()
+    } else {
+        format!("{daemon_name}-overlay")
+    }
+}
 
 /// Isolation mode for the compute systems this runtime creates.
 ///
@@ -138,6 +163,13 @@ pub struct HcsConfig {
     /// the node joins the cluster and the leader hands out a slice. When
     /// `None`, [`HcsRuntime::ensure_overlay_network`] cannot proceed.
     pub slice_cidr: Option<ipnet::IpNet>,
+    /// Daemon instance name (resolved from the top-level `--daemon-name`
+    /// flag, with a `current_exe()` fallback). Drives the HCS owner tag
+    /// stamped onto every compute system this runtime owns and the name
+    /// of the per-daemon HCN Transparent overlay network so two daemons
+    /// running side-by-side on one host never collide. Defaults to
+    /// `"zlayer"` for backward compatibility with single-instance installs.
+    pub daemon_name: String,
 }
 
 impl Default for HcsConfig {
@@ -150,6 +182,7 @@ impl Default for HcsConfig {
             default_scratch_size_gb: 20,
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,
+            daemon_name: "zlayer".to_string(),
         }
     }
 }
@@ -359,18 +392,20 @@ impl HcsRuntime {
         let subnet_str = slice_cidr.to_string();
         let subnet_for_create = subnet_str.clone();
         let uplink_for_create = uplink.clone();
+        let net_name = overlay_network_name(&self.config.daemon_name);
+        let net_name_for_create = net_name.clone();
 
         let network = tokio::task::spawn_blocking(move || {
             zlayer_hns::network::Network::create_transparent(
                 net_id,
-                OVERLAY_NETWORK_NAME,
+                &net_name_for_create,
                 &subnet_for_create,
                 &uplink_for_create,
             )
         })
         .await
         .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
-        .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork(zlayer-overlay): {e}")))?;
+        .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork({net_name}): {e}")))?;
 
         *guard = Some(OverlayNetwork {
             id: net_id,
@@ -417,7 +452,7 @@ impl HcsRuntime {
     }
 
     /// Scan the host for HCN endpoints owned by this runtime (name prefix
-    /// matches [`OWNER_TAG`]) and delete them.
+    /// matches [`owner_tag`]) and delete them.
     ///
     /// Intended for agent startup: the in-memory container map is empty at
     /// that moment so every owned endpoint is by definition an orphan from a
@@ -437,15 +472,18 @@ impl HcsRuntime {
         let live: std::collections::HashSet<String> =
             self.containers.read().await.keys().cloned().collect();
 
-        let owned = tokio::task::spawn_blocking(|| hns_attach::list_owned_endpoints(OWNER_TAG))
-            .await
-            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
-            .map_err(|e| AgentError::Internal(format!("list_owned_endpoints: {e}")))?;
+        let tag = owner_tag(&self.config.daemon_name);
+        let tag_for_list = tag.clone();
+        let owned =
+            tokio::task::spawn_blocking(move || hns_attach::list_owned_endpoints(&tag_for_list))
+                .await
+                .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
+                .map_err(|e| AgentError::Internal(format!("list_owned_endpoints: {e}")))?;
 
         for (endpoint_id, name) in owned {
-            // Endpoint name is `{OWNER_TAG}-{container_id}`. Strip the prefix
+            // Endpoint name is `{owner_tag}-{container_id}`. Strip the prefix
             // + dash to recover the container id and skip live containers.
-            let prefix = format!("{OWNER_TAG}-");
+            let prefix = format!("{tag}-");
             let container_id = name.strip_prefix(&prefix).unwrap_or(name.as_str());
             if live.contains(container_id) {
                 continue;
@@ -657,7 +695,7 @@ impl HcsRuntime {
         };
 
         HcsDoc {
-            owner: OWNER_TAG.to_string(),
+            owner: owner_tag(&self.config.daemon_name),
             schema_version: SchemaVersion::default(),
             hosting_system_id: String::new(),
             container: Some(container),
@@ -861,6 +899,7 @@ impl Runtime for HcsRuntime {
         let allocated_ip = self.next_container_ip.lock().await.take();
         let dns_config = self.next_container_dns.lock().await.take();
         let cluster_cidr = self.config.cluster_cidr.clone();
+        let owner_tag_for_endpoint = owner_tag(&self.config.daemon_name);
         let network_attachment = match (slice_cidr, allocated_ip) {
             (Some(slice), Some(ip)) => match self.ensure_overlay_network(slice).await {
                 Ok(net_id) => {
@@ -868,10 +907,11 @@ impl Runtime for HcsRuntime {
                     let prefix_length = slice.prefix_len();
                     let cluster_cidr_owned = cluster_cidr;
                     let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
+                    let owner_tag_for_attach = owner_tag_for_endpoint;
                     match tokio::task::spawn_blocking(move || {
                         EndpointAttachment::create_overlay(
                             net_id,
-                            OWNER_TAG,
+                            &owner_tag_for_attach,
                             cid_for_attach.as_str(),
                             ip,
                             prefix_length,
@@ -1477,11 +1517,17 @@ fn extract_process_exit_code(raw_json: &str) -> Option<i32> {
 /// as a free function so the agent's boot path can terminate stragglers
 /// before we create any new systems.
 ///
+/// `daemon_name` selects the owner tag this enumeration sweeps —
+/// pass the value used to construct the [`HcsRuntime`] so a `zlayer-dev`
+/// instance never enumerates a peer `zlayer` daemon's systems (and vice
+/// versa).
+///
 /// # Errors
 ///
 /// Returns the error emitted by [`zlayer_hcs::enumerate::list_by_owner`].
-pub async fn list_owned_systems() -> Result<Vec<String>> {
-    let systems = enumerate::list_by_owner(OWNER_TAG)
+pub async fn list_owned_systems(daemon_name: &str) -> Result<Vec<String>> {
+    let tag = owner_tag(daemon_name);
+    let systems = enumerate::list_by_owner(&tag)
         .await
         .map_err(|e| AgentError::Internal(format!("HcsEnumerateComputeSystems: {e}")))?;
     Ok(systems.into_iter().map(|s| s.id).collect())
@@ -1555,5 +1601,34 @@ mod tests {
             cfg.slice_cidr.is_none(),
             "slice_cidr must be None until the node joins the cluster and the leader hands out a slice"
         );
+    }
+
+    #[test]
+    fn hcs_config_default_daemon_name_is_legacy() {
+        let cfg = HcsConfig::default();
+        assert_eq!(
+            cfg.daemon_name, "zlayer",
+            "single-instance installs must keep the legacy `zlayer` owner tag"
+        );
+    }
+
+    #[test]
+    fn owner_tag_legacy() {
+        assert_eq!(owner_tag("zlayer"), "zlayer");
+    }
+
+    #[test]
+    fn owner_tag_dev() {
+        assert_eq!(owner_tag("zlayer-dev"), "zlayer-dev");
+    }
+
+    #[test]
+    fn overlay_network_legacy() {
+        assert_eq!(overlay_network_name("zlayer"), "zlayer-overlay");
+    }
+
+    #[test]
+    fn overlay_network_dev() {
+        assert_eq!(overlay_network_name("zlayer-dev"), "zlayer-dev-overlay");
     }
 }

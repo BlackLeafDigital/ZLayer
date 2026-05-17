@@ -1778,6 +1778,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secrets_raft_op_roundtrips_through_postcard() {
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let cases = [
+            SecretsRaftOp::RevokeNode {
+                node_id: "n1".into(),
+            },
+            SecretsRaftOp::WipeJoinSecret,
+            SecretsRaftOp::DeleteSecret {
+                storage_key: "scope:key".into(),
+            },
+        ];
+        for op in &cases {
+            let bytes = postcard2::to_vec(op).expect("encode");
+            let back: SecretsRaftOp = postcard2::from_bytes(&bytes).expect("decode");
+            let _ = format!("{back:?}");
+        }
+    }
+
+    #[test]
     fn test_cluster_state_service_operations() {
         let mut state = ClusterState::new();
 

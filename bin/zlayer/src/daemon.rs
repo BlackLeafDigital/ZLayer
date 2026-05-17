@@ -179,6 +179,14 @@ pub struct DaemonConfig {
     /// Deployment name used for overlay interface naming and DNS zone.
     pub deployment_name: String,
 
+    /// Daemon instance name resolved from the top-level `--daemon-name`
+    /// flag (with a `current_exe()` fallback to the binary's filename and a
+    /// final fallback of `"zlayer"`). Drives the HCS owner tag, the HCN
+    /// overlay network name, and any other per-daemon resource scoping the
+    /// runtime needs at boot. Defaults to `"zlayer"` to preserve the legacy
+    /// single-instance install.
+    pub daemon_name: String,
+
     /// Container runtime selection (Auto, Youki, Docker, etc.).
     pub runtime_config: RuntimeConfig,
 
@@ -188,6 +196,13 @@ pub struct DaemonConfig {
     /// Root data directory (databases, state).
     /// Default: `~/.zlayer` on macOS, `/var/lib/zlayer` (root) or `~/.zlayer` (user) on Linux.
     pub data_dir: PathBuf,
+
+    /// API bind port (the `<port>` half of `--bind <host>:<port>`).
+    /// Threaded through so `init_daemon` can sync the loaded/initialised
+    /// `node_config.api_port` with the daemon's actual listening port —
+    /// otherwise cluster state reports a stale/hardcoded port to
+    /// API clients (e.g. e2e harness).
+    pub api_port: u16,
 
     /// Log directory.  Default: `{data_dir}/logs` on macOS, `/var/log/zlayer` on Linux.
     pub log_dir: PathBuf,
@@ -232,9 +247,11 @@ impl Default for DaemonConfig {
         Self {
             host_network: false,
             deployment_name: "zlayer".to_string(),
+            daemon_name: "zlayer".to_string(),
             runtime_config: RuntimeConfig::Auto,
             dns_port: 15353,
             data_dir,
+            api_port: 3669,
             log_dir,
             run_dir,
             s3_storage: None,
@@ -551,7 +568,32 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 other => other,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            // Override Auto with an explicitly configured HCS runtime so the
+            // resolved `daemon_name` lands on `HcsConfig.daemon_name` —
+            // without this, `create_auto_runtime` falls back to
+            // `HcsConfig::default()` which always uses the legacy
+            // `"zlayer"` owner tag and clobbers any second instance.
+            match config.runtime_config.clone() {
+                RuntimeConfig::Auto => RuntimeConfig::Hcs(zlayer_agent::runtimes::hcs::HcsConfig {
+                    daemon_name: config.daemon_name.clone(),
+                    ..zlayer_agent::runtimes::hcs::HcsConfig::default()
+                }),
+                RuntimeConfig::Hcs(mut hcs_cfg) => {
+                    // If the caller built an explicit HcsConfig without
+                    // setting daemon_name (i.e. left it at the default
+                    // `"zlayer"`), inherit the daemon's resolved name so
+                    // per-instance scoping still applies.
+                    if hcs_cfg.daemon_name == "zlayer" && config.daemon_name != "zlayer" {
+                        hcs_cfg.daemon_name.clone_from(&config.daemon_name);
+                    }
+                    RuntimeConfig::Hcs(hcs_cfg)
+                }
+                other => other,
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         {
             config.runtime_config.clone()
         }
@@ -958,14 +1000,73 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     let mut node_config = load_or_init_node_config(&config.data_dir).await?;
 
+    // Sync node_config.api_port with the actual bind port. Without this,
+    // a node auto-initialised with hardcoded 3669 (or loaded with a stale
+    // value from a prior bind) reports the wrong port to cluster state —
+    // breaks anything (including the e2e harness) that identifies nodes
+    // by their actual API endpoint.
+    if node_config.api_port != config.api_port {
+        info!(
+            previous = node_config.api_port,
+            new = config.api_port,
+            "Updating node_config.api_port to match --bind"
+        );
+        node_config.api_port = config.api_port;
+        save_node_config(&config.data_dir, &node_config)
+            .await
+            .context("Failed to persist updated node_config after api_port sync")?;
+    }
+
     // -----------------------------------------------------------------------
     // Phase 14: Internal token (generated early for Raft auth + Scheduler)
     // -----------------------------------------------------------------------
 
-    // Generate the internal token up-front so the Raft RPC layer, the
-    // Scheduler (for dispatching scale requests), and the API InternalState
-    // (for validating them) all share the same secret.
-    let internal_token = generate_internal_token();
+    // Derive the internal token deterministically from the cluster
+    // `join_secret` so the Raft RPC layer, the Scheduler (for dispatching
+    // scale requests), and the API InternalState (for validating them) all
+    // share the same secret across every node in the cluster.
+    //
+    // Before this, `generate_internal_token` minted a random per-process
+    // value, which meant a leader's outbound Bearer never matched a
+    // follower's validator and every cross-node Raft RPC 401'd. This was
+    // masked by in-process Raft test suites and only surfaced once the
+    // multi-process raft e2e harness landed.
+    let internal_token = {
+        let path = config.data_dir.join("join_secret");
+        let secret = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // First boot on this node: generate-and-persist so subsequent
+                // reads (serve.rs's HS256 loader, generate-join-token, etc.)
+                // see the same value and so cross-node Raft RPCs converge on
+                // one derived bearer. A joiner's `node join` would normally
+                // write this file from the leader's response before serve
+                // starts; the only path that hits this branch is the leader's
+                // very first boot.
+                let bytes: [u8; 32] = rand::random();
+                let fresh = hex::encode(bytes);
+                if let Err(write_err) = tokio::fs::write(&path, &fresh).await {
+                    warn!(
+                        error = %write_err,
+                        path = %path.display(),
+                        "Failed to persist generated join_secret — cross-node Raft RPCs will fail on next restart",
+                    );
+                } else {
+                    info!(path = %path.display(), "Generated cluster join_secret at daemon init");
+                }
+                fresh
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "join_secret read failed at daemon startup; falling back to random internal_token — cross-node Raft RPCs will fail",
+                );
+                hex::encode(rand::random::<[u8; 32]>())
+            }
+        };
+        derive_internal_token(&secret)
+    };
 
     // -----------------------------------------------------------------------
     // Phase 14b: Force-leader recovery check
@@ -1090,6 +1191,36 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                         .await
                     {
                         warn!("Failed to register leader in Raft state: {e}");
+                    }
+
+                    // Register the leader in the SECRETS node table too, and
+                    // bootstrap the cluster DEK with the leader as the sole
+                    // initial recipient. Without this, the first joiner
+                    // triggers DEK creation from an empty `current.nodes` set
+                    // — the resulting DEK wraps only for the joiner, not the
+                    // leader, and the next join fails with "leader has no
+                    // wrap in current DEK". Idempotent-on-restart via the
+                    // wrapped_dek presence check; we only seed when the
+                    // secrets table is empty.
+                    if coordinator.secrets_state().await.wrapped_dek.is_none() {
+                        let leader_identity = zlayer_types::storage::NodeIdentity {
+                            node_id: node_config.node_id.clone(),
+                            secrets_pubkey: *node_priv.public_key().as_bytes(),
+                            wg_pubkey: node_config.wireguard_public_key.clone(),
+                            joined_at: chrono::Utc::now(),
+                            revoked_at: None,
+                        };
+                        match coordinator
+                            .propose_register_node_and_rotate(leader_identity)
+                            .await
+                        {
+                            Ok(_) => info!(
+                                "Leader registered in secrets node table; cluster DEK initialized"
+                            ),
+                            Err(e) => {
+                                warn!("Failed to bootstrap secrets node table for leader: {e}");
+                            }
+                        }
                     }
                 }
 
@@ -1501,7 +1632,7 @@ async fn dead_node_detection_loop(
     timeout: std::time::Duration,
 ) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         // Only the leader should perform dead-node detection.
         if !raft.is_leader() {
@@ -1529,12 +1660,35 @@ async fn dead_node_detection_loop(
                     now_ms = now,
                     "Node missed heartbeat deadline, marking dead"
                 );
-                let _ = raft
-                    .propose(Request::UpdateNodeStatus {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    raft.propose(Request::UpdateNodeStatus {
                         node_id: *id,
                         status: "dead".to_string(),
-                    })
-                    .await;
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        info!(
+                            node_id = id,
+                            "Dead-node propose committed: status updated to dead"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            node_id = id,
+                            error = %e,
+                            "Dead-node propose FAILED — status will not reflect in cluster state"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            node_id = id,
+                            "Dead-node propose TIMED OUT after 2s — openraft client_write blocked; will retry next tick"
+                        );
+                    }
+                }
 
                 // Rebalance voters to maintain odd count (promotes eligible learners
                 // if the dead node was a voter).
@@ -1561,15 +1715,40 @@ async fn dead_node_detection_loop(
     }
 }
 
-/// Generate a random internal token for scheduler-to-agent communication.
-fn generate_internal_token() -> String {
-    use std::fmt::Write;
-    let mut buf = String::with_capacity(64);
-    for _ in 0..32 {
-        let byte: u8 = rand::random();
-        let _ = write!(buf, "{byte:02x}");
+/// Derive the internal Raft bearer token from the cluster `join_secret`.
+///
+/// All nodes that share the `join_secret` produce the same token, so the
+/// leader's outbound `Authorization: Bearer` matches the followers'
+/// validator. The token format is the lowercase hex SHA-256 of a
+/// domain-tagged prefix concatenated with the join secret bytes —
+/// 64 ASCII hex characters, suitable for use as an HTTP bearer.
+fn derive_internal_token(join_secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"zlayer-raft-internal-token-v1\0");
+    hasher.update(join_secret.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+#[cfg(test)]
+mod internal_token_tests {
+    use super::derive_internal_token;
+
+    #[test]
+    fn derive_internal_token_is_deterministic() {
+        let a = derive_internal_token("deadbeef");
+        let b = derive_internal_token("deadbeef");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // sha256 hex
     }
-    buf
+
+    #[test]
+    fn derive_internal_token_distinguishes_secrets() {
+        let a = derive_internal_token("aaa");
+        let b = derive_internal_token("bbb");
+        assert_ne!(a, b);
+    }
 }
 
 /// Path to the bootstrap wrapped DEK file written by the join handler

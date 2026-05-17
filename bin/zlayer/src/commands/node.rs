@@ -81,6 +81,11 @@ struct NodeJoinRequest {
     overlay_port: u16,
     /// Joining node's Raft port
     raft_port: u16,
+    /// Joining node's API server port. Must match the daemon's `--bind`
+    /// port on the joining side; the leader records this in cluster
+    /// state so other clients (and e2e harnesses) can reach the new
+    /// member by its actual API endpoint.
+    api_port: u16,
     /// Joining node's overlay public key
     wg_public_key: String,
     /// Node mode (full, replicate)
@@ -132,6 +137,11 @@ struct NodeJoinResponse {
     /// daemon detect rotation drift. `None` when `wrapped_dek` is `None`.
     #[serde(default)]
     dek_generation: Option<u64>,
+    /// Cluster-wide HMAC join secret. Used to derive the internal Raft
+    /// bearer token so cross-node Raft RPCs authenticate uniformly.
+    /// `None` on legacy responses from older leaders.
+    #[serde(default)]
+    join_secret: Option<String>,
 }
 
 /// Peer node information
@@ -511,6 +521,69 @@ const DEK_GENERATION_FILE: &str = "dek_generation";
 ///
 /// Returns `Ok(())` on a clean write of all three files, otherwise an
 /// `anyhow::Error` annotated with the path that failed.
+/// Persist the cluster `join_secret` returned by the leader to
+/// `{data_dir}/join_secret`. This is the HMAC root the daemon will hash
+/// to derive its internal Raft bearer token, so every node ends up with
+/// the same token and cross-node Raft RPCs authenticate.
+///
+/// Idempotent: if the file already exists with the same content, skip
+/// the write. If it exists with different content, log a warning and
+/// overwrite — the leader is the source of truth.
+///
+/// Failures are logged at warn level but never bubble up: a missing
+/// `join_secret` after join is recoverable on the next daemon start
+/// (which would regenerate it locally and break cross-node auth, but
+/// that's strictly better than failing the join itself).
+async fn persist_join_secret(data_dir: &Path, join_secret: &str) {
+    if join_secret.is_empty() {
+        tracing::warn!(
+            "leader returned empty join_secret; skipping write to {data_dir}/join_secret",
+            data_dir = data_dir.display(),
+        );
+        return;
+    }
+
+    let path = data_dir.join("join_secret");
+
+    match tokio::fs::read_to_string(&path).await {
+        Ok(existing) if existing.trim() == join_secret.trim() => {
+            tracing::info!(
+                path = %path.display(),
+                "join_secret already matches leader's value; skipping write"
+            );
+            return;
+        }
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "join_secret on disk differs from leader's value; overwriting with leader's copy"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read existing join_secret; will attempt to overwrite"
+            );
+        }
+    }
+
+    if let Err(e) = tokio::fs::write(&path, join_secret).await {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to persist join_secret; cross-node Raft auth may fail until next daemon start"
+        );
+        return;
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        "persisted cluster join_secret from leader"
+    );
+}
+
 fn persist_secrets_join_material(
     secrets_dir: &Path,
     jwt: &str,
@@ -1339,6 +1412,7 @@ pub(crate) async fn handle_node_join(
         advertise_addr: advertise_addr.clone(),
         overlay_port,
         raft_port,
+        api_port,
         wg_public_key: public_key.clone(),
         mode: mode.clone(),
         services: services.clone(),
@@ -1396,6 +1470,19 @@ pub(crate) async fn handle_node_join(
             "leader did not return secrets capability — node will run without \
              cluster-replicated secrets access; re-run join against a Phase-1+ \
              leader to enable replicated secrets"
+        );
+    }
+
+    // 8b. Persist the cluster HMAC `join_secret` so the daemon can derive
+    //     the same internal Raft bearer token as the leader. Without this,
+    //     cross-node Raft RPCs always 401 because each daemon would
+    //     otherwise mint its own per-process random token.
+    if let Some(secret) = join_response.join_secret.as_deref() {
+        persist_join_secret(&data_dir, secret).await;
+    } else {
+        warn!(
+            "leader did not return join_secret in join response — cross-node Raft RPCs \
+             will fail until this node re-joins against a leader that emits it"
         );
     }
 
@@ -1758,6 +1845,7 @@ pub(crate) async fn handle_node_join(
         advertise_addr: advertise_addr.clone(),
         overlay_port,
         raft_port,
+        api_port,
         wg_public_key: public_key.clone(),
         mode: mode.clone(),
         services: services.clone(),
@@ -1815,6 +1903,19 @@ pub(crate) async fn handle_node_join(
             "leader did not return secrets capability — node will run without \
              cluster-replicated secrets access; re-run join against a Phase-1+ \
              leader to enable replicated secrets"
+        );
+    }
+
+    // 6b. Persist the cluster HMAC `join_secret` so the daemon can derive
+    //     the same internal Raft bearer token as the leader. Without this,
+    //     cross-node Raft RPCs always 401 because each daemon would
+    //     otherwise mint its own per-process random token.
+    if let Some(secret) = join_response.join_secret.as_deref() {
+        persist_join_secret(&data_dir, secret).await;
+    } else {
+        warn!(
+            "leader did not return join_secret in join response — cross-node Raft RPCs \
+             will fail until this node re-joins against a leader that emits it"
         );
     }
 

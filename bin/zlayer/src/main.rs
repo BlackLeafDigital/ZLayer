@@ -57,6 +57,14 @@ fn main() -> ExitCode {
     // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
+    // Propagate the effective data dir to the process environment so that
+    // DaemonClient::default_socket_path() resolves to the matching per-data-dir
+    // socket (and any auto-spawned daemon inherits the same root via clap's
+    // env-var fallback on the --data-dir field). Without this, `zlayer
+    // --data-dir /custom/foo deploy …` would hit the SYSTEM default socket
+    // (`/var/run/zlayer.sock`) instead of `/custom/foo/run/zlayer.sock`.
+    std::env::set_var("ZLAYER_DATA_DIR", cli.effective_data_dir());
+
     if matches!(&cli.command, None | Some(Commands::Tui { .. })) {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
@@ -561,6 +569,8 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
         let _guards = init_observability(&obs_config)
             .context("Failed to initialize observability for Windows Service")?;
 
+        let daemon_name = crate::cli::resolve_daemon_name(cli.daemon_name.as_deref());
+
         daemon_service::run_as_windows_service(
             bind.clone(),
             jwt_secret.clone(),
@@ -569,6 +579,7 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
             cli.host_network,
             data_dir,
             deployment_name.clone(),
+            daemon_name,
             *wg_port,
             *dns_port,
         )
@@ -780,6 +791,12 @@ async fn run(
             // runs. Defaults to `false`; consumed exactly once per process.
             commands::serve::set_pending_vacuum_secrets(*vacuum_secrets);
 
+            // Resolve the daemon instance name from the top-level
+            // `--daemon-name` flag (with current_exe fallback) so the
+            // running daemon stamps per-instance owner tags on its
+            // HCS/HCN resources.
+            let daemon_name = crate::cli::resolve_daemon_name(cli.daemon_name.as_deref());
+
             // NAT overrides are gated on the `nat` feature; on builds without
             // it, fall back to the env-var-only path via `serve()`.
             #[cfg(feature = "nat")]
@@ -798,6 +815,7 @@ async fn run(
                     cli.host_network,
                     data_dir,
                     deployment_name.clone(),
+                    daemon_name,
                     *wg_port,
                     *dns_port,
                     nat_overrides,
@@ -816,6 +834,7 @@ async fn run(
                     cli.host_network,
                     data_dir,
                     deployment_name.clone(),
+                    daemon_name,
                     *wg_port,
                     *dns_port,
                     *restart_on_exit,
@@ -920,8 +939,13 @@ async fn run(
         Commands::Cluster(cluster_cmd) => {
             commands::cluster::handle_cluster(cluster_cmd, &cli.effective_data_dir()).await
         }
-        Commands::Daemon(action) => {
-            commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
+        Commands::Daemon(daemon_args) => {
+            commands::daemon::handle_daemon(
+                daemon_args,
+                &cli.effective_data_dir(),
+                cli.daemon_name.as_deref(),
+            )
+            .await
         }
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         Commands::Windows(cmd) => commands::windows::handle(cmd).await,

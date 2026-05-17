@@ -58,6 +58,7 @@ use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime};
 #[cfg(feature = "wsl")]
 use zlayer_agent::runtimes::wsl2_delegate::Wsl2DelegateRuntime;
 use zlayer_overlay::ipnet;
+use zlayer_paths::ZLayerDirs;
 use zlayer_spec::{ArchKind, DeploymentSpec, OsKind, ServiceSpec, TargetPlatform};
 
 // ---------------------------------------------------------------------------

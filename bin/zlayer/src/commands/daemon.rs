@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use crate::cli::DaemonAction;
+use crate::cli::{DaemonAction, DaemonArgs};
 
 /// Resolved admin-account bootstrap material to inject into the daemon's
 /// environment at first start. The password is materialised as a file so the
@@ -184,7 +184,14 @@ pub fn resolve_admin_bootstrap(
 }
 
 /// Handle daemon lifecycle commands.
-pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Result<()> {
+pub(crate) async fn handle_daemon(
+    daemon_args: &DaemonArgs,
+    data_dir: &Path,
+    daemon_name_override: Option<&str>,
+) -> Result<()> {
+    let daemon_name = crate::cli::resolve_daemon_name(daemon_name_override);
+    let action = &daemon_args.action;
+
     // Privileged actions auto-elevate via `sudo -E` (Unix) or the UAC
     // `runas` verb (Windows). `Status` is read-only and `ResumeFromSnapshot`
     // talks to a running daemon over its socket — neither needs root.
@@ -192,7 +199,7 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
         DaemonAction::Install(_) => {
             crate::privilege::ensure_root_or_reexec("install the system service")?;
         }
-        DaemonAction::Uninstall => {
+        DaemonAction::Uninstall { .. } => {
             crate::privilege::ensure_root_or_reexec("uninstall the system service")?;
         }
         DaemonAction::Start => {
@@ -220,9 +227,11 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             // Unix install path forwards only the daemon-environment flags
             // below.
             install(
+                &daemon_name,
                 data_dir,
                 args.no_start,
                 &args.bind,
+                args.socket.as_deref(),
                 args.jwt_secret.as_deref(),
                 args.no_swagger,
                 #[cfg(feature = "docker-compat")]
@@ -240,11 +249,24 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             )
             .await
         }
-        DaemonAction::Uninstall => uninstall().await,
-        DaemonAction::Start => start(data_dir).await,
-        DaemonAction::Stop => stop().await,
-        DaemonAction::Restart => restart(data_dir).await,
-        DaemonAction::Status => status(data_dir).await,
+        DaemonAction::Uninstall {
+            remove_binary,
+            remove_completions,
+            purge_data,
+        } => {
+            uninstall(
+                &daemon_name,
+                *remove_binary,
+                *remove_completions,
+                *purge_data,
+                data_dir,
+            )
+            .await
+        }
+        DaemonAction::Start => start(&daemon_name, data_dir).await,
+        DaemonAction::Stop => stop(&daemon_name).await,
+        DaemonAction::Restart => restart(&daemon_name, data_dir).await,
+        DaemonAction::Status => status(&daemon_name, data_dir).await,
         DaemonAction::Reset { force } => reset(data_dir, *force),
         DaemonAction::ResumeFromSnapshot { path } => {
             let outcome = restore_from_snapshot(path).await;
@@ -664,6 +686,7 @@ fn print_restore_summary(outcome: &RestoreOutcome) {
 /// the labels (`API:`, `Manager:`, `Admin user:`, `Password:`, `Service:`,
 /// `Logs:`, `Resumed:`) line up roughly in one column.
 pub fn print_install_summary(
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] daemon_name: &str,
     bind: &str,
     _data_dir: &Path,
     log_dir: Option<&Path>,
@@ -711,8 +734,9 @@ pub fn print_install_summary(
     }
     #[cfg(target_os = "windows")]
     {
-        println!("  Service:    sc query ZLayer");
-        println!("  Logs:       Get-EventLog -LogName Application -Source ZLayer");
+        let svc_name = crate::daemon_service::service_name(daemon_name);
+        println!("  Service:    sc query {svc_name}");
+        println!("  Logs:       Get-EventLog -LogName Application -Source {svc_name}");
         if let Some(dir) = log_dir {
             println!("              {}\\daemon.log", dir.display());
         }
@@ -739,8 +763,22 @@ pub fn print_install_summary(
 // macOS (launchd)
 // ---------------------------------------------------------------------------
 
+/// Compute the launchd plist `Label` for a given daemon instance name.
+///
+/// The default `zlayer` instance keeps the legacy label `com.zlayer.daemon`
+/// so upgrading does not orphan existing installs. Any other instance name
+/// is appended as a suffix (with a leading `zlayer-` prefix stripped if
+/// present), allowing multiple instances (`zlayer`, `zlayer-dev`, etc.) to
+/// coexist on a single Mac with distinct launchd labels.
 #[cfg(target_os = "macos")]
-const PLIST_LABEL: &str = "com.zlayer.daemon";
+fn plist_label(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "com.zlayer.daemon".to_string()
+    } else {
+        let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+        format!("com.zlayer.daemon-{suffix}")
+    }
+}
 
 /// Determine plist directory and launchctl target based on privilege level.
 #[cfg(target_os = "macos")]
@@ -768,8 +806,8 @@ fn launchd_context() -> Result<(String, String)> {
 }
 
 #[cfg(target_os = "macos")]
-fn plist_path_for(plist_dir: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(plist_dir).join(format!("{PLIST_LABEL}.plist"))
+fn plist_path_for(plist_dir: &str, daemon_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(plist_dir).join(format!("{}.plist", plist_label(daemon_name)))
 }
 
 #[cfg(target_os = "macos")]
@@ -780,9 +818,11 @@ fn plist_path_for(plist_dir: &str) -> std::path::PathBuf {
     unsafe_code
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
@@ -823,7 +863,14 @@ async fn install(
 
     let log_dir = crate::cli::default_log_dir(data_dir);
     let run_dir = crate::cli::default_run_dir(data_dir);
-    let socket_path = run_dir.join("zlayer.sock");
+    // Per-instance socket: two instances (e.g. `zlayer` and `zlayer-dev`)
+    // on the same Mac must not share the Unix socket. Caller may override
+    // via the explicit `socket` argument; otherwise we derive a name from
+    // the daemon instance.
+    let socket_path = socket.map_or_else(
+        || run_dir.join(format!("{daemon_name}.sock")),
+        std::path::Path::to_path_buf,
+    );
 
     // Build ProgramArguments
     // --data-dir is a top-level Cli arg, so it must come BEFORE the subcommand.
@@ -913,6 +960,8 @@ async fn install(
     let log_path = log_dir.join("daemon.log");
     let log_path_str = log_path.to_string_lossy();
 
+    let label = plist_label(daemon_name);
+
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -920,8 +969,9 @@ async fn install(
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{PLIST_LABEL}</string>
+    <string>{label}</string>
     <key>GroupName</key>
+    <!-- Why: unix group is shared across instances (access-control), not the daemon identity. Same convention as the Linux block. -->
     <string>zlayer</string>
     <key>ProgramArguments</key>
     <array>
@@ -954,12 +1004,12 @@ async fn install(
     ensure_zlayer_group_macos(data_dir).await?;
 
     let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let path = plist_path_for(&plist_dir, daemon_name);
     let path_str = path.to_string_lossy().to_string();
 
     // Unload existing service first (ignore errors)
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
+        .args(["bootout", &format!("{target}/{label}")])
         .output()
         .await;
     let _ = Command::new("launchctl")
@@ -1010,14 +1060,14 @@ async fn install(
         // bootstrapped and may not be running yet, and we don't want to
         // fail the whole install over a cosmetic warning.
         let kickstart_out = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("{target}/{PLIST_LABEL}")])
+            .args(["kickstart", "-k", &format!("{target}/{label}")])
             .output()
             .await;
         match kickstart_out {
             Ok(o) if !o.status.success() => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 eprintln!(
-                    "Warning: launchctl kickstart -k {target}/{PLIST_LABEL} exited non-zero \
+                    "Warning: launchctl kickstart -k {target}/{label} exited non-zero \
                      (the freshly-installed plist is loaded; if the daemon was already \
                      running it may still be on the old binary until next restart): {stderr}",
                 );
@@ -1029,7 +1079,7 @@ async fn install(
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started");
@@ -1041,6 +1091,7 @@ async fn install(
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -1118,15 +1169,24 @@ async fn install(
 }
 
 #[cfg(target_os = "macos")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use tokio::process::Command;
+    use tokio::time::sleep;
 
     let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let path = plist_path_for(&plist_dir, daemon_name);
+    let label = plist_label(daemon_name);
 
     if path.exists() {
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
+            .args(["bootout", &format!("{target}/{label}")])
             .output()
             .await;
         let _ = Command::new("launchctl")
@@ -1173,15 +1233,107 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        let bin_path = zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name);
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+        // Best-effort: also try Homebrew prefix if `brew` is in PATH.
+        if let Ok(out) = Command::new("brew").arg("--prefix").output().await {
+            if out.status.success() {
+                let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !prefix.is_empty() {
+                    let brew_bin = PathBuf::from(prefix).join("bin").join(daemon_name);
+                    if brew_bin.exists() {
+                        match std::fs::remove_file(&brew_bin) {
+                            Ok(_) => println!("Removed brew binary: {}", brew_bin.display()),
+                            Err(e) => {
+                                eprintln!("Warning: failed to remove {}: {e}", brew_bin.display())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if remove_completions {
+        let bash_paths = [PathBuf::from(format!(
+            "/usr/local/etc/bash_completion.d/{daemon_name}"
+        ))];
+        for p in bash_paths {
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+                println!("Removed bash completion: {}", p.display());
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let zsh = PathBuf::from(home.clone())
+                .join(".zsh/completions")
+                .join(format!("_{daemon_name}"));
+            if zsh.exists() {
+                let _ = std::fs::remove_file(&zsh);
+                println!("Removed zsh completion: {}", zsh.display());
+            }
+            let fish = PathBuf::from(home)
+                .join(".config/fish/completions")
+                .join(format!("{daemon_name}.fish"));
+            if fish.exists() {
+                let _ = std::fs::remove_file(&fish);
+                println!("Removed fish completion: {}", fish.display());
+            }
+        }
+        // Homebrew-managed completions
+        if let Ok(out) = Command::new("brew").arg("--prefix").output().await {
+            if out.status.success() {
+                let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !prefix.is_empty() {
+                    let brew_zsh = PathBuf::from(&prefix)
+                        .join("share/zsh/site-functions")
+                        .join(format!("_{daemon_name}"));
+                    if brew_zsh.exists() {
+                        let _ = std::fs::remove_file(&brew_zsh);
+                        println!("Removed brew zsh completion: {}", brew_zsh.display());
+                    }
+                    let brew_bash = PathBuf::from(&prefix)
+                        .join("etc/bash_completion.d")
+                        .join(daemon_name);
+                    if brew_bash.exists() {
+                        let _ = std::fs::remove_file(&brew_bash);
+                        println!("Removed brew bash completion: {}", brew_bash.display());
+                    }
+                }
+            }
+        }
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let path = plist_path_for(&plist_dir, daemon_name);
     let path_str = path.to_string_lossy().to_string();
 
     if !path.exists() {
@@ -1215,7 +1367,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    match wait_for_daemon_ready(daemon_name, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -1230,20 +1382,21 @@ async fn start(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use tokio::process::Command;
 
     let (_plist_dir, target) = launchd_context()?;
+    let label = plist_label(daemon_name);
 
     let out = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
+        .args(["bootout", &format!("{target}/{label}")])
         .output()
         .await
         .context("Failed to run launchctl bootout")?;
 
     if !out.status.success() {
         let (plist_dir, _) = launchd_context()?;
-        let path = plist_path_for(&plist_dir);
+        let path = plist_path_for(&plist_dir, daemon_name);
         let _ = Command::new("launchctl")
             .args(["unload", path.to_string_lossy().as_ref()])
             .output()
@@ -1255,20 +1408,21 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn restart(data_dir: &Path) -> Result<()> {
+async fn restart(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (_plist_dir, target) = launchd_context()?;
+    let label = plist_label(daemon_name);
 
     let out = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("{target}/{PLIST_LABEL}")])
+        .args(["kickstart", "-k", &format!("{target}/{label}")])
         .output()
         .await
         .context("Failed to run launchctl kickstart")?;
 
     if !out.status.success() {
-        stop().await.ok();
-        return start(data_dir).await;
+        stop(daemon_name).await.ok();
+        return start(daemon_name, data_dir).await;
     }
 
     println!("Daemon restarted");
@@ -1277,11 +1431,12 @@ async fn restart(data_dir: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, clippy::cast_possible_truncation)]
-async fn status(data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
+    let label = plist_label(daemon_name);
     let out = Command::new("launchctl")
-        .args(["list", PLIST_LABEL])
+        .args(["list", &label])
         .output()
         .await
         .context("Failed to run launchctl list")?;
@@ -1325,11 +1480,13 @@ async fn status(data_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-const UNIT_NAME: &str = "zlayer.service";
+fn unit_name(daemon_name: &str) -> String {
+    format!("{daemon_name}.service")
+}
 
 #[cfg(target_os = "linux")]
-fn unit_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/etc/systemd/system").join(UNIT_NAME)
+fn unit_path(daemon_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/systemd/system").join(unit_name(daemon_name))
 }
 
 #[cfg(target_os = "linux")]
@@ -1337,14 +1494,16 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
     base_args.iter().copied().map(ToString::to_string).collect()
 }
 
-/// Pick a writable system location for the daemon binary.
+/// Pick a writable system location for the daemon binary, named after the
+/// daemon instance so side-by-side daemons land at distinct paths
+/// (`/usr/local/bin/<daemon_name>`).
 ///
 /// Delegates to [`zlayer_paths::ZLayerDirs::default_binary_dir`] which
 /// write-probes `/usr/local/bin` first, then falls back to the `ZLayer`
 /// data dir (`/var/lib/zlayer/bin`) which is always writable.
 #[cfg(target_os = "linux")]
-fn pick_system_binary_path() -> std::path::PathBuf {
-    zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer")
+fn pick_system_binary_path(daemon_name: &str) -> std::path::PathBuf {
+    zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name)
 }
 
 /// Create the `zlayer` group, add the invoking user to it, and make the
@@ -1697,9 +1856,11 @@ async fn ensure_zlayer_group_macos(data_dir: &Path) -> Result<()> {
     unsafe_code
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
@@ -1711,6 +1872,7 @@ async fn install(
 ) -> Result<()> {
     use std::fmt::Write as _;
     use tokio::process::Command;
+    let unit_file_name = unit_name(daemon_name);
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
@@ -1758,10 +1920,10 @@ async fn install(
                 || exe.to_string_lossy().contains("/.local/bin/");
 
             if in_home {
-                let system_path = pick_system_binary_path();
+                let system_path = pick_system_binary_path(daemon_name);
 
                 // Stop any running service before overwriting (avoids ETXTBSY)
-                let stop_args = systemctl_args(&["stop", UNIT_NAME]);
+                let stop_args = systemctl_args(&["stop", unit_file_name.as_str()]);
                 let _ = Command::new("systemctl").args(&stop_args).output().await;
 
                 // Unlink destination first — succeeds even while the old process
@@ -1803,6 +1965,11 @@ async fn install(
         exe.display(),
         data_dir.display()
     );
+    if let Some(sock_path) = socket {
+        // Custom UDS socket path so side-by-side daemon instances don't
+        // collide on the default `/var/run/<daemon-name>.sock`.
+        write!(exec_start, " --socket {}", sock_path.display()).unwrap();
+    }
     if no_swagger {
         exec_start.push_str(" --no-swagger");
     }
@@ -1875,7 +2042,7 @@ SuccessExitStatus=75
 RestartForceExitStatus=75
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=zlayer
+SyslogIdentifier={daemon_name}
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
@@ -1887,7 +2054,7 @@ WantedBy=multi-user.target
 ",
     );
 
-    let path = unit_path();
+    let path = unit_path(daemon_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -1915,7 +2082,7 @@ WantedBy=multi-user.target
         bail!("systemctl daemon-reload failed: {stderr}");
     }
 
-    let enable_args = systemctl_args(&["enable", UNIT_NAME]);
+    let enable_args = systemctl_args(&["enable", unit_file_name.as_str()]);
     let enable_out = Command::new("systemctl")
         .args(&enable_args)
         .output()
@@ -1935,7 +2102,7 @@ WantedBy=multi-user.target
     // Install Docker + Docker Compose CLI shims when docker-compat is enabled
     #[cfg(feature = "docker-compat")]
     if docker_socket {
-        let shim_dir = pick_system_binary_path()
+        let shim_dir = pick_system_binary_path(daemon_name)
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
@@ -1981,7 +2148,7 @@ WantedBy=multi-user.target
         // applied earlier in this install (e.g. updated `Environment=`
         // lines) won't take effect. Use `restart` in that case so the
         // daemon picks up the new ExecStart/Environment.
-        let is_active_args = systemctl_args(&["is-active", UNIT_NAME]);
+        let is_active_args = systemctl_args(&["is-active", unit_file_name.as_str()]);
         let is_active_status = Command::new("systemctl")
             .args(&is_active_args)
             .output()
@@ -1990,7 +2157,7 @@ WantedBy=multi-user.target
         let was_active = is_active_status.status.success();
 
         let action = if was_active { "restart" } else { "start" };
-        let action_args = systemctl_args(&[action, UNIT_NAME]);
+        let action_args = systemctl_args(&[action, unit_file_name.as_str()]);
         let out = Command::new("systemctl")
             .args(&action_args)
             .output()
@@ -1998,7 +2165,7 @@ WantedBy=multi-user.target
             .with_context(|| format!("Failed to {action} service"))?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&spawner_pid_path);
-            let context = get_daemon_failure_context();
+            let context = get_daemon_failure_context(daemon_name);
             if was_active {
                 bail!("Daemon failed to restart.\n{context}");
             }
@@ -2006,7 +2173,7 @@ WantedBy=multi-user.target
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 if was_active {
@@ -2020,6 +2187,7 @@ WantedBy=multi-user.target
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -2061,15 +2229,24 @@ WantedBy=multi-user.target
 }
 
 #[cfg(target_os = "linux")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use tokio::process::Command;
+    use tokio::time::sleep;
 
-    let stop_args = systemctl_args(&["stop", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let stop_args = systemctl_args(&["stop", unit_file_name.as_str()]);
     let _ = Command::new("systemctl").args(&stop_args).output().await;
-    let disable_args = systemctl_args(&["disable", UNIT_NAME]);
+    let disable_args = systemctl_args(&["disable", unit_file_name.as_str()]);
     let _ = Command::new("systemctl").args(&disable_args).output().await;
 
-    let path = unit_path();
+    let path = unit_path(daemon_name);
     if path.exists() {
         tokio::fs::remove_file(&path)
             .await
@@ -2085,7 +2262,7 @@ async fn uninstall() -> Result<()> {
     // installed by `daemon install --docker-socket`.
     #[cfg(feature = "docker-compat")]
     {
-        let shim_dir = pick_system_binary_path()
+        let shim_dir = pick_system_binary_path(daemon_name)
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
@@ -2120,14 +2297,71 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        let bin_path = pick_system_binary_path(daemon_name);
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+    }
+
+    if remove_completions {
+        // Bash: /etc/bash_completion.d/<name> + Homebrew prefix
+        let bash_paths = [
+            PathBuf::from(format!("/etc/bash_completion.d/{daemon_name}")),
+            // Homebrew prefix not relevant on Linux; ignore
+        ];
+        for p in bash_paths {
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+                println!("Removed bash completion: {}", p.display());
+            }
+        }
+        // Zsh: $HOME/.zsh/completions/_<name>
+        if let Ok(home) = std::env::var("HOME") {
+            let zsh = PathBuf::from(home.clone())
+                .join(".zsh/completions")
+                .join(format!("_{daemon_name}"));
+            if zsh.exists() {
+                let _ = std::fs::remove_file(&zsh);
+                println!("Removed zsh completion: {}", zsh.display());
+            }
+            let fish = PathBuf::from(home)
+                .join(".config/fish/completions")
+                .join(format!("{daemon_name}.fish"));
+            if fish.exists() {
+                let _ = std::fs::remove_file(&fish);
+                println!("Removed fish completion: {}", fish.display());
+            }
+        }
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let path = unit_path();
+    let unit_file_name = unit_name(daemon_name);
+    let path = unit_path(daemon_name);
     if !path.exists() {
         bail!("Daemon not installed. Run `zlayer daemon install` first.");
     }
@@ -2140,7 +2374,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     // Clear stale logs so failure diagnostics only show this attempt.
     truncate_daemon_logs(&crate::cli::default_log_dir(data_dir));
 
-    let args = systemctl_args(&["start", UNIT_NAME]);
+    let args = systemctl_args(&["start", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2148,12 +2382,12 @@ async fn start(data_dir: &Path) -> Result<()> {
         .context("Failed to start service")?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&spawner_pid_path);
-        let context = get_daemon_failure_context();
+        let context = get_daemon_failure_context(daemon_name);
         bail!("Daemon failed to start.\n{context}");
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    match wait_for_daemon_ready(daemon_name, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -2169,10 +2403,11 @@ async fn start(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["stop", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["stop", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2187,10 +2422,11 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn restart(_data_dir: &Path) -> Result<()> {
+async fn restart(daemon_name: &str, _data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["restart", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["restart", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2205,10 +2441,11 @@ async fn restart(_data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn status(data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["status", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["status", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2298,9 +2535,12 @@ fn is_service_not_found(err: &windows_service::Error) -> bool {
 /// by any local admin via `sc qc` / `systemctl cat`, so there's no extra
 /// exposure beyond what is already accepted.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn build_service_launch_arguments(
+    daemon_name: &str,
     data_dir: &Path,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
@@ -2308,16 +2548,26 @@ fn build_service_launch_arguments(
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
-    // `--data-dir` is a top-level Cli arg, so it must come BEFORE the
-    // `serve` subcommand — mirrors the Linux/macOS install paths.
+    // `--data-dir` and `--daemon-name` are top-level Cli args, so they must
+    // come BEFORE the `serve` subcommand — mirrors the Linux/macOS install
+    // paths. `--daemon-name` is plumbed onto the top-level `Cli` struct in a
+    // later wave; emitting it here unconditionally is forward-compatible
+    // (older builds without the flag would reject it, but only newer builds
+    // produce these argument vectors).
     let mut args: Vec<OsString> = vec![
         OsString::from("--data-dir"),
         data_dir.as_os_str().to_os_string(),
+        OsString::from("--daemon-name"),
+        OsString::from(daemon_name),
         OsString::from("serve"),
         OsString::from("--service"),
         OsString::from("--bind"),
         OsString::from(bind),
     ];
+    if let Some(sock) = socket {
+        args.push(OsString::from("--socket"));
+        args.push(sock.as_os_str().to_os_string());
+    }
     if no_swagger {
         args.push(OsString::from("--no-swagger"));
     }
@@ -2355,9 +2605,11 @@ fn build_service_launch_arguments(
     clippy::items_after_statements
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
@@ -2432,8 +2684,10 @@ async fn install(
     let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
 
     let launch_arguments = build_service_launch_arguments(
+        daemon_name,
         data_dir,
         bind,
+        socket,
         jwt_secret,
         no_swagger,
         #[cfg(feature = "docker-compat")]
@@ -2441,9 +2695,12 @@ async fn install(
         tunnel,
     );
 
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+    let svc_display = crate::daemon_service::display_name(daemon_name);
+
     let service_info = ServiceInfo {
-        name: OsString::from(crate::daemon_service::SERVICE_NAME),
-        display_name: OsString::from("ZLayer Daemon"),
+        name: OsString::from(svc_name.clone()),
+        display_name: OsString::from(svc_display.clone()),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -2479,9 +2736,8 @@ async fn install(
             if !already_exists {
                 return Err(e).with_context(|| {
                     format!(
-                        "Failed to create Windows Service '{}'. \
-                         If the service is already registered, run `zlayer daemon uninstall` first.",
-                        crate::daemon_service::SERVICE_NAME
+                        "Failed to create Windows Service '{svc_name}'. \
+                         If the service is already registered, run `zlayer daemon uninstall` first."
                     )
                 });
             }
@@ -2491,13 +2747,12 @@ async fn install(
             // teardown that follows.
             let existing = manager
                 .open_service(
-                    crate::daemon_service::SERVICE_NAME,
+                    svc_name.as_str(),
                     ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
                 )
                 .with_context(|| {
                     format!(
-                        "Service '{}' already exists but could not be opened for replacement",
-                        crate::daemon_service::SERVICE_NAME
+                        "Service '{svc_name}' already exists but could not be opened for replacement"
                     )
                 })?;
 
@@ -2541,8 +2796,7 @@ async fn install(
 
             existing.delete().with_context(|| {
                 format!(
-                    "Failed to delete existing Windows Service '{}' before replacing it",
-                    crate::daemon_service::SERVICE_NAME
+                    "Failed to delete existing Windows Service '{svc_name}' before replacing it"
                 )
             })?;
 
@@ -2551,14 +2805,13 @@ async fn install(
             // can race with pending deletion and return ERROR_SERVICE_MARKED_FOR_DELETE.
             drop(existing);
 
-            println!("Replaced existing ZLayer service");
+            println!("Replaced existing service '{svc_name}'");
 
             manager
                 .create_service(&service_info, ServiceAccess::ALL_ACCESS)
                 .with_context(|| {
                     format!(
-                        "Failed to recreate Windows Service '{}' after replacing existing instance",
-                        crate::daemon_service::SERVICE_NAME
+                        "Failed to recreate Windows Service '{svc_name}' after replacing existing instance"
                     )
                 })?
         }
@@ -2568,10 +2821,7 @@ async fn install(
     // `build_service_launch_arguments` above — SCM does not inherit env
     // from the installing CLI, so env-passing wouldn't work here.
 
-    println!(
-        "Registered Windows Service '{}' (display: 'ZLayer Daemon').",
-        crate::daemon_service::SERVICE_NAME
-    );
+    println!("Registered Windows Service '{svc_name}' (display: '{svc_display}').");
     println!("  Binary:   {}", exe.display());
     println!("  Data dir: {}", data_dir.display());
     println!("  Bind:     {bind}");
@@ -2598,7 +2848,7 @@ async fn install(
         let sc_out = tokio::process::Command::new("sc.exe")
             .args([
                 "failure",
-                crate::daemon_service::SERVICE_NAME,
+                svc_name.as_str(),
                 "reset=",
                 "86400",
                 "actions=",
@@ -2611,16 +2861,14 @@ async fn install(
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 eprintln!(
-                    "Warning: `sc failure {}` exited non-zero. Service will NOT auto-restart \
-                     on exit code 75 until this is configured. stderr={stderr} stdout={stdout}",
-                    crate::daemon_service::SERVICE_NAME
+                    "Warning: `sc failure {svc_name}` exited non-zero. Service will NOT auto-restart \
+                     on exit code 75 until this is configured. stderr={stderr} stdout={stdout}"
                 );
             }
             Err(e) => {
                 eprintln!(
                     "Warning: failed to invoke `sc.exe failure` to configure auto-restart \
-                     for service '{}': {e}",
-                    crate::daemon_service::SERVICE_NAME
+                     for service '{svc_name}': {e}"
                 );
             }
             _ => {
@@ -2632,16 +2880,15 @@ async fn install(
     if !no_start {
         service.start::<&OsStr>(&[]).with_context(|| {
             format!(
-                "Failed to start Windows Service '{}'. \
-                 Check the Windows Event Log (Application) for startup errors.",
-                crate::daemon_service::SERVICE_NAME
+                "Failed to start Windows Service '{svc_name}'. \
+                 Check the Windows Event Log (Application) for startup errors."
             )
         })?;
 
         print!("Daemon starting...");
         // Poll the API endpoint until it's reachable — same readiness
         // signal as the systemd/launchd paths.
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, 45).await {
             Ok(()) => {
                 println!(" started");
                 let restore_outcome = if let Some(ref sp) = snapshot_path {
@@ -2650,6 +2897,7 @@ async fn install(
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -2740,15 +2988,28 @@ async fn install(
 }
 
 #[cfg(target_os = "windows")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use std::ffi::OsStr;
+    use tokio::time::sleep;
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // Track whether the SCM service was found so the post-stop cleanup flags
+    // (--remove-binary / --remove-completions / --purge-data) still run even
+    // if the service was never registered.
+    let mut service_unregistered = false;
 
     // Best-effort stop first so we don't leave an orphaned process after
     // delete. Ignore errors — if it's already stopped (or not registered),
     // `delete` below will pick up the slack.
-    let _ = stop().await;
+    let _ = stop(daemon_name).await;
 
     let manager =
         match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT) {
@@ -2761,39 +3022,27 @@ async fn uninstall() -> Result<()> {
             }
         };
 
-    let service = match manager.open_service(
-        crate::daemon_service::SERVICE_NAME,
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+
+    match manager.open_service(
+        svc_name.as_str(),
         ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     ) {
-        Ok(s) => s,
+        Ok(service) => {
+            service
+                .delete()
+                .with_context(|| format!("Failed to delete Windows Service '{svc_name}'"))?;
+            println!("Unregistered Windows Service '{svc_name}'.");
+            service_unregistered = true;
+        }
         Err(e) if is_service_not_found(&e) => {
-            println!(
-                "Windows Service '{}' is not registered; nothing to uninstall.",
-                crate::daemon_service::SERVICE_NAME
-            );
-            return Ok(());
+            println!("Windows Service '{svc_name}' is not registered; nothing to uninstall.");
         }
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Failed to open Windows Service '{}'",
-                    crate::daemon_service::SERVICE_NAME
-                )
-            });
+            return Err(e).with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
         }
-    };
-
-    service.delete().with_context(|| {
-        format!(
-            "Failed to delete Windows Service '{}'",
-            crate::daemon_service::SERVICE_NAME
-        )
-    })?;
-
-    println!(
-        "Unregistered Windows Service '{}'.",
-        crate::daemon_service::SERVICE_NAME
-    );
+    }
+    let _ = service_unregistered; // silence unused-var warning when not consumed downstream
 
     #[cfg(feature = "docker-compat")]
     {
@@ -2827,22 +3076,55 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        let bin_path =
+            zlayer_paths::ZLayerDirs::default_binary_dir().join(format!("{daemon_name}.exe"));
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+    }
+
+    if remove_completions {
+        // PowerShell completions, if installed, would live under the user's
+        // PowerShell module path. The installer does not currently create
+        // these, so this branch is a no-op on Windows.
+        let _ = daemon_name;
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     // Kept as a foreground-spawn fallback for users who haven't registered
     // the SCM service (e.g. during local development). For an installed
     // service, callers should use `sc start ZLayerDaemon` or re-run
     // `zlayer daemon install` — we don't promote `start` to an SCM call
     // here because `install` already starts the service on registration.
     let bind = "127.0.0.1:3669";
-    spawn_daemon_windows(data_dir, bind, None, false).await
+    spawn_daemon_windows(daemon_name, data_dir, bind, None, false).await
 }
 
 #[cfg(target_os = "windows")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use std::ffi::OsStr;
     use std::time::{Duration, Instant};
     use windows_service::service::{ServiceAccess, ServiceState};
@@ -2854,26 +3136,22 @@ async fn stop() -> Result<()> {
              Run this command from an elevated (Administrator) prompt.",
         )?;
 
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+
     let service = match manager.open_service(
-        crate::daemon_service::SERVICE_NAME,
+        svc_name.as_str(),
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     ) {
         Ok(s) => s,
         Err(e) if is_service_not_found(&e) => {
             println!(
-                "Windows Service '{}' is not registered. \
-                 If a foreground `zlayer serve` is running, press Ctrl+C in its window.",
-                crate::daemon_service::SERVICE_NAME
+                "Windows Service '{svc_name}' is not registered. \
+                 If a foreground `zlayer serve` is running, press Ctrl+C in its window."
             );
             return Ok(());
         }
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Failed to open Windows Service '{}'",
-                    crate::daemon_service::SERVICE_NAME
-                )
-            });
+            return Err(e).with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
         }
     };
 
@@ -2908,9 +3186,8 @@ async fn stop() -> Result<()> {
         if Instant::now() >= deadline {
             println!(
                 "Daemon did not reach Stopped state within 30s (current: {:?}). \
-                 The service may still be shutting down; check `sc query {}`.",
-                status.current_state,
-                crate::daemon_service::SERVICE_NAME
+                 The service may still be shutting down; check `sc query {svc_name}`.",
+                status.current_state
             );
             return Ok(());
         }
@@ -2919,16 +3196,18 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-async fn restart(data_dir: &Path) -> Result<()> {
-    stop().await.ok();
-    start(data_dir).await
+async fn restart(daemon_name: &str, data_dir: &Path) -> Result<()> {
+    stop(daemon_name).await.ok();
+    start(daemon_name, data_dir).await
 }
 
 #[cfg(target_os = "windows")]
-async fn status(_data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, _data_dir: &Path) -> Result<()> {
     use std::ffi::OsStr;
     use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let svc_name = crate::daemon_service::service_name(daemon_name);
 
     // Try SCM first. If the service is registered, its state is the
     // authoritative answer — a foreground daemon on a different bind could
@@ -2937,10 +3216,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
         ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT);
 
     if let Ok(manager) = manager_result {
-        match manager.open_service(
-            crate::daemon_service::SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS,
-        ) {
+        match manager.open_service(svc_name.as_str(), ServiceAccess::QUERY_STATUS) {
             Ok(service) => {
                 let status = service
                     .query_status()
@@ -2954,10 +3230,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
                     ServiceState::PausePending => "PausePending",
                     ServiceState::ContinuePending => "ContinuePending",
                 };
-                println!(
-                    "Daemon: {label} (Windows Service '{}')",
-                    crate::daemon_service::SERVICE_NAME
-                );
+                println!("Daemon: {label} (Windows Service '{svc_name}')");
                 if let Some(pid) = status.process_id {
                     println!("  PID: {pid}");
                 }
@@ -2969,12 +3242,8 @@ async fn status(_data_dir: &Path) -> Result<()> {
                 // installed service.
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to open Windows Service '{}'",
-                        crate::daemon_service::SERVICE_NAME
-                    )
-                });
+                return Err(e)
+                    .with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
             }
         }
     }
@@ -2995,6 +3264,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 async fn spawn_daemon_windows(
+    daemon_name: &str,
     data_dir: &Path,
     bind: &str,
     jwt_secret: Option<&str>,
@@ -3013,10 +3283,14 @@ async fn spawn_daemon_windows(
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
-    // --data-dir is a top-level Cli arg, so it must come BEFORE the
-    // subcommand — matches the Linux systemd unit.
+    // --data-dir and --daemon-name are top-level Cli args, so they must come
+    // BEFORE the subcommand — matches the Linux systemd unit. `--daemon-name`
+    // is added to the top-level Cli struct in a later wave; the
+    // foreground-spawned daemon needs to receive its instance identity the
+    // same way the SCM-launched service does.
     let mut cmd = Command::new(&exe);
     cmd.arg("--data-dir").arg(data_dir);
+    cmd.arg("--daemon-name").arg(daemon_name);
     cmd.arg("serve").arg("--daemon").arg("--bind").arg(bind);
     if no_swagger {
         cmd.arg("--no-swagger");
@@ -3039,7 +3313,7 @@ async fn spawn_daemon_windows(
     drop(child);
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    match wait_for_daemon_ready(daemon_name, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -3087,7 +3361,7 @@ fn truncate_daemon_logs(log_dir: &std::path::Path) {
 /// On timeout, [`get_daemon_failure_context`] auto-surfaces the error from
 /// the OS service manager (systemctl/journalctl on Linux, the stderr log on
 /// macOS) so the user sees why it failed without running a separate command.
-async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
+async fn wait_for_daemon_ready(daemon_name: &str, timeout_secs: u64) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
@@ -3135,7 +3409,7 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
         }
     }
 
-    let error_context = get_daemon_failure_context();
+    let error_context = get_daemon_failure_context(daemon_name);
     bail!("Daemon failed to start within {timeout_secs}s.\n{error_context}");
 }
 
@@ -3143,13 +3417,14 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
 /// fails to start.  On Linux, pulls from `systemctl status` and journalctl.
 /// On macOS, reads the stderr log from the launchd plist's `StandardErrorPath`.
 #[allow(unused_variables)]
-fn get_daemon_failure_context() -> String {
+fn get_daemon_failure_context(daemon_name: &str) -> String {
     let mut context = String::new();
 
     #[cfg(target_os = "linux")]
     {
         // systemctl status includes exit code and the last few journal lines
-        let args = systemctl_args(&["status", UNIT_NAME]);
+        let unit_file_name = unit_name(daemon_name);
+        let args = systemctl_args(&["status", unit_file_name.as_str()]);
         if let Ok(out) = std::process::Command::new("systemctl").args(&args).output() {
             let status = String::from_utf8_lossy(&out.stdout);
             if !status.trim().is_empty() {
@@ -3165,7 +3440,7 @@ fn get_daemon_failure_context() -> String {
                 "30",
                 "--since=-2min",
                 "-u",
-                "zlayer",
+                daemon_name,
                 "--output",
                 "cat",
             ];
@@ -3250,6 +3525,23 @@ fn reset(data_dir: &Path, force: bool) -> Result<()> {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_uninstall_tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_remove_binary_path_default_name() {
+        let p = pick_system_binary_path("zlayer");
+        assert!(p.ends_with("zlayer"));
+    }
+
+    #[test]
+    fn uninstall_remove_binary_path_dev_name() {
+        let p = pick_system_binary_path("zlayer-dev");
+        assert!(p.ends_with("zlayer-dev"));
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod windows_tests {
     use super::*;
@@ -3263,8 +3555,10 @@ mod windows_tests {
     fn launch_arguments_puts_data_dir_before_serve() {
         let data_dir = PathBuf::from(r"C:\ProgramData\zlayer");
         let args = build_service_launch_arguments(
+            "zlayer",
             &data_dir,
             "0.0.0.0:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3296,8 +3590,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_includes_service_flag() {
         let args = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3314,8 +3610,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_forwards_bind() {
         let args = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "10.0.0.5:4242",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3333,8 +3631,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_no_swagger_toggle() {
         let without = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3344,8 +3644,10 @@ mod windows_tests {
         assert!(!without.iter().any(|a| a == OsStr::new("--no-swagger")));
 
         let with = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             true,
             #[cfg(feature = "docker-compat")]
@@ -3361,8 +3663,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_jwt_secret_round_trip() {
         let without = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3372,8 +3676,10 @@ mod windows_tests {
         assert!(!without.iter().any(|a| a == OsStr::new("--jwt-secret")));
 
         let with = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             Some("super-secret-token"),
             false,
             #[cfg(feature = "docker-compat")]
@@ -3404,5 +3710,25 @@ mod windows_tests {
         let io_err = std::io::Error::from_raw_os_error(5);
         let err = windows_service::Error::Winapi(io_err);
         assert!(!is_service_not_found(&err));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_label_tests {
+    use super::*;
+
+    #[test]
+    fn plist_label_default_is_com_zlayer_daemon() {
+        assert_eq!(plist_label("zlayer"), "com.zlayer.daemon");
+    }
+
+    #[test]
+    fn plist_label_dev_becomes_daemon_dev() {
+        assert_eq!(plist_label("zlayer-dev"), "com.zlayer.daemon-dev");
+    }
+
+    #[test]
+    fn plist_label_arbitrary_name() {
+        assert_eq!(plist_label("foo"), "com.zlayer.daemon-foo");
     }
 }
