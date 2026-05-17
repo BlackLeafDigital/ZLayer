@@ -1243,20 +1243,32 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 let coordinator = Arc::new(coordinator);
 
                 // Start Raft RPC server in the background.
-                // Bind to the overlay IP when available so Raft traffic stays on
-                // the encrypted WireGuard mesh. Fall back to 127.0.0.1 (loopback)
-                // in host-networking mode -- never bind to 0.0.0.0.
+                //
+                // Bind raft to whatever `advertise_addr` resolves to. The cluster
+                // topology stores each node's `address` as
+                // `{advertise_addr}:{raft_port}` (see `Request::RegisterNode`
+                // a few lines up + the corresponding propose for joiners), so
+                // peers connect to that exact pair. If we bound the listener to
+                // a different IP (e.g. the overlay IP) the peers' connections
+                // would land on a port no one is listening on and openraft
+                // would log `Unreachable node: ... /raft/append`. In normal
+                // production deploys `advertise_addr` IS the overlay IP, so
+                // this preserves the encrypted-mesh property; in loopback /
+                // host-network test setups `advertise_addr` is `127.0.0.1` and
+                // raft correctly binds there too.
                 let raft_service =
                     RaftService::with_auth(Arc::clone(&coordinator), Some(internal_token.clone()));
 
-                let raft_bind_ip: std::net::IpAddr = if let Some(om) = &overlay {
-                    om.read()
-                        .await
-                        .node_ip()
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                };
+                let raft_bind_ip: std::net::IpAddr = node_config
+                    .advertise_addr
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            advertise_addr = %node_config.advertise_addr,
+                            "advertise_addr is not a parseable IP — falling back to 127.0.0.1 for raft bind. Inter-node raft replication will fail unless advertise_addr resolves at the peer."
+                        );
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    });
                 let raft_addr = std::net::SocketAddr::new(raft_bind_ip, node_config.raft_port);
 
                 let raft_handle = {

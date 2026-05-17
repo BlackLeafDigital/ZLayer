@@ -766,8 +766,1144 @@ def _cleanup_cluster(
     shutil.rmtree(root_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Container-mode helpers (--overlay-mode container)
+# ---------------------------------------------------------------------------
+#
+# When `--overlay-mode container` AND `ZLAYER_E2E_PRIVILEGED=1` are set, each
+# cluster node runs inside its own privileged container attached to a shared
+# bridge network so the boringtun overlay (zlayer0 / TUN) is actually
+# exercised. The harness orchestrates each node via
+# `<runtime> exec <container> zlayer ...`.
+#
+# Design doc: docs/operating/e2e-privileged.md.
+#
+# Env vars:
+#   ZLAYER_E2E_PRIVILEGED=1          required (acknowledge privileged host)
+#   ZLAYER_E2E_IMAGE                 default `zlayer/zlayer-e2e-node:latest`
+#   ZLAYER_E2E_NETWORK               default `zlayer-e2e`
+#   ZLAYER_E2E_KEEP_CONTAINERS=1     leave containers up after the suite
+#
+# Image is expected to be present (operator runs
+# `zlayer pipeline -f ZPipeline.yaml --set VERSION=dev`); the harness only
+# verifies presence, never builds.
+
+# Static IPs assigned inside the bridge subnet. /24 with `.1` as the gateway
+# (created by the runtime). Nodes get `.10`, `.11`, `.12` so each suite gets
+# a deterministic mapping for join-target URLs.
+_CONTAINER_SUBNET = "10.99.99.0/24"
+_CONTAINER_GATEWAY = "10.99.99.1"
+_CONTAINER_NODE_IPS = ["10.99.99.10", "10.99.99.11", "10.99.99.12"]
+
+# Inside the test image: binary at /usr/local/bin/zlayer, data at /var/lib/zlayer.
+_CONTAINER_BIN = "/usr/local/bin/zlayer"
+_CONTAINER_DATA_DIR = "/var/lib/zlayer"
+
+
+def _detect_container_runtime() -> str:
+    """Return the absolute path to `podman` or `docker`.
+
+    Per the design doc, podman is preferred (rootless friendly) but docker
+    works too. Raises RuntimeError if neither is on PATH so the caller can
+    print an actionable error.
+    """
+    for name in ("podman", "docker"):
+        path = shutil.which(name)
+        if path:
+            return path
+    raise RuntimeError(
+        "no container runtime found in PATH; need podman or docker for "
+        "--overlay-mode container (see docs/operating/e2e-privileged.md)"
+    )
+
+
+def _runtime_is_podman(runtime: str) -> bool:
+    return os.path.basename(runtime) == "podman"
+
+
+def _ensure_e2e_network(runtime: str, network: str) -> None:
+    """Create the named bridge network if it doesn't already exist.
+
+    Uses `<runtime> network exists` (podman) / `<runtime> network inspect`
+    (docker) to probe, falling back to `network create` with our fixed
+    `--subnet`/`--gateway` so the harness controls IP allocation.
+    """
+    if _runtime_is_podman(runtime):
+        probe = subprocess.run(
+            [runtime, "network", "exists", network],
+            check=False, capture_output=True,
+        )
+        exists = probe.returncode == 0
+    else:
+        probe = subprocess.run(
+            [runtime, "network", "inspect", network],
+            check=False, capture_output=True,
+        )
+        exists = probe.returncode == 0
+    if exists:
+        log(f"container: reusing existing network `{network}`")
+        return
+    log(
+        f"container: creating bridge network `{network}` "
+        f"(subnet={_CONTAINER_SUBNET}, gateway={_CONTAINER_GATEWAY})"
+    )
+    subprocess.run(
+        [
+            runtime, "network", "create",
+            "--driver", "bridge",
+            "--subnet", _CONTAINER_SUBNET,
+            "--gateway", _CONTAINER_GATEWAY,
+            network,
+        ],
+        check=True, capture_output=True,
+    )
+
+
+def _ensure_e2e_image(runtime: str, image: str) -> None:
+    """Refuse to start if the test image isn't present locally.
+
+    Image build is the operator's responsibility:
+        zlayer pipeline -f ZPipeline.yaml --set VERSION=dev
+    (see images/ZImagefile.zlayer-e2e-node + docs/operating/e2e-privileged.md).
+    """
+    if _runtime_is_podman(runtime):
+        probe = subprocess.run(
+            [runtime, "image", "exists", image],
+            check=False, capture_output=True,
+        )
+        exists = probe.returncode == 0
+    else:
+        probe = subprocess.run(
+            [runtime, "image", "inspect", image],
+            check=False, capture_output=True,
+        )
+        exists = probe.returncode == 0
+    if exists:
+        log(f"container: test image `{image}` present")
+        return
+    die(
+        f"container: test image `{image}` not found locally.\n"
+        "  Build it first:\n"
+        "    zlayer pipeline -f ZPipeline.yaml --set VERSION=dev\n"
+        "  (see images/ZImagefile.zlayer-e2e-node + "
+        "docs/operating/e2e-privileged.md)"
+    )
+
+
+def _container_name(suite: str, idx: int) -> str:
+    """Predictable name e.g. `zlayer-e2e-cluster_3node-node1`."""
+    return f"zlayer-e2e-{suite}-node{idx + 1}"
+
+
+def _container_run(
+    runtime: str, *,
+    name: str, image: str, network: str, ip: str,
+) -> None:
+    """Start a privileged container detached, attached to `network` at `ip`.
+
+    The image's CMD is `sleep infinity` (see images/ZImagefile.zlayer-e2e-node)
+    so the container stays up for subsequent `_container_exec` calls. We use
+    `--rm` so a crash doesn't leave a phantom; cleanup is via `<runtime>
+    stop` which removes it.
+    """
+    argv = [
+        runtime, "run", "-d", "--rm",
+        "--name", name,
+        "--hostname", name,
+        "--privileged",
+        "--cap-add", "NET_ADMIN",
+        "--device", "/dev/net/tun",
+        "--network", network,
+        "--ip", ip,
+        image,
+    ]
+    log(f"container: starting `{name}` on {network} at {ip}")
+    subprocess.run(argv, check=True, capture_output=True)
+
+
+def _container_exec(
+    runtime: str, name: str, argv: list[str], *,
+    check: bool = True, capture: bool = False, detach: bool = False,
+) -> Optional[subprocess.CompletedProcess]:
+    """Run `<runtime> exec [-d] <name> <argv...>`.
+
+    Returns the completed process when not detached, None when detached.
+    When `capture=True`, stdout+stderr are captured (text mode); otherwise
+    they flow to the harness's stdio.
+    """
+    cmd = [runtime, "exec"]
+    if detach:
+        cmd.append("-d")
+    cmd.append(name)
+    cmd.extend(argv)
+    if detach:
+        subprocess.run(cmd, check=check, capture_output=True)
+        return None
+    return subprocess.run(
+        cmd, check=check, capture_output=capture, text=capture,
+    )
+
+
+def _container_stop(runtime: str, name: str) -> None:
+    """Stop a container. Best-effort: log on failure, never raise.
+
+    Containers are started with `--rm` so stop also removes them.
+    """
+    res = subprocess.run(
+        [runtime, "stop", name],
+        check=False, capture_output=True,
+    )
+    if res.returncode != 0:
+        log(
+            f"container: `{runtime} stop {name}` failed "
+            f"(rc={res.returncode}, stderr={res.stderr.decode('utf-8', 'replace').strip()!r})"
+        )
+
+
+def _bootstrap_3node_cluster_container(
+    runtime: str, image: str, network: str, suite: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """Stand up a 3-node container cluster.
+
+    Returns (container_names, node_ips, api_endpoints) where
+    `api_endpoints[i]` is `http://<ip>:<api_port>` for poll-from-host calls.
+
+    Mirrors the sequence in `_bootstrap_3node_cluster`:
+      1. Start all 3 containers at static IPs.
+      2. `node init` on node1 → `serve` (detached) → wait /health/ready.
+      3. For each joiner:
+           a. Generate a fresh signed join token from node1.
+           b. `node join` from joiner → `serve` (detached) → wait /health/ready.
+
+    Caller is responsible for `_cleanup_cluster_container` in `finally:`.
+    """
+    names: list[str] = [_container_name(suite, i) for i in range(3)]
+    ips: list[str] = list(_CONTAINER_NODE_IPS)
+    api_endpoints: list[str] = [
+        f"http://{ips[i]}:{CLUSTER_NODES[i]['api']}" for i in range(3)
+    ]
+
+    # --- Phase 1: launch all 3 containers ---------------------------------
+    for i in range(3):
+        _container_run(
+            runtime,
+            name=names[i], image=image, network=network, ip=ips[i],
+        )
+
+    # --- Phase 2: bootstrap node1 -----------------------------------------
+    log(f"cluster(container): initializing node1 (api={CLUSTER_NODES[0]['api']})")
+    _container_exec(
+        runtime, names[0],
+        [
+            _CONTAINER_BIN,
+            "--data-dir", _CONTAINER_DATA_DIR,
+            "node", "init",
+            "--advertise-addr", ips[0],
+            "--api-port", str(CLUSTER_NODES[0]["api"]),
+            "--raft-port", str(CLUSTER_NODES[0]["raft"]),
+            "--overlay-port", str(CLUSTER_NODES[0]["overlay"]),
+        ],
+        check=True,
+    )
+
+    log(f"cluster(container): starting node1 serve on {ips[0]}:{CLUSTER_NODES[0]['api']}")
+    _container_exec(
+        runtime, names[0],
+        [
+            _CONTAINER_BIN,
+            "--data-dir", _CONTAINER_DATA_DIR,
+            "serve",
+            "--bind", f"0.0.0.0:{CLUSTER_NODES[0]['api']}",
+            "--deployment-name", CLUSTER_DEPLOYMENT,
+        ],
+        detach=True,
+    )
+    if not _wait_http_ok(f"{api_endpoints[0]}/health/ready", 30):
+        die(f"node1 (container) never came up on {api_endpoints[0]}")
+
+    # --- Phase 3: join nodes 2 & 3 ---------------------------------------
+    # Mint one fresh signed join token per joiner (single-use, see
+    # `_bootstrap_3node_cluster` for the same rationale).
+    for i in (1, 2):
+        cfg = CLUSTER_NODES[i]
+        log(
+            f"cluster(container): generating join token on node1 for "
+            f"node{i + 1}"
+        )
+        gen = _container_exec(
+            runtime, names[0],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "node", "generate-join-token",
+                CLUSTER_DEPLOYMENT,
+                "-a", api_endpoints[0],
+            ],
+            check=True, capture=True,
+        )
+        assert gen is not None
+        token = _parse_join_token(gen.stdout)
+        log(
+            f"cluster(container): join token for node{i + 1} "
+            f"({len(token)} chars) acquired"
+        )
+
+        log(
+            f"cluster(container): joining node{i + 1} via {ips[0]}:{CLUSTER_NODES[0]['api']} "
+            f"(advertise={ips[i]}, api={cfg['api']})"
+        )
+        _container_exec(
+            runtime, names[i],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "node", "join",
+                f"{ips[0]}:{CLUSTER_NODES[0]['api']}",
+                "--token", token,
+                "--advertise-addr", ips[i],
+                "--api-port", str(cfg["api"]),
+                "--raft-port", str(cfg["raft"]),
+                "--overlay-port", str(cfg["overlay"]),
+            ],
+            check=True,
+        )
+        log(
+            f"cluster(container): starting node{i + 1} serve on "
+            f"{ips[i]}:{cfg['api']}"
+        )
+        _container_exec(
+            runtime, names[i],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "serve",
+                "--bind", f"0.0.0.0:{cfg['api']}",
+                "--deployment-name", CLUSTER_DEPLOYMENT,
+            ],
+            detach=True,
+        )
+        if not _wait_http_ok(f"{api_endpoints[i]}/health/ready", 30):
+            die(f"node{i + 1} (container) never came up on {api_endpoints[i]}")
+
+    return names, ips, api_endpoints
+
+
+def _cleanup_cluster_container(
+    runtime: str, names: list[str], *, network: Optional[str] = None,
+) -> None:
+    """Stop + remove each container, optionally remove the bridge network.
+
+    `ZLAYER_E2E_KEEP_CONTAINERS=1` short-circuits the whole thing for
+    postmortem inspection.
+    """
+    if os.environ.get("ZLAYER_E2E_KEEP_CONTAINERS") == "1":
+        log(
+            "container: ZLAYER_E2E_KEEP_CONTAINERS=1 → leaving containers "
+            f"{names!r} (and network {network!r}) in place"
+        )
+        return
+    for name in names:
+        _container_stop(runtime, name)
+    if network:
+        res = subprocess.run(
+            [runtime, "network", "rm", network],
+            check=False, capture_output=True,
+        )
+        if res.returncode != 0:
+            log(
+                f"container: `{runtime} network rm {network}` failed "
+                f"(may still have endpoints; rc={res.returncode})"
+            )
+
+
+def _fetch_cluster_nodes_url(api_url: str) -> list[dict]:
+    """Container-mode variant of `_fetch_cluster_nodes` that accepts a full URL.
+
+    Loopback mode polls `http://127.0.0.1:<port>/...`; container mode polls
+    `http://<container_ip>:<port>/...`. The handler logic is identical so
+    this is just a thin URL-instead-of-port wrapper.
+    """
+    req = urllib.request.Request(f"{api_url}/api/v1/cluster/nodes")
+    bearer = os.environ.get("ZLAYER_E2E_CLUSTER_TOKEN")
+    if bearer:
+        req.add_header("Authorization", f"Bearer {bearer}")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        body = resp.read().decode("utf-8")
+    data = json.loads(body)
+    if isinstance(data, dict) and "nodes" in data:
+        return list(data["nodes"])
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(
+        f"unexpected /api/v1/cluster/nodes payload shape: {data!r}"
+    )
+
+
+def _wait_for_ready_cluster_url(
+    leader_api_url: str, expected_nodes: int, timeout_s: int,
+) -> list[dict]:
+    """URL-keyed analogue of `_wait_for_ready_cluster` for container mode."""
+    deadline = time.monotonic() + timeout_s
+    last_nodes: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            nodes = _fetch_cluster_nodes_url(leader_api_url)
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                ConnectionError, TimeoutError, OSError, json.JSONDecodeError,
+                RuntimeError) as e:
+            last_err = repr(e)
+            time.sleep(2)
+            continue
+        last_nodes = nodes
+        ready = [n for n in nodes if str(n.get("status", "")).lower() == "ready"]
+        leaders = [n for n in nodes if str(n.get("role", "")).lower() == "leader"]
+        if len(ready) >= expected_nodes and len(leaders) >= 1:
+            return nodes
+        time.sleep(2)
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_nodes={last_nodes!r}"
+    )
+    raise RuntimeError(
+        f"cluster never reached {expected_nodes} ready nodes with a leader "
+        f"within {timeout_s}s{detail}"
+    )
+
+
+def _container_ps_running(
+    runtime: str, container: str, deployment: str,
+    expected_count: int, timeout_s: int = 120,
+) -> list[dict]:
+    """Container-mode analogue of `_count_running_containers`.
+
+    Runs `zlayer ps --containers --format json` inside `container` instead
+    of as a host subprocess; otherwise the polling/parse logic is identical.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_entries: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            result = _container_exec(
+                runtime, container,
+                [
+                    _CONTAINER_BIN,
+                    "--data-dir", _CONTAINER_DATA_DIR,
+                    "ps",
+                    "--deployment", deployment,
+                    "--containers",
+                    "--format", "json",
+                ],
+                check=True, capture=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_err = (
+                f"exit={exc.returncode} stderr={(exc.stderr or '').strip()!r}"
+            )
+            time.sleep(2)
+            continue
+        assert result is not None
+        raw = (result.stdout or "").strip()
+        if not raw:
+            last_err = "empty stdout"
+            time.sleep(2)
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_err = f"json decode error: {e!r}; stdout={raw!r}"
+            time.sleep(2)
+            continue
+        if isinstance(parsed, dict) and "containers" in parsed:
+            entries = list(parsed["containers"])
+        elif isinstance(parsed, list):
+            entries = parsed
+        else:
+            last_err = f"unexpected ps payload shape: {parsed!r}"
+            time.sleep(2)
+            continue
+        running = [
+            e for e in entries
+            if "running" in _container_status(e).lower()
+        ]
+        last_entries = running
+        if len(running) == expected_count:
+            return running
+        time.sleep(2)
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_running={last_entries!r}"
+    )
+    raise RuntimeError(
+        f"deployment {deployment} never reached {expected_count} running "
+        f"containers within {timeout_s}s{detail}"
+    )
+
+
+def _container_wait_image_transition(
+    runtime: str, container: str, deployment: str,
+    expected_image: str, expected_count: int, timeout_s: int = 180,
+) -> list[dict]:
+    """Container-mode analogue of `_wait_image_transition`."""
+    deadline = time.monotonic() + timeout_s
+    last_state: list[dict] = []
+    last_err: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            result = _container_exec(
+                runtime, container,
+                [
+                    _CONTAINER_BIN,
+                    "--data-dir", _CONTAINER_DATA_DIR,
+                    "ps",
+                    "--deployment", deployment,
+                    "--containers",
+                    "--format", "json",
+                ],
+                check=True, capture=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            last_err = (
+                f"exit={exc.returncode} stderr={(exc.stderr or '').strip()!r}"
+            )
+            time.sleep(2)
+            continue
+        assert result is not None
+        raw = (result.stdout or "").strip()
+        if not raw:
+            last_err = "empty stdout"
+            time.sleep(2)
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            last_err = f"json decode error: {e!r}; stdout={raw!r}"
+            time.sleep(2)
+            continue
+        if isinstance(parsed, dict) and "containers" in parsed:
+            entries = list(parsed["containers"])
+        elif isinstance(parsed, list):
+            entries = parsed
+        else:
+            last_err = f"unexpected ps payload shape: {parsed!r}"
+            time.sleep(2)
+            continue
+        running = [
+            e for e in entries
+            if "running" in _container_status(e).lower()
+        ]
+        last_state = running
+        if len(running) == expected_count and all(
+            _container_image(e) == expected_image for e in running
+        ):
+            return running
+        time.sleep(2)
+    detail = (
+        f"; last_err={last_err}" if last_err else
+        f"; last_running={[(_container_image(e), _container_status(e)) for e in last_state]!r}"
+    )
+    raise RuntimeError(
+        f"deployment {deployment} never converged to {expected_count} "
+        f"containers on image {expected_image} within {timeout_s}s{detail}"
+    )
+
+
+def _container_mode_settings() -> tuple[str, str, str]:
+    """Resolve (runtime, image, network) from env + defaults.
+
+    Raises on missing runtime; dies on missing image (with actionable msg).
+    Always ensures the network exists.
+    """
+    runtime = _detect_container_runtime()
+    image = os.environ.get("ZLAYER_E2E_IMAGE", "zlayer/zlayer-e2e-node:latest")
+    network = os.environ.get("ZLAYER_E2E_NETWORK", "zlayer-e2e")
+    _ensure_e2e_image(runtime, image)
+    _ensure_e2e_network(runtime, network)
+    return runtime, image, network
+
+
+# ---------------------------------------------------------------------------
+# Container-mode cluster suites
+# ---------------------------------------------------------------------------
+
+
+def run_cluster_3node_container(args: argparse.Namespace) -> int:
+    """Container-mode mirror of `run_cluster_3node`."""
+    runtime, image, network = _container_mode_settings()
+    suite = "cluster_3node"
+    names: list[str] = []
+    try:
+        names, _ips, api_endpoints = _bootstrap_3node_cluster_container(
+            runtime, image, network, suite,
+        )
+        log("cluster_3node(container): waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster_url(
+            api_endpoints[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+        for n in nodes:
+            log(
+                f"cluster_3node(container): node id={n.get('id', '?')} "
+                f"role={n.get('role', '?')} status={n.get('status', '?')}"
+            )
+        log("cluster_3node(container): PASS — 3 ready nodes with leader elected")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"cluster_3node(container): FAIL — {e!r}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        _cleanup_cluster_container(runtime, names, network=network)
+
+
+def run_cluster_failover_container(args: argparse.Namespace) -> int:
+    """Container-mode mirror of `run_cluster_failover`.
+
+    Failover here means `<runtime> stop <container>` instead of `_kill_pg`,
+    and `<runtime> start` (or relaunch) for recovery. We relaunch the
+    container from the same image so the daemon's data-dir is wiped — node
+    join state survives only if the runtime preserved the rootfs, which
+    `--rm` does NOT. Restart-via-join is the correct semantics anyway:
+    signed join tokens are single-use, so we mint a fresh one.
+    """
+    runtime, image, network = _container_mode_settings()
+    suite = "cluster_failover"
+    names: list[str] = []
+    try:
+        names, ips, api_endpoints = _bootstrap_3node_cluster_container(
+            runtime, image, network, suite,
+        )
+        leader_url = api_endpoints[0]
+        log("cluster_failover(container): waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster_url(
+            leader_url, expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        # Pick a worker (non-leader). Bootstrap path makes node1 leader.
+        worker_idx: Optional[int] = None
+        for n in nodes:
+            role = str(n.get("role", "")).lower()
+            api_endpoint = str(n.get("api_endpoint") or n.get("address") or "")
+            if role and role != "leader":
+                for i, port in enumerate(CLUSTER_NODES):
+                    if str(port["api"]) in api_endpoint:
+                        worker_idx = i
+                        break
+                if worker_idx is None:
+                    worker_idx = 1
+                break
+        if worker_idx is None:
+            worker_idx = 1
+        log(
+            f"cluster_failover(container): selected worker = node{worker_idx + 1} "
+            f"(api={CLUSTER_NODES[worker_idx]['api']})"
+        )
+
+        # 1. Stop the worker container.
+        _container_stop(runtime, names[worker_idx])
+
+        # 2. Poll for `dead`.
+        log(
+            f"cluster_failover(container): waiting up to "
+            f"{CLUSTER_NODE_DEAD_TIMEOUT_S}s for node{worker_idx + 1} → dead"
+        )
+        deadline = time.monotonic() + CLUSTER_NODE_DEAD_TIMEOUT_S
+        saw_dead = False
+        while time.monotonic() < deadline:
+            try:
+                current = _fetch_cluster_nodes_url(leader_url)
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
+                continue
+            for n in current:
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                if str(CLUSTER_NODES[worker_idx]["api"]) not in api_endpoint:
+                    continue
+                if str(n.get("status", "")).lower() == "dead":
+                    saw_dead = True
+                    break
+            if saw_dead:
+                break
+            time.sleep(2)
+        if not saw_dead:
+            raise RuntimeError(
+                f"node{worker_idx + 1} never transitioned to 'dead' within "
+                f"{CLUSTER_NODE_DEAD_TIMEOUT_S}s"
+            )
+        log(f"cluster_failover(container): node{worker_idx + 1} → dead (OK)")
+
+        # 3. Relaunch the worker container + rejoin with a fresh token.
+        # Since we used --rm, the previous container's data-dir is gone;
+        # rejoin via a fresh signed token from the leader is the right path.
+        log(f"cluster_failover(container): relaunching node{worker_idx + 1}")
+        _container_run(
+            runtime,
+            name=names[worker_idx], image=image, network=network,
+            ip=ips[worker_idx],
+        )
+        cfg = CLUSTER_NODES[worker_idx]
+        gen = _container_exec(
+            runtime, names[0],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "node", "generate-join-token",
+                CLUSTER_DEPLOYMENT,
+                "-a", leader_url,
+            ],
+            check=True, capture=True,
+        )
+        assert gen is not None
+        token = _parse_join_token(gen.stdout)
+        _container_exec(
+            runtime, names[worker_idx],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "node", "join",
+                f"{ips[0]}:{CLUSTER_NODES[0]['api']}",
+                "--token", token,
+                "--advertise-addr", ips[worker_idx],
+                "--api-port", str(cfg["api"]),
+                "--raft-port", str(cfg["raft"]),
+                "--overlay-port", str(cfg["overlay"]),
+            ],
+            check=True,
+        )
+        _container_exec(
+            runtime, names[worker_idx],
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "serve",
+                "--bind", f"0.0.0.0:{cfg['api']}",
+                "--deployment-name", CLUSTER_DEPLOYMENT,
+            ],
+            detach=True,
+        )
+        if not _wait_http_ok(
+            f"{api_endpoints[worker_idx]}/health/ready", 30,
+        ):
+            raise RuntimeError(
+                f"restarted node{worker_idx + 1} (container) never came up on "
+                f"{api_endpoints[worker_idx]}"
+            )
+
+        # 4. Poll for `ready` again.
+        log(
+            f"cluster_failover(container): waiting up to "
+            f"{CLUSTER_NODE_RECOVER_TIMEOUT_S}s for node{worker_idx + 1} → ready"
+        )
+        deadline = time.monotonic() + CLUSTER_NODE_RECOVER_TIMEOUT_S
+        recovered = False
+        while time.monotonic() < deadline:
+            try:
+                current = _fetch_cluster_nodes_url(leader_url)
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
+                continue
+            for n in current:
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                if str(CLUSTER_NODES[worker_idx]["api"]) not in api_endpoint:
+                    continue
+                if str(n.get("status", "")).lower() == "ready":
+                    recovered = True
+                    break
+            if recovered:
+                break
+            time.sleep(2)
+        if not recovered:
+            raise RuntimeError(
+                f"node{worker_idx + 1} never recovered to 'ready' within "
+                f"{CLUSTER_NODE_RECOVER_TIMEOUT_S}s"
+            )
+        log(
+            f"cluster_failover(container): PASS — node{worker_idx + 1} "
+            "ready→dead→ready"
+        )
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"cluster_failover(container): FAIL — {e!r}",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    finally:
+        _cleanup_cluster_container(runtime, names, network=network)
+
+
+def run_cluster_scaling_container(args: argparse.Namespace) -> int:
+    """Container-mode mirror of `run_cluster_scaling`.
+
+    `zlayer deploy <spec>` runs INSIDE the leader container; the spec file
+    needs to be visible inside the container. We copy each spec into the
+    leader container under /tmp via `<runtime> cp` before deploying.
+    """
+    runtime, image, network = _container_mode_settings()
+    suite = "cluster_scaling"
+    names: list[str] = []
+    try:
+        names, _ips, api_endpoints = _bootstrap_3node_cluster_container(
+            runtime, image, network, suite,
+        )
+        log("cluster_scaling(container): waiting for cluster to converge")
+        _wait_for_ready_cluster_url(
+            api_endpoints[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        leader = names[0]
+        spec_1r = CLUSTER_SPECS_DIR / "nginx-v1-1r.yaml"
+        spec_3r = CLUSTER_SPECS_DIR / "nginx-v1-3r.yaml"
+
+        def _cp_spec(spec: Path) -> str:
+            """Copy `spec` into the leader container, return inside-path."""
+            inside = f"/tmp/{spec.name}"
+            subprocess.run(
+                [runtime, "cp", str(spec), f"{leader}:{inside}"],
+                check=True, capture_output=True,
+            )
+            return inside
+
+        # --- 1 replica ----------------------------------------------------
+        inside_1r = _cp_spec(spec_1r)
+        log(f"cluster_scaling(container): deploying {spec_1r.name} (1 replica)")
+        _container_exec(
+            runtime, leader,
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "deploy", "--detach", inside_1r,
+            ],
+            check=True,
+        )
+        log("cluster_scaling(container): waiting for 1 running container")
+        _container_ps_running(
+            runtime, leader, CLUSTER_APP_DEPLOYMENT, expected_count=1,
+        )
+        log("cluster_scaling(container): 1 replica running (OK)")
+
+        # --- 3 replicas ---------------------------------------------------
+        inside_3r = _cp_spec(spec_3r)
+        log(f"cluster_scaling(container): deploying {spec_3r.name} (3 replicas)")
+        _container_exec(
+            runtime, leader,
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "deploy", "--detach", inside_3r,
+            ],
+            check=True,
+        )
+        log("cluster_scaling(container): waiting for 3 running containers")
+        running = _container_ps_running(
+            runtime, leader, CLUSTER_APP_DEPLOYMENT, expected_count=3,
+        )
+
+        node_ids = [_container_node(e) for e in running]
+        distinct = {nid for nid in node_ids if nid}
+        log(f"cluster_scaling(container): replica node distribution = {node_ids!r}")
+        if len(distinct) < 2:
+            raise RuntimeError(
+                f"expected replicas spread across at least 2 nodes; "
+                f"got distinct={distinct!r} from {node_ids!r}"
+            )
+        log(
+            f"cluster_scaling(container): replicas spread across "
+            f"{len(distinct)} nodes (OK)"
+        )
+
+        # --- back to 1 replica -------------------------------------------
+        log(f"cluster_scaling(container): redeploying {spec_1r.name} (3→1)")
+        _container_exec(
+            runtime, leader,
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "deploy", "--detach", inside_1r,
+            ],
+            check=True,
+        )
+        log("cluster_scaling(container): waiting for 1 running container")
+        _container_ps_running(
+            runtime, leader, CLUSTER_APP_DEPLOYMENT, expected_count=1,
+        )
+        log("cluster_scaling(container): PASS — 1 → 3 → 1 replicas across cluster")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"cluster_scaling(container): FAIL — {e!r}",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    finally:
+        _cleanup_cluster_container(runtime, names, network=network)
+
+
+def run_cluster_upgrade_container(args: argparse.Namespace) -> int:
+    """Container-mode mirror of `run_cluster_upgrade`."""
+    runtime, image, network = _container_mode_settings()
+    suite = "cluster_upgrade"
+    names: list[str] = []
+    try:
+        names, _ips, api_endpoints = _bootstrap_3node_cluster_container(
+            runtime, image, network, suite,
+        )
+        log("cluster_upgrade(container): waiting for cluster to converge")
+        _wait_for_ready_cluster_url(
+            api_endpoints[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        leader = names[0]
+        spec_v1 = CLUSTER_SPECS_DIR / "nginx-v1-3r.yaml"
+        spec_v2 = CLUSTER_SPECS_DIR / "nginx-v2-3r.yaml"
+
+        def _cp_spec(spec: Path) -> str:
+            inside = f"/tmp/{spec.name}"
+            subprocess.run(
+                [runtime, "cp", str(spec), f"{leader}:{inside}"],
+                check=True, capture_output=True,
+            )
+            return inside
+
+        # --- v1 -----------------------------------------------------------
+        inside_v1 = _cp_spec(spec_v1)
+        log(f"cluster_upgrade(container): deploying {spec_v1.name} (v1)")
+        _container_exec(
+            runtime, leader,
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "deploy", "--detach", inside_v1,
+            ],
+            check=True,
+        )
+        log("cluster_upgrade(container): waiting for 3 running v1 containers")
+        v1_running = _container_ps_running(
+            runtime, leader, CLUSTER_APP_DEPLOYMENT, expected_count=3,
+        )
+        initial_images = [_container_image(e) for e in v1_running]
+        log(f"cluster_upgrade(container): initial images = {initial_images!r}")
+
+        # --- v2 -----------------------------------------------------------
+        inside_v2 = _cp_spec(spec_v2)
+        log(f"cluster_upgrade(container): deploying {spec_v2.name} (v2)")
+        _container_exec(
+            runtime, leader,
+            [
+                _CONTAINER_BIN,
+                "--data-dir", _CONTAINER_DATA_DIR,
+                "deploy", "--detach", inside_v2,
+            ],
+            check=True,
+        )
+        expected_image = "nginx:1.29-alpine"
+        log(f"cluster_upgrade(container): waiting for 3 containers on {expected_image}")
+        _container_wait_image_transition(
+            runtime, leader, CLUSTER_APP_DEPLOYMENT,
+            expected_image=expected_image, expected_count=3,
+        )
+
+        log("cluster_upgrade(container): PASS — 3 replicas migrated v1.28 → v1.29")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"cluster_upgrade(container): FAIL — {e!r}",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    finally:
+        _cleanup_cluster_container(runtime, names, network=network)
+
+
+def run_cluster_node_upgrade_container(args: argparse.Namespace) -> int:
+    """Container-mode mirror of `run_cluster_node_upgrade`.
+
+    POSTs to the cluster-upgrade endpoint are made from the host against
+    the container IPs (the bridge network is reachable from the host).
+    """
+    runtime, image, network = _container_mode_settings()
+    suite = "cluster_node_upgrade"
+    names: list[str] = []
+    try:
+        names, _ips, api_endpoints = _bootstrap_3node_cluster_container(
+            runtime, image, network, suite,
+        )
+        log("cluster_node_upgrade(container): waiting for cluster to converge")
+        nodes = _wait_for_ready_cluster_url(
+            api_endpoints[0], expected_nodes=3,
+            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+        )
+
+        # Identify leader URL. Bootstrap path makes node1 leader.
+        leader_url: Optional[str] = None
+        for n in nodes:
+            role = str(n.get("role", "")).lower()
+            if role == "leader":
+                api_endpoint = str(
+                    n.get("api_endpoint") or n.get("address") or ""
+                )
+                for ep in api_endpoints:
+                    # ep is `http://<ip>:<port>` — match `<ip>:<port>` or `<port>`.
+                    bare = ep.split("//", 1)[-1]
+                    if bare in api_endpoint or str(bare.split(":")[-1]) in api_endpoint:
+                        leader_url = ep
+                        break
+                break
+        if leader_url is None:
+            leader_url = api_endpoints[0]
+        log(f"cluster_node_upgrade(container): leader = {leader_url}")
+
+        follower_url = api_endpoints[-1]
+        if follower_url == leader_url:
+            follower_url = next(
+                ep for ep in api_endpoints if ep != leader_url
+            )
+        log(f"cluster_node_upgrade(container): follower for 421 test = {follower_url}")
+
+        def _post_cluster_upgrade(
+            api_url: str, body: dict, timeout_s: int = 60,
+        ) -> tuple[int, dict, dict]:
+            url = f"{api_url}/api/v1/cluster/upgrade"
+            req = urllib.request.Request(
+                url, method="POST",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(body).encode("utf-8"),
+            )
+            bearer = os.environ.get("ZLAYER_E2E_CLUSTER_TOKEN")
+            if bearer:
+                req.add_header("Authorization", f"Bearer {bearer}")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    return (
+                        resp.status,
+                        json.loads(resp.read().decode("utf-8")),
+                        dict(resp.headers),
+                    )
+            except urllib.error.HTTPError as e:
+                body_bytes = e.read() if hasattr(e, "read") else b""
+                body_text = body_bytes.decode("utf-8", errors="replace")
+                try:
+                    body_json = json.loads(body_text) if body_text else {}
+                except json.JSONDecodeError:
+                    body_json = {"raw": body_text}
+                return (
+                    e.code, body_json, dict(e.headers) if e.headers else {},
+                )
+
+        # --- Test 1: 421 leader-redirect ---------------------------------
+        log(
+            "cluster_node_upgrade(container): Test 1 — POST against "
+            "non-leader, expect 421 + X-Leader-Addr"
+        )
+        bad_body = {
+            "version": "v0.0.0-test-nonexistent",
+            "cooldown_secs": 1,
+            "strict": False,
+        }
+        status1, body1, headers1 = _post_cluster_upgrade(
+            follower_url, bad_body, timeout_s=30,
+        )
+        if status1 != 421:
+            raise RuntimeError(
+                f"expected 421 from follower POST, got {status1}; "
+                f"body={body1!r} headers={headers1!r}"
+            )
+        leader_addr_hdr = (
+            headers1.get("X-Leader-Addr") or headers1.get("x-leader-addr")
+        )
+        if not leader_addr_hdr:
+            raise RuntimeError(
+                "follower 421 response missing X-Leader-Addr header; "
+                f"status={status1} body={body1!r} headers={headers1!r}"
+            )
+        if str(body1.get("error", "")) != "not_leader":
+            raise RuntimeError(
+                "follower 421 response body missing `error: not_leader`; "
+                f"status={status1} body={body1!r} headers={headers1!r}"
+            )
+        log(
+            f"cluster_node_upgrade(container): 421 redirect OK "
+            f"(leader_addr={leader_addr_hdr})"
+        )
+
+        # --- Test 2: orchestrator walks followers and records errors -----
+        log(
+            "cluster_node_upgrade(container): Test 2 — POST against "
+            "leader with bad version, expect 2 errors / 0 upgrades"
+        )
+        status2, body2, _headers2 = _post_cluster_upgrade(
+            leader_url, bad_body, timeout_s=600,
+        )
+        if status2 != 200:
+            raise RuntimeError(
+                f"expected 200 from leader POST, got {status2}; "
+                f"body={body2!r}"
+            )
+        upgraded = body2.get("upgraded") or []
+        errors_list = body2.get("errors") or []
+        skipped = body2.get("skipped") or []
+        if len(upgraded) != 0:
+            raise RuntimeError(
+                f"expected upgraded=[], got {upgraded!r}; full body={body2!r}"
+            )
+        if len(errors_list) != 2:
+            raise RuntimeError(
+                f"expected 2 errors (one per follower), got "
+                f"{len(errors_list)}; errors={errors_list!r} "
+                f"upgraded={upgraded!r} skipped={skipped!r}"
+            )
+        log(
+            f"cluster_node_upgrade(container): orchestrator-walk OK "
+            f"(upgraded={upgraded!r} skipped={skipped!r} "
+            f"errors={[e.get('node_id') for e in errors_list]!r})"
+        )
+
+        # --- Test 3: cluster survives the failed upgrade -----------------
+        log(
+            "cluster_node_upgrade(container): Test 3 — re-fetch cluster "
+            "nodes, expect all 3 still ready"
+        )
+        after = _fetch_cluster_nodes_url(leader_url)
+        ready_after = [
+            n for n in after
+            if str(n.get("status", "")).lower() == "ready"
+        ]
+        if len(ready_after) != 3:
+            raise RuntimeError(
+                f"expected 3 ready nodes after failed upgrade, got "
+                f"{len(ready_after)}; nodes={after!r}"
+            )
+        log(
+            "cluster_node_upgrade(container): PASS — 421-redirect, "
+            "orchestrator-walk, error-recording, cluster-survival all verified"
+        )
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"cluster_node_upgrade(container): FAIL — {e!r}",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+    finally:
+        _cleanup_cluster_container(runtime, names, network=network)
+
+
+# ---------------------------------------------------------------------------
+# Cluster suite entry points (host-mode preserved bit-identical)
+# ---------------------------------------------------------------------------
+
+
 def run_cluster_3node(args: argparse.Namespace) -> int:
     """Stand up a 3-node cluster, assert it forms with a leader + 3 ready."""
+    if args.overlay_mode == "container":
+        return run_cluster_3node_container(args)
     if not args.no_build:
         build_phase(throwaway=args.throwaway, with_manager=False)
 
@@ -810,6 +1946,8 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
     assertion belongs in a separate suite. This suite scope is heartbeat
     transition (ready -> dead -> ready) per README §385-387.
     """
+    if args.overlay_mode == "container":
+        return run_cluster_failover_container(args)
     if not args.no_build:
         build_phase(throwaway=args.throwaway, with_manager=False)
 
@@ -1148,6 +2286,8 @@ def _wait_image_transition(
 
 def run_cluster_scaling(args: argparse.Namespace) -> int:
     """3-node cluster, deploy nginx-v1 at 1→3→1 replicas via spec swaps."""
+    if args.overlay_mode == "container":
+        return run_cluster_scaling_container(args)
     if not args.no_build:
         build_phase(throwaway=args.throwaway, with_manager=False)
 
@@ -1261,6 +2401,8 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
 
 def run_cluster_upgrade(args: argparse.Namespace) -> int:
     """3-node cluster, rolling image upgrade v1.28 → v1.29."""
+    if args.overlay_mode == "container":
+        return run_cluster_upgrade_container(args)
     if not args.no_build:
         build_phase(throwaway=args.throwaway, with_manager=False)
 
@@ -1366,6 +2508,8 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
     """`POST /api/v1/cluster/upgrade` with a bad version: assert 421
     leader-redirect, orchestrator follower-walk + error-recording, and
     that the cluster survives the failed rollout."""
+    if args.overlay_mode == "container":
+        return run_cluster_node_upgrade_container(args)
     if not args.no_build:
         build_phase(throwaway=args.throwaway, with_manager=False)
 
@@ -1670,9 +2814,12 @@ def main() -> int:
     args = parse_args()
 
     # Overlay-mode gate. `loopback` (default) is the historical raw-process
-    # path and falls through. `container` is the privileged-container
-    # harness scaffolded in Wave 10; the launch driver is the next
-    # iteration, so today we short-circuit BEFORE any daemon-setup runs.
+    # path. `container` boots each node inside a privileged container on a
+    # shared bridge network so the boringtun overlay is actually exercised.
+    # The env-var gate (`ZLAYER_E2E_PRIVILEGED=1`) is a finger-on-the-trigger
+    # acknowledgement that the host meets the prereqs in
+    # docs/operating/e2e-privileged.md (TUN, --privileged allowed, image
+    # built via `zlayer pipeline -f ZPipeline.yaml --set VERSION=dev`).
     if args.overlay_mode == "container":
         if os.environ.get("ZLAYER_E2E_PRIVILEGED") != "1":
             sys.stderr.write(
@@ -1681,17 +2828,25 @@ def main() -> int:
                 "docs/operating/e2e-privileged.md for setup)\n"
             )
             sys.exit(0)
-        # Container-mode driver lives in a sibling module on a future
-        # iteration; for now this branch is a TODO-stub that fails loudly
-        # so an operator who tries to use it gets actionable feedback.
-        sys.stderr.write(
-            "ERROR: --overlay-mode container is scaffolded but not yet "
-            "fully wired. Image (images/ZImagefile.zlayer-e2e-node), pipeline "
-            "registration, and CI gate are in place. The container-launch "
-            "logic itself is the next iteration -- contributions welcome.\n"
-            "See docs/operating/e2e-privileged.md for the full design.\n"
-        )
-        sys.exit(2)
+        # Only cluster suites are supported in container mode today; the
+        # manager_auth suite uses a host-side daemon socket + leptos
+        # frontend that don't make sense to mirror into containers.
+        if args.suite not in (
+            "cluster_3node",
+            "cluster_failover",
+            "cluster_scaling",
+            "cluster_upgrade",
+            "cluster_node_upgrade",
+        ):
+            sys.stderr.write(
+                f"--overlay-mode container is only supported for cluster_* "
+                f"suites; got suite={args.suite!r}. "
+                "See docs/operating/e2e-privileged.md.\n"
+            )
+            sys.exit(2)
+        # Fall through to the cluster suite dispatch below; each
+        # `run_cluster_*` function branches on `args.overlay_mode` to call
+        # its `*_container` counterpart.
 
     # Cluster suites do not use the manager fixture pipeline below; dispatch
     # them up-front and return their exit code directly.
