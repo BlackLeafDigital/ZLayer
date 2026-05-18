@@ -37,6 +37,12 @@ pub struct ServiceState {
     pub service_manager: Option<Arc<RwLock<ServiceManager>>>,
     /// Storage backend for deployment specifications
     pub storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    /// Raft node ID of the local daemon, if Raft is initialized.
+    ///
+    /// Surfaced on container API responses so the CLI/UI can show which node
+    /// owns each container. `None` in read-only mode or when Raft failed to
+    /// initialize.
+    pub local_node_id: Option<String>,
 }
 
 impl ServiceState {
@@ -44,10 +50,12 @@ impl ServiceState {
     pub fn new(
         service_manager: Arc<RwLock<ServiceManager>>,
         storage: Arc<dyn DeploymentStorage + Send + Sync>,
+        local_node_id: Option<String>,
     ) -> Self {
         Self {
             service_manager: Some(service_manager),
             storage,
+            local_node_id,
         }
     }
 
@@ -59,6 +67,7 @@ impl ServiceState {
         Self {
             service_manager: None,
             storage,
+            local_node_id: None,
         }
     }
 }
@@ -415,6 +424,7 @@ pub async fn list_containers(
                 state: "running".to_string(),
                 pid: None,
                 overlay_ip: None,
+                node_id: state.local_node_id.clone(),
             });
         }
     }

@@ -78,7 +78,7 @@ pub use lb::{
 
 // Re-export service routing types
 pub use acme::{CertManager, CertMetadata};
-pub use routes::{ResolvedService, RouteEntry, ServiceRegistry};
+pub use routes::{endpoint_lb_key, ResolvedService, RouteEntry, ServiceRegistry};
 pub use sni_resolver::SniCertResolver;
 
 // Re-export stream (L4) proxy types

@@ -81,6 +81,7 @@ pub mod image_ref_serde {
 pub mod api;
 pub mod auth;
 pub mod client;
+pub mod cluster;
 pub mod jwt;
 pub mod scratch;
 pub mod secrets;

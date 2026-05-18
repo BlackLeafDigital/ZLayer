@@ -35,16 +35,86 @@ pub enum ContainerState {
     Failed { reason: String },
 }
 
-/// Container identifier
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Container identifier.
+///
+/// Identifies a container by `(service, replica)` for the legacy single-group
+/// case, and extends with `role` + `node_id` for cluster-aware
+/// multi-group services and cross-node identification.
+///
+/// Defaults: `role = "default"`, `node_id = 0`. Existing constructors
+/// (`ContainerId::new(service, replica)`) produce these defaults. Use
+/// `ContainerId::with_role_and_node(...)` when the new fields matter.
+///
+/// Display:
+/// - With defaults: `{service}-rep-{replica}` (backward compat).
+/// - Otherwise: `{service}-{role}-{replica}-on-{node_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ContainerId {
     pub service: String,
     pub replica: u32,
+    /// Role within `replica_groups`. `"default"` for services without groups.
+    #[serde(default = "default_container_role")]
+    pub role: String,
+    /// Cluster node that owns this container. `0` in single-node deployments
+    /// or before the cluster is initialized.
+    #[serde(default)]
+    pub node_id: u64,
+}
+
+fn default_container_role() -> String {
+    "default".to_string()
+}
+
+impl ContainerId {
+    /// Build a legacy `{service, replica}` `ContainerId` with default `role`
+    /// and `node_id`. Used by all existing callsites — behavior is unchanged.
+    #[must_use]
+    pub fn new(service: impl Into<String>, replica: u32) -> Self {
+        Self {
+            service: service.into(),
+            replica,
+            role: default_container_role(),
+            node_id: 0,
+        }
+    }
+
+    /// Build a cluster-aware `ContainerId` with explicit `role` and `node_id`.
+    /// Used by `ServiceManager` when a service has `replica_groups` or when
+    /// the daemon participates in a multi-node cluster.
+    #[must_use]
+    pub fn with_role_and_node(
+        service: impl Into<String>,
+        replica: u32,
+        role: impl Into<String>,
+        node_id: u64,
+    ) -> Self {
+        Self {
+            service: service.into(),
+            replica,
+            role: role.into(),
+            node_id,
+        }
+    }
+
+    /// True when both `role` and `node_id` are at their defaults — i.e.
+    /// this is a legacy-shape `ContainerId`.
+    #[must_use]
+    pub fn is_legacy_shape(&self) -> bool {
+        self.role == "default" && self.node_id == 0
+    }
 }
 
 impl std::fmt::Display for ContainerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-rep-{}", self.service, self.replica)
+        if self.is_legacy_shape() {
+            write!(f, "{}-rep-{}", self.service, self.replica)
+        } else {
+            write!(
+                f,
+                "{}-{}-{}-on-{}",
+                self.service, self.role, self.replica, self.node_id
+            )
+        }
     }
 }
 
@@ -2080,10 +2150,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_runtime() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
 
         runtime.pull_image("test:latest").await.unwrap();
         runtime.create_container(&id, &mock_spec()).await.unwrap();
@@ -2138,10 +2205,7 @@ mod tests {
     #[tokio::test]
     async fn mock_kill_container_defaults_to_sigkill() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "kill-me".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("kill-me".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2215,10 +2279,7 @@ mod tests {
     #[tokio::test]
     async fn default_wait_outcome_delegates_to_wait_container() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "wait-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("wait-test".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2233,10 +2294,7 @@ mod tests {
     #[tokio::test]
     async fn mock_kill_container_rejects_bogus_signal() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "kill-me".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("kill-me".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2317,10 +2375,7 @@ mod tests {
     #[tokio::test]
     async fn default_logs_stream_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "stream-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stream-test".to_string(), 0);
         // The success-side `LogsStream` is not `Debug`, so we can't call
         // `unwrap_err`; pattern-match on the Result directly instead.
         match runtime.logs_stream(&id, LogsStreamOptions::default()).await {
@@ -2333,10 +2388,7 @@ mod tests {
     #[tokio::test]
     async fn default_stats_stream_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "stream-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stream-test".to_string(), 0);
         match runtime.stats_stream(&id).await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2357,10 +2409,7 @@ mod tests {
     #[tokio::test]
     async fn default_archive_get_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         match runtime.archive_get(&id, "/etc/hosts").await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2371,10 +2420,7 @@ mod tests {
     #[tokio::test]
     async fn default_archive_put_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         let err = runtime
             .archive_put(
                 &id,
@@ -2390,10 +2436,7 @@ mod tests {
     #[tokio::test]
     async fn default_archive_head_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         let err = runtime.archive_head(&id, "/etc/hosts").await.unwrap_err();
         assert!(matches!(err, AgentError::Unsupported(_)));
     }
@@ -2401,10 +2444,7 @@ mod tests {
     #[tokio::test]
     async fn default_exec_pty_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "exec-pty".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("exec-pty".to_string(), 0);
         // The success-side `ExecHandle` is not `Debug`, so we can't call
         // `unwrap_err`; pattern-match on the Result directly instead.
         match runtime.exec_pty(&id, ExecOptions::default()).await {
@@ -2472,10 +2512,7 @@ mod tests {
     #[tokio::test]
     async fn default_export_container_fs_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "export".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("export".to_string(), 0);
         match runtime.export_container_fs(&id).await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2486,10 +2523,7 @@ mod tests {
     #[tokio::test]
     async fn default_commit_container_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "commit".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("commit".to_string(), 0);
         let err = runtime
             .commit_container(&id, &CommitOptions::default())
             .await
@@ -2539,10 +2573,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "logs-order".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("logs-order".to_string(), 0);
 
         let make_chunk = |s: &str, ch: LogChannel| LogChunk {
             stream: ch,
@@ -2590,10 +2621,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "logs-empty".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("logs-empty".to_string(), 0);
 
         let opts = LogsStreamOptions {
             follow: false,
@@ -2618,10 +2646,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "stats-order".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stats-order".to_string(), 0);
 
         let now = chrono::Utc::now();
         let mk = |cpu: u64| StatsSample {

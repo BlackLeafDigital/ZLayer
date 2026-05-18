@@ -63,10 +63,30 @@ pub fn make_interface_name(parts: &[&str], suffix: &str) -> String {
     }
 }
 
+/// Tracking info recorded by `OverlayManager::attach_container` for every
+/// container that successfully attaches to an overlay interface on Linux.
+/// Used by `detach_container(pid)` to release the IPs back to the
+/// allocator and tear down host-side veths.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct AttachInfo {
+    /// IP allocated on the per-service overlay (eth0 inside the container).
+    service_ip: IpAddr,
+    /// IP allocated on the global overlay (eth1 inside the container), if
+    /// the container joined the global mesh.
+    global_ip: Option<IpAddr>,
+    /// True iff the container also attached to the global overlay (eth1).
+    joined_global: bool,
+}
+
 /// Manages overlay networks for a deployment
 pub struct OverlayManager {
     /// Deployment name (used for network naming)
     deployment: String,
+    /// Per-daemon-process disambiguator included in overlay link names so multiple
+    /// daemons sharing a single host netns (local testing, multi-tenant hosts) don't
+    /// collide on link names. Stable for the daemon's lifetime, changes across restarts.
+    instance_id: String,
     /// Global overlay interface name
     global_interface: Option<String>,
     /// Global overlay transport (must be kept alive for the TUN device lifetime)
@@ -99,6 +119,12 @@ pub struct OverlayManager {
             std::collections::HashMap<windows::core::GUID, (String, std::net::IpAddr)>,
         >,
     >,
+    /// Per-PID tracking of overlay attachments on Linux. Populated by
+    /// `attach_container` on success; consumed by `detach_container(pid)`
+    /// to release IPs and delete host-side veth pairs. Linux-only because
+    /// Windows uses the HCN cleanup path above.
+    #[cfg(target_os = "linux")]
+    attached: std::sync::Arc<tokio::sync::Mutex<HashMap<u32, AttachInfo>>>,
     /// Overlay hickory DNS server listen address, if the daemon bootstrapped
     /// one. Used to populate the `Dns.ServerList` field on HCN endpoints so
     /// Windows containers resolve overlay service names. `None` when the
@@ -135,6 +161,58 @@ pub struct OverlayManager {
     nat_last_refresh: AtomicU64,
 }
 
+/// Best-effort sweep of orphan veth endpoints whose owning container
+/// process is no longer alive. Names matching `veth-<pid>-*` or
+/// `vc-<pid>-*` where `/proc/<pid>` does not exist are deleted.
+///
+/// Linux-only: there is no veth concept on other platforms.
+///
+/// Implemented as a free function (rather than `&self`) so the periodic
+/// background sweep task can call it without holding a reference to the
+/// `OverlayManager` — it reads no manager state, only the kernel link
+/// list and `/proc`.
+#[cfg(target_os = "linux")]
+async fn sweep_orphan_veths_inner() {
+    let links = match crate::netlink::list_all_links().await {
+        Ok(links) => links,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list links for orphan sweep");
+            return;
+        }
+    };
+
+    for (_index, name) in links {
+        // We only care about our veth endpoints.
+        let remainder = if let Some(r) = name.strip_prefix("veth-") {
+            r
+        } else if let Some(r) = name.strip_prefix("vc-") {
+            r
+        } else {
+            continue;
+        };
+
+        // Extract the PID: everything before the first `-` after the prefix.
+        let Some(pid_str) = remainder.split('-').next() else {
+            continue;
+        };
+
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // If the process is still alive, leave the veth alone.
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+
+        tracing::info!(link = %name, pid = pid, "Deleting orphan veth");
+        if let Err(e) = crate::netlink::delete_link_by_name(&name).await {
+            tracing::warn!(link = %name, error = %e, "Failed to delete orphan veth");
+        }
+    }
+}
+
 impl OverlayManager {
     /// Create a new overlay manager for a deployment (legacy single-node path).
     ///
@@ -151,14 +229,16 @@ impl OverlayManager {
     /// # Panics
     /// Panics if the default CIDR `10.200.0.0/16` cannot be parsed (this is a compile-time constant).
     #[allow(clippy::unused_async)]
-    pub async fn new(deployment: String) -> Result<Self, AgentError> {
+    pub async fn new(deployment: String, instance_id: String) -> Result<Self, AgentError> {
         tracing::debug!(
             deployment = %deployment,
+            instance_id = %instance_id,
             "OverlayManager::new uses full /16 default; cluster deployments should use with_slice"
         );
         let default_cidr: IpNetwork = "10.200.0.0/16".parse().unwrap();
         Ok(Self {
             deployment,
+            instance_id,
             global_interface: None,
             global_transport: None,
             service_interfaces: RwLock::new(HashMap::new()),
@@ -172,6 +252,8 @@ impl OverlayManager {
             hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            #[cfg(target_os = "linux")]
+            attached: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dns_server_addr: None,
             dns_domain: None,
             nat_config: None,
@@ -197,9 +279,11 @@ impl OverlayManager {
         cluster_cidr: IpNetwork,
         slice_cidr: IpNetwork,
         port: u16,
+        instance_id: String,
     ) -> Self {
         Self {
             deployment,
+            instance_id,
             global_interface: None,
             global_transport: None,
             service_interfaces: RwLock::new(HashMap::new()),
@@ -213,6 +297,8 @@ impl OverlayManager {
             hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            #[cfg(target_os = "linux")]
+            attached: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dns_server_addr: None,
             dns_domain: None,
             nat_config: None,
@@ -449,7 +535,7 @@ impl OverlayManager {
             return Ok(());
         }
 
-        let interface_name = make_interface_name(&[&self.deployment], "g");
+        let interface_name = make_interface_name(&[&self.deployment, &self.instance_id], "g");
 
         let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
@@ -500,7 +586,8 @@ impl OverlayManager {
             return Ok(existing_name);
         }
 
-        let interface_name = make_interface_name(&[&self.deployment, service_name], "s");
+        let interface_name =
+            make_interface_name(&[&self.deployment, &self.instance_id, service_name], "s");
 
         // Attempt overlay creation (for inter-node communication).
         // Non-fatal: single-node deployments work fine without it.
@@ -623,19 +710,27 @@ impl OverlayManager {
             )
             .await?;
 
+            let mut global_ip: Option<IpAddr> = None;
             if join_global {
                 if let Some(global_iface) = &self.global_interface {
-                    let global_ip = self.ip_allocator.allocate()?;
-                    self.attach_to_interface(
-                        container_pid,
-                        global_iface,
-                        global_ip,
-                        "g",
-                        "eth1",
-                        false,
-                    )
-                    .await?;
+                    let g_ip = self.ip_allocator.allocate()?;
+                    self.attach_to_interface(container_pid, global_iface, g_ip, "g", "eth1", false)
+                        .await?;
+                    global_ip = Some(g_ip);
                 }
+            }
+
+            // Record the attachment so detach_container can clean it up later.
+            {
+                let mut attached = self.attached.lock().await;
+                attached.insert(
+                    container_pid,
+                    AttachInfo {
+                        service_ip: container_ip,
+                        global_ip,
+                        joined_global: global_ip.is_some(),
+                    },
+                );
             }
 
             Ok(container_ip)
@@ -717,6 +812,110 @@ impl OverlayManager {
             tracing::info!(ns = ?namespace_id, service = %service_name, ip = %ip, "Released HCN overlay attachment");
         }
         Ok(())
+    }
+
+    /// Release the overlay resources held by a container.
+    ///
+    /// Called by the runtime adapter's `remove_container` BEFORE the
+    /// container init process exits (PID is still in `/proc`). Idempotent:
+    /// no-op if `pid` was never attached or was already detached.
+    ///
+    /// On Linux:
+    ///   1. Removes the `(pid -> AttachInfo)` entry from `self.attached`.
+    ///   2. Deletes the host-side veth endpoints `veth-{pid}-s` and
+    ///      (if `joined_global`) `veth-{pid}-g` by name. Deletion is
+    ///      idempotent — `delete_link_by_name` returns Ok if the link
+    ///      is already gone.
+    ///   3. Releases the allocated IPs back to the per-node IP pool so a
+    ///      subsequent `allocate()` can hand them out again instead of
+    ///      extending the monotonic counter.
+    ///
+    /// On non-Linux: no-op (Windows uses `detach_container_hcn`; other
+    /// platforms use host networking and have nothing to detach).
+    ///
+    /// # Errors
+    /// Returns an error only if a netlink delete operation fails in a way
+    /// other than "link not found" (e.g. permission denied). The IP
+    /// release step never fails.
+    pub async fn detach_container(&self, pid: u32) -> Result<(), AgentError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let info = {
+                let mut attached = self.attached.lock().await;
+                attached.remove(&pid)
+            };
+            let Some(info) = info else { return Ok(()) };
+
+            // Delete host-side veths by name. Idempotent (delete_link_by_name
+            // returns Ok if the link is already gone).
+            let veth_s = format!("veth-{pid}-s");
+            if let Err(e) = crate::netlink::delete_link_by_name(&veth_s).await {
+                tracing::warn!(link = %veth_s, pid, error = %e, "Failed to delete service veth");
+            }
+            if info.joined_global {
+                let veth_g = format!("veth-{pid}-g");
+                if let Err(e) = crate::netlink::delete_link_by_name(&veth_g).await {
+                    tracing::warn!(link = %veth_g, pid, error = %e, "Failed to delete global veth");
+                }
+            }
+
+            // Release the IPs back to the slice allocator.
+            self.ip_allocator.release(info.service_ip);
+            if let Some(g) = info.global_ip {
+                self.ip_allocator.release(g);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Start a background tokio task that periodically calls
+    /// [`sweep_orphan_veths_inner`] to clean up any `veth-<pid>-*` or
+    /// `vc-<pid>-*` interfaces whose owning container PID has exited.
+    ///
+    /// Defensive — the primary cleanup path is `detach_container`, which
+    /// is called explicitly from runtime adapters' `remove_container`.
+    /// This sweep catches anything detach missed (daemon panic mid-attach,
+    /// runtime that bypassed `remove_container`, host-side surgery).
+    ///
+    /// Spawned with a 60-second interval. The task holds an `Arc<RwLock<Self>>`
+    /// reference so the manager stays alive for its lifetime; it exits
+    /// when the `Arc` is dropped (last strong ref away).
+    ///
+    /// Linux-only. No-op on other platforms because there are no veths
+    /// to sweep.
+    pub fn start_periodic_orphan_sweep(this: std::sync::Arc<tokio::sync::RwLock<Self>>) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = this;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // The free function `sweep_orphan_veths_inner` doesn't capture
+            // state, so we don't need to keep `self` alive for it — but we
+            // tie the task's lifetime to the manager anyway by holding the
+            // Arc in the spawned future. This way the periodic task exits
+            // cleanly when the OverlayManager is dropped.
+            tokio::spawn(async move {
+                let _keep_alive = this;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                // Skip the immediate first tick; the daemon already calls
+                // sweep on attach.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await; // consume the initial tick
+                loop {
+                    ticker.tick().await;
+                    sweep_orphan_veths_inner().await;
+                }
+            });
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -831,44 +1030,7 @@ impl OverlayManager {
     /// and there is no veth concept on other platforms.
     #[cfg(target_os = "linux")]
     async fn sweep_orphan_veths(&self) {
-        let links = match crate::netlink::list_all_links().await {
-            Ok(links) => links,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to list links for orphan sweep");
-                return;
-            }
-        };
-
-        for (_index, name) in links {
-            // We only care about our veth endpoints.
-            let remainder = if let Some(r) = name.strip_prefix("veth-") {
-                r
-            } else if let Some(r) = name.strip_prefix("vc-") {
-                r
-            } else {
-                continue;
-            };
-
-            // Extract the PID: everything before the first `-` after the prefix.
-            let Some(pid_str) = remainder.split('-').next() else {
-                continue;
-            };
-
-            let pid: u32 = match pid_str.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // If the process is still alive, leave the veth alone.
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                continue;
-            }
-
-            tracing::info!(link = %name, pid = pid, "Deleting orphan veth");
-            if let Err(e) = crate::netlink::delete_link_by_name(&name).await {
-                tracing::warn!(link = %name, error = %e, "Failed to delete orphan veth");
-            }
-        }
+        sweep_orphan_veths_inner().await;
     }
 
     /// Tear down the overlay network for a single service.
@@ -1056,6 +1218,10 @@ struct IpAllocator {
     cidr: IpNetwork,
     /// Monotonic counter for the next allocation offset relative to `base`.
     next_offset: AtomicU64,
+    /// IPs returned by `release(...)`. `allocate()` drains this first before
+    /// incrementing `next_offset`, so a churning daemon doesn't exhaust the
+    /// slice from monotonic counter growth.
+    released: parking_lot::Mutex<Vec<IpAddr>>,
 }
 
 /// On-disk serialization format for the IPAM allocator state.
@@ -1075,6 +1241,7 @@ impl IpAllocator {
             base: cidr.network(),
             cidr,
             next_offset: AtomicU64::new(1),
+            released: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -1100,6 +1267,13 @@ impl IpAllocator {
     /// address would be the broadcast for IPv4 or past the last address for
     /// IPv6).
     fn allocate(&self) -> Result<IpAddr, AgentError> {
+        // Reuse released IPs before extending into fresh counter space.
+        {
+            let mut released = self.released.lock();
+            if let Some(ip) = released.pop() {
+                return Ok(ip);
+            }
+        }
         // Reserve the offset up-front so concurrent callers can't both get
         // the same address, then fail-loud if the reserved slot is past the
         // end of the slice.
@@ -1120,6 +1294,20 @@ impl IpAllocator {
             )));
         }
         Ok(addr)
+    }
+
+    /// Return an IP to the free pool. The next `allocate()` will hand it back
+    /// before extending the monotonic counter. Idempotent: no-op if the IP is
+    /// already in the free list (we do not double-track because the counter
+    /// would already have moved past it).
+    fn release(&self, ip: IpAddr) {
+        // Light dedup: avoid pushing the same address twice. The pool is
+        // small in steady state (number of live containers); linear scan is
+        // fine.
+        let mut released = self.released.lock();
+        if !released.contains(&ip) {
+            released.push(ip);
+        }
     }
 
     fn allocate_for_service(&self, _service: &str) -> Result<IpAddr, AgentError> {
@@ -1198,6 +1386,20 @@ impl IpAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_allocator_release_recycles() {
+        let alloc = IpAllocator::new("10.200.42.0/28".parse().unwrap());
+        let a1 = alloc.allocate().expect("first alloc");
+        let a2 = alloc.allocate().expect("second alloc");
+        alloc.release(a1);
+        let a3 = alloc.allocate().expect("third alloc after release");
+        assert_eq!(a3, a1, "allocate should hand back the released IP");
+        // The next allocation continues from the monotonic counter.
+        let a4 = alloc.allocate().expect("fourth alloc");
+        assert_ne!(a4, a1);
+        assert_ne!(a4, a2);
+    }
 
     /// No generated name may ever exceed 15 characters.
     #[test]
@@ -1359,7 +1561,7 @@ mod tests {
     /// `node_ip()` should be None before `setup_global_overlay` and Some after.
     #[tokio::test]
     async fn test_node_ip_before_and_after_init() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
 
@@ -1464,7 +1666,13 @@ mod tests {
         let cluster: IpNetwork = "10.200.0.0/16".parse().unwrap();
         let slice: IpNetwork = "10.200.42.0/28".parse().unwrap();
 
-        let om = OverlayManager::with_slice("test-deploy".to_string(), cluster, slice, 51820);
+        let om = OverlayManager::with_slice(
+            "test-deploy".to_string(),
+            cluster,
+            slice,
+            51820,
+            "test".to_string(),
+        );
 
         assert_eq!(om.slice_cidr(), Some(slice));
         assert_eq!(om.cluster_cidr(), Some(cluster));
@@ -1516,7 +1724,13 @@ mod tests {
     async fn test_attach_detach_container_hcn_tracks_cleanup_map() {
         let cluster: IpNetwork = "10.200.0.0/16".parse().unwrap();
         let slice: IpNetwork = "10.200.42.0/28".parse().unwrap();
-        let om = OverlayManager::with_slice("test-deploy".to_string(), cluster, slice, 51820);
+        let om = OverlayManager::with_slice(
+            "test-deploy".to_string(),
+            cluster,
+            slice,
+            51820,
+            "test".to_string(),
+        );
 
         let ns = windows::core::GUID::zeroed();
         let fixed_ip: std::net::IpAddr = "10.200.42.5".parse().unwrap();
@@ -1562,7 +1776,7 @@ mod tests {
     /// daemon bootstraps one. Both accessors must return `None`.
     #[tokio::test]
     async fn dns_config_defaults_to_none() {
-        let om = OverlayManager::new("dns-default".to_string())
+        let om = OverlayManager::new("dns-default".to_string(), "test".to_string())
             .await
             .expect("OverlayManager::new");
         assert!(om.dns_server_addr().is_none());
@@ -1573,7 +1787,7 @@ mod tests {
     /// Covers the J-1 contract with `attach_container_hcn` / `HcsRuntime`.
     #[tokio::test]
     async fn dns_config_set_and_round_trip() {
-        let mut om = OverlayManager::new("dns-roundtrip".to_string())
+        let mut om = OverlayManager::new("dns-roundtrip".to_string(), "test".to_string())
             .await
             .expect("OverlayManager::new");
         let addr: SocketAddr = "10.200.42.1:15353".parse().unwrap();
@@ -1594,8 +1808,14 @@ mod tests {
         let cluster: IpNetwork = "10.200.0.0/16".parse().unwrap();
         let slice: IpNetwork = "10.200.42.0/28".parse().unwrap();
         let addr: SocketAddr = "10.200.42.1:15353".parse().unwrap();
-        let om = OverlayManager::with_slice("dns-builder".to_string(), cluster, slice, 51820)
-            .with_dns_config(Some(addr), Some("overlay.local".to_string()));
+        let om = OverlayManager::with_slice(
+            "dns-builder".to_string(),
+            cluster,
+            slice,
+            51820,
+            "test".to_string(),
+        )
+        .with_dns_config(Some(addr), Some("overlay.local".to_string()));
         assert_eq!(om.dns_server_addr(), Some(addr));
         assert_eq!(om.dns_domain(), Some("overlay.local"));
     }

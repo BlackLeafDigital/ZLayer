@@ -521,9 +521,16 @@ impl YoukiRuntime {
     ///
     /// Uses the shared blob cache to avoid repeated network requests for cached layers.
     /// The `policy` parameter is translated to a `force_refresh` flag: `PullPolicy::Always`
-    /// clears the manifest cache before fetching, while `IfNotPresent` and `Never` reuse
-    /// any cached manifest (the puller still revalidates mutable tags via HEAD for
-    /// `IfNotPresent`, and serves purely from cache for `Never`).
+    /// clears the manifest cache before fetching, while `IfNotPresent` reuses any cached
+    /// manifest (the puller still revalidates mutable tags via HEAD).
+    ///
+    /// `PullPolicy::Never` short-circuits to a local-cache-only path: the puller is
+    /// invoked with `force_refresh = false` so it consults the local registry and blob
+    /// cache first. If the image is not present locally and the puller falls through to
+    /// a remote fetch that fails, the error is remapped to a Never-specific message so
+    /// callers can distinguish "missing locally" from a transient network failure. With
+    /// the Phase 0 import fix, locally-imported images always satisfy the local lookup
+    /// and no remote round-trip occurs.
     async fn pull_image_layers(
         &self,
         image: &str,
@@ -539,6 +546,21 @@ impl YoukiRuntime {
             }
         };
         let auth = self.auth_resolver.resolve(image);
+
+        if matches!(policy, zlayer_spec::PullPolicy::Never) {
+            tracing::debug!(
+                image = %image,
+                "pull_policy=Never; serving layers from local cache only"
+            );
+            return puller
+                .pull_image_with_policy(image, &auth, false)
+                .await
+                .map_err(|e| AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!("pull_policy=never and image not present locally: {e}"),
+                });
+        }
+
         let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
 
         puller
@@ -1282,6 +1304,56 @@ impl Runtime for YoukiRuntime {
 
         if let Err(e) = libcontainer_result {
             tracing::warn!("spawn_blocking failed during remove: {}", e);
+        }
+
+        // Best-effort cgroup teardown: libcontainer's delete() should reap
+        // the container's cgroup, but systemd-cgroup races (and occasional
+        // cgroup-v2 unified hiccups) can leave an empty subdir behind. A
+        // follow-up rmdir is idempotent — fails harmlessly if the dir is
+        // already gone, and shouldn't fail with EBUSY because the container
+        // is already deleted.
+        #[cfg(target_os = "linux")]
+        {
+            use std::path::Path;
+            let candidates: &[&str] = &[
+                // cgroup-v2 unified hierarchy under zlayer.slice
+                "/sys/fs/cgroup/zlayer.slice",
+                // systemd-cgroup nested
+                "/sys/fs/cgroup",
+            ];
+            for root in candidates {
+                let root_path = Path::new(root);
+                if !root_path.exists() {
+                    continue;
+                }
+                // Look for any subdirectory whose name contains the
+                // container_id (the libcontainer scope name). Idempotent rmdir.
+                if let Ok(entries) = std::fs::read_dir(root_path) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.contains(&container_id) || name_str.contains(&id.service) {
+                            let path = entry.path();
+                            // Only rmdir if it's a directory and the cgroup.procs file is empty.
+                            if path.is_dir() {
+                                let procs = path.join("cgroup.procs");
+                                let empty = std::fs::read_to_string(&procs)
+                                    .map(|s| s.trim().is_empty())
+                                    .unwrap_or(true);
+                                if empty {
+                                    if let Err(e) = std::fs::remove_dir(&path) {
+                                        tracing::debug!(
+                                            cgroup = %path.display(),
+                                            error = %e,
+                                            "cgroup rmdir failed (probably already gone)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // ALWAYS clean up bundle regardless of libcontainer result
@@ -3782,10 +3854,7 @@ mod tests {
 
     #[test]
     fn test_container_id_str() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
 
         let expected = "myservice-1";
         assert_eq!(format!("{}-{}", id.service, id.replica), expected);
@@ -3847,10 +3916,7 @@ mod tests {
     fn test_log_paths() {
         let config = YoukiConfig::default();
         let dirs = zlayer_paths::ZLayerDirs::system_default();
-        let id = ContainerId {
-            service: "testservice".to_string(),
-            replica: 2,
-        };
+        let id = ContainerId::new("testservice".to_string(), 2);
 
         let container_id = format!("{}-{}", id.service, id.replica);
         let state_dir = config.state_dir.join(&container_id);
@@ -4080,10 +4146,7 @@ mod tests {
         };
 
         let runtime = YoukiRuntime::new(config, None).await.unwrap();
-        let id = ContainerId {
-            service: "missing".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("missing".to_string(), 0);
 
         let result = runtime
             .exec_pty(

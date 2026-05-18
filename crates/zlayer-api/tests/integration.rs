@@ -322,7 +322,13 @@ fn create_app_with_internal() -> (axum::Router, String) {
     let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
     let internal_token = "test-internal-secret".to_string();
 
-    let app = build_router_with_internal(&config, storage, service_manager, internal_token.clone());
+    let app = build_router_with_internal(
+        &config,
+        storage,
+        service_manager,
+        internal_token.clone(),
+        None,
+    );
     (app, internal_token)
 }
 

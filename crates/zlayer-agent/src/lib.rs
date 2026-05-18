@@ -27,6 +27,7 @@ pub mod runtimes;
 pub mod service;
 pub mod stabilization;
 pub mod storage_manager;
+pub mod worker_client;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -77,6 +78,9 @@ pub use stabilization::{
     wait_for_stabilization, ServiceHealthSummary, StabilizationOutcome, StabilizationResult,
 };
 pub use storage_manager::{StorageError, StorageManager, VolumeInfo};
+pub use worker_client::{
+    WorkerClientError, WorkerClientImpl, WorkerIdentity, WorkerStatusProvider,
+};
 
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;

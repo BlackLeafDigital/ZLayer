@@ -681,10 +681,7 @@ services:
     }
 
     fn cid(service: &str, replica: u32) -> ContainerId {
-        ContainerId {
-            service: service.to_string(),
-            replica,
-        }
+        ContainerId::new(service.to_string(), replica)
     }
 
     fn make_composite(with_delegate: bool) -> (CompositeRuntime, CallLog) {

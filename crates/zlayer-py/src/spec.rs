@@ -590,6 +590,7 @@ pub fn create_service_spec(
             expose: zlayer_spec::ExposeType::Internal,
             stream: None,
             tunnel: None,
+            target_role: None,
         });
     }
 
@@ -656,6 +657,7 @@ pub fn create_service_spec(
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        replica_groups: None,
     };
 
     Ok(ServiceSpec {

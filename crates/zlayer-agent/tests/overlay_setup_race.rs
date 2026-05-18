@@ -39,7 +39,7 @@ use zlayer_agent::overlay_manager::OverlayManager;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_setup_service_overlay_inserts_once() {
     let om = Arc::new(
-        OverlayManager::new("racetest".to_string())
+        OverlayManager::new("racetest".to_string(), "test".to_string())
             .await
             .expect("OverlayManager::new"),
     );
@@ -80,7 +80,7 @@ async fn concurrent_setup_service_overlay_inserts_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_setup_distinct_service_names_each_get_one_entry() {
     let om = Arc::new(
-        OverlayManager::new("racetest2".to_string())
+        OverlayManager::new("racetest2".to_string(), "test".to_string())
             .await
             .expect("OverlayManager::new"),
     );
@@ -137,7 +137,7 @@ async fn concurrent_setup_distinct_service_names_each_get_one_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires CAP_NET_ADMIN; run with: sudo -E cargo test -p zlayer-agent --test overlay_setup_race -- --ignored --nocapture"]
 async fn concurrent_setup_with_real_tun_creates_one_device() {
-    let mut om_owned = OverlayManager::new("racetest3".to_string())
+    let mut om_owned = OverlayManager::new("racetest3".to_string(), "test".to_string())
         .await
         .expect("OverlayManager::new");
     if let Err(e) = om_owned.setup_global_overlay().await {

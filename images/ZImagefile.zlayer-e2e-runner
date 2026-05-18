@@ -1,0 +1,59 @@
+# ZLayer E2E Runner — CI-matching environment for running zlayer e2e suites
+# locally inside a ZLayer-managed container.
+#
+# Mirrors the toolchain installed by `.forgejo/workflows/e2e.yml` for the
+# `raft-e2e-tests` and `manager-intellitester-tests` jobs:
+#   - Base: node:20-bullseye (identical to CI)
+#   - apt deps: sudo protobuf-compiler libseccomp-dev psmisc lsof sqlite3
+#     + build essentials + networking tools
+#   - Rust 1.91 via rustup, with rustfmt/clippy + wasm32-unknown-unknown
+#     (matches /workspace/rust-toolchain.toml when source is bind-mounted)
+#   - pnpm@9 (matches CI pnpm/action-setup@v4 version: 9)
+#   - uv (matches CI astral-sh/setup-uv@v6)
+#   - cargo-leptos (intellitester pre-build dependency)
+#
+# Playwright chromium is NOT baked in — it's pulled lazily on first
+# intellitester run from /workspace/crates/zlayer-manager/tests/e2e/package.json
+# so the version always tracks the source tree.
+#
+# The source tree is bind-mounted at /workspace by the deployment spec
+# (examples/e2e-runner.zlayer.yml); the container does not embed sources.
+#
+# Usage:
+#   zlayer build images/ZImagefile.zlayer-e2e-runner -t zlayer-e2e-runner:dev
+#   zlayer deploy examples/e2e-runner.zlayer.yml
+#   zlayer exec e2e-runner -- bash -lc 'cd /workspace && cargo build --release -p zlayer'
+
+version: "1"
+
+base: "node:20-bullseye"
+
+env:
+  DEBIAN_FRONTEND: "noninteractive"
+  RUST_BACKTRACE: "1"
+  CARGO_TERM_COLOR: "always"
+  CARGO_HOME: "/root/.cargo"
+  RUSTUP_HOME: "/root/.rustup"
+  PATH: "/root/.cargo/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+steps:
+  - run: "apt-get update && apt-get install -y --no-install-recommends sudo protobuf-compiler libseccomp-dev psmisc lsof sqlite3 build-essential pkg-config libssl-dev libclang-dev clang ca-certificates curl wget git iproute2 iptables tcpdump wireguard-tools jq && apt-get clean && rm -rf /var/lib/apt/lists/*"
+
+  - run: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal"
+
+  - run: "/root/.cargo/bin/rustup toolchain install 1.91 --component rustfmt --component clippy --target wasm32-unknown-unknown && /root/.cargo/bin/rustup default 1.91"
+
+  - run: "npm install -g pnpm@9"
+
+  - run: "curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+  - run: "/root/.cargo/bin/cargo install cargo-leptos --locked"
+
+  - run: "mkdir -p /workspace"
+
+cmd: ["sleep", "infinity"]
+
+labels:
+  org.opencontainers.image.title: "ZLayer E2E Runner"
+  org.opencontainers.image.description: "CI-matching environment for running zlayer e2e suites locally"
+  maintainer: "Zach Handley <zachhandley@gmail.com>"

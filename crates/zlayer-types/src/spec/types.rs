@@ -128,6 +128,102 @@ pub struct NodeSelector {
     pub prefer_labels: HashMap<String, String>,
 }
 
+/// Affinity hint for a single replica group's placement.
+///
+/// Three behaviors:
+/// - `Spread`: try to put each replica on a different node (default).
+/// - `Pack`: bin-pack onto the fewest nodes that can fit.
+/// - `Pin`: pin all replicas to a single node, identified either by
+///   node id (`"id=2"`) or label match (`"role=database"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GroupAffinity {
+    /// Default: spread across distinct nodes.
+    #[default]
+    Spread,
+    /// Pack onto fewest nodes.
+    Pack,
+    /// Pin to a specific node selector.
+    ///
+    /// Examples:
+    /// - `Pin("id=2")` — exact node id match
+    /// - `Pin("zone=us-east-1a")` — label match
+    Pin(String),
+}
+
+/// Regex for [`ReplicaGroup::role`] validation. A valid DNS label: starts with
+/// a lowercase letter, then any mix of lowercase letters, digits, or
+/// internal hyphens, ending with a letter or digit. 1-30 chars total.
+static REPLICA_GROUP_ROLE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$").expect("valid regex literal")
+});
+
+/// One named replica group within a service.
+///
+/// When `ServiceSpec.replica_groups` is set, the service is composed of one
+/// or more groups, each with its own count, optional overrides, and
+/// affinity hint. Containers in each group get DNS names of the form
+/// `<role>.<service>.<deployment>.zlayer.internal` and proxy backends
+/// can target a single role via `EndpointSpec.target_role`.
+///
+/// Backward compat: services without `replica_groups` are treated as a
+/// single implicit group `{role: "default", count: <scale.replicas>}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaGroup {
+    /// Group identifier. Becomes part of container IDs and DNS names.
+    /// Must be a valid DNS label: lowercase letters, digits, and hyphens;
+    /// must not start or end with a hyphen; ≤ 30 chars.
+    #[validate(length(min = 1, max = 30))]
+    #[validate(regex(path = *REPLICA_GROUP_ROLE_RE))]
+    pub role: String,
+
+    /// Number of replicas in this group.
+    #[validate(range(min = 1))]
+    pub count: u32,
+
+    /// Image override (inherits `ServiceSpec.image` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSpec>,
+
+    /// Environment variables MERGED on top of `ServiceSpec.env`. Entries
+    /// in this map win on conflict (group overrides service default).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+
+    /// Command override (inherits `ServiceSpec.command` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandSpec>,
+
+    /// Resources override (inherits `ServiceSpec.resources` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesSpec>,
+
+    /// Affinity hint for placement of this group's replicas.
+    #[serde(default)]
+    pub affinity: GroupAffinity,
+}
+
+/// Validate that no two [`ReplicaGroup`]s share the same `role` within a
+/// single [`ServiceSpec`].
+///
+/// Called from the deploy handler before storing the spec; not wired into
+/// the `Validate` derive on `ServiceSpec` because validator 0.19's `custom`
+/// only sees the field type (`Option<Vec<ReplicaGroup>>`) and not the
+/// surrounding struct.
+///
+/// # Errors
+/// Returns the duplicated role name on first collision.
+pub fn validate_unique_replica_group_roles(groups: &[ReplicaGroup]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for g in groups {
+        if !seen.insert(g.role.as_str()) {
+            return Err(g.role.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Operating system a service needs to run on.
 ///
 /// Mirrors the OS half of an OCI platform descriptor. Canonical wire strings
@@ -961,6 +1057,24 @@ pub struct ServiceSpec {
     #[validate(custom(function = "crate::spec::validate::validate_scale_spec"))]
     pub scale: ScaleSpec,
 
+    /// Heterogeneous replica groups within this service.
+    ///
+    /// When set, the service is composed of multiple named groups (e.g.
+    /// `primary` + `read` + `cache`) instead of a flat `scale.replicas`.
+    /// Each group inherits `ServiceSpec` defaults (image, env, command,
+    /// resources) and overrides per-group fields.
+    ///
+    /// When `None` (default), the service uses `scale` directly with an
+    /// implicit single group `{role: "default", count: <scale.replicas>}`.
+    /// This is the backward-compatible path used by all existing
+    /// specifications.
+    ///
+    /// Cross-group role uniqueness is validated separately by
+    /// [`validate_unique_replica_group_roles`] from the deploy handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub replica_groups: Option<Vec<ReplicaGroup>>,
+
     /// Dependency specifications
     #[serde(default)]
     pub depends: Vec<DependsSpec>,
@@ -1209,6 +1323,8 @@ struct ServiceSpecCompat {
     #[serde(default)]
     scale: ScaleSpec,
     #[serde(default)]
+    replica_groups: Option<Vec<ReplicaGroup>>,
+    #[serde(default)]
     depends: Vec<DependsSpec>,
     #[serde(default = "default_health")]
     health: HealthSpec,
@@ -1314,6 +1430,7 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             network: c.network,
             endpoints: c.endpoints,
             scale: c.scale,
+            replica_groups: c.replica_groups,
             depends: c.depends,
             health: c.health,
             init: c.init,
@@ -1867,6 +1984,32 @@ pub struct EndpointSpec {
     /// Only applicable when protocol is tcp or udp
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<StreamEndpointConfig>,
+
+    /// Restrict this endpoint to backends in a specific replica role.
+    ///
+    /// When `Some`, only containers whose `replica_groups.role` matches this
+    /// value receive traffic from this endpoint. When `None` (default), the
+    /// endpoint accepts all containers of the service (legacy behavior).
+    ///
+    /// Validation: when set, the role MUST appear in the parent
+    /// `ServiceSpec.replica_groups` (enforced at deploy time in the API
+    /// handler, not via derive(Validate)).
+    ///
+    /// Example (a postgres service with primary + read replicas):
+    ///
+    /// ```yaml
+    /// endpoints:
+    ///   - name: write
+    ///     port: 5432
+    ///     protocol: tcp
+    ///     target_role: primary
+    ///   - name: read
+    ///     port: 5433
+    ///     protocol: tcp
+    ///     target_role: read
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_role: Option<String>,
 
     /// Optional tunnel configuration for this endpoint
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3886,5 +4029,111 @@ services:
         let reparsed_svc = reparsed.services.get("app").expect("app service after rt");
         assert!(reparsed_svc.lifecycle.delete_on_exit);
         assert_eq!(svc.lifecycle, reparsed_svc.lifecycle);
+    }
+}
+
+#[cfg(test)]
+mod replica_group_tests {
+    use super::{
+        validate_unique_replica_group_roles, EndpointSpec, GroupAffinity, ReplicaGroup,
+        REPLICA_GROUP_ROLE_RE,
+    };
+
+    #[test]
+    fn yaml_roundtrip_basic_group() {
+        let yaml = r"
+role: primary
+count: 1
+env:
+  POSTGRES_REPLICATION_MODE: primary
+affinity: spread
+";
+        let group: ReplicaGroup = serde_yaml::from_str(yaml).expect("parse basic group");
+        assert_eq!(group.role, "primary");
+        assert_eq!(group.count, 1);
+        assert_eq!(group.affinity, GroupAffinity::Spread);
+        assert_eq!(
+            group.env.get("POSTGRES_REPLICATION_MODE"),
+            Some(&"primary".to_string())
+        );
+    }
+
+    #[test]
+    fn yaml_default_affinity_is_spread() {
+        let yaml = "role: x\ncount: 2\n";
+        let group: ReplicaGroup = serde_yaml::from_str(yaml).expect("parse minimal group");
+        assert_eq!(group.affinity, GroupAffinity::Spread);
+    }
+
+    #[test]
+    fn role_regex_accepts_valid_labels() {
+        for ok in ["a", "primary", "read-only", "x1", "ab-cd-ef"] {
+            assert!(
+                REPLICA_GROUP_ROLE_RE.is_match(ok),
+                "regex should accept: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_regex_rejects_invalid_labels() {
+        for bad in [
+            "",
+            "-primary",
+            "primary-",
+            "Primary",
+            "0primary",
+            "primary_role",
+            "this-is-way-too-long-of-a-role-name-here",
+        ] {
+            assert!(
+                !REPLICA_GROUP_ROLE_RE.is_match(bad),
+                "regex should reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_affinity_pin_roundtrips_via_serde_yaml() {
+        // Externally-tagged enum with a single string payload serializes as
+        // a mapping `pin: <value>` under snake_case naming.
+        let pinned = GroupAffinity::Pin("id=2".to_string());
+        let dumped = serde_yaml::to_string(&pinned).expect("serialize pin");
+        let reparsed: GroupAffinity = serde_yaml::from_str(&dumped).expect("reparse pin");
+        match reparsed {
+            GroupAffinity::Pin(s) => assert_eq!(s, "id=2"),
+            other => panic!("expected Pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unique_role_validator_rejects_duplicates() {
+        let mk = |role: &str| ReplicaGroup {
+            role: role.to_string(),
+            count: 1,
+            image: None,
+            env: std::collections::HashMap::new(),
+            command: None,
+            resources: None,
+            affinity: GroupAffinity::Spread,
+        };
+        assert!(validate_unique_replica_group_roles(&[mk("a"), mk("b")]).is_ok());
+        let err = validate_unique_replica_group_roles(&[mk("a"), mk("a")])
+            .expect_err("duplicate should fail");
+        assert_eq!(err, "a");
+    }
+
+    #[test]
+    fn endpoint_target_role_yaml_roundtrip() {
+        let yaml = "name: read\nprotocol: tcp\nport: 5433\ntarget_role: read\n";
+        let ep: EndpointSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ep.target_role, Some("read".to_string()));
+    }
+
+    #[test]
+    fn endpoint_without_target_role_is_none() {
+        let yaml = "name: any\nprotocol: tcp\nport: 5432\n";
+        let ep: EndpointSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ep.target_role, None);
     }
 }

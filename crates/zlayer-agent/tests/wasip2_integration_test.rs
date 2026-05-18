@@ -119,10 +119,7 @@ fn unique_service_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_service_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_service_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for WASM testing
@@ -140,6 +137,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,
@@ -865,10 +863,7 @@ mod error_handling_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "nonexistent-service".to_string(),
-            replica: 999,
-        };
+        let id = ContainerId::new("nonexistent-service".to_string(), 999);
 
         // All operations on nonexistent container should fail
         let state_result = runtime.container_state(&id).await;
@@ -1290,10 +1285,7 @@ mod logs_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "ghost".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("ghost".to_string(), 1);
 
         let logs_result = runtime.container_logs(&id, 100).await;
         assert!(
@@ -1331,10 +1323,7 @@ mod concurrent_tests {
             let runtime = runtime.clone();
             let image = image.clone();
 
-            let id = ContainerId {
-                service: format!("concurrent-{}-{}", i, std::process::id()),
-                replica: 1,
-            };
+            let id = ContainerId::new(format!("concurrent-{}-{}", i, std::process::id()), 1);
             guards.push(InstanceGuard::new(runtime.clone(), id.clone()));
 
             handles.push(tokio::spawn(async move {
@@ -1377,10 +1366,7 @@ mod concurrent_tests {
         let service_name = format!("sequential-{}", std::process::id());
 
         for i in 0..3 {
-            let id = ContainerId {
-                service: service_name.clone(),
-                replica: i,
-            };
+            let id = ContainerId::new(service_name.clone(), i);
             let spec = create_wasm_spec(&image);
 
             runtime.create_container(&id, &spec).await.unwrap();

@@ -22,6 +22,7 @@
 //! ```
 
 pub mod autoscaler;
+pub mod cluster;
 pub mod error;
 pub mod handlers;
 pub mod metrics;
@@ -30,6 +31,9 @@ pub mod raft;
 pub mod raft_network;
 pub mod raft_service;
 pub mod raft_storage;
+pub mod worker_dispatcher;
+
+pub use worker_dispatcher::{WorkerDispatcherImpl, WorkerDispatcherService};
 
 pub use autoscaler::{
     Autoscaler, EmaCalculator, ScalingDecision, DEFAULT_COOLDOWN, DEFAULT_EMA_ALPHA,
@@ -339,10 +343,9 @@ impl Scheduler {
                 .http_client
                 .post(&url)
                 .header("X-ZLayer-Internal-Token", &self.internal_token)
-                .json(&serde_json::json!({
-                    "service": service,
-                    "replicas": replicas
-                }))
+                .json(&zlayer_types::cluster::InternalScaleRequest::new(
+                    service, replicas,
+                ))
                 .send()
                 .await
                 .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
@@ -456,6 +459,7 @@ impl Scheduler {
             userns_mode: None,
             cgroup_parent: None,
             expose: Vec::new(),
+            replica_groups: None,
         };
 
         let effective_spec = spec.unwrap_or(&default_spec);
@@ -573,10 +577,10 @@ impl Scheduler {
                     .http_client
                     .post(&url)
                     .header("X-ZLayer-Internal-Token", &self.internal_token)
-                    .json(&serde_json::json!({
-                        "service": service_name,
-                        "replicas": replicas,
-                    }))
+                    .json(&zlayer_types::cluster::InternalScaleRequest::new(
+                        service_name,
+                        replicas,
+                    ))
                     .timeout(Duration::from_secs(30))
                     .send()
                     .await

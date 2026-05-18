@@ -496,6 +496,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intellitester-e2e-${{ github.run_id }}
+          path: target/zlayer-e2e/**
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
@@ -607,6 +616,15 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: info
+
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raft-e2e-${{ github.run_id }}
+          path: target/zlayer-e2e/**
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'

@@ -44,6 +44,11 @@ pub struct ServiceInstance {
     /// requiring callers to track digest state externally. Wrapped in a
     /// `RwLock` so `&self` methods (`scale_to`) can update it.
     last_pulled_digest: tokio::sync::RwLock<Option<String>>,
+    /// Local cluster node id used when constructing new `ContainerId`s during
+    /// scale-up. `0` in single-node deployments or when the cluster handle is
+    /// not yet wired. Populated by `ServiceManager` from `Cluster::node_id()`
+    /// at instance construction time.
+    node_id: u64,
 }
 
 impl ServiceInstance {
@@ -64,6 +69,7 @@ impl ServiceInstance {
             dns_server: None,
             health_states: None,
             last_pulled_digest: tokio::sync::RwLock::new(None),
+            node_id: 0,
         }
     }
 
@@ -85,7 +91,39 @@ impl ServiceInstance {
             dns_server: None,
             health_states: None,
             last_pulled_digest: tokio::sync::RwLock::new(None),
+            node_id: 0,
         }
+    }
+
+    /// Set the local cluster node id. Used by `ServiceManager` to thread
+    /// `Cluster::node_id()` down to container construction so new
+    /// `ContainerId`s carry the owning node identity. Defaults to `0` (the
+    /// single-node sentinel) when unset.
+    pub fn set_node_id(&mut self, node_id: u64) {
+        self.node_id = node_id;
+    }
+
+    /// Derive the replica group role for a 1-based `replica_idx`.
+    ///
+    /// When `spec.replica_groups` is unset, returns `"default"` (the implicit
+    /// single-group case). Otherwise walks groups in declaration order,
+    /// accumulating each group's `count` until `replica_idx` falls within the
+    /// current group's range, and returns that group's `role`.
+    ///
+    /// Replicas beyond the declared total fall back to `"default"`.
+    #[must_use]
+    pub fn role_for_replica(&self, replica_idx: u32) -> String {
+        let Some(groups) = self.spec.replica_groups.as_ref() else {
+            return "default".to_string();
+        };
+        let mut cumulative = 0u32;
+        for group in groups {
+            cumulative = cumulative.saturating_add(group.count);
+            if replica_idx <= cumulative {
+                return group.role.clone();
+            }
+        }
+        "default".to_string()
     }
 
     /// Builder method to add DNS server for service discovery
@@ -122,15 +160,13 @@ impl ServiceInstance {
     /// the cached digest from `Runtime::list_images` when the runtime exposes
     /// it. Returns the digest observed after the pull, when known.
     ///
-    /// `Never` skips the pull entirely; the cached digest is returned
-    /// unchanged.
+    /// For `Never`, the runtime is still called so it can load the image
+    /// config from the local cache (without any remote round-trip); only the
+    /// remote digest refresh is skipped. Without this call the bundle builder
+    /// has no image entrypoint/cmd and falls back to `/bin/sh`.
     async fn pull_and_refresh_digest(&self) -> Result<Option<String>> {
         let image_str = self.spec.image.name.to_string();
         let effective = effective_pull_policy(&self.spec.image.name, self.spec.image.pull_policy);
-
-        if matches!(effective, PullPolicy::Never) {
-            return Ok(self.last_pulled_digest.read().await.clone());
-        }
 
         self.runtime
             .pull_image_with_policy(&image_str, effective, None)
@@ -182,21 +218,52 @@ impl ServiceInstance {
 
         // Phase 1b: Pull image up front so a redeploy on `:latest` (which lands
         // here with replicas == current_replicas in the steady state) actually
-        // refreshes the cached digest. We skip the pull when scaling strictly
-        // down (no new containers needed) and when policy is `Never`. Cached
-        // layers make this cheap when nothing changed.
-        let effective = effective_pull_policy(&self.spec.image.name, self.spec.image.pull_policy);
-        if replicas >= current_replicas && !matches!(effective, PullPolicy::Never) {
+        // refreshes the cached digest. We skip the call only when scaling
+        // strictly down (no new containers needed). For `Never` the runtime
+        // still needs to load the image config from the local cache so the
+        // bundle builder gets entrypoint/cmd/env — without it the container
+        // falls back to `/bin/sh` and exits instantly. `pull_and_refresh_digest`
+        // itself handles the Never case (no remote round-trip, cache-only).
+        if replicas >= current_replicas {
             let _ = self.pull_and_refresh_digest().await?;
         }
 
         // Phase 2: Scale up - create new containers (no lock held during I/O)
+        //
+        // Compute (role, replica_index) tuples for each new replica. When
+        // `spec.replica_groups` is set, expand groups in declaration order so
+        // each created replica maps to its declared `(role, intra_group_index)`.
+        // Otherwise fall back to the implicit single "default" group. The
+        // `local_node_id` is captured once so every new `ContainerId` carries
+        // the owning node identity for cross-node disambiguation.
+        let local_node_id = self.node_id;
         if replicas > current_replicas {
-            for i in current_replicas..replicas {
-                let id = ContainerId {
-                    service: self.service_name.clone(),
-                    replica: i + 1,
+            let replica_specs: Vec<(String, u32)> =
+                if let Some(groups) = self.spec.replica_groups.as_ref() {
+                    let mut specs: Vec<(String, u32)> = Vec::new();
+                    for group in groups {
+                        for idx in 0..group.count {
+                            specs.push((group.role.clone(), idx + 1));
+                        }
+                    }
+                    specs
+                        .into_iter()
+                        .skip(current_replicas as usize)
+                        .take((replicas - current_replicas) as usize)
+                        .collect()
+                } else {
+                    (current_replicas..replicas)
+                        .map(|i| ("default".to_string(), i + 1))
+                        .collect()
                 };
+
+            for (role, replica_idx) in replica_specs {
+                let id = ContainerId::with_role_and_node(
+                    self.service_name.clone(),
+                    replica_idx,
+                    role,
+                    local_node_id,
+                );
 
                 // Create container (no lock needed - I/O operation)
                 //
@@ -442,6 +509,29 @@ impl ServiceInstance {
                                     "registered DNS for replica"
                                 );
                             }
+
+                            // Per-role DNS: register `{role}.{service}.service.local` when
+                            // this container belongs to a non-default replica group. Lets
+                            // intra-cluster clients reach a specific group (e.g.
+                            // `read.db.service.local` for the read replicas of a postgres
+                            // service with primary+read replica groups).
+                            if id.role != "default" {
+                                let role_hostname =
+                                    format!("{}.{}.service.local", id.role, self.service_name);
+                                match dns.add_record(&role_hostname, ip).await {
+                                    Ok(()) => tracing::debug!(
+                                        hostname = %role_hostname,
+                                        ip = %ip,
+                                        role = %id.role,
+                                        "registered DNS for replica group role"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        hostname = %role_hostname,
+                                        error = %e,
+                                        "failed to register role DNS"
+                                    ),
+                                }
+                            }
                         }
 
                         Some(ip)
@@ -649,12 +739,21 @@ impl ServiceInstance {
         }
 
         // Phase 3: Scale down - remove containers (short write lock per removal)
+        //
+        // Containers were created with `with_role_and_node(role, local_node_id)`
+        // on scale-up, so we must reconstruct the same identity on scale-down
+        // — the role is derived from `replica_groups` via `role_for_replica`
+        // and the node id is the local cluster node. Mismatched ids would miss
+        // the live entry in `self.containers` and leak the container.
         if replicas < current_replicas {
             for i in replicas..current_replicas {
-                let id = ContainerId {
-                    service: self.service_name.clone(),
-                    replica: i + 1,
-                };
+                let replica_idx = i + 1;
+                let id = ContainerId::with_role_and_node(
+                    self.service_name.clone(),
+                    replica_idx,
+                    self.role_for_replica(replica_idx),
+                    local_node_id,
+                );
 
                 // Remove from state first and get the container to abort health monitor (short write lock)
                 let removed_container = {
@@ -687,9 +786,79 @@ impl ServiceInstance {
                             );
                         }
 
+                        // Remove per-role DNS entry if this was a non-default group.
+                        // Note: this is best-effort and removes the record even if
+                        // other replicas in the same role still need it — the DNS
+                        // server's add/remove API is single-record so we can't keep
+                        // it alive for siblings. P2.3-bis (round-robin per-role)
+                        // can fix this later via a per-role refcount; for now the
+                        // service-level hostname keeps cluster-internal clients
+                        // working even when the role-specific record briefly
+                        // disappears.
+                        if id.role != "default" {
+                            let role_hostname =
+                                format!("{}.{}.service.local", id.role, self.service_name);
+                            if let Err(e) = dns.remove_record(&role_hostname).await {
+                                tracing::warn!(
+                                    hostname = %role_hostname,
+                                    error = %e,
+                                    "failed to remove role DNS record"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    hostname = %role_hostname,
+                                    "removed role DNS record"
+                                );
+                            }
+                        }
+
                         // Note: We don't remove the service-level hostname here because
                         // other replicas may still be using it. The service-level record
                         // should be cleaned up when the entire service is removed.
+                    }
+
+                    // Detach from overlay network if manager available.
+                    //
+                    // Done BEFORE stop_container because:
+                    //   - The container init process must still be in
+                    //     /proc to look up its PID via `get_container_pid`.
+                    //   - `OverlayManager::detach_container` deletes host-side
+                    //     veth interfaces by name (`veth-<pid>-*`) and
+                    //     releases the allocated overlay IPs back to the
+                    //     per-node slice. Without this the IPs leak across
+                    //     container churn and the slice exhausts.
+                    //
+                    // Best-effort: failures are logged but never abort the
+                    // scale-down. The periodic orphan sweep
+                    // (`start_periodic_orphan_sweep`) catches anything we
+                    // missed.
+                    if let Some(overlay) = &self.overlay_manager {
+                        match self.runtime.get_container_pid(&id).await {
+                            Ok(Some(pid)) => {
+                                let overlay_guard = overlay.read().await;
+                                if let Err(e) = overlay_guard.detach_container(pid).await {
+                                    tracing::warn!(
+                                        container = %id,
+                                        pid,
+                                        error = %e,
+                                        "overlay detach_container failed; relying on orphan sweep"
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    container = %id,
+                                    "no PID available for overlay detach (already exited or non-Linux runtime)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    container = %id,
+                                    error = %e,
+                                    "failed to query container PID for overlay detach"
+                                );
+                            }
+                        }
                     }
 
                     // Stop container
@@ -774,6 +943,11 @@ pub struct ServiceManager {
     cron_scheduler: Option<Arc<CronScheduler>>,
     /// Container supervisor for crash/panic policy enforcement
     container_supervisor: Option<Arc<ContainerSupervisor>>,
+    /// Cluster membership + dispatch handle. When `None`, scale operations
+    /// run purely local (single-node mode). When `Some`, `scale_service`
+    /// routes through the cluster (leader dispatches to peers; followers
+    /// forward to the leader).
+    cluster: Option<Arc<dyn zlayer_scheduler::cluster::Cluster>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +977,7 @@ pub struct ServiceManagerBuilder {
     job_executor: Option<Arc<JobExecutor>>,
     cron_scheduler: Option<Arc<CronScheduler>>,
     container_supervisor: Option<Arc<ContainerSupervisor>>,
+    cluster: Option<Arc<dyn zlayer_scheduler::cluster::Cluster>>,
 }
 
 impl ServiceManagerBuilder {
@@ -818,6 +993,7 @@ impl ServiceManagerBuilder {
             job_executor: None,
             cron_scheduler: None,
             container_supervisor: None,
+            cluster: None,
         }
     }
 
@@ -877,6 +1053,16 @@ impl ServiceManagerBuilder {
         self
     }
 
+    /// Set the cluster membership + dispatch handle. When set,
+    /// [`ServiceManager::scale_service`] will route through the cluster
+    /// (leader dispatches to peers; followers forward to the leader).
+    /// When unset (the default), scale operations remain local-only.
+    #[must_use]
+    pub fn cluster(mut self, cluster: Arc<dyn zlayer_scheduler::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
     /// Consume the builder and produce a fully-wired [`ServiceManager`].
     ///
     /// Logs warnings for missing recommended subsystems (proxy,
@@ -908,6 +1094,7 @@ impl ServiceManagerBuilder {
             job_executor: self.job_executor,
             cron_scheduler: self.cron_scheduler,
             container_supervisor: self.container_supervisor,
+            cluster: self.cluster,
         }
     }
 }
@@ -945,6 +1132,7 @@ impl ServiceManager {
             job_executor: None,
             cron_scheduler: None,
             container_supervisor: None,
+            cluster: None,
         }
     }
 
@@ -967,6 +1155,7 @@ impl ServiceManager {
             job_executor: None,
             cron_scheduler: None,
             container_supervisor: None,
+            cluster: None,
         }
     }
 
@@ -990,6 +1179,7 @@ impl ServiceManager {
             job_executor: None,
             cron_scheduler: None,
             container_supervisor: None,
+            cluster: None,
         }
     }
 
@@ -1099,6 +1289,25 @@ impl ServiceManager {
     pub fn with_cron_scheduler(mut self, scheduler: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(scheduler);
         self
+    }
+
+    /// Set the cluster handle for cluster-aware scaling.
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    pub fn set_cluster(&mut self, cluster: Arc<dyn zlayer_scheduler::cluster::Cluster>) {
+        self.cluster = Some(cluster);
+    }
+
+    /// Builder pattern: add a cluster handle for cluster-aware scaling.
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<dyn zlayer_scheduler::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Get the cluster handle (if configured).
+    pub fn cluster(&self) -> Option<&Arc<dyn zlayer_scheduler::cluster::Cluster>> {
+        self.cluster.as_ref()
     }
 
     /// Get the job executor (if configured)
@@ -1456,6 +1665,9 @@ impl ServiceManager {
                 } else {
                     ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
                 };
+                // Thread the local cluster node id so new `ContainerId`s carry
+                // owning-node identity. Defaults to `0` in single-node mode.
+                instance.set_node_id(self.cluster.as_ref().map_or(0, |c| c.node_id()));
                 // Set DNS server if configured
                 if let Some(dns) = &self.dns_server {
                     instance.set_dns_server(Arc::clone(dns));
@@ -1521,6 +1733,10 @@ impl ServiceManager {
                     } else {
                         ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
                     };
+                    // Thread the local cluster node id (same as the Service
+                    // branch above) so the fallback-as-service Job entry also
+                    // carries owning-node identity.
+                    instance.set_node_id(self.cluster.as_ref().map_or(0, |c| c.node_id()));
                     // Set DNS server if configured
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
@@ -1544,10 +1760,30 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Update backend addresses via `ProxyManager` after scaling
-    async fn update_proxy_backends(&self, service_name: &str, addrs: Vec<SocketAddr>) {
-        if let Some(proxy) = &self.proxy_manager {
-            proxy.update_backends(service_name, addrs).await;
+    /// Update backend addresses via `ProxyManager` after scaling, applying
+    /// per-endpoint `target_role` filtering.
+    ///
+    /// For each L7 endpoint of the service, this collects the subset of
+    /// containers whose `ContainerId.role` matches `endpoint.target_role`
+    /// (or all containers when `target_role` is `None`) and updates the
+    /// proxy's backend pool for that specific endpoint via
+    /// [`ProxyManager::update_endpoint_backends`].
+    async fn update_proxy_backends(&self, instance: &ServiceInstance) {
+        let Some(proxy) = &self.proxy_manager else {
+            return;
+        };
+        for endpoint in &instance.spec.endpoints {
+            // Only L7 endpoints flow through the proxy (HTTP/HTTPS/WS).
+            if !matches!(
+                endpoint.protocol,
+                Protocol::Http | Protocol::Https | Protocol::Websocket
+            ) {
+                continue;
+            }
+            let addrs = self.collect_endpoint_backends(instance, endpoint).await;
+            proxy
+                .update_endpoint_backends(&instance.service_name, &endpoint.name, addrs)
+                .await;
         }
     }
 
@@ -1559,68 +1795,34 @@ impl ServiceManager {
     /// containers without a port override (Linux, VMs), we reconstruct addresses
     /// using the endpoint's declared port, since each container has its own IP
     /// and can bind any port independently.
-    fn update_stream_backends(&self, spec: &ServiceSpec, addrs: &[SocketAddr]) {
+    async fn update_stream_backends(&self, instance: &ServiceInstance) {
         let Some(stream_registry) = &self.stream_registry else {
             return;
         };
 
-        // Determine if any addresses have a port override by checking whether
-        // all addresses use the same port as the primary spec endpoint. If not,
-        // they carry per-container port overrides and should be used as-is.
-        let primary_spec_port = spec
-            .endpoints
-            .iter()
-            .find(|ep| {
-                matches!(
-                    ep.protocol,
-                    Protocol::Http | Protocol::Https | Protocol::Websocket
-                )
-            })
-            .map_or(8080, zlayer_spec::EndpointSpec::target_port);
-
-        let has_port_overrides = addrs.iter().any(|addr| addr.port() != primary_spec_port);
-
-        for endpoint in &spec.endpoints {
+        for endpoint in &instance.spec.endpoints {
             match endpoint.protocol {
                 Protocol::Tcp => {
-                    let tcp_backends: Vec<SocketAddr> = if has_port_overrides {
-                        // Port overrides active (macOS sandbox): the container listens
-                        // on its assigned port for all traffic. Use addresses as-is.
-                        addrs.to_vec()
-                    } else {
-                        // Normal case: each container has its own IP, construct
-                        // addresses using the TCP endpoint's container target port.
-                        addrs
-                            .iter()
-                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.target_port()))
-                            .collect()
-                    };
-
+                    let tcp_backends = self.collect_endpoint_backends(instance, endpoint).await;
+                    let backend_count = tcp_backends.len();
                     stream_registry.update_tcp_backends(endpoint.port, tcp_backends);
-
                     tracing::debug!(
                         endpoint = %endpoint.name,
                         port = endpoint.port,
-                        backend_count = addrs.len(),
+                        backend_count = backend_count,
+                        target_role = ?endpoint.target_role,
                         "Updated TCP stream backends"
                     );
                 }
                 Protocol::Udp => {
-                    let udp_backends: Vec<SocketAddr> = if has_port_overrides {
-                        addrs.to_vec()
-                    } else {
-                        addrs
-                            .iter()
-                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.target_port()))
-                            .collect()
-                    };
-
+                    let udp_backends = self.collect_endpoint_backends(instance, endpoint).await;
+                    let backend_count = udp_backends.len();
                     stream_registry.update_udp_backends(endpoint.port, udp_backends);
-
                     tracing::debug!(
                         endpoint = %endpoint.name,
                         port = endpoint.port,
-                        backend_count = addrs.len(),
+                        backend_count = backend_count,
+                        target_role = ?endpoint.target_role,
                         "Updated UDP stream backends"
                     );
                 }
@@ -1629,12 +1831,65 @@ impl ServiceManager {
         }
     }
 
-    /// Scale a service to desired replica count
+    /// Scale a service. Cluster-aware: if this node has a `Cluster` handle
+    /// and we're not the leader, forward to the leader; if leader, dispatch
+    /// via the cluster's placement layer (Phase 1 sends to every peer that
+    /// gets a share); else (single-node) just scale locally.
+    ///
+    /// # Errors
+    /// Returns an error if scaling fails on any participating node.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
+        use zlayer_scheduler::cluster::InternalScaleRequest;
+
+        if let Some(cluster) = &self.cluster {
+            if !cluster.is_leader().await {
+                // Follower: forward to the leader and let it dispatch.
+                return cluster
+                    .forward_scale(InternalScaleRequest::new(name, replicas))
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: name.to_string(),
+                        reason: format!("cluster forward: {e}"),
+                    });
+            }
+
+            // Leader path. For Phase 1 we keep the placement logic in the
+            // scheduler layer (called externally); here we just send the
+            // legacy `{service, replicas}` shape to every node and let the
+            // scheduler fan it out. The scheduler-side wrapper handles the
+            // actual per-node split — that lands in a follow-up.
+            //
+            // In Phase 1 single-cluster setups, leader dispatch reduces to
+            // `dispatch_scale(self_node_id, req)` which short-circuits to
+            // local. The full scheduler-driven fan-out wires up once
+            // `Scheduler::scale_service_distributed` is exposed.
+            return cluster
+                .dispatch_scale(cluster.node_id(), InternalScaleRequest::new(name, replicas))
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: name.to_string(),
+                    reason: format!("cluster dispatch: {e}"),
+                });
+        }
+
+        // No cluster handle — single-node mode.
+        self.scale_service_local(name, replicas).await
+    }
+
+    /// Local (single-node) scale: directly creates/destroys containers on
+    /// this node only. Called by:
+    ///   - `scale_service` in single-node mode (when `self.cluster` is None).
+    ///   - The `/api/v1/internal/scale` handler (which the leader's
+    ///     `Cluster::dispatch_scale` HTTP-POSTs to, bottoming out the
+    ///     recursive loop on each receiving node).
+    ///   - The cluster impls' `local_dispatch` closure (for the leader's own
+    ///     share — short-circuited to avoid a localhost round-trip).
     ///
     /// # Errors
     /// Returns an error if the service is not found or scaling fails.
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
+    pub async fn scale_service_local(&self, name: &str, replicas: u32) -> Result<()> {
         let _permit = self.scale_semaphore.acquire().await;
 
         let services = self.services.read().await;
@@ -1649,42 +1904,49 @@ impl ServiceManager {
         // Perform the scaling operation
         instance.scale_to(replicas).await?;
 
-        // After scaling, update proxy backends with new container addresses
-        // Note: In a real implementation, we would get actual container IPs
-        // from the overlay network or container runtime. For now, we construct
-        // backend addresses based on the endpoint port and localhost (for same-node).
-        // TODO: Get actual container addresses from overlay_manager or runtime
-        let addrs = self.collect_backend_addrs(instance, replicas).await;
-
-        // Update HTTP backends via ProxyManager
-        if self.proxy_manager.is_some() && !addrs.is_empty() {
-            self.update_proxy_backends(name, addrs.clone()).await;
+        // After scaling, update proxy and stream backends for each endpoint.
+        // Per-endpoint collection (rather than a single service-wide list)
+        // is what makes `EndpointSpec.target_role` filtering possible:
+        // each endpoint receives only the containers whose
+        // `ContainerId.role` matches its declared role.
+        if self.proxy_manager.is_some() {
+            self.update_proxy_backends(instance).await;
         }
-
-        // Update TCP/UDP backends in StreamRegistry
         if self.stream_registry.is_some() {
-            self.update_stream_backends(&instance.spec, &addrs);
+            self.update_stream_backends(instance).await;
         }
 
-        // Register new containers with supervisor for crash monitoring
+        // Register new containers with supervisor for crash monitoring.
+        //
+        // Container ids here must match what `ServiceInstance::scale_to`
+        // constructed — same role (derived from `replica_groups`) and same
+        // local node id. Otherwise supervise/unsupervise miss the live entry
+        // and crash-restart bookkeeping leaks across scale events.
+        let local_node_id = self.cluster.as_ref().map_or(0, |c| c.node_id());
         if let Some(supervisor) = &self.container_supervisor {
             // For scale-up, register new containers
             if replicas > current_replicas {
                 for i in current_replicas..replicas {
-                    let container_id = ContainerId {
-                        service: name.to_string(),
-                        replica: i + 1,
-                    };
+                    let replica_idx = i + 1;
+                    let container_id = ContainerId::with_role_and_node(
+                        name.to_string(),
+                        replica_idx,
+                        instance.role_for_replica(replica_idx),
+                        local_node_id,
+                    );
                     supervisor.supervise(&container_id, &instance.spec).await;
                 }
             }
             // For scale-down, unregister removed containers
             if replicas < current_replicas {
                 for i in replicas..current_replicas {
-                    let container_id = ContainerId {
-                        service: name.to_string(),
-                        replica: i + 1,
-                    };
+                    let replica_idx = i + 1;
+                    let container_id = ContainerId::with_role_and_node(
+                        name.to_string(),
+                        replica_idx,
+                        instance.role_for_replica(replica_idx),
+                        local_node_id,
+                    );
                     supervisor.unsupervise(&container_id).await;
                 }
             }
@@ -1693,55 +1955,59 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Collect backend addresses for a service's containers
+    /// Collect backend addresses for a single endpoint of a service.
     ///
-    /// This queries the service instance's containers for their overlay network
-    /// IP addresses and constructs backend addresses using those IPs with the
-    /// service's endpoint port.
+    /// This queries the service instance's containers for their overlay
+    /// network IP addresses and constructs backend addresses using the
+    /// endpoint's container target port.
+    ///
+    /// Containers are filtered by `endpoint.target_role`:
+    /// - `None` (default): all containers of the service are eligible
+    ///   (legacy behavior).
+    /// - `Some(role)`: only containers whose `ContainerId.role` equals
+    ///   `role` are included. Implements
+    ///   [`zlayer_spec::EndpointSpec::target_role`].
     ///
     /// If a container has a `port_override` (e.g., macOS sandbox where all
-    /// containers share the host network), that port is used instead of the
-    /// spec-declared endpoint port. This allows multiple replicas on the same
-    /// IP (`127.0.0.1`) to be distinguished by port.
-    async fn collect_backend_addrs(
+    /// containers share the host network), that port is used instead of
+    /// the spec-declared endpoint port. This allows multiple replicas on
+    /// the same IP (`127.0.0.1`) to be distinguished by port.
+    async fn collect_endpoint_backends(
         &self,
         instance: &ServiceInstance,
-        _replicas: u32, // No longer needed - we iterate containers directly
+        endpoint: &zlayer_spec::EndpointSpec,
     ) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
-
-        // Get the primary container target port (first HTTP endpoint) as the default
-        let spec_port = instance
-            .spec
-            .endpoints
-            .iter()
-            .find(|ep| {
-                matches!(
-                    ep.protocol,
-                    Protocol::Http | Protocol::Https | Protocol::Websocket
-                )
-            })
-            .map_or(8080, zlayer_spec::EndpointSpec::target_port);
-
-        // Collect backend addresses from containers with overlay IPs
+        let endpoint_port = endpoint.target_port();
         let containers = instance.containers().read().await;
 
-        for container in containers.values() {
-            if let Some(ip) = container.overlay_ip {
-                // Use the runtime-assigned port override if present (macOS sandbox),
-                // otherwise fall back to the spec-declared endpoint port.
-                let port = container.port_override.unwrap_or(spec_port);
-                addrs.push(SocketAddr::new(ip, port));
+        for (container_id, container) in containers.iter() {
+            // target_role filter: skip containers whose role doesn't match.
+            if let Some(required_role) = endpoint.target_role.as_ref() {
+                if container_id.role != *required_role {
+                    continue;
+                }
             }
+            let Some(ip) = container.overlay_ip else {
+                continue;
+            };
+            // Use the runtime-assigned port override if present (macOS
+            // sandbox), otherwise fall back to the endpoint's declared
+            // target port.
+            let port = container.port_override.unwrap_or(endpoint_port);
+            addrs.push(SocketAddr::new(ip, port));
         }
 
-        // If no overlay IPs available, this might be Docker runtime or failed attachments
-        // Log a warning but don't fallback to localhost in production
+        // If we expected backends but found none, log a hint so operators
+        // can debug. Distinguish "no containers" from "role filter
+        // excluded everything" from "no overlay IPs".
         if addrs.is_empty() && !containers.is_empty() {
             tracing::warn!(
                 service = %instance.service_name,
+                endpoint = %endpoint.name,
+                target_role = ?endpoint.target_role,
                 container_count = containers.len(),
-                "no overlay IPs available for backends - containers may not be reachable via proxy"
+                "no backends collected for endpoint - either no matching role, no overlay IPs, or filtering excluded all"
             );
         }
 
@@ -2240,7 +2506,7 @@ mod tests {
 
         // Create a mock overlay manager (skip actual network setup)
         let overlay_manager = Arc::new(RwLock::new(
-            OverlayManager::new("test-deployment".to_string())
+            OverlayManager::new("test-deployment".to_string(), "test".to_string())
                 .await
                 .unwrap(),
         ));
@@ -2829,10 +3095,7 @@ services:
         manager.scale_service("web", 1).await.unwrap();
 
         // Check supervised state
-        let container_id = ContainerId {
-            service: "web".to_string(),
-            replica: 1,
-        };
+        let container_id = ContainerId::new("web".to_string(), 1);
         let state = manager.get_container_supervised_state(&container_id).await;
         assert_eq!(state, Some(SupervisedState::Running));
     }
@@ -3062,5 +3325,183 @@ services:
         // No stream registry to check, but service should be tracked
         let services = manager.list_services().await;
         assert!(services.contains(&"database".to_string()));
+    }
+
+    /// Verify `collect_endpoint_backends` filters containers by
+    /// `EndpointSpec.target_role`.
+    ///
+    /// Given two replica groups (`primary` × 1, `read` × 2) and two
+    /// endpoints — one with `target_role: primary` and one with
+    /// `target_role: read` — each endpoint should receive only the
+    /// matching containers' overlay addresses. The legacy no-filter
+    /// endpoint (`target_role: None`) should receive all of them.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_collect_endpoint_backends_respects_target_role() {
+        use crate::runtime::Container;
+        use std::collections::HashMap as StdHashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+        use zlayer_spec::{
+            EndpointSpec, ExposeType, GroupAffinity, Protocol, ReplicaGroup, ScaleSpec,
+        };
+
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let manager = ServiceManager::new(runtime.clone());
+
+        // Build a spec with replica_groups and three endpoints:
+        // - "write" targets role "primary"
+        // - "read" targets role "read"
+        // - "any" has no target_role (legacy)
+        let mut spec = mock_spec();
+        spec.replica_groups = Some(vec![
+            ReplicaGroup {
+                role: "primary".to_string(),
+                count: 1,
+                image: None,
+                env: StdHashMap::new(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::default(),
+            },
+            ReplicaGroup {
+                role: "read".to_string(),
+                count: 2,
+                image: None,
+                env: StdHashMap::new(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::default(),
+            },
+        ]);
+        spec.scale = ScaleSpec::Fixed { replicas: 3 };
+        spec.endpoints = vec![
+            EndpointSpec {
+                name: "write".to_string(),
+                protocol: Protocol::Tcp,
+                port: 5432,
+                target_port: Some(5432),
+                path: None,
+                host: None,
+                expose: ExposeType::Internal,
+                stream: None,
+                tunnel: None,
+                target_role: Some("primary".to_string()),
+            },
+            EndpointSpec {
+                name: "read".to_string(),
+                protocol: Protocol::Tcp,
+                port: 5433,
+                target_port: Some(5432),
+                path: None,
+                host: None,
+                expose: ExposeType::Internal,
+                stream: None,
+                tunnel: None,
+                target_role: Some("read".to_string()),
+            },
+            EndpointSpec {
+                name: "any".to_string(),
+                protocol: Protocol::Tcp,
+                port: 5434,
+                target_port: Some(5432),
+                path: None,
+                host: None,
+                expose: ExposeType::Internal,
+                stream: None,
+                tunnel: None,
+                target_role: None,
+            },
+        ];
+
+        let instance = ServiceInstance::new(
+            "postgres".to_string(),
+            spec.clone(),
+            runtime,
+            None, // overlay_manager — not exercised by this test
+        );
+
+        // Inject three containers directly: one primary, two read replicas.
+        let cid_primary = ContainerId::with_role_and_node("postgres", 1, "primary", 0);
+        let cid_first_read = ContainerId::with_role_and_node("postgres", 2, "read", 0);
+        let cid_second_read = ContainerId::with_role_and_node("postgres", 3, "read", 0);
+
+        let ip_primary = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1));
+        let ip_first_read = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 2));
+        let ip_second_read = IpAddr::V4(Ipv4Addr::new(10, 200, 0, 3));
+
+        {
+            let mut containers = instance.containers().write().await;
+            containers.insert(
+                cid_primary.clone(),
+                Container {
+                    id: cid_primary,
+                    state: crate::runtime::ContainerState::Running,
+                    pid: None,
+                    task: None,
+                    overlay_ip: Some(ip_primary),
+                    health_monitor: None,
+                    port_override: None,
+                },
+            );
+            containers.insert(
+                cid_first_read.clone(),
+                Container {
+                    id: cid_first_read,
+                    state: crate::runtime::ContainerState::Running,
+                    pid: None,
+                    task: None,
+                    overlay_ip: Some(ip_first_read),
+                    health_monitor: None,
+                    port_override: None,
+                },
+            );
+            containers.insert(
+                cid_second_read.clone(),
+                Container {
+                    id: cid_second_read,
+                    state: crate::runtime::ContainerState::Running,
+                    pid: None,
+                    task: None,
+                    overlay_ip: Some(ip_second_read),
+                    health_monitor: None,
+                    port_override: None,
+                },
+            );
+        }
+
+        let write_ep = &spec.endpoints[0];
+        let read_ep = &spec.endpoints[1];
+        let any_ep = &spec.endpoints[2];
+
+        let write_backends = manager.collect_endpoint_backends(&instance, write_ep).await;
+        let read_backends = manager.collect_endpoint_backends(&instance, read_ep).await;
+        let any_backends = manager.collect_endpoint_backends(&instance, any_ep).await;
+
+        // write endpoint -> only the primary container
+        assert_eq!(write_backends.len(), 1, "write should match only primary");
+        assert!(
+            write_backends.iter().any(|a| a.ip() == ip_primary),
+            "write backends missing primary IP: {write_backends:?}"
+        );
+
+        // read endpoint -> both read containers, no primary
+        assert_eq!(
+            read_backends.len(),
+            2,
+            "read should match both read replicas"
+        );
+        assert!(read_backends.iter().any(|a| a.ip() == ip_first_read));
+        assert!(read_backends.iter().any(|a| a.ip() == ip_second_read));
+        assert!(
+            !read_backends.iter().any(|a| a.ip() == ip_primary),
+            "read backends must not contain primary: {read_backends:?}"
+        );
+
+        // legacy endpoint (target_role = None) -> every container
+        assert_eq!(
+            any_backends.len(),
+            3,
+            "any-role endpoint should see all containers"
+        );
     }
 }

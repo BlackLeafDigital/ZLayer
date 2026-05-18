@@ -325,7 +325,12 @@ pub(crate) async fn join(
     }
 
     // Step 7: Setup overlay networks
-    let overlay_manager = match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
+    let overlay_manager = match zlayer_agent::OverlayManager::new(
+        spec.deployment.clone(),
+        std::process::id().to_string(),
+    )
+    .await
+    {
         Ok(mut om) => {
             // Setup global overlay
             if let Err(e) = om.setup_global_overlay().await {
@@ -335,7 +340,9 @@ pub(crate) async fn join(
                 info!("Global overlay network created");
                 println!("Global overlay network created");
             }
-            Some(Arc::new(RwLock::new(om)))
+            let om = Arc::new(RwLock::new(om));
+            zlayer_agent::OverlayManager::start_periodic_orphan_sweep(om.clone());
+            Some(om)
         }
         Err(e) => {
             warn!("Overlay networks disabled: {}", e);
@@ -589,7 +596,12 @@ pub(crate) async fn join(
     info!("Runtime created successfully");
 
     // Step 6: Setup overlay networks
-    let overlay_manager = match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
+    let overlay_manager = match zlayer_agent::OverlayManager::new(
+        spec.deployment.clone(),
+        std::process::id().to_string(),
+    )
+    .await
+    {
         Ok(mut om) => {
             // Setup global overlay
             if let Err(e) = om.setup_global_overlay().await {
@@ -599,7 +611,9 @@ pub(crate) async fn join(
                 info!("Global overlay network created");
                 println!("Global overlay network created");
             }
-            Some(Arc::new(RwLock::new(om)))
+            let om = Arc::new(RwLock::new(om));
+            zlayer_agent::OverlayManager::start_periodic_orphan_sweep(om.clone());
+            Some(om)
         }
         Err(e) => {
             warn!("Overlay networks disabled: {}", e);

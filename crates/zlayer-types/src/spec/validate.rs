@@ -1146,6 +1146,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
             EndpointSpec {
@@ -1157,6 +1158,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Internal,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
         ];
@@ -1181,6 +1183,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
             EndpointSpec {
@@ -1192,6 +1195,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
         ];

@@ -8,14 +8,15 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Request to scale a service
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct InternalScaleRequest {
-    /// Service name to scale
-    pub service: String,
-    /// Target replica count
-    pub replicas: u32,
-}
+/// Re-export the wire-level scale request from `crate::cluster`.
+///
+/// `InternalScaleRequest` was moved to `zlayer_types::cluster` so the same
+/// Rust type can be shared between the HTTP fan-out path (in
+/// `zlayer-scheduler::cluster`) and the `/internal/scale` handler in
+/// `zlayer-api`. This re-export preserves the original
+/// `zlayer_types::api::internal::InternalScaleRequest` path for downstream
+/// callers (and `pub use ...::internal::*` consumers).
+pub use crate::cluster::{InternalScaleRequest, ScaleAssignment};
 
 /// Response from internal scale operation
 #[derive(Debug, Serialize, ToSchema)]

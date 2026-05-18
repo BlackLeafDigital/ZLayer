@@ -1051,6 +1051,7 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
         userns_mode: args.userns.clone(),
         cgroup_parent: args.cgroup_parent.clone(),
         expose: args.expose.clone(),
+        replica_groups: None,
     };
 
     let mut services = HashMap::new();
@@ -1414,6 +1415,7 @@ fn parse_ports(specs: &[String]) -> Result<Vec<EndpointSpec>> {
             expose: ExposeType::Public,
             stream: None,
             tunnel: None,
+            target_role: None,
         });
     }
     Ok(out)
@@ -1719,8 +1721,10 @@ mod tests {
                 expose: ExposeType::Public,
                 stream: None,
                 tunnel: None,
+                target_role: None,
             }],
             scale: ScaleSpec::Fixed { replicas: 1 },
+            replica_groups: None,
             depends: Vec::new(),
             health: HealthSpec {
                 start_grace: Some(std::time::Duration::from_secs(5)),

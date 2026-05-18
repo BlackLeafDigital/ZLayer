@@ -1878,6 +1878,255 @@ pub(crate) async fn serve_with_external_shutdown(
             )
         })?;
 
+    // -----------------------------------------------------------------------
+    // Cluster trait construction.
+    //
+    // Dispatches on `ClusterMode` loaded from `<data_dir>/cluster_mode.yaml`
+    // (defaults to `ClusterMode::SingleNode` when absent). The single-node
+    // shape is preserved as the default to keep developer / single-host
+    // deployments behaving identically without a config file.
+    //
+    // The local-dispatch closure is shared across every variant: it routes a
+    // scale request that targets THIS node back into
+    // `ServiceManager::scale_service_local`, breaking the cycle that would
+    // otherwise form once the manager holds an `Arc<dyn Cluster>` itself.
+    // -----------------------------------------------------------------------
+    let cluster_node_id = _raft.as_ref().map_or(1, |r| r.node_id());
+    let cluster_api_addr: std::net::SocketAddr = api_config.bind;
+
+    // Load the daemon's `ClusterMode` from `<data_dir>/cluster_mode.yaml` if
+    // present. The file is owned by the operator (or `zlayer node init`); a
+    // missing or malformed file falls back to `SingleNode` to keep the
+    // legacy single-host deployment behaviour unchanged.
+    let cluster_mode: zlayer_types::cluster::ClusterMode = {
+        let path = config.data_dir.join("cluster_mode.yaml");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => match serde_yaml::from_str::<zlayer_types::cluster::ClusterMode>(&s) {
+                Ok(m) => {
+                    info!(path = %path.display(), "loaded ClusterMode from disk");
+                    m
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to parse cluster_mode.yaml; falling back to SingleNode"
+                    );
+                    zlayer_types::cluster::ClusterMode::SingleNode
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zlayer_types::cluster::ClusterMode::SingleNode
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to read cluster_mode.yaml; falling back to SingleNode"
+                );
+                zlayer_types::cluster::ClusterMode::SingleNode
+            }
+        }
+    };
+
+    let cluster_local_dispatch = {
+        let sm_weak = Arc::downgrade(&service_manager);
+        move |req: zlayer_scheduler::cluster::InternalScaleRequest| -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), zlayer_scheduler::cluster::ClusterError>,
+                    > + Send,
+            >,
+        > {
+            let sm_weak = sm_weak.clone();
+            Box::pin(async move {
+                let Some(sm) = sm_weak.upgrade() else {
+                    return Err(zlayer_scheduler::cluster::ClusterError::Transport(
+                        "ServiceManager has been dropped".to_string(),
+                    ));
+                };
+                let mgr = sm.read().await;
+                mgr.scale_service_local(&req.service, req.replicas)
+                    .await
+                    .map_err(|e| zlayer_scheduler::cluster::ClusterError::Transport(e.to_string()))
+            })
+        }
+    };
+
+    // Shared HTTP client + token used by Raft / Static cluster fan-out. The
+    // single-node and worker-tier variants don't need them but it's cheap to
+    // build once up front and clone where required.
+    let cluster_http_client = reqwest::Client::new();
+    let cluster_internal_token = daemon_internal_token.clone();
+
+    let cluster_handle: std::sync::Arc<dyn zlayer_scheduler::cluster::Cluster> = match cluster_mode
+    {
+        zlayer_types::cluster::ClusterMode::SingleNode => {
+            std::sync::Arc::new(zlayer_scheduler::cluster::SingleNodeCluster::new(
+                cluster_node_id,
+                cluster_api_addr,
+                "linux",
+                cluster_local_dispatch,
+            ))
+        }
+        zlayer_types::cluster::ClusterMode::Raft { .. } => {
+            let Some(raft) = _raft.clone() else {
+                anyhow::bail!(
+                    "ClusterMode::Raft requires raft consensus to have initialized; \
+                     check daemon logs for raft startup errors"
+                );
+            };
+            std::sync::Arc::new(zlayer_scheduler::cluster::RaftCluster::new(
+                cluster_node_id,
+                raft,
+                cluster_http_client.clone(),
+                cluster_internal_token.clone(),
+                cluster_local_dispatch,
+            ))
+        }
+        zlayer_types::cluster::ClusterMode::Static {
+            node_id,
+            peers,
+            heartbeat_interval,
+            failure_threshold,
+        } => {
+            let peer_specs = peers
+                .into_iter()
+                .map(|p| zlayer_scheduler::cluster::StaticPeerSpec {
+                    id: p.id,
+                    api_addr: p.api_addr,
+                    labels: p.labels,
+                    os: p.os,
+                })
+                .collect();
+            let failure_threshold_secs = failure_threshold.as_secs();
+            let static_cluster =
+                std::sync::Arc::new(zlayer_scheduler::cluster::StaticCluster::new(
+                    node_id,
+                    peer_specs,
+                    failure_threshold_secs,
+                    cluster_http_client.clone(),
+                    cluster_internal_token.clone(),
+                    cluster_local_dispatch,
+                ));
+            static_cluster.clone().start_heartbeats(heartbeat_interval);
+            static_cluster
+        }
+        zlayer_types::cluster::ClusterMode::WorkerTier {
+            role: zlayer_types::cluster::WorkerTierRole::Worker,
+            ..
+        } => {
+            anyhow::bail!(
+                "`mode: worker-tier` with `role: worker` must use `zlayer worker` \
+                 (not `zlayer serve`). See `zlayer worker --help`."
+            );
+        }
+        zlayer_types::cluster::ClusterMode::WorkerTier {
+            role: zlayer_types::cluster::WorkerTierRole::Server,
+            worker_grpc_addr,
+            worker_ca_dir,
+            heartbeat_min_ttl,
+            heartbeat_max_ttl,
+            heartbeat_grace,
+            max_heartbeats_per_second,
+            failover_heartbeat_ttl,
+            ..
+        } => {
+            // worker-tier server-role REQUIRES raft consensus.
+            let Some(raft) = _raft.clone() else {
+                anyhow::bail!(
+                    "ClusterMode::WorkerTier server-role requires raft consensus; \
+                     check daemon logs for raft startup errors"
+                );
+            };
+
+            let raft_for_dispatcher = raft.clone();
+            let raft_cluster = std::sync::Arc::new(zlayer_scheduler::cluster::RaftCluster::new(
+                cluster_node_id,
+                raft,
+                cluster_http_client.clone(),
+                cluster_internal_token.clone(),
+                cluster_local_dispatch,
+            ));
+
+            // Worker CA storage. Defaults to `<data_dir>/cluster/` (the same
+            // directory used elsewhere for cluster keypairs).
+            let worker_ca_dir_path = worker_ca_dir
+                .as_deref()
+                .map_or_else(|| config.data_dir.join("cluster"), std::path::PathBuf::from);
+            let worker_ca = std::sync::Arc::new(
+                zlayer_secrets::WorkerCa::load_or_generate(&worker_ca_dir_path).with_context(
+                    || {
+                        format!(
+                            "loading or generating worker CA in {}",
+                            worker_ca_dir_path.display()
+                        )
+                    },
+                )?,
+            );
+
+            // Adaptive-TTL tunables threaded through from `ClusterMode`.
+            let ttl_cfg = zlayer_types::cluster::AdaptiveTtlConfig {
+                min_ttl_secs: u32::try_from(heartbeat_min_ttl.as_secs()).unwrap_or(u32::MAX),
+                max_ttl_secs: u32::try_from(heartbeat_max_ttl.as_secs()).unwrap_or(u32::MAX),
+                grace_secs: u32::try_from(heartbeat_grace.as_secs()).unwrap_or(u32::MAX),
+                max_heartbeats_per_second,
+                failover_ttl_secs: u32::try_from(failover_heartbeat_ttl.as_secs())
+                    .unwrap_or(u32::MAX),
+            };
+
+            // Cluster ID persisted under `<data_dir>/cluster_id`; falls back to
+            // a placeholder when the file is missing (matches the bootstrap
+            // path in `node_helpers::issue_worker_bootstrap_token`).
+            let cluster_id = tokio::fs::read_to_string(config.data_dir.join("cluster_id"))
+                .await
+                .map_or_else(|_| "default-cluster".to_string(), |s| s.trim().to_string());
+
+            // Workers start at id 1_000_000 to avoid collisions with raft
+            // member ids (which start at 1 and are usually < 100).
+            let starting_worker_node_id: u64 = 1_000_000;
+
+            let dispatcher = std::sync::Arc::new(
+                zlayer_scheduler::worker_dispatcher::WorkerDispatcherImpl::new(
+                    raft_for_dispatcher,
+                    cluster_id,
+                    cluster_signer.clone(),
+                    worker_ca,
+                    ttl_cfg,
+                    starting_worker_node_id,
+                ),
+            );
+            let _expiry_handle = dispatcher.start_expiry_sweep();
+
+            // Spawn the worker-facing gRPC server.
+            let grpc_service = dispatcher.clone().into_tonic_service();
+            tokio::spawn(async move {
+                info!(addr = %worker_grpc_addr, "worker-tier gRPC server starting");
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(grpc_service)
+                    .serve(worker_grpc_addr)
+                    .await
+                {
+                    tracing::error!(error = %e, "worker-tier gRPC server exited");
+                }
+            });
+
+            let dispatcher_dyn: std::sync::Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher> =
+                dispatcher;
+
+            std::sync::Arc::new(zlayer_scheduler::cluster::WorkerTierCluster::server(
+                raft_cluster,
+                dispatcher_dyn,
+            ))
+        }
+    };
+
+    {
+        let mut mgr_guard = service_manager.write().await;
+        #[allow(deprecated)]
+        mgr_guard.set_cluster(cluster_handle.clone());
+    }
+
     // Build deployment state with orchestration wiring so create_deployment
     // actually registers services, sets up overlays, and scales containers.
     // Clone dns_handle so the deployment state keeps one for API handlers while
@@ -1896,11 +2145,16 @@ pub(crate) async fn serve_with_external_shutdown(
 
     // Build the core router using the orchestration-wired deployment state.
     // This ensures create_deployment actually orchestrates containers.
+    // Surface this daemon's Raft node ID on container API responses so the
+    // CLI/UI can show which node owns each container. `None` when Raft failed
+    // to initialize.
+    let local_node_id = _raft.as_ref().map(|r| r.node_id().to_string());
     let base_router = zlayer_api::build_router_with_deployment_state(
         &api_config,
         deployment_state,
         service_manager.clone(),
         storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+        local_node_id,
     );
 
     // Add internal routes for scheduler-to-agent communication.

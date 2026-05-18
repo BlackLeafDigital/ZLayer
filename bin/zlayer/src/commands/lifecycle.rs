@@ -375,10 +375,7 @@ pub(crate) async fn stop(
                 println!("  Stopping service: {name} (up to {replicas} replicas)");
 
                 for replica in 1..=replicas {
-                    let id = zlayer_agent::ContainerId {
-                        service: (*name).clone(),
-                        replica,
-                    };
+                    let id = zlayer_agent::ContainerId::new((*name).clone(), replica);
                     if let Err(e) = runtime.stop_container(&id, timeout_duration).await {
                         warn!(container = %id, error = %e, "Failed to stop container (may not exist)");
                     } else {
@@ -398,10 +395,10 @@ pub(crate) async fn stop(
                             if let Some(rep_str) = entry_name.strip_prefix(&prefix) {
                                 if let Ok(rep_num) = rep_str.parse::<u32>() {
                                     if rep_num > replicas {
-                                        let id = zlayer_agent::ContainerId {
-                                            service: (*name).clone(),
-                                            replica: rep_num,
-                                        };
+                                        let id = zlayer_agent::ContainerId::new(
+                                            (*name).clone(),
+                                            rep_num,
+                                        );
                                         info!(container = %id, "Found extra container beyond spec");
                                         if let Err(e) =
                                             runtime.stop_container(&id, timeout_duration).await

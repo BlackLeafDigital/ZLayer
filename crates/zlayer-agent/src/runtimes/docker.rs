@@ -3667,23 +3667,14 @@ mod tests {
 
     #[test]
     fn test_container_name() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
         assert_eq!(container_name(&id), "zlayer-myservice-1");
     }
 
     #[test]
     fn test_container_name_with_different_replicas() {
-        let id1 = ContainerId {
-            service: "api".to_string(),
-            replica: 0,
-        };
-        let id2 = ContainerId {
-            service: "api".to_string(),
-            replica: 42,
-        };
+        let id1 = ContainerId::new("api".to_string(), 0);
+        let id2 = ContainerId::new("api".to_string(), 42);
         assert_eq!(container_name(&id1), "zlayer-api-0");
         assert_eq!(container_name(&id2), "zlayer-api-42");
     }
@@ -3891,6 +3882,7 @@ mod tests {
                 expose: ExposeType::Internal,
                 stream: None,
                 tunnel: None,
+                target_role: None,
             })
             .collect();
 
@@ -3907,6 +3899,7 @@ mod tests {
             network: ServiceNetworkSpec::default(),
             endpoints,
             scale: ScaleSpec::default(),
+            replica_groups: None,
             depends: vec![],
             health: HealthSpec {
                 start_grace: None,
@@ -4748,10 +4741,7 @@ mod tests {
         // the smoke test we rely on a pre-existing `alpine` container
         // named `zlayer-exec-pty-smoke-0` so this test stays independent
         // of the rest of the runtime API.
-        let id = ContainerId {
-            service: "exec-pty-smoke".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("exec-pty-smoke".to_string(), 0);
 
         let opts = ExecOptions {
             command: vec!["sh".into()],

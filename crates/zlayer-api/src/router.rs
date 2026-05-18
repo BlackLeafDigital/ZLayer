@@ -374,7 +374,7 @@ pub fn build_router_full(
 /// let runtime = Arc::new(MockRuntime::new());
 /// let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
 ///
-/// let router = build_router_with_services(&config, storage, service_manager);
+/// let router = build_router_with_services(&config, storage, service_manager, None);
 /// # Ok(())
 /// # }
 /// ```
@@ -382,6 +382,7 @@ pub fn build_router_with_services(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Auth state
     let auth_state = AuthState {
@@ -399,7 +400,7 @@ pub fn build_router_with_services(
     let deployment_state = DeploymentState::new(storage.clone());
 
     // Service state (for service scaling operations)
-    let service_state = ServiceState::new(service_manager, storage);
+    let service_state = ServiceState::new(service_manager, storage, local_node_id);
 
     // Rate limiting
     let rate_limit_state = RateLimitState::new(&config.rate_limit);
@@ -505,6 +506,7 @@ pub fn build_router_with_deployment_state(
     deployment_state: DeploymentState,
     service_manager: Arc<RwLock<ServiceManager>>,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Auth state
     let auth_state = AuthState {
@@ -519,7 +521,7 @@ pub fn build_router_with_deployment_state(
     log_auth_state_audit(&auth_state);
 
     // Service state (for service scaling operations)
-    let service_state = ServiceState::new(service_manager, storage);
+    let service_state = ServiceState::new(service_manager, storage, local_node_id);
 
     // Rate limiting
     let rate_limit_state = RateLimitState::new(&config.rate_limit);
@@ -681,6 +683,7 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
 ///     storage,
 ///     service_manager,
 ///     internal_token,
+///     None,
 /// );
 /// # Ok(())
 /// # }
@@ -690,9 +693,11 @@ pub fn build_router_with_internal(
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     internal_token: String,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager.clone());
+    let base_router =
+        build_router_with_services(config, storage, service_manager.clone(), local_node_id);
 
     // Create internal state
     let internal_state = InternalState::new(service_manager, internal_token);
@@ -1083,8 +1088,9 @@ pub fn build_router_with_services_and_secrets(
     service_manager: Arc<RwLock<ServiceManager>>,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
     env_store: Arc<dyn EnvironmentStorage>,
+    local_node_id: Option<String>,
 ) -> Router {
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
 
     let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
     let env_state = EnvironmentsState::new(env_store);
@@ -1116,8 +1122,15 @@ pub fn build_router_with_internal_and_secrets(
     internal_token: String,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
     env_store: Arc<dyn EnvironmentStorage>,
+    local_node_id: Option<String>,
 ) -> Router {
-    let base_router = build_router_with_internal(config, storage, service_manager, internal_token);
+    let base_router = build_router_with_internal(
+        config,
+        storage,
+        service_manager,
+        internal_token,
+        local_node_id,
+    );
 
     let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
     let env_state = EnvironmentsState::new(env_store);
@@ -1203,9 +1216,10 @@ pub fn build_router_with_nodes_and_overlay(
     service_manager: Arc<RwLock<ServiceManager>>,
     node_state: NodeApiState,
     overlay_state: OverlayApiState,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
 
     // Build node and overlay routes
     let node_routes = build_node_routes(node_state);
@@ -1582,9 +1596,10 @@ pub fn build_router_with_containers(
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
 
     // Create container state (carries the shared event bus)
     let container_state = ContainerApiState::new(runtime);
@@ -1840,7 +1855,8 @@ mod tests {
         let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
         let internal_token = "test-secret-token".to_string();
 
-        let _router = build_router_with_internal(&config, storage, service_manager, internal_token);
+        let _router =
+            build_router_with_internal(&config, storage, service_manager, internal_token, None);
         // Router builds without error
     }
 
@@ -1883,6 +1899,7 @@ mod tests {
             service_manager,
             node_state,
             overlay_state,
+            None,
         );
         // Router builds without error
     }
@@ -1933,7 +1950,8 @@ mod tests {
         let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
         let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime.clone())));
 
-        let _router = build_router_with_containers(&config, storage, service_manager, runtime);
+        let _router =
+            build_router_with_containers(&config, storage, service_manager, runtime, None);
         // Router builds without error
     }
 }

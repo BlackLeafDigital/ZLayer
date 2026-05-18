@@ -880,6 +880,27 @@ async fn run(
             ))
             .await
         }
+        Commands::Worker {
+            server,
+            token,
+            token_file,
+            labels,
+            identity_dir,
+            api_addr,
+        } => {
+            let resolved_identity_dir = identity_dir
+                .clone()
+                .unwrap_or_else(|| cli.effective_data_dir().join("worker").join("identity"));
+            commands::worker::run(
+                server.clone(),
+                token.clone(),
+                token_file.clone(),
+                labels.clone(),
+                resolved_identity_dir,
+                *api_addr,
+            )
+            .await
+        }
         Commands::Status => commands::lifecycle::status(&cli).await,
         Commands::Logs {
             deployment,

@@ -612,7 +612,12 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         info!("Host networking mode: skipping overlay network setup");
         None
     } else {
-        match OverlayManager::new(config.deployment_name.clone()).await {
+        match OverlayManager::new(
+            config.deployment_name.clone(),
+            std::process::id().to_string(),
+        )
+        .await
+        {
             Ok(om) => {
                 // Data-dir-aware UAPI socket dir: a daemon launched with
                 // `--data-dir /tmp/foo` writes its boringtun sockets under
@@ -629,7 +634,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 } else {
                     info!("Global overlay network created");
                 }
-                Some(Arc::new(RwLock::new(om)))
+                let om = Arc::new(RwLock::new(om));
+                OverlayManager::start_periodic_orphan_sweep(om.clone());
+                Some(om)
             }
             Err(e) => {
                 warn!("Overlay manager init failed: {e}");

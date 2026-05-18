@@ -146,6 +146,8 @@ humantime = "2"
 # `iat`; this dep lets the CLI mint matching tokens without round-tripping
 # through the daemon.
 jsonwebtoken = { workspace = true }
+async-trait.workspace = true
+tonic = "0.14.5"
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

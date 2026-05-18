@@ -957,6 +957,7 @@ fn translate_service_only(body: &DockerServiceSpec) -> Result<ZServiceSpec, Stri
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        replica_groups: None,
     })
 }
 
@@ -1107,6 +1108,7 @@ mod tests {
             network: zlayer_spec::ServiceNetworkSpec::default(),
             endpoints: Vec::new(),
             scale: ScaleSpec::Fixed { replicas: 3 },
+            replica_groups: None,
             depends: Vec::new(),
             health: zlayer_spec::HealthSpec {
                 start_grace: None,

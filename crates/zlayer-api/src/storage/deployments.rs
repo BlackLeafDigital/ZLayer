@@ -281,6 +281,7 @@ mod tests {
                 network: zlayer_spec::ServiceNetworkSpec::default(),
                 endpoints: vec![],
                 scale: zlayer_spec::ScaleSpec::default(),
+                replica_groups: None,
                 depends: vec![],
                 health: zlayer_spec::HealthSpec {
                     start_grace: None,

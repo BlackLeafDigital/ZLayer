@@ -282,10 +282,7 @@ impl JobExecutor {
         // Use a unique replica number based on execution ID hash
         let replica = exec_id.0.chars().take(8).collect::<String>();
         let replica_num = u32::from_str_radix(&replica, 16).unwrap_or(0) % 10000;
-        let container_id = ContainerId {
-            service: format!("job-{job_name}"),
-            replica: replica_num,
-        };
+        let container_id = ContainerId::new(format!("job-{job_name}"), replica_num);
 
         // Store container ID
         Self::update_status(&executions, &exec_id, |exec| {

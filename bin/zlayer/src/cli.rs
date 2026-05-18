@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::ui::consent::ConsentMode;
@@ -301,6 +302,45 @@ pub(crate) enum Commands {
         /// WSL2 auto-install consent (Windows only).
         #[command(flatten)]
         install_wsl: InstallWslArgs,
+    },
+
+    /// Run this host as a worker-tier worker node.
+    ///
+    /// Joins a remote control plane via gRPC, registers via a bootstrap
+    /// token + locally-generated mTLS CSR, then long-polls assignments.
+    /// Does not run an API server or raft.
+    ///
+    /// Examples:
+    ///   zlayer worker --server <http://leader1:3670> --token-file /etc/zlayer/worker.token
+    ///   zlayer worker -s <http://10.0.0.1:3670> -s <http://10.0.0.2:3670> --token $TOK \
+    ///                  --labels region=us-east,tier=edge
+    #[command(verbatim_doc_comment)]
+    Worker {
+        /// Control-plane gRPC endpoint (specify multiple times for HA).
+        #[arg(short = 's', long, required = true)]
+        server: Vec<String>,
+
+        /// Bootstrap token. Conflicts with --token-file.
+        #[arg(long, conflicts_with = "token_file")]
+        token: Option<String>,
+
+        /// Path to a file containing the bootstrap token. Conflicts with --token.
+        #[arg(long, conflicts_with = "token")]
+        token_file: Option<String>,
+
+        /// Free-form labels as k=v,k=v (e.g. `region=us-east,tier=edge`).
+        #[arg(long, default_value = "")]
+        labels: String,
+
+        /// Directory to persist the worker's mTLS identity (cert.pem, key.pem,
+        /// ca.pem). Default: `<data_dir>/worker/identity/`.
+        #[arg(long)]
+        identity_dir: Option<PathBuf>,
+
+        /// Local API/health address advertised to the leader for in-cluster
+        /// reachability. Default: 0.0.0.0:3669.
+        #[arg(long, default_value = "0.0.0.0:3669")]
+        api_addr: SocketAddr,
     },
 
     /// List running deployments, services, and containers
@@ -2995,6 +3035,46 @@ pub(crate) enum NodeCommands {
         /// Humantime syntax (`24h`, `7d`).
         #[arg(long, value_name = "DURATION")]
         grace: Option<humantime::Duration>,
+    },
+
+    /// Generate a worker bootstrap token for a worker-tier cluster.
+    ///
+    /// Prints the URL-safe-base64 token to stdout. Use it via
+    /// `zlayer worker --token-file <path>` on the worker node.
+    #[command(name = "generate-worker-token", verbatim_doc_comment)]
+    GenerateWorkerToken {
+        /// Token validity in seconds (default 86400 = 24h).
+        #[arg(long, default_value = "86400")]
+        valid_for: u64,
+
+        /// Maximum number of times this token may be redeemed. 0 = unlimited
+        /// (NOT recommended outside dev). Default 1.
+        #[arg(long, default_value = "1")]
+        max_uses: u32,
+    },
+
+    /// Show the status of currently-leased workers in the cluster.
+    #[command(name = "worker-status")]
+    WorkerStatus,
+
+    /// Mark a worker for graceful drain — existing containers finish their
+    /// current work, no new assignments are pushed to the worker.
+    #[command(name = "worker-drain", verbatim_doc_comment)]
+    WorkerDrain {
+        /// Target worker's node id.
+        node_id: u64,
+
+        /// Grace period in seconds before forceful termination. Default 60.
+        #[arg(long, default_value = "60")]
+        grace: u32,
+    },
+
+    /// Immediately evict a worker — terminates assignments and revokes its
+    /// lease. The worker will need a fresh bootstrap token to rejoin.
+    #[command(name = "worker-evict", verbatim_doc_comment)]
+    WorkerEvict {
+        /// Target worker's node id.
+        node_id: u64,
     },
 }
 

@@ -533,8 +533,13 @@ pub async fn scale_service_internal(
     // `RouteToPeer`, surface it as a structured response (not a 500) so the
     // scheduler can re-dispatch to a capable peer instead of treating the
     // service as broken.
+    // Call `scale_service_local` (not `scale_service`) here: this endpoint
+    // is the bottom of the cluster-dispatch recursion. The leader's
+    // `Cluster::dispatch_scale` POSTs to /internal/scale on each target
+    // node; if we routed through `scale_service` again, that would loop
+    // back through the cluster forever.
     match manager
-        .scale_service(&request.service, request.replicas)
+        .scale_service_local(&request.service, request.replicas)
         .await
     {
         Ok(()) => {}

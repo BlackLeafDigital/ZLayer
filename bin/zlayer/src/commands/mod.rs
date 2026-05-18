@@ -44,4 +44,5 @@ pub mod token;
 pub mod user;
 pub mod variable;
 pub mod volume;
+pub mod worker;
 pub mod workflow;

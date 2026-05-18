@@ -368,10 +368,7 @@ mod tests {
 
     fn make_entry(service: &str, replica: u32) -> StandaloneContainer {
         StandaloneContainer {
-            container_id: ContainerId {
-                service: service.to_string(),
-                replica,
-            },
+            container_id: ContainerId::new(service.to_string(), replica),
             image: format!("registry.example.com/{service}:latest"),
             name: Some(format!("{service}-{replica}")),
             labels: HashMap::new(),
@@ -411,10 +408,7 @@ mod tests {
             "storage row must be deleted"
         );
         // ContainerIdMap empty for that container.
-        let cid = ContainerId {
-            service: "ghost-svc".into(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("ghost-svc", 0);
         assert!(
             state.id_map.lookup_container(&cid).is_none(),
             "id_map must not have a stale registration"

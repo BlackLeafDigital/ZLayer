@@ -1,0 +1,74 @@
+# Nested ZLayer e2e runner — deploys a privileged container that
+# reproduces the `.forgejo/workflows/e2e.yml` environment locally.
+#
+# Inside this container, `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`
+# spawns its 3 throwaway daemons (raft) or 1 daemon + 1 manager
+# (intellitester) — all the veth / TUN gear those daemons create lives in
+# the container's netns, so host networking stays clean even when the
+# inner daemons crash mid-suite.
+#
+# Image: zlayer-e2e-runner:dev (built from images/ZImagefile.zlayer-e2e-runner)
+#
+# Usage:
+#   zlayer build images/ZImagefile.zlayer-e2e-runner -t zlayer-e2e-runner:dev
+#   zlayer deploy examples/e2e-runner.zlayer.yml
+#   zlayer exec e2e-runner -- bash -lc 'cd /workspace && cargo build --release -p zlayer'
+
+version: v1
+deployment: zlayer-e2e-runner
+
+services:
+  e2e-runner:
+    rtype: service
+
+    image:
+      # Daemon-side import normalizes unqualified tags to docker.io/library/...
+      # — match that exact key + pull_policy: never to short-circuit any
+      # remote round-trip. See /home/zach/.claude/plans/oaky-so-we-ahve-cosmic-shannon.md
+      # ("Image resolution gotcha") for the underlying cause.
+      name: docker.io/library/zlayer-e2e-runner:dev
+      pull_policy: never
+
+    resources:
+      cpu: 4.0
+      memory: 8Gi
+
+    # Privileged: nested namespace creation for run-suite.py's throwaway
+    # daemons + their boringtun overlay TUNs.
+    privileged: true
+
+    # Explicit even under privileged — survives any future privileged-mode
+    # tightening and documents intent.
+    capabilities:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - NET_RAW
+
+    devices:
+      - path: /dev/net/tun
+        read: true
+        write: true
+        mknod: true
+
+    storage:
+      - type: bind
+        source: /home/zach/github/ZLayer
+        target: /workspace
+        readonly: false
+
+    env:
+      RUST_BACKTRACE: "1"
+      RUST_LOG: info
+      CARGO_BUILD_JOBS: "4"
+      CARGO_TERM_COLOR: always
+      # Mirror CI's port allocation. The container has its own netns so
+      # host ports are not at risk; these vars just keep paths/logs
+      # predictable when comparing to CI runs.
+      ZLAYER_E2E_API_PORT: "13669"
+      ZLAYER_E2E_WG_PORT: "51421"
+      ZLAYER_E2E_DNS_PORT: "15354"
+      ZLAYER_E2E_MANAGER_PORT: "16677"
+
+    scale:
+      mode: fixed
+      replicas: 1

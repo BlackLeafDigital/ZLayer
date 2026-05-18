@@ -745,7 +745,77 @@ pub(crate) async fn handle_node(
             )
             .await
         }
+        NodeCommands::GenerateWorkerToken {
+            valid_for,
+            max_uses,
+        } => handle_node_generate_worker_token(*valid_for, *max_uses, cli_data_dir).await,
+        NodeCommands::WorkerStatus => handle_node_worker_status(),
+        NodeCommands::WorkerDrain { node_id, grace } => handle_node_worker_drain(*node_id, *grace),
+        NodeCommands::WorkerEvict { node_id } => handle_node_worker_evict(*node_id),
     }
+}
+
+/// Mint a worker bootstrap token using the cluster signer on disk.
+///
+/// The actual /api/v1/cluster/workers/* endpoints land in P3.9; for now this
+/// reads the on-disk signer + cluster id and produces a token locally so
+/// operators can pre-stage workers ahead of the leader being reachable.
+pub(crate) async fn handle_node_generate_worker_token(
+    valid_for: u64,
+    max_uses: u32,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
+    use zlayer_secrets::{issue_worker_bootstrap_token, ClusterSigner};
+
+    // Load the cluster signer from the daemon's expected path. The on-disk
+    // path matches what `cluster_signer.rs` writes during `node init`.
+    let signer_path = cli_data_dir.join("cluster").join("cluster_signer.json");
+    let signer = ClusterSigner::load_or_generate(&signer_path)
+        .await
+        .context("loading cluster signer")?;
+
+    // The runtime cluster_id is persisted alongside the node config; fall back
+    // to a placeholder if absent (matches the worker_ca bootstrap fallback).
+    let cluster_id = std::fs::read_to_string(cli_data_dir.join("cluster_id"))
+        .map_or_else(|_| "default-cluster".to_string(), |s| s.trim().to_string());
+
+    let token = issue_worker_bootstrap_token(
+        &signer,
+        cluster_id,
+        i64::try_from(valid_for).unwrap_or(86_400),
+        max_uses,
+        vec![],
+    )
+    .context("issuing worker bootstrap token")?;
+
+    let encoded = token
+        .to_cli_string()
+        .context("encoding worker bootstrap token")?;
+    println!("{encoded}");
+    Ok(())
+}
+
+/// Stub — P3.9 will wire the actual /api/v1/cluster/workers GET endpoint.
+/// Return type is `Result<()>` so the call signature stays stable once
+/// the real HTTP call (which can fail) lands.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_node_worker_status() -> Result<()> {
+    println!("worker-status: not yet wired (P3.9 will add the API endpoint)");
+    Ok(())
+}
+
+/// Stub — P3.9 will wire the actual /api/v1/cluster/workers/{id}/drain endpoint.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_node_worker_drain(node_id: u64, _grace: u32) -> Result<()> {
+    println!("worker-drain {node_id}: not yet wired (P3.9 will add the API endpoint)");
+    Ok(())
+}
+
+/// Stub — P3.9 will wire the actual /api/v1/cluster/workers/{id}/evict endpoint.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_node_worker_evict(node_id: u64) -> Result<()> {
+    println!("worker-evict {node_id}: not yet wired (P3.9 will add the API endpoint)");
+    Ok(())
 }
 
 /// Initialize this node as cluster leader (Windows).

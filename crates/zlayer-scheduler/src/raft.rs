@@ -122,6 +122,28 @@ pub enum Request {
     Secrets(SecretsRaftOp),
     /// Update a node's membership mode (`full` or `replicate`).
     UpdateNodeMode { node_id: NodeId, mode: String },
+    /// Grant a new worker lease — emitted when a worker successfully Registers.
+    GrantWorkerLease {
+        node_id: NodeId,
+        holder: String,   // worker's mTLS cn or token-cn
+        acquired_ns: u64, // unix nanos
+        renewed_ns: u64,  // unix nanos (== acquired_ns on first grant)
+        ttl_secs: u32,
+    },
+    /// Renew an existing worker lease — emitted on every successful `ReportStatus`
+    /// ack tick. Only updates `renewed_ns` and `ttl_secs`; the lease stays alive.
+    RenewWorkerLease {
+        node_id: NodeId,
+        renewed_ns: u64,
+        ttl_secs: u32,
+    },
+    /// Expire a worker lease — emitted by the leader's expiry sweep tick when
+    /// `renewed_ns + ttl_secs + grace_secs < now`. Idempotent: removes the
+    /// lease if present, no-op otherwise.
+    ExpireWorkerLease { node_id: NodeId },
+    /// Revoke a worker lease — admin action (e.g. `worker-evict`). Same effect
+    /// as `ExpireWorkerLease` but distinct for audit/log readability.
+    RevokeWorkerLease { node_id: NodeId },
 }
 
 /// Raft response types
@@ -187,6 +209,36 @@ pub struct ScaleEvent {
     pub timestamp: u64,
 }
 
+/// FSM-internal record of a worker lease. Mirrors `zlayer_types::cluster::WorkerLease`
+/// but uses u64 unix-nanos so postcard serialization stays stable across versions.
+///
+/// Converted to/from `zlayer_types::cluster::WorkerLease` at the read boundary
+/// (queries that return leases to callers do the `SystemTime` conversion there).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerLeaseRecord {
+    pub node_id: NodeId,
+    pub holder: String,
+    pub acquired_ns: u64,
+    pub renewed_ns: u64,
+    pub ttl_secs: u32,
+    /// Monotonic revision, incremented on every renew. Lets the leader-side
+    /// dispatcher push updates that include the latest revision the worker
+    /// observed so reconnects can fast-forward.
+    pub revision: u64,
+}
+
+impl WorkerLeaseRecord {
+    /// Returns true if `now_ns >= renewed_ns + (ttl_secs + grace_secs) * 1e9`.
+    #[must_use]
+    pub fn is_expired(&self, now_ns: u64, grace_secs: u32) -> bool {
+        let deadline_ns = self
+            .renewed_ns
+            .saturating_add(u64::from(self.ttl_secs).saturating_mul(1_000_000_000))
+            .saturating_add(u64::from(grace_secs).saturating_mul(1_000_000_000));
+        now_ns >= deadline_ns
+    }
+}
+
 /// Cluster state (the Raft state machine application state).
 ///
 /// This is the `S` generic parameter to the storage state machine types.
@@ -207,6 +259,12 @@ pub struct ClusterState {
     /// cleanly with an empty [`SecretsState`].
     #[serde(default)]
     pub secrets: SecretsState,
+    /// Worker-tier leases (Nomad-style). Keyed by `node_id` of the worker.
+    /// Only populated when the cluster is in `worker-tier` mode; empty in
+    /// single-node / static / pure-raft modes. `#[serde(default)]` keeps old
+    /// snapshots loading cleanly.
+    #[serde(default)]
+    pub worker_leases: HashMap<NodeId, WorkerLeaseRecord>,
 }
 
 /// Node information
@@ -482,6 +540,54 @@ impl ClusterState {
                 }
             }
             Request::Secrets(op) => self.apply_secrets(op),
+            Request::GrantWorkerLease {
+                node_id,
+                holder,
+                acquired_ns,
+                renewed_ns,
+                ttl_secs,
+            } => {
+                // Re-grant (re-register) is OK: overwrite existing record with
+                // fresh acquired_ns. Revision restarts at 1.
+                let record = WorkerLeaseRecord {
+                    node_id: *node_id,
+                    holder: holder.clone(),
+                    acquired_ns: *acquired_ns,
+                    renewed_ns: *renewed_ns,
+                    ttl_secs: *ttl_secs,
+                    revision: 1,
+                };
+                self.worker_leases.insert(*node_id, record);
+                Response::Success { data: None }
+            }
+            Request::RenewWorkerLease {
+                node_id,
+                renewed_ns,
+                ttl_secs,
+            } => {
+                if let Some(lease) = self.worker_leases.get_mut(node_id) {
+                    // Reject monotonic time-travel: never advance renewed_ns
+                    // backwards. Stale acks (out-of-order replay) are no-ops.
+                    if *renewed_ns > lease.renewed_ns {
+                        lease.renewed_ns = *renewed_ns;
+                        lease.ttl_secs = *ttl_secs;
+                        lease.revision = lease.revision.saturating_add(1);
+                    }
+                    Response::Success { data: None }
+                } else {
+                    // Renew without a prior Grant — happens after ExpireWorkerLease
+                    // races with an in-flight renewal. Caller should re-Register.
+                    Response::Error {
+                        message: format!("RenewWorkerLease: no lease for node {node_id}"),
+                    }
+                }
+            }
+            Request::ExpireWorkerLease { node_id } | Request::RevokeWorkerLease { node_id } => {
+                // Idempotent removal. Both variants share apply-logic; the
+                // distinction is only for log audit / metrics.
+                self.worker_leases.remove(node_id);
+                Response::Success { data: None }
+            }
         }
     }
 
@@ -2319,5 +2425,85 @@ mod tests {
             result.is_err(),
             "dispatch_node_effects must only fire for WipeJoinSecret",
         );
+    }
+
+    #[test]
+    fn grant_renew_expire_lease_round_trip() {
+        let mut state = ClusterState::new();
+        let now_ns: u64 = 1_700_000_000_000_000_000;
+
+        let resp = state.apply(&Request::GrantWorkerLease {
+            node_id: 42,
+            holder: "worker-cn-1".into(),
+            acquired_ns: now_ns,
+            renewed_ns: now_ns,
+            ttl_secs: 60,
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        assert!(state.worker_leases.contains_key(&42));
+
+        // Renew advances renewed_ns and increments revision.
+        let later = now_ns + 30_000_000_000;
+        state.apply(&Request::RenewWorkerLease {
+            node_id: 42,
+            renewed_ns: later,
+            ttl_secs: 90,
+        });
+        let l = state.worker_leases.get(&42).expect("present");
+        assert_eq!(l.renewed_ns, later);
+        assert_eq!(l.ttl_secs, 90);
+        assert_eq!(l.revision, 2);
+
+        // Stale renew (renewed_ns < current) is ignored.
+        let stale_renewed_ns = now_ns - 1_000_000_000;
+        state.apply(&Request::RenewWorkerLease {
+            node_id: 42,
+            renewed_ns: stale_renewed_ns,
+            ttl_secs: 10,
+        });
+        let l = state.worker_leases.get(&42).expect("still present");
+        assert_eq!(l.renewed_ns, later); // unchanged
+        assert_eq!(l.ttl_secs, 90); // unchanged
+
+        // Expire removes.
+        state.apply(&Request::ExpireWorkerLease { node_id: 42 });
+        assert!(!state.worker_leases.contains_key(&42));
+
+        // Idempotent expire = no-op.
+        let resp2 = state.apply(&Request::ExpireWorkerLease { node_id: 42 });
+        assert!(matches!(resp2, Response::Success { .. }));
+    }
+
+    #[test]
+    fn worker_lease_is_expired_math() {
+        let rec = WorkerLeaseRecord {
+            node_id: 1,
+            holder: "x".into(),
+            acquired_ns: 1_000_000_000,
+            renewed_ns: 1_000_000_000,
+            ttl_secs: 10,
+            revision: 1,
+        };
+        // 10s TTL + 0 grace; not expired at +5s, expired at +10s.
+        assert!(!rec.is_expired(1_000_000_000 + 5_000_000_000, 0));
+        assert!(rec.is_expired(1_000_000_000 + 10_000_000_000, 0));
+        // With 5s grace: not expired at +10s, expired at +15s.
+        assert!(!rec.is_expired(1_000_000_000 + 10_000_000_000, 5));
+        assert!(rec.is_expired(1_000_000_000 + 15_000_000_000, 5));
+    }
+
+    #[test]
+    fn old_snapshot_without_worker_leases_field_deserializes() {
+        // Simulates a snapshot serialized before worker_leases existed.
+        // serde_json equivalent of legacy ClusterState (no worker_leases key).
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // worker_leases intentionally absent
+            // secrets intentionally absent (has #[serde(default)] already)
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(s.worker_leases.is_empty());
     }
 }

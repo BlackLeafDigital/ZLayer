@@ -643,10 +643,7 @@ mod tests {
     use crate::runtime::MockRuntime;
 
     fn mock_container_id(service: &str, replica: u32) -> ContainerId {
-        ContainerId {
-            service: service.to_string(),
-            replica,
-        }
+        ContainerId::new(service.to_string(), replica)
     }
 
     fn mock_service_spec(panic_action: PanicAction) -> ServiceSpec {

@@ -106,6 +106,7 @@ pub mod config;
 pub mod dns;
 pub mod error;
 pub mod firewall;
+pub mod gossip;
 pub mod health;
 pub mod transport;
 
@@ -127,6 +128,7 @@ pub use bootstrap::{
 pub use config::*;
 pub use dns::*;
 pub use error::{OverlayError, Result};
+pub use gossip::{GossipConfig, GossipPool, TopologyEvent};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};
 pub use ipnet;
 pub use transport::*;

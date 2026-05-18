@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.50.2] - 2026-05-18
+
+### Added
+- Per-endpoint `target_role` filtering for the agent proxy (P2.4-full). When an `EndpointSpec.target_role` is set, the proxy backend pool for that endpoint now contains only containers whose `ContainerId.role` matches; endpoints without `target_role` keep the legacy behavior (all containers eligible). Implementation: the proxy `ServiceRegistry` gained `update_backends_for_endpoint(service, endpoint, addrs)` and a new `endpoint_lb_key(service, endpoint)` helper; `RouteEntry::from_endpoint` now sets `resolved.name` to that composite key so the load balancer maintains one backend group per `(service, endpoint)` pair. The agent's `ProxyManager` registers a per-endpoint LB group at `add_service` time, exposes `update_endpoint_backends`, and fans `add_backend` / `remove_backend` / `update_backend_health` / `update_backends` out to every per-endpoint group for legacy callers. `ServiceManager` iterates endpoints in `update_proxy_backends` and `update_stream_backends`, collecting role-filtered backends per endpoint via the new `collect_endpoint_backends(instance, endpoint)` helper (replaces the old service-wide `collect_backend_addrs`). New unit tests: `routes::tests::test_update_backends_for_endpoint_isolates_endpoints` and `routes::tests::test_endpoint_lb_key_format` in `zlayer-proxy`, and `service::tests::test_collect_endpoint_backends_respects_target_role` in `zlayer-agent` (postgres-style spec with `primary × 1` and `read × 2` replica groups, asserts each endpoint receives only matching containers).
+
 ## [0.50.1] - 2026-05-15
 
 ### Added

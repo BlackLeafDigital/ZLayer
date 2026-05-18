@@ -1251,6 +1251,12 @@ impl BundleBuilder {
                     .build()
                     .unwrap(),
             );
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Cgroup)
+                    .build()
+                    .unwrap(),
+            );
         }
 
         let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
@@ -2086,10 +2092,7 @@ services:
     #[test]
     fn test_bundle_builder_for_container() {
         let dirs = zlayer_paths::ZLayerDirs::system_default();
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
         let builder = BundleBuilder::for_container(&id);
         assert_eq!(builder.bundle_dir(), dirs.bundles().join("myservice-rep-1"));
     }
@@ -2104,10 +2107,7 @@ services:
 
     #[tokio::test]
     async fn test_build_oci_spec_basic() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
@@ -2128,10 +2128,7 @@ services:
 
     #[tokio::test]
     async fn test_build_oci_spec_with_resources() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec_with_resources();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
@@ -2156,10 +2153,7 @@ services:
 
     #[tokio::test]
     async fn test_build_oci_spec_privileged() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_privileged_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
@@ -2186,10 +2180,7 @@ services:
 
     #[tokio::test]
     async fn test_build_oci_spec_environment() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec_with_resources();
         let builder = BundleBuilder::new("/tmp/test-bundle".into())
             .with_env("EXTRA_VAR".to_string(), "extra_value".to_string());
@@ -2213,10 +2204,7 @@ services:
 
     #[tokio::test]
     async fn test_build_namespaces() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
@@ -2241,10 +2229,7 @@ services:
 
     #[tokio::test]
     async fn test_build_namespaces_host_network() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into()).with_host_network(true);
 
@@ -2486,10 +2471,7 @@ services:
 
     #[tokio::test]
     async fn test_oci_spec_includes_storage_mounts() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1

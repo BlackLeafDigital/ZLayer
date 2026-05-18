@@ -133,10 +133,7 @@ impl Container {
         // Create a mock runtime for now - in production this would be configurable
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
 
-        let id = ContainerId {
-            service: container_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(container_name, 1);
 
         Ok(Container::new(id, spec, runtime))
     }

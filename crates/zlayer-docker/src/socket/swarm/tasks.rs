@@ -592,6 +592,7 @@ mod tests {
             state: state.to_string(),
             pid: Some(1234),
             overlay_ip: None,
+            node_id: None,
         }
     }
 

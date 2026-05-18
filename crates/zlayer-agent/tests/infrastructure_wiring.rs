@@ -118,7 +118,7 @@ async fn test_upsert_passes_overlay_manager_to_service_instance() {
     // instead of self.overlay_manager.as_ref().map(Arc::clone)
     let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
     let overlay_manager = Arc::new(RwLock::new(
-        OverlayManager::new("test-deploy".to_string())
+        OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap(),
     ));
@@ -253,7 +253,9 @@ async fn test_service_manager_full_infrastructure_wiring() {
     // This single test would have caught ALL of the bugs in the original deploy flow.
     let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
     let overlay_manager = Arc::new(RwLock::new(
-        OverlayManager::new("prod".to_string()).await.unwrap(),
+        OverlayManager::new("prod".to_string(), "test".to_string())
+            .await
+            .unwrap(),
     ));
     let service_registry = Arc::new(ServiceRegistry::new());
     let stream_registry = Arc::new(StreamRegistry::new());

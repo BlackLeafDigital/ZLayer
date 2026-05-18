@@ -194,6 +194,7 @@ fn convert_service(
         userns_mode: svc.userns_mode.clone(),
         cgroup_parent: svc.cgroup_parent.clone(),
         expose,
+        replica_groups: None,
     })
 }
 
@@ -490,6 +491,7 @@ fn convert_ports(ports: &[super::types::ComposePort]) -> crate::Result<Vec<Endpo
             expose: ExposeType::Public,
             stream: None,
             tunnel: None,
+            target_role: None,
         });
     }
 

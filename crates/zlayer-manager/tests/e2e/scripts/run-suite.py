@@ -34,7 +34,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
@@ -81,6 +81,236 @@ def is_socket(path: Path) -> bool:
         return False
 
 
+def _open_logs(token_dir: Path, name: str) -> tuple:
+    """Open stdout/stderr log files for a spawned process.
+
+    Returns (out_fh, err_fh) — keep these tied to the Popen so the kernel
+    keeps writing until the writer exits. Caller is responsible for closing
+    via _close_proc_logs(proc) after proc.wait().
+    """
+    logs_dir = token_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    out = open(logs_dir / f"{name}.out.log", "ab", buffering=0)
+    err = open(logs_dir / f"{name}.err.log", "ab", buffering=0)
+    return out, err
+
+
+def _attach_logs(proc: subprocess.Popen, out, err) -> subprocess.Popen:
+    """Stash log file handles on a Popen so cleanup can close them."""
+    proc._zlayer_log_files = (out, err)  # type: ignore[attr-defined]
+    return proc
+
+
+def _close_proc_logs(proc: subprocess.Popen) -> None:
+    """Close any log handles attached via _attach_logs. Idempotent."""
+    for fh in getattr(proc, "_zlayer_log_files", ()):
+        with suppress(Exception):
+            fh.close()
+    if hasattr(proc, "_zlayer_log_files"):
+        proc._zlayer_log_files = ()  # type: ignore[attr-defined]
+
+
+def _run_capture(cmd: list, output_path: Path) -> None:
+    """Run a shell command, write its combined stdout+stderr to output_path.
+
+    Failures are swallowed — capture is best-effort only.
+    """
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as fh:
+            subprocess.run(
+                cmd, stdout=fh, stderr=subprocess.STDOUT,
+                timeout=10, check=False,
+            )
+    except Exception as e:  # noqa: BLE001 - post-mortem must not fail
+        with suppress(Exception):
+            output_path.write_text(f"capture failed: {e!r}\n")
+
+
+def _capture_tail(src: Path, dst: Path, n: int = 500) -> None:
+    """Write the last n lines of src to dst. Best-effort."""
+    try:
+        if not src.is_file():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(src, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            block = min(size, max(n * 200, 4096))
+            fh.seek(-block, 2)
+            data = fh.read()
+        lines = data.splitlines()[-n:]
+        with open(dst, "wb") as fh:
+            for line in lines:
+                fh.write(line + b"\n")
+    except Exception as e:  # noqa: BLE001
+        with suppress(Exception):
+            dst.write_text(f"tail failed: {e!r}\n")
+
+
+def _capture_postmortem(
+    token_dir: Path,
+    data_dirs: list,
+    suite_name: str,
+    exit_code: int,
+) -> None:
+    """Snapshot host state + per-node bundles + log tails into <token>/postmortem/.
+
+    Called BEFORE cleanup deletes the data dirs. Every step is best-effort —
+    never raises, never fails the calling suite. `data_dirs` is the list of
+    daemon data dirs (e.g. `[<token>/node1/data, <token>/node2/data, ...]`
+    for cluster suites, `[<token>/data]` for the manager suite).
+    """
+    pm = token_dir / "postmortem"
+    try:
+        pm.mkdir(parents=True, exist_ok=True)
+        with suppress(Exception):
+            (pm / "marker.txt").write_text(
+                f"suite={suite_name}\nexit_code={exit_code}\n"
+                f"captured_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            )
+    except Exception:  # noqa: BLE001
+        return
+
+    host = pm / "host"
+    _run_capture(["ip", "-o", "link", "show"], host / "ip-link.txt")
+    _run_capture(["ip", "-o", "addr", "show"], host / "ip-addr.txt")
+    _run_capture(["sh", "-c", "mount | grep -E '^cgroup|cgroup2|/sys/fs/cgroup'"],
+                 host / "mount-cgroup.txt")
+    _run_capture(["findmnt", "--json"], host / "findmnt.txt")
+    _run_capture(
+        ["sh", "-c",
+         "echo '== /proc/self/uid_map =='; cat /proc/self/uid_map 2>&1; "
+         "echo '== /proc/self/gid_map =='; cat /proc/self/gid_map 2>&1; "
+         "echo '== /proc/self/setgroups =='; cat /proc/self/setgroups 2>&1"],
+        host / "userns.txt",
+    )
+
+    for idx, data_dir in enumerate(data_dirs, start=1):
+        try:
+            if data_dir == token_dir:
+                node_name = "manager"
+            else:
+                node_name = f"node{idx}"
+            dest = pm / node_name
+            dest.mkdir(parents=True, exist_ok=True)
+            bundles_src = data_dir / "bundles"
+            if bundles_src.is_dir():
+                with suppress(Exception):
+                    shutil.copytree(
+                        bundles_src, dest / "bundles",
+                        dirs_exist_ok=True, symlinks=True,
+                    )
+            dj = data_dir / "daemon.json"
+            if dj.is_file():
+                with suppress(Exception):
+                    shutil.copy2(dj, dest / "daemon.json")
+            run_dir = data_dir / "run"
+            if run_dir.is_dir():
+                with suppress(Exception):
+                    (dest / "run-listing.txt").write_text(
+                        "\n".join(
+                            sorted(str(p.relative_to(run_dir))
+                                   for p in run_dir.rglob("*"))
+                        ) + "\n"
+                    )
+        except Exception:  # noqa: BLE001
+            continue
+
+    logs_src = token_dir / "logs"
+    if logs_src.is_dir():
+        tail_dir = pm / "tail"
+        for log_file in logs_src.glob("*.log"):
+            _capture_tail(log_file, tail_dir / (log_file.name + ".tail"))
+
+
+# ---------------------------------------------------------------------------
+# Layer C: step tracking + SUMMARY.json
+# ---------------------------------------------------------------------------
+
+# Tracks the currently-executing suite step so failed_step can be recorded
+# in SUMMARY.json even when the exception is caught far from the failure
+# point. Reset by the _step() context manager.
+_current_step: Optional[str] = None
+
+
+@contextmanager
+def _step(name: str):
+    """Track the currently-running step for SUMMARY.json's failed_step field.
+
+    Wrap each obvious suite phase: with _step("bootstrap_3node"): ...
+
+    When an exception bubbles out of the wrapped block, _current_step retains
+    `name` until the next outer _step (or until cleanup); SUMMARY.json reads
+    it to populate failed_step.
+    """
+    global _current_step
+    prev = _current_step
+    _current_step = name
+    try:
+        yield
+    finally:
+        # On exception we want failed_step to STAY at the inner name (don't
+        # reset to prev); on normal exit, restore prev so an outer _step
+        # is correctly named when no error occurred.
+        if sys.exc_info()[0] is None:
+            _current_step = prev
+
+
+def _write_summary(
+    token_dir: Path,
+    suite_name: str,
+    started_at: float,
+    ended_at: float,
+    exit_code: int,
+    failure: Optional[tuple],
+    nodes: Optional[list] = None,
+) -> None:
+    """Write <token>/SUMMARY.json with the suite outcome. Best-effort.
+
+    `failure` is `(type_name, message)` or None on success.
+    `nodes` is a list of dicts shaped like
+        {"index": int, "api_port": int, "pid": int, "data_dir": str}
+    or None for non-cluster suites.
+    """
+    try:
+        token_dir.mkdir(parents=True, exist_ok=True)
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        payload = {
+            "suite": suite_name,
+            "token": token_dir.name,
+            "started_at": iso(started_at),
+            "ended_at": iso(ended_at),
+            "exit_code": exit_code,
+            "failed_step": _current_step,
+            "failure": (
+                {"type": failure[0], "message": failure[1]}
+                if failure else None
+            ),
+            "nodes": nodes or [],
+            "artifacts": {
+                "logs": "logs/",
+                "postmortem": "postmortem/",
+                "data_dirs": [
+                    str(d.relative_to(token_dir))
+                    if token_dir in d.parents or d == token_dir
+                    else str(d)
+                    for d in (
+                        [Path(n["data_dir"]) for n in (nodes or [])]
+                    )
+                ],
+            },
+        }
+        (token_dir / "SUMMARY.json").write_text(
+            json.dumps(payload, indent=2) + "\n"
+        )
+    except Exception as e:  # noqa: BLE001
+        with suppress(Exception):
+            (token_dir / "SUMMARY.json.error").write_text(
+                f"summary write failed: {e!r}\n"
+            )
+
+
 def _wait_http_ok(url: str, timeout_s: int) -> bool:
     """Poll a URL once a second until any non-5xx response returns."""
     deadline = time.monotonic() + timeout_s
@@ -106,10 +336,12 @@ def _kill_pg(proc: subprocess.Popen, name: str, *, sudo: bool = False) -> None:
     `--sudo-daemon`) get killed despite the harness running unprivileged.
     """
     if proc.poll() is not None:
+        _close_proc_logs(proc)
         return
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
+        _close_proc_logs(proc)
         return
     log(f"Killing {name} (pgid={pgid})")
     need_sudo = sudo and os.geteuid() != 0
@@ -133,6 +365,7 @@ def _kill_pg(proc: subprocess.Popen, name: str, *, sudo: bool = False) -> None:
     _send(signal.SIGKILL)
     with suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=TERM_GRACE_S)
+    _close_proc_logs(proc)
 
 
 def _ports_in_use(ports: list[int]) -> list[int]:
@@ -279,7 +512,7 @@ def build_phase(*, throwaway: bool, with_manager: bool = True) -> None:
 
 
 def start_throwaway_daemon(
-    data_dir: Path, zlayer_bin: Path, *, sudo: bool,
+    data_dir: Path, zlayer_bin: Path, *, sudo: bool, token_dir: Path,
 ) -> tuple[subprocess.Popen, Path]:
     log(f"Starting throwaway daemon on 127.0.0.1:{API_PORT} (data-dir: {data_dir})")
     argv = _maybe_sudo(
@@ -301,7 +534,12 @@ def start_throwaway_daemon(
             "e2e-secret-do-not-use-in-prod-do-not-share-this-key-1234567890",
         ),
     }
-    proc = subprocess.Popen(argv, cwd=REPO_ROOT, env=env, start_new_session=True)
+    out, err = _open_logs(token_dir, "daemon")
+    proc = subprocess.Popen(
+        argv, cwd=REPO_ROOT, env=env, start_new_session=True,
+        stdout=out, stderr=err,
+    )
+    _attach_logs(proc, out, err)
 
     ready_url = f"http://127.0.0.1:{API_PORT}/health/ready"
     if not _wait_http_ok(ready_url, HEALTHCHECK_TIMEOUT_S):
@@ -345,6 +583,7 @@ def start_throwaway_daemon(
 def create_fixture_user(
     zlayer_bin: Path, cli_data_dir: Optional[Path],
     email: str, password: str, display: str,
+    *, sudo: bool = False,
 ) -> str:
     log(f"Creating fixture user {email} (admin)")
     env = {**os.environ}
@@ -352,13 +591,13 @@ def create_fixture_user(
         env["ZLAYER_DATA_DIR"] = str(cli_data_dir)
     try:
         result = subprocess.run(
-            [
+            _maybe_sudo([
                 str(zlayer_bin), "user", "create",
                 "--email", email,
                 "--password", password,
                 "--role", "admin",
                 "--display-name", display,
-            ],
+            ], sudo=sudo),
             env=env, capture_output=True, text=True, check=True,
         )
     except subprocess.CalledProcessError as exc:
@@ -382,6 +621,7 @@ def create_fixture_user(
 
 def delete_fixture_user(
     zlayer_bin: Path, cli_data_dir: Optional[Path], user_id: str,
+    *, sudo: bool = False,
 ) -> None:
     env = {**os.environ}
     if cli_data_dir:
@@ -389,7 +629,10 @@ def delete_fixture_user(
     # Daemon-side delete is idempotent (204 in both cases). Transport
     # failures during cleanup are tolerated.
     result = subprocess.run(
-        [str(zlayer_bin), "user", "delete", user_id, "--yes"],
+        _maybe_sudo(
+            [str(zlayer_bin), "user", "delete", user_id, "--yes"],
+            sudo=sudo,
+        ),
         env=env, capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -400,7 +643,7 @@ def delete_fixture_user(
         )
 
 
-def start_manager(socket_path: Path) -> subprocess.Popen:
+def start_manager(socket_path: Path, *, token_dir: Path) -> subprocess.Popen:
     log(f"Starting manager on 127.0.0.1:{MANAGER_PORT} (talking to {socket_path})")
     env = {
         **os.environ,
@@ -417,9 +660,12 @@ def start_manager(socket_path: Path) -> subprocess.Popen:
     binary = REPO_ROOT / "target" / "release" / "zlayer-manager"
     if not binary.exists():
         die(f"zlayer-manager binary not found at {binary}; drop --no-build")
+    out, err = _open_logs(token_dir, "manager")
     proc = subprocess.Popen(
         [str(binary)], cwd=REPO_ROOT, env=env, start_new_session=True,
+        stdout=out, stderr=err,
     )
+    _attach_logs(proc, out, err)
     if not _wait_http_ok(
         f"http://127.0.0.1:{MANAGER_PORT}/login", HEALTHCHECK_TIMEOUT_S,
     ):
@@ -545,7 +791,8 @@ def _fetch_cluster_nodes(api_port: int) -> list[dict]:
 
 
 def _spawn_node_serve(
-    zlayer_bin: Path, data_dir: Path, api_port: int, *, sudo: bool = False,
+    zlayer_bin: Path, data_dir: Path, api_port: int,
+    *, sudo: bool = False, node_index: int, token_dir: Path,
 ) -> subprocess.Popen:
     """Spawn `zlayer serve` for a cluster node (no --daemon, killable group).
 
@@ -572,7 +819,12 @@ def _spawn_node_serve(
         ],
         sudo=sudo,
     )
-    return subprocess.Popen(argv, cwd=REPO_ROOT, env=env, start_new_session=True)
+    out, err = _open_logs(token_dir, f"node{node_index}")
+    proc = subprocess.Popen(
+        argv, cwd=REPO_ROOT, env=env, start_new_session=True,
+        stdout=out, stderr=err,
+    )
+    return _attach_logs(proc, out, err)
 
 
 def _bootstrap_3node_cluster(
@@ -619,7 +871,7 @@ def _bootstrap_3node_cluster(
     # --- Node 1: init (bootstrap leader) -----------------------------------
     log(f"cluster: initializing node1 (api={CLUSTER_NODES[0]['api']})")
     subprocess.run(
-        [
+        _maybe_sudo([
             str(zlayer_bin),
             "--data-dir", str(data_dirs[0]),
             "node", "init",
@@ -627,7 +879,7 @@ def _bootstrap_3node_cluster(
             "--api-port", str(CLUSTER_NODES[0]["api"]),
             "--raft-port", str(CLUSTER_NODES[0]["raft"]),
             "--overlay-port", str(CLUSTER_NODES[0]["overlay"]),
-        ],
+        ], sudo=sudo),
         check=True, cwd=REPO_ROOT,
     )
 
@@ -635,6 +887,7 @@ def _bootstrap_3node_cluster(
     log(f"cluster: starting node1 serve on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
     n1 = _spawn_node_serve(
         zlayer_bin, data_dirs[0], CLUSTER_NODES[0]["api"], sudo=sudo,
+        node_index=1, token_dir=root_dir,
     )
     procs.append(n1)
     if not _wait_http_ok(
@@ -651,13 +904,13 @@ def _bootstrap_3node_cluster(
         log(f"cluster: generating join token on node1 for node{i + 1}")
         try:
             gen = subprocess.run(
-                [
+                _maybe_sudo([
                     str(zlayer_bin),
                     "--data-dir", str(data_dirs[0]),
                     "node", "generate-join-token",
                     CLUSTER_DEPLOYMENT,
                     "-a", f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}",
-                ],
+                ], sudo=sudo),
                 capture_output=True, text=True, check=True, cwd=REPO_ROOT,
             )
         except subprocess.CalledProcessError as exc:
@@ -678,7 +931,7 @@ def _bootstrap_3node_cluster(
             f"(advertise=127.0.0.1, api={cfg['api']})"
         )
         subprocess.run(
-            [
+            _maybe_sudo([
                 str(zlayer_bin),
                 "--data-dir", str(data_dirs[i]),
                 "node", "join",
@@ -688,11 +941,14 @@ def _bootstrap_3node_cluster(
                 "--api-port", str(cfg["api"]),
                 "--raft-port", str(cfg["raft"]),
                 "--overlay-port", str(cfg["overlay"]),
-            ],
+            ], sudo=sudo),
             check=True, cwd=REPO_ROOT,
         )
         log(f"cluster: starting node{i + 1} serve on 127.0.0.1:{cfg['api']}")
-        p = _spawn_node_serve(zlayer_bin, data_dirs[i], cfg["api"], sudo=sudo)
+        p = _spawn_node_serve(
+            zlayer_bin, data_dirs[i], cfg["api"], sudo=sudo,
+            node_index=i + 1, token_dir=root_dir,
+        )
         procs.append(p)
         if not _wait_http_ok(
             f"http://127.0.0.1:{cfg['api']}/health/ready", 30,
@@ -737,9 +993,17 @@ def _wait_for_ready_cluster(
 
 def _cleanup_cluster(
     procs: list[subprocess.Popen], root_dir: Path, *, sudo: bool = False,
+    suite_name: str = "unknown",
+    data_dirs: Optional[list[Path]] = None,
+    exit_code: int = 0,
+    started_at: float = 0.0,
+    nodes: Optional[list] = None,
 ) -> None:
+    if data_dirs:
+        _capture_postmortem(root_dir, data_dirs, suite_name, exit_code)
     for i, p in enumerate(procs):
         _kill_pg(p, f"cluster-node{i + 1}", sudo=sudo)
+        _close_proc_logs(p)
     # Wait for the kernel to actually release the cluster ports before the
     # next suite's bootstrap tries to bind them. Without this, suite N+1
     # silently talks to suite N's leftover daemon (cross-suite contamination
@@ -760,6 +1024,13 @@ def _cleanup_cluster(
                 f"cluster cleanup: ports {still_busy} STILL bound after "
                 "force-kill; next suite's bootstrap will fail loudly"
             )
+    # Write SUMMARY.json before the rmtree below has a chance to wipe it.
+    if started_at > 0:
+        _write_summary(
+            token_dir=root_dir, suite_name=suite_name,
+            started_at=started_at, ended_at=time.time(),
+            exit_code=exit_code, failure=None, nodes=nodes,
+        )
     if os.environ.get("KEEP_E2E_ARTIFACTS") == "1":
         log(f"cluster: KEEP_E2E_ARTIFACTS=1 → leaving {root_dir} in place")
         return
@@ -1915,16 +2186,21 @@ def run_cluster_3node(args: argparse.Namespace) -> int:
     shutil.rmtree(root_dir, ignore_errors=True)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    _started = time.time()
     procs: list[subprocess.Popen] = []
+    _data_dirs: list[Path] = []
+    _suite_exit: int = 0
     try:
-        procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir, sudo=args.sudo_daemon,
-        )
+        with _step("bootstrap_3node"):
+            procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
+                zlayer_bin, root_dir, sudo=args.sudo_daemon,
+            )
         log("cluster_3node: waiting for cluster to converge")
-        nodes = _wait_for_ready_cluster(
-            api_ports[0], expected_nodes=3,
-            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
-        )
+        with _step("wait_cluster_converged"):
+            nodes = _wait_for_ready_cluster(
+                api_ports[0], expected_nodes=3,
+                timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+            )
         for n in nodes:
             log(
                 f"cluster_3node: node id={n.get('id', '?')} "
@@ -1934,9 +2210,16 @@ def run_cluster_3node(args: argparse.Namespace) -> int:
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"cluster_3node: FAIL — {e!r}", file=sys.stderr, flush=True)
+        _suite_exit = 1
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
+        _cleanup_cluster(
+            procs, root_dir, sudo=args.sudo_daemon,
+            suite_name="cluster_3node",
+            data_dirs=_data_dirs,
+            exit_code=_suite_exit,
+            started_at=_started,
+        )
 
 
 def run_cluster_failover(args: argparse.Namespace) -> int:
@@ -1958,17 +2241,22 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
     shutil.rmtree(root_dir, ignore_errors=True)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    _started = time.time()
     procs: list[subprocess.Popen] = []
+    data_dirs: list[Path] = []
+    _suite_exit: int = 0
     try:
-        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir, sudo=args.sudo_daemon,
-        )
+        with _step("bootstrap_3node"):
+            procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+                zlayer_bin, root_dir, sudo=args.sudo_daemon,
+            )
         leader_api = api_ports[0]
         log("cluster_failover: waiting for cluster to converge")
-        nodes = _wait_for_ready_cluster(
-            leader_api, expected_nodes=3,
-            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
-        )
+        with _step("wait_cluster_converged"):
+            nodes = _wait_for_ready_cluster(
+                leader_api, expected_nodes=3,
+                timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+            )
 
         # Pick a worker (non-leader). The leader's API endpoint contains
         # node1's port; we use that as a fallback identifier when the
@@ -1996,97 +2284,109 @@ def run_cluster_failover(args: argparse.Namespace) -> int:
         )
 
         # 1. Kill the worker.
-        _kill_pg(
-            procs[worker_idx],
-            f"cluster-node{worker_idx + 1} (kill)",
-            sudo=args.sudo_daemon,
-        )
+        with _step("failover_kill_worker"):
+            _kill_pg(
+                procs[worker_idx],
+                f"cluster-node{worker_idx + 1} (kill)",
+                sudo=args.sudo_daemon,
+            )
 
         # 2. Poll for `dead`.
         log(
             f"cluster_failover: waiting up to {CLUSTER_NODE_DEAD_TIMEOUT_S}s "
             f"for node{worker_idx + 1} → dead"
         )
-        deadline = time.monotonic() + CLUSTER_NODE_DEAD_TIMEOUT_S
-        saw_dead = False
-        while time.monotonic() < deadline:
-            try:
-                current = _fetch_cluster_nodes(leader_api)
-            except Exception:  # noqa: BLE001
-                time.sleep(2)
-                continue
-            for n in current:
-                api_endpoint = str(
-                    n.get("api_endpoint") or n.get("address") or ""
-                )
-                if str(api_ports[worker_idx]) not in api_endpoint:
+        with _step("failover_wait_dead"):
+            deadline = time.monotonic() + CLUSTER_NODE_DEAD_TIMEOUT_S
+            saw_dead = False
+            while time.monotonic() < deadline:
+                try:
+                    current = _fetch_cluster_nodes(leader_api)
+                except Exception:  # noqa: BLE001
+                    time.sleep(2)
                     continue
-                if str(n.get("status", "")).lower() == "dead":
-                    saw_dead = True
+                for n in current:
+                    api_endpoint = str(
+                        n.get("api_endpoint") or n.get("address") or ""
+                    )
+                    if str(api_ports[worker_idx]) not in api_endpoint:
+                        continue
+                    if str(n.get("status", "")).lower() == "dead":
+                        saw_dead = True
+                        break
+                if saw_dead:
                     break
-            if saw_dead:
-                break
-            time.sleep(2)
-        if not saw_dead:
-            raise RuntimeError(
-                f"node{worker_idx + 1} never transitioned to 'dead' within "
-                f"{CLUSTER_NODE_DEAD_TIMEOUT_S}s"
-            )
+                time.sleep(2)
+            if not saw_dead:
+                raise RuntimeError(
+                    f"node{worker_idx + 1} never transitioned to 'dead' within "
+                    f"{CLUSTER_NODE_DEAD_TIMEOUT_S}s"
+                )
         log(f"cluster_failover: node{worker_idx + 1} → dead (OK)")
 
         # 3. Restart the killed worker. It already joined → just `serve`.
         log(f"cluster_failover: restarting node{worker_idx + 1}")
-        procs[worker_idx] = _spawn_node_serve(
-            zlayer_bin, data_dirs[worker_idx], api_ports[worker_idx],
-            sudo=args.sudo_daemon,
-        )
-        if not _wait_http_ok(
-            f"http://127.0.0.1:{api_ports[worker_idx]}/health/ready", 30,
-        ):
-            raise RuntimeError(
-                f"restarted node{worker_idx + 1} never came up on "
-                f"127.0.0.1:{api_ports[worker_idx]}"
+        with _step("failover_restart_worker"):
+            procs[worker_idx] = _spawn_node_serve(
+                zlayer_bin, data_dirs[worker_idx], api_ports[worker_idx],
+                sudo=args.sudo_daemon,
+                node_index=worker_idx + 1, token_dir=root_dir,
             )
+            if not _wait_http_ok(
+                f"http://127.0.0.1:{api_ports[worker_idx]}/health/ready", 30,
+            ):
+                raise RuntimeError(
+                    f"restarted node{worker_idx + 1} never came up on "
+                    f"127.0.0.1:{api_ports[worker_idx]}"
+                )
 
         # 4. Poll for `ready` again.
         log(
             f"cluster_failover: waiting up to {CLUSTER_NODE_RECOVER_TIMEOUT_S}s "
             f"for node{worker_idx + 1} → ready"
         )
-        deadline = time.monotonic() + CLUSTER_NODE_RECOVER_TIMEOUT_S
-        recovered = False
-        while time.monotonic() < deadline:
-            try:
-                current = _fetch_cluster_nodes(leader_api)
-            except Exception:  # noqa: BLE001
-                time.sleep(2)
-                continue
-            for n in current:
-                api_endpoint = str(
-                    n.get("api_endpoint") or n.get("address") or ""
-                )
-                if str(api_ports[worker_idx]) not in api_endpoint:
+        with _step("failover_wait_recover"):
+            deadline = time.monotonic() + CLUSTER_NODE_RECOVER_TIMEOUT_S
+            recovered = False
+            while time.monotonic() < deadline:
+                try:
+                    current = _fetch_cluster_nodes(leader_api)
+                except Exception:  # noqa: BLE001
+                    time.sleep(2)
                     continue
-                if str(n.get("status", "")).lower() == "ready":
-                    recovered = True
+                for n in current:
+                    api_endpoint = str(
+                        n.get("api_endpoint") or n.get("address") or ""
+                    )
+                    if str(api_ports[worker_idx]) not in api_endpoint:
+                        continue
+                    if str(n.get("status", "")).lower() == "ready":
+                        recovered = True
+                        break
+                if recovered:
                     break
-            if recovered:
-                break
-            time.sleep(2)
-        if not recovered:
-            raise RuntimeError(
-                f"node{worker_idx + 1} never recovered to 'ready' within "
-                f"{CLUSTER_NODE_RECOVER_TIMEOUT_S}s"
-            )
+                time.sleep(2)
+            if not recovered:
+                raise RuntimeError(
+                    f"node{worker_idx + 1} never recovered to 'ready' within "
+                    f"{CLUSTER_NODE_RECOVER_TIMEOUT_S}s"
+                )
         log(
             f"cluster_failover: PASS — node{worker_idx + 1} ready→dead→ready"
         )
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"cluster_failover: FAIL — {e!r}", file=sys.stderr, flush=True)
+        _suite_exit = 1
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
+        _cleanup_cluster(
+            procs, root_dir, sudo=args.sudo_daemon,
+            suite_name="cluster_failover",
+            data_dirs=data_dirs,
+            exit_code=_suite_exit,
+            started_at=_started,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2134,7 +2434,7 @@ def _container_node(entry: dict) -> str:
 
 def _count_running_containers(
     zlayer_bin: Path, data_dir: Path, deployment: str,
-    expected_count: int, timeout_s: int = 120,
+    expected_count: int, timeout_s: int = 120, *, sudo: bool = False,
 ) -> list[dict]:
     """Poll `zlayer ps --containers` until `expected_count` are running.
 
@@ -2148,14 +2448,14 @@ def _count_running_containers(
     while time.monotonic() < deadline:
         try:
             result = subprocess.run(
-                [
+                _maybe_sudo([
                     str(zlayer_bin),
                     "--data-dir", str(data_dir),
                     "ps",
                     "--deployment", deployment,
                     "--containers",
                     "--format", "json",
-                ],
+                ], sudo=sudo),
                 capture_output=True, text=True, check=True, cwd=REPO_ROOT,
             )
         except subprocess.CalledProcessError as exc:
@@ -2212,6 +2512,7 @@ def _count_running_containers(
 def _wait_image_transition(
     zlayer_bin: Path, data_dir: Path, deployment: str,
     expected_image: str, expected_count: int, timeout_s: int = 180,
+    *, sudo: bool = False,
 ) -> list[dict]:
     """Poll until all `expected_count` running containers report
     `image == expected_image`. Returns the converged list."""
@@ -2221,14 +2522,14 @@ def _wait_image_transition(
     while time.monotonic() < deadline:
         try:
             result = subprocess.run(
-                [
+                _maybe_sudo([
                     str(zlayer_bin),
                     "--data-dir", str(data_dir),
                     "ps",
                     "--deployment", deployment,
                     "--containers",
                     "--format", "json",
-                ],
+                ], sudo=sudo),
                 capture_output=True, text=True, check=True, cwd=REPO_ROOT,
             )
         except subprocess.CalledProcessError as exc:
@@ -2298,16 +2599,21 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
     shutil.rmtree(root_dir, ignore_errors=True)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    _started = time.time()
     procs: list[subprocess.Popen] = []
+    data_dirs: list[Path] = []
+    _suite_exit: int = 0
     try:
-        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir, sudo=args.sudo_daemon,
-        )
+        with _step("bootstrap_3node"):
+            procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+                zlayer_bin, root_dir, sudo=args.sudo_daemon,
+            )
         log("cluster_scaling: waiting for cluster to converge")
-        _wait_for_ready_cluster(
-            api_ports[0], expected_nodes=3,
-            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
-        )
+        with _step("wait_cluster_converged"):
+            _wait_for_ready_cluster(
+                api_ports[0], expected_nodes=3,
+                timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+            )
 
         leader_data_dir = data_dirs[0]
         spec_1r = CLUSTER_SPECS_DIR / "nginx-v1-1r.yaml"
@@ -2315,46 +2621,50 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
 
         # --- 1 replica ----------------------------------------------------
         log(f"cluster_scaling: deploying {spec_1r.name} (1 replica)")
-        try:
-            subprocess.run(
-                [
-                    str(zlayer_bin),
-                    "--data-dir", str(leader_data_dir),
-                    "deploy", "--detach", str(spec_1r),
-                ],
-                check=True, cwd=REPO_ROOT,
+        with _step("deploy_1r"):
+            try:
+                subprocess.run(
+                    _maybe_sudo([
+                        str(zlayer_bin),
+                        "--data-dir", str(leader_data_dir),
+                        "deploy", "--detach", str(spec_1r),
+                    ], sudo=args.sudo_daemon),
+                    check=True, cwd=REPO_ROOT,
+                )
+            except subprocess.CalledProcessError as exc:
+                if exc.stderr:
+                    sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+                raise
+            log("cluster_scaling: waiting for 1 running container")
+            _count_running_containers(
+                zlayer_bin, leader_data_dir,
+                CLUSTER_APP_DEPLOYMENT, expected_count=1,
+                sudo=args.sudo_daemon,
             )
-        except subprocess.CalledProcessError as exc:
-            if exc.stderr:
-                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
-            raise
-        log("cluster_scaling: waiting for 1 running container")
-        _count_running_containers(
-            zlayer_bin, leader_data_dir,
-            CLUSTER_APP_DEPLOYMENT, expected_count=1,
-        )
         log("cluster_scaling: 1 replica running (OK)")
 
         # --- 3 replicas ---------------------------------------------------
         log(f"cluster_scaling: deploying {spec_3r.name} (3 replicas)")
-        try:
-            subprocess.run(
-                [
-                    str(zlayer_bin),
-                    "--data-dir", str(leader_data_dir),
-                    "deploy", "--detach", str(spec_3r),
-                ],
-                check=True, cwd=REPO_ROOT,
+        with _step("scale_up_3r"):
+            try:
+                subprocess.run(
+                    _maybe_sudo([
+                        str(zlayer_bin),
+                        "--data-dir", str(leader_data_dir),
+                        "deploy", "--detach", str(spec_3r),
+                    ], sudo=args.sudo_daemon),
+                    check=True, cwd=REPO_ROOT,
+                )
+            except subprocess.CalledProcessError as exc:
+                if exc.stderr:
+                    sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+                raise
+            log("cluster_scaling: waiting for 3 running containers")
+            running = _count_running_containers(
+                zlayer_bin, leader_data_dir,
+                CLUSTER_APP_DEPLOYMENT, expected_count=3,
+                sudo=args.sudo_daemon,
             )
-        except subprocess.CalledProcessError as exc:
-            if exc.stderr:
-                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
-            raise
-        log("cluster_scaling: waiting for 3 running containers")
-        running = _count_running_containers(
-            zlayer_bin, leader_data_dir,
-            CLUSTER_APP_DEPLOYMENT, expected_count=3,
-        )
 
         node_ids = [_container_node(e) for e in running]
         distinct = {nid for nid in node_ids if nid}
@@ -2371,32 +2681,41 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
 
         # --- back to 1 replica -------------------------------------------
         log(f"cluster_scaling: redeploying {spec_1r.name} (scale-down 3→1)")
-        try:
-            subprocess.run(
-                [
-                    str(zlayer_bin),
-                    "--data-dir", str(leader_data_dir),
-                    "deploy", "--detach", str(spec_1r),
-                ],
-                check=True, cwd=REPO_ROOT,
+        with _step("scale_down_1r"):
+            try:
+                subprocess.run(
+                    _maybe_sudo([
+                        str(zlayer_bin),
+                        "--data-dir", str(leader_data_dir),
+                        "deploy", "--detach", str(spec_1r),
+                    ], sudo=args.sudo_daemon),
+                    check=True, cwd=REPO_ROOT,
+                )
+            except subprocess.CalledProcessError as exc:
+                if exc.stderr:
+                    sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+                raise
+            log("cluster_scaling: waiting for 1 running container (scale-down)")
+            _count_running_containers(
+                zlayer_bin, leader_data_dir,
+                CLUSTER_APP_DEPLOYMENT, expected_count=1,
+                sudo=args.sudo_daemon,
             )
-        except subprocess.CalledProcessError as exc:
-            if exc.stderr:
-                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
-            raise
-        log("cluster_scaling: waiting for 1 running container (scale-down)")
-        _count_running_containers(
-            zlayer_bin, leader_data_dir,
-            CLUSTER_APP_DEPLOYMENT, expected_count=1,
-        )
 
         log("cluster_scaling: PASS — 1 → 3 → 1 replicas across cluster")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"cluster_scaling: FAIL — {e!r}", file=sys.stderr, flush=True)
+        _suite_exit = 1
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
+        _cleanup_cluster(
+            procs, root_dir, sudo=args.sudo_daemon,
+            suite_name="cluster_scaling",
+            data_dirs=data_dirs,
+            exit_code=_suite_exit,
+            started_at=_started,
+        )
 
 
 def run_cluster_upgrade(args: argparse.Namespace) -> int:
@@ -2413,16 +2732,21 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
     shutil.rmtree(root_dir, ignore_errors=True)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    _started = time.time()
     procs: list[subprocess.Popen] = []
+    data_dirs: list[Path] = []
+    _suite_exit: int = 0
     try:
-        procs, data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir, sudo=args.sudo_daemon,
-        )
+        with _step("bootstrap_3node"):
+            procs, data_dirs, api_ports = _bootstrap_3node_cluster(
+                zlayer_bin, root_dir, sudo=args.sudo_daemon,
+            )
         log("cluster_upgrade: waiting for cluster to converge")
-        _wait_for_ready_cluster(
-            api_ports[0], expected_nodes=3,
-            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
-        )
+        with _step("wait_cluster_converged"):
+            _wait_for_ready_cluster(
+                api_ports[0], expected_nodes=3,
+                timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+            )
 
         leader_data_dir = data_dirs[0]
         spec_v1 = CLUSTER_SPECS_DIR / "nginx-v1-3r.yaml"
@@ -2430,52 +2754,56 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
 
         # --- v1 (nginx:1.28-alpine) --------------------------------------
         log(f"cluster_upgrade: deploying {spec_v1.name} (v1, 3 replicas)")
-        try:
-            subprocess.run(
-                [
-                    str(zlayer_bin),
-                    "--data-dir", str(leader_data_dir),
-                    "deploy", "--detach", str(spec_v1),
-                ],
-                check=True, cwd=REPO_ROOT,
+        with _step("deploy_v1"):
+            try:
+                subprocess.run(
+                    _maybe_sudo([
+                        str(zlayer_bin),
+                        "--data-dir", str(leader_data_dir),
+                        "deploy", "--detach", str(spec_v1),
+                    ], sudo=args.sudo_daemon),
+                    check=True, cwd=REPO_ROOT,
+                )
+            except subprocess.CalledProcessError as exc:
+                if exc.stderr:
+                    sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+                raise
+            log("cluster_upgrade: waiting for 3 running v1 containers")
+            v1_running = _count_running_containers(
+                zlayer_bin, leader_data_dir,
+                CLUSTER_APP_DEPLOYMENT, expected_count=3,
+                sudo=args.sudo_daemon,
             )
-        except subprocess.CalledProcessError as exc:
-            if exc.stderr:
-                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
-            raise
-        log("cluster_upgrade: waiting for 3 running v1 containers")
-        v1_running = _count_running_containers(
-            zlayer_bin, leader_data_dir,
-            CLUSTER_APP_DEPLOYMENT, expected_count=3,
-        )
         initial_images = [_container_image(e) for e in v1_running]
         log(f"cluster_upgrade: initial images = {initial_images!r}")
 
         # --- v2 (nginx:1.29-alpine), poll for image-field transition -----
         log(f"cluster_upgrade: deploying {spec_v2.name} (v2 rolling upgrade)")
-        try:
-            subprocess.run(
-                [
-                    str(zlayer_bin),
-                    "--data-dir", str(leader_data_dir),
-                    "deploy", "--detach", str(spec_v2),
-                ],
-                check=True, cwd=REPO_ROOT,
-            )
-        except subprocess.CalledProcessError as exc:
-            if exc.stderr:
-                sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
-            raise
+        with _step("rolling_upgrade_v2"):
+            try:
+                subprocess.run(
+                    _maybe_sudo([
+                        str(zlayer_bin),
+                        "--data-dir", str(leader_data_dir),
+                        "deploy", "--detach", str(spec_v2),
+                    ], sudo=args.sudo_daemon),
+                    check=True, cwd=REPO_ROOT,
+                )
+            except subprocess.CalledProcessError as exc:
+                if exc.stderr:
+                    sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
+                raise
 
-        expected_image = "nginx:1.29-alpine"
-        log(
-            f"cluster_upgrade: waiting for 3 containers on {expected_image}"
-        )
-        _wait_image_transition(
-            zlayer_bin, leader_data_dir,
-            CLUSTER_APP_DEPLOYMENT, expected_image=expected_image,
-            expected_count=3,
-        )
+            expected_image = "nginx:1.29-alpine"
+            log(
+                f"cluster_upgrade: waiting for 3 containers on {expected_image}"
+            )
+            _wait_image_transition(
+                zlayer_bin, leader_data_dir,
+                CLUSTER_APP_DEPLOYMENT, expected_image=expected_image,
+                expected_count=3,
+                sudo=args.sudo_daemon,
+            )
 
         log(
             "cluster_upgrade: PASS — 3 replicas migrated v1.28 → v1.29"
@@ -2483,9 +2811,16 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"cluster_upgrade: FAIL — {e!r}", file=sys.stderr, flush=True)
+        _suite_exit = 1
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
+        _cleanup_cluster(
+            procs, root_dir, sudo=args.sudo_daemon,
+            suite_name="cluster_upgrade",
+            data_dirs=data_dirs,
+            exit_code=_suite_exit,
+            started_at=_started,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2520,16 +2855,21 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
     shutil.rmtree(root_dir, ignore_errors=True)
     root_dir.mkdir(parents=True, exist_ok=True)
 
+    _started = time.time()
     procs: list[subprocess.Popen] = []
+    _data_dirs: list[Path] = []
+    _suite_exit: int = 0
     try:
-        procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
-            zlayer_bin, root_dir, sudo=args.sudo_daemon,
-        )
+        with _step("bootstrap_3node"):
+            procs, _data_dirs, api_ports = _bootstrap_3node_cluster(
+                zlayer_bin, root_dir, sudo=args.sudo_daemon,
+            )
         log("cluster_node_upgrade: waiting for cluster to converge")
-        nodes = _wait_for_ready_cluster(
-            api_ports[0], expected_nodes=3,
-            timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
-        )
+        with _step("wait_cluster_converged"):
+            nodes = _wait_for_ready_cluster(
+                api_ports[0], expected_nodes=3,
+                timeout_s=CLUSTER_NODES_READY_TIMEOUT_S,
+            )
 
         # Identify leader. The bootstrap path makes node1 the leader, but
         # if the payload exposes an explicit `role=leader` we honour it.
@@ -2604,28 +2944,29 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
             "cooldown_secs": 1,
             "strict": False,
         }
-        status1, body1, headers1 = _post_cluster_upgrade(
-            follower_port, bad_body, timeout_s=30,
-        )
-        if status1 != 421:
-            raise RuntimeError(
-                f"expected 421 from follower POST, got {status1}; "
-                f"body={body1!r} headers={headers1!r}"
+        with _step("test_421_redirect"):
+            status1, body1, headers1 = _post_cluster_upgrade(
+                follower_port, bad_body, timeout_s=30,
             )
-        leader_addr_hdr = (
-            headers1.get("X-Leader-Addr")
-            or headers1.get("x-leader-addr")
-        )
-        if not leader_addr_hdr:
-            raise RuntimeError(
-                "follower 421 response missing X-Leader-Addr header; "
-                f"status={status1} body={body1!r} headers={headers1!r}"
+            if status1 != 421:
+                raise RuntimeError(
+                    f"expected 421 from follower POST, got {status1}; "
+                    f"body={body1!r} headers={headers1!r}"
+                )
+            leader_addr_hdr = (
+                headers1.get("X-Leader-Addr")
+                or headers1.get("x-leader-addr")
             )
-        if str(body1.get("error", "")) != "not_leader":
-            raise RuntimeError(
-                "follower 421 response body missing `error: not_leader`; "
-                f"status={status1} body={body1!r} headers={headers1!r}"
-            )
+            if not leader_addr_hdr:
+                raise RuntimeError(
+                    "follower 421 response missing X-Leader-Addr header; "
+                    f"status={status1} body={body1!r} headers={headers1!r}"
+                )
+            if str(body1.get("error", "")) != "not_leader":
+                raise RuntimeError(
+                    "follower 421 response body missing `error: not_leader`; "
+                    f"status={status1} body={body1!r} headers={headers1!r}"
+                )
         log(
             f"cluster_node_upgrade: 421 redirect OK "
             f"(leader_addr={leader_addr_hdr})"
@@ -2642,28 +2983,29 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
             "version, expect orchestrator to record 2 errors (one per "
             "follower) and 0 upgrades"
         )
-        status2, body2, _headers2 = _post_cluster_upgrade(
-            leader_port, bad_body, timeout_s=600,
-        )
-        if status2 != 200:
-            raise RuntimeError(
-                f"expected 200 from leader POST, got {status2}; "
-                f"body={body2!r}"
+        with _step("test_orchestrator_walk"):
+            status2, body2, _headers2 = _post_cluster_upgrade(
+                leader_port, bad_body, timeout_s=600,
             )
-        upgraded = body2.get("upgraded") or []
-        errors_list = body2.get("errors") or []
-        skipped = body2.get("skipped") or []
-        if len(upgraded) != 0:
-            raise RuntimeError(
-                f"expected upgraded=[], got {upgraded!r}; "
-                f"full body={body2!r}"
-            )
-        if len(errors_list) != 2:
-            raise RuntimeError(
-                f"expected 2 errors (one per follower), got "
-                f"{len(errors_list)}; errors={errors_list!r} "
-                f"upgraded={upgraded!r} skipped={skipped!r}"
-            )
+            if status2 != 200:
+                raise RuntimeError(
+                    f"expected 200 from leader POST, got {status2}; "
+                    f"body={body2!r}"
+                )
+            upgraded = body2.get("upgraded") or []
+            errors_list = body2.get("errors") or []
+            skipped = body2.get("skipped") or []
+            if len(upgraded) != 0:
+                raise RuntimeError(
+                    f"expected upgraded=[], got {upgraded!r}; "
+                    f"full body={body2!r}"
+                )
+            if len(errors_list) != 2:
+                raise RuntimeError(
+                    f"expected 2 errors (one per follower), got "
+                    f"{len(errors_list)}; errors={errors_list!r} "
+                    f"upgraded={upgraded!r} skipped={skipped!r}"
+                )
         log(
             f"cluster_node_upgrade: orchestrator-walk OK "
             f"(upgraded={upgraded!r} skipped={skipped!r} "
@@ -2675,16 +3017,17 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
             "cluster_node_upgrade: Test 3 — re-fetch cluster nodes, "
             "expect all 3 still ready"
         )
-        after = _fetch_cluster_nodes(leader_port)
-        ready_after = [
-            n for n in after
-            if str(n.get("status", "")).lower() == "ready"
-        ]
-        if len(ready_after) != 3:
-            raise RuntimeError(
-                f"expected 3 ready nodes after failed upgrade, got "
-                f"{len(ready_after)}; nodes={after!r}"
-            )
+        with _step("test_cluster_survival"):
+            after = _fetch_cluster_nodes(leader_port)
+            ready_after = [
+                n for n in after
+                if str(n.get("status", "")).lower() == "ready"
+            ]
+            if len(ready_after) != 3:
+                raise RuntimeError(
+                    f"expected 3 ready nodes after failed upgrade, got "
+                    f"{len(ready_after)}; nodes={after!r}"
+                )
         log(
             "cluster_node_upgrade: PASS — 421-redirect, orchestrator-walk, "
             "error-recording, cluster-survival all verified"
@@ -2695,9 +3038,16 @@ def run_cluster_node_upgrade(args: argparse.Namespace) -> int:
             f"cluster_node_upgrade: FAIL — {e!r}",
             file=sys.stderr, flush=True,
         )
+        _suite_exit = 1
         return 1
     finally:
-        _cleanup_cluster(procs, root_dir, sudo=args.sudo_daemon)
+        _cleanup_cluster(
+            procs, root_dir, sudo=args.sudo_daemon,
+            suite_name="cluster_node_upgrade",
+            data_dirs=_data_dirs,
+            exit_code=_suite_exit,
+            started_at=_started,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2870,13 +3220,17 @@ def main() -> int:
     fixture_user_id: Optional[str] = None
     zlayer_bin: Optional[Path] = None
     daemon_sudo: bool = False
+    suite_failure: Optional[tuple] = None
+    suite_exit_code: int = 0
+    suite_started_at: float = time.time()
 
     # SIGTERM via a handler so the `finally:` block always runs.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     try:
         if not args.no_build:
-            build_phase(throwaway=args.throwaway)
+            with _step("build_phase"):
+                build_phase(throwaway=args.throwaway)
 
         zlayer_bin = resolve_zlayer_bin(throwaway=args.throwaway)
         log(f"Using zlayer binary: {zlayer_bin}")
@@ -2889,8 +3243,10 @@ def main() -> int:
             daemon_sudo = args.sudo_daemon
             daemon_proc, socket_path = start_throwaway_daemon(
                 throwaway_dir, zlayer_bin, sudo=daemon_sudo,
+                token_dir=throwaway_dir,
             )
             log(f"Throwaway daemon socket: {socket_path}")
+            manager_log_dir = throwaway_dir
         else:
             socket = resolve_host_socket()
             if not socket:
@@ -2905,6 +3261,8 @@ def main() -> int:
                 raise RuntimeError("unreachable")
             socket_path = socket
             log(f"Host daemon socket: {socket_path}")
+            manager_log_dir = THROWAWAY_ROOT / f"manager_{secrets.token_hex(4)}"
+            manager_log_dir.mkdir(parents=True, exist_ok=True)
 
         suite_token = secrets.token_hex(4)
         fixture_email = f"e2e-{suite_token}@test.local"
@@ -2914,9 +3272,10 @@ def main() -> int:
         fixture_user_id = create_fixture_user(
             zlayer_bin, cli_data_dir,
             fixture_email, fixture_password, fixture_display,
+            sudo=daemon_sudo,
         )
 
-        manager_proc = start_manager(socket_path)
+        manager_proc = start_manager(socket_path, token_dir=manager_log_dir)
 
         # Intellitester's collectMissingEnvVars scans every `${VAR}`
         # reference and prompts when one is missing from process.env —
@@ -2933,17 +3292,22 @@ def main() -> int:
             if not target.exists():
                 die(f"--only target not found: {target}")
             log(f"Running single test: {args.only}")
-            run_intellitester(target, env_extras=intelli_env)
+            with _step(f"intellitester_only:{args.only}"):
+                run_intellitester(target, env_extras=intelli_env)
             log(f"Single test passed: {args.only}")
             return 0
 
         log("Running login.test.yaml")
-        run_intellitester(E2E_DIR / "login.test.yaml", env_extras=intelli_env)
+        with _step("intellitester_login"):
+            run_intellitester(
+                E2E_DIR / "login.test.yaml", env_extras=intelli_env,
+            )
 
         log("Running nav-smoke.test.yaml")
-        run_intellitester(
-            E2E_DIR / "nav-smoke.test.yaml", env_extras=intelli_env,
-        )
+        with _step("intellitester_nav_smoke"):
+            run_intellitester(
+                E2E_DIR / "nav-smoke.test.yaml", env_extras=intelli_env,
+            )
 
         # --- Stale-session regression -----------------------------------
         #
@@ -2957,34 +3321,64 @@ def main() -> int:
         state_file.unlink(missing_ok=True)
 
         log("Stale-session: login + saveStorageState")
-        run_intellitester(
-            E2E_DIR / "stale-session-setup.test.yaml",
-            env_extras=intelli_env,
-        )
+        with _step("intellitester_stale_setup"):
+            run_intellitester(
+                E2E_DIR / "stale-session-setup.test.yaml",
+                env_extras=intelli_env,
+            )
 
         log(f"Stale-session: deleting fixture user via CLI ({fixture_user_id})")
-        delete_fixture_user(zlayer_bin, cli_data_dir, fixture_user_id)
+        delete_fixture_user(
+            zlayer_bin, cli_data_dir, fixture_user_id, sudo=daemon_sudo,
+        )
         # Mark deleted so the `finally:` doesn't double-delete.
         fixture_user_id = None
 
         log("Stale-session: verify cookies cleared on next request")
-        run_intellitester(
-            E2E_DIR / "stale-session-verify.test.yaml",
-            extra_args=["--storage-state", str(state_file)],
-            env_extras=intelli_env,
-        )
+        with _step("intellitester_stale_verify"):
+            run_intellitester(
+                E2E_DIR / "stale-session-verify.test.yaml",
+                extra_args=["--storage-state", str(state_file)],
+                env_extras=intelli_env,
+            )
 
         log("All e2e checks passed.")
         return 0
 
+    except Exception as suite_exc:
+        suite_failure = (type(suite_exc).__name__, str(suite_exc))
+        suite_exit_code = 1
+        raise
     finally:
+        if throwaway_dir is not None:
+            with suppress(Exception):
+                _capture_postmortem(
+                    throwaway_dir,
+                    [throwaway_dir],
+                    suite_name="manager",
+                    exit_code=suite_exit_code,
+                )
+            with suppress(Exception):
+                _write_summary(
+                    token_dir=throwaway_dir,
+                    suite_name="manager",
+                    started_at=suite_started_at,
+                    ended_at=time.time(),
+                    exit_code=suite_exit_code,
+                    failure=suite_failure,
+                    nodes=None,
+                )
         # Order matters: manager → fixture user → daemon → tmpdir → state.
         if manager_proc is not None:
             _kill_pg(manager_proc, "manager")
+            _close_proc_logs(manager_proc)
         if fixture_user_id is not None and zlayer_bin is not None:
-            delete_fixture_user(zlayer_bin, cli_data_dir, fixture_user_id)
+            delete_fixture_user(
+                zlayer_bin, cli_data_dir, fixture_user_id, sudo=daemon_sudo,
+            )
         if daemon_proc is not None:
             _kill_pg(daemon_proc, "daemon", sudo=daemon_sudo)
+            _close_proc_logs(daemon_proc)
         if throwaway_dir is not None:
             # If --sudo-daemon was used, the daemon may have written
             # root-owned files inside throwaway_dir. shutil.rmtree will

@@ -30,6 +30,7 @@ members = [
   "crates/zlayer-hcs",
   "crates/zlayer-hns",
   "crates/zlayer-types",
+  "crates/zlayer-cluster-rpc",
 ]
 
 [workspace.package]

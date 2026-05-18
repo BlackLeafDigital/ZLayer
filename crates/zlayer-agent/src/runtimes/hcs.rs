@@ -301,7 +301,26 @@ impl HcsRuntime {
             AgentError::Configuration(format!("failed to open HCS blob cache: {e}"))
         })?;
         let registry = Arc::new(zlayer_registry::ImagePuller::with_cache(blob_cache));
-        Self::new_with_registry(config, registry)
+        let runtime = Self::new_with_registry(config, registry)?;
+
+        // Best-effort startup reconcile: terminate orphan ComputeSystems left
+        // over from a previous crashed daemon run, then reap any stray HCN
+        // endpoints. Both are non-fatal — a failure here must not block the
+        // daemon from coming up.
+        if let Err(e) = runtime.reconcile_orphan_systems().await {
+            tracing::warn!(
+                error = %e,
+                "startup reconcile of orphan HCS compute systems failed; continuing without it"
+            );
+        }
+        if let Err(e) = runtime.reconcile_orphans().await {
+            tracing::warn!(
+                error = %e,
+                "startup reconcile of orphan HCN endpoints failed; continuing without it"
+            );
+        }
+
+        Ok(runtime)
     }
 
     /// Build a new [`HcsRuntime`] with an explicit registry client.
@@ -451,6 +470,89 @@ impl HcsRuntime {
         *self.next_container_dns.lock().await = Some((dns_server, dns_domain));
     }
 
+    /// Scan HCS for compute systems owned by this runtime that we do **not**
+    /// track in [`Self::containers`], and terminate them.
+    ///
+    /// This covers the daemon-crash recovery window where
+    /// [`Runtime::create_container`] succeeded (the ComputeSystem exists in the
+    /// Windows kernel and is tagged with our [`owner_tag`]) but the daemon
+    /// went down before recording it in any persistence — so on next boot
+    /// the in-memory map has no entry and the system would otherwise leak
+    /// until manual cleanup.
+    ///
+    /// At startup the live set is whatever [`Self::containers`] currently
+    /// holds (usually empty); every enumerated system not in that set is an
+    /// orphan. Each orphan is opened with default access, terminated, and
+    /// then the handle is dropped — releasing our handle and the
+    /// `should_terminate_on_last_handle_closed: true` flag on the compute-
+    /// system doc means the system is removed entirely.
+    ///
+    /// Individual failures (open, terminate) are logged and swallowed so one
+    /// stuck system cannot block the rest of reconciliation; the enumeration
+    /// error itself is propagated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if [`enumerate::list_by_owner`] fails. Per-system
+    /// failures are logged.
+    pub async fn reconcile_orphan_systems(&self) -> Result<()> {
+        let live: std::collections::HashSet<String> =
+            self.containers.read().await.keys().cloned().collect();
+
+        let tag = owner_tag(&self.config.daemon_name);
+        let systems = enumerate::list_by_owner(&tag)
+            .await
+            .map_err(|e| AgentError::Internal(format!("HcsEnumerateComputeSystems: {e}")))?;
+
+        if systems.is_empty() {
+            tracing::debug!(owner = %tag, "reconcile: no HCS compute systems found for owner");
+            return Ok(());
+        }
+
+        for sys in systems {
+            if live.contains(&sys.id) {
+                continue;
+            }
+
+            // Open with `requested_access = 0` (default access for our token)
+            // and terminate. Both calls are best-effort: log on failure and
+            // continue so a single wedged orphan can't block the sweep.
+            let id = sys.id.clone();
+            match ComputeSystem::open(&id, 0) {
+                Ok(system) => match system.terminate("").await {
+                    Ok(()) => {
+                        tracing::info!(
+                            hcs_id = %id,
+                            state = %sys.state,
+                            "reconcile: terminated orphan HCS compute system"
+                        );
+                        // Drop the handle so HCS finalizes removal via the
+                        // `should_terminate_on_last_handle_closed` flag set
+                        // on every system this runtime creates.
+                        drop(system);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            hcs_id = %id,
+                            error = %e,
+                            "reconcile: HcsTerminateComputeSystem failed for orphan; \
+                             system may need manual cleanup"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        hcs_id = %id,
+                        error = %e,
+                        "reconcile: HcsOpenComputeSystem failed for enumerated orphan; \
+                         skipping (may have just exited)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Scan the host for HCN endpoints owned by this runtime (name prefix
     /// matches [`owner_tag`]) and delete them.
     ///
@@ -467,7 +569,6 @@ impl HcsRuntime {
     ///
     /// Returns an error only if the initial HCN enumeration fails. Per-
     /// endpoint delete failures are logged.
-    #[allow(dead_code)]
     pub async fn reconcile_orphans(&self) -> Result<()> {
         let live: std::collections::HashSet<String> =
             self.containers.read().await.keys().cloned().collect();

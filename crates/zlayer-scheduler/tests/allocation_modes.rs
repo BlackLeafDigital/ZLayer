@@ -51,6 +51,7 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: Vec::<EndpointSpec>::new(),
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: Vec::<DependsSpec>::new(),
         health: HealthSpec {
             start_grace: None,

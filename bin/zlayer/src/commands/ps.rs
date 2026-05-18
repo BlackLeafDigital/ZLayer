@@ -28,6 +28,8 @@ struct ContainerRow {
     container: String,
     replica: u32,
     state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 /// Execute the `ps` command.
@@ -127,6 +129,7 @@ pub(crate) async fn ps(
                             container: c["id"].as_str().unwrap_or("unknown").to_string(),
                             replica: c["replica"].as_u64().unwrap_or(0) as u32,
                             state: c["state"].as_str().unwrap_or("unknown").to_string(),
+                            node_id: c["node_id"].as_str().map(str::to_string),
                         });
                     }
                 } else {
@@ -473,6 +476,7 @@ mod tests {
             container: "web-rep-1".to_string(),
             replica: 1,
             state: "running".to_string(),
+            node_id: None,
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(json.contains("web-rep-1"));
@@ -525,6 +529,7 @@ mod tests {
                 container: "web-rep-1".to_string(),
                 replica: 1,
                 state: "running".to_string(),
+                node_id: None,
             },
             ContainerRow {
                 deployment: "my-app".to_string(),
@@ -532,6 +537,7 @@ mod tests {
                 container: "web-rep-2".to_string(),
                 replica: 2,
                 state: "running".to_string(),
+                node_id: None,
             },
         ];
         // Should not panic

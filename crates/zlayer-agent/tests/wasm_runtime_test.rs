@@ -203,10 +203,7 @@ fn unique_instance_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_instance_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_instance_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for WASM testing
@@ -224,6 +221,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,
@@ -840,10 +838,7 @@ mod state_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "nonexistent".to_string(),
-            replica: 999,
-        };
+        let id = ContainerId::new("nonexistent".to_string(), 999);
 
         let state = runtime.container_state(&id).await;
         assert!(state.is_err(), "Should fail for nonexistent instance");
@@ -954,10 +949,7 @@ mod logs_stats_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "ghost".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("ghost".to_string(), 1);
 
         let stats = runtime.get_container_stats(&id).await;
         assert!(stats.is_err(), "Should fail for nonexistent instance");
@@ -1109,10 +1101,7 @@ mod instance_id_tests {
 
     #[test]
     fn test_container_id_display() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
 
         let display = format!("{id}");
         assert_eq!(display, "myservice-rep-1");

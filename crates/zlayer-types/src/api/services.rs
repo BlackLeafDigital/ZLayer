@@ -103,6 +103,12 @@ pub struct ContainerSummary {
     pub pid: Option<u32>,
     /// Overlay IP (if assigned)
     pub overlay_ip: Option<String>,
+    /// Raft node ID of the daemon that owns this container (if known).
+    ///
+    /// Each daemon tags containers it knows about with its own local node ID.
+    /// `None` when the API is running in read-only mode (no local Raft node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 /// Exec request body

@@ -61,10 +61,7 @@ fn unique_container_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_container_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_container_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for testing
@@ -82,6 +79,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,

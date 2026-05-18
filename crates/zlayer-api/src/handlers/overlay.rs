@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_overlay_status_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -436,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_overlay_peers_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -450,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_ip_allocation_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -696,7 +696,7 @@ mod tests {
     /// surfaces the configured STUN defaults and an empty candidate list.
     #[tokio::test]
     async fn test_get_nat_status_with_manager_no_traversal() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));

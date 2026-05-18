@@ -529,10 +529,7 @@ fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
         Some(n) => format!("standalone-{n}"),
         None => format!("standalone-{}", uuid::Uuid::new_v4().as_simple()),
     };
-    let cid = ContainerId {
-        service: service_name.clone(),
-        replica: 0,
-    };
+    let cid = ContainerId::new(service_name.clone(), 0);
     (service_name, cid)
 }
 
@@ -818,6 +815,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        replica_groups: None,
     })
 }
 
@@ -3823,10 +3821,7 @@ mod tests {
         use zlayer_agent::runtime::{ExecEvent, MockRuntime, Runtime};
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "test-svc".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("test-svc".to_string(), 0);
         // `MockRuntime::exec` returns `(0, cmd.join(" "), "")`, so with a
         // non-empty stdout and empty stderr the default fallback should emit
         // exactly two events: Stdout then Exit.
@@ -4277,10 +4272,7 @@ mod tests {
         // Seed the storage with two records — one "named" container and one
         // anonymous — that the cache should pick up on repopulate.
         let alpha = StandaloneContainer {
-            container_id: ContainerId {
-                service: "standalone-alpha".to_string(),
-                replica: 0,
-            },
+            container_id: ContainerId::new("standalone-alpha".to_string(), 0),
             image: "alpine:latest".to_string(),
             name: Some("alpha".to_string()),
             labels: HashMap::new(),
@@ -4288,10 +4280,7 @@ mod tests {
             delete_on_exit: false,
         };
         let beta = StandaloneContainer {
-            container_id: ContainerId {
-                service: "standalone-beta".to_string(),
-                replica: 0,
-            },
+            container_id: ContainerId::new("standalone-beta".to_string(), 0),
             image: "alpine:3.20".to_string(),
             name: None,
             labels: HashMap::new(),
@@ -4337,10 +4326,7 @@ mod tests {
     ) -> (ContainerApiState, ContainerId, String) {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica,
-        };
+        let cid = ContainerId::new(service.to_string(), replica);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4524,10 +4510,7 @@ mod tests {
         });
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime;
         let state = ContainerApiState::with_daemon_uuid(runtime_dyn, "wait-fixed-uuid".to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new(service.to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
         let standalone = StandaloneContainer {
             container_id: cid.clone(),
@@ -4711,10 +4694,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "rename-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-rename".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-rename".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4897,10 +4877,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "update-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-update".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-update".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4983,10 +4960,7 @@ mod tests {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state =
             ContainerApiState::with_daemon_uuid(runtime, "update-unsupported-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-unsupported".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-unsupported".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -5123,10 +5097,7 @@ mod tests {
         #[tokio::test]
         async fn json_format_emits_ndjson_per_chunk() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "logs-json".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("logs-json".to_string(), 0);
             // Pre-script three chunks: one stdout (UTF-8), one stderr (with
             // timestamp), and one stdout containing non-UTF8 bytes that must
             // be base64-encoded.
@@ -5231,10 +5202,7 @@ mod tests {
         #[tokio::test]
         async fn stream_false_emits_exactly_one_sample() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "stats-once".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("stats-once".to_string(), 0);
             // Enqueue three samples; only the first must reach the body.
             runtime.enqueue_stats_sample(&id, sample(1)).await;
             runtime.enqueue_stats_sample(&id, sample(2)).await;
@@ -5260,10 +5228,7 @@ mod tests {
         #[tokio::test]
         async fn stream_true_emits_multiple_samples() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "stats-many".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("stats-many".to_string(), 0);
             for n in 1u64..=4 {
                 runtime.enqueue_stats_sample(&id, sample(n)).await;
             }
@@ -5686,10 +5651,7 @@ mod tests {
 
     #[test]
     fn runtime_container_name_matches_docker_convention() {
-        let id = ContainerId {
-            service: "svc".to_string(),
-            replica: 3,
-        };
+        let id = ContainerId::new("svc".to_string(), 3);
         assert_eq!(runtime_container_name(&id), "zlayer-svc-3");
     }
 
@@ -5896,10 +5858,7 @@ mod tests {
         // `attach_container_to_networks` via the Runtime trait object.
         let tracing_concrete = Arc::new(TracingRuntime::default());
         let tracing: Arc<dyn Runtime + Send + Sync> = tracing_concrete.clone();
-        let cid = ContainerId {
-            service: "svc".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("svc".to_string(), 0);
 
         let attachments = vec![
             NetworkAttachmentRequest {
@@ -6168,10 +6127,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "lifecycle-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-life".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-life".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
         let standalone = StandaloneContainer {
             container_id: cid.clone(),

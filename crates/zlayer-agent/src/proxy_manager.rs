@@ -16,9 +16,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use zlayer_proxy::{
-    load_existing_certs_into_resolver, CertManager, LbStrategy, LoadBalancer, NetworkPolicyChecker,
-    ProxyConfig, ProxyServer, RouteEntry, ServiceRegistry, SniCertResolver, StreamRegistry,
-    TcpStreamService, UdpStreamService,
+    endpoint_lb_key, load_existing_certs_into_resolver, CertManager, LbStrategy, LoadBalancer,
+    NetworkPolicyChecker, ProxyConfig, ProxyServer, RouteEntry, ServiceRegistry, SniCertResolver,
+    StreamRegistry, TcpStreamService, UdpStreamService,
 };
 use zlayer_spec::{ExposeType, Protocol, ServiceSpec};
 
@@ -72,8 +72,8 @@ impl ProxyManagerConfig {
 /// Per-service tracking information for cleanup purposes.
 #[derive(Debug, Clone)]
 struct ServiceTracking {
-    /// Endpoint names (retained for Debug output and future introspection)
-    #[allow(dead_code)]
+    /// Endpoint names (used to derive per-endpoint LB group keys for
+    /// cleanup on `remove_service`).
     endpoint_names: Vec<String>,
     /// TCP ports owned by this service
     tcp_ports: Vec<u16>,
@@ -521,6 +521,16 @@ impl ProxyManager {
                     self.registry.register(entry).await;
                     http_ports.push(endpoint.port);
 
+                    // Register one LB group per L7 endpoint, keyed by the
+                    // composite `{service}#{endpoint}`. This matches the
+                    // `resolved.name` set by `RouteEntry::from_endpoint` and
+                    // is required so that different endpoints on the same
+                    // service (potentially with different `target_role`
+                    // filters) maintain independent backend pools.
+                    let lb_key = endpoint_lb_key(name, &endpoint.name);
+                    self.load_balancer
+                        .register(&lb_key, vec![], LbStrategy::RoundRobin);
+
                     info!(
                         service = name,
                         endpoint = %endpoint.name,
@@ -557,7 +567,12 @@ impl ProxyManager {
             endpoint_names.push(endpoint.name.clone());
         }
 
-        // Register the service in the load balancer (starts with no backends)
+        // Register a service-level LB group as well so legacy callers that
+        // use `update_backends(service, ...)` (which fans out to all
+        // endpoints) and any code that selects by bare service name still
+        // resolve. Per-endpoint LB groups (registered above) are the
+        // primary source for L7 select; this is a no-op for callers that
+        // already use composite keys.
         self.load_balancer
             .register(name, vec![], LbStrategy::RoundRobin);
 
@@ -588,8 +603,13 @@ impl ProxyManager {
             // 1. Remove L7 routes from the ServiceRegistry
             self.registry.unregister_service(name).await;
 
-            // 1b. Remove from the load balancer
+            // 1b. Remove from the load balancer (both the service-level
+            //     group and every per-endpoint composite group).
             self.load_balancer.unregister(name);
+            for endpoint_name in &tracking.endpoint_names {
+                let lb_key = endpoint_lb_key(name, endpoint_name);
+                self.load_balancer.unregister(&lb_key);
+            }
 
             // 2. Unregister TCP stream services and clear port tracking
             if !tracking.tcp_ports.is_empty() {
@@ -642,27 +662,59 @@ impl ProxyManager {
         }
     }
 
-    /// Add a single backend to a service
+    /// Add a single backend to a service.
+    ///
+    /// Adds to the service-level LB group **and** to every per-endpoint LB
+    /// group tracked for `service`. Per-endpoint role filtering happens at
+    /// collection time in the agent's service manager, so any backend
+    /// surfaced here is already eligible for every endpoint.
     pub async fn add_backend(&self, service: &str, addr: SocketAddr) {
         self.registry.add_backend(service, addr).await;
         self.load_balancer.add_backend(service, addr);
+        // Fan out to every per-endpoint LB group for backward-compat.
+        let services = self.services.read().await;
+        if let Some(tracking) = services.get(service) {
+            for endpoint_name in &tracking.endpoint_names {
+                let lb_key = endpoint_lb_key(service, endpoint_name);
+                self.load_balancer.add_backend(&lb_key, addr);
+            }
+        }
         info!(service = service, backend = %addr, "Registered backend with proxy");
     }
 
-    /// Remove a backend from a service
+    /// Remove a backend from a service.
+    ///
+    /// Removes from the service-level LB group **and** from every
+    /// per-endpoint LB group.
     pub async fn remove_backend(&self, service: &str, addr: SocketAddr) {
         self.registry.remove_backend(service, addr).await;
         self.load_balancer.remove_backend(service, &addr);
+        let services = self.services.read().await;
+        if let Some(tracking) = services.get(service) {
+            for endpoint_name in &tracking.endpoint_names {
+                let lb_key = endpoint_lb_key(service, endpoint_name);
+                self.load_balancer.remove_backend(&lb_key, &addr);
+            }
+        }
         debug!(service = service, backend = %addr, "Removed backend from service");
     }
 
     /// Update the health status of a backend in the load balancer.
     ///
     /// Delegates to [`LoadBalancer::mark_health`] so that unhealthy backends
-    /// are skipped during selection.
+    /// are skipped during selection. Health is tracked on both the
+    /// service-level group and every per-endpoint group that contains
+    /// this address.
     #[allow(clippy::unused_async)]
     pub async fn update_backend_health(&self, service: &str, addr: SocketAddr, healthy: bool) {
         self.load_balancer.mark_health(service, &addr, healthy);
+        let services = self.services.read().await;
+        if let Some(tracking) = services.get(service) {
+            for endpoint_name in &tracking.endpoint_names {
+                let lb_key = endpoint_lb_key(service, endpoint_name);
+                self.load_balancer.mark_health(&lb_key, &addr, healthy);
+            }
+        }
         debug!(
             service = service,
             backend = %addr,
@@ -671,14 +723,49 @@ impl ProxyManager {
         );
     }
 
-    /// Update the backends for a service
+    /// Update the backends for **every** endpoint of a service with the
+    /// same list.
     ///
-    /// This replaces all backends for the given service with the provided list.
-    /// Each backend should be the address where the service replica is listening.
+    /// Use this only when caller cannot distinguish per-endpoint backend
+    /// sets (e.g., legacy paths that do not honor `target_role`). Prefer
+    /// [`Self::update_endpoint_backends`] when per-endpoint filtering is
+    /// possible.
     pub async fn update_backends(&self, service: &str, addrs: Vec<SocketAddr>) {
         self.registry.update_backends(service, addrs.clone()).await;
-        self.load_balancer.update_backends(service, addrs);
+        // Update the service-level LB group plus every per-endpoint group.
+        self.load_balancer.update_backends(service, addrs.clone());
+        let services = self.services.read().await;
+        if let Some(tracking) = services.get(service) {
+            for endpoint_name in &tracking.endpoint_names {
+                let lb_key = endpoint_lb_key(service, endpoint_name);
+                self.load_balancer.update_backends(&lb_key, addrs.clone());
+            }
+        }
         debug!(service = service, "Updated backends for service");
+    }
+
+    /// Update backends for a single L7 endpoint of a service.
+    ///
+    /// This honors [`EndpointSpec::target_role`] filtering: the caller
+    /// supplies the role-filtered backend list and this method updates
+    /// only the routes and LB group corresponding to `(service,
+    /// endpoint_name)`.
+    pub async fn update_endpoint_backends(
+        &self,
+        service: &str,
+        endpoint_name: &str,
+        addrs: Vec<SocketAddr>,
+    ) {
+        self.registry
+            .update_backends_for_endpoint(service, endpoint_name, addrs.clone())
+            .await;
+        let lb_key = endpoint_lb_key(service, endpoint_name);
+        self.load_balancer.update_backends(&lb_key, addrs);
+        debug!(
+            service = service,
+            endpoint = endpoint_name,
+            "Updated backends for service endpoint"
+        );
     }
 
     /// Get the number of registered routes

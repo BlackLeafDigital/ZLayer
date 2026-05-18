@@ -873,16 +873,10 @@ fn parse_container_id(raw: &str) -> zlayer_agent::runtime::ContainerId {
         let (service, rep) = raw.split_at(idx);
         let rep_num = rep.trim_start_matches("-rep-");
         if let Ok(replica) = rep_num.parse::<u32>() {
-            return zlayer_agent::runtime::ContainerId {
-                service: service.to_string(),
-                replica,
-            };
+            return zlayer_agent::runtime::ContainerId::new(service.to_string(), replica);
         }
     }
-    zlayer_agent::runtime::ContainerId {
-        service: raw.to_string(),
-        replica: 0,
-    }
+    zlayer_agent::runtime::ContainerId::new(raw.to_string(), 0)
 }
 
 /// Map an [`zlayer_agent::AgentError`] from an image method into the API's

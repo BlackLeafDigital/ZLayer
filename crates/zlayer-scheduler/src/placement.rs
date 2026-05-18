@@ -365,6 +365,9 @@ pub struct PlacementDecision {
     pub reason: PlacementReason,
     /// GPU indices allocated on the target node (empty if no GPUs requested)
     pub gpu_indices: Vec<u32>,
+    /// Role within the service this container belongs to. Defaults to
+    /// `"default"` for services without `replica_groups`.
+    pub role: String,
 }
 
 impl PlacementDecision {
@@ -710,6 +713,7 @@ pub fn place_service_replicas(
                     reason: no_suitable_node_reason(service_name, service_spec, nodes),
                 },
                 gpu_indices: Vec::new(),
+                role: "default".to_string(),
             });
             continue;
         }
@@ -721,6 +725,7 @@ pub fn place_service_replicas(
                 // Also consider preferred labels and GPU availability
                 select_for_bin_packing(
                     &suitable_nodes,
+                    placements,
                     service_spec.node_selector.as_ref(),
                     Some(service_spec),
                 )
@@ -767,6 +772,7 @@ pub fn place_service_replicas(
             node_id: Some(selected_id),
             reason,
             gpu_indices,
+            role: "default".to_string(),
         });
     }
 
@@ -784,6 +790,70 @@ pub fn place_service_replicas(
     }
 
     decisions
+}
+
+/// Place a service's replica groups, returning one `Vec<PlacementDecision>`
+/// flattened across all groups.
+///
+/// Each group is placed independently with its own effective `ServiceSpec`
+/// (group overrides merged onto the base service spec). Cross-group
+/// anti-affinity is not enforced in Phase 2.2 — the placement state's
+/// `container_count` tie-breaks naturally favors spreading.
+///
+/// # Arguments
+/// * `service_name` - Service name (used for `ContainerId` construction).
+/// * `service_spec` - Base `ServiceSpec`; provides defaults for groups
+///   that don't override.
+/// * `groups` - The non-empty `replica_groups` from the spec.
+/// * `nodes` - Cluster nodes (mutated for GPU allocation tracking).
+/// * `placements` - Placement state (mutated as containers are placed).
+///
+/// # Returns
+/// One `PlacementDecision` per replica across all groups, with `role`
+/// populated. The flat `Vec` preserves group declaration order.
+pub fn place_service_with_groups(
+    service_name: &str,
+    service_spec: &ServiceSpec,
+    groups: &[zlayer_types::spec::types::ReplicaGroup],
+    nodes: &mut [NodeState],
+    placements: &mut PlacementState,
+) -> Vec<PlacementDecision> {
+    let mut decisions = Vec::new();
+    for group in groups {
+        let effective = effective_spec_for_group(service_spec, group);
+        let group_decisions =
+            place_service_replicas(service_name, &effective, group.count, nodes, placements);
+        for mut d in group_decisions {
+            d.role.clone_from(&group.role);
+            decisions.push(d);
+        }
+    }
+    decisions
+}
+
+/// Merge a group's overrides onto the base service spec.
+///
+/// Fields with `None` group overrides inherit from the base. The `env`
+/// `HashMap` is merged with group entries winning on conflict.
+fn effective_spec_for_group(
+    base: &ServiceSpec,
+    group: &zlayer_types::spec::types::ReplicaGroup,
+) -> ServiceSpec {
+    let mut effective = base.clone();
+    if let Some(image) = &group.image {
+        effective.image = image.clone();
+    }
+    if let Some(command) = &group.command {
+        effective.command = command.clone();
+    }
+    if let Some(resources) = &group.resources {
+        effective.resources = resources.clone();
+    }
+    // env: merge group entries on top of base.
+    for (k, v) in &group.env {
+        effective.env.insert(k.clone(), v.clone());
+    }
+    effective
 }
 
 /// Roll back a failed gang-scheduled placement.
@@ -849,6 +919,7 @@ fn gang_rollback(
                     "Gang scheduling: could not place all {replicas} replicas of '{service_name}'"
                 ),
             },
+            role: "default".to_string(),
         })
         .collect()
 }
@@ -860,6 +931,7 @@ fn gang_rollback(
 /// and CPU/memory utilization as before.
 fn select_for_bin_packing<'a>(
     nodes: &[&'a NodeState],
+    placements: &PlacementState,
     node_selector: Option<&NodeSelector>,
     service_spec: Option<&ServiceSpec>,
 ) -> &'a NodeState {
@@ -921,11 +993,31 @@ fn select_for_bin_packing<'a>(
                             .partial_cmp(&b_combined)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     } else {
-                        // Non-GPU: by utilization (lower is better for bin-packing)
-                        // Note: we're using max_by, so we reverse the comparison
-                        b.utilization()
+                        // Non-GPU: by utilization (lower is better for
+                        // bin-packing). `max_by` selects the greater, so we
+                        // compare `b vs a` to prefer the node with the
+                        // *lower* utilization. Tie-break inside is below.
+                        let util_cmp = b
+                            .utilization()
                             .partial_cmp(&a.utilization())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                        match util_cmp {
+                            std::cmp::Ordering::Equal => {
+                                // Bin-pack: when utilization ties (e.g. all
+                                // nodes at 0% on a fresh deploy), prefer the
+                                // node that already has MORE of this
+                                // service's containers. Concentrating
+                                // consecutive replicas on one node is the
+                                // whole point of shared/bin-pack mode.
+                                // `max_by` selects the "greater" element, so
+                                // returning `a_count.cmp(&b_count)` makes the
+                                // node with the higher count win.
+                                let a_count = placements.container_count(a.id);
+                                let b_count = placements.container_count(b.id);
+                                a_count.cmp(&b_count)
+                            }
+                            other => other,
+                        }
                     }
                 }
                 other => other,
@@ -1105,6 +1197,7 @@ mod tests {
             userns_mode: None,
             cgroup_parent: None,
             expose: Vec::new(),
+            replica_groups: None,
         }
     }
 
@@ -1329,6 +1422,50 @@ mod tests {
 
         assert_eq!(decisions.len(), 3);
         assert!(decisions.iter().all(PlacementDecision::is_success));
+    }
+
+    #[test]
+    fn test_place_service_with_groups() {
+        use zlayer_types::spec::types::{GroupAffinity, ReplicaGroup};
+        let groups = vec![
+            ReplicaGroup {
+                role: "primary".to_string(),
+                count: 1,
+                image: None,
+                env: HashMap::default(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::Spread,
+            },
+            ReplicaGroup {
+                role: "read".to_string(),
+                count: 2,
+                image: None,
+                env: HashMap::default(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::Spread,
+            },
+        ];
+        let mut nodes = vec![
+            make_node(1, "192.168.1.1:8000"),
+            make_node(2, "192.168.1.2:8000"),
+            make_node(3, "192.168.1.3:8000"),
+        ];
+        let mut placements = PlacementState::new();
+        let spec = make_service_spec(NodeMode::Shared, None);
+
+        let decisions =
+            place_service_with_groups("db", &spec, &groups, &mut nodes, &mut placements);
+
+        assert_eq!(decisions.len(), 3, "1 primary + 2 read = 3");
+        let primary: Vec<_> = decisions.iter().filter(|d| d.role == "primary").collect();
+        let read: Vec<_> = decisions.iter().filter(|d| d.role == "read").collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(read.len(), 2);
+        for d in &decisions {
+            assert!(d.node_id.is_some(), "all replicas should land on a node");
+        }
     }
 
     #[test]
