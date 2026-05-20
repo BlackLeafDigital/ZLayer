@@ -1341,6 +1341,11 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             post(handlers::cluster::cluster_wipe_join_secret),
         )
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
+        .route("/workers", get(handlers::cluster::cluster_list_workers))
+        .route(
+            "/gossip/peers",
+            get(handlers::cluster::cluster_list_gossip_peers),
+        )
         .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .route(
             "/force-leader",

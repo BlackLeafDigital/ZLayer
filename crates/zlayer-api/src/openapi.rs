@@ -14,7 +14,7 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer, ForceLeaderRequest,
-    ForceLeaderResponse, HeartbeatRequest,
+    ForceLeaderResponse, GossipPeerSummary, HeartbeatRequest, WorkerSummary,
 };
 use crate::handlers::container_networks::{
     BridgeNetworkDetails, ConnectBridgeNetworkRequest, CreateBridgeNetworkRequest,
@@ -109,7 +109,8 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
-    __path_cluster_list_nodes, __path_cluster_upgrade, __path_cluster_upgrade_self,
+    __path_cluster_list_gossip_peers, __path_cluster_list_nodes, __path_cluster_list_workers,
+    __path_cluster_upgrade, __path_cluster_upgrade_self,
 };
 use crate::handlers::container_networks::{
     __path_connect_container_network, __path_create_container_network,
@@ -462,6 +463,8 @@ impl Modify for SecurityAddon {
         // Cluster
         cluster_join,
         cluster_list_nodes,
+        cluster_list_workers,
+        cluster_list_gossip_peers,
         cluster_heartbeat,
         cluster_force_leader,
         cluster_upgrade,
@@ -705,6 +708,8 @@ impl Modify for SecurityAddon {
             ClusterJoinResponse,
             ClusterPeer,
             ClusterNodeSummary,
+            WorkerSummary,
+            GossipPeerSummary,
             HeartbeatRequest,
             ForceLeaderRequest,
             ForceLeaderResponse,

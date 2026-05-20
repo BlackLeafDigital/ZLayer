@@ -4881,6 +4881,30 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// List worker-tier workers leased by the local leader.
+    ///
+    /// `GET /api/v1/cluster/workers`. Returns an empty list when this node
+    /// is not running a worker-tier dispatcher (e.g., single-node, raft-only,
+    /// static, or a worker-tier worker-role daemon).
+    pub async fn list_workers(&self) -> Result<Vec<zlayer_types::api::cluster::WorkerSummary>> {
+        let (status, body) = self.get("/api/v1/cluster/workers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Snapshot of peers known via the gossip pool on the local daemon.
+    ///
+    /// `GET /api/v1/cluster/gossip/peers`. Returns an empty list when this
+    /// node has no gossip pool configured (single-node, raft-only, static,
+    /// or a worker-tier server without gossip enabled).
+    pub async fn list_gossip_peers(
+        &self,
+    ) -> Result<Vec<zlayer_types::api::cluster::GossipPeerSummary>> {
+        let (status, body) = self.get("/api/v1/cluster/gossip/peers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
     /// Inspect a single node by id.
     ///
     /// `GET /api/v1/nodes/{id}`. The daemon serves the richer

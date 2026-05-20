@@ -749,7 +749,7 @@ pub(crate) async fn handle_node(
             valid_for,
             max_uses,
         } => handle_node_generate_worker_token(*valid_for, *max_uses, cli_data_dir).await,
-        NodeCommands::WorkerStatus => handle_node_worker_status(),
+        NodeCommands::WorkerStatus => handle_node_worker_status(cli_data_dir).await,
         NodeCommands::WorkerDrain { node_id, grace } => handle_node_worker_drain(*node_id, *grace),
         NodeCommands::WorkerEvict { node_id } => handle_node_worker_evict(*node_id),
     }
@@ -795,12 +795,65 @@ pub(crate) async fn handle_node_generate_worker_token(
     Ok(())
 }
 
-/// Stub — P3.9 will wire the actual /api/v1/cluster/workers GET endpoint.
-/// Return type is `Result<()>` so the call signature stays stable once
-/// the real HTTP call (which can fail) lands.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn handle_node_worker_status() -> Result<()> {
-    println!("worker-status: not yet wired (P3.9 will add the API endpoint)");
+/// Print the leader-known worker tier workers via
+/// `GET /api/v1/cluster/workers`.
+///
+/// Resolves the daemon API endpoint from the local node config (same
+/// pattern as `handle_node_list`) and renders a small table. An empty
+/// list is rendered as a single human-readable line — this is the
+/// expected output on a single-node / raft-only / static cluster where
+/// the dispatcher is `None`.
+pub(crate) async fn handle_node_worker_status(cli_data_dir: &std::path::Path) -> Result<()> {
+    use std::time::Duration;
+
+    let data_dir = cli_data_dir.to_path_buf();
+    let node_config = load_or_init_node_config(&data_dir).await?;
+    let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let response = client
+        .get(format!("http://{api_endpoint}/api/v1/cluster/workers"))
+        .send()
+        .await
+        .context("Failed to call /api/v1/cluster/workers")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("worker-status: API returned HTTP {status}: {body}");
+    }
+
+    let workers: Vec<zlayer_types::api::cluster::WorkerSummary> = response
+        .json()
+        .await
+        .context("Failed to parse /api/v1/cluster/workers response")?;
+
+    if workers.is_empty() {
+        println!("No worker-tier workers registered.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<10} {:<24} {:<14} {:<10} LABELS",
+        "ID", "API_ADDR", "STATE", "OS"
+    );
+    for w in workers {
+        let labels = w
+            .labels
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let labels_disp = if labels.is_empty() { "-" } else { &labels };
+        println!(
+            "{:<10} {:<24} {:<14} {:<10} {}",
+            w.id, w.api_addr, w.state, w.os, labels_disp
+        );
+    }
     Ok(())
 }
 

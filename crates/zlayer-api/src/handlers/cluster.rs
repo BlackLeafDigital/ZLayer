@@ -35,11 +35,12 @@ use zlayer_scheduler::{AddMemberParams, NodeId, RaftCoordinator};
 // (the `cluster_join` handler, the test module) keep compiling.
 pub use zlayer_types::api::cluster::{
     default_api_port, default_mode, ClusterJoinClaims, ClusterJoinRequest, ClusterJoinResponse,
-    ClusterNodeSummary, ClusterPeer, ImportTrustBundleRequest, ImportTrustBundleResponse,
-    JwtStatusResponse, RevocationEntry, RevocationListResponse, RevokeTokenRequest,
-    RevokeTokenResponse, RotateSigningKeyRequest, RotateSigningKeyResponse, SetJwtAlgorithmRequest,
-    SignedClusterJoinToken, SigningPubkeyEntry, SigningPubkeyResponse, SigningPubkeysResponse,
-    TrustedBundleEntry, TrustedBundlesResponse, SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
+    ClusterNodeSummary, ClusterPeer, GossipPeerSummary, ImportTrustBundleRequest,
+    ImportTrustBundleResponse, JwtStatusResponse, RevocationEntry, RevocationListResponse,
+    RevokeTokenRequest, RevokeTokenResponse, RotateSigningKeyRequest, RotateSigningKeyResponse,
+    SetJwtAlgorithmRequest, SignedClusterJoinToken, SigningPubkeyEntry, SigningPubkeyResponse,
+    SigningPubkeysResponse, TrustedBundleEntry, TrustedBundlesResponse, WorkerSummary,
+    SIGNED_TOKEN_V_WAVE3, SIGNED_TOKEN_V_WAVE9,
 };
 
 /// Worker nodes whose `last_heartbeat` is older than this threshold are
@@ -149,6 +150,12 @@ pub struct ClusterApiState {
     // TODO Phase-1.5: replicate `used_jtis` through Raft so the replay
     // protection survives leader changes within the JWT's TTL window.
     pub used_jtis: Arc<Mutex<HashSet<String>>>,
+    /// Worker-tier dispatcher (server-role only). When `None`, the
+    /// `/api/v1/cluster/workers` endpoint returns an empty list.
+    pub worker_dispatcher: Option<Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher>>,
+    /// Gossip pool (worker-tier deployments only). When `None`, the
+    /// `/api/v1/cluster/gossip/peers` endpoint returns an empty list.
+    pub gossip_pool: Option<Arc<zlayer_overlay::gossip::GossipPool>>,
 }
 
 impl ClusterApiState {
@@ -186,6 +193,8 @@ impl ClusterApiState {
             slice_allocator,
             slice_allocator_path,
             used_jtis: Arc::new(Mutex::new(HashSet::new())),
+            worker_dispatcher: None,
+            gossip_pool: None,
         }
     }
 
@@ -217,6 +226,8 @@ impl ClusterApiState {
             slice_allocator,
             slice_allocator_path,
             used_jtis: Arc::new(Mutex::new(HashSet::new())),
+            worker_dispatcher: None,
+            gossip_pool: None,
         }
     }
 
@@ -253,7 +264,32 @@ impl ClusterApiState {
             slice_allocator: Arc::new(RwLock::new(slice_allocator)),
             slice_allocator_path: None,
             used_jtis: Arc::new(Mutex::new(HashSet::new())),
+            worker_dispatcher: None,
+            gossip_pool: None,
         }
+    }
+
+    /// Attach a worker dispatcher (called from `serve.rs` when
+    /// `mode: worker-tier, role: server`).
+    ///
+    /// Without this, `GET /api/v1/cluster/workers` returns an empty list.
+    #[must_use]
+    pub fn with_worker_dispatcher(
+        mut self,
+        dispatcher: Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher>,
+    ) -> Self {
+        self.worker_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Attach a gossip pool (called from `serve.rs` when running in a
+    /// worker-tier server mode that brought up chitchat).
+    ///
+    /// Without this, `GET /api/v1/cluster/gossip/peers` returns an empty list.
+    #[must_use]
+    pub fn with_gossip_pool(mut self, pool: Arc<zlayer_overlay::gossip::GossipPool>) -> Self {
+        self.gossip_pool = Some(pool);
+        self
     }
 
     /// Allocate the next Raft node ID.
@@ -800,6 +836,94 @@ pub async fn cluster_list_nodes(
         .collect();
 
     Ok(Json(nodes))
+}
+
+/// `GET /api/v1/cluster/workers` — list currently-leased worker-tier workers.
+///
+/// Returns an empty list when this node is not running a worker-tier
+/// dispatcher (e.g., single-node, raft-only, static, or a worker-tier
+/// worker-role daemon).
+///
+/// # Errors
+///
+/// Never errors today — `known_workers()` is infallible. The result type
+/// stays `Result<_>` so a future fallible implementation doesn't need a
+/// signature change.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/workers",
+    responses(
+        (status = 200, description = "List of worker-tier workers", body = Vec<WorkerSummary>),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+pub async fn cluster_list_workers(
+    State(state): State<ClusterApiState>,
+) -> Result<Json<Vec<WorkerSummary>>> {
+    let Some(dispatcher) = &state.worker_dispatcher else {
+        return Ok(Json(Vec::new()));
+    };
+    let workers = dispatcher.known_workers().await;
+    let summaries: Vec<WorkerSummary> = workers
+        .into_iter()
+        .map(|n| WorkerSummary {
+            id: n.id,
+            api_addr: n.api_addr.to_string(),
+            labels: n.labels,
+            os: n.os,
+            last_seen_unix_secs: n
+                .last_seen
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+                .unwrap_or(0),
+            state: match n.state {
+                zlayer_scheduler::cluster::NodeState::Ready => "ready".to_string(),
+                zlayer_scheduler::cluster::NodeState::Unreachable => "unreachable".to_string(),
+                zlayer_scheduler::cluster::NodeState::Draining => "draining".to_string(),
+            },
+        })
+        .collect();
+    Ok(Json(summaries))
+}
+
+/// `GET /api/v1/cluster/gossip/peers` — list peers known via the gossip pool.
+///
+/// Returns an empty list when the daemon has no gossip pool configured
+/// (single-node, raft-only, static, or worker-tier without gossip enabled).
+///
+/// # Errors
+///
+/// Currently infallible — `GossipPool::peers()` can't fail today. The
+/// return type stays `Result<_>` so a future fallible implementation
+/// doesn't need a signature change.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/gossip/peers",
+    responses(
+        (status = 200, description = "List of gossip pool peers", body = Vec<GossipPeerSummary>),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+pub async fn cluster_list_gossip_peers(
+    State(state): State<ClusterApiState>,
+) -> Result<Json<Vec<GossipPeerSummary>>> {
+    let Some(pool) = &state.gossip_pool else {
+        return Ok(Json(Vec::new()));
+    };
+    let peers = pool.peers().await;
+    let summaries: Vec<GossipPeerSummary> = peers
+        .into_iter()
+        .map(|p| GossipPeerSummary {
+            node_id: p.node_id,
+            wg_pubkey: Some(p.wg_pubkey),
+            wg_endpoint: Some(p.wg_endpoint.to_string()),
+            overlay_ip: Some(p.overlay_ip),
+            labels: p.labels,
+        })
+        .collect();
+    Ok(Json(summaries))
 }
 
 /// `GET /api/v1/cluster/signing-pubkey` — return the cluster's active

@@ -515,6 +515,44 @@ pub struct JwtStatusResponse {
     pub join_secret_wiped_at: Option<String>,
 }
 
+/// Summary of a worker-tier worker node, returned by `GET /api/v1/cluster/workers`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkerSummary {
+    /// Worker's assigned node id.
+    pub id: u64,
+    /// Worker's API/health address (host:port).
+    pub api_addr: String,
+    /// Labels declared during Register.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
+    /// Worker's reported OS.
+    pub os: String,
+    /// Last time the leader observed the worker.
+    pub last_seen_unix_secs: i64,
+    /// Liveness state (`ready` | `unreachable` | `draining`).
+    pub state: String,
+}
+
+/// Snapshot of one gossip-pool peer, returned by
+/// `GET /api/v1/cluster/gossip/peers`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GossipPeerSummary {
+    /// Worker (or peer) node id.
+    pub node_id: u64,
+    /// `WireGuard` public key (base64-url-no-pad), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_pubkey: Option<String>,
+    /// `WireGuard` UDP endpoint (host:port), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_endpoint: Option<String>,
+    /// Overlay IP assigned to this peer, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip: Option<String>,
+    /// Free-form labels advertised by the peer.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
+}
+
 /// Summary of a cluster node for listing.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterNodeSummary {

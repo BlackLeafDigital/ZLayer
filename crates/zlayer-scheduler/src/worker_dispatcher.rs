@@ -671,8 +671,10 @@ mod tests {
         // Build a per-test RaftCoordinator rooted in `data_dir` so concurrent
         // tests don't race on the production raft lock file at
         // `~/.zlayer/raft/raft-log`.
-        let mut cfg = crate::raft::RaftConfig::default();
-        cfg.data_dir = data_dir.join("raft");
+        let cfg = crate::raft::RaftConfig {
+            data_dir: data_dir.join("raft"),
+            ..Default::default()
+        };
         Arc::new(
             RaftCoordinator::new(cfg)
                 .await

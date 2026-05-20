@@ -1,0 +1,26 @@
+# Cluster e2e fixture — worker-tier suite. Deploys a 10-replica nginx
+# service that should land entirely on worker-tier worker nodes; the
+# 3 control-plane nodes (mode: worker-tier, role: server) must NOT
+# receive any replicas because they do not enter the worker dispatcher.
+#
+# Consumed by the `cluster_worker_tier` suite in run-suite.py.
+
+version: v1
+deployment: worker-tier-test
+
+services:
+  web:
+    rtype: service
+    image:
+      name: nginx:1.28-alpine
+      pull_policy: if_not_present
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 10

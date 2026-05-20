@@ -1959,6 +1959,20 @@ pub(crate) async fn serve_with_external_shutdown(
     let cluster_http_client = reqwest::Client::new();
     let cluster_internal_token = daemon_internal_token.clone();
 
+    // Captured from the worker-tier Server arm so the `/api/v1/cluster/workers`
+    // handler in `ClusterApiState` can call `known_workers()` after the match
+    // moves `dispatcher` into the `WorkerTierCluster`. `None` in every other
+    // cluster mode — the handler returns an empty list when this is unset.
+    let mut worker_dispatcher_for_api: Option<
+        std::sync::Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher>,
+    > = None;
+
+    // Captured from the worker-tier Server arm so the
+    // `/api/v1/cluster/gossip/peers` handler can return a snapshot. `None`
+    // in every other cluster mode — the handler returns an empty list when
+    // this is unset.
+    let mut gossip_pool_for_api: Option<std::sync::Arc<zlayer_overlay::gossip::GossipPool>> = None;
+
     let cluster_handle: std::sync::Arc<dyn zlayer_scheduler::cluster::Cluster> = match cluster_mode
     {
         zlayer_types::cluster::ClusterMode::SingleNode => {
@@ -2113,6 +2127,94 @@ pub(crate) async fn serve_with_external_shutdown(
 
             let dispatcher_dyn: std::sync::Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher> =
                 dispatcher;
+
+            // Stash a clone for `ClusterApiState::with_worker_dispatcher` so
+            // `GET /api/v1/cluster/workers` can list known workers without
+            // round-tripping through the `Cluster` trait (which doesn't expose
+            // worker-only state).
+            worker_dispatcher_for_api = Some(dispatcher_dyn.clone());
+
+            // ------------------------------------------------------------
+            // Bring up the chitchat gossip pool so worker peers can
+            // discover each other's WireGuard endpoints without the leader
+            // brokering every update. The pool publishes a minimal
+            // self-info record now (empty wg key + 0.0.0.0:0 endpoint —
+            // worker join logic in a follow-up will fill these in via
+            // `announce_self` once the WG interface is up). Seeds come
+            // from the current Raft membership: every other voter's
+            // advertise_addr paired with the conventional Serf UDP port
+            // 7946. If the membership is empty (single-node bootstrap),
+            // the seed list is empty and joiners discover this node via
+            // the bootstrap token + RegisterResponse path.
+            // ------------------------------------------------------------
+            let gossip_listen: std::net::SocketAddr = "0.0.0.0:7946"
+                .parse()
+                .expect("hardcoded gossip listen addr must parse");
+
+            let gossip_seeds: Vec<std::net::SocketAddr> = {
+                if let Some(raft_for_seeds) = _raft.clone() {
+                    let cluster_state_snapshot = raft_for_seeds.read_state().await;
+                    cluster_state_snapshot
+                        .nodes
+                        .values()
+                        .filter(|n| n.node_id != cluster_node_id)
+                        .filter_map(|n| {
+                            // Use advertise_addr (public IP) + the gossip
+                            // UDP port. Skip nodes that don't yet have an
+                            // advertise_addr (pre-Wave-5 registrations).
+                            if n.advertise_addr.is_empty() {
+                                return None;
+                            }
+                            format!("{}:7946", n.advertise_addr).parse().ok()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let self_info = zlayer_overlay::gossip::PeerInfo {
+                node_id: cluster_node_id,
+                wg_pubkey: String::new(),
+                wg_endpoint: "0.0.0.0:0"
+                    .parse()
+                    .expect("hardcoded placeholder endpoint must parse"),
+                overlay_ip: String::new(),
+                labels: std::collections::HashMap::new(),
+            };
+
+            let gossip_cluster_id = tokio::fs::read_to_string(config.data_dir.join("cluster_id"))
+                .await
+                .map_or_else(|_| "default-cluster".to_string(), |s| s.trim().to_string());
+
+            let gossip_config = zlayer_overlay::gossip::GossipConfig {
+                node_id: cluster_node_id,
+                gossip_listen,
+                seeds: gossip_seeds,
+                cluster_id: gossip_cluster_id,
+                self_info,
+            };
+            match zlayer_overlay::gossip::GossipPool::start(gossip_config).await {
+                Ok(pool) => {
+                    info!(
+                        node_id = cluster_node_id,
+                        listen = %gossip_listen,
+                        "gossip pool started for worker-tier server"
+                    );
+                    gossip_pool_for_api = Some(pool);
+                }
+                Err(e) => {
+                    // Gossip is non-essential at boot: workers can still
+                    // register via gRPC and the leader still drives
+                    // scheduling. Log and continue so a stale 7946 port
+                    // (e.g. left over from a previous daemon) doesn't
+                    // brick the whole control plane.
+                    tracing::warn!(
+                        error = %e,
+                        "failed to start gossip pool; /api/v1/cluster/gossip/peers will return empty"
+                    );
+                }
+            }
 
             std::sync::Arc::new(zlayer_scheduler::cluster::WorkerTierCluster::server(
                 raft_cluster,
@@ -2480,6 +2582,12 @@ pub(crate) async fn serve_with_external_shutdown(
     cluster_state.cluster_signing_key_path = Some(config.data_dir.join("cluster_signing.key"));
     cluster_state.cluster_ca.clone_from(&cluster_ca);
     cluster_state.cluster_domain = Some(node_config.node_id.clone());
+    if let Some(dispatcher) = worker_dispatcher_for_api {
+        cluster_state = cluster_state.with_worker_dispatcher(dispatcher);
+    }
+    if let Some(pool) = gossip_pool_for_api {
+        cluster_state = cluster_state.with_gossip_pool(pool);
+    }
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
