@@ -41,7 +41,7 @@ pub(crate) fn routes(state: SocketState) -> Router {
 /// host (where containers actually run), not the client.
 fn ping_headers() -> AppendHeaders<[(&'static str, &'static str); 5]> {
     AppendHeaders([
-        ("Api-Version", "1.43"),
+        ("Api-Version", "1.47"),
         ("OSType", ping_ostype()),
         ("Builder-Version", "2"),
         ("Cache-Control", "no-cache, no-store, must-revalidate"),
@@ -76,7 +76,7 @@ async fn ping_head() -> impl IntoResponse {
 async fn version() -> Json<VersionInfo> {
     Json(VersionInfo {
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        api_version: "1.43".to_owned(),
+        api_version: "1.47".to_owned(),
         min_api_version: "1.24".to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -89,7 +89,7 @@ async fn version() -> Json<VersionInfo> {
 ///
 /// Sources live counts from the zlayer daemon (containers, images) and
 /// fills the rest from the host. Docker-aware tools rely on these fields
-/// so we emit the full v1.43 shape, leaving plugin/driver metadata as
+/// so we emit the full v1.47 shape, leaving plugin/driver metadata as
 /// empty arrays when we have nothing meaningful to report.
 ///
 /// The `Swarm` block is populated via
@@ -121,7 +121,7 @@ async fn info(State(state): State<SocketState>) -> Json<serde_json::Value> {
     };
 
     // Start from the typed serialization, then splice in the remaining
-    // Docker v1.43 fields that the narrow `SystemInfo` type doesn't
+    // Docker v1.47 fields that the narrow `SystemInfo` type doesn't
     // carry. Docker-aware clients rely on the full shape.
     let mut value = serde_json::to_value(&base).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = value.as_object_mut() {

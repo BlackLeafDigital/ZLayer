@@ -250,10 +250,25 @@ fn to_container_summary(v: &serde_json::Value) -> ContainerSummary {
 
 /// Query parameters accepted on `GET /containers/json`.
 ///
-/// `filters` and `size` are parsed but not honored — the daemon's
-/// container list doesn't expose size info, and filter translation
-/// (e.g. `label=foo`) would require invoking the daemon repeatedly.
-/// `all` and `limit` are honored.
+/// `all`, `limit`, and `filters` are honored. `size` is parsed but
+/// ignored — the daemon's container list doesn't expose size info.
+///
+/// Supported `filters` keys (Docker JSON map of key → `Vec<String>`):
+///
+/// - `label` — AND across the requested label list. Each entry is
+///   either `"k=v"` (exact match on both key and value) or `"k"`
+///   (presence of key regardless of value). All listed labels must
+///   match.
+/// - `status` — OR within the list, case-insensitive comparison
+///   against the container's `state`.
+/// - `name` — OR within the list, substring match. A leading `/` is
+///   stripped from each container name before comparison.
+/// - `id` — OR within the list, prefix match against the container's
+///   id.
+///
+/// Other Docker filter keys (`ancestor`, `network`, `volume`,
+/// `health`, `exited`, `before`, `since`, …) are accepted but not
+/// applied — they pass through without filtering anything out.
 #[derive(Debug, Default, Deserialize)]
 struct ListContainersQuery {
     #[serde(default)]
@@ -261,11 +276,94 @@ struct ListContainersQuery {
     #[serde(default)]
     limit: Option<i64>,
     #[serde(default)]
-    #[allow(dead_code)]
     filters: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     size: Option<String>,
+}
+
+/// Parse Docker's `filters` query parameter, a JSON-encoded map of
+/// `key → Vec<String>`.
+///
+/// Returns `None` if the parameter is absent, empty, or fails to
+/// parse. Parse failures are logged with `tracing::warn!` so clients
+/// see misuse in logs but the request is not rejected with `500`.
+fn parse_filters(raw: Option<&str>) -> Option<HashMap<String, Vec<String>>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<HashMap<String, Vec<String>>>(raw) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                raw = %raw,
+                "docker /containers/json: ignoring unparseable filters query parameter"
+            );
+            None
+        }
+    }
+}
+
+/// Apply Docker's `filters` semantics to a single [`ContainerSummary`].
+///
+/// See [`ListContainersQuery`] for the supported keys. Unsupported
+/// keys are logged at `debug` and treated as match-pass-through (they
+/// do not filter the container out).
+fn container_matches_filters(c: &ContainerSummary, filters: &HashMap<String, Vec<String>>) -> bool {
+    for (key, values) in filters {
+        match key.as_str() {
+            "label" => {
+                // AND across the requested label list.
+                for entry in values {
+                    let matched = if let Some((k, v)) = entry.split_once('=') {
+                        c.labels.get(k).map(String::as_str) == Some(v)
+                    } else {
+                        c.labels.contains_key(entry.as_str())
+                    };
+                    if !matched {
+                        return false;
+                    }
+                }
+            }
+            "status" => {
+                // OR within the list, case-insensitive against c.state.
+                let state_lower = c.state.to_ascii_lowercase();
+                let any = values.iter().any(|v| v.to_ascii_lowercase() == state_lower);
+                if !any {
+                    return false;
+                }
+            }
+            "name" => {
+                // OR within the list, substring match. Strip leading
+                // `/` from each container name before comparing.
+                let any = values.iter().any(|needle| {
+                    c.names.iter().any(|n| {
+                        let stripped = n.strip_prefix('/').unwrap_or(n.as_str());
+                        stripped.contains(needle.as_str())
+                    })
+                });
+                if !any {
+                    return false;
+                }
+            }
+            "id" => {
+                // OR within the list, prefix match.
+                let any = values.iter().any(|p| c.id.starts_with(p.as_str()));
+                if !any {
+                    return false;
+                }
+            }
+            other => {
+                tracing::debug!(
+                    key = %other,
+                    "docker /containers/json: unsupported filter key, ignoring"
+                );
+            }
+        }
+    }
+    true
 }
 
 fn parse_bool(s: Option<&str>) -> bool {
@@ -298,6 +396,10 @@ async fn list_containers(
 
     if !all {
         summaries.retain(|c| c.state == "running");
+    }
+
+    if let Some(filters) = parse_filters(query.filters.as_deref()) {
+        summaries.retain(|c| container_matches_filters(c, &filters));
     }
 
     if let Some(limit) = query.limit {
@@ -895,6 +997,86 @@ async fn remove_container(
     }
 }
 
+/// Build the Docker-shaped `NetworkSettings` object from a zlayer
+/// `ContainerInfo` JSON value.
+///
+/// Pulls the top-level `ipv4` into `NetworkSettings.IPAddress` and turns each
+/// entry of the `networks` array into a Docker `EndpointSettings` keyed by the
+/// attachment's `network` name. `NetworkID` and `EndpointID` are synthesised
+/// deterministically with blake3 (64-char hex) so Docker clients that key on
+/// these IDs can correlate calls across inspect/network endpoints — zlayer
+/// doesn't track real Docker endpoint IDs internally.
+fn build_network_settings(v: &serde_json::Value, cid: &str) -> serde_json::Value {
+    let primary_ipv4 = v.get("ipv4").and_then(|x| x.as_str()).unwrap_or("");
+
+    let attachments: Vec<&serde_json::Value> = v
+        .get("networks")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default();
+
+    let mut networks_map = serde_json::Map::new();
+    let mut first_endpoint_id = String::new();
+
+    for att in &attachments {
+        let Some(netname) = att.get("network").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let ip = att.get("ipv4").and_then(|x| x.as_str()).unwrap_or("");
+
+        let network_id = blake3::hash(format!("net:{netname}").as_bytes())
+            .to_hex()
+            .to_string();
+        let endpoint_id = blake3::hash(format!("ep:{cid}:{netname}").as_bytes())
+            .to_hex()
+            .to_string();
+
+        if first_endpoint_id.is_empty() {
+            first_endpoint_id.clone_from(&endpoint_id);
+        }
+
+        networks_map.insert(
+            netname.to_owned(),
+            serde_json::json!({
+                "IPAMConfig": serde_json::Value::Null,
+                "Links": serde_json::Value::Null,
+                "Aliases": serde_json::Value::Null,
+                "NetworkID": network_id,
+                "EndpointID": endpoint_id,
+                "Gateway": "",
+                "IPAddress": ip,
+                "IPPrefixLen": 0,
+                "IPv6Gateway": "",
+                "GlobalIPv6Address": "",
+                "GlobalIPv6PrefixLen": 0,
+                "MacAddress": "",
+                "DriverOpts": serde_json::Value::Null,
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "Bridge": "",
+        "SandboxID": "",
+        "HairpinMode": false,
+        "LinkLocalIPv6Address": "",
+        "LinkLocalIPv6PrefixLen": 0,
+        "Ports": {},
+        "SandboxKey": "",
+        "SecondaryIPAddresses": serde_json::Value::Null,
+        "SecondaryIPv6Addresses": serde_json::Value::Null,
+        "EndpointID": first_endpoint_id,
+        "Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "IPAddress": primary_ipv4,
+        "IPPrefixLen": 0,
+        "IPv6Gateway": "",
+        "MacAddress": "",
+        "Networks": serde_json::Value::Object(networks_map),
+    })
+}
+
 /// `GET /containers/{id}/json` — Inspect a container.
 ///
 /// Returns a minimum-viable subset of Docker's `ContainerInspect` shape:
@@ -902,6 +1084,12 @@ async fn remove_container(
 /// ExitCode, StartedAt, FinishedAt }`, `HostConfig`, `Config { Image,
 /// Labels }`, `NetworkSettings`, `Mounts`. Fields we don't track are
 /// filled with reasonable defaults (empty strings, `0`, empty maps).
+///
+/// `NetworkSettings` is populated from the underlying `ContainerInfo`'s
+/// top-level `ipv4` (→ `IPAddress`) and each entry of `networks`
+/// (→ `Networks[<name>]`) via [`build_network_settings`]; `NetworkID` /
+/// `EndpointID` are deterministic blake3 hashes so Docker clients can
+/// correlate them across calls.
 #[allow(clippy::too_many_lines)] // Most lines are Docker's inspect shape (literal JSON fields).
 async fn inspect_container(State(state): State<SocketState>, Path(id): Path<String>) -> Response {
     let v = match state.client.get_container(&id).await {
@@ -988,26 +1176,7 @@ async fn inspect_container(State(state): State<SocketState>, Path(id): Path<Stri
             "OnBuild": null,
             "Labels": labels,
         },
-        "NetworkSettings": {
-            "Bridge": "",
-            "SandboxID": "",
-            "HairpinMode": false,
-            "LinkLocalIPv6Address": "",
-            "LinkLocalIPv6PrefixLen": 0,
-            "Ports": {},
-            "SandboxKey": "",
-            "SecondaryIPAddresses": null,
-            "SecondaryIPv6Addresses": null,
-            "EndpointID": "",
-            "Gateway": "",
-            "GlobalIPv6Address": "",
-            "GlobalIPv6PrefixLen": 0,
-            "IPAddress": "",
-            "IPPrefixLen": 0,
-            "IPv6Gateway": "",
-            "MacAddress": "",
-            "Networks": {},
-        },
+        "NetworkSettings": build_network_settings(&v, cid),
         // Also echo zlayer's derived Docker-style short status so
         // clients that ignore `State.Status` still get something useful.
         "ZLayerStatus": status_str,
@@ -2447,6 +2616,51 @@ mod tests {
     }
 
     #[test]
+    fn build_network_settings_populates_ipaddress_and_networks() {
+        let v = serde_json::json!({
+            "ipv4": "10.99.99.20",
+            "networks": [
+                { "network": "bridge", "ipv4": "10.99.99.20", "aliases": [] }
+            ]
+        });
+        let out = build_network_settings(&v, "abc123");
+
+        assert_eq!(out["IPAddress"].as_str(), Some("10.99.99.20"));
+        assert_eq!(
+            out["Networks"]["bridge"]["IPAddress"].as_str(),
+            Some("10.99.99.20")
+        );
+
+        let net_id = out["Networks"]["bridge"]["NetworkID"]
+            .as_str()
+            .expect("NetworkID");
+        let ep_id = out["Networks"]["bridge"]["EndpointID"]
+            .as_str()
+            .expect("EndpointID");
+        assert_eq!(net_id.len(), 64);
+        assert_eq!(ep_id.len(), 64);
+        assert!(net_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(ep_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // Top-level EndpointID should mirror the first attachment's endpoint.
+        assert_eq!(out["EndpointID"].as_str(), Some(ep_id));
+    }
+
+    #[test]
+    fn build_network_settings_no_networks_yields_empty_defaults() {
+        let v = serde_json::json!({
+            "networks": []
+        });
+        let out = build_network_settings(&v, "abc123");
+
+        assert_eq!(out["IPAddress"].as_str(), Some(""));
+        assert_eq!(out["EndpointID"].as_str(), Some(""));
+        assert_eq!(
+            out["Networks"].as_object().map(serde_json::Map::len),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn state_mapping_exited() {
         let (s, _) = docker_state("exited");
         assert_eq!(s, "exited");
@@ -3565,5 +3779,152 @@ mod tests {
 
         let empty: RenameQuery = serde_json::from_value(serde_json::json!({})).expect("parses");
         assert!(empty.name.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // `GET /containers/json` filters parameter
+    // -----------------------------------------------------------------
+
+    /// Compact constructor for a [`ContainerSummary`] used by the
+    /// filter tests below.
+    fn cs(id: &str, names: &[&str], state: &str, labels: &[(&str, &str)]) -> ContainerSummary {
+        ContainerSummary {
+            id: id.to_owned(),
+            names: names.iter().map(|s| (*s).to_owned()).collect(),
+            image: "img:latest".to_owned(),
+            image_id: "sha256:deadbeef".to_owned(),
+            command: String::new(),
+            created: 0,
+            state: state.to_owned(),
+            status: String::new(),
+            ports: Vec::new(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn parse_filters_returns_none_on_empty() {
+        assert!(parse_filters(None).is_none());
+        assert!(parse_filters(Some("")).is_none());
+        assert!(parse_filters(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn parse_filters_returns_none_on_invalid_json() {
+        // Must not panic; just return None.
+        assert!(parse_filters(Some("not json")).is_none());
+        assert!(parse_filters(Some("{")).is_none());
+        // Wrong shape (values must be arrays of strings).
+        assert!(parse_filters(Some(r#"{"label":"env=prod"}"#)).is_none());
+    }
+
+    #[test]
+    fn parse_filters_parses_label_and_status() {
+        let raw = r#"{"label":["env=prod","tier=db"],"status":["running"]}"#;
+        let parsed = parse_filters(Some(raw)).expect("parses");
+        assert_eq!(
+            parsed.get("label").map(Vec::as_slice),
+            Some(["env=prod".to_owned(), "tier=db".to_owned()].as_slice())
+        );
+        assert_eq!(
+            parsed.get("status").map(Vec::as_slice),
+            Some(["running".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn container_matches_filters_label_kv_exact() {
+        let c = cs("abc", &["/x"], "running", &[("env", "prod")]);
+        let mut f = HashMap::new();
+        f.insert("label".to_owned(), vec!["env=prod".to_owned()]);
+        assert!(container_matches_filters(&c, &f));
+
+        let c2 = cs("abc", &["/x"], "running", &[("env", "dev")]);
+        assert!(!container_matches_filters(&c2, &f));
+
+        let c3 = cs("abc", &["/x"], "running", &[("other", "prod")]);
+        assert!(!container_matches_filters(&c3, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_label_key_only() {
+        let c = cs("abc", &["/x"], "running", &[("managed", "yes")]);
+        let mut f = HashMap::new();
+        f.insert("label".to_owned(), vec!["managed".to_owned()]);
+        assert!(container_matches_filters(&c, &f));
+
+        let c2 = cs("abc", &["/x"], "running", &[("other", "yes")]);
+        assert!(!container_matches_filters(&c2, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_label_and_semantics() {
+        let c = cs("abc", &["/x"], "running", &[("a", "1"), ("b", "2")]);
+        let mut f = HashMap::new();
+        f.insert("label".to_owned(), vec!["a=1".to_owned(), "b=2".to_owned()]);
+        assert!(container_matches_filters(&c, &f));
+
+        let c2 = cs("abc", &["/x"], "running", &[("a", "1")]);
+        assert!(!container_matches_filters(&c2, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_status_or_semantics() {
+        let mut f = HashMap::new();
+        f.insert(
+            "status".to_owned(),
+            vec!["running".to_owned(), "paused".to_owned()],
+        );
+
+        let running = cs("a", &["/x"], "running", &[]);
+        let paused = cs("a", &["/x"], "paused", &[]);
+        let exited = cs("a", &["/x"], "exited", &[]);
+        assert!(container_matches_filters(&running, &f));
+        assert!(container_matches_filters(&paused, &f));
+        assert!(!container_matches_filters(&exited, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_status_case_insensitive() {
+        let mut f = HashMap::new();
+        f.insert("status".to_owned(), vec!["Running".to_owned()]);
+        let c = cs("a", &["/x"], "running", &[]);
+        assert!(container_matches_filters(&c, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_name_substring_strips_slash() {
+        let mut f = HashMap::new();
+        f.insert("name".to_owned(), vec!["web".to_owned()]);
+
+        let c = cs("a", &["/myweb-1"], "running", &[]);
+        assert!(container_matches_filters(&c, &f));
+
+        let c2 = cs("a", &["/db-1"], "running", &[]);
+        assert!(!container_matches_filters(&c2, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_id_prefix() {
+        let mut f = HashMap::new();
+        f.insert("id".to_owned(), vec!["abc".to_owned()]);
+
+        let c = cs("abc123def", &["/x"], "running", &[]);
+        assert!(container_matches_filters(&c, &f));
+
+        let c2 = cs("xyz123def", &["/x"], "running", &[]);
+        assert!(!container_matches_filters(&c2, &f));
+    }
+
+    #[test]
+    fn container_matches_filters_unsupported_key_passes_through() {
+        let mut f = HashMap::new();
+        f.insert("ancestor".to_owned(), vec!["never-matches".to_owned()]);
+        let c = cs("abc", &["/x"], "running", &[("env", "prod")]);
+        // Unsupported keys do not filter anything out.
+        assert!(container_matches_filters(&c, &f));
     }
 }

@@ -271,18 +271,41 @@ fi
 # --- Install and start service ---
 SKIP_SERVICE="${ZLAYER_NO_SERVICE:-}"
 if [ -z "$SKIP_SERVICE" ]; then
+    # Build daemon install flags from optional env vars. Each var is only
+    # appended when set/non-empty (or, for booleans, =1/true/yes).
+    # ZLAYER_JWT_SECRET and ZLAYER_BOOTSTRAP_EMAIL are NOT passed as flags —
+    # clap maps them via `env = "..."` inside `daemon install`, so we rely
+    # on `sudo -E` below to preserve them across the privilege boundary.
+    DAEMON_INSTALL_FLAGS=""
+    if [ -n "${ZLAYER_BIND:-}" ]; then
+        DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --bind ${ZLAYER_BIND}"
+    fi
+    if [ -n "${ZLAYER_ADMIN_PASSWORD_FILE:-}" ]; then
+        DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --admin-password-file ${ZLAYER_ADMIN_PASSWORD_FILE}"
+    fi
+    case "${ZLAYER_DOCKER_SOCKET:-}" in
+        1|true|yes) DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --docker-socket" ;;
+    esac
+    case "${ZLAYER_WITH_OVERLAY:-}" in
+        1|true|yes) DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --with-overlay" ;;
+    esac
+
     echo ""
     echo "Installing zlayer daemon..."
     case "$OS" in
         linux)
-            sudo "${INSTALL_DIR}/${BINARY}" daemon install
+            # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
+            # shellcheck disable=SC2086
+            sudo -E "${INSTALL_DIR}/${BINARY}" daemon install ${DAEMON_INSTALL_FLAGS}
             # Belt-and-suspenders: `daemon install` already runs the migration,
             # but if the user is upgrading from a build that predates that, this
             # second invocation heals it. Idempotent and never fails the install.
             sudo "${INSTALL_DIR}/${BINARY}" daemon migrate >/dev/null 2>&1 || true
             ;;
         darwin)
-            "${INSTALL_DIR}/${BINARY}" daemon install
+            # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
+            # shellcheck disable=SC2086
+            "${INSTALL_DIR}/${BINARY}" daemon install ${DAEMON_INSTALL_FLAGS}
             ;;
     esac
 fi

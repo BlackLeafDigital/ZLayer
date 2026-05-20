@@ -1158,6 +1158,13 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) docker_socket: bool,
 
+    /// Provision the daemon with overlay-networking capabilities.
+    /// Adds `AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN` to the
+    /// systemd unit and runs `modprobe tun` as a pre-start. No-op on
+    /// macOS (the launchd plist is unchanged).
+    #[arg(long)]
+    pub(crate) with_overlay: bool,
+
     /// WSL2 auto-install consent (Windows only — parsed here for
     /// forward-compatibility when `daemon install` lands on Windows).
     #[command(flatten)]

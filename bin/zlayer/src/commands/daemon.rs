@@ -236,6 +236,7 @@ pub(crate) async fn handle_daemon(
                 args.no_swagger,
                 #[cfg(feature = "docker-compat")]
                 args.docker_socket,
+                args.with_overlay,
                 args.admin_email.as_deref(),
                 args.admin_password.as_deref(),
                 args.admin_password_file.as_deref(),
@@ -826,6 +827,7 @@ async fn install(
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -833,6 +835,9 @@ async fn install(
     tunnel: TunnelInstallArgs<'_>,
 ) -> Result<()> {
     use tokio::process::Command;
+
+    // with_overlay is Linux-only; macOS sandbox runtime doesn't use overlay networking.
+    let _ = with_overlay;
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
@@ -1864,6 +1869,7 @@ async fn install(
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -2017,6 +2023,18 @@ async fn install(
     // Pre-create log directory so tracing-appender can write on first start.
     let log_dir = crate::cli::default_log_dir(data_dir);
 
+    // Overlay networking capabilities. The `=-` prefix on `ExecStartPre`
+    // tells systemd to ignore failures (e.g. `tun` built into the kernel
+    // or `/sbin/modprobe` missing), so the daemon still starts on hosts
+    // where `modprobe tun` is unnecessary or unavailable.
+    let overlay_block = if with_overlay {
+        "ExecStartPre=-/sbin/modprobe tun\n\
+         AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\n"
+    } else {
+        ""
+    };
+
     let unit = format!(
         r"[Unit]
 Description=ZLayer Container Orchestration Daemon
@@ -2048,7 +2066,7 @@ LimitNPROC=infinity
 LimitCORE=infinity
 Delegate=yes
 KillMode=process
-{env_line}
+{overlay_block}{env_line}
 [Install]
 WantedBy=multi-user.target
 ",
@@ -2613,6 +2631,7 @@ async fn install(
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -2624,6 +2643,9 @@ async fn install(
         ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // with_overlay is Linux-only; Windows SCM doesn't use Linux ambient capabilities.
+    let _ = with_overlay;
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
