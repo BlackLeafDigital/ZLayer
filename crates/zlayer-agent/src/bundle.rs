@@ -5,13 +5,15 @@
 //! - config.json: OCI runtime specification
 //! - rootfs/: Container filesystem (symlink or bind mount target)
 
+use crate::cdi::{self, CdiContainerEdits, CdiRegistry};
 use crate::error::{AgentError, Result};
 use crate::runtime::ContainerId;
 use oci_spec::runtime::{
-    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceBuilder,
-    LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxIdMappingBuilder, LinuxMemoryBuilder,
-    LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount, MountBuilder,
-    ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
+    Capability, Hook, HookBuilder, Hooks, HooksBuilder, LinuxBuilder, LinuxCapabilitiesBuilder,
+    LinuxCpuBuilder, LinuxDeviceBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType,
+    LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
+    LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
+    UserBuilder,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,6 +57,67 @@ pub(crate) fn current_cgroup_v2_path() -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn current_cgroup_v2_path() -> Option<String> {
     None
+}
+
+/// Convert a CDI device node descriptor into the OCI [`LinuxDevice`] used by
+/// the runtime.
+///
+/// CDI device nodes may omit `type`, `major`, and `minor` — in that case we
+/// probe the host (via `get_device_type` / `get_device_major_minor`) using
+/// the resolved host path, falling back to character device with zero
+/// major/minor when the file is unavailable (typical for test fixtures
+/// that reference paths that don't exist on the build host).
+fn cdi_node_to_oci_device(
+    node: &crate::cdi::CdiDeviceNode,
+) -> Result<oci_spec::runtime::LinuxDevice> {
+    let host_path = node.host_path.as_deref().unwrap_or(&node.path);
+
+    let dev_type = match node.device_type.as_deref() {
+        Some("c" | "u") => LinuxDeviceType::C,
+        Some("b") => LinuxDeviceType::B,
+        Some("p") => LinuxDeviceType::P,
+        _ => get_device_type(host_path).unwrap_or(LinuxDeviceType::C),
+    };
+
+    let (major, minor) = if let (Some(maj), Some(min)) = (node.major, node.minor) {
+        (maj, min)
+    } else {
+        get_device_major_minor(host_path).unwrap_or((0, 0))
+    };
+
+    let mut builder = LinuxDeviceBuilder::default()
+        .path(node.path.clone())
+        .typ(dev_type)
+        .major(major)
+        .minor(minor);
+    if let Some(mode) = node.file_mode {
+        builder = builder.file_mode(mode);
+    } else {
+        builder = builder.file_mode(0o666u32);
+    }
+    builder = builder.uid(node.uid.unwrap_or(0));
+    builder = builder.gid(node.gid.unwrap_or(0));
+
+    builder.build().map_err(|e| {
+        AgentError::InvalidSpec(format!(
+            "failed to build CDI device {path}: {e}",
+            path = node.path
+        ))
+    })
+}
+
+/// Convert a CDI hook descriptor into the OCI [`Hook`] used by the runtime.
+fn convert_cdi_hook(cdi_hook: &crate::cdi::CdiHook) -> Result<Hook> {
+    let mut builder = HookBuilder::default().path(PathBuf::from(&cdi_hook.path));
+    if !cdi_hook.args.is_empty() {
+        builder = builder.args(cdi_hook.args.clone());
+    }
+    if !cdi_hook.env.is_empty() {
+        builder = builder.env(cdi_hook.env.clone());
+    }
+    builder
+        .build()
+        .map_err(|e| AgentError::InvalidSpec(format!("failed to build CDI hook: {e}")))
 }
 
 /// All Linux capabilities for privileged mode
@@ -236,6 +299,13 @@ pub struct BundleBuilder {
     deployment_scope: Option<String>,
     /// Host-side Unix socket path to bind-mount into the container
     socket_path: Option<String>,
+    /// Optional CDI registry override (defaults to discovery from system paths).
+    ///
+    /// Wrapped in `Arc` so [`BundleBuilder`] can stay [`Clone`]. Primarily set
+    /// in tests via [`BundleBuilder::with_cdi_registry`]; production paths
+    /// leave this `None` and lazy-discover via [`CdiRegistry::discover`] when
+    /// a `GpuSpec` is present.
+    cdi_registry: Option<Arc<CdiRegistry>>,
 }
 
 impl std::fmt::Debug for BundleBuilder {
@@ -253,6 +323,7 @@ impl std::fmt::Debug for BundleBuilder {
             .field("secrets_provider", &self.secrets_provider.is_some())
             .field("deployment_scope", &self.deployment_scope)
             .field("socket_path", &self.socket_path)
+            .field("cdi_registry", &self.cdi_registry.is_some())
             .finish()
     }
 }
@@ -331,7 +402,20 @@ impl BundleBuilder {
             secrets_provider: None,
             deployment_scope: None,
             socket_path: None,
+            cdi_registry: None,
         }
+    }
+
+    /// Override the CDI registry used for GPU device resolution.
+    ///
+    /// When unset, [`build_oci_spec`](Self::build_oci_spec) discovers CDI
+    /// specs lazily from the standard system search paths (`/etc/cdi`,
+    /// `/var/run/cdi`, plus `$CDI_SPEC_DIRS`). Tests use this setter to
+    /// inject fixture-backed registries pointed at a temp directory.
+    #[must_use]
+    pub fn with_cdi_registry(mut self, registry: Arc<CdiRegistry>) -> Self {
+        self.cdi_registry = Some(registry);
+        self
     }
 
     /// Create a `BundleBuilder` for a container in the default bundle location
@@ -561,6 +645,69 @@ impl BundleBuilder {
         self.build_oci_spec(container_id, spec, volume_paths).await
     }
 
+    /// Resolve CDI edits for a service spec's GPU request, if any.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when the spec has no `GpuSpec`, when the vendor isn't a
+    ///   known CDI-published kind (e.g. `"apple"`), or when no explicit
+    ///   registry was set and lazy discovery turned up no installed specs
+    ///   (production fallback — baked-in defaults take over).
+    /// - `Ok(Some(vec))` with one entry per requested device when CDI specs
+    ///   are available and resolution succeeds.
+    /// - `Err(AgentError::InvalidSpec(...))` when the caller explicitly opted
+    ///   into CDI (via `with_cdi_registry`) but the resolution fails —
+    ///   surfaces [`cdi::CdiError::SpecMissing`] /
+    ///   [`cdi::CdiError::DeviceMissing`] / [`cdi::CdiError::NoDevices`] as
+    ///   actionable strings.
+    fn resolve_cdi_edits(&self, spec: &ServiceSpec) -> Result<Option<Vec<CdiContainerEdits>>> {
+        let Some(ref gpu) = spec.resources.gpu else {
+            return Ok(None);
+        };
+
+        // Map short vendor to CDI kind. Unknown vendors (e.g. "apple") fall
+        // back to baked-in behavior.
+        let Some(kind) = cdi::vendor_to_cdi_kind(&gpu.vendor) else {
+            return Ok(None);
+        };
+
+        // Decide registry source:
+        // - Explicit override: strict mode. Missing kind/device == hard error.
+        // - Lazy discover: opportunistic. Missing kind == silent fallback to
+        //   baked-in defaults so prod hosts without CDI installed keep
+        //   working.
+        let (registry, strict) = if let Some(reg) = &self.cdi_registry {
+            (reg.clone(), true)
+        } else {
+            let reg = Arc::new(CdiRegistry::discover());
+            if reg.is_empty() {
+                return Ok(None);
+            }
+            (reg, false)
+        };
+
+        let device_names: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
+
+        match registry.resolve_for_kind(kind, &device_names) {
+            Ok(edits) => Ok(Some(edits)),
+            Err(err) => {
+                if strict {
+                    Err(AgentError::InvalidSpec(format!(
+                        "CDI resolution failed for vendor '{}': {err}",
+                        gpu.vendor
+                    )))
+                } else {
+                    tracing::warn!(
+                        vendor = %gpu.vendor,
+                        kind = %kind,
+                        error = %err,
+                        "CDI resolution failed; falling back to baked-in GPU device passthrough"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     /// Build the OCI runtime spec from `ServiceSpec`
     #[allow(clippy::too_many_lines)]
     async fn build_oci_spec(
@@ -569,6 +716,11 @@ impl BundleBuilder {
         spec: &ServiceSpec,
         volume_paths: &std::collections::HashMap<String, PathBuf>,
     ) -> Result<Spec> {
+        // Resolve CDI edits up front. When present, these replace the
+        // baked-in vendor device-node / env injection below; when absent
+        // (no CDI installed, unknown vendor), the legacy code paths run.
+        let cdi_edits = self.resolve_cdi_edits(spec)?;
+
         // Build user: image config user > root (spec doesn't currently have user override)
         let user = {
             let (uid, gid) = if let Some(user_str) = self
@@ -683,10 +835,27 @@ impl BundleBuilder {
             env.push(format!("{key}={value}"));
         }
 
-        // Inject GPU device visibility environment variables based on vendor
-        // and allocated indices so runtimes (CUDA, ROCm, oneAPI) see only
-        // the GPUs assigned to this container.
-        if let Some(ref gpu) = spec.resources.gpu {
+        // GPU device visibility environment variables.
+        //
+        // When CDI edits are available, the vendor-supplied spec is the
+        // source of truth (e.g. NVIDIA's `nvidia-ctk cdi generate` emits
+        // `NVIDIA_VISIBLE_DEVICES` plus driver-capability env on every
+        // device entry). Otherwise fall back to the historical baked-in
+        // strings so non-CDI hosts continue to advertise the right devices
+        // to CUDA/ROCm/oneAPI runtimes.
+        if let Some(ref edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for entry in &edits.env {
+                    if let Some(key) = entry.split('=').next() {
+                        if env_keys.contains(key) {
+                            env.retain(|e| e.split('=').next() != Some(key));
+                        }
+                        env_keys.insert(key.to_string());
+                    }
+                    env.push(entry.clone());
+                }
+            }
+        } else if let Some(ref gpu) = spec.resources.gpu {
             // Default to 0..count when no explicit indices are provided
             let indices: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
             let device_list = indices.join(",");
@@ -796,8 +965,32 @@ impl BundleBuilder {
             );
         }
 
+        // Append CDI-provided mounts (e.g. vendor driver libraries that the
+        // GPU runtime needs to expose to the container).
+        if let Some(ref edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for cdi_mount in &edits.mounts {
+                    let mut opts = cdi_mount.options.clone();
+                    if !opts.iter().any(|o| o == "bind" || o == "rbind") {
+                        opts.push("rbind".to_string());
+                    }
+                    mounts.push(
+                        MountBuilder::default()
+                            .destination(cdi_mount.container_path.clone())
+                            .typ("bind")
+                            .source(cdi_mount.host_path.clone())
+                            .options(opts)
+                            .build()
+                            .map_err(|e| {
+                                AgentError::InvalidSpec(format!("failed to build CDI mount: {e}"))
+                            })?,
+                    );
+                }
+            }
+        }
+
         // Build Linux-specific config
-        let linux = self.build_linux_config(container_id, spec)?;
+        let linux = self.build_linux_config(container_id, spec, cdi_edits.as_deref())?;
 
         // Determine hostname
         let hostname = self
@@ -805,18 +998,101 @@ impl BundleBuilder {
             .clone()
             .unwrap_or_else(|| container_id.to_string());
 
-        // Build the complete spec
-        let oci_spec = SpecBuilder::default()
+        // Build the complete spec, attaching any CDI-provided hooks.
+        let mut spec_builder = SpecBuilder::default()
             .version("1.0.2".to_string())
             .root(root)
             .process(process)
             .hostname(hostname)
             .mounts(mounts)
-            .linux(linux)
+            .linux(linux);
+
+        if let Some(ref edits_per_device) = cdi_edits {
+            if let Some(hooks) = Self::build_hooks_from_cdi(edits_per_device)? {
+                spec_builder = spec_builder.hooks(hooks);
+            }
+        }
+
+        let oci_spec = spec_builder
             .build()
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {e}")))?;
 
         Ok(oci_spec)
+    }
+
+    /// Convert the union of CDI hooks across all resolved devices into an
+    /// OCI [`Hooks`] block.
+    ///
+    /// Returns `Ok(None)` when no device contributed hooks (so the spec
+    /// builder skips the empty block — `oci-spec` treats `null` as "no
+    /// hooks" while serializers may emit empty arrays otherwise).
+    fn build_hooks_from_cdi(edits_per_device: &[CdiContainerEdits]) -> Result<Option<Hooks>> {
+        let mut prestart: Vec<Hook> = Vec::new();
+        let mut create_runtime: Vec<Hook> = Vec::new();
+        let mut create_container: Vec<Hook> = Vec::new();
+        let mut start_container: Vec<Hook> = Vec::new();
+        let mut poststart: Vec<Hook> = Vec::new();
+        let mut poststop: Vec<Hook> = Vec::new();
+
+        for edits in edits_per_device {
+            let Some(ref h) = edits.hooks else { continue };
+            for hook in &h.prestart {
+                prestart.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.create_runtime {
+                create_runtime.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.create_container {
+                create_container.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.start_container {
+                start_container.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.poststart {
+                poststart.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.poststop {
+                poststop.push(convert_cdi_hook(hook)?);
+            }
+        }
+
+        if prestart.is_empty()
+            && create_runtime.is_empty()
+            && create_container.is_empty()
+            && start_container.is_empty()
+            && poststart.is_empty()
+            && poststop.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let mut builder = HooksBuilder::default();
+        if !prestart.is_empty() {
+            #[allow(deprecated)]
+            {
+                builder = builder.prestart(prestart);
+            }
+        }
+        if !create_runtime.is_empty() {
+            builder = builder.create_runtime(create_runtime);
+        }
+        if !create_container.is_empty() {
+            builder = builder.create_container(create_container);
+        }
+        if !start_container.is_empty() {
+            builder = builder.start_container(start_container);
+        }
+        if !poststart.is_empty() {
+            builder = builder.poststart(poststart);
+        }
+        if !poststop.is_empty() {
+            builder = builder.poststop(poststop);
+        }
+
+        let hooks = builder
+            .build()
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build CDI hooks: {e}")))?;
+        Ok(Some(hooks))
     }
 
     /// Build Linux capabilities configuration
@@ -1248,6 +1524,7 @@ impl BundleBuilder {
         &self,
         container_id: &ContainerId,
         spec: &ServiceSpec,
+        cdi_edits: Option<&[CdiContainerEdits]>,
     ) -> Result<oci_spec::runtime::Linux> {
         // Build namespaces
         let mut namespaces = vec![
@@ -1327,8 +1604,20 @@ impl BundleBuilder {
             linux_builder = linux_builder.resources(resources);
         }
 
-        // Build device entries for passthrough
-        let devices = self.build_devices(spec, None)?;
+        // Build device entries for passthrough.
+        //
+        // When CDI edits are present, the vendor-supplied device-node list
+        // replaces our baked-in vendor-specific defaults — CDI knows the
+        // host's exact device geometry (which majors/minors map to which
+        // GPUs) so we trust it over our static `/dev/nvidiaN` enumeration.
+        let mut devices = self.build_devices(spec, None, cdi_edits.is_some())?;
+        if let Some(edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for node in &edits.device_nodes {
+                    devices.push(cdi_node_to_oci_device(node)?);
+                }
+            }
+        }
         if !devices.is_empty() {
             linux_builder = linux_builder.devices(devices);
         }
@@ -1665,6 +1954,7 @@ impl BundleBuilder {
         &self,
         spec: &ServiceSpec,
         gpu_indices: Option<&[u32]>,
+        skip_gpu_defaults: bool,
     ) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
         let mut devices = Vec::new();
 
@@ -1690,6 +1980,13 @@ impl BundleBuilder {
 
                 devices.push(linux_device);
             }
+        }
+
+        // When CDI is providing GPU device descriptors the caller will append
+        // the vendor-supplied entries; skip our hard-coded `/dev/nvidiaN`
+        // enumeration so we don't end up with both sources of truth.
+        if skip_gpu_defaults {
+            return Ok(devices);
         }
 
         // Auto-inject GPU devices when gpu spec is set
@@ -2582,6 +2879,226 @@ services:
         assert!(destinations.contains(&"/dev".to_string())); // default
         assert!(destinations.contains(&"/app/data".to_string())); // storage bind
         assert!(destinations.contains(&"/app/tmp".to_string())); // storage tmpfs
+    }
+
+    fn mock_gpu_spec(vendor: &str, count: u32) -> ServiceSpec {
+        let yaml = format!(
+            "
+version: v1
+deployment: test
+services:
+  test:
+    rtype: service
+    image:
+      name: test:latest
+    resources:
+      gpu:
+        count: {count}
+        vendor: {vendor}
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+"
+        );
+        serde_yaml::from_str::<DeploymentSpec>(&yaml)
+            .unwrap()
+            .services
+            .remove("test")
+            .unwrap()
+    }
+
+    fn write_nvidia_cdi_fixture(dir: &std::path::Path, json: &str) {
+        std::fs::write(dir.join("nvidia.json"), json).unwrap();
+    }
+
+    fn nvidia_cdi_fixture() -> &'static str {
+        r#"{
+            "cdiVersion": "0.6.0",
+            "kind": "nvidia.com/gpu",
+            "devices": [{
+                "name": "0",
+                "containerEdits": {
+                    "deviceNodes": [
+                        {"path": "/dev/nvidia0", "type": "c", "major": 195, "minor": 0}
+                    ],
+                    "env": ["NVIDIA_VISIBLE_DEVICES=0"],
+                    "hooks": {
+                        "createContainer": [{
+                            "path": "/usr/bin/nvidia-container-runtime-hook",
+                            "args": ["nvidia-container-runtime-hook", "prestart"]
+                        }]
+                    }
+                }
+            }]
+        }"#
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_translates_to_cdi_device_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nvidia_cdi_fixture(dir.path(), nvidia_cdi_fixture());
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        let builder = BundleBuilder::new("/tmp/test-bundle-cdi".into()).with_cdi_registry(registry);
+
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with CDI fixture");
+
+        // CDI device node merged into linux.devices
+        let linux = oci_spec.linux().as_ref().expect("linux config present");
+        let devices = linux.devices().as_ref().expect("devices present");
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.path() == std::path::Path::new("/dev/nvidia0")),
+            "expected /dev/nvidia0 from CDI fixture; got {:?}",
+            devices
+                .iter()
+                .map(oci_spec::runtime::LinuxDevice::path)
+                .collect::<Vec<_>>()
+        );
+
+        // CDI env var merged into process.env
+        let process = oci_spec.process().as_ref().expect("process present");
+        let env = process.env().as_ref().expect("env present");
+        assert!(
+            env.iter().any(|e| e == "NVIDIA_VISIBLE_DEVICES=0"),
+            "expected NVIDIA_VISIBLE_DEVICES=0 in env; got {env:?}"
+        );
+
+        // CDI hook merged into hooks.createContainer
+        let hooks = oci_spec.hooks().as_ref().expect("hooks present");
+        let create_container = hooks
+            .create_container()
+            .as_ref()
+            .expect("createContainer hooks present");
+        assert_eq!(create_container.len(), 1);
+        assert_eq!(
+            create_container[0].path(),
+            &std::path::PathBuf::from("/usr/bin/nvidia-container-runtime-hook")
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_missing_cdi_returns_error() {
+        // Empty tempdir — no CDI specs installed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-missing".into()).with_cdi_registry(registry);
+
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when CDI registry is empty");
+
+        match err {
+            AgentError::InvalidSpec(msg) => {
+                assert!(
+                    msg.contains("nvidia") || msg.contains("CDI"),
+                    "error should mention CDI / vendor; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_unknown_device_returns_error() {
+        // Spec has device "0" but the request will ask for two GPUs (so the
+        // resolver will look for "1" and fail).
+        let dir = tempfile::tempdir().unwrap();
+        write_nvidia_cdi_fixture(dir.path(), nvidia_cdi_fixture());
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 2);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-unknown".into()).with_cdi_registry(registry);
+
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when device '1' is not declared");
+        match err {
+            AgentError::InvalidSpec(msg) => {
+                assert!(
+                    msg.contains("'1'") || msg.contains("device"),
+                    "error should mention the missing device; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_all_devices_expands_to_all_in_spec() {
+        // Fixture with two declared devices ("0" and "1").
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = r#"{
+            "cdiVersion": "0.6.0",
+            "kind": "nvidia.com/gpu",
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=0"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia0", "type": "c", "major": 195, "minor": 0}
+                        ]
+                    }
+                },
+                {
+                    "name": "1",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=1"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia1", "type": "c", "major": 195, "minor": 1}
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        write_nvidia_cdi_fixture(dir.path(), fixture);
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        // Resolve "all" via the registry directly to validate expansion
+        // semantics independently of how we map count -> names.
+        let edits = registry
+            .resolve_for_kind("nvidia.com/gpu", &["all".to_string()])
+            .expect("resolve all");
+        assert_eq!(edits.len(), 2);
+
+        // Now build the bundle for a 2-GPU service and confirm both nodes
+        // land in linux.devices.
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 2);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-all".into()).with_cdi_registry(registry);
+
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with 2-device fixture");
+
+        let devices = oci_spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .devices()
+            .as_ref()
+            .expect("devices present");
+        let paths: Vec<_> = devices.iter().map(|d| d.path().clone()).collect();
+        assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia0")));
+        assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia1")));
     }
 
     mod subid_tests {

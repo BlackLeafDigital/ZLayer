@@ -8,13 +8,35 @@
 //! See: <https://github.com/cncf-tags/container-device-interface>
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 /// Standard CDI spec discovery directories
 const CDI_SPEC_DIRS: &[&str] = &["/etc/cdi", "/var/run/cdi"];
+
+/// Environment variable that overrides the default CDI spec search path.
+///
+/// When set, its value is interpreted as a list of directories separated by
+/// the platform path separator (`:` on Unix, `;` on Windows). Each directory
+/// is scanned in addition to the standard locations.
+pub const CDI_SPEC_DIRS_ENV: &str = "CDI_SPEC_DIRS";
+
+/// Map a `GpuSpec.vendor` short name to a CDI kind.
+///
+/// CDI kinds are fully-qualified (`vendor.tld/class`) while `GpuSpec.vendor`
+/// is a short alias (`"nvidia"`, `"amd"`, `"intel"`). This is the canonical
+/// mapping used when resolving GPU devices from a service spec.
+#[must_use]
+pub fn vendor_to_cdi_kind(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "nvidia" => Some("nvidia.com/gpu"),
+        "amd" => Some("amd.com/gpu"),
+        "intel" => Some("intel.com/gpu"),
+        _ => None,
+    }
+}
 
 /// A parsed CDI specification file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,21 +164,38 @@ impl CdiRegistry {
     /// Discover and load CDI specs from the standard directories.
     ///
     /// Scans `/etc/cdi/` and `/var/run/cdi/` for `*.json` and `*.yaml` files,
-    /// parses them, and indexes them by kind.
+    /// parses them, and indexes them by kind. Honors the `CDI_SPEC_DIRS`
+    /// environment variable for an additional override search path.
     pub fn discover() -> Self {
+        let mut dirs: Vec<PathBuf> = CDI_SPEC_DIRS.iter().map(PathBuf::from).collect();
+        if let Ok(env_dirs) = std::env::var(CDI_SPEC_DIRS_ENV) {
+            for entry in std::env::split_paths(&env_dirs) {
+                if !entry.as_os_str().is_empty() {
+                    dirs.push(entry);
+                }
+            }
+        }
+        Self::discover_from(&dirs)
+    }
+
+    /// Discover and load CDI specs from an explicit list of directories.
+    ///
+    /// This is primarily useful for tests where the standard system paths
+    /// are not appropriate. Missing directories are silently skipped.
+    pub fn discover_from<P: AsRef<Path>>(dirs: &[P]) -> Self {
         let mut registry = Self::default();
 
-        for dir in CDI_SPEC_DIRS {
-            let dir_path = Path::new(dir);
+        for dir in dirs {
+            let dir_path = dir.as_ref();
             if !dir_path.is_dir() {
-                debug!(dir = %dir, "CDI spec directory does not exist, skipping");
+                debug!(dir = %dir_path.display(), "CDI spec directory does not exist, skipping");
                 continue;
             }
 
             let entries = match std::fs::read_dir(dir_path) {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(dir = %dir, error = %e, "Failed to read CDI spec directory");
+                    warn!(dir = %dir_path.display(), error = %e, "Failed to read CDI spec directory");
                     continue;
                 }
             };
@@ -228,9 +267,81 @@ impl CdiRegistry {
             merged.env.extend(dev_edits.env.clone());
             merged.device_nodes.extend(dev_edits.device_nodes.clone());
             merged.mounts.extend(dev_edits.mounts.clone());
+            if let Some(ref dev_hooks) = dev_edits.hooks {
+                let merged_hooks = merged.hooks.get_or_insert_with(CdiHooks::default);
+                merged_hooks.prestart.extend(dev_hooks.prestart.clone());
+                merged_hooks
+                    .create_runtime
+                    .extend(dev_hooks.create_runtime.clone());
+                merged_hooks
+                    .create_container
+                    .extend(dev_hooks.create_container.clone());
+                merged_hooks
+                    .start_container
+                    .extend(dev_hooks.start_container.clone());
+                merged_hooks.poststart.extend(dev_hooks.poststart.clone());
+                merged_hooks.poststop.extend(dev_hooks.poststop.clone());
+            }
         }
 
         Some(merged)
+    }
+
+    /// Resolve one or more device names for a given vendor kind into a
+    /// flat list of per-device container edits.
+    ///
+    /// The special device name `"all"` expands to every device declared in
+    /// the spec for the requested vendor — this mirrors the semantics of
+    /// `NVIDIA_VISIBLE_DEVICES=all` and matches the behavior of `nvidia-ctk`'s
+    /// CDI implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CdiError::SpecMissing`] if no spec is loaded for the
+    /// requested kind. Returns [`CdiError::DeviceMissing`] if any of the
+    /// requested device names is not declared in the spec. Returns
+    /// [`CdiError::NoDevices`] if the request asks for `"all"` but the
+    /// spec contains no devices.
+    pub fn resolve_for_kind(
+        &self,
+        kind: &str,
+        device_names: &[String],
+    ) -> std::result::Result<Vec<CdiContainerEdits>, CdiError> {
+        let spec = self
+            .specs
+            .get(kind)
+            .ok_or_else(|| CdiError::SpecMissing(kind.to_string()))?;
+
+        // Expand the "all" alias to every declared device name (excluding
+        // any device that itself is literally named "all" — that's a
+        // sentinel device used by some vendors to express "use any GPU").
+        let expanded: Vec<String> = if device_names.iter().any(|n| n == "all") {
+            let names: Vec<String> = spec
+                .devices
+                .iter()
+                .filter(|d| d.name != "all")
+                .map(|d| d.name.clone())
+                .collect();
+            if names.is_empty() {
+                return Err(CdiError::NoDevices(kind.to_string()));
+            }
+            names
+        } else {
+            device_names.to_vec()
+        };
+
+        let mut out = Vec::with_capacity(expanded.len());
+        for name in &expanded {
+            let qualified = format!("{kind}={name}");
+            let edits = self
+                .resolve_device(&qualified)
+                .ok_or_else(|| CdiError::DeviceMissing {
+                    kind: kind.to_string(),
+                    device: name.clone(),
+                })?;
+            out.push(edits);
+        }
+        Ok(out)
     }
 
     /// Check if any CDI specs are available.
@@ -284,6 +395,24 @@ pub enum CdiError {
     /// Failed to parse a CDI spec file
     #[error("CDI parse error: {0}")]
     Parse(String),
+    /// No CDI spec installed for the requested vendor/kind.
+    ///
+    /// Typically means the vendor's CDI generator has not been run on this
+    /// host (e.g. `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.json`).
+    #[error("no CDI spec installed for kind '{0}' (run the vendor's CDI generator)")]
+    SpecMissing(String),
+    /// A requested device name is not declared in the CDI spec for the kind.
+    #[error("CDI device '{device}' not declared in spec for kind '{kind}'")]
+    DeviceMissing {
+        /// CDI kind (e.g. `nvidia.com/gpu`).
+        kind: String,
+        /// Device name that was requested but not found.
+        device: String,
+    },
+    /// A request for `"all"` devices resolved to an empty list because the
+    /// installed CDI spec declares no devices for the kind.
+    #[error("CDI spec for kind '{0}' declares no devices (host has no compatible hardware)")]
+    NoDevices(String),
 }
 
 #[cfg(test)]
@@ -408,5 +537,122 @@ devices:
         assert_eq!(spec.kind, "vendor.com/net");
         assert_eq!(spec.devices.len(), 1);
         assert_eq!(spec.devices[0].name, "eth0");
+    }
+
+    fn fixture_spec_with_hooks() -> &'static str {
+        r#"{
+            "cdiVersion": "0.6.0",
+            "kind": "nvidia.com/gpu",
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=0"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia0", "type": "c", "major": 195, "minor": 0}
+                        ],
+                        "hooks": {
+                            "createContainer": [{
+                                "path": "/usr/bin/nvidia-container-runtime-hook",
+                                "args": ["nvidia-container-runtime-hook", "prestart"]
+                            }]
+                        }
+                    }
+                },
+                {
+                    "name": "1",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=1"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia1", "type": "c", "major": 195, "minor": 1}
+                        ]
+                    }
+                }
+            ]
+        }"#
+    }
+
+    fn registry_with_fixture_dir() -> (tempfile::TempDir, CdiRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nvidia.json");
+        std::fs::write(&path, fixture_spec_with_hooks()).unwrap();
+        let registry = CdiRegistry::discover_from(&[dir.path()]);
+        (dir, registry)
+    }
+
+    #[test]
+    fn discover_from_loads_specs() {
+        let (_keep, registry) = registry_with_fixture_dir();
+        assert_eq!(registry.kinds().count(), 1);
+        assert!(registry.get_spec("nvidia.com/gpu").is_some());
+    }
+
+    #[test]
+    fn discover_from_empty_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = CdiRegistry::discover_from(&[dir.path()]);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn resolve_for_kind_returns_edits_per_device() {
+        let (_keep, registry) = registry_with_fixture_dir();
+        let edits = registry
+            .resolve_for_kind("nvidia.com/gpu", &["0".to_string()])
+            .expect("resolve gpu 0");
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].env.iter().any(|e| e == "NVIDIA_VISIBLE_DEVICES=0"));
+        assert!(edits[0]
+            .device_nodes
+            .iter()
+            .any(|d| d.path == "/dev/nvidia0"));
+        let hooks = edits[0].hooks.as_ref().expect("hooks merged");
+        assert_eq!(hooks.create_container.len(), 1);
+    }
+
+    #[test]
+    fn resolve_for_kind_all_expands_to_every_device() {
+        let (_keep, registry) = registry_with_fixture_dir();
+        let edits = registry
+            .resolve_for_kind("nvidia.com/gpu", &["all".to_string()])
+            .expect("resolve all");
+        assert_eq!(edits.len(), 2, "should expand to both '0' and '1'");
+        let names: Vec<&str> = edits
+            .iter()
+            .flat_map(|e| e.env.iter())
+            .filter(|s| s.starts_with("NVIDIA_VISIBLE_DEVICES="))
+            .map(String::as_str)
+            .collect();
+        assert!(names.contains(&"NVIDIA_VISIBLE_DEVICES=0"));
+        assert!(names.contains(&"NVIDIA_VISIBLE_DEVICES=1"));
+    }
+
+    #[test]
+    fn resolve_for_kind_missing_spec_errors() {
+        let registry = CdiRegistry::default();
+        let err = registry
+            .resolve_for_kind("nvidia.com/gpu", &["0".to_string()])
+            .unwrap_err();
+        assert!(matches!(err, CdiError::SpecMissing(ref k) if k == "nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn resolve_for_kind_unknown_device_errors() {
+        let (_keep, registry) = registry_with_fixture_dir();
+        let err = registry
+            .resolve_for_kind("nvidia.com/gpu", &["99".to_string()])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CdiError::DeviceMissing { ref device, .. } if device == "99"
+        ));
+    }
+
+    #[test]
+    fn vendor_to_cdi_kind_maps_known_vendors() {
+        assert_eq!(vendor_to_cdi_kind("nvidia"), Some("nvidia.com/gpu"));
+        assert_eq!(vendor_to_cdi_kind("amd"), Some("amd.com/gpu"));
+        assert_eq!(vendor_to_cdi_kind("intel"), Some("intel.com/gpu"));
+        assert_eq!(vendor_to_cdi_kind("apple"), None);
     }
 }
