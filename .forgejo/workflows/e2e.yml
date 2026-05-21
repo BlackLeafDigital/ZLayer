@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: inputs.test == '' || inputs.test == 'youki'
     steps:
       - name: Checkout
@@ -141,7 +141,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: inputs.test == '' || inputs.test == 'wasm'
     steps:
       - name: Checkout
@@ -209,7 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host -v /var/run/docker.sock:/var/run/docker.sock
     if: inputs.test == '' || inputs.test == 'docker'
     steps:
       - name: Checkout
@@ -281,7 +281,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: inputs.test == '' || inputs.test == 'manager-unit'
     steps:
       - name: Checkout
@@ -356,7 +356,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: |
       inputs.test == '' ||
       inputs.test == 'manager-intellitester' ||
@@ -530,7 +530,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
@@ -648,7 +648,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun --cgroupns=host
     if: inputs.test == '' || inputs.test == 'scheduler-unit'
     steps:
       - name: Checkout

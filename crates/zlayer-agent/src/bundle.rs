@@ -21,6 +21,42 @@ use tokio::fs;
 use zlayer_secrets::SecretsProvider;
 use zlayer_spec::{ServiceSpec, StorageSpec, StorageTier};
 
+/// Pure parser for the contents of `/proc/self/cgroup`.
+///
+/// Finds the cgroup-v2 line (prefix `0::`) and returns the path suffix with
+/// surrounding whitespace trimmed. Returns `None` when:
+/// - the input has no `0::` line (cgroup-v1-only host), or
+/// - the v2 path is exactly `/` (host root — bare-metal, no enclosing cgroup), or
+/// - the input is empty.
+fn parse_cgroup_v2_line(content: &str) -> Option<String> {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() || trimmed == "/" {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Returns the current process's cgroup-v2 path, if any.
+///
+/// On Linux reads `/proc/self/cgroup` and delegates to `parse_cgroup_v2_line`.
+/// On non-Linux always returns `None`. Returns `None` on any read error or
+/// when the process is at the cgroup-v2 root (bare-metal case).
+#[cfg(target_os = "linux")]
+pub(crate) fn current_cgroup_v2_path() -> Option<String> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    parse_cgroup_v2_line(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn current_cgroup_v2_path() -> Option<String> {
+    None
+}
+
 /// All Linux capabilities for privileged mode
 const ALL_CAPABILITIES: &[Capability] = &[
     Capability::AuditControl,
@@ -761,7 +797,7 @@ impl BundleBuilder {
         }
 
         // Build Linux-specific config
-        let linux = self.build_linux_config(spec)?;
+        let linux = self.build_linux_config(container_id, spec)?;
 
         // Determine hostname
         let hostname = self
@@ -1207,7 +1243,12 @@ impl BundleBuilder {
 
     /// Build Linux-specific configuration
     #[allow(clippy::similar_names)] // euid/egid are POSIX-standard paired names
-    fn build_linux_config(&self, spec: &ServiceSpec) -> Result<oci_spec::runtime::Linux> {
+    #[allow(clippy::too_many_lines)]
+    fn build_linux_config(
+        &self,
+        container_id: &ContainerId,
+        spec: &ServiceSpec,
+    ) -> Result<oci_spec::runtime::Linux> {
         // Build namespaces
         let mut namespaces = vec![
             LinuxNamespaceBuilder::default()
@@ -1326,6 +1367,34 @@ impl BundleBuilder {
             linux_builder = linux_builder
                 .masked_paths(masked_paths)
                 .readonly_paths(readonly_paths);
+        }
+
+        // Determine cgroups_path so libcontainer creates the container cgroup
+        // under the current process's cgroup rather than at the v2 root. This
+        // is required when running inside another container (e.g. Forgejo CI
+        // `container:` block) where `/sys/fs/cgroup/cgroup.subtree_control` is
+        // read-only. Precedence:
+        //   1. spec.cgroup_parent (per-service override)
+        //   2. ZLAYER_CGROUP_PARENT env var (host-wide override)
+        //   3. /proc/self/cgroup (auto-detect when nested)
+        //   4. unset (default — bare-metal happy path)
+        let cid = container_id.to_string();
+        let cgroup_parent_value: Option<String> = spec
+            .cgroup_parent
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("ZLAYER_CGROUP_PARENT")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(current_cgroup_v2_path);
+
+        if let Some(parent) = cgroup_parent_value {
+            let parent = parent.trim_end_matches('/');
+            let full = format!("{parent}/{cid}");
+            linux_builder = linux_builder.cgroups_path(std::path::PathBuf::from(full));
         }
 
         linux_builder
@@ -2547,6 +2616,39 @@ services:
                 read_subid_range("/this/path/does/not/exist/subuid", "anyone"),
                 None
             );
+        }
+    }
+
+    mod cgroup_parser {
+        use super::super::parse_cgroup_v2_line;
+
+        #[test]
+        fn parse_cgroup_v2_root_returns_none() {
+            assert_eq!(parse_cgroup_v2_line("0::/\n"), None);
+        }
+
+        #[test]
+        fn parse_cgroup_v2_path_returns_some() {
+            assert_eq!(
+                parse_cgroup_v2_line("0::/system.slice/forgejo-runner.service\n"),
+                Some("/system.slice/forgejo-runner.service".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_cgroup_v2_hybrid_finds_v2_line() {
+            let input = "12:devices:/user.slice\n11:memory:/user.slice\n0::/foo\n";
+            assert_eq!(parse_cgroup_v2_line(input), Some("/foo".to_string()));
+        }
+
+        #[test]
+        fn parse_cgroup_v2_no_newline() {
+            assert_eq!(parse_cgroup_v2_line("0::/bar"), Some("/bar".to_string()));
+        }
+
+        #[test]
+        fn parse_cgroup_v2_missing_returns_none() {
+            assert_eq!(parse_cgroup_v2_line(""), None);
         }
     }
 }
