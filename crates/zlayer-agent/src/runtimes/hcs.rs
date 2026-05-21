@@ -145,6 +145,84 @@ pub enum IsolationMode {
     Hyperv,
 }
 
+/// Resolve [`zlayer_spec::IsolationMode::Auto`] to a concrete runtime-internal
+/// isolation mode based on host SKU.
+///
+/// Picks [`IsolationMode::Hyperv`] on Windows 10/11 client SKUs (detected by
+/// `OSVERSIONINFOEXW.wProductType == VER_NT_WORKSTATION`) and
+/// [`IsolationMode::Process`] on Server SKUs (`VER_NT_SERVER` /
+/// `VER_NT_DOMAIN_CONTROLLER`). If detection fails (missing API, unrecognized
+/// SKU, non-zero HRESULT from `GetVersionExW`) we default to
+/// [`IsolationMode::Process`] — process isolation fails predictably when the
+/// container OS build does not match the host, so a wrong-on-Server choice is
+/// less surprising than a wrong-on-client one (Hyper-V on a host without
+/// Hyper-V installed is a hard error at start time).
+///
+/// Marked `#[must_use]` because the caller always needs to read the result;
+/// throwing it away would silently leave isolation unresolved.
+#[must_use]
+pub(crate) fn resolve_isolation_auto() -> IsolationMode {
+    use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOEXW};
+
+    // `VER_NT_*` are documented Win32 constants that the `windows` crate
+    // does not re-export (they originate as `#define`s in `winnt.h`). Inline
+    // them as documented. Source: Microsoft Learn — OSVERSIONINFOEXW.
+    const VER_NT_WORKSTATION: u8 = 0x0000_0001;
+
+    let mut info = OSVERSIONINFOEXW {
+        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOEXW>())
+            .unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+
+    // SAFETY: `info` is a stack-resident, properly-sized `OSVERSIONINFOEXW`
+    // with `dwOSVersionInfoSize` set per the Win32 contract; `GetVersionExW`
+    // is documented to accept an `OSVERSIONINFOEXW*` via the
+    // `OSVERSIONINFOW*` parameter when the size field reflects the EX
+    // variant. The cast matches the pattern used inside the `windows` crate's
+    // own wrapper (see windows-0.62.2 SystemInformation/mod.rs:216).
+    let ok =
+        unsafe { GetVersionExW(std::ptr::from_mut::<OSVERSIONINFOEXW>(&mut info).cast()).is_ok() };
+
+    if !ok {
+        return IsolationMode::Process;
+    }
+
+    if info.wProductType == VER_NT_WORKSTATION {
+        IsolationMode::Hyperv
+    } else {
+        // VER_NT_SERVER (3) or VER_NT_DOMAIN_CONTROLLER (2) — Server SKU.
+        // Anything else (0, unrecognized) also funnels here, which is the
+        // documented "safer fallback" path.
+        IsolationMode::Process
+    }
+}
+
+/// Convert a spec-side [`zlayer_spec::IsolationMode`] (which carries the
+/// `Auto` variant exposed to users) into the runtime-internal
+/// [`IsolationMode`] (which only knows about concrete `Process` / `Hyperv`).
+///
+/// * `Some(Process)` / `Some(Hyperv)` map through directly.
+/// * `None` (spec did not set a value) and `Some(Auto)` both defer to the
+///   `config_default` argument — typically [`HcsConfig::default_isolation`].
+///
+/// `HcsConfig::default_isolation` is already a concrete
+/// [`IsolationMode`], so the caller decides whether that default itself was
+/// derived from [`resolve_isolation_auto`] at config-load time or pinned by
+/// the operator. This keeps the per-call hot path free of an OS-probe FFI
+/// call.
+fn spec_isolation_to_internal(
+    spec: Option<zlayer_spec::IsolationMode>,
+    config_default: IsolationMode,
+) -> IsolationMode {
+    use zlayer_spec::IsolationMode as Spec;
+    match spec {
+        None | Some(Spec::Auto) => config_default,
+        Some(Spec::Process) => IsolationMode::Process,
+        Some(Spec::Hyperv) => IsolationMode::Hyperv,
+    }
+}
+
 /// Configuration for [`HcsRuntime`].
 #[derive(Debug, Clone)]
 pub struct HcsConfig {
@@ -740,7 +818,21 @@ impl HcsRuntime {
         scratch_layer: &scratch::WritableLayer,
         parent_layers: Vec<zlayer_hcs::schema::Layer>,
         namespace_ids: Vec<String>,
-    ) -> HcsDoc {
+        isolation: IsolationMode,
+    ) -> Result<HcsDoc> {
+        // Hyper-V isolation requires a UVM lifecycle (scratch VHDX +
+        // VirtualMachine compute-system document with VirtualSmb share of the
+        // boot files + SCSI attachment of the per-container scratch VHDX).
+        // That wiring lands in Phase 2 task 3.D. Until then, surface a clean
+        // [`AgentError::Unsupported`] so callers can route around the
+        // unimplemented path instead of getting a low-level HCS error.
+        if matches!(isolation, IsolationMode::Hyperv) {
+            return Err(AgentError::Unsupported(
+                "Hyper-V isolation requires UVM lifecycle wiring (see Phase 2 task 3.D)"
+                    .to_string(),
+            ));
+        }
+
         let processor = spec.resources.cpu.and_then(|cpu| {
             // `count` must be at least 1 vCPU; we round up fractional requests.
             let count = cpu.ceil();
@@ -795,7 +887,7 @@ impl HcsRuntime {
             memory,
         };
 
-        HcsDoc {
+        let doc = HcsDoc {
             owner: owner_tag(&self.config.daemon_name),
             schema_version: SchemaVersion::default(),
             hosting_system_id: String::new(),
@@ -803,7 +895,8 @@ impl HcsRuntime {
             virtual_machine: None,
             should_terminate_on_last_handle_closed: Some(true),
         }
-        .apply_service_id(hcs_id)
+        .apply_service_id(hcs_id);
+        Ok(doc)
     }
 
     /// Return the cached unpacked image's parent-chain layers in the
@@ -1076,13 +1169,22 @@ impl Runtime for HcsRuntime {
             .as_ref()
             .map(|att| vec![format!("{:?}", att.namespace_id())])
             .unwrap_or_default();
+        // Resolve the spec-side isolation choice (which may be `Auto` or
+        // absent) to the concrete runtime-internal isolation mode. `Auto`
+        // and absence both fall back to [`HcsConfig::default_isolation`];
+        // explicit `Process` / `Hyperv` flow through. The resolved value is
+        // passed into `build_compute_system_doc`, which currently errors out
+        // with [`AgentError::Unsupported`] on `Hyperv` (UVM wiring lands in
+        // Phase 2 task 3.D).
+        let isolation = spec_isolation_to_internal(spec.isolation, self.config.default_isolation);
         let doc = self.build_compute_system_doc(
             &hcs_id,
             spec,
             &scratch_layer,
             parent_layers,
             namespace_strs,
-        );
+            isolation,
+        )?;
         let doc_json = serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
             id: hcs_id.clone(),
             reason: format!("serialize ComputeSystem doc: {e}"),
@@ -1731,5 +1833,65 @@ mod tests {
     #[test]
     fn overlay_network_dev() {
         assert_eq!(overlay_network_name("zlayer-dev"), "zlayer-dev-overlay");
+    }
+
+    /// Smoke-check that [`resolve_isolation_auto`] is callable and returns
+    /// one of the two concrete variants. The exact value depends on host
+    /// SKU; both `Process` (Server) and `Hyperv` (Client) are acceptable.
+    /// Real Hyper-V behaviour against a live host is covered by Phase 2
+    /// task 3.E E2E tests.
+    #[test]
+    fn resolve_isolation_auto_returns_a_concrete_variant() {
+        let mode = resolve_isolation_auto();
+        assert!(
+            matches!(mode, IsolationMode::Process | IsolationMode::Hyperv),
+            "resolve_isolation_auto returned an unexpected variant: {mode:?}",
+        );
+    }
+
+    /// `None` from the spec defers to the config default.
+    #[test]
+    fn spec_isolation_none_uses_config_default() {
+        assert_eq!(
+            spec_isolation_to_internal(None, IsolationMode::Process),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            spec_isolation_to_internal(None, IsolationMode::Hyperv),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// `Some(Auto)` also defers to the config default (Auto is the
+    /// user-visible "let the runtime decide" sentinel).
+    #[test]
+    fn spec_isolation_auto_uses_config_default() {
+        assert_eq!(
+            spec_isolation_to_internal(
+                Some(zlayer_spec::IsolationMode::Auto),
+                IsolationMode::Hyperv,
+            ),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// Explicit `Process` / `Hyperv` from the spec wins over the config
+    /// default.
+    #[test]
+    fn spec_isolation_explicit_overrides_config_default() {
+        assert_eq!(
+            spec_isolation_to_internal(
+                Some(zlayer_spec::IsolationMode::Process),
+                IsolationMode::Hyperv,
+            ),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            spec_isolation_to_internal(
+                Some(zlayer_spec::IsolationMode::Hyperv),
+                IsolationMode::Process,
+            ),
+            IsolationMode::Hyperv,
+        );
     }
 }
