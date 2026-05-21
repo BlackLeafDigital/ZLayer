@@ -77,6 +77,8 @@ zlayer-spec.workspace = true
 
 # Shared types (re-exports oci_client::Reference as ImageReference)
 zlayer-types.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+tempfile = "3"
 
 # Windows-only dependencies for the HCS (Host Compute Service) build backend.
 # The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer

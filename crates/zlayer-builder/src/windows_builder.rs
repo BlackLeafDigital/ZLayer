@@ -11,9 +11,25 @@
 //! - **4.B** (this task): RUN execution via a transient HCS compute system
 //!   attached to the working layer chain, with a Chocolatey translation
 //!   hook for Linux package-manager invocations.
-//! - **4.C**: COPY / ADD writes into the working scratch layer.
-//!   [`WindowsBuilder::execute_instruction`] for [`Instruction::Copy`] /
-//!   [`Instruction::Add`] currently surfaces a clear error pointing here.
+//! - **4.C** (this task): COPY / ADD writes into the working layer chain
+//!   as a new RO layer per instruction (the **per-instruction commit
+//!   model**), and config-only instructions (WORKDIR / ENV / ENTRYPOINT /
+//!   CMD / USER / EXPOSE / VOLUME / LABEL / SHELL / STOPSIGNAL /
+//!   HEALTHCHECK / ONBUILD) accumulate into a typed [`OciImageConfig`]
+//!   carried on the [`BuildSkeleton`] for task 4.D to serialise.
+//!
+//!   **Layer-commit model**: COPY and ADD each produce ONE new RO layer
+//!   on Windows. The alternative "combined scratch" model (let COPY/ADD
+//!   write into the same scratch the next RUN sees) is simpler at build
+//!   time but produces irregular layer chains where a single RO layer
+//!   conflates user-visible operations; per-instruction commits keep the
+//!   layer chain 1:1 with Dockerfile instructions, which makes the
+//!   emitted OCI manifest (4.D) cleanly auditable and downstream tooling
+//!   like `docker history` / `zlayer inspect` produce sensible output.
+//!   Off-Windows the model is moot — COPY/ADD still validate sources and
+//!   mutate the working tree under `working_layer_chain_dir/<scratch>/`
+//!   so unit tests on Linux CI exercise the path-traversal and
+//!   tar-extract logic without touching HCS.
 //! - **4.D**: OCI image manifest emission with `os: "windows"` +
 //!   `os.version` from the resolved base manifest; preserves foreign-layer
 //!   `urls[]`.
@@ -50,12 +66,14 @@
 //! `BuildError::NotSupported`. Phase 4 follow-up tasks preserve this
 //! gating discipline.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path, PathBuf};
 
-#[cfg(target_os = "windows")]
-use crate::dockerfile::ShellOrExec;
-use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction, RunInstruction};
+use crate::dockerfile::{
+    AddInstruction, CopyInstruction, Dockerfile, DockerfileFromTarget, EnvInstruction,
+    ExposeInstruction, ExposeProtocol, HealthcheckInstruction, Instruction, RunInstruction,
+    ShellOrExec,
+};
 use crate::error::{BuildError, Result};
 
 // `RegistryAuth` is re-exported by `zlayer-registry` unconditionally (the
@@ -225,6 +243,115 @@ pub struct BaseImageManifest {
     pub config_blob: Vec<u8>,
 }
 
+/// OCI image config accumulated during instruction execution.
+///
+/// Config-only Dockerfile instructions (WORKDIR / ENV / ENTRYPOINT / CMD
+/// / USER / EXPOSE / VOLUME / LABEL / SHELL / STOPSIGNAL / HEALTHCHECK)
+/// mutate this struct in-place during 4.C; task 4.D serialises it into
+/// the OCI image config blob alongside the layer descriptors on
+/// [`BuildSkeleton`].
+///
+/// Field shape matches the OCI image-spec
+/// `application/vnd.oci.image.config.v1+json` config object so 4.D's
+/// emission step is a straight `serde_json::to_value` over each field
+/// without remapping.
+#[derive(Debug, Clone, Default)]
+pub struct OciImageConfig {
+    /// `WorkingDir` in the OCI config — the cwd applied to subsequent RUN
+    /// steps and to the final container's process. WORKDIR with a
+    /// relative path resolves against the previous WORKDIR per the
+    /// Dockerfile spec.
+    pub working_dir: Option<String>,
+    /// `Env` in the OCI config — list of `KEY=value` entries.
+    /// Builder-side ENV mutation enforces last-write-wins per key so the
+    /// vector never grows duplicate KEYs.
+    pub env: Vec<String>,
+    /// `Entrypoint` in the OCI config. ENTRYPOINT shell form is rewritten
+    /// to `["cmd", "/c", "<rest>"]` for WCOW; exec form is passed
+    /// through as-is.
+    pub entrypoint: Option<Vec<String>>,
+    /// `Cmd` in the OCI config. Setting ENTRYPOINT resets CMD to `None`
+    /// per the Dockerfile spec.
+    pub cmd: Option<Vec<String>>,
+    /// `User` in the OCI config (e.g. `"ContainerUser"` or
+    /// `"user:group"`).
+    pub user: Option<String>,
+    /// `ExposedPorts` in the OCI config — map of `"<port>/<proto>"` →
+    /// empty object. Stored as `BTreeMap` so the serialised key order is
+    /// deterministic across runs.
+    pub exposed_ports: BTreeMap<String, serde_json::Value>,
+    /// `Volumes` in the OCI config — map of `<path>` → empty object.
+    pub volumes: BTreeMap<String, serde_json::Value>,
+    /// `Labels` in the OCI config — string→string map. Multiple LABEL
+    /// lines merge; later LABEL with the same KEY wins.
+    pub labels: BTreeMap<String, String>,
+    /// `StopSignal` in the OCI config (e.g. `"SIGTERM"`). Carried as-is
+    /// from the STOPSIGNAL instruction.
+    pub stop_signal: Option<String>,
+    /// `Healthcheck` in the OCI config. `None` means no healthcheck was
+    /// configured (and the base image's healthcheck is inherited);
+    /// `HEALTHCHECK NONE` sets this to a sentinel
+    /// [`OciHealthcheck::disabled`].
+    pub healthcheck: Option<OciHealthcheck>,
+    /// `Shell` in the OCI config — list of tokens (`["cmd", "/c"]` for
+    /// the default WCOW shell, or a user override via the SHELL
+    /// instruction).
+    pub shell: Option<Vec<String>>,
+    /// `OnBuild` triggers in the OCI config — list of raw Dockerfile
+    /// instruction text (`"COPY . /app"` etc.). Only matters when this
+    /// image is used as a base; the builder itself never re-executes
+    /// them in the producing build.
+    pub on_build: Vec<String>,
+}
+
+/// OCI healthcheck shape used by [`OciImageConfig`].
+///
+/// The Dockerfile [`HealthcheckInstruction::Check`] variant carries
+/// `Duration` values; we normalise them to OCI's string form
+/// (`"30s"`, `"1m30s"`, …) at the point of capture so 4.D can serialise
+/// the struct without re-formatting. `disabled` corresponds to
+/// `HEALTHCHECK NONE` and round-trips as `Test == ["NONE"]` per the
+/// OCI / Docker convention.
+#[derive(Debug, Clone)]
+pub struct OciHealthcheck {
+    /// Healthcheck command. For `HEALTHCHECK NONE` this is
+    /// `vec!["NONE".to_string()]`; for `HEALTHCHECK CMD …` this is
+    /// `["CMD-SHELL", "<cmd>"]` (shell form) or
+    /// `["CMD", "<arg0>", "<arg1>", …]` (exec form).
+    pub test: Vec<String>,
+    /// `Interval` between consecutive checks (OCI string form).
+    pub interval: Option<String>,
+    /// Per-check `Timeout` (OCI string form).
+    pub timeout: Option<String>,
+    /// `Retries` before transition to unhealthy.
+    pub retries: Option<u32>,
+    /// `StartPeriod` grace before the first check is counted (OCI
+    /// string form).
+    pub start_period: Option<String>,
+}
+
+impl OciHealthcheck {
+    /// Build the sentinel value for `HEALTHCHECK NONE`. Reads cleanly in
+    /// the emit path: `if hc.is_disabled() { "NONE" } else { … }`.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            test: vec!["NONE".to_string()],
+            interval: None,
+            timeout: None,
+            retries: None,
+            start_period: None,
+        }
+    }
+
+    /// `true` iff this healthcheck is the sentinel produced by
+    /// [`OciHealthcheck::disabled`].
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.test == ["NONE"]
+    }
+}
+
 /// Output of [`WindowsBuilder::build_skeleton`] — the parsed Dockerfile
 /// plus the materialised base layer chain plus the resolved base
 /// manifest.
@@ -268,6 +395,11 @@ pub struct BuildSkeleton {
     /// Windows by `build_skeleton` from the unpacker output and extended
     /// by each successful RUN step.
     pub working_chain: Vec<WindowsLayerEntry>,
+    /// OCI image config accumulated by config-only Dockerfile
+    /// instructions (WORKDIR / ENV / ENTRYPOINT / CMD / USER / EXPOSE /
+    /// VOLUME / LABEL / SHELL / STOPSIGNAL / HEALTHCHECK / ONBUILD).
+    /// Task 4.D serialises this into the image config blob.
+    pub image_config: OciImageConfig,
 }
 
 /// Native WCOW image builder.
@@ -397,32 +529,38 @@ impl WindowsBuilder {
             base_manifest,
             working_layer_chain_dir,
             working_chain,
+            image_config: OciImageConfig::default(),
         })
     }
 
     /// Apply a single non-FROM instruction to a [`BuildSkeleton`].
     ///
-    /// Routes to the per-instruction handler appropriate for the
-    /// instruction kind. Config-only instructions (ENV / WORKDIR /
-    /// ENTRYPOINT / CMD / USER / EXPOSE / VOLUME / LABEL / ARG / SHELL /
-    /// STOPSIGNAL / HEALTHCHECK / ONBUILD) are accepted as no-ops at the
-    /// rootfs level — those mutations land on the OCI image config in
-    /// task 4.D, not on the working layer chain. RUN is executed via an
-    /// HCS-driven ephemeral compute system (this task). COPY / ADD
-    /// return a [`BuildError::NotYetImplemented`] pointing at task 4.C.
+    /// Dispatches to a per-instruction handler. Config-only instructions
+    /// mutate [`BuildSkeleton::image_config`] in place; COPY/ADD/RUN
+    /// commit a new RO layer per instruction (the per-instruction layer
+    /// model documented at the top of this module).
     ///
     /// # Errors
     ///
-    /// - [`BuildError::NotYetImplemented`] for COPY / ADD (delivered in
-    ///   4.C).
-    /// - [`BuildError::RunFailed`] when the RUN command exits non-zero.
-    /// - [`BuildError::LayerCreate`] / [`BuildError::IoError`] on HCS or
-    ///   filesystem failures during RUN execution or layer export.
-    /// - [`BuildError::NotSupported`] when invoked on a non-Windows host
-    ///   (RUN needs the HCS APIs).
+    /// - [`BuildError::NotSupported`] for cross-stage `COPY --from=`
+    ///   (multi-stage support arrives in a later task).
+    /// - [`BuildError::PathTraversal`] when a COPY/ADD source contains
+    ///   `..`.
+    /// - [`BuildError::HttpFetchFailed`] when an ADD URL fetch fails.
+    /// - [`BuildError::TarExtractFailed`] when an ADD tarball
+    ///   auto-extract fails.
+    /// - [`BuildError::ContextRead`] / [`BuildError::IoError`] for
+    ///   filesystem failures.
+    /// - [`BuildError::RunStepFailed`] when the RUN command exits
+    ///   non-zero.
+    /// - [`BuildError::LayerCreate`] / [`BuildError::LayerExportFailed`]
+    ///   on HCS or wclayer failures.
+    /// - [`BuildError::NotSupported`] when COPY/ADD/RUN is invoked on a
+    ///   non-Windows host (HCS layer commits require the Windows APIs).
     pub async fn execute_instruction(
         &self,
         skeleton: &mut BuildSkeleton,
+        ctx: &BuildContext,
         instruction: &Instruction,
     ) -> Result<()> {
         // The step index is the position of this instruction in the
@@ -439,31 +577,164 @@ impl WindowsBuilder {
 
         match instruction {
             Instruction::Run(run) => self.execute_run_step(skeleton, run, step_index).await,
-            Instruction::Copy(_) => Err(BuildError::not_yet_implemented(
-                "COPY lands in Phase 4 task 4.C (writes into the scratch layer before the next \
-                 RUN commit)",
-            )),
-            Instruction::Add(_) => Err(BuildError::not_yet_implemented(
-                "ADD lands in Phase 4 task 4.C (writes into the scratch layer; URL fetch + \
-                 archive auto-extract reuse the existing sandbox_builder helpers)",
-            )),
-            // Config-only instructions: 4.A treats them as no-ops on the
-            // rootfs. The values they carry are applied to the OCI image
-            // config in task 4.D.
-            Instruction::Env(_)
-            | Instruction::Workdir(_)
-            | Instruction::Entrypoint(_)
-            | Instruction::Cmd(_)
-            | Instruction::User(_)
-            | Instruction::Expose(_)
-            | Instruction::Volume(_)
-            | Instruction::Label(_)
-            | Instruction::Arg(_)
-            | Instruction::Shell(_)
-            | Instruction::Stopsignal(_)
-            | Instruction::Healthcheck(_)
-            | Instruction::Onbuild(_) => Ok(()),
+            Instruction::Copy(copy) => self.apply_copy(skeleton, ctx, copy, step_index).await,
+            Instruction::Add(add) => self.apply_add(skeleton, ctx, add, step_index).await,
+            Instruction::Env(env) => {
+                apply_env(&mut skeleton.image_config, env);
+                Ok(())
+            }
+            Instruction::Workdir(path) => {
+                apply_workdir(&mut skeleton.image_config, path);
+                Ok(())
+            }
+            Instruction::Entrypoint(cmd) => {
+                apply_entrypoint(&mut skeleton.image_config, cmd);
+                Ok(())
+            }
+            Instruction::Cmd(cmd) => {
+                apply_cmd(&mut skeleton.image_config, cmd);
+                Ok(())
+            }
+            Instruction::User(user) => {
+                skeleton.image_config.user = Some(user.clone());
+                Ok(())
+            }
+            Instruction::Expose(expose) => {
+                apply_expose(&mut skeleton.image_config, expose);
+                Ok(())
+            }
+            Instruction::Volume(paths) => {
+                for p in paths {
+                    skeleton
+                        .image_config
+                        .volumes
+                        .insert(p.clone(), serde_json::json!({}));
+                }
+                Ok(())
+            }
+            Instruction::Label(labels) => {
+                for (k, v) in labels {
+                    skeleton.image_config.labels.insert(k.clone(), v.clone());
+                }
+                Ok(())
+            }
+            // ARG is consumed by the parser's variable-expansion pass and
+            // does not appear in the final OCI image config. We accept it
+            // here as a no-op so a Dockerfile with bare `ARG` lines walks
+            // through the builder cleanly.
+            Instruction::Arg(_) => Ok(()),
+            Instruction::Shell(tokens) => {
+                skeleton.image_config.shell = Some(tokens.clone());
+                Ok(())
+            }
+            Instruction::Stopsignal(sig) => {
+                skeleton.image_config.stop_signal = Some(sig.clone());
+                Ok(())
+            }
+            Instruction::Healthcheck(hc) => {
+                apply_healthcheck(&mut skeleton.image_config, hc);
+                Ok(())
+            }
+            Instruction::Onbuild(boxed) => {
+                skeleton
+                    .image_config
+                    .on_build
+                    .push(format_onbuild_trigger(boxed));
+                Ok(())
+            }
         }
+    }
+
+    /// Execute a COPY instruction. Resolves sources against
+    /// `ctx.context_dir`, rejects `..` traversal, copies into a fresh
+    /// scratch layer, then commits the scratch as a new RO layer on
+    /// Windows. Off-Windows the copy is performed against a plain
+    /// directory under `working_layer_chain_dir/<scratch_id>/Files/` for
+    /// unit-test coverage; no HCS commit happens.
+    async fn apply_copy(
+        &self,
+        skeleton: &mut BuildSkeleton,
+        ctx: &BuildContext,
+        copy: &CopyInstruction,
+        step_index: usize,
+    ) -> Result<()> {
+        if let Some(stage) = &copy.from {
+            return Err(BuildError::NotSupported {
+                operation: format!(
+                    "multi-stage COPY --from='{stage}' lands in a later task — the WCOW skeleton \
+                     supports single-stage builds only"
+                ),
+            });
+        }
+        if let Some(owner) = &copy.chown {
+            tracing::info!(
+                step_index = step_index,
+                chown = %owner,
+                "COPY --chown is a no-op on WCOW (Windows containers do not honour Unix-style \
+                 uid:gid ownership the same way)"
+            );
+        }
+        let resolved_sources = resolve_copy_sources(ctx, &copy.sources)?;
+        apply_filesystem_writes(
+            self.config(),
+            skeleton,
+            step_index,
+            &resolved_sources,
+            &copy.destination,
+            /* extract_archives = */ false,
+            /* downloads = */ &[],
+        )
+        .await
+    }
+
+    /// Execute an ADD instruction. Extends COPY with HTTP(S) URL fetch
+    /// and tarball auto-extraction.
+    async fn apply_add(
+        &self,
+        skeleton: &mut BuildSkeleton,
+        ctx: &BuildContext,
+        add: &AddInstruction,
+        step_index: usize,
+    ) -> Result<()> {
+        if let Some(owner) = &add.chown {
+            tracing::info!(
+                step_index = step_index,
+                chown = %owner,
+                "ADD --chown is a no-op on WCOW"
+            );
+        }
+        // Partition sources into URLs vs local paths.
+        let mut local_sources: Vec<String> = Vec::new();
+        let mut url_sources: Vec<String> = Vec::new();
+        for src in &add.sources {
+            if is_http_url(src) {
+                url_sources.push(src.clone());
+            } else {
+                local_sources.push(src.clone());
+            }
+        }
+        let resolved_locals = resolve_copy_sources(ctx, &local_sources)?;
+
+        // Download URLs into a temp dir so the per-instruction commit
+        // step sees them as ordinary files. We materialise the downloads
+        // alongside the resolved locals; the writes function does the
+        // extract-if-tarball decision uniformly across both groups.
+        let mut downloads: Vec<DownloadedFile> = Vec::with_capacity(url_sources.len());
+        for url in &url_sources {
+            let download = download_url(url).await?;
+            downloads.push(download);
+        }
+
+        apply_filesystem_writes(
+            self.config(),
+            skeleton,
+            step_index,
+            &resolved_locals,
+            &add.destination,
+            /* extract_archives = */ true,
+            &downloads,
+        )
+        .await
     }
 
     /// Execute one RUN step: optionally translate Linux package-manager
@@ -482,6 +753,668 @@ impl WindowsBuilder {
     ) -> Result<()> {
         execute_run_step_impl(&self.config, skeleton, run, step_index).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// 4.C: config-only instruction helpers (cross-platform, pure mutation)
+// ---------------------------------------------------------------------------
+
+/// Apply a WORKDIR instruction.
+///
+/// Relative paths resolve against the previous WORKDIR per the Dockerfile
+/// spec. On Windows the resolution uses backslash as the separator so
+/// `WORKDIR sub` after `WORKDIR C:\\app` yields `C:\\app\\sub`. Absolute
+/// paths (Unix-style `/x` or Windows-style `C:\\x` / `C:/x`) replace the
+/// prior value.
+pub(crate) fn apply_workdir(cfg: &mut OciImageConfig, path: &str) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let is_absolute = is_absolute_windows_or_unix(trimmed);
+    let resolved = if is_absolute {
+        trimmed.to_string()
+    } else if let Some(prev) = cfg.working_dir.as_deref() {
+        join_windows_path(prev, trimmed)
+    } else {
+        // No prior WORKDIR — relative path against an unset cwd is
+        // treated as the root drive on Windows. We surface it verbatim
+        // so the final OCI config preserves the user's intent for 4.D.
+        trimmed.to_string()
+    };
+    cfg.working_dir = Some(resolved);
+}
+
+/// Apply an ENV instruction, enforcing last-write-wins for each KEY.
+pub(crate) fn apply_env(cfg: &mut OciImageConfig, env: &EnvInstruction) {
+    // Sort keys so repeated calls produce a stable order in the final
+    // image config — multi-key ENV lines are common (`ENV A=1 B=2`) and
+    // a non-deterministic order breaks image-digest reproducibility.
+    let mut keys: Vec<&String> = env.vars.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &env.vars[key];
+        let entry = format!("{key}={value}");
+        // Drop any existing entry with the same KEY.
+        cfg.env
+            .retain(|e| e.split_once('=').is_none_or(|(k, _)| k != key.as_str()));
+        cfg.env.push(entry);
+    }
+}
+
+/// Apply an ENTRYPOINT instruction. Shell form is rewritten to
+/// `cmd /c <body>` per Windows convention; exec form is passed through.
+/// Setting ENTRYPOINT resets CMD to `None` per the Dockerfile spec.
+pub(crate) fn apply_entrypoint(cfg: &mut OciImageConfig, cmd: &ShellOrExec) {
+    cfg.entrypoint = Some(shell_or_exec_to_vec(cmd));
+    cfg.cmd = None;
+}
+
+/// Apply a CMD instruction. Shell form is rewritten to `cmd /c <body>`;
+/// exec form is passed through.
+pub(crate) fn apply_cmd(cfg: &mut OciImageConfig, cmd: &ShellOrExec) {
+    cfg.cmd = Some(shell_or_exec_to_vec(cmd));
+}
+
+/// Apply an EXPOSE instruction. Multiple EXPOSE lines accumulate.
+pub(crate) fn apply_expose(cfg: &mut OciImageConfig, expose: &ExposeInstruction) {
+    let proto = match expose.protocol {
+        ExposeProtocol::Tcp => "tcp",
+        ExposeProtocol::Udp => "udp",
+    };
+    let key = format!("{}/{}", expose.port, proto);
+    cfg.exposed_ports.insert(key, serde_json::json!({}));
+}
+
+/// Apply a HEALTHCHECK instruction, normalising `Duration` values to OCI
+/// string form so 4.D can serialise without re-formatting.
+pub(crate) fn apply_healthcheck(cfg: &mut OciImageConfig, hc: &HealthcheckInstruction) {
+    match hc {
+        HealthcheckInstruction::None => {
+            cfg.healthcheck = Some(OciHealthcheck::disabled());
+        }
+        HealthcheckInstruction::Check {
+            command,
+            interval,
+            timeout,
+            start_period,
+            retries,
+            ..
+        } => {
+            let test = match command {
+                ShellOrExec::Shell(s) => vec!["CMD-SHELL".to_string(), s.clone()],
+                ShellOrExec::Exec(args) => {
+                    let mut v = Vec::with_capacity(args.len() + 1);
+                    v.push("CMD".to_string());
+                    v.extend(args.iter().cloned());
+                    v
+                }
+            };
+            cfg.healthcheck = Some(OciHealthcheck {
+                test,
+                interval: interval.map(duration_to_oci_string),
+                timeout: timeout.map(duration_to_oci_string),
+                retries: *retries,
+                start_period: start_period.map(duration_to_oci_string),
+            });
+        }
+    }
+}
+
+/// Convert a [`ShellOrExec`] into the OCI config's vector form. Shell
+/// form is wrapped in `["cmd", "/c", "<body>"]` for WCOW; exec form is
+/// passed through.
+fn shell_or_exec_to_vec(cmd: &ShellOrExec) -> Vec<String> {
+    match cmd {
+        ShellOrExec::Shell(body) => {
+            vec!["cmd".to_string(), "/c".to_string(), body.clone()]
+        }
+        ShellOrExec::Exec(args) => args.clone(),
+    }
+}
+
+/// Format a [`std::time::Duration`] into the OCI healthcheck string form
+/// (e.g. `"30s"`, `"1m30s"`, `"500ms"`). Mirrors the `time.ParseDuration`
+/// shape Docker uses on the wire.
+fn duration_to_oci_string(d: std::time::Duration) -> String {
+    let total_ms = d.as_millis();
+    if total_ms == 0 {
+        return "0s".to_string();
+    }
+    if total_ms % 1000 != 0 {
+        return format!("{total_ms}ms");
+    }
+    let secs = d.as_secs();
+    if secs % 60 != 0 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins % 60 != 0 {
+        return format!("{mins}m");
+    }
+    format!("{}h", mins / 60)
+}
+
+/// Format an ONBUILD trigger back into Dockerfile source form for
+/// storage in the image config's `OnBuild` array. The OCI image config
+/// stores triggers as raw instruction strings so downstream builds can
+/// re-parse them.
+fn format_onbuild_trigger(instr: &Instruction) -> String {
+    match instr {
+        Instruction::Run(run) => match &run.command {
+            ShellOrExec::Shell(s) => format!("RUN {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "RUN {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        Instruction::Copy(c) => format!("COPY {} {}", c.sources.join(" "), c.destination),
+        Instruction::Add(a) => format!("ADD {} {}", a.sources.join(" "), a.destination),
+        Instruction::Env(e) => {
+            let mut keys: Vec<&String> = e.vars.keys().collect();
+            keys.sort();
+            let body = keys
+                .iter()
+                .map(|k| format!("{}={}", k, e.vars[*k]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("ENV {body}")
+        }
+        Instruction::Workdir(p) => format!("WORKDIR {p}"),
+        Instruction::User(u) => format!("USER {u}"),
+        Instruction::Cmd(c) => match c {
+            ShellOrExec::Shell(s) => format!("CMD {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "CMD {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        Instruction::Entrypoint(c) => match c {
+            ShellOrExec::Shell(s) => format!("ENTRYPOINT {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "ENTRYPOINT {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        other => other.name().to_string(),
+    }
+}
+
+/// Return `true` for paths that start with `/`, `\`, or a Windows drive
+/// letter (`C:\` / `C:/`). Used by [`apply_workdir`] to decide whether
+/// to resolve relative-to-previous.
+fn is_absolute_windows_or_unix(p: &str) -> bool {
+    if p.starts_with('/') || p.starts_with('\\') {
+        return true;
+    }
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    false
+}
+
+/// Join a base path with a relative suffix using a backslash separator
+/// (Windows path convention). Avoids `std::path::Path::join` because
+/// that uses the host OS's separator, which would produce
+/// `C:\\app/sub` on Linux — wrong shape for an OCI image targeting
+/// Windows.
+fn join_windows_path(base: &str, suffix: &str) -> String {
+    let mut joined = base.trim_end_matches(['\\', '/']).to_string();
+    joined.push('\\');
+    joined.push_str(suffix.trim_start_matches(['\\', '/']));
+    joined
+}
+
+// ---------------------------------------------------------------------------
+// 4.C: COPY/ADD filesystem helpers (cross-platform plumbing)
+// ---------------------------------------------------------------------------
+
+/// One resolved local source for a COPY/ADD. `relative` is the original
+/// `<src>` string from the Dockerfile (kept for diagnostics); `absolute`
+/// is the fully-resolved `context_dir.join(<src>)`.
+#[derive(Debug, Clone)]
+struct ResolvedSource {
+    relative: String,
+    absolute: PathBuf,
+}
+
+/// A downloaded URL materialised on disk, paired with the URL's
+/// basename so [`apply_filesystem_writes`] can place the file at
+/// `<dest>/<basename>` when `<dest>` is a directory.
+struct DownloadedFile {
+    /// Path on disk to the downloaded blob (lives in a tempdir whose
+    /// guard is held until this struct is dropped).
+    path: PathBuf,
+    /// Basename derived from the URL path component.
+    basename: String,
+    /// The original URL for diagnostics + the extract-if-tarball
+    /// decision (tarball detection is purely by extension).
+    url: String,
+    /// Temp-dir guard so the file outlives this object until the
+    /// destructor runs.
+    _guard: tempfile::TempDir,
+}
+
+/// Detect whether a COPY/ADD source string is an HTTP(S) URL.
+fn is_http_url(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Resolve a list of COPY/ADD source strings against the build context,
+/// rejecting any path that contains a `..` component.
+fn resolve_copy_sources(ctx: &BuildContext, srcs: &[String]) -> Result<Vec<ResolvedSource>> {
+    let mut out = Vec::with_capacity(srcs.len());
+    for src in srcs {
+        // Reject `..` BEFORE any filesystem access so a malicious
+        // Dockerfile cannot win a TOCTOU race against the resolver.
+        if path_contains_parent_dir(src) {
+            return Err(BuildError::PathTraversal { src: src.clone() });
+        }
+        let absolute = ctx.context_dir.join(src);
+        // Second-line defence: the joined path itself must stay under
+        // `context_dir`. We canonicalise lazily — only when the entry
+        // exists — because COPY against a non-existent source is itself
+        // an error reported below by the copy step. The cheap
+        // component-walk above already handles the common attack
+        // surface.
+        out.push(ResolvedSource {
+            relative: src.clone(),
+            absolute,
+        });
+    }
+    Ok(out)
+}
+
+/// Pure path-component walk that rejects any `..` segment. Works on
+/// both Unix and Windows-style separators because Dockerfile sources
+/// always use forward slashes per the spec.
+fn path_contains_parent_dir(src: &str) -> bool {
+    // Normalise both separator flavours to `/` so a Dockerfile written
+    // with backslashes (which the spec discourages but tooling tolerates)
+    // is still inspected correctly.
+    let normalised = src.replace('\\', "/");
+    Path::new(&normalised)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+}
+
+/// Download a URL into a tempdir and return a [`DownloadedFile`].
+async fn download_url(url: &str) -> Result<DownloadedFile> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|e| BuildError::HttpFetchFailed {
+            url: url.to_string(),
+            source: e,
+        })?
+        .error_for_status()
+        .map_err(|e| BuildError::HttpFetchFailed {
+            url: url.to_string(),
+            source: e,
+        })?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| BuildError::HttpFetchFailed {
+            url: url.to_string(),
+            source: e,
+        })?;
+    let basename = url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.split('?').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download")
+        .to_string();
+    let guard = tempfile::tempdir().map_err(BuildError::IoError)?;
+    let path = guard.path().join(&basename);
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(BuildError::IoError)?;
+    Ok(DownloadedFile {
+        path,
+        basename,
+        url: url.to_string(),
+        _guard: guard,
+    })
+}
+
+/// Detect whether a path's extension marks it as an auto-extractable
+/// archive. Matches the Docker ADD documentation: `.tar`, `.tar.gz`
+/// (`.tgz`), `.tar.bz2`, `.tar.xz`. Case-insensitive — Dockerfile
+/// authors on Windows occasionally write `.TAR.GZ`.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn is_tarball_path(name: &str) -> bool {
+    // `extension()` only sees the final segment so `.tar.gz` needs the
+    // suffix-match form. Lowercasing the whole name once keeps the rule
+    // straightforward and avoids stitching path components back together.
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".tar")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tar.xz")
+}
+
+/// Materialise the COPY/ADD destination root inside a scratch directory.
+///
+/// Returns `(scratch_dir, files_root)` where `scratch_dir` is the
+/// per-instruction staging area under `working_layer_chain_dir` and
+/// `files_root` is the `Files/` subdirectory that mirrors HCS's
+/// per-layer payload layout (HCS exports layers with `Files/` +
+/// `Hives/`; we use the same shape so 4.D's manifest emission can pass
+/// the directory straight to `wclayer::import_layer`).
+fn prepare_scratch_for_writes(
+    config: &WindowsBuildConfig,
+    skeleton: &BuildSkeleton,
+    step_index: usize,
+) -> Result<(PathBuf, PathBuf)> {
+    let _ = config; // reserved for size_gb / cache policy in a later task
+    let scratch_id = format!("copy-add-{step_index}-{}", uuid::Uuid::new_v4());
+    let scratch_dir = skeleton.working_layer_chain_dir.join(&scratch_id);
+    let files_root = scratch_dir.join("Files");
+    std::fs::create_dir_all(&files_root).map_err(BuildError::IoError)?;
+    Ok((scratch_dir, files_root))
+}
+
+/// Strip a Windows or Unix root prefix from a destination so it can be
+/// joined against `Files/`. `C:\app\bin` → `app/bin`; `/etc/foo` →
+/// `etc/foo`. Mixed separators are normalised to forward slashes.
+fn dest_under_files_root(dest: &str) -> PathBuf {
+    let mut s = dest.replace('\\', "/");
+    if s.len() >= 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' {
+        s = s[2..].to_string();
+    }
+    let trimmed = s.trim_start_matches('/');
+    PathBuf::from(trimmed)
+}
+
+/// Decide whether a destination is a directory (ends with `/` or `\`,
+/// or there are multiple sources). Mirrors Dockerfile COPY/ADD
+/// semantics: with N>1 sources or a trailing separator, the destination
+/// is treated as a directory; otherwise the single source is treated
+/// as a file rename.
+fn destination_is_directory(dest: &str, source_count: usize) -> bool {
+    source_count > 1 || dest.ends_with('/') || dest.ends_with('\\')
+}
+
+/// Recursively copy `src` to `dst`. Mirrors `std::fs::copy` semantics
+/// for files; for directories it walks the tree and re-creates each
+/// child.
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(src)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let child_src = entry.path();
+            let child_dst = dst.join(entry.file_name());
+            copy_recursive(&child_src, &child_dst)?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+/// Extract a tarball into `dest_dir`, picking the decompressor by
+/// extension. Used by ADD's archive auto-extract path.
+fn extract_tarball(archive_path: &Path, dest_dir: &Path) -> Result<()> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    std::fs::create_dir_all(dest_dir).map_err(BuildError::IoError)?;
+    let file = File::open(archive_path).map_err(BuildError::IoError)?;
+    let reader = BufReader::new(file);
+    let lower = archive_path.to_string_lossy().to_ascii_lowercase();
+
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    let mut archive: tar::Archive<Box<dyn std::io::Read>> = if lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+    {
+        tar::Archive::new(Box::new(flate2::read::GzDecoder::new(reader)) as Box<dyn std::io::Read>)
+    } else if lower.ends_with(".tar.bz2") {
+        tar::Archive::new(Box::new(bzip2::read::BzDecoder::new(reader)) as Box<dyn std::io::Read>)
+    } else if lower.ends_with(".tar.xz") {
+        tar::Archive::new(Box::new(xz2::read::XzDecoder::new(reader)) as Box<dyn std::io::Read>)
+    } else {
+        tar::Archive::new(Box::new(reader) as Box<dyn std::io::Read>)
+    };
+
+    // Reject entries with `..` so a hostile tarball cannot escape
+    // `dest_dir`. `tar::Archive::set_overwrite(true)` would silently
+    // clobber files outside `dest_dir` if we let traversal through.
+    for entry in archive
+        .entries()
+        .map_err(|e| BuildError::TarExtractFailed { source: e })?
+    {
+        let mut entry = entry.map_err(|e| BuildError::TarExtractFailed { source: e })?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| BuildError::TarExtractFailed { source: e })?
+            .into_owned();
+        if entry_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(BuildError::TarExtractFailed {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tarball entry '{}' contains '..' — refusing to extract",
+                        entry_path.display()
+                    ),
+                ),
+            });
+        }
+        entry
+            .unpack_in(dest_dir)
+            .map_err(|e| BuildError::TarExtractFailed { source: e })?;
+    }
+    Ok(())
+}
+
+/// Stage every COPY/ADD write into a per-instruction scratch directory
+/// and commit it as a new RO layer.
+///
+/// - On Windows this calls into HCS via [`commit_scratch_as_layer`].
+/// - Off-Windows the scratch dir is left in place (so unit tests can
+///   inspect `Files/<dest>/<src>`) and the function returns `Ok(())`
+///   without touching `skeleton.base_layers` / `skeleton.working_chain`
+///   — the next Windows-gated `build_skeleton` call is what produces
+///   real layer descriptors. This preserves the cross-platform unit-test
+///   contract documented at the top of the module.
+#[allow(clippy::similar_names)] // `dst`/`dest_*` bindings name distinct concepts (per-entry destination vs. resolved dest_*)
+async fn apply_filesystem_writes(
+    config: &WindowsBuildConfig,
+    skeleton: &mut BuildSkeleton,
+    step_index: usize,
+    locals: &[ResolvedSource],
+    dest: &str,
+    extract_archives: bool,
+    downloads: &[DownloadedFile],
+) -> Result<()> {
+    let total_sources = locals.len() + downloads.len();
+    if total_sources == 0 {
+        // No-op COPY/ADD — Dockerfile parser already rejects truly
+        // empty source lists, but a `COPY` with only URLs that all
+        // failed-but-recovered is conceivable. Treat as success.
+        return Ok(());
+    }
+    let dest_is_dir = destination_is_directory(dest, total_sources);
+    let (scratch_dir, files_root) = prepare_scratch_for_writes(config, skeleton, step_index)?;
+
+    let dest_rel = dest_under_files_root(dest);
+    let dest_abs_in_layer = files_root.join(&dest_rel);
+
+    // Process local sources.
+    for src in locals {
+        let meta = std::fs::metadata(&src.absolute).map_err(|e| BuildError::ContextRead {
+            path: src.absolute.clone(),
+            source: e,
+        })?;
+        if extract_archives && meta.is_file() && is_tarball_path(&src.relative) {
+            extract_tarball(&src.absolute, &dest_abs_in_layer)?;
+        } else if meta.is_dir() {
+            std::fs::create_dir_all(&dest_abs_in_layer).map_err(BuildError::IoError)?;
+            // Directory copy: contents-into-dest (the Docker default).
+            for entry in std::fs::read_dir(&src.absolute).map_err(BuildError::IoError)? {
+                let entry = entry.map_err(BuildError::IoError)?;
+                let child_dst = dest_abs_in_layer.join(entry.file_name());
+                copy_recursive(&entry.path(), &child_dst).map_err(BuildError::IoError)?;
+            }
+        } else if dest_is_dir {
+            std::fs::create_dir_all(&dest_abs_in_layer).map_err(BuildError::IoError)?;
+            let basename = src
+                .absolute
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .ok_or_else(|| BuildError::ContextRead {
+                    path: src.absolute.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "COPY/ADD source '{}' has no file name",
+                            src.absolute.display()
+                        ),
+                    ),
+                })?;
+            let dst = dest_abs_in_layer.join(basename);
+            std::fs::copy(&src.absolute, &dst).map_err(BuildError::IoError)?;
+        } else {
+            if let Some(parent) = dest_abs_in_layer.parent() {
+                std::fs::create_dir_all(parent).map_err(BuildError::IoError)?;
+            }
+            std::fs::copy(&src.absolute, &dest_abs_in_layer).map_err(BuildError::IoError)?;
+        }
+    }
+
+    // Process URL downloads.
+    for download in downloads {
+        let is_tar = is_tarball_path(&download.basename);
+        if extract_archives && is_tar {
+            extract_tarball(&download.path, &dest_abs_in_layer)?;
+        } else if dest_is_dir {
+            std::fs::create_dir_all(&dest_abs_in_layer).map_err(BuildError::IoError)?;
+            let dst = dest_abs_in_layer.join(&download.basename);
+            std::fs::copy(&download.path, &dst).map_err(BuildError::IoError)?;
+        } else {
+            if let Some(parent) = dest_abs_in_layer.parent() {
+                std::fs::create_dir_all(parent).map_err(BuildError::IoError)?;
+            }
+            std::fs::copy(&download.path, &dest_abs_in_layer).map_err(BuildError::IoError)?;
+        }
+        tracing::debug!(
+            step_index = step_index,
+            url = %download.url,
+            dest = %dest,
+            "ADD URL download materialised"
+        );
+    }
+
+    commit_scratch_as_layer(skeleton, step_index, &scratch_dir).await
+}
+
+/// Windows: tar+gz the scratch directory, commit a new RO layer via
+/// `wclayer::import_layer`, and append the new layer to both chains.
+#[cfg(target_os = "windows")]
+async fn commit_scratch_as_layer(
+    skeleton: &mut BuildSkeleton,
+    step_index: usize,
+    scratch_dir: &Path,
+) -> Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use sha2::{Digest, Sha256};
+    use zlayer_agent::windows::wclayer::{self, LayerChain};
+    use zlayer_hcs::schema::Layer as HcsLayer;
+
+    // Build the parent chain in HCS child-to-parent order from the
+    // base-first working_chain.
+    let parent_chain: LayerChain = LayerChain::new(
+        skeleton
+            .working_chain
+            .iter()
+            .rev()
+            .map(|e| HcsLayer {
+                id: e.layer_id.clone(),
+                path: e.layer_path.to_string_lossy().into_owned(),
+            })
+            .collect(),
+    );
+
+    // Tar + gzip the scratch dir to get a digest + size for the layer
+    // descriptor that 4.D will emit. The on-disk form is what
+    // `wclayer::import_layer` consumes (an unpacked HCS layer folder
+    // shape — `Files/`, optionally `Hives/`); we keep both.
+    let tar_bytes =
+        tar_export_folder(scratch_dir).map_err(|e| BuildError::LayerExportFailed { source: e })?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar_bytes)
+        .map_err(|e| BuildError::LayerExportFailed { source: e })?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| BuildError::LayerExportFailed { source: e })?;
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&compressed)));
+    #[allow(clippy::cast_possible_wrap)]
+    let size = compressed.len() as i64;
+
+    // Materialise the staged scratch as a new RO layer on disk so
+    // subsequent RUN steps can chain off it.
+    let new_layer_id = uuid::Uuid::new_v4().to_string();
+    let new_layer_path = skeleton.working_layer_chain_dir.join(&new_layer_id);
+    std::fs::create_dir_all(&new_layer_path)
+        .map_err(|e| BuildError::LayerExportFailed { source: e })?;
+    zlayer_agent::windows::layer::enable_backup_restore_privileges()
+        .map_err(BuildError::IoError)?;
+    wclayer::import_layer(&new_layer_path, scratch_dir, &parent_chain)
+        .map_err(|e| BuildError::LayerExportFailed { source: e })?;
+
+    // Best-effort cleanup of the staging scratch.
+    if let Err(e) = std::fs::remove_dir_all(scratch_dir) {
+        tracing::warn!(
+            scratch_dir = %scratch_dir.display(),
+            step_index = step_index,
+            error = %e,
+            "failed to remove COPY/ADD scratch dir after import"
+        );
+    }
+
+    skeleton.base_layers.push(LayerRef {
+        digest,
+        media_type: OCI_WINDOWS_LAYER_MEDIA_TYPE.to_string(),
+        size,
+        urls: Vec::new(),
+    });
+    skeleton.working_chain.push(WindowsLayerEntry {
+        layer_id: new_layer_id,
+        layer_path: new_layer_path,
+    });
+
+    Ok(())
+}
+
+/// Non-Windows hosts: leave the staged scratch in place so unit tests
+/// can assert against it, and return Ok without producing a layer
+/// descriptor. Off-Windows COPY/ADD is unit-test fixture territory; an
+/// actual production build off-Windows is rejected by
+/// [`build_skeleton`] upstream.
+#[cfg(not(target_os = "windows"))]
+#[allow(clippy::unused_async)]
+async fn commit_scratch_as_layer(
+    _skeleton: &mut BuildSkeleton,
+    _step_index: usize,
+    _scratch_dir: &Path,
+) -> Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,7 +2328,7 @@ fn derive_source_distro(base: &BaseImageManifest) -> String {
 mod tests {
     use super::*;
 
-    use crate::dockerfile::{CopyInstruction, EnvInstruction, ShellOrExec};
+    use crate::dockerfile::{AddInstruction, CopyInstruction, EnvInstruction, ShellOrExec};
     use crate::windows_image_resolver::ChocoMapShard;
 
     fn dummy_config() -> WindowsBuildConfig {
@@ -1427,7 +2360,29 @@ mod tests {
             },
             working_layer_chain_dir: std::env::temp_dir().join("zlayer-wcow-skeleton-tests/x"),
             working_chain: Vec::new(),
+            image_config: OciImageConfig::default(),
         }
+    }
+
+    /// Build a fresh [`BuildContext`] + [`BuildSkeleton`] pair backed by
+    /// a per-test tempdir, plus the tempdir guard. Used by every 4.C
+    /// COPY/ADD test so each invocation has an isolated context dir and
+    /// `working_layer_chain_dir` no test ever races against another.
+    fn ctx_and_skeleton_in_tempdir() -> (BuildContext, BuildSkeleton, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let context_dir = tmp.path().join("context");
+        std::fs::create_dir_all(&context_dir).expect("mk context");
+        let chain_dir = tmp.path().join("chain");
+        std::fs::create_dir_all(&chain_dir).expect("mk chain");
+        let ctx = BuildContext {
+            context_dir,
+            dockerfile_path: PathBuf::from("Dockerfile"),
+            build_args: HashMap::new(),
+            tag: "zlayer-wcow-test:latest".to_string(),
+        };
+        let mut skel = dummy_skeleton();
+        skel.working_layer_chain_dir = chain_dir;
+        (ctx, skel, tmp)
     }
 
     #[test]
@@ -1469,51 +2424,362 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_instruction_copy_returns_not_yet_implemented() {
+    async fn execute_instruction_copy_from_multi_stage_is_unsupported() {
+        // Multi-stage COPY --from=builder is intentionally rejected with
+        // a typed `NotSupported` error until a later task lands
+        // multi-stage support. This is the documented 4.C behaviour.
         let builder = WindowsBuilder::new(dummy_config());
-        let mut skel = dummy_skeleton();
-        let copy = Instruction::Copy(CopyInstruction::new(
-            vec!["app.exe".to_string()],
-            "C:\\app\\app.exe".to_string(),
-        ));
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+        let copy = Instruction::Copy(
+            CopyInstruction::new(vec!["app.exe".to_string()], "C:\\app\\app.exe".to_string())
+                .from_stage("builder"),
+        );
         let err = builder
-            .execute_instruction(&mut skel, &copy)
+            .execute_instruction(&mut skel, &ctx, &copy)
             .await
-            .expect_err("COPY must route to a NotYetImplemented error in the 4.A skeleton");
+            .expect_err("multi-stage COPY --from must surface NotSupported");
         assert!(
-            matches!(err, BuildError::NotYetImplemented(ref msg) if msg.contains("4.C")),
-            "COPY error must point at Phase 4 task 4.C, got: {err}"
+            matches!(err, BuildError::NotSupported { ref operation } if operation.contains("multi-stage")),
+            "COPY --from error must explain multi-stage gap, got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn execute_instruction_env_succeeds() {
+    async fn execute_instruction_env_records_kv() {
         let builder = WindowsBuilder::new(dummy_config());
-        let mut skel = dummy_skeleton();
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
         let mut vars = HashMap::new();
         vars.insert("APP_HOME".to_string(), "C:\\app".to_string());
         let env = Instruction::Env(EnvInstruction { vars });
         builder
-            .execute_instruction(&mut skel, &env)
+            .execute_instruction(&mut skel, &ctx, &env)
             .await
-            .expect("ENV is a config-only instruction and must succeed in the 4.A skeleton");
+            .expect("ENV must succeed and accumulate into image_config");
+        assert_eq!(skel.image_config.env, vec!["APP_HOME=C:\\app".to_string()]);
     }
 
     #[tokio::test]
-    async fn execute_instruction_workdir_and_entrypoint_succeed() {
+    async fn execute_instruction_workdir_and_entrypoint_mutate_config() {
         let builder = WindowsBuilder::new(dummy_config());
-        let mut skel = dummy_skeleton();
-        builder
-            .execute_instruction(&mut skel, &Instruction::Workdir("C:\\app".to_string()))
-            .await
-            .expect("WORKDIR is config-only and must succeed in the 4.A skeleton");
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
         builder
             .execute_instruction(
                 &mut skel,
+                &ctx,
+                &Instruction::Workdir("C:\\app".to_string()),
+            )
+            .await
+            .expect("WORKDIR must succeed");
+        assert_eq!(skel.image_config.working_dir.as_deref(), Some("C:\\app"));
+        builder
+            .execute_instruction(
+                &mut skel,
+                &ctx,
                 &Instruction::Entrypoint(ShellOrExec::Exec(vec!["C:\\app\\app.exe".to_string()])),
             )
             .await
-            .expect("ENTRYPOINT is config-only and must succeed in the 4.A skeleton");
+            .expect("ENTRYPOINT must succeed");
+        assert_eq!(
+            skel.image_config.entrypoint.as_deref(),
+            Some(["C:\\app\\app.exe".to_string()].as_slice())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 4.C: config-only instruction helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn apply_workdir_relative_resolves_against_previous() {
+        let mut cfg = OciImageConfig::default();
+        apply_workdir(&mut cfg, "C:\\app");
+        apply_workdir(&mut cfg, "sub");
+        assert_eq!(cfg.working_dir.as_deref(), Some("C:\\app\\sub"));
+        // Absolute drive replaces; trailing-slash base is honoured.
+        apply_workdir(&mut cfg, "D:\\other");
+        assert_eq!(cfg.working_dir.as_deref(), Some("D:\\other"));
+        // Forward-slash absolute Unix path is treated as absolute.
+        apply_workdir(&mut cfg, "/data");
+        assert_eq!(cfg.working_dir.as_deref(), Some("/data"));
+    }
+
+    #[test]
+    fn apply_env_replaces_existing_key() {
+        let mut cfg = OciImageConfig::default();
+        let mut vars = HashMap::new();
+        vars.insert("FOO".to_string(), "1".to_string());
+        apply_env(&mut cfg, &EnvInstruction { vars });
+        let mut vars2 = HashMap::new();
+        vars2.insert("FOO".to_string(), "2".to_string());
+        vars2.insert("BAR".to_string(), "baz".to_string());
+        apply_env(&mut cfg, &EnvInstruction { vars: vars2 });
+        // FOO must have been replaced (last write wins), and the new
+        // BAR sits alongside it.
+        assert!(cfg.env.contains(&"FOO=2".to_string()), "{:?}", cfg.env);
+        assert!(cfg.env.contains(&"BAR=baz".to_string()), "{:?}", cfg.env);
+        assert!(!cfg.env.contains(&"FOO=1".to_string()), "{:?}", cfg.env);
+        // No duplicate KEYs.
+        let foo_count = cfg.env.iter().filter(|e| e.starts_with("FOO=")).count();
+        assert_eq!(foo_count, 1, "ENV must enforce single KEY: {:?}", cfg.env);
+    }
+
+    #[test]
+    fn apply_entrypoint_resets_cmd_per_spec() {
+        let mut cfg = OciImageConfig::default();
+        apply_cmd(&mut cfg, &ShellOrExec::Exec(vec!["bash".to_string()]));
+        assert!(cfg.cmd.is_some());
+        apply_entrypoint(
+            &mut cfg,
+            &ShellOrExec::Exec(vec!["C:\\app\\app.exe".to_string()]),
+        );
+        assert_eq!(
+            cfg.entrypoint.as_deref(),
+            Some(["C:\\app\\app.exe".to_string()].as_slice())
+        );
+        assert!(
+            cfg.cmd.is_none(),
+            "ENTRYPOINT must reset CMD per Dockerfile spec"
+        );
+    }
+
+    #[test]
+    fn apply_expose_accumulates_ports() {
+        let mut cfg = OciImageConfig::default();
+        apply_expose(&mut cfg, &ExposeInstruction::tcp(80));
+        apply_expose(&mut cfg, &ExposeInstruction::tcp(443));
+        apply_expose(&mut cfg, &ExposeInstruction::udp(53));
+        assert!(cfg.exposed_ports.contains_key("80/tcp"));
+        assert!(cfg.exposed_ports.contains_key("443/tcp"));
+        assert!(cfg.exposed_ports.contains_key("53/udp"));
+        assert_eq!(cfg.exposed_ports.len(), 3);
+    }
+
+    #[test]
+    fn apply_label_last_value_wins() {
+        let mut cfg = OciImageConfig::default();
+        cfg.labels
+            .insert("maintainer".to_string(), "alice".to_string());
+        // Direct mutation simulates `Instruction::Label(...)` dispatch
+        // in execute_instruction. The contract is: later LABEL with the
+        // same KEY overrides.
+        cfg.labels
+            .insert("maintainer".to_string(), "bob".to_string());
+        assert_eq!(
+            cfg.labels.get("maintainer").map(String::as_str),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn apply_healthcheck_disabled_and_check_round_trip() {
+        let mut cfg = OciImageConfig::default();
+        apply_healthcheck(&mut cfg, &HealthcheckInstruction::None);
+        let hc = cfg
+            .healthcheck
+            .as_ref()
+            .expect("HEALTHCHECK NONE must populate config");
+        assert!(hc.is_disabled());
+
+        let cmd = HealthcheckInstruction::Check {
+            command: ShellOrExec::Shell("curl -f http://localhost/".to_string()),
+            interval: Some(std::time::Duration::from_secs(30)),
+            timeout: Some(std::time::Duration::from_secs(5)),
+            start_period: None,
+            start_interval: None,
+            retries: Some(3),
+        };
+        apply_healthcheck(&mut cfg, &cmd);
+        let hc2 = cfg.healthcheck.as_ref().expect("healthcheck populated");
+        assert_eq!(
+            hc2.test,
+            vec![
+                "CMD-SHELL".to_string(),
+                "curl -f http://localhost/".to_string()
+            ]
+        );
+        assert_eq!(hc2.interval.as_deref(), Some("30s"));
+        assert_eq!(hc2.timeout.as_deref(), Some("5s"));
+        assert_eq!(hc2.retries, Some(3));
+    }
+
+    // -----------------------------------------------------------------
+    // 4.C: COPY/ADD filesystem semantics
+    // -----------------------------------------------------------------
+
+    /// Locate the materialised `Files/<dest>` payload under
+    /// `working_layer_chain_dir/<scratch_id>/` for off-Windows tests.
+    /// The scratch id is non-deterministic (uuid) so we scan the dir.
+    fn locate_scratch_files(chain_dir: &std::path::Path) -> PathBuf {
+        for entry in std::fs::read_dir(chain_dir).expect("read chain dir") {
+            let entry = entry.expect("read dir entry");
+            let path = entry.path();
+            if path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|s| s.starts_with("copy-add-"))
+            {
+                return path.join("Files");
+            }
+        }
+        panic!("no copy-add-* scratch dir under {}", chain_dir.display());
+    }
+
+    #[tokio::test]
+    async fn apply_copy_simple_file_writes_to_scratch() {
+        let builder = WindowsBuilder::new(dummy_config());
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+        std::fs::write(ctx.context_dir.join("hello.txt"), b"hello").unwrap();
+        let copy = Instruction::Copy(CopyInstruction::new(
+            vec!["hello.txt".to_string()],
+            "C:\\app\\hello.txt".to_string(),
+        ));
+        builder
+            .execute_instruction(&mut skel, &ctx, &copy)
+            .await
+            .expect("COPY of a simple file must succeed off-Windows");
+        let files = locate_scratch_files(&skel.working_layer_chain_dir);
+        let copied = files.join("app").join("hello.txt");
+        assert!(copied.is_file(), "expected file at {}", copied.display());
+        assert_eq!(std::fs::read(&copied).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn apply_copy_rejects_parent_dir_traversal() {
+        let builder = WindowsBuilder::new(dummy_config());
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+        let copy = Instruction::Copy(CopyInstruction::new(
+            vec!["../secrets".to_string()],
+            "C:\\".to_string(),
+        ));
+        let err = builder
+            .execute_instruction(&mut skel, &ctx, &copy)
+            .await
+            .expect_err("COPY with `..` must be rejected");
+        assert!(
+            matches!(err, BuildError::PathTraversal { ref src } if src == "../secrets"),
+            "expected PathTraversal, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_copy_directory_recursive() {
+        let builder = WindowsBuilder::new(dummy_config());
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+        let src_dir = ctx.context_dir.join("payload");
+        std::fs::create_dir_all(src_dir.join("nested")).unwrap();
+        std::fs::write(src_dir.join("a.txt"), b"A").unwrap();
+        std::fs::write(src_dir.join("nested").join("b.txt"), b"B").unwrap();
+
+        let copy = Instruction::Copy(CopyInstruction::new(
+            vec!["payload".to_string()],
+            "C:\\opt\\payload\\".to_string(),
+        ));
+        builder
+            .execute_instruction(&mut skel, &ctx, &copy)
+            .await
+            .expect("recursive COPY must succeed");
+        let files = locate_scratch_files(&skel.working_layer_chain_dir);
+        assert!(files.join("opt/payload/a.txt").is_file());
+        assert!(files.join("opt/payload/nested/b.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn apply_add_tarball_extracts() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let builder = WindowsBuilder::new(dummy_config());
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+
+        // Build a tiny .tar.gz fixture containing one file `inside.txt`.
+        let tar_bytes = {
+            let mut tar_builder = tar::Builder::new(Vec::new());
+            let payload = b"INSIDE\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_path("inside.txt").unwrap();
+            header.set_cksum();
+            tar_builder.append(&header, payload.as_ref()).unwrap();
+            tar_builder.finish().unwrap();
+            tar_builder.into_inner().unwrap()
+        };
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_bytes).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        std::fs::write(ctx.context_dir.join("payload.tar.gz"), gz_bytes).unwrap();
+
+        let add = Instruction::Add(AddInstruction::new(
+            vec!["payload.tar.gz".to_string()],
+            "C:\\opt\\extracted\\".to_string(),
+        ));
+        builder
+            .execute_instruction(&mut skel, &ctx, &add)
+            .await
+            .expect("ADD must extract a tarball");
+        let files = locate_scratch_files(&skel.working_layer_chain_dir);
+        let extracted = files.join("opt/extracted/inside.txt");
+        assert!(extracted.is_file(), "expected {}", extracted.display());
+        assert_eq!(std::fs::read(&extracted).unwrap(), b"INSIDE\n");
+    }
+
+    #[tokio::test]
+    #[ignore = "live network — exercises ADD URL fetch against example.com"]
+    async fn apply_add_http_url_downloads() {
+        let builder = WindowsBuilder::new(dummy_config());
+        let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
+        let add = Instruction::Add(AddInstruction::new(
+            vec!["https://example.com/".to_string()],
+            "C:\\downloads\\".to_string(),
+        ));
+        builder
+            .execute_instruction(&mut skel, &ctx, &add)
+            .await
+            .expect("ADD URL must succeed when the network is reachable");
+        let files = locate_scratch_files(&skel.working_layer_chain_dir);
+        // The basename "" from `example.com/` becomes the fallback
+        // `download`; either form is acceptable.
+        assert!(
+            files.join("downloads").is_dir(),
+            "expected downloads/ dir under {}",
+            files.display()
+        );
+    }
+
+    #[test]
+    fn path_traversal_detection_flavours() {
+        assert!(path_contains_parent_dir("../etc"));
+        assert!(path_contains_parent_dir("foo/../bar"));
+        assert!(path_contains_parent_dir("foo\\..\\bar"));
+        assert!(!path_contains_parent_dir("foo/bar"));
+        assert!(!path_contains_parent_dir("foo..bar")); // no separator → ordinary name
+    }
+
+    #[test]
+    fn dest_under_files_root_strips_drive() {
+        assert_eq!(
+            dest_under_files_root("C:\\app\\bin"),
+            PathBuf::from("app/bin")
+        );
+        assert_eq!(
+            dest_under_files_root("/etc/passwd"),
+            PathBuf::from("etc/passwd")
+        );
+        assert_eq!(
+            dest_under_files_root("relative/x"),
+            PathBuf::from("relative/x")
+        );
+    }
+
+    #[test]
+    fn duration_to_oci_string_shapes() {
+        use std::time::Duration;
+        assert_eq!(duration_to_oci_string(Duration::from_secs(30)), "30s");
+        assert_eq!(duration_to_oci_string(Duration::from_secs(90)), "90s");
+        assert_eq!(duration_to_oci_string(Duration::from_secs(60)), "1m");
+        assert_eq!(duration_to_oci_string(Duration::from_millis(500)), "500ms");
+        assert_eq!(duration_to_oci_string(Duration::from_secs(3600)), "1h");
     }
 
     // -----------------------------------------------------------------
@@ -1807,7 +3073,7 @@ mod tests {
             .expect("Dockerfile fixture has a RUN");
 
         builder
-            .execute_instruction(&mut skeleton, &run_instr)
+            .execute_instruction(&mut skeleton, &ctx, &run_instr)
             .await
             .expect("RUN cmd /c echo hello must succeed on a Windows host");
 

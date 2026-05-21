@@ -232,6 +232,40 @@ pub enum BuildError {
         /// (e.g. `"debian-12"`, `"ubuntu-22.04"`).
         source_distro: String,
     },
+
+    /// COPY/ADD source path contained a `..` component which is forbidden
+    /// because it would escape the build context. Surfaced before any
+    /// filesystem access so a malicious Dockerfile cannot reach files
+    /// outside the build directory even via a TOCTOU window.
+    #[error("COPY/ADD source path '{src}' contains '..' which is forbidden")]
+    PathTraversal {
+        /// The offending source path as it appeared in the Dockerfile.
+        src: String,
+    },
+
+    /// ADD `<URL> <dest>` failed to download the remote resource. Carries
+    /// the URL for diagnostics; the underlying network/protocol failure is
+    /// chained as the `source` so users get the precise cause (connection
+    /// refused, 404, TLS error, etc.).
+    #[error("ADD failed to fetch '{url}': {source}")]
+    HttpFetchFailed {
+        /// The URL the builder attempted to fetch.
+        url: String,
+        /// Underlying reqwest failure.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// ADD auto-extraction of a tarball failed. Carries the chained IO
+    /// error from the `tar` / `flate2` / `bzip2` / `xz2` pipeline so the
+    /// user can see which entry tripped (path traversal in the archive,
+    /// disk full, etc.).
+    #[error("ADD failed to extract tarball: {source}")]
+    TarExtractFailed {
+        /// Underlying tar/decompressor IO error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl BuildError {
