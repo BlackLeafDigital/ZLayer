@@ -55,6 +55,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use oci_spec::runtime::{
+    LinuxDevice, LinuxDeviceBuilder, LinuxDeviceType, Mount, MountBuilder, Spec,
+};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -62,7 +65,7 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_registry::{CompressionType, ImageConfig};
-use zlayer_spec::{PullPolicy, RegistryAuth, ServiceSpec};
+use zlayer_spec::{GpuSpec, PullPolicy, RegistryAuth, ServiceSpec};
 
 use crate::bundle::BundleBuilder;
 use crate::cgroups_stats::ContainerStats;
@@ -982,13 +985,20 @@ impl Runtime for Wsl2DelegateRuntime {
         let builder = BundleBuilder::new(PathBuf::from(&bundle_dir))
             .with_image_config(cached.config.clone())
             .with_hostname(slug.clone());
-        let oci_spec = builder
+        let mut oci_spec = builder
             .build_spec_only(id, spec, &HashMap::new())
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
                 reason: format!("failed to build OCI spec on Windows host: {e}"),
             })?;
+
+        // Phase 5.D: wire `/dev/dxg` + WSLg lib mounts into the bundle when
+        // the service spec requests a GPU. No-op for CPU-only workloads.
+        // A missing `/dev/dxg` is a hard error here; we don't want a silent
+        // CPU fallback for users who explicitly asked for GPU.
+        let gpu_probe = DefaultWslGpuHostProbe { runtime: self };
+        apply_wsl_gpu_to_spec(&mut oci_spec, spec, &gpu_probe).await?;
 
         let config_json =
             serde_json::to_string_pretty(&oci_spec).map_err(|e| AgentError::CreateFailed {
@@ -1678,6 +1688,258 @@ fn parse_youki_stats(output: &Output, timestamp: std::time::Instant) -> Containe
 }
 
 // ---------------------------------------------------------------------------
+// WSL2 GPU exposure (Phase 5.D)
+//
+// When a service spec carries `resources.gpu`, the youki bundle running inside
+// the WSL2 distro needs three things mirrored from how WSLg exposes GPU to a
+// regular user shell:
+//
+//   1. `/dev/dxg`            — the WSL DirectX kernel interface, the actual
+//                              entry point apps talk to for GPU work.
+//   2. `/usr/lib/wsl/`       — the WSLg shim library tree (`libdxcore.so`,
+//                              `libd3d12.so`, `libdxguid.so`).
+//   3. `/usr/lib/wsl/drivers/` (NVIDIA-only) — the NVIDIA WDDM driver shim that
+//                              CUDA libraries resolve through.
+//
+// On the host (Windows) we can't touch any of these directly; everything
+// lives inside the WSL2 distro. So the probe trait below shells out to
+// `wsl.exe -d <distro> -- ...` to stat `/dev/dxg` and check the lib trees.
+// The pure mutation helper [`inject_wsl_gpu_mounts`] takes the probe's
+// answers as inputs so it can be unit-tested without any real WSL2 host.
+// ---------------------------------------------------------------------------
+
+/// Result of probing the WSL2 distro for GPU readiness.
+///
+/// Populated by an impl of [`WslGpuHostProbe`] before
+/// [`inject_wsl_gpu_mounts`] runs so the mutation helper stays purely
+/// in-memory and testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WslGpuHostState {
+    /// `(major, minor)` for `/dev/dxg` inside the distro, or `None` if the
+    /// device node is absent. `None` is a hard error when GPU was requested:
+    /// silently falling back to CPU is surprising.
+    pub dxg_devno: Option<(i64, i64)>,
+    /// Whether `/usr/lib/wsl` is present inside the distro. When false the
+    /// shim libraries are missing and GPU work will fail at link time even
+    /// with `/dev/dxg` mounted.
+    pub wsl_lib_present: bool,
+    /// Whether `/usr/lib/wsl/drivers` is present inside the distro. This is
+    /// the NVIDIA-specific driver shim path; absent on AMD/Intel hosts.
+    pub wsl_drivers_present: bool,
+}
+
+/// Probe trait. Lets unit tests substitute a stub that doesn't need a real
+/// WSL2 host with `/dev/dxg` exposed.
+#[async_trait]
+pub(crate) trait WslGpuHostProbe: Send + Sync {
+    async fn probe(&self) -> Result<WslGpuHostState>;
+}
+
+/// Production probe that shells out via [`Wsl2DelegateRuntime::wsl`] to read
+/// the actual state of the configured distro.
+struct DefaultWslGpuHostProbe<'a> {
+    runtime: &'a Wsl2DelegateRuntime,
+}
+
+#[async_trait]
+impl WslGpuHostProbe for DefaultWslGpuHostProbe<'_> {
+    async fn probe(&self) -> Result<WslGpuHostState> {
+        // `stat -c '%t %T' /dev/dxg` prints major/minor as hex. We swallow
+        // stat's nonzero exit (file missing) and report devno=None, which
+        // `inject_wsl_gpu_mounts` translates into `WslGpuUnavailable`.
+        let dxg_devno = match self.runtime.wsl("stat", &["-c", "%t %T", "/dev/dxg"]).await {
+            Ok(output) if output.status.success() => {
+                let raw = String::from_utf8_lossy(&output.stdout);
+                parse_stat_hex_devno(raw.trim())
+            }
+            _ => None,
+        };
+
+        // `test -d` returns 0 when the directory exists. Both -d probes are
+        // best-effort: a failure to spawn `wsl.exe` is the same as the path
+        // being absent — we'd fail later anyway.
+        let wsl_lib_present = self
+            .runtime
+            .wsl("test", &["-d", "/usr/lib/wsl"])
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let wsl_drivers_present = self
+            .runtime
+            .wsl("test", &["-d", "/usr/lib/wsl/drivers"])
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        Ok(WslGpuHostState {
+            dxg_devno,
+            wsl_lib_present,
+            wsl_drivers_present,
+        })
+    }
+}
+
+/// Parse the output of `stat -c '%t %T' <path>`: two whitespace-separated
+/// hexadecimal numbers (major, then minor). Returns `None` on any parse
+/// failure so callers treat malformed stat output as "device missing".
+fn parse_stat_hex_devno(s: &str) -> Option<(i64, i64)> {
+    let mut parts = s.split_ascii_whitespace();
+    let major = i64::from_str_radix(parts.next()?, 16).ok()?;
+    let minor = i64::from_str_radix(parts.next()?, 16).ok()?;
+    Some((major, minor))
+}
+
+/// Inject `/dev/dxg` + the WSLg shim mounts into a bundle's mounts/devices
+/// and prepend the WSLg lib paths to `LD_LIBRARY_PATH`.
+///
+/// Returns `Err(AgentError::WslGpuUnavailable)` when GPU was requested but
+/// the host cannot deliver it (no `/dev/dxg`). Idempotent w.r.t. existing
+/// user-supplied `/dev/dxg` entries: if the spec's device list already names
+/// `/dev/dxg`, the helper leaves that entry alone instead of duplicating.
+pub(crate) fn inject_wsl_gpu_mounts(
+    mounts: &mut Vec<Mount>,
+    env: &mut Vec<String>,
+    devices: &mut Vec<LinuxDevice>,
+    _gpu_spec: &GpuSpec,
+    host: &WslGpuHostState,
+) -> Result<()> {
+    let (major, minor) = host
+        .dxg_devno
+        .ok_or_else(|| AgentError::WslGpuUnavailable {
+            reason: "/dev/dxg is not exposed by the WSL2 kernel inside the configured distro; \
+                 enable WSL2 GPU support (Windows 11 + a recent WSL kernel) or drop \
+                 `resources.gpu` from the service spec"
+                .to_string(),
+        })?;
+
+    let has_dxg_mount = mounts
+        .iter()
+        .any(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"));
+    if !has_dxg_mount {
+        let mount = MountBuilder::default()
+            .destination("/dev/dxg".to_string())
+            .source("/dev/dxg".to_string())
+            .typ("bind".to_string())
+            .options(vec!["bind".to_string(), "rw".to_string()])
+            .build()
+            .map_err(|e| AgentError::WslGpuUnavailable {
+                reason: format!("failed to build /dev/dxg bind mount: {e}"),
+            })?;
+        mounts.push(mount);
+    }
+
+    let has_dxg_device = devices
+        .iter()
+        .any(|d| d.path().as_path() == std::path::Path::new("/dev/dxg"));
+    if !has_dxg_device {
+        let device = LinuxDeviceBuilder::default()
+            .path("/dev/dxg")
+            .typ(LinuxDeviceType::C)
+            .major(major)
+            .minor(minor)
+            .file_mode(0o666u32)
+            .uid(0u32)
+            .gid(0u32)
+            .build()
+            .map_err(|e| AgentError::WslGpuUnavailable {
+                reason: format!("failed to build /dev/dxg device node: {e}"),
+            })?;
+        devices.push(device);
+    }
+
+    // /usr/lib/wsl read-only shim mount.
+    if host.wsl_lib_present {
+        let has_wsl_lib_mount = mounts
+            .iter()
+            .any(|m| m.destination().as_path() == std::path::Path::new("/usr/lib/wsl"));
+        if !has_wsl_lib_mount {
+            let mount = MountBuilder::default()
+                .destination("/usr/lib/wsl".to_string())
+                .source("/usr/lib/wsl".to_string())
+                .typ("bind".to_string())
+                .options(vec!["bind".to_string(), "ro".to_string()])
+                .build()
+                .map_err(|e| AgentError::WslGpuUnavailable {
+                    reason: format!("failed to build /usr/lib/wsl bind mount: {e}"),
+                })?;
+            mounts.push(mount);
+        }
+    } else {
+        tracing::warn!(
+            "WSL2 GPU: /usr/lib/wsl missing on host; container will see /dev/dxg but no \
+             WSLg shim libraries (libdxcore.so etc.). GPU workloads will fail at dlopen."
+        );
+    }
+
+    // Prepend WSLg lib paths to LD_LIBRARY_PATH (drivers ahead of lib so the
+    // NVIDIA driver shim wins lookup ordering). Preserve any existing value.
+    let mut new_prefix: Vec<&str> = Vec::new();
+    if host.wsl_drivers_present {
+        new_prefix.push("/usr/lib/wsl/drivers");
+    }
+    if host.wsl_lib_present {
+        new_prefix.push("/usr/lib/wsl/lib");
+    }
+    if !new_prefix.is_empty() {
+        let prefix_joined = new_prefix.join(":");
+        if let Some(entry) = env.iter_mut().find(|e| e.starts_with("LD_LIBRARY_PATH=")) {
+            let existing = entry.splitn(2, '=').nth(1).unwrap_or("").to_string();
+            *entry = if existing.is_empty() {
+                format!("LD_LIBRARY_PATH={prefix_joined}")
+            } else {
+                format!("LD_LIBRARY_PATH={prefix_joined}:{existing}")
+            };
+        } else {
+            env.push(format!("LD_LIBRARY_PATH={prefix_joined}"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Mutates the already-built [`Spec`] in place to inject the WSL2 GPU
+/// mounts/devices/env when `resources.gpu` is set. No-op when the spec
+/// doesn't request a GPU.
+async fn apply_wsl_gpu_to_spec(
+    oci_spec: &mut Spec,
+    service: &ServiceSpec,
+    probe: &dyn WslGpuHostProbe,
+) -> Result<()> {
+    let Some(gpu_spec) = service.resources.gpu.as_ref() else {
+        return Ok(());
+    };
+
+    let host = probe.probe().await?;
+
+    // Pull the three slices we need to mutate out of the Spec via the getset
+    // accessors. Each is wrapped in Option<Vec<...>>; we materialise empty
+    // vecs as needed so the helper can push without further branching.
+    let mut mounts = oci_spec.mounts().clone().unwrap_or_default();
+    let mut env = oci_spec
+        .process()
+        .as_ref()
+        .and_then(|p| p.env().clone())
+        .unwrap_or_default();
+    let mut devices = oci_spec
+        .linux()
+        .as_ref()
+        .and_then(|l| l.devices().clone())
+        .unwrap_or_default();
+
+    inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, gpu_spec, &host)?;
+
+    oci_spec.set_mounts(Some(mounts));
+    if let Some(process) = oci_spec.process_mut().as_mut() {
+        process.set_env(Some(env));
+    }
+    if let Some(linux) = oci_spec.linux_mut().as_mut() {
+        linux.set_devices(Some(devices));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure-logic coverage only. Anything that shells out to wsl.exe is
 // tested by the Windows-gated integration suite in Phase F-9.
 // ---------------------------------------------------------------------------
@@ -2319,6 +2581,260 @@ services:
             "teardown must delete the netns, got {joined:?}"
         );
         assert!(runtime.netns.read().await.get(&id).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 5.D: WSL2 GPU exposure tests.
+    //
+    // These exercise `inject_wsl_gpu_mounts` against a stub host state so we
+    // don't need a real `/dev/dxg` on the Windows CI runner. They cover
+    // the four spec'd cases plus the GPU-not-requested no-op path.
+    // -------------------------------------------------------------------
+
+    fn test_gpu_spec() -> GpuSpec {
+        GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        }
+    }
+
+    fn happy_host_state() -> WslGpuHostState {
+        WslGpuHostState {
+            dxg_devno: Some((10, 117)),
+            wsl_lib_present: true,
+            wsl_drivers_present: true,
+        }
+    }
+
+    #[test]
+    fn inject_wsl_gpu_mounts_adds_dxg_mount() {
+        let mut mounts: Vec<Mount> = Vec::new();
+        let mut env: Vec<String> = Vec::new();
+        let mut devices: Vec<LinuxDevice> = Vec::new();
+        let gpu = test_gpu_spec();
+        let host = happy_host_state();
+
+        inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, &gpu, &host)
+            .expect("inject must succeed on happy host");
+
+        let dxg_mounts: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"))
+            .collect();
+        assert_eq!(
+            dxg_mounts.len(),
+            1,
+            "expected exactly one /dev/dxg mount, got {}: {:?}",
+            dxg_mounts.len(),
+            mounts
+        );
+        assert_eq!(
+            dxg_mounts[0]
+                .source()
+                .as_ref()
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/dev/dxg"))
+        );
+        assert_eq!(dxg_mounts[0].typ().as_deref(), Some("bind"));
+
+        // Device cgroup entry must be present too with the probed major/minor.
+        let dxg_devs: Vec<_> = devices
+            .iter()
+            .filter(|d| d.path().as_path() == std::path::Path::new("/dev/dxg"))
+            .collect();
+        assert_eq!(dxg_devs.len(), 1);
+        assert_eq!(dxg_devs[0].major(), 10);
+        assert_eq!(dxg_devs[0].minor(), 117);
+        assert_eq!(dxg_devs[0].typ(), LinuxDeviceType::C);
+    }
+
+    #[test]
+    fn inject_wsl_gpu_mounts_respects_existing_user_mount() {
+        // User already declared a /dev/dxg bind mount via spec.devices; the
+        // helper must not double-mount.
+        let pre_existing = MountBuilder::default()
+            .destination("/dev/dxg".to_string())
+            .source("/dev/dxg".to_string())
+            .typ("bind".to_string())
+            .options(vec!["bind".to_string(), "rw".to_string()])
+            .build()
+            .unwrap();
+        let mut mounts = vec![pre_existing];
+
+        let pre_existing_dev = LinuxDeviceBuilder::default()
+            .path("/dev/dxg")
+            .typ(LinuxDeviceType::C)
+            .major(10)
+            .minor(117)
+            .file_mode(0o666u32)
+            .uid(0u32)
+            .gid(0u32)
+            .build()
+            .unwrap();
+        let mut devices = vec![pre_existing_dev];
+
+        let mut env: Vec<String> = Vec::new();
+        let gpu = test_gpu_spec();
+        let host = happy_host_state();
+
+        inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, &gpu, &host)
+            .expect("inject must succeed on happy host");
+
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"))
+                .count(),
+            1,
+            "expected no duplicate /dev/dxg mount, mounts: {mounts:?}"
+        );
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|d| d.path().as_path() == std::path::Path::new("/dev/dxg"))
+                .count(),
+            1,
+            "expected no duplicate /dev/dxg device, devices: {devices:?}"
+        );
+    }
+
+    #[test]
+    fn inject_wsl_gpu_mounts_prepends_ld_library_path() {
+        let mut mounts: Vec<Mount> = Vec::new();
+        let mut env: Vec<String> = vec!["LD_LIBRARY_PATH=/foo".to_string()];
+        let mut devices: Vec<LinuxDevice> = Vec::new();
+        let gpu = test_gpu_spec();
+        let host = happy_host_state();
+
+        inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, &gpu, &host)
+            .expect("inject must succeed on happy host");
+
+        let ld_entries: Vec<_> = env
+            .iter()
+            .filter(|e| e.starts_with("LD_LIBRARY_PATH="))
+            .collect();
+        assert_eq!(
+            ld_entries.len(),
+            1,
+            "exactly one LD_LIBRARY_PATH entry: {env:?}"
+        );
+        // Drivers ahead of lib (NVIDIA shim wins lookup), original /foo preserved.
+        assert_eq!(
+            ld_entries[0], "LD_LIBRARY_PATH=/usr/lib/wsl/drivers:/usr/lib/wsl/lib:/foo",
+            "unexpected LD_LIBRARY_PATH: {env:?}"
+        );
+    }
+
+    #[test]
+    fn inject_wsl_gpu_mounts_appends_ld_library_path_when_absent() {
+        // No existing LD_LIBRARY_PATH — the helper should add one rather than
+        // silently dropping the prefix.
+        let mut mounts: Vec<Mount> = Vec::new();
+        let mut env: Vec<String> = vec!["PATH=/bin".to_string()];
+        let mut devices: Vec<LinuxDevice> = Vec::new();
+        let gpu = test_gpu_spec();
+        let host = happy_host_state();
+
+        inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, &gpu, &host).unwrap();
+
+        assert!(env.contains(&"PATH=/bin".to_string()));
+        assert!(env
+            .iter()
+            .any(|e| e == "LD_LIBRARY_PATH=/usr/lib/wsl/drivers:/usr/lib/wsl/lib"));
+    }
+
+    #[test]
+    fn inject_wsl_gpu_mounts_fails_when_dxg_missing() {
+        let mut mounts: Vec<Mount> = Vec::new();
+        let mut env: Vec<String> = Vec::new();
+        let mut devices: Vec<LinuxDevice> = Vec::new();
+        let gpu = test_gpu_spec();
+        let host = WslGpuHostState {
+            dxg_devno: None,
+            wsl_lib_present: true,
+            wsl_drivers_present: true,
+        };
+
+        let err = inject_wsl_gpu_mounts(&mut mounts, &mut env, &mut devices, &gpu, &host)
+            .expect_err("expected WslGpuUnavailable when /dev/dxg missing");
+        assert!(
+            matches!(err, AgentError::WslGpuUnavailable { .. }),
+            "expected WslGpuUnavailable, got: {err:?}"
+        );
+        assert!(mounts.is_empty(), "no mount should have been pushed");
+        assert!(devices.is_empty(), "no device should have been pushed");
+    }
+
+    #[tokio::test]
+    async fn apply_wsl_gpu_to_spec_no_op_when_gpu_not_requested() {
+        // Build a minimal Spec via the OCI default; the apply function should
+        // leave it untouched when the service spec doesn't request a GPU.
+        let mut oci_spec = Spec::default();
+        let mounts_before = oci_spec.mounts().clone();
+
+        // ServiceSpec has no Default impl in zlayer-types; parse a minimal
+        // fixture from YAML the same way the spec crate's own tests do.
+        let yaml = r"
+version: v1
+deployment: gpu-noop-test
+services:
+  cpu-only:
+    rtype: service
+    image:
+      name: alpine:latest
+";
+        let deployment: zlayer_spec::DeploymentSpec =
+            serde_yaml::from_str(yaml).expect("parse fixture deployment");
+        let service = deployment
+            .services
+            .get("cpu-only")
+            .cloned()
+            .expect("cpu-only service");
+        assert!(
+            service.resources.gpu.is_none(),
+            "fixture must not request GPU"
+        );
+
+        struct ExplodingProbe;
+        #[async_trait]
+        impl WslGpuHostProbe for ExplodingProbe {
+            async fn probe(&self) -> Result<WslGpuHostState> {
+                panic!("probe must not run when no GPU is requested");
+            }
+        }
+
+        apply_wsl_gpu_to_spec(&mut oci_spec, &service, &ExplodingProbe)
+            .await
+            .expect("no-op should succeed");
+
+        assert_eq!(oci_spec.mounts(), &mounts_before);
+        let has_dxg = oci_spec
+            .mounts()
+            .as_ref()
+            .map(|ms| {
+                ms.iter()
+                    .any(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"))
+            })
+            .unwrap_or(false);
+        assert!(
+            !has_dxg,
+            "no /dev/dxg mount should appear for CPU-only spec"
+        );
+    }
+
+    #[test]
+    fn parse_stat_hex_devno_handles_typical_wsl_output() {
+        // `stat -c '%t %T' /dev/dxg` on a real WSL2 distro returns e.g. "a 75".
+        assert_eq!(parse_stat_hex_devno("a 75"), Some((10, 117)));
+        assert_eq!(parse_stat_hex_devno("  a   75  "), Some((10, 117)));
+        assert_eq!(parse_stat_hex_devno(""), None);
+        assert_eq!(parse_stat_hex_devno("nothex zz"), None);
+        assert_eq!(parse_stat_hex_devno("a"), None);
     }
 
     /// J-3: netns setup tolerates an already-existing namespace so a

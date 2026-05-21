@@ -67,6 +67,19 @@ pub enum AgentError {
     #[error("Operation not supported by this runtime: {0}")]
     Unsupported(String),
 
+    /// GPU was requested by the service spec, but the underlying WSL2 host
+    /// cannot deliver GPU access (typically because `/dev/dxg` is not exposed
+    /// by the running WSL2 kernel, or the `WSLg` driver shim mount is missing).
+    ///
+    /// Returned by the WSL2 delegate when wiring `/dev/dxg` and the `WSLg` lib
+    /// mounts into the youki bundle. Silent CPU fallback would be surprising
+    /// for users who explicitly asked for a GPU, so this is a hard error;
+    /// callers must either downgrade the spec to drop `resources.gpu` or
+    /// re-place the workload on a node whose WSL2 distro exposes the
+    /// `DirectX` kernel interface.
+    #[error("GPU requested but WSL2 GPU support not available on this host: {reason}")]
+    WslGpuUnavailable { reason: String },
+
     /// The workload cannot run on this node and must be re-placed on a peer
     /// that can satisfy `required_os`.
     ///
