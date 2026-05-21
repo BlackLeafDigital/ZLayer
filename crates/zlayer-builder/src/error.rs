@@ -266,6 +266,42 @@ pub enum BuildError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The WCOW builder could not resolve an `os.version` for the emitted
+    /// OCI image config. The Windows runtime refuses to launch a
+    /// container whose `os.version` does not exactly match the host
+    /// kernel's build, so emitting a manifest without one would produce
+    /// an image nothing can run. Surfaces when the base manifest's
+    /// `os.version` is missing AND the user did not pass
+    /// `WindowsBuildConfig::os_version_override`.
+    #[error(
+        "os.version could not be resolved from base manifest or override; \
+         set WindowsBuildConfig::os_version_override or pull a base image \
+         whose manifest carries an os.version field"
+    )]
+    OsVersionUnresolved,
+
+    /// Computing a sha256 digest over a layer blob (or an in-memory
+    /// manifest blob) failed because the underlying IO read failed.
+    /// Carries the chained IO error so callers can see which file
+    /// tripped.
+    #[error("layer digest computation failed: {source}")]
+    LayerDigestComputationFailed {
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// JSON serialisation of the emitted OCI image config or manifest
+    /// blob failed. In practice this only happens if a value carried on
+    /// the [`crate::windows_builder::OciImageConfig`] is itself
+    /// unserialisable, which is a programmer error in this crate.
+    #[error("failed to serialise manifest/image config: {source}")]
+    SerializeManifestFailed {
+        /// Underlying `serde_json` error.
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl BuildError {

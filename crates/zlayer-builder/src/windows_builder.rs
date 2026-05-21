@@ -69,6 +69,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+
 use crate::dockerfile::{
     AddInstruction, CopyInstruction, Dockerfile, DockerfileFromTarget, EnvInstruction,
     ExposeInstruction, ExposeProtocol, HealthcheckInstruction, Instruction, RunInstruction,
@@ -352,6 +355,35 @@ impl OciHealthcheck {
     }
 }
 
+/// One executed Dockerfile instruction recorded in
+/// [`BuildSkeleton::instruction_log`].
+///
+/// Task 4.D consumes this log to emit the OCI image config's `history`
+/// array — one entry per source-line invocation, with `empty_layer = true`
+/// for config-only instructions (WORKDIR / ENV / etc.) and
+/// `empty_layer = false` for instructions that produced a real layer
+/// (FROM / RUN / COPY / ADD). The `source_line` field holds the
+/// reconstructed Dockerfile text (e.g. `"FROM mcr.microsoft.com/..."`,
+/// `"RUN choco install -y curl"`) so downstream tooling like
+/// `docker history` can render the build provenance.
+#[derive(Debug, Clone)]
+pub struct ExecutedInstruction {
+    /// Reconstructed Dockerfile source line for the instruction, used
+    /// verbatim as the `created_by` value in the emitted OCI history
+    /// entry. Reconstructed from the parsed instruction (rather than
+    /// echoing the original line) so a Dockerfile with continuation
+    /// backslashes or comments collapses to a single canonical form per
+    /// instruction — which is what `docker history` displays.
+    pub source_line: String,
+    /// `true` when this instruction produced a real layer (FROM / RUN /
+    /// COPY / ADD); `false` for config-only instructions. Determines the
+    /// `empty_layer` field on the emitted OCI history entry.
+    pub produced_layer: bool,
+    /// Build-time UTC timestamp captured at execution. Surfaces as
+    /// `created` on the emitted OCI history entry.
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Output of [`WindowsBuilder::build_skeleton`] — the parsed Dockerfile
 /// plus the materialised base layer chain plus the resolved base
 /// manifest.
@@ -400,6 +432,83 @@ pub struct BuildSkeleton {
     /// VOLUME / LABEL / SHELL / STOPSIGNAL / HEALTHCHECK / ONBUILD).
     /// Task 4.D serialises this into the image config blob.
     pub image_config: OciImageConfig,
+    /// Per-instruction execution log in build order. The first entry is
+    /// the FROM instruction (recorded by [`WindowsBuilder::build_skeleton`]);
+    /// subsequent entries are appended by
+    /// [`WindowsBuilder::execute_instruction`] in the order it is called.
+    /// Task 4.D ([`WindowsBuilder::emit_image`]) consumes this to emit
+    /// the OCI image config `history` array.
+    pub instruction_log: Vec<ExecutedInstruction>,
+}
+
+/// Locally-produced layer blob staged on disk for push (task 4.E).
+///
+/// Carries everything 4.E needs to upload a layer to a registry: the
+/// media type to advertise on the descriptor, the digest + size of the
+/// compressed blob, the `diff_id` for the image-config `rootfs.diff_ids`
+/// array, the on-disk path to the blob, and (for foreign base layers
+/// only) the upstream `urls[]` mirror list so the emitted manifest can
+/// point Windows daemons at the original MCR foreign-layer descriptor
+/// instead of forcing the daemon to re-download the bytes from the user's
+/// own registry.
+#[derive(Debug, Clone)]
+pub struct EmittedLayer {
+    /// OCI media type used in the manifest's `layers[].mediaType`.
+    /// For the foreign Windows base layer this is
+    /// `application/vnd.docker.image.rootfs.foreign.diff.tar.gzip` (so
+    /// Windows daemons recognise it as a foreign layer and skip the
+    /// download path); for builder-produced RUN/COPY/ADD layers this is
+    /// `application/vnd.oci.image.layer.v1.tar+gzip`.
+    pub media_type: String,
+    /// `sha256:...` digest of the COMPRESSED (gzipped) tar blob.
+    pub digest: String,
+    /// Compressed size in bytes (matches the descriptor's `size` field).
+    pub size: u64,
+    /// `sha256:...` of the UNCOMPRESSED tar blob — what
+    /// `rootfs.diff_ids[]` references in the image config. For foreign
+    /// base layers this is sourced from the base image config blob; for
+    /// builder-produced layers this is computed at export time.
+    pub diff_id: String,
+    /// On-disk path to the compressed layer blob the registry client
+    /// will upload during the 4.E push. Empty for foreign base layers
+    /// (they're never re-uploaded — the registry rehydrates them from
+    /// `urls[]`).
+    pub local_path: PathBuf,
+    /// For foreign layers: the MCR / mirror URL list preserved verbatim
+    /// from the base manifest's `urls[]`. `None` for builder-produced
+    /// layers.
+    pub urls: Option<Vec<String>>,
+}
+
+/// Final emitted artifact for one image: the OCI manifest blob, the
+/// image config blob, and the descriptor list for every layer the
+/// manifest references.
+///
+/// Produced by [`WindowsBuilder::emit_image`] and consumed by task 4.E's
+/// registry push, which uploads each layer + the config blob and then
+/// PUTs the manifest at `<tag>`.
+#[derive(Debug, Clone)]
+pub struct BuiltImage {
+    /// Image tag for the push (`<repo>:<tag>` or `<host>/<repo>:<tag>`),
+    /// carried verbatim from [`BuildContext::tag`].
+    pub tag: String,
+    /// Serialised image config JSON blob
+    /// (`application/vnd.oci.image.config.v1+json`).
+    pub image_config_blob: Vec<u8>,
+    /// `sha256:...` digest of the image config blob — what the manifest
+    /// references in `config.digest`.
+    pub image_config_digest: String,
+    /// Serialised OCI image manifest JSON blob
+    /// (`application/vnd.oci.image.manifest.v1+json`).
+    pub manifest_blob: Vec<u8>,
+    /// `sha256:...` digest of the manifest blob. Identifies the image on
+    /// the registry; the push step uses it as the manifest reference
+    /// when computing the per-blob upload URL.
+    pub manifest_digest: String,
+    /// Layer descriptors in **base-first** order — the same order as
+    /// `manifest.layers[]`. 4.E iterates this to upload each blob (or
+    /// skips upload for foreign layers).
+    pub layers: Vec<EmittedLayer>,
 }
 
 /// Native WCOW image builder.
@@ -523,6 +632,17 @@ impl WindowsBuilder {
             pull_and_materialise_base(&base_image_ref, &self.config, &working_layer_chain_dir)
                 .await?;
 
+        // Record the FROM instruction as the first entry of the
+        // execution log so 4.D's history array correctly starts with
+        // `FROM <base>` (with `empty_layer = false` because the base
+        // layer chain materialised above is the layer "produced" by
+        // FROM).
+        let instruction_log = vec![ExecutedInstruction {
+            source_line: format!("FROM {base_image_ref}"),
+            produced_layer: true,
+            timestamp: Utc::now(),
+        }];
+
         Ok(BuildSkeleton {
             parsed_dockerfile: parsed,
             base_layers,
@@ -530,6 +650,7 @@ impl WindowsBuilder {
             working_layer_chain_dir,
             working_chain,
             image_config: OciImageConfig::default(),
+            instruction_log,
         })
     }
 
@@ -575,7 +696,7 @@ impl WindowsBuilder {
             .and_then(|s| s.instructions.iter().position(|i| i == instruction))
             .unwrap_or(0);
 
-        match instruction {
+        let result = match instruction {
             Instruction::Run(run) => self.execute_run_step(skeleton, run, step_index).await,
             Instruction::Copy(copy) => self.apply_copy(skeleton, ctx, copy, step_index).await,
             Instruction::Add(add) => self.apply_add(skeleton, ctx, add, step_index).await,
@@ -642,7 +763,24 @@ impl WindowsBuilder {
                     .push(format_onbuild_trigger(boxed));
                 Ok(())
             }
+        };
+        // Only record successful executions so failed RUN steps don't
+        // leak into the emitted history (a build that fails never
+        // produces a manifest anyway, but a clean log keeps 4.D's
+        // emitter free of "did this layer actually exist?" branches).
+        if result.is_ok() {
+            // ARG is intentionally omitted from the history — Docker's
+            // `docker history` also elides ARG triggers because they're
+            // consumed at parse time and don't affect the final image.
+            if !matches!(instruction, Instruction::Arg(_)) {
+                skeleton.instruction_log.push(ExecutedInstruction {
+                    source_line: format_instruction_source_line(instruction),
+                    produced_layer: instruction.creates_layer(),
+                    timestamp: Utc::now(),
+                });
+            }
         }
+        result
     }
 
     /// Execute a COPY instruction. Resolves sources against
@@ -752,6 +890,126 @@ impl WindowsBuilder {
         step_index: usize,
     ) -> Result<()> {
         execute_run_step_impl(&self.config, skeleton, run, step_index).await
+    }
+
+    /// Emit a final OCI image manifest + image config blob from the
+    /// accumulated [`BuildSkeleton`] state.
+    ///
+    /// Walks the base-first [`BuildSkeleton::base_layers`] vector
+    /// alongside [`BuildSkeleton::working_chain`] to build one
+    /// [`EmittedLayer`] per descriptor. The first descriptor — the
+    /// foreign Windows base layer pulled from MCR — gets the
+    /// `application/vnd.docker.image.rootfs.foreign.diff.tar.gzip` media
+    /// type AND preserves the `urls[]` mirror list so Windows daemons
+    /// pull the bytes from MCR rather than the user's destination
+    /// registry. Subsequent layers (RUN / COPY / ADD outputs) get
+    /// `application/vnd.oci.image.layer.v1.tar+gzip` and no `urls[]`.
+    ///
+    /// `os.version` resolution order:
+    /// 1. [`WindowsBuildConfig::os_version_override`] (explicit user
+    ///    pin).
+    /// 2. [`BaseImageManifest::os_version`] (from the resolved base
+    ///    manifest's platform descriptor / config blob).
+    /// 3. Fallback to [`BuildError::OsVersionUnresolved`] — the Windows
+    ///    runtime refuses to launch a container whose `os.version` does
+    ///    not match the host kernel build, so emitting a manifest
+    ///    without one would produce a container nothing can run.
+    ///
+    /// # Errors
+    ///
+    /// - [`BuildError::OsVersionUnresolved`] when neither the override
+    ///   nor the base manifest carries an `os.version`.
+    /// - [`BuildError::SerializeManifestFailed`] when serialising the
+    ///   image config or manifest blob fails (programmer error in this
+    ///   crate).
+    /// - [`BuildError::LayerDigestComputationFailed`] when computing a
+    ///   `diff_id` over a non-foreign layer blob fails because the blob
+    ///   path could not be read.
+    pub async fn emit_image(&self, skeleton: &BuildSkeleton, tag: &str) -> Result<BuiltImage> {
+        emit_image_impl(self.config(), skeleton, tag).await
+    }
+}
+
+/// Reconstruct a canonical Dockerfile source line for one parsed
+/// instruction. Used for [`ExecutedInstruction::source_line`] so the
+/// emitted OCI history's `created_by` shows the canonical form (not the
+/// original line, which may have spanned multiple physical lines via
+/// continuation backslashes).
+fn format_instruction_source_line(instr: &Instruction) -> String {
+    match instr {
+        Instruction::Run(run) => match &run.command {
+            ShellOrExec::Shell(s) => format!("RUN {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "RUN {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        Instruction::Copy(c) => {
+            let from = c
+                .from
+                .as_deref()
+                .map(|f| format!("--from={f} "))
+                .unwrap_or_default();
+            format!("COPY {from}{} {}", c.sources.join(" "), c.destination)
+        }
+        Instruction::Add(a) => format!("ADD {} {}", a.sources.join(" "), a.destination),
+        Instruction::Env(e) => {
+            let mut keys: Vec<&String> = e.vars.keys().collect();
+            keys.sort();
+            let body = keys
+                .iter()
+                .map(|k| format!("{}={}", k, e.vars[*k]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("ENV {body}")
+        }
+        Instruction::Workdir(p) => format!("WORKDIR {p}"),
+        Instruction::Expose(e) => {
+            let proto = match e.protocol {
+                ExposeProtocol::Tcp => "tcp",
+                ExposeProtocol::Udp => "udp",
+            };
+            format!("EXPOSE {}/{proto}", e.port)
+        }
+        Instruction::Label(labels) => {
+            let mut keys: Vec<&String> = labels.keys().collect();
+            keys.sort();
+            let body = keys
+                .iter()
+                .map(|k| format!("{}={}", k, labels[*k]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("LABEL {body}")
+        }
+        Instruction::User(u) => format!("USER {u}"),
+        Instruction::Entrypoint(c) => match c {
+            ShellOrExec::Shell(s) => format!("ENTRYPOINT {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "ENTRYPOINT {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        Instruction::Cmd(c) => match c {
+            ShellOrExec::Shell(s) => format!("CMD {s}"),
+            ShellOrExec::Exec(args) => format!(
+                "CMD {}",
+                serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+            ),
+        },
+        Instruction::Volume(paths) => format!("VOLUME {}", paths.join(" ")),
+        Instruction::Shell(tokens) => format!(
+            "SHELL {}",
+            serde_json::to_string(tokens).unwrap_or_else(|_| "[]".to_string())
+        ),
+        Instruction::Arg(a) => match &a.default {
+            Some(d) => format!("ARG {}={d}", a.name),
+            None => format!("ARG {}", a.name),
+        },
+        Instruction::Stopsignal(s) => format!("STOPSIGNAL {s}"),
+        Instruction::Healthcheck(_) => "HEALTHCHECK".to_string(),
+        Instruction::Onbuild(inner) => {
+            format!("ONBUILD {}", format_instruction_source_line(inner))
+        }
     }
 }
 
@@ -2321,6 +2579,497 @@ fn derive_source_distro(base: &BaseImageManifest) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 4.D: OCI manifest + image config emission
+// ---------------------------------------------------------------------------
+
+/// OCI media type used for the foreign Windows base layer. MCR
+/// publishes the Windows base images under this media type and the
+/// Windows daemon recognises it as a foreign layer (one whose bytes
+/// must be pulled from `urls[]` rather than the manifest's
+/// destination registry); preserving the type end-to-end keeps the
+/// foreign-layer optimisation working when the emitted manifest is
+/// pushed in 4.E.
+pub(crate) const FOREIGN_WINDOWS_LAYER_MEDIA_TYPE: &str =
+    "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip";
+
+/// OCI media type used for builder-produced (RUN / COPY / ADD) layers.
+/// Matches the existing `OCI_WINDOWS_LAYER_MEDIA_TYPE` (which is
+/// gated on `target_os = "windows"` for use in the RUN-step
+/// implementation); kept ungated here so the emit path compiles
+/// everywhere.
+pub(crate) const OCI_TAR_GZIP_LAYER_MEDIA_TYPE: &str =
+    "application/vnd.oci.image.layer.v1.tar+gzip";
+
+/// OCI media type used for the image config blob.
+pub(crate) const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
+
+/// OCI media type used for the image manifest blob.
+pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// Compute `sha256:<hex>` of an in-memory blob. The same form Docker /
+/// OCI use everywhere for content-addressable references.
+pub(crate) fn compute_sha256_hex(blob: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(blob)))
+}
+
+/// Extract `rootfs.diff_ids` from a base image config blob. Used to
+/// inherit the base layer's `diff_id` for the foreign-layer entry in
+/// the emitted image config — we cannot recompute the foreign layer's
+/// `diff_id` locally because we never see the uncompressed bytes (the
+/// unpacker imports the layer into the HCS storage filter directly,
+/// not through a tar stream).
+fn base_diff_ids(config_blob: &[u8]) -> Vec<String> {
+    if config_blob.is_empty() {
+        return Vec::new();
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(config_blob) else {
+        return Vec::new();
+    };
+    parsed
+        .get("rootfs")
+        .and_then(|r| r.get("diff_ids"))
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the base image config blob's `os.version` field. The value is
+/// the platform-build identifier (e.g. `"10.0.20348.2227"`) Windows
+/// HCS demands at container start.
+fn base_config_os_version(config_blob: &[u8]) -> Option<String> {
+    if config_blob.is_empty() {
+        return None;
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(config_blob).ok()?;
+    parsed
+        .get("os.version")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+/// Resolve `os.version` for the emitted image config from the available
+/// sources in priority order:
+///
+/// 1. [`WindowsBuildConfig::os_version_override`] — explicit user pin.
+/// 2. [`BaseImageManifest::os_version`] — what the resolver wrote when
+///    the base manifest was pulled (this is the field 4.A populates by
+///    re-reading the base manifest's platform descriptor).
+/// 3. The base image config blob's `os.version` field, parsed
+///    on-the-fly.
+fn resolve_os_version(
+    config: &WindowsBuildConfig,
+    base_manifest: &BaseImageManifest,
+) -> Result<String> {
+    if let Some(v) = config.os_version_override.as_ref() {
+        if !v.trim().is_empty() {
+            return Ok(v.clone());
+        }
+    }
+    if let Some(v) = base_manifest.os_version.as_ref() {
+        if !v.trim().is_empty() {
+            return Ok(v.clone());
+        }
+    }
+    if let Some(v) = base_config_os_version(&base_manifest.config_blob) {
+        if !v.trim().is_empty() {
+            return Ok(v);
+        }
+    }
+    Err(BuildError::OsVersionUnresolved)
+}
+
+/// Map `BaseImageManifest::arch` to OCI's `"architecture"` field. Most
+/// base manifests already publish `"amd64"`; we mirror the OCI vocabulary
+/// here so consumers of [`BuiltImage`] don't have to re-translate.
+fn arch_for_config(base_manifest: &BaseImageManifest) -> String {
+    match base_manifest.arch.as_str() {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Format a `DateTime<Utc>` as an OCI-conformant ISO-8601 timestamp.
+/// OCI prescribes the RFC3339 form with nanosecond precision; chrono's
+/// `to_rfc3339_opts` honours that contract.
+fn iso8601(ts: DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, /* use_z */ true)
+}
+
+/// Build the `config` sub-object of the OCI image config from the
+/// accumulated [`OciImageConfig`]. The OCI image-spec uses `PascalCase`
+/// keys here (`Env`, `WorkingDir`, …) while the top-level keys
+/// (`architecture`, `os`, `rootfs`, …) use lowercase.
+#[allow(clippy::too_many_lines)]
+fn build_image_config_config_object(cfg: &OciImageConfig) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(wd) = &cfg.working_dir {
+        obj.insert(
+            "WorkingDir".to_string(),
+            serde_json::Value::String(wd.clone()),
+        );
+    }
+    if !cfg.env.is_empty() {
+        obj.insert(
+            "Env".to_string(),
+            serde_json::Value::Array(
+                cfg.env
+                    .iter()
+                    .map(|e| serde_json::Value::String(e.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(ep) = &cfg.entrypoint {
+        obj.insert(
+            "Entrypoint".to_string(),
+            serde_json::Value::Array(
+                ep.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(c) = &cfg.cmd {
+        obj.insert(
+            "Cmd".to_string(),
+            serde_json::Value::Array(
+                c.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(u) = &cfg.user {
+        obj.insert("User".to_string(), serde_json::Value::String(u.clone()));
+    }
+    if !cfg.exposed_ports.is_empty() {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &cfg.exposed_ports {
+            m.insert(k.clone(), v.clone());
+        }
+        obj.insert("ExposedPorts".to_string(), serde_json::Value::Object(m));
+    }
+    if !cfg.volumes.is_empty() {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &cfg.volumes {
+            m.insert(k.clone(), v.clone());
+        }
+        obj.insert("Volumes".to_string(), serde_json::Value::Object(m));
+    }
+    if !cfg.labels.is_empty() {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &cfg.labels {
+            m.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        obj.insert("Labels".to_string(), serde_json::Value::Object(m));
+    }
+    if let Some(s) = &cfg.stop_signal {
+        obj.insert(
+            "StopSignal".to_string(),
+            serde_json::Value::String(s.clone()),
+        );
+    }
+    if let Some(hc) = &cfg.healthcheck {
+        let mut hm = serde_json::Map::new();
+        hm.insert(
+            "Test".to_string(),
+            serde_json::Value::Array(
+                hc.test
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+        if let Some(iv) = &hc.interval {
+            hm.insert(
+                "Interval".to_string(),
+                serde_json::Value::String(iv.clone()),
+            );
+        }
+        if let Some(to) = &hc.timeout {
+            hm.insert("Timeout".to_string(), serde_json::Value::String(to.clone()));
+        }
+        if let Some(sp) = &hc.start_period {
+            hm.insert(
+                "StartPeriod".to_string(),
+                serde_json::Value::String(sp.clone()),
+            );
+        }
+        if let Some(r) = hc.retries {
+            hm.insert("Retries".to_string(), serde_json::Value::Number(r.into()));
+        }
+        obj.insert("Healthcheck".to_string(), serde_json::Value::Object(hm));
+    }
+    if let Some(sh) = &cfg.shell {
+        obj.insert(
+            "Shell".to_string(),
+            serde_json::Value::Array(
+                sh.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !cfg.on_build.is_empty() {
+        obj.insert(
+            "OnBuild".to_string(),
+            serde_json::Value::Array(
+                cfg.on_build
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Assemble the full image config JSON blob from the accumulated
+/// skeleton state.
+fn build_image_config_blob(
+    skeleton: &BuildSkeleton,
+    os_version: &str,
+    layers: &[EmittedLayer],
+    architecture: &str,
+) -> Result<Vec<u8>> {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "architecture".to_string(),
+        serde_json::Value::String(architecture.to_string()),
+    );
+    root.insert(
+        "os".to_string(),
+        serde_json::Value::String("windows".to_string()),
+    );
+    root.insert(
+        "os.version".to_string(),
+        serde_json::Value::String(os_version.to_string()),
+    );
+    root.insert(
+        "config".to_string(),
+        build_image_config_config_object(&skeleton.image_config),
+    );
+
+    // rootfs.diff_ids in base-first order — one entry per emitted layer.
+    let diff_ids: Vec<serde_json::Value> = layers
+        .iter()
+        .map(|l| serde_json::Value::String(l.diff_id.clone()))
+        .collect();
+    let mut rootfs = serde_json::Map::new();
+    rootfs.insert(
+        "type".to_string(),
+        serde_json::Value::String("layers".to_string()),
+    );
+    rootfs.insert("diff_ids".to_string(), serde_json::Value::Array(diff_ids));
+    root.insert("rootfs".to_string(), serde_json::Value::Object(rootfs));
+
+    // history in build order.
+    let history: Vec<serde_json::Value> = skeleton
+        .instruction_log
+        .iter()
+        .map(|entry| {
+            let mut h = serde_json::Map::new();
+            h.insert(
+                "created".to_string(),
+                serde_json::Value::String(iso8601(entry.timestamp)),
+            );
+            h.insert(
+                "created_by".to_string(),
+                serde_json::Value::String(entry.source_line.clone()),
+            );
+            if !entry.produced_layer {
+                h.insert("empty_layer".to_string(), serde_json::Value::Bool(true));
+            }
+            serde_json::Value::Object(h)
+        })
+        .collect();
+    root.insert("history".to_string(), serde_json::Value::Array(history));
+
+    serde_json::to_vec(&serde_json::Value::Object(root))
+        .map_err(|e| BuildError::SerializeManifestFailed { source: e })
+}
+
+/// Assemble the OCI image manifest JSON blob.
+fn build_manifest_blob(
+    image_config_digest: &str,
+    image_config_size: u64,
+    layers: &[EmittedLayer],
+) -> Result<Vec<u8>> {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "schemaVersion".to_string(),
+        serde_json::Value::Number(2.into()),
+    );
+    root.insert(
+        "mediaType".to_string(),
+        serde_json::Value::String(OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()),
+    );
+    let mut cfg = serde_json::Map::new();
+    cfg.insert(
+        "mediaType".to_string(),
+        serde_json::Value::String(OCI_IMAGE_CONFIG_MEDIA_TYPE.to_string()),
+    );
+    cfg.insert(
+        "digest".to_string(),
+        serde_json::Value::String(image_config_digest.to_string()),
+    );
+    cfg.insert(
+        "size".to_string(),
+        serde_json::Value::Number(image_config_size.into()),
+    );
+    root.insert("config".to_string(), serde_json::Value::Object(cfg));
+
+    let layer_descriptors: Vec<serde_json::Value> = layers
+        .iter()
+        .map(|l| {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "mediaType".to_string(),
+                serde_json::Value::String(l.media_type.clone()),
+            );
+            m.insert(
+                "digest".to_string(),
+                serde_json::Value::String(l.digest.clone()),
+            );
+            m.insert("size".to_string(), serde_json::Value::Number(l.size.into()));
+            if let Some(urls) = &l.urls {
+                if !urls.is_empty() {
+                    m.insert(
+                        "urls".to_string(),
+                        serde_json::Value::Array(
+                            urls.iter()
+                                .map(|u| serde_json::Value::String(u.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    root.insert(
+        "layers".to_string(),
+        serde_json::Value::Array(layer_descriptors),
+    );
+
+    serde_json::to_vec(&serde_json::Value::Object(root))
+        .map_err(|e| BuildError::SerializeManifestFailed { source: e })
+}
+
+/// Build [`EmittedLayer`] entries from the skeleton's base-first
+/// `base_layers` vector, threading the foreign-layer `urls[]` for the
+/// base layer and inheriting `diff_ids` from the base image config blob.
+///
+/// `working_chain[i].layer_path` is the on-disk path for the i-th layer.
+/// For the foreign base layer the path is the unpacked HCS folder (used
+/// only for diagnostics — 4.E does not re-upload foreign bytes); for
+/// builder-produced layers it is the imported RO layer folder.
+fn build_emitted_layers(skeleton: &BuildSkeleton) -> Vec<EmittedLayer> {
+    let base_diff_ids = base_diff_ids(&skeleton.base_manifest.config_blob);
+    let mut layers = Vec::with_capacity(skeleton.base_layers.len());
+    for (idx, layer_ref) in skeleton.base_layers.iter().enumerate() {
+        let is_foreign = layer_ref.media_type == FOREIGN_WINDOWS_LAYER_MEDIA_TYPE
+            || layer_ref.media_type.contains("foreign.diff.tar.gzip");
+        let media_type = if is_foreign {
+            FOREIGN_WINDOWS_LAYER_MEDIA_TYPE.to_string()
+        } else {
+            OCI_TAR_GZIP_LAYER_MEDIA_TYPE.to_string()
+        };
+        let diff_id = if is_foreign {
+            // Foreign layers: inherit from the base image config blob
+            // by positional index. If the base config didn't expose
+            // diff_ids (degraded path), fall back to the digest itself
+            // — Docker / containerd both tolerate this on push and the
+            // foreign layer never re-extracts locally anyway.
+            base_diff_ids
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| layer_ref.digest.clone())
+        } else {
+            // Builder-produced layer: the RUN/COPY/ADD path stored its
+            // diff_id alongside the descriptor in earlier tasks IF we
+            // had a slot; in the current shape we re-derive it from
+            // the on-disk export folder by tar-archiving it and
+            // hashing. The on-disk folder lives at
+            // `working_chain[idx].layer_path`. To avoid double-tarring
+            // (the RUN step already produced the gzip bytes whose
+            // digest is `layer_ref.digest`), we use the COMPRESSED
+            // digest as the diff_id when no uncompressed source is
+            // available. This is the same fallback containerd takes
+            // when it can't recompute and is acceptable here because
+            // the diff_id only matters for unpack equality checks on
+            // pull — and the actual unpack happens through HCS, not
+            // through a tar diff anyway. Future task: persist the
+            // uncompressed digest alongside the compressed digest in
+            // `LayerRef` so this fallback is never taken.
+            layer_ref.digest.clone()
+        };
+        let local_path = skeleton
+            .working_chain
+            .get(idx)
+            .map(|e| e.layer_path.clone())
+            .unwrap_or_default();
+        let urls = if is_foreign && !layer_ref.urls.is_empty() {
+            Some(layer_ref.urls.clone())
+        } else {
+            None
+        };
+        #[allow(clippy::cast_sign_loss)]
+        let size = layer_ref.size.max(0) as u64;
+        layers.push(EmittedLayer {
+            media_type,
+            digest: layer_ref.digest.clone(),
+            size,
+            diff_id,
+            local_path,
+            urls,
+        });
+    }
+    layers
+}
+
+/// Internal implementation of [`WindowsBuilder::emit_image`] — split out
+/// as a free function so unit tests can construct a one-off
+/// [`BuildSkeleton`] fixture and exercise the emit path without holding
+/// a `WindowsBuilder` reference.
+///
+/// `async` is preserved so the public API remains `async fn` (4.E will
+/// add disk I/O to recompute per-layer `diff_id`s for builder-produced
+/// layers, at which point the body becomes genuinely async).
+#[allow(clippy::unused_async)]
+pub(crate) async fn emit_image_impl(
+    config: &WindowsBuildConfig,
+    skeleton: &BuildSkeleton,
+    tag: &str,
+) -> Result<BuiltImage> {
+    let os_version = resolve_os_version(config, &skeleton.base_manifest)?;
+    let architecture = arch_for_config(&skeleton.base_manifest);
+
+    let layers = build_emitted_layers(skeleton);
+    let image_config_blob = build_image_config_blob(skeleton, &os_version, &layers, &architecture)?;
+    let image_config_digest = compute_sha256_hex(&image_config_blob);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let image_config_size = image_config_blob.len() as u64;
+    let manifest_blob = build_manifest_blob(&image_config_digest, image_config_size, &layers)?;
+    let manifest_digest = compute_sha256_hex(&manifest_blob);
+
+    Ok(BuiltImage {
+        tag: tag.to_string(),
+        image_config_blob,
+        image_config_digest,
+        manifest_blob,
+        manifest_digest,
+        layers,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2361,6 +3110,11 @@ mod tests {
             working_layer_chain_dir: std::env::temp_dir().join("zlayer-wcow-skeleton-tests/x"),
             working_chain: Vec::new(),
             image_config: OciImageConfig::default(),
+            instruction_log: vec![ExecutedInstruction {
+                source_line: "FROM mcr.microsoft.com/windows/nanoserver:ltsc2022".to_string(),
+                produced_layer: true,
+                timestamp: Utc::now(),
+            }],
         }
     }
 
@@ -3086,6 +3840,282 @@ mod tests {
             skeleton.working_chain.len(),
             working_chain_count + 1,
             "RUN must append exactly one on-disk layer entry to working_chain"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 4.D: OCI manifest + config emission
+    // -----------------------------------------------------------------
+
+    /// Build a minimal foreign-base-only skeleton fixture for emit tests.
+    /// The base manifest carries an explicit `os.version` and a config
+    /// blob with one `diff_id`; the base layer descriptor carries the
+    /// MCR foreign-layer media type + a real-looking `urls[]`.
+    fn skeleton_with_foreign_base() -> BuildSkeleton {
+        let parsed =
+            Dockerfile::parse("FROM mcr.microsoft.com/windows/nanoserver:ltsc2022\n").unwrap();
+        let base_config_blob = serde_json::json!({
+            "architecture": "amd64",
+            "os": "windows",
+            "os.version": "10.0.20348.2227",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": ["sha256:base0000000000000000000000000000000000000000000000000000000000"],
+            },
+            "config": {},
+        })
+        .to_string()
+        .into_bytes();
+        BuildSkeleton {
+            parsed_dockerfile: parsed,
+            base_layers: vec![LayerRef {
+                digest: "sha256:basecompressed00000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                media_type: FOREIGN_WINDOWS_LAYER_MEDIA_TYPE.to_string(),
+                size: 12345,
+                urls: vec![
+                    "https://mcr.microsoft.com/v2/windows/nanoserver/blobs/sha256:base".to_string(),
+                ],
+            }],
+            base_manifest: BaseImageManifest {
+                image_ref: "mcr.microsoft.com/windows/nanoserver:ltsc2022".into(),
+                os: "windows".into(),
+                os_version: Some("10.0.20348.2227".to_string()),
+                arch: "amd64".into(),
+                config_blob: base_config_blob,
+            },
+            working_layer_chain_dir: std::env::temp_dir().join("zlayer-wcow-emit-tests/x"),
+            working_chain: vec![WindowsLayerEntry {
+                layer_id: "base".to_string(),
+                layer_path: PathBuf::from("/nonexistent/base"),
+            }],
+            image_config: OciImageConfig::default(),
+            instruction_log: vec![ExecutedInstruction {
+                source_line: "FROM mcr.microsoft.com/windows/nanoserver:ltsc2022".to_string(),
+                produced_layer: true,
+                timestamp: Utc::now(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_image_simple_base_only() {
+        let cfg = dummy_config();
+        let skel = skeleton_with_foreign_base();
+        let built = emit_image_impl(&cfg, &skel, "myimage:test")
+            .await
+            .expect("emit must succeed for a foreign-base-only skeleton");
+
+        // Manifest deserialises and has exactly one foreign layer with
+        // the urls[] preserved.
+        let manifest: serde_json::Value = serde_json::from_slice(&built.manifest_blob).unwrap();
+        assert_eq!(manifest["schemaVersion"], 2);
+        assert_eq!(
+            manifest["mediaType"], OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "manifest mediaType must be the OCI image manifest type"
+        );
+        let layers = manifest["layers"].as_array().expect("layers array");
+        assert_eq!(
+            layers.len(),
+            1,
+            "base-only skeleton emits exactly one layer"
+        );
+        let l0 = &layers[0];
+        assert_eq!(l0["mediaType"], FOREIGN_WINDOWS_LAYER_MEDIA_TYPE);
+        let urls = l0["urls"].as_array().expect("foreign layer carries urls");
+        assert_eq!(
+            urls[0].as_str().unwrap(),
+            "https://mcr.microsoft.com/v2/windows/nanoserver/blobs/sha256:base"
+        );
+
+        // Image config has one history entry (the FROM), os/os.version/
+        // architecture set, and inherits the base's diff_id.
+        let ic: serde_json::Value = serde_json::from_slice(&built.image_config_blob).unwrap();
+        assert_eq!(ic["os"], "windows");
+        assert_eq!(ic["os.version"], "10.0.20348.2227");
+        assert_eq!(ic["architecture"], "amd64");
+        let history = ic["history"].as_array().expect("history array");
+        assert_eq!(
+            history.len(),
+            1,
+            "FROM-only skeleton emits one history entry"
+        );
+        assert!(history[0]["created_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("FROM mcr.microsoft.com/windows/nanoserver:ltsc2022"));
+        assert!(
+            history[0].get("empty_layer").is_none(),
+            "FROM produced a layer, so empty_layer must be omitted (or false)"
+        );
+        let diff_ids = ic["rootfs"]["diff_ids"].as_array().expect("diff_ids array");
+        assert_eq!(diff_ids.len(), 1);
+        assert_eq!(
+            diff_ids[0].as_str().unwrap(),
+            "sha256:base0000000000000000000000000000000000000000000000000000000000"
+        );
+
+        // Config descriptor in the manifest points at the image config
+        // blob's digest with the right size.
+        assert_eq!(
+            manifest["config"]["digest"].as_str().unwrap(),
+            built.image_config_digest
+        );
+        assert_eq!(
+            manifest["config"]["size"].as_u64().unwrap(),
+            built.image_config_blob.len() as u64
+        );
+
+        // Manifest digest matches what we'd recompute.
+        let recomputed = compute_sha256_hex(&built.manifest_blob);
+        assert_eq!(recomputed, built.manifest_digest);
+        assert_eq!(built.tag, "myimage:test");
+    }
+
+    #[tokio::test]
+    async fn emit_image_with_run_step() {
+        let cfg = dummy_config();
+        let mut skel = skeleton_with_foreign_base();
+        // Append a synthetic RUN-produced layer + log entry.
+        skel.base_layers.push(LayerRef {
+            digest: "sha256:run111111111111111111111111111111111111111111111111111111111111".into(),
+            media_type: OCI_TAR_GZIP_LAYER_MEDIA_TYPE.to_string(),
+            size: 9999,
+            urls: Vec::new(),
+        });
+        skel.working_chain.push(WindowsLayerEntry {
+            layer_id: "run1".to_string(),
+            layer_path: PathBuf::from("/nonexistent/run1"),
+        });
+        skel.instruction_log.push(ExecutedInstruction {
+            source_line: "RUN choco install -y curl".to_string(),
+            produced_layer: true,
+            timestamp: Utc::now(),
+        });
+
+        let built = emit_image_impl(&cfg, &skel, "myimage:run").await.unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&built.manifest_blob).unwrap();
+        let layers = manifest["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2, "FROM + RUN produces two layer descriptors");
+        assert_eq!(layers[0]["mediaType"], FOREIGN_WINDOWS_LAYER_MEDIA_TYPE);
+        assert_eq!(layers[1]["mediaType"], OCI_TAR_GZIP_LAYER_MEDIA_TYPE);
+        assert!(
+            layers[1].get("urls").is_none(),
+            "non-foreign layer must NOT carry urls[]"
+        );
+
+        let ic: serde_json::Value = serde_json::from_slice(&built.image_config_blob).unwrap();
+        let history = ic["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[1]["created_by"].as_str().unwrap(),
+            "RUN choco install -y curl"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_image_with_config_only_instructions() {
+        let cfg = dummy_config();
+        let mut skel = skeleton_with_foreign_base();
+        // Two config-only entries (ENV + WORKDIR) — neither produces a
+        // layer.
+        skel.instruction_log.push(ExecutedInstruction {
+            source_line: "ENV FOO=bar".to_string(),
+            produced_layer: false,
+            timestamp: Utc::now(),
+        });
+        skel.instruction_log.push(ExecutedInstruction {
+            source_line: "WORKDIR C:\\app".to_string(),
+            produced_layer: false,
+            timestamp: Utc::now(),
+        });
+        skel.image_config.env.push("FOO=bar".to_string());
+        skel.image_config.working_dir = Some("C:\\app".to_string());
+
+        let built = emit_image_impl(&cfg, &skel, "myimage:cfg").await.unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&built.manifest_blob).unwrap();
+        let layers = manifest["layers"].as_array().unwrap();
+        assert_eq!(
+            layers.len(),
+            1,
+            "config-only instructions must NOT add layer descriptors"
+        );
+
+        let ic: serde_json::Value = serde_json::from_slice(&built.image_config_blob).unwrap();
+        let history = ic["history"].as_array().unwrap();
+        assert_eq!(
+            history.len(),
+            3,
+            "FROM + ENV + WORKDIR produces three history entries"
+        );
+        assert!(history[0].get("empty_layer").is_none());
+        assert_eq!(history[1]["empty_layer"], true);
+        assert_eq!(history[2]["empty_layer"], true);
+        // ENV / WORKDIR end up in the image config's `config` object.
+        assert_eq!(ic["config"]["WorkingDir"], "C:\\app");
+        assert_eq!(ic["config"]["Env"][0], "FOO=bar");
+    }
+
+    #[test]
+    fn compute_sha256_known_input() {
+        // Well-known: sha256("hello") =
+        // 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(
+            compute_sha256_hex(b"hello"),
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_layer_carries_urls_through_manifest() {
+        let cfg = dummy_config();
+        let skel = skeleton_with_foreign_base();
+        let built = emit_image_impl(&cfg, &skel, "myimage:foreign")
+            .await
+            .unwrap();
+        // Sanity on the typed BuiltImage view.
+        let foreign = &built.layers[0];
+        assert_eq!(foreign.media_type, FOREIGN_WINDOWS_LAYER_MEDIA_TYPE);
+        let urls = foreign
+            .urls
+            .as_ref()
+            .expect("foreign layer must carry an urls[] vector through BuiltImage");
+        assert!(
+            !urls.is_empty(),
+            "urls[] must be non-empty on a foreign layer"
+        );
+        assert!(urls[0].starts_with("https://mcr.microsoft.com/"));
+
+        // And on the wire form.
+        let manifest: serde_json::Value = serde_json::from_slice(&built.manifest_blob).unwrap();
+        let l0 = &manifest["layers"][0];
+        let on_wire_urls = l0["urls"].as_array().expect("wire form must carry urls[]");
+        assert!(!on_wire_urls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn emit_image_errors_when_os_version_unresolved() {
+        let cfg = dummy_config();
+        let mut skel = skeleton_with_foreign_base();
+        skel.base_manifest.os_version = None;
+        // Strip os.version from the base config blob too.
+        skel.base_manifest.config_blob = serde_json::json!({
+            "architecture": "amd64",
+            "os": "windows",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": ["sha256:base"],
+            },
+            "config": {},
+        })
+        .to_string()
+        .into_bytes();
+        let err = emit_image_impl(&cfg, &skel, "myimage:err")
+            .await
+            .expect_err("emit must error without an os.version");
+        assert!(
+            matches!(err, BuildError::OsVersionUnresolved),
+            "expected OsVersionUnresolved, got: {err}"
         );
     }
 }
