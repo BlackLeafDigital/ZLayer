@@ -344,6 +344,10 @@ fn enrich_resources_with_gpus_short(
         scheduling: None,
         distributed: None,
         sharing: None,
+        mps_pipe_dir: None,
+        mps_log_dir: None,
+        time_slice_index: None,
+        time_slicing_config_path: None,
     });
     spec
 }
@@ -896,6 +900,10 @@ fn enrich_resources_with_gpu(
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
         break;
     }

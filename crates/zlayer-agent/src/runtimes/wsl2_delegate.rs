@@ -2600,6 +2600,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         }
     }
 

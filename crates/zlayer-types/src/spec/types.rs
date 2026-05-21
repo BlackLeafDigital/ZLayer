@@ -1838,6 +1838,38 @@ pub struct GpuSpec {
     /// GPU sharing mode: exclusive (default), mps, or time-slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharing: Option<GpuSharingMode>,
+    /// Host directory for the NVIDIA MPS control pipe.
+    ///
+    /// Only consulted when `sharing == Mps`. Defaults to `/tmp/nvidia-mps`
+    /// when unset. The directory MUST exist on the host (created by the
+    /// `nvidia-cuda-mps-control` daemon). It is bind-mounted into the
+    /// container at the same path and exported as `CUDA_MPS_PIPE_DIRECTORY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mps_pipe_dir: Option<String>,
+    /// Host directory for NVIDIA MPS log output.
+    ///
+    /// Only consulted when `sharing == Mps`. Defaults to `/tmp/nvidia-log`
+    /// when unset. The directory MUST exist on the host. It is bind-mounted
+    /// into the container and exported as `CUDA_MPS_LOG_DIRECTORY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mps_log_dir: Option<String>,
+    /// CUDA device index this replica should see when `sharing == TimeSlice`.
+    ///
+    /// Emitted as `CUDA_VISIBLE_DEVICES=<slice_index>`, overriding the default
+    /// 0..count visibility list. Use this together with a host-side NVIDIA
+    /// time-slicing config to advertise a single physical GPU as multiple
+    /// virtual slices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_slice_index: Option<u32>,
+    /// Optional host path to a NVIDIA time-slicing config YAML.
+    ///
+    /// When set, the file is bind-mounted read-only at
+    /// `/etc/nvidia/gpu-time-slicing.yaml` inside the container so tools that
+    /// inspect the slicing topology (e.g. monitoring sidecars) can read it.
+    /// The file is not interpreted by `ZLayer` — it's purely informational for
+    /// the workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_slicing_config_path: Option<String>,
 }
 
 fn default_gpu_count() -> u32 {

@@ -1733,6 +1733,10 @@ mod tests {
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
         spec
     }
@@ -2000,6 +2004,10 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("gpu-gang", &spec, 3, &mut nodes, &mut placements);
@@ -2033,6 +2041,10 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("gpu-gang", &spec, 4, &mut nodes, &mut placements);
@@ -2072,6 +2084,10 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Spread),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("spread-svc", &spec, 1, &mut nodes, &mut placements);

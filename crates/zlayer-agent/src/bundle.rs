@@ -21,7 +21,70 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
 use zlayer_secrets::SecretsProvider;
-use zlayer_spec::{ServiceSpec, StorageSpec, StorageTier};
+use zlayer_spec::{GpuSharingMode, ServiceSpec, StorageSpec, StorageTier};
+
+/// Default host directory for the NVIDIA MPS control pipe when the spec
+/// doesn't override [`zlayer_spec::GpuSpec::mps_pipe_dir`].
+const DEFAULT_MPS_PIPE_DIR: &str = "/tmp/nvidia-mps";
+
+/// Default host directory for NVIDIA MPS log output when the spec doesn't
+/// override [`zlayer_spec::GpuSpec::mps_log_dir`].
+const DEFAULT_MPS_LOG_DIR: &str = "/tmp/nvidia-log";
+
+/// Container path where a host-supplied NVIDIA time-slicing config YAML is
+/// surfaced (read-only). The file is informational — `ZLayer` doesn't interpret
+/// it; tools running inside the container can read it to discover slice
+/// topology.
+const TIMESLICE_CONFIG_CONTAINER_PATH: &str = "/etc/nvidia/gpu-time-slicing.yaml";
+
+/// Resolved MPS host directories (pipe + log), validated to exist on disk.
+///
+/// Returned by [`resolve_mps_dirs`] only when `GpuSpec.sharing == Mps`. Both
+/// paths are absolute and guaranteed to be directories at the time the
+/// helper ran — callers can bind-mount them directly.
+struct MpsDirs {
+    pipe_dir: PathBuf,
+    log_dir: PathBuf,
+}
+
+/// Resolve and validate the MPS pipe / log directories for a GPU spec.
+///
+/// Returns `Ok(None)` when sharing is not MPS (or absent), `Ok(Some(...))`
+/// when both directories exist on the host, or
+/// [`AgentError::GpuSharingUnavailable`] when either directory is missing.
+///
+/// Defaults to [`DEFAULT_MPS_PIPE_DIR`] / [`DEFAULT_MPS_LOG_DIR`] when the
+/// spec omits explicit paths, matching the convention used by
+/// `nvidia-cuda-mps-control` out of the box.
+fn resolve_mps_dirs(gpu: &zlayer_spec::GpuSpec) -> Result<Option<MpsDirs>> {
+    if gpu.sharing != Some(GpuSharingMode::Mps) {
+        return Ok(None);
+    }
+
+    let pipe_dir = PathBuf::from(gpu.mps_pipe_dir.as_deref().unwrap_or(DEFAULT_MPS_PIPE_DIR));
+    let log_dir = PathBuf::from(gpu.mps_log_dir.as_deref().unwrap_or(DEFAULT_MPS_LOG_DIR));
+
+    if !pipe_dir.is_dir() {
+        return Err(AgentError::GpuSharingUnavailable {
+            mode: "mps".to_string(),
+            reason: format!(
+                "MPS pipe directory {} does not exist; ensure nvidia-cuda-mps-control is running",
+                pipe_dir.display()
+            ),
+        });
+    }
+    if !log_dir.is_dir() {
+        return Err(AgentError::GpuSharingUnavailable {
+            mode: "mps".to_string(),
+            reason: format!(
+                "MPS log directory {} does not exist; ensure nvidia-cuda-mps-control is running",
+                log_dir.display()
+            ),
+        });
+    }
+
+    Ok(Some(MpsDirs { pipe_dir, log_dir }))
+}
 
 /// Pure parser for the contents of `/proc/self/cgroup`.
 ///
@@ -875,6 +938,51 @@ impl BundleBuilder {
             }
         }
 
+        // GPU sharing (MPS / time-slicing) env injection.
+        //
+        // Layered on top of the CDI / baked-in `*_VISIBLE_DEVICES` block above:
+        // * MPS: validate host pipe/log dirs exist (error otherwise) and
+        //   export `CUDA_MPS_PIPE_DIRECTORY` / `CUDA_MPS_LOG_DIRECTORY`.
+        // * Time-slicing: override `CUDA_VISIBLE_DEVICES` to the configured
+        //   slice index so the workload sees a single virtualised GPU rather
+        //   than the full 0..count list emitted above.
+        //
+        // The mount side (bind-mounting the MPS dirs / time-slicing config
+        // file) is handled further down where the rest of the mounts get
+        // assembled.
+        let mps_dirs = if let Some(ref gpu) = spec.resources.gpu {
+            resolve_mps_dirs(gpu)?
+        } else {
+            None
+        };
+        if let Some(ref dirs) = mps_dirs {
+            let pipe = format!("CUDA_MPS_PIPE_DIRECTORY={}", dirs.pipe_dir.display());
+            let log = format!("CUDA_MPS_LOG_DIRECTORY={}", dirs.log_dir.display());
+            if env_keys.contains("CUDA_MPS_PIPE_DIRECTORY") {
+                env.retain(|e| e.split('=').next() != Some("CUDA_MPS_PIPE_DIRECTORY"));
+            }
+            if env_keys.contains("CUDA_MPS_LOG_DIRECTORY") {
+                env.retain(|e| e.split('=').next() != Some("CUDA_MPS_LOG_DIRECTORY"));
+            }
+            env_keys.insert("CUDA_MPS_PIPE_DIRECTORY".to_string());
+            env_keys.insert("CUDA_MPS_LOG_DIRECTORY".to_string());
+            env.push(pipe);
+            env.push(log);
+        }
+        if let Some(ref gpu) = spec.resources.gpu {
+            if gpu.sharing == Some(GpuSharingMode::TimeSlice) {
+                if let Some(idx) = gpu.time_slice_index {
+                    // Time-slicing virtualises a single physical GPU as N
+                    // slices; the workload sees one device, addressed by
+                    // its slice index. Override whatever the CDI / baked-in
+                    // path emitted earlier.
+                    env.retain(|e| e.split('=').next() != Some("CUDA_VISIBLE_DEVICES"));
+                    env_keys.insert("CUDA_VISIBLE_DEVICES".to_string());
+                    env.push(format!("CUDA_VISIBLE_DEVICES={idx}"));
+                }
+            }
+        }
+
         // Inject distributed training coordination env vars when configured.
         // MASTER_ADDR uses the service DNS name (resolved by the overlay DNS).
         // RANK defaults to 0 (overridden by the agent when placing specific replicas).
@@ -983,6 +1091,71 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!("failed to build CDI mount: {e}"))
+                            })?,
+                    );
+                }
+            }
+        }
+
+        // GPU sharing mounts.
+        //
+        // MPS: bind-mount the host pipe / log directories into the container
+        // at the same path so the in-container CUDA runtime can talk to the
+        // MPS daemon over its UNIX socket and append to the shared log.
+        // The env vars (`CUDA_MPS_PIPE_DIRECTORY` / `CUDA_MPS_LOG_DIRECTORY`)
+        // are exported earlier in the env-assembly block.
+        //
+        // Time-slicing: optionally surface the host's slicing config YAML at
+        // a well-known read-only path so introspection tools inside the
+        // container can read it.
+        if let Some(ref dirs) = mps_dirs {
+            mounts.push(
+                MountBuilder::default()
+                    .destination(dirs.pipe_dir.clone())
+                    .typ("bind")
+                    .source(dirs.pipe_dir.clone())
+                    .options(vec!["rbind".into(), "rw".into()])
+                    .build()
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!("failed to build MPS pipe mount: {e}"))
+                    })?,
+            );
+            mounts.push(
+                MountBuilder::default()
+                    .destination(dirs.log_dir.clone())
+                    .typ("bind")
+                    .source(dirs.log_dir.clone())
+                    .options(vec!["rbind".into(), "rw".into()])
+                    .build()
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!("failed to build MPS log mount: {e}"))
+                    })?,
+            );
+        }
+        if let Some(ref gpu) = spec.resources.gpu {
+            if gpu.sharing == Some(GpuSharingMode::TimeSlice) {
+                if let Some(ref cfg_path) = gpu.time_slicing_config_path {
+                    let host = PathBuf::from(cfg_path);
+                    if !host.is_file() {
+                        return Err(AgentError::GpuSharingUnavailable {
+                            mode: "time-slice".to_string(),
+                            reason: format!(
+                                "time-slicing config {} is not a regular file on the host",
+                                host.display()
+                            ),
+                        });
+                    }
+                    mounts.push(
+                        MountBuilder::default()
+                            .destination(PathBuf::from(TIMESLICE_CONFIG_CONTAINER_PATH))
+                            .typ("bind")
+                            .source(host)
+                            .options(vec!["rbind".into(), "ro".into()])
+                            .build()
+                            .map_err(|e| {
+                                AgentError::InvalidSpec(format!(
+                                    "failed to build time-slicing config mount: {e}"
+                                ))
                             })?,
                     );
                 }
@@ -3099,6 +3272,184 @@ services:
         let paths: Vec<_> = devices.iter().map(|d| d.path().clone()).collect();
         assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia0")));
         assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia1")));
+    }
+
+    /// Build the standard fixture-backed CDI registry used by the MPS /
+    /// time-slicing tests. Identical to the helper used by the 5.A CDI
+    /// tests above but expressed as a closure-style helper to keep each test
+    /// self-contained.
+    fn build_nvidia_cdi_registry(dir: &std::path::Path) -> std::sync::Arc<crate::cdi::CdiRegistry> {
+        write_nvidia_cdi_fixture(dir, nvidia_cdi_fixture());
+        std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir]))
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_mps_sharing_injects_env_and_mounts() {
+        // Stage host-side MPS directories in a tempdir so the resolver's
+        // `is_dir()` check passes without touching /tmp/nvidia-mps on the
+        // real host.
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let mps_root = tempfile::tempdir().unwrap();
+        let pipe_dir = mps_root.path().join("nvidia-mps");
+        let log_dir = mps_root.path().join("nvidia-log");
+        std::fs::create_dir(&pipe_dir).unwrap();
+        std::fs::create_dir(&log_dir).unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::Mps);
+        gpu.mps_pipe_dir = Some(pipe_dir.to_string_lossy().into_owned());
+        gpu.mps_log_dir = Some(log_dir.to_string_lossy().into_owned());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-mps-env".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with MPS sharing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        let pipe_expect = format!("CUDA_MPS_PIPE_DIRECTORY={}", pipe_dir.display());
+        let log_expect = format!("CUDA_MPS_LOG_DIRECTORY={}", log_dir.display());
+        assert!(
+            env.iter().any(|e| e == &pipe_expect),
+            "expected {pipe_expect} in env; got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == &log_expect),
+            "expected {log_expect} in env; got {env:?}"
+        );
+
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.destination() == &pipe_dir && m.source().as_ref() == Some(&pipe_dir)),
+            "expected bind mount of MPS pipe dir {}; got destinations {:?}",
+            pipe_dir.display(),
+            mounts.iter().map(Mount::destination).collect::<Vec<_>>()
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.destination() == &log_dir && m.source().as_ref() == Some(&log_dir)),
+            "expected bind mount of MPS log dir {}",
+            log_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_mps_sharing_fails_when_pipe_dir_missing() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::Mps);
+        // Path that demonstrably does not exist — tempdir() returns a unique
+        // path so appending "definitely-not-here" gives a guaranteed miss.
+        let missing = tempfile::tempdir().unwrap();
+        let missing_path = missing.path().join("definitely-not-here");
+        gpu.mps_pipe_dir = Some(missing_path.to_string_lossy().into_owned());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-mps-missing".into()).with_cdi_registry(registry);
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when MPS pipe dir is missing");
+        match err {
+            AgentError::GpuSharingUnavailable { mode, reason } => {
+                assert_eq!(mode, "mps");
+                assert!(
+                    reason.contains("pipe") || reason.contains(&missing_path.display().to_string()),
+                    "reason should mention the missing path; got: {reason}"
+                );
+            }
+            other => panic!("expected GpuSharingUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_timeslicing_injects_visible_devices() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::TimeSlice);
+        gpu.time_slice_index = Some(2);
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-timeslice".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with time-slicing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        // Time-slicing must clobber any earlier `CUDA_VISIBLE_DEVICES` (e.g.
+        // the CDI-emitted full-device list) to advertise exactly the slice.
+        let cuda_entries: Vec<&String> = env
+            .iter()
+            .filter(|e| e.starts_with("CUDA_VISIBLE_DEVICES="))
+            .collect();
+        assert_eq!(
+            cuda_entries.len(),
+            1,
+            "exactly one CUDA_VISIBLE_DEVICES expected; got {cuda_entries:?}"
+        );
+        assert_eq!(cuda_entries[0], "CUDA_VISIBLE_DEVICES=2");
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_without_sharing_omits_mps_env() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        assert!(spec.resources.gpu.as_ref().unwrap().sharing.is_none());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-no-sharing".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build without sharing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        assert!(
+            !env.iter().any(|e| e.starts_with("CUDA_MPS_")),
+            "no CUDA_MPS_* env should be present without sharing; got {env:?}"
+        );
+
+        // No MPS mount should be added either. The 5.A CDI fixture mounts a
+        // /dev/nvidia0 device but never bind-mounts /tmp/nvidia-mps; verify
+        // we don't sneak that in.
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| { m.destination().to_string_lossy().contains("nvidia-mps") }),
+            "no MPS pipe mount should be present without sharing"
+        );
     }
 
     mod subid_tests {

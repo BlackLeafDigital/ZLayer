@@ -80,6 +80,29 @@ pub enum AgentError {
     #[error("GPU requested but WSL2 GPU support not available on this host: {reason}")]
     WslGpuUnavailable { reason: String },
 
+    /// GPU sharing was requested (MPS or time-slicing) but the host or
+    /// runtime cannot satisfy the requested mode.
+    ///
+    /// Typical causes:
+    /// * `mode = "mps"` but the host MPS pipe / log directory does not exist
+    ///   (the `nvidia-cuda-mps-control` daemon is not running).
+    /// * `mode = "mps"` combined with `isolation: hyperv` on Windows — MPS is
+    ///   not exposed inside the UVM kernel.
+    ///
+    /// Silent fallback to exclusive-mode access would be surprising for users
+    /// who explicitly opted in to sharing (they may be relying on sharing for
+    /// capacity planning), so this is a hard error. Callers must either fix
+    /// the host (start the MPS daemon, switch isolation) or drop the
+    /// `sharing` field from the spec.
+    #[error("GPU sharing mode '{mode}' is unavailable: {reason}")]
+    GpuSharingUnavailable {
+        /// Sharing mode that could not be satisfied (`"mps"`, `"time-slice"`).
+        mode: String,
+        /// Human-readable explanation (e.g. "/tmp/nvidia-mps does not exist; \
+        /// ensure nvidia-cuda-mps-control is running").
+        reason: String,
+    },
+
     /// The workload cannot run on this node and must be re-placed on a peer
     /// that can satisfy `required_os`.
     ///

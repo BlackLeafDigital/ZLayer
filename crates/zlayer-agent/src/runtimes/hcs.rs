@@ -856,6 +856,21 @@ impl HcsRuntime {
                         .to_string(),
                 ));
             }
+            // MPS requires the host MPS control daemon (`nvidia-cuda-mps-control`)
+            // to be reachable from the workload. Under Hyper-V isolation the
+            // workload runs inside a UVM kernel that does NOT expose the host
+            // MPS pipe directory, so MPS sharing is meaningless here.
+            // Reject up-front rather than silently producing a broken setup.
+            if matches!(gpu_spec.sharing, Some(zlayer_spec::GpuSharingMode::Mps))
+                && matches!(isolation, IsolationMode::Hyperv)
+            {
+                return Err(AgentError::GpuSharingUnavailable {
+                    mode: "mps".to_string(),
+                    reason: "MPS is not supported with Hyper-V isolation; use Process isolation \
+                             or remove the sharing config"
+                        .to_string(),
+                });
+            }
             let all_adapters =
                 enumerate_host_gpu_adapters().map_err(|e| AgentError::CreateFailed {
                     id: hcs_id.to_string(),
@@ -2487,6 +2502,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         };
         let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
         assert_eq!(filtered.len(), 2);
@@ -2504,6 +2523,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         };
         let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
         assert_eq!(filtered.len(), 1);
@@ -2520,6 +2543,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         };
         let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
         assert_eq!(filtered.len(), 1);
@@ -2548,6 +2575,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let adapters = vec![HostGpuAdapter {
@@ -2595,6 +2626,10 @@ services:
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
