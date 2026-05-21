@@ -11,10 +11,13 @@ use crate::runtime::ContainerId;
 use oci_spec::runtime::{
     Capability, Hook, HookBuilder, Hooks, HooksBuilder, LinuxBuilder, LinuxCapabilitiesBuilder,
     LinuxCpuBuilder, LinuxDeviceBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType,
-    LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
-    UserBuilder,
+    LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
+    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
+// `LinuxIdMappingBuilder` is only used by the unix-gated rootless user-namespace
+// helpers below; importing it unconditionally trips dead-code lints on Windows.
+#[cfg(unix)]
+use oci_spec::runtime::LinuxIdMappingBuilder;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -395,6 +398,10 @@ impl std::fmt::Debug for BundleBuilder {
 /// container. Always emits a single-id mapping (container 0 → `host_id`, size 1).
 /// If `username` has an entry in `subid_path` (e.g. /etc/subuid), appends a
 /// range mapping (container 1 → range start, size = range count).
+///
+/// Rootless user-namespace mapping is a Linux/libcontainer concept; on Windows
+/// containers run via HCS so this helper is unix-only.
+#[cfg(unix)]
 fn build_rootless_id_mappings(
     host_id: u32,
     subid_path: &str,
@@ -425,6 +432,10 @@ fn build_rootless_id_mappings(
 /// allocated to the given username, if any. Returns None on any I/O error
 /// or when the user has no entry — callers must fall back to a single-id
 /// mapping in that case.
+///
+/// Subuid files are a Linux concept and the only caller is the unix-gated
+/// `build_rootless_id_mappings`, so this helper is unix-only as well.
+#[cfg(unix)]
 fn read_subid_range(path: &str, username: &str) -> Option<(u32, u32)> {
     let contents = std::fs::read_to_string(path).ok()?;
     for line in contents.lines() {
@@ -1731,9 +1742,14 @@ impl BundleBuilder {
             );
         }
 
-        let euid = nix::unistd::geteuid();
-        let egid = nix::unistd::getegid();
-        let rootless = !euid.is_root();
+        // `nix::unistd` is unix-only. On non-unix targets (Windows), libcontainer
+        // is not the runtime path (HCS is) and this function is effectively dead
+        // code — so we statically force `rootless = false` there and skip the
+        // user-namespace mapping block entirely.
+        #[cfg(unix)]
+        let rootless = !nix::unistd::geteuid().is_root();
+        #[cfg(not(unix))]
+        let rootless = false;
 
         if rootless {
             namespaces.push(
@@ -1752,7 +1768,10 @@ impl BundleBuilder {
 
         let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
 
+        #[cfg(unix)]
         if rootless {
+            let euid = nix::unistd::geteuid();
+            let egid = nix::unistd::getegid();
             let username = nix::unistd::User::from_uid(euid)
                 .ok()
                 .flatten()
@@ -3452,6 +3471,7 @@ services:
         );
     }
 
+    #[cfg(unix)]
     mod subid_tests {
         use super::super::read_subid_range;
         use std::io::Write;
