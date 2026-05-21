@@ -16,4 +16,5 @@
 pub mod layer;
 pub mod scratch;
 pub mod unpacker;
+pub mod uvm;
 pub mod wclayer;
