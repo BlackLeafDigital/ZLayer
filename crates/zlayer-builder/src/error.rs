@@ -180,6 +180,58 @@ pub enum BuildError {
     /// no-op".
     #[error("not yet implemented: {0}")]
     NotYetImplemented(String),
+
+    /// A specific RUN step in a Dockerfile failed with a non-zero exit
+    /// code. Carries the step index (0-based, counted across the active
+    /// stage's instruction list), the exit code surfaced by the
+    /// guest process, and a stderr tail to anchor diagnostics.
+    ///
+    /// Distinct from [`BuildError::RunFailed`] in that the latter is
+    /// emitted by the buildah/HCS backends working through the
+    /// `BuildBackend` trait, whereas this variant is emitted by the
+    /// Phase 4 `WindowsBuilder` path which carries a richer per-step
+    /// context (the step index and a stderr tail) than the buildah
+    /// path can produce.
+    #[error("RUN step {step_index} failed with exit code {exit_code}: {stderr_tail}")]
+    RunStepFailed {
+        /// Zero-based step index within the active stage's instruction
+        /// list (the value Phase 4 errors use to anchor a diagnostic).
+        step_index: usize,
+        /// Exit code reported by the guest process.
+        exit_code: i32,
+        /// Last fragment of stderr captured during the RUN step (or a
+        /// synthesised message when pipe capture has not yet been
+        /// wired). Surfaced verbatim in the error display so users get
+        /// the failing command in their build log.
+        stderr_tail: String,
+    },
+
+    /// `HcsExportLayer` / wclayer-side IO failed while capturing the
+    /// post-RUN scratch diff. Distinct from [`BuildError::IoError`] so
+    /// the WCOW builder can surface a layer-export-specific message
+    /// (the underlying failure is almost always either an
+    /// `HcsExportLayer` HRESULT or a tar/gzip walk error).
+    #[error("layer export failed: {source}")]
+    LayerExportFailed {
+        /// Underlying IO error (often wraps an HCS HRESULT).
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Chocolatey resolver could not produce a Windows equivalent for a
+    /// Linux package name encountered in a RUN instruction. The package
+    /// is named so the user can edit the Dockerfile (or contribute the
+    /// mapping to `RepoSources`).
+    #[error(
+        "no Chocolatey mapping for Linux package '{package}' in source distro '{source_distro}'"
+    )]
+    ChocoResolutionFailed {
+        /// The Linux package name that did not resolve.
+        package: String,
+        /// The `RepoSources`-style source distro key that was queried
+        /// (e.g. `"debian-12"`, `"ubuntu-22.04"`).
+        source_distro: String,
+    },
 }
 
 impl BuildError {
