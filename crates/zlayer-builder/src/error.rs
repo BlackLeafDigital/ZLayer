@@ -167,6 +167,19 @@ pub enum BuildError {
         /// The operation that was attempted
         operation: String,
     },
+
+    /// A code path that is reserved for a future phase / task and is
+    /// intentionally not yet wired up. Constructed by
+    /// [`BuildError::not_yet_implemented`] so call sites can give a precise
+    /// reason (typically referencing the follow-up task that delivers it,
+    /// e.g. "RUN execution lands in Phase 4 task 4.B").
+    ///
+    /// This is distinct from [`BuildError::NotSupported`], which signals a
+    /// permanent capability gap of the chosen backend; `NotYetImplemented`
+    /// signals "tracked work, coming in a later task — do not silently
+    /// no-op".
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(String),
 }
 
 impl BuildError {
@@ -272,6 +285,13 @@ impl BuildError {
         Self::PipelineError {
             message: message.into(),
         }
+    }
+
+    /// Create a `NotYetImplemented` error. The `msg` should name the
+    /// follow-up task or phase that delivers the missing behavior
+    /// (e.g. `"RUN execution lands in Phase 4 task 4.B"`).
+    pub fn not_yet_implemented(msg: impl Into<String>) -> Self {
+        Self::NotYetImplemented(msg.into())
     }
 }
 
