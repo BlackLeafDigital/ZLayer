@@ -148,12 +148,8 @@ as the fixture admin and dumps the Playwright storage state
 `.stale-session.state.json`. The harness then deletes the fixture
 user via `zlayer user delete <id> --yes`. The verify test runs with
 `--storage-state .stale-session.state.json`, makes one navigation to
-`/`, and asserts three things:
+`/`, and asserts two things:
 
-- **Network layer** — `expectResponse` catches the
-  `/api/manager/manager_me` response and asserts its `set-cookie`
-  header contains `zlayer_session=; …; Max-Age=0`. Proves the manager
-  hit `/auth/logout` and propagated its expiry headers.
 - **Browser jar** — `assertCookies` (which calls Playwright's
   `context.cookies()` and therefore sees HttpOnly cookies) asserts
   both `zlayer_session` and `zlayer_csrf` are absent after the bounce.
@@ -162,8 +158,10 @@ user via `zlayer user delete <id> --yes`. The verify test runs with
   still exist in the daemon's user table — only the fixture was
   deleted — so the redirect is `/login`, not `/bootstrap`.)
 
-Any of the three failing localizes the regression: missing
-`Set-Cookie` means the manager skipped the logout probe; the
-assertion landing but the jar still holding cookies means propagation
-broke between `forward_raw` and the Leptos response; the wrong
-redirect target means AuthGuard misread the post-401 state.
+Either failing localizes the regression: the jar still holding
+cookies means propagation broke between `forward_raw` and the Leptos
+response; the wrong redirect target means AuthGuard misread the
+post-401 state. The wire trace is no longer asserted directly because
+the two outcome checks (empty cookie jar + redirect to `/login`)
+together imply the `Set-Cookie` expiries rode back on `manager_me` —
+keeping the test sequential-friendly with intellitester 0.4.x.
