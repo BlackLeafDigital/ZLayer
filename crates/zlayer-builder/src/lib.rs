@@ -203,6 +203,7 @@ pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
 pub mod windows;
+pub mod windows_image_resolver;
 pub mod zimage;
 
 // Re-export main types at crate root
