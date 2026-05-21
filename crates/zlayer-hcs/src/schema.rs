@@ -274,6 +274,66 @@ pub struct Devices {
     /// `VirtualSMB` shares keyed by share name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub virtual_smb: BTreeMap<String, VirtualSmbShare>,
+    /// GPU-PV (paravirtualized GPU) device assignment for Hyper-V-isolated
+    /// containers. Populated only when the workload requests a GPU; otherwise
+    /// omitted so HCS does not attach any host adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuAssignment>,
+}
+
+/// GPU-PV assignment block attached under [`Devices::gpu`].
+///
+/// Mirrors the `GpuAssignment` schema HCS accepts on a `VirtualMachine`
+/// document. The valid `assignment_mode` values are:
+///
+/// - [`GpuAssignmentMode::Default`] — HCS picks the host's default adapter
+///   set (typically the discrete GPU, if any). `assignment_request` should
+///   be empty in this mode.
+/// - [`GpuAssignmentMode::List`] — explicit list of host adapter LUIDs in
+///   `assignment_request`; HCS attaches only those adapters.
+/// - [`GpuAssignmentMode::Disabled`] — no GPU is attached. Equivalent to
+///   omitting the block, but explicit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct GpuAssignment {
+    /// Which GPUs to attach: `Default`, `List`, or `Disabled`.
+    pub assignment_mode: GpuAssignmentMode,
+    /// When `assignment_mode == List`, the host adapter LUIDs to attach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignment_request: Vec<GpuAssignmentRequest>,
+    /// Allow vendor-extensions in the guest (vGPU paravirtualization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_vendor_extension: Option<bool>,
+}
+
+/// Selection mode for [`GpuAssignment::assignment_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum GpuAssignmentMode {
+    /// Let HCS pick the host's default adapter set.
+    Default,
+    /// Use the LUIDs in [`GpuAssignment::assignment_request`].
+    List,
+    /// Attach no GPU.
+    Disabled,
+}
+
+/// One host adapter LUID assigned to the VM.
+///
+/// LUIDs come from `IDXGIAdapter::GetDesc().AdapterLuid` on the host; the
+/// `HighPart` (`u32`) and `LowPart` (`i32`) fields preserve the exact sign /
+/// width Microsoft's `LUID` struct uses so the round-trip back to a host
+/// handle is bit-exact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct GpuAssignmentRequest {
+    /// LUID as a `0x<hi>:0x<lo>` hex string per the HCS schema. HCS keys
+    /// adapters by this string in its event payloads.
+    pub virtual_machine_id_string: String,
+    /// Adapter LUID high part.
+    pub adapter_luid_high_part: u32,
+    /// Adapter LUID low part.
+    pub adapter_luid_low_part: i32,
 }
 
 /// A SCSI controller with its attachment map.

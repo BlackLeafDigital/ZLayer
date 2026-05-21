@@ -90,9 +90,10 @@ use zlayer_hcs::enumerate;
 use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
     Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
-    ContainerProcessor, Devices, GuestState, ProcessParameters, SchemaVersion, ScsiAttachment,
-    ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor,
-    Uefi, UefiBootEntry, VirtualMachine, VirtualSmbShare,
+    ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
+    GuestState, ProcessParameters, SchemaVersion, ScsiAttachment, ScsiController, Statistics,
+    Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi, UefiBootEntry,
+    VirtualMachine, VirtualSmbShare,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -834,6 +835,37 @@ impl HcsRuntime {
         // dirs → read-only VirtualSMB shares, boot-files dir → GuestState.
         // [`IsolationMode::Process`] flows down through the `Container` path
         // unchanged.
+        //
+        // GPU-PV: when `spec.resources.gpu` is set, we enumerate host adapters
+        // via DXGI and filter by the spec's vendor/model/count. The filtered
+        // list is passed into the VirtualMachine document. Process-isolated
+        // containers cannot use GPU-PV; the equivalent DirectX-device-sharing
+        // path (`\\.\GLOBALROOT\Device\…` SMB shares + dxgkrnl projection) is
+        // an hcsshim-internal surface whose exact paths drift between Windows
+        // builds, so rather than fabricate paths we surface a typed error.
+        // Users wanting GPU with `isolation: process` must switch to
+        // `isolation: hyperv` for now.
+        let gpu_adapters: Vec<HostGpuAdapter> = if let Some(gpu_spec) = spec.resources.gpu.as_ref()
+        {
+            if matches!(isolation, IsolationMode::Process) {
+                return Err(AgentError::Unsupported(
+                    "GPU passthrough with `isolation: process` is not yet wired; switch to \
+                     `isolation: hyperv` (DirectX device-sharing for Process isolation requires \
+                     dxgkrnl device paths that drift between Windows builds and would need a \
+                     stable hcsshim binding to be safe)"
+                        .to_string(),
+                ));
+            }
+            let all_adapters =
+                enumerate_host_gpu_adapters().map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("DXGI host GPU enumeration: {e}"),
+                })?;
+            filter_adapters_by_gpu_spec(&all_adapters, gpu_spec)
+        } else {
+            Vec::new()
+        };
+
         let virtual_machine = match isolation {
             IsolationMode::Process => None,
             IsolationMode::Hyperv => {
@@ -843,7 +875,12 @@ impl HcsRuntime {
                             .to_string(),
                     )
                 })?;
-                Some(build_virtual_machine_doc(uvm, &parent_layers, spec))
+                Some(build_virtual_machine_doc(
+                    uvm,
+                    &parent_layers,
+                    spec,
+                    &gpu_adapters,
+                ))
             }
         };
 
@@ -1011,14 +1048,24 @@ const VSMB_FLAGS_READONLY_LAYER: u32 = 0x0008_0000;
 /// * `guest_state.guest_state_file_path` points at the boot-files directory
 ///   exposed by the UVM.
 ///
-/// `spec` is currently unused — the UVM's processor/memory topology is fixed
-/// by the constants above so the per-container CPU/memory limits remain a
-/// property of the workload inside the UVM (see
+/// `spec` carries the workload's [`zlayer_spec::GpuSpec`] (if any) so GPU-PV
+/// adapters can be attached when the caller has already enumerated and
+/// filtered the host's GPU adapters; the UVM's CPU/memory topology stays
+/// fixed by the constants above so the per-container CPU/memory limits remain
+/// a property of the workload inside the UVM (see
 /// [`HcsRuntime::build_compute_system_doc`]'s `ContainerProcessor`/`ContainerMemory`).
+///
+/// `gpu_adapters` is the already-filtered list of host adapters to attach for
+/// Hyper-V GPU-PV. The caller is responsible for vendor/model filtering and
+/// for honoring `spec.resources.gpu.count`. An empty slice paired with a
+/// populated `spec.resources.gpu` produces a [`GpuAssignmentMode::Default`]
+/// block (let HCS pick); a non-empty slice produces a
+/// [`GpuAssignmentMode::List`] block.
 fn build_virtual_machine_doc(
     uvm: &Uvm,
     parent_layers: &[zlayer_hcs::schema::Layer],
-    _spec: &ServiceSpec,
+    spec: &ServiceSpec,
+    gpu_adapters: &[HostGpuAdapter],
 ) -> VirtualMachine {
     use std::collections::BTreeMap;
 
@@ -1056,6 +1103,35 @@ fn build_virtual_machine_doc(
         );
     }
 
+    // Populate the GPU-PV block when the workload requested a GPU. With no
+    // candidate adapters we emit `Default` so HCS picks the host default
+    // instead of silently dropping the request; with candidates we list them
+    // explicitly.
+    let gpu = spec.resources.gpu.as_ref().map(|_| {
+        let requests: Vec<GpuAssignmentRequest> = gpu_adapters
+            .iter()
+            .map(|a| GpuAssignmentRequest {
+                #[allow(clippy::cast_sign_loss)]
+                virtual_machine_id_string: format!(
+                    "0x{:08x}:0x{:08x}",
+                    a.luid_high, a.luid_low as u32,
+                ),
+                adapter_luid_high_part: a.luid_high,
+                adapter_luid_low_part: a.luid_low,
+            })
+            .collect();
+        let mode = if requests.is_empty() {
+            GpuAssignmentMode::Default
+        } else {
+            GpuAssignmentMode::List
+        };
+        GpuAssignment {
+            assignment_mode: mode,
+            assignment_request: requests,
+            allow_vendor_extension: Some(true),
+        }
+    });
+
     VirtualMachine {
         chipset: Some(Chipset {
             uefi: Some(Uefi {
@@ -1074,12 +1150,187 @@ fn build_virtual_machine_doc(
                 count: UVM_DEFAULT_VCPUS,
             }),
         }),
-        devices: Some(Devices { scsi, virtual_smb }),
+        devices: Some(Devices {
+            scsi,
+            virtual_smb,
+            gpu,
+        }),
         guest_state: Some(GuestState {
             guest_state_file_path: uvm.boot_files().to_string_lossy().into_owned(),
         }),
         runtime_state_file_path: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Host GPU adapter probe (DXGI) + spec-side filtering
+// ---------------------------------------------------------------------------
+
+/// One host GPU adapter as seen by DXGI.
+///
+/// `luid_high` / `luid_low` come from
+/// `IDXGIAdapter::GetDesc().AdapterLuid` — Microsoft's `LUID` carries
+/// `HighPart: i32` and `LowPart: u32` on the wire but the HCS GPU-PV schema
+/// expects `AdapterLuidHighPart: u32` and `AdapterLuidLowPart: i32`, so we
+/// match that orientation here and apply the sign conversion at the wire
+/// boundary inside [`build_virtual_machine_doc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostGpuAdapter {
+    /// `LUID.HighPart` cast to `u32` for HCS.
+    pub luid_high: u32,
+    /// `LUID.LowPart` cast to `i32` for HCS.
+    pub luid_low: i32,
+    /// Human-readable adapter description (`Description` field of
+    /// `DXGI_ADAPTER_DESC`, NUL-trimmed and UTF-8'd).
+    pub description: String,
+    /// PCI vendor id (e.g. `0x10de` for NVIDIA, `0x1002` for AMD, `0x8086`
+    /// for Intel, `0x1414` for Microsoft Basic Render Driver / WARP).
+    pub vendor_id: u32,
+    /// PCI device id.
+    pub device_id: u32,
+}
+
+/// PCI vendor id of Microsoft's software renderer (WARP / Basic Render
+/// Driver). We skip these in [`enumerate_host_gpu_adapters`] because they
+/// cannot back GPU-PV passthrough.
+const VENDOR_ID_MICROSOFT_BASIC: u32 = 0x1414;
+
+/// Enumerate host GPU adapters via DXGI on Windows. Returns
+/// [`io::ErrorKind::Unsupported`] on every other platform so the runtime
+/// surfaces a clean error rather than panicking when a cross-compile slips
+/// through.
+#[cfg(target_os = "windows")]
+fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+
+    // SAFETY: `CreateDXGIFactory1` is the documented entry point for the
+    // DXGI 1.1 factory; we hold the resulting interface for the lifetime of
+    // this function only, so the COM ref-count is managed entirely by
+    // `windows-rs`. No raw pointers are dereferenced by the caller.
+    let factory: IDXGIFactory1 = unsafe {
+        CreateDXGIFactory1()
+            .map_err(|e| std::io::Error::other(format!("CreateDXGIFactory1 failed: {e}")))?
+    };
+
+    let mut adapters = Vec::new();
+    let mut index: u32 = 0;
+    loop {
+        // SAFETY: `EnumAdapters` returns `DXGI_ERROR_NOT_FOUND` once the
+        // index runs past the last adapter; we treat that as the loop's
+        // natural termination. Any other error is propagated.
+        let adapter: IDXGIAdapter = unsafe {
+            match factory.EnumAdapters(index) {
+                Ok(a) => a,
+                Err(e) => {
+                    // DXGI_ERROR_NOT_FOUND is HRESULT 0x887A0002.
+                    if e.code().0 as u32 == 0x887A_0002 {
+                        break;
+                    }
+                    return Err(std::io::Error::other(format!(
+                        "IDXGIFactory1::EnumAdapters({index}) failed: {e}",
+                    )));
+                }
+            }
+        };
+
+        // SAFETY: `IDXGIAdapter::GetDesc` returns the descriptor by value;
+        // `windows-rs` wraps the HRESULT into a `Result`. No raw pointers are
+        // dereferenced by the caller.
+        let desc = unsafe {
+            adapter.GetDesc().map_err(|e| {
+                std::io::Error::other(format!("IDXGIAdapter::GetDesc({index}) failed: {e}"))
+            })?
+        };
+
+        if desc.VendorId == VENDOR_ID_MICROSOFT_BASIC {
+            // Skip WARP / Basic Render Driver — cannot back GPU-PV.
+            index += 1;
+            continue;
+        }
+
+        // `Description` is a NUL-terminated UTF-16 array up to 128 chars.
+        let nul = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let description = String::from_utf16_lossy(&desc.Description[..nul]);
+
+        adapters.push(HostGpuAdapter {
+            luid_high: desc.AdapterLuid.HighPart as u32,
+            luid_low: desc.AdapterLuid.LowPart as i32,
+            description,
+            vendor_id: desc.VendorId,
+            device_id: desc.DeviceId,
+        });
+
+        index += 1;
+    }
+
+    Ok(adapters)
+}
+
+/// Non-Windows stub: DXGI is a Windows-only API. Compiled on every other
+/// platform so unit tests on Linux / macOS can still link the module and
+/// assert the expected error shape.
+#[cfg(not(target_os = "windows"))]
+fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "DXGI host GPU enumeration is Windows-only",
+    ))
+}
+
+/// Map a [`zlayer_spec::GpuSpec`] vendor string to its PCI vendor id, or
+/// `None` when the vendor is `"all"` / empty / unknown (in which case no
+/// vendor filtering is applied).
+fn vendor_id_for_spec(vendor: &str) -> Option<u32> {
+    match vendor.to_ascii_lowercase().as_str() {
+        "nvidia" => Some(0x10de),
+        "amd" | "ati" => Some(0x1002),
+        "intel" => Some(0x8086),
+        _ => None,
+    }
+}
+
+/// Filter a list of host adapters by the spec's vendor + count. Model
+/// filtering matches as a case-insensitive substring against
+/// [`HostGpuAdapter::description`].
+///
+/// Filtering is applied in this order:
+/// 1. Vendor (if not `"all"`/empty/unknown).
+/// 2. Model substring (if present).
+/// 3. Truncate to `count` (always; defaults to 1 in the spec).
+fn filter_adapters_by_gpu_spec(
+    adapters: &[HostGpuAdapter],
+    spec: &zlayer_spec::GpuSpec,
+) -> Vec<HostGpuAdapter> {
+    let vendor_filter = if spec.vendor.eq_ignore_ascii_case("all") || spec.vendor.is_empty() {
+        None
+    } else {
+        vendor_id_for_spec(&spec.vendor)
+    };
+
+    let model_lower = spec.model.as_deref().map(str::to_ascii_lowercase);
+
+    let mut filtered: Vec<HostGpuAdapter> = adapters
+        .iter()
+        .filter(|a| match vendor_filter {
+            Some(vid) => a.vendor_id == vid,
+            None => true,
+        })
+        .filter(|a| match model_lower.as_deref() {
+            Some(needle) => a.description.to_ascii_lowercase().contains(needle),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    let want = spec.count.max(1) as usize;
+    if filtered.len() > want {
+        filtered.truncate(want);
+    }
+    filtered
 }
 
 /// Parse a GUID that may or may not be brace-wrapped, as HCN emits them on
@@ -2107,7 +2358,7 @@ services:
         ];
 
         let spec = fixture_spec();
-        let vm = build_virtual_machine_doc(&uvm, &parent_layers, &spec);
+        let vm = build_virtual_machine_doc(&uvm, &parent_layers, &spec, &[]);
 
         // Chipset / UEFI: boot from SCSI controller 0, LUN 0.
         let chipset = vm.chipset.expect("chipset");
@@ -2161,10 +2412,214 @@ services:
             PathBuf::from(r"C:\boot"),
         );
         let spec = fixture_spec();
-        let vm = build_virtual_machine_doc(&uvm, &[], &spec);
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
 
         let devices = vm.devices.expect("devices");
         assert!(devices.virtual_smb.is_empty());
         assert_eq!(devices.scsi.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // GPU-PV tests
+    // -----------------------------------------------------------------------
+
+    /// Linux / macOS stub for [`enumerate_host_gpu_adapters`] returns
+    /// `ErrorKind::Unsupported`. The Windows implementation is exercised by
+    /// the `#[ignore]`'d real-host test below.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn enumerate_host_gpu_adapters_returns_unsupported_on_non_windows() {
+        let err =
+            super::enumerate_host_gpu_adapters().expect_err("must be Unsupported off-Windows");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// Smoke-test the real DXGI probe on a Windows host. Ignored by default
+    /// because CI / dev machines may not have a GPU, but flagged so the
+    /// `windows-hcs-e2e` job can opt in with `--ignored`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a real Windows host with at least one GPU adapter"]
+    fn enumerate_host_gpu_adapters_on_windows_finds_at_least_one() {
+        let adapters = super::enumerate_host_gpu_adapters().expect("DXGI probe must succeed");
+        assert!(
+            !adapters.is_empty(),
+            "expected at least one host GPU adapter (WARP excluded); got {adapters:?}",
+        );
+    }
+
+    /// Fixture: three host adapters — 2 NVIDIA, 1 AMD — so the filter tests
+    /// can assert both vendor and count behaviour.
+    fn fixture_adapters() -> Vec<HostGpuAdapter> {
+        vec![
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 1,
+                description: "NVIDIA GeForce RTX 4090".to_string(),
+                vendor_id: 0x10de,
+                device_id: 0x2684,
+            },
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 2,
+                description: "NVIDIA RTX A6000".to_string(),
+                vendor_id: 0x10de,
+                device_id: 0x2230,
+            },
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 3,
+                description: "AMD Radeon RX 7900 XTX".to_string(),
+                vendor_id: 0x1002,
+                device_id: 0x744c,
+            },
+        ]
+    }
+
+    #[test]
+    fn filter_adapters_by_vendor_nvidia() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 99, // do not truncate
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|a| a.vendor_id == 0x10de));
+    }
+
+    #[test]
+    fn filter_adapters_by_count_truncates() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "all".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn filter_adapters_by_model_substring() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 99,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: Some("a6000".to_string()),
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].description, "NVIDIA RTX A6000");
+    }
+
+    /// When `spec.resources.gpu` is set AND we have candidate adapters, the
+    /// VirtualMachine document carries a `GpuAssignment` with
+    /// `assignment_mode = List` and one `GpuAssignmentRequest` per adapter.
+    #[test]
+    fn build_virtual_machine_doc_with_gpu_populates_assignment() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "gpu-list",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+
+        let mut spec = fixture_spec();
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        });
+
+        let adapters = vec![HostGpuAdapter {
+            luid_high: 0xdead_beef,
+            luid_low: 0x1234_5678,
+            description: "NVIDIA GeForce RTX 4090".to_string(),
+            vendor_id: 0x10de,
+            device_id: 0x2684,
+        }];
+
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &adapters);
+        let devices = vm.devices.expect("devices");
+        let gpu = devices.gpu.expect("gpu assignment present");
+        assert_eq!(gpu.assignment_mode, GpuAssignmentMode::List);
+        assert_eq!(gpu.assignment_request.len(), 1);
+        let req = &gpu.assignment_request[0];
+        assert_eq!(req.adapter_luid_high_part, 0xdead_beef);
+        assert_eq!(req.adapter_luid_low_part, 0x1234_5678);
+        assert_eq!(
+            req.virtual_machine_id_string, "0xdeadbeef:0x12345678",
+            "LUID hex string must be `0x<hi>:0x<lo>`",
+        );
+        assert_eq!(gpu.allow_vendor_extension, Some(true));
+    }
+
+    /// When `spec.resources.gpu` is set but no candidate adapters were found
+    /// on the host, fall back to `assignment_mode = Default` rather than
+    /// silently dropping the request.
+    #[test]
+    fn build_virtual_machine_doc_with_gpu_no_adapters_falls_back_to_default() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "gpu-default",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+
+        let mut spec = fixture_spec();
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "all".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+        });
+
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+        let devices = vm.devices.expect("devices");
+        let gpu = devices.gpu.expect("gpu assignment present");
+        assert_eq!(gpu.assignment_mode, GpuAssignmentMode::Default);
+        assert!(gpu.assignment_request.is_empty());
+    }
+
+    /// When the spec has no GPU, `devices.gpu` is omitted entirely.
+    #[test]
+    fn build_virtual_machine_doc_without_gpu_omits_assignment() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "no-gpu",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+        let devices = vm.devices.expect("devices");
+        assert!(
+            devices.gpu.is_none(),
+            "spec without GpuSpec must produce a Devices block with no GPU field",
+        );
     }
 }
