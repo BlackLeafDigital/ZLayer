@@ -990,6 +990,20 @@ where
     Ok(NetworkMode::from(inner))
 }
 
+/// Container isolation mode (Windows containers only; ignored on Linux/macOS).
+///
+/// * `Auto` (default) — runtime picks: Hyper-V on Windows client SKUs, Process on Server with matching build.
+/// * `Process` — shared host kernel (fast, requires container OS build to match host).
+/// * `Hyperv` — utility VM (stronger boundary, cross-version compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationMode {
+    #[default]
+    Auto,
+    Process,
+    Hyperv,
+}
+
 /// Per-process resource limit (Docker `--ulimit` style).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -1098,6 +1112,10 @@ pub struct ServiceSpec {
     /// container record after termination.
     #[serde(default)]
     pub lifecycle: LifecycleSpec,
+
+    /// Container isolation mode (Windows containers only; ignored on Linux/macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationMode>,
 
     /// Device passthrough (e.g., /dev/kvm for VMs)
     #[serde(default)]
@@ -1335,6 +1353,8 @@ struct ServiceSpecCompat {
     #[serde(default)]
     lifecycle: LifecycleSpec,
     #[serde(default)]
+    isolation: Option<IsolationMode>,
+    #[serde(default)]
     devices: Vec<DeviceSpec>,
     #[serde(default)]
     storage: Vec<StorageSpec>,
@@ -1436,6 +1456,7 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             init: c.init,
             errors: c.errors,
             lifecycle: c.lifecycle,
+            isolation: c.isolation,
             devices: c.devices,
             storage: c.storage,
             port_mappings: c.port_mappings,

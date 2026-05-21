@@ -1052,6 +1052,7 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
         cgroup_parent: args.cgroup_parent.clone(),
         expose: args.expose.clone(),
         replica_groups: None,
+        isolation: None,
     };
 
     let mut services = HashMap::new();
@@ -1771,6 +1772,7 @@ mod tests {
             userns_mode: None,
             cgroup_parent: None,
             expose: Vec::new(),
+            isolation: None,
         };
         let mut services = HashMap::new();
         services.insert("nginx".to_string(), service);

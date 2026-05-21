@@ -460,6 +460,7 @@ impl Scheduler {
             cgroup_parent: None,
             expose: Vec::new(),
             replica_groups: None,
+            isolation: None,
         };
 
         let effective_spec = spec.unwrap_or(&default_spec);

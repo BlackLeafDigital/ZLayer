@@ -184,6 +184,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        isolation: None,
     }
 }
 

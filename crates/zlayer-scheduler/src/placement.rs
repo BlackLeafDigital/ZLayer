@@ -1198,6 +1198,7 @@ mod tests {
             cgroup_parent: None,
             expose: Vec::new(),
             replica_groups: None,
+            isolation: None,
         }
     }
 

@@ -213,6 +213,7 @@ mod tests {
                 userns_mode: None,
                 cgroup_parent: None,
                 expose: Vec::new(),
+                isolation: None,
             },
         );
 

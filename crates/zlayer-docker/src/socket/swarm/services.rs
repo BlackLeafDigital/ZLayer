@@ -958,6 +958,7 @@ fn translate_service_only(body: &DockerServiceSpec) -> Result<ZServiceSpec, Stri
         cgroup_parent: None,
         expose: Vec::new(),
         replica_groups: None,
+        isolation: None,
     })
 }
 
@@ -1155,6 +1156,7 @@ mod tests {
             userns_mode: None,
             cgroup_parent: None,
             expose: Vec::new(),
+            isolation: None,
         }
     }
 

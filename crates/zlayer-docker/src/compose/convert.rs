@@ -195,6 +195,7 @@ fn convert_service(
         cgroup_parent: svc.cgroup_parent.clone(),
         expose,
         replica_groups: None,
+        isolation: None,
     })
 }
 

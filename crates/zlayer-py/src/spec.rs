@@ -658,6 +658,7 @@ pub fn create_service_spec(
         cgroup_parent: None,
         expose: Vec::new(),
         replica_groups: None,
+        isolation: None,
     };
 
     Ok(ServiceSpec {

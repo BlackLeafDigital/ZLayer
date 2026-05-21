@@ -98,6 +98,7 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        isolation: None,
     }
 }
 
