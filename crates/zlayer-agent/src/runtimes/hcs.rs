@@ -83,13 +83,16 @@ use crate::runtime::{
     ContainerId, ContainerInspectDetails, ContainerState, ExecEvent, ExecEventStream, ImageInfo,
     PruneResult, Runtime, WaitOutcome, WaitReason,
 };
+use crate::windows::uvm::Uvm;
 use crate::windows::{scratch, unpacker};
 
 use zlayer_hcs::enumerate;
 use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
-    ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory, ContainerProcessor,
-    ProcessParameters, SchemaVersion, Statistics, Storage as HcsStorage,
+    Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
+    ContainerProcessor, Devices, GuestState, ProcessParameters, SchemaVersion, ScsiAttachment,
+    ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor,
+    Uefi, UefiBootEntry, VirtualMachine, VirtualSmbShare,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -293,6 +296,11 @@ struct ContainerEntry {
     /// at [`HcsRuntime::create_container`] time — we still let the container
     /// start, but it won't have networking.
     network_attachment: Option<EndpointAttachment>,
+    /// Hyper-V utility VM backing this container when isolation is
+    /// [`IsolationMode::Hyperv`]. `None` for [`IsolationMode::Process`]
+    /// entries. Dropped on remove so the per-container scratch VHDX is
+    /// cleaned up via [`Uvm::Drop`].
+    uvm: Option<Uvm>,
 }
 
 /// Per-daemon HCN Transparent overlay network created lazily on first
@@ -819,19 +827,25 @@ impl HcsRuntime {
         parent_layers: Vec<zlayer_hcs::schema::Layer>,
         namespace_ids: Vec<String>,
         isolation: IsolationMode,
+        uvm: Option<&Uvm>,
     ) -> Result<HcsDoc> {
-        // Hyper-V isolation requires a UVM lifecycle (scratch VHDX +
-        // VirtualMachine compute-system document with VirtualSmb share of the
-        // boot files + SCSI attachment of the per-container scratch VHDX).
-        // That wiring lands in Phase 2 task 3.D. Until then, surface a clean
-        // [`AgentError::Unsupported`] so callers can route around the
-        // unimplemented path instead of getting a low-level HCS error.
-        if matches!(isolation, IsolationMode::Hyperv) {
-            return Err(AgentError::Unsupported(
-                "Hyper-V isolation requires UVM lifecycle wiring (see Phase 2 task 3.D)"
-                    .to_string(),
-            ));
-        }
+        // Hyper-V isolation populates the `VirtualMachine` body using the UVM
+        // the caller already provisioned: scratch VHDX → SCSI attachment, layer
+        // dirs → read-only VirtualSMB shares, boot-files dir → GuestState.
+        // [`IsolationMode::Process`] flows down through the `Container` path
+        // unchanged.
+        let virtual_machine = match isolation {
+            IsolationMode::Process => None,
+            IsolationMode::Hyperv => {
+                let uvm = uvm.ok_or_else(|| {
+                    AgentError::Internal(
+                        "build_compute_system_doc called with Hyperv isolation but no UVM provided"
+                            .to_string(),
+                    )
+                })?;
+                Some(build_virtual_machine_doc(uvm, &parent_layers, spec))
+            }
+        };
 
         let processor = spec.resources.cpu.and_then(|cpu| {
             // `count` must be at least 1 vCPU; we round up fractional requests.
@@ -887,12 +901,21 @@ impl HcsRuntime {
             memory,
         };
 
+        // A Hyper-V-isolated compute system carries the `VirtualMachine` body
+        // and omits the `Container` body — HCS picks up the container
+        // configuration from the workload running inside the UVM, not from the
+        // outer compute system. Process isolation is the inverse.
+        let (container_doc, vm_doc) = match isolation {
+            IsolationMode::Process => (Some(container), None),
+            IsolationMode::Hyperv => (None, virtual_machine),
+        };
+
         let doc = HcsDoc {
             owner: owner_tag(&self.config.daemon_name),
             schema_version: SchemaVersion::default(),
             hosting_system_id: String::new(),
-            container: Some(container),
-            virtual_machine: None,
+            container: container_doc,
+            virtual_machine: vm_doc,
             should_terminate_on_last_handle_closed: Some(true),
         }
         .apply_service_id(hcs_id);
@@ -948,6 +971,114 @@ impl HcsRuntime {
                 }
             }
         });
+    }
+}
+
+/// Default vCPU count assigned to a freshly-provisioned UVM.
+///
+/// Two vCPUs is the hcsshim convention for a Hyper-V-isolated container's
+/// utility VM — enough to keep the guest kernel responsive without giving up
+/// large amounts of host scheduling capacity per container.
+const UVM_DEFAULT_VCPUS: u32 = 2;
+
+/// Default memory (MiB) assigned to a freshly-provisioned UVM.
+///
+/// 1 GiB matches the hcsshim default for `WCOW` utility VMs. The container's
+/// own memory pressure is independent of this number — the limit set on the
+/// service's [`ServiceSpec::resources`] is applied to the workload running
+/// inside the UVM, not the UVM itself.
+const UVM_DEFAULT_MEMORY_MB: u64 = 1024;
+
+/// VirtualSMB share flags requesting a read-only, share-as-direct mount of the
+/// layer directory into the UVM. Matches hcsshim's `vsmbFlags` for read-only
+/// container layer shares (`READ_ONLY | SHARE_READ | CACHE_IO | NO_OPLOCKS |
+/// FORCE_LEVEL_2_OPLOCKS`).
+const VSMB_FLAGS_READONLY_LAYER: u32 = 0x0008_0000;
+
+/// Build a [`VirtualMachine`] document populated from a freshly-provisioned
+/// [`Uvm`] plus the parent read-only layer chain.
+///
+/// Layout follows the hcsshim convention for Hyper-V-isolated WCOW containers:
+///
+/// * `chipset.uefi` boots from the SCSI drive at controller 0, LUN 0 — the
+///   scratch VHDX the UVM owns.
+/// * `compute_topology` defaults to [`UVM_DEFAULT_VCPUS`] vCPUs and
+///   [`UVM_DEFAULT_MEMORY_MB`] MiB of memory.
+/// * `devices.scsi["0"]` carries one attachment at LUN `"0"` for the scratch
+///   VHDX (writable).
+/// * `devices.virtual_smb` shares the read-only layer chain into the UVM so
+///   the container workload can mount its image.
+/// * `guest_state.guest_state_file_path` points at the boot-files directory
+///   exposed by the UVM.
+///
+/// `spec` is currently unused — the UVM's processor/memory topology is fixed
+/// by the constants above so the per-container CPU/memory limits remain a
+/// property of the workload inside the UVM (see
+/// [`HcsRuntime::build_compute_system_doc`]'s `ContainerProcessor`/`ContainerMemory`).
+fn build_virtual_machine_doc(
+    uvm: &Uvm,
+    parent_layers: &[zlayer_hcs::schema::Layer],
+    _spec: &ServiceSpec,
+) -> VirtualMachine {
+    use std::collections::BTreeMap;
+
+    let mut scsi_attachments: BTreeMap<String, ScsiAttachment> = BTreeMap::new();
+    scsi_attachments.insert(
+        "0".to_string(),
+        ScsiAttachment {
+            path: uvm.scratch_vhdx().to_string_lossy().into_owned(),
+            r#type: "VirtualDisk".to_string(),
+            read_only: Some(false),
+        },
+    );
+
+    let mut scsi: BTreeMap<String, ScsiController> = BTreeMap::new();
+    scsi.insert(
+        "0".to_string(),
+        ScsiController {
+            attachments: scsi_attachments,
+        },
+    );
+
+    // One VirtualSMB share per read-only parent layer. The share name is the
+    // layer's HCS id (already a stable GUID) so two containers attached to the
+    // same layer dir on the same UVM (we don't do that today, but the schema
+    // permits it) never collide.
+    let mut virtual_smb: BTreeMap<String, VirtualSmbShare> = BTreeMap::new();
+    for layer in parent_layers {
+        virtual_smb.insert(
+            layer.id.clone(),
+            VirtualSmbShare {
+                name: layer.id.clone(),
+                path: layer.path.clone(),
+                flags: Some(VSMB_FLAGS_READONLY_LAYER),
+            },
+        );
+    }
+
+    VirtualMachine {
+        chipset: Some(Chipset {
+            uefi: Some(Uefi {
+                boot_this: Some(UefiBootEntry {
+                    device_type: "ScsiDrive".to_string(),
+                    device_path: String::new(),
+                    disk_number: Some(0),
+                }),
+            }),
+        }),
+        compute_topology: Some(Topology {
+            memory: Some(TopologyMemory {
+                size_in_mb: UVM_DEFAULT_MEMORY_MB,
+            }),
+            processor: Some(TopologyProcessor {
+                count: UVM_DEFAULT_VCPUS,
+            }),
+        }),
+        devices: Some(Devices { scsi, virtual_smb }),
+        guest_state: Some(GuestState {
+            guest_state_file_path: uvm.boot_files().to_string_lossy().into_owned(),
+        }),
+        runtime_state_file_path: None,
     }
 }
 
@@ -1172,11 +1303,31 @@ impl Runtime for HcsRuntime {
         // Resolve the spec-side isolation choice (which may be `Auto` or
         // absent) to the concrete runtime-internal isolation mode. `Auto`
         // and absence both fall back to [`HcsConfig::default_isolation`];
-        // explicit `Process` / `Hyperv` flow through. The resolved value is
-        // passed into `build_compute_system_doc`, which currently errors out
-        // with [`AgentError::Unsupported`] on `Hyperv` (UVM wiring lands in
-        // Phase 2 task 3.D).
+        // explicit `Process` / `Hyperv` flow through.
         let isolation = spec_isolation_to_internal(spec.isolation, self.config.default_isolation);
+
+        // For Hyper-V isolation, provision the utility VM BEFORE building the
+        // compute-system doc so the doc can reference the UVM's scratch VHDX,
+        // boot files, and per-layer VirtualSMB shares. The UVM's `Drop` impl
+        // cleans up the scratch VHDX if any later step fails; on the happy
+        // path it lands in `ContainerEntry.uvm` and is dropped on
+        // `remove_container`. Process-isolated containers never allocate a
+        // UVM (it would just waste a few hundred MiB of host memory).
+        let uvm = match isolation {
+            IsolationMode::Hyperv => Some(
+                Uvm::create(
+                    &hcs_id,
+                    &self.config.storage_root,
+                    self.config.default_scratch_size_gb,
+                )
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!("UVM provisioning failed: {e}"),
+                })?,
+            ),
+            IsolationMode::Process => None,
+        };
+
         let doc = self.build_compute_system_doc(
             &hcs_id,
             spec,
@@ -1184,6 +1335,7 @@ impl Runtime for HcsRuntime {
             parent_layers,
             namespace_strs,
             isolation,
+            uvm.as_ref(),
         )?;
         let doc_json = serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
             id: hcs_id.clone(),
@@ -1216,6 +1368,7 @@ impl Runtime for HcsRuntime {
             hcs_id: hcs_id.clone(),
             last_exit_code: sink,
             network_attachment,
+            uvm,
         };
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
@@ -1311,6 +1464,16 @@ impl Runtime for HcsRuntime {
             scratch_layer
                 .detach_and_destroy()
                 .map_err(|e| AgentError::Internal(format!("scratch teardown: {e}")))?;
+        }
+
+        // Tear down the UVM (if any). The scratch VHDX cleanup happens in
+        // `Uvm::Drop` — we explicitly `drop` here so the order with respect to
+        // the scratch-layer teardown above is deterministic and any
+        // best-effort errors get logged via the `Drop` impl's tracing call
+        // before we move on to HCN teardown. Process-isolated entries never
+        // allocated a UVM and skip this no-op.
+        if let Some(uvm) = entry.uvm.take() {
+            drop(uvm);
         }
 
         // Tear down the HCN endpoint + namespace, if we attached one. Best-
@@ -1893,5 +2056,115 @@ mod tests {
             ),
             IsolationMode::Hyperv,
         );
+    }
+
+    /// Build a minimal [`ServiceSpec`] for the unit tests below. Mirrors
+    /// `runtimes::composite::tests::make_spec` so the construction stays in
+    /// step with the canonical YAML schema; we only need *a* well-formed spec
+    /// here because `build_virtual_machine_doc` ignores the spec body today.
+    fn fixture_spec() -> ServiceSpec {
+        let yaml = r"
+version: v1
+deployment: test
+services:
+  test:
+    rtype: service
+    image:
+      name: mcr.microsoft.com/windows/nanoserver:ltsc2022
+";
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(yaml)
+            .expect("valid fixture yaml")
+            .services
+            .remove("test")
+            .expect("service 'test' present")
+    }
+
+    /// `build_virtual_machine_doc` populates the `VirtualMachine` body with
+    /// the UVM's scratch VHDX (SCSI attachment), one read-only VirtualSMB
+    /// share per parent layer, the default 2 vCPU / 1024 MiB topology, the
+    /// UEFI ScsiDrive boot entry, and the boot-files path as GuestState.
+    ///
+    /// Uses [`Uvm::for_test`] so the test does not touch HCS, the VHD APIs,
+    /// or the filesystem under `%ProgramData%`.
+    #[test]
+    fn build_virtual_machine_doc_populates_uvm_fields() {
+        use std::path::PathBuf;
+        use zlayer_hcs::schema::Layer;
+
+        let scratch = PathBuf::from(r"C:\zlayer\uvms\test-container\scratch.vhdx");
+        let boot = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Hyper-V\Containers");
+        let uvm = Uvm::for_test("test-container", scratch.clone(), boot.clone());
+
+        let parent_layers = vec![
+            Layer {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                path: r"C:\zlayer\images\base".to_string(),
+            },
+            Layer {
+                id: "22222222-2222-2222-2222-222222222222".to_string(),
+                path: r"C:\zlayer\images\app".to_string(),
+            },
+        ];
+
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &parent_layers, &spec);
+
+        // Chipset / UEFI: boot from SCSI controller 0, LUN 0.
+        let chipset = vm.chipset.expect("chipset");
+        let uefi = chipset.uefi.expect("uefi");
+        let boot_entry = uefi.boot_this.expect("boot_this");
+        assert_eq!(boot_entry.device_type, "ScsiDrive");
+        assert_eq!(boot_entry.disk_number, Some(0));
+
+        // Devices.scsi: one controller `"0"` with one attachment `"0"` ↦ scratch VHDX.
+        let devices = vm.devices.expect("devices");
+        let controller = devices.scsi.get("0").expect("scsi controller 0");
+        let attachment = controller.attachments.get("0").expect("scsi attachment 0");
+        assert_eq!(attachment.path, scratch.to_string_lossy());
+        assert_eq!(attachment.r#type, "VirtualDisk");
+        assert_eq!(attachment.read_only, Some(false));
+
+        // Devices.virtual_smb: one share per parent layer, keyed by layer id.
+        assert_eq!(
+            devices.virtual_smb.len(),
+            2,
+            "expected one VirtualSMB share per parent layer",
+        );
+        let share = devices
+            .virtual_smb
+            .get("11111111-1111-1111-1111-111111111111")
+            .expect("smb share for base layer");
+        assert_eq!(share.path, r"C:\zlayer\images\base");
+        assert_eq!(share.flags, Some(VSMB_FLAGS_READONLY_LAYER));
+
+        // Compute topology: defaults to 2 vCPU / 1024 MiB.
+        let topology = vm.compute_topology.expect("compute_topology");
+        assert_eq!(topology.processor.expect("processor").count, 2);
+        assert_eq!(topology.memory.expect("memory").size_in_mb, 1024);
+
+        // GuestState: boot-files directory path.
+        let gs = vm.guest_state.expect("guest_state");
+        assert_eq!(gs.guest_state_file_path, boot.to_string_lossy());
+    }
+
+    /// `build_virtual_machine_doc` against an empty parent chain still
+    /// produces a valid SCSI + chipset + topology block; the `virtual_smb`
+    /// map is simply empty. This pins the contract that a zero-layer image
+    /// (theoretical edge case) does not panic.
+    #[test]
+    fn build_virtual_machine_doc_handles_empty_parent_chain() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "empty-chain",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec);
+
+        let devices = vm.devices.expect("devices");
+        assert!(devices.virtual_smb.is_empty());
+        assert_eq!(devices.scsi.len(), 1);
     }
 }

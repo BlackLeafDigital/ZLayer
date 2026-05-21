@@ -176,6 +176,25 @@ impl Uvm {
         &self.container_id
     }
 
+    /// Test-only constructor that fabricates a [`Uvm`] from caller-supplied
+    /// paths without touching the filesystem or invoking `CreateVirtualDisk`.
+    /// Used by integration tests in [`crate::runtimes::hcs`] that exercise
+    /// the Hyper-V branch of `build_compute_system_doc` without a live
+    /// Windows host.
+    ///
+    /// Sets `needs_cleanup = false` so `Drop` never tries to delete the
+    /// caller's fixture files.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test(container_id: &str, scratch_vhdx: PathBuf, boot_files: PathBuf) -> Self {
+        Self {
+            container_id: container_id.to_string(),
+            scratch_vhdx,
+            boot_files,
+            needs_cleanup: false,
+        }
+    }
+
     /// Explicitly remove the scratch VHDX. Prefer this over relying on
     /// `Drop` when the caller wants to surface teardown errors. After a
     /// successful call, `Drop` becomes a no-op.
