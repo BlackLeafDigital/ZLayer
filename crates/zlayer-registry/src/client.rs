@@ -1416,6 +1416,87 @@ impl ImagePuller {
         Ok(digest)
     }
 
+    /// Push a pre-serialised manifest blob verbatim to a remote registry.
+    ///
+    /// Unlike [`Self::push_manifest_to_registry`], which round-trips through
+    /// `OciImageManifest` and so re-serialises the JSON (potentially losing
+    /// byte-level fidelity with the locally-computed digest), this PUTs the
+    /// exact bytes the caller already computed a sha256 over. This matters
+    /// for Windows WCOW manifests where the layer descriptors carry foreign
+    /// `urls[]` arrays that must round-trip unmodified so Windows daemons
+    /// recognise the layers as foreign and skip download.
+    ///
+    /// The `content_type` is sent verbatim as the `Content-Type` header; for
+    /// a Docker manifest pass `"application/vnd.docker.distribution.manifest.v2+json"`,
+    /// for an OCI image manifest pass `"application/vnd.oci.image.manifest.v1+json"`.
+    ///
+    /// # Errors
+    ///
+    /// - [`PushError::InvalidReference`] if `reference` is not a parseable image ref.
+    /// - [`PushError::AuthenticationFailed`] on auth failure for the target registry.
+    /// - [`PushError::ManifestUploadFailed`] if the underlying PUT fails or the
+    ///   provided `content_type` is not a valid HTTP header value.
+    #[instrument(
+        name = "push_manifest_blob",
+        skip(self, manifest_bytes, auth),
+        fields(
+            reference = %reference,
+            content_type = %content_type,
+            size = manifest_bytes.len(),
+        )
+    )]
+    pub async fn push_manifest_blob(
+        &self,
+        reference: &str,
+        manifest_bytes: Vec<u8>,
+        content_type: &str,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<String, PushError> {
+        let image_ref: Reference = reference.parse().map_err(|_| PushError::InvalidReference {
+            reference: reference.to_string(),
+        })?;
+
+        let header_value =
+            content_type
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| {
+                    PushError::ManifestUploadFailed {
+                        reason: format!("invalid Content-Type {content_type:?}: {e}"),
+                    }
+                })?;
+
+        // Authenticate for push operation
+        self.client
+            .auth(&image_ref, auth, RegistryOperation::Push)
+            .await
+            .map_err(|e| PushError::AuthenticationFailed {
+                registry: image_ref.resolve_registry().to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let manifest_url = self
+            .client
+            .push_manifest_raw(&image_ref, manifest_bytes.clone(), header_value)
+            .await
+            .map_err(|e| PushError::ManifestUploadFailed {
+                reason: e.to_string(),
+            })?;
+
+        let digest = if let Some(digest_start) = manifest_url.rfind('@') {
+            manifest_url[digest_start + 1..].to_string()
+        } else {
+            crate::cache::compute_digest(&manifest_bytes)
+        };
+
+        tracing::info!(
+            reference = %reference,
+            digest = %digest,
+            "manifest blob pushed successfully"
+        );
+
+        Ok(digest)
+    }
+
     /// Push a WASM artifact to a remote registry
     ///
     /// This method pushes a complete WASM artifact including the config blob,

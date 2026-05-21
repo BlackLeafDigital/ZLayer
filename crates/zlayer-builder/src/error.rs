@@ -302,6 +302,47 @@ pub enum BuildError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// Top-level wrapper for any failure during the WCOW
+    /// [`crate::windows_builder::WindowsBuilder::push`] flow. Returned when
+    /// the push could not be completed but the failure is not better
+    /// described by [`BuildError::BlobUploadFailed`] or
+    /// [`BuildError::ManifestPutFailed`] — for example, when reading a
+    /// local layer blob off disk fails before it ever reaches the wire.
+    #[error("push of image {tag:?} failed: {reason}")]
+    PushFailed {
+        /// Target image tag the push was destined for, e.g.
+        /// `"ghcr.io/zorpxinc/zlayer-test:wcow-0.1"`.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
+
+    /// A single layer blob upload PUT/PATCH chain failed. Carries the
+    /// blob's content-addressable digest so the operator can correlate
+    /// against registry-side logs.
+    #[error("failed to upload blob {digest} for tag {tag:?}: {reason}")]
+    BlobUploadFailed {
+        /// `sha256:...` digest of the blob that failed to upload.
+        digest: String,
+        /// Target image tag.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
+
+    /// The final `PUT /v2/<name>/manifests/<tag>` request failed.
+    /// Distinct from [`BuildError::BlobUploadFailed`] because the manifest
+    /// PUT is the last write that makes the push observable from the
+    /// registry — a failure here means the layers and config blob may be
+    /// staged but the image is not yet visible under `tag`.
+    #[error("failed to PUT manifest for tag {tag:?}: {reason}")]
+    ManifestPutFailed {
+        /// Target image tag the manifest PUT targeted.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
 }
 
 impl BuildError {

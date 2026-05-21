@@ -928,6 +928,309 @@ impl WindowsBuilder {
     pub async fn emit_image(&self, skeleton: &BuildSkeleton, tag: &str) -> Result<BuiltImage> {
         emit_image_impl(self.config(), skeleton, tag).await
     }
+
+    /// Push an already-emitted [`BuiltImage`] to its target registry
+    /// (task 4.E).
+    ///
+    /// Uploads every non-foreign layer blob, the image config blob, and
+    /// finally PUTs the manifest at `tag`. Foreign Windows base layers
+    /// (those carrying a non-`None` `urls[]` on their [`EmittedLayer`])
+    /// are NEVER re-uploaded — Windows daemons pulling the image will
+    /// follow the manifest's `urls[]` array back to MCR (or the configured
+    /// mirror) for those blobs. This is the entire point of foreign-layer
+    /// distribution and why the WCOW push path must round-trip `urls[]`
+    /// verbatim into the manifest blob.
+    ///
+    /// Authentication is sourced from
+    /// [`WindowsBuildConfig::registry_auth`].
+    ///
+    /// # Arguments
+    ///
+    /// * `image` — output of [`Self::emit_image`].
+    /// * `tag` — full image reference (`"ghcr.io/org/name:version"`,
+    ///   `"localhost:5000/repo:tag"`, …). Used verbatim as the manifest's
+    ///   PUT target.
+    ///
+    /// # Errors
+    ///
+    /// - [`BuildError::BlobUploadFailed`] when uploading a non-foreign
+    ///   layer blob or the image config blob fails.
+    /// - [`BuildError::ManifestPutFailed`] when the final manifest PUT
+    ///   fails.
+    /// - [`BuildError::PushFailed`] when staging a local blob (reading
+    ///   off disk) fails before any wire interaction.
+    pub async fn push(&self, image: &BuiltImage, tag: &str) -> Result<()> {
+        let target = RegistryPushTarget::new();
+        self.push_with(image, tag, &target).await
+    }
+
+    /// Push variant that takes an explicit [`PushTarget`]. The public
+    /// [`Self::push`] wires up the real registry-backed implementation;
+    /// this variant exists so unit tests can inject a recording double
+    /// without needing a live registry. The split also means the wire
+    /// protocol details (how many `PATCH`es per blob, what `Content-Type`
+    /// the manifest carries, etc.) live entirely behind the trait and can
+    /// be unit-tested independently of `WindowsBuilder`.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::push`]: [`BuildError::BlobUploadFailed`],
+    /// [`BuildError::ManifestPutFailed`], or [`BuildError::PushFailed`]
+    /// depending on which stage of the push tripped.
+    pub async fn push_with(
+        &self,
+        image: &BuiltImage,
+        tag: &str,
+        target: &dyn PushTarget,
+    ) -> Result<()> {
+        push_impl(image, tag, &self.config.registry_auth, target).await
+    }
+
+    /// Convenience: skeleton → execute every parsed instruction → emit
+    /// manifest → push. Single entry point for callers that want a
+    /// one-shot WCOW build from a [`BuildContext`].
+    ///
+    /// Walks `ctx`'s Dockerfile in order. After each `Instruction` the
+    /// instruction is routed through [`Self::execute_instruction`] which
+    /// commits a new RO layer per RUN/COPY/ADD and mutates the in-memory
+    /// image config for config-only instructions. After the last
+    /// instruction the manifest is emitted via [`Self::emit_image`] and
+    /// pushed via [`Self::push`].
+    ///
+    /// # Errors
+    ///
+    /// Any [`BuildError`] that [`Self::build_skeleton`],
+    /// [`Self::execute_instruction`], [`Self::emit_image`], or
+    /// [`Self::push`] can produce.
+    pub async fn build_and_push(&self, ctx: &BuildContext) -> Result<()> {
+        let mut skeleton = self.build_skeleton(ctx).await?;
+        // The Dockerfile's first (and only — multi-stage is rejected by
+        // build_skeleton) stage is what we walk. Cloning the instruction
+        // vector is cheap and lets us pass `&mut skeleton` into
+        // execute_instruction without aliasing the parsed-dockerfile
+        // borrow.
+        let instructions: Vec<Instruction> = skeleton
+            .parsed_dockerfile
+            .stages
+            .first()
+            .map(|s| s.instructions.clone())
+            .unwrap_or_default();
+        for instr in &instructions {
+            self.execute_instruction(&mut skeleton, ctx, instr).await?;
+        }
+        let built = self.emit_image(&skeleton, &ctx.tag).await?;
+        self.push(&built, &ctx.tag).await
+    }
+}
+
+/// Abstraction over the wire-side push operations the WCOW builder needs.
+///
+/// Two implementations:
+///
+/// - [`RegistryPushTarget`] — the real impl, wraps
+///   [`zlayer_registry::ImagePuller`].
+/// - In-test recording doubles (see this module's `tests` submodule) —
+///   capture which blobs were uploaded and which manifest bytes were PUT
+///   so unit tests can assert foreign layers are skipped and `urls[]`
+///   round-trips verbatim.
+///
+/// `PushTarget` is intentionally minimal: just "upload an arbitrary blob
+/// with this digest" and "PUT this manifest blob at this tag with this
+/// content type." Everything WCOW-specific (foreign-layer detection,
+/// reading layer blobs off disk, computing the manifest's
+/// `Content-Type`) lives in [`push_impl`] — the trait surface only
+/// describes registry-side primitives.
+#[async_trait::async_trait]
+pub trait PushTarget: Send + Sync {
+    /// Upload a single blob, content-addressed by `digest`, to the
+    /// registry under `reference`.
+    ///
+    /// `media_type` is informational — the registry's blob-upload
+    /// endpoint does not key on it — but is plumbed through so backends
+    /// that key off media type for observability can use it.
+    async fn upload_blob(
+        &self,
+        reference: &str,
+        digest: &str,
+        media_type: &str,
+        data: Vec<u8>,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<(), String>;
+
+    /// PUT the pre-serialised manifest blob `bytes` at `reference` with
+    /// `Content-Type: content_type`. The bytes are sent verbatim so the
+    /// foreign-layer `urls[]` array round-trips byte-identical between
+    /// what [`BuiltImage::manifest_blob`] computed its digest over and
+    /// what the registry indexes.
+    async fn put_manifest(
+        &self,
+        reference: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<(), String>;
+}
+
+/// Real [`PushTarget`] backed by [`zlayer_registry::ImagePuller`].
+///
+/// Constructed with an in-memory blob cache because the push path never
+/// reads from the cache — `ImagePuller`'s pull-side machinery is the only
+/// reason the cache is wired in at construction. The cache is dropped as
+/// soon as the push completes.
+pub struct RegistryPushTarget {
+    puller: zlayer_registry::ImagePuller,
+}
+
+impl RegistryPushTarget {
+    /// Construct a fresh push target backed by an in-memory blob cache.
+    /// The cache is unused on the push path but satisfies the
+    /// `ImagePuller` constructor contract.
+    /// # Panics
+    ///
+    /// Panics only if the in-memory blob cache fails to initialise,
+    /// which the implementation does not currently allow — kept as a
+    /// panic rather than threading a `Result` through every push site.
+    #[must_use]
+    pub fn new() -> Self {
+        let cache = zlayer_registry::BlobCache::new()
+            .expect("in-memory BlobCache::new() is infallible in the current impl");
+        Self {
+            puller: zlayer_registry::ImagePuller::new(cache),
+        }
+    }
+}
+
+impl Default for RegistryPushTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl PushTarget for RegistryPushTarget {
+    async fn upload_blob(
+        &self,
+        reference: &str,
+        digest: &str,
+        media_type: &str,
+        data: Vec<u8>,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<(), String> {
+        self.puller
+            .push_blob(reference, digest, &data, media_type, auth)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn put_manifest(
+        &self,
+        reference: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<(), String> {
+        self.puller
+            .push_manifest_blob(reference, bytes, content_type, auth)
+            .await
+            .map(|_digest| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Free-function push implementation — takes a [`PushTarget`] by
+/// reference so both the public [`WindowsBuilder::push`] and the unit
+/// tests can drive the same body.
+///
+/// Order: layers (skipping foreign) → image config blob → manifest.
+/// Foreign layers are detected by the presence of a non-`None` `urls[]`
+/// on their [`EmittedLayer`].
+async fn push_impl(
+    image: &BuiltImage,
+    tag: &str,
+    auth: &RegistryAuth,
+    target: &dyn PushTarget,
+) -> Result<()> {
+    // 1. Upload every non-foreign layer blob.
+    for layer in &image.layers {
+        if layer.urls.is_some() {
+            // Foreign layer — the manifest descriptor carries the MCR
+            // urls[] verbatim; the registry never sees these bytes.
+            tracing::debug!(
+                tag = %tag,
+                digest = %layer.digest,
+                "skipping foreign layer blob upload (urls[] preserved on manifest)"
+            );
+            continue;
+        }
+
+        let data = if layer.local_path.as_os_str().is_empty() {
+            // Not foreign but no on-disk path either — programmer error
+            // upstream of push. Surface a typed error instead of trying
+            // to upload empty bytes.
+            return Err(BuildError::PushFailed {
+                tag: tag.to_string(),
+                reason: format!(
+                    "non-foreign layer {} has no local_path (emit_image must populate it)",
+                    layer.digest
+                ),
+            });
+        } else {
+            tokio::fs::read(&layer.local_path)
+                .await
+                .map_err(|e| BuildError::PushFailed {
+                    tag: tag.to_string(),
+                    reason: format!(
+                        "failed to read layer blob {} from {}: {e}",
+                        layer.digest,
+                        layer.local_path.display()
+                    ),
+                })?
+        };
+
+        target
+            .upload_blob(tag, &layer.digest, &layer.media_type, data, auth)
+            .await
+            .map_err(|reason| BuildError::BlobUploadFailed {
+                digest: layer.digest.clone(),
+                tag: tag.to_string(),
+                reason,
+            })?;
+    }
+
+    // 2. Upload the image config blob.
+    target
+        .upload_blob(
+            tag,
+            &image.image_config_digest,
+            OCI_IMAGE_CONFIG_MEDIA_TYPE,
+            image.image_config_blob.clone(),
+            auth,
+        )
+        .await
+        .map_err(|reason| BuildError::BlobUploadFailed {
+            digest: image.image_config_digest.clone(),
+            tag: tag.to_string(),
+            reason,
+        })?;
+
+    // 3. PUT the manifest blob. We send the raw bytes (not a
+    //    re-serialised OciImageManifest) so foreign `urls[]` round-trips
+    //    byte-identical to what BuiltImage::manifest_digest was computed
+    //    over.
+    target
+        .put_manifest(
+            tag,
+            image.manifest_blob.clone(),
+            OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            auth,
+        )
+        .await
+        .map_err(|reason| BuildError::ManifestPutFailed {
+            tag: tag.to_string(),
+            reason,
+        })?;
+
+    Ok(())
 }
 
 /// Reconstruct a canonical Dockerfile source line for one parsed
@@ -4117,5 +4420,273 @@ mod tests {
             matches!(err, BuildError::OsVersionUnresolved),
             "expected OsVersionUnresolved, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4.E push tests
+    //
+    // These exercise `push_impl` against a recording `PushTarget` double
+    // so we can assert on the wire-side calls without needing a live
+    // registry. The fourth, `build_and_push_e2e`, is the only test that
+    // needs a real network; it's `#[ignore]`d by default.
+    // -----------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    /// One call recorded by [`RecordingPushTarget`]. We capture the bare
+    /// minimum needed by the assertions: which blobs were uploaded (by
+    /// digest), whether the manifest PUT happened, and what bytes the
+    /// manifest PUT sent so foreign-layer round-trip can be verified.
+    #[derive(Debug, Default, Clone)]
+    struct PushRecord {
+        uploaded_blob_digests: Vec<String>,
+        manifest_put: Option<(String, Vec<u8>, String)>,
+    }
+
+    /// In-test [`PushTarget`] double. Optional `fail_on_digest` causes
+    /// `upload_blob` to return an `Err` when that digest is uploaded —
+    /// used to verify [`BuildError::BlobUploadFailed`] propagation.
+    struct RecordingPushTarget {
+        inner: Mutex<PushRecord>,
+        fail_on_digest: Option<String>,
+    }
+
+    impl RecordingPushTarget {
+        fn new() -> Self {
+            Self {
+                inner: Mutex::new(PushRecord::default()),
+                fail_on_digest: None,
+            }
+        }
+
+        fn with_failure(digest: impl Into<String>) -> Self {
+            Self {
+                inner: Mutex::new(PushRecord::default()),
+                fail_on_digest: Some(digest.into()),
+            }
+        }
+
+        fn snapshot(&self) -> PushRecord {
+            self.inner.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PushTarget for RecordingPushTarget {
+        async fn upload_blob(
+            &self,
+            _reference: &str,
+            digest: &str,
+            _media_type: &str,
+            _data: Vec<u8>,
+            _auth: &RegistryAuth,
+        ) -> std::result::Result<(), String> {
+            if let Some(fail) = &self.fail_on_digest {
+                if fail == digest {
+                    return Err(format!("simulated upload failure for {digest}"));
+                }
+            }
+            self.inner
+                .lock()
+                .unwrap()
+                .uploaded_blob_digests
+                .push(digest.to_string());
+            Ok(())
+        }
+
+        async fn put_manifest(
+            &self,
+            reference: &str,
+            bytes: Vec<u8>,
+            content_type: &str,
+            _auth: &RegistryAuth,
+        ) -> std::result::Result<(), String> {
+            self.inner.lock().unwrap().manifest_put =
+                Some((reference.to_string(), bytes, content_type.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Construct a [`BuiltImage`] fixture with one foreign base layer
+    /// (`urls` set, empty `local_path`) and one OCI builder-produced
+    /// layer backed by a real on-disk blob. The OCI layer's `local_path`
+    /// points at a tempfile so `push_impl` can `tokio::fs::read` it; the
+    /// caller keeps the `TempDir` alive for the lifetime of the test.
+    fn built_image_fixture() -> (BuiltImage, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let oci_blob_path = tmp.path().join("oci-layer.tar.gz");
+        std::fs::write(&oci_blob_path, b"fake-oci-layer-bytes").expect("write fake blob");
+
+        let layers = vec![
+            EmittedLayer {
+                media_type: FOREIGN_WINDOWS_LAYER_MEDIA_TYPE.to_string(),
+                digest: "sha256:foreign00000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                size: 12345,
+                diff_id: "sha256:foreigndiff0000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                local_path: PathBuf::new(),
+                urls: Some(vec![
+                    "https://mcr.microsoft.com/v2/windows/nanoserver/blobs/sha256:foreign"
+                        .to_string(),
+                ]),
+            },
+            EmittedLayer {
+                media_type: OCI_TAR_GZIP_LAYER_MEDIA_TYPE.to_string(),
+                digest: "sha256:oci11111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+                size: 20,
+                diff_id: "sha256:ocidiff111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+                local_path: oci_blob_path,
+                urls: None,
+            },
+        ];
+        // Build a real manifest blob via the same helper used in
+        // production so the foreign urls[] really do appear in the bytes
+        // we PUT (rather than being injected by the test).
+        let manifest_blob =
+            build_manifest_blob("sha256:config0000", 42, &layers).expect("manifest blob");
+        let manifest_digest = compute_sha256_hex(&manifest_blob);
+        let built = BuiltImage {
+            tag: "ghcr.io/zorpxinc/zlayer-test:wcow-0.1".to_string(),
+            image_config_blob: b"{\"fake\":\"config\"}".to_vec(),
+            image_config_digest: "sha256:config0000".to_string(),
+            manifest_blob,
+            manifest_digest,
+            layers,
+        };
+        (built, tmp)
+    }
+
+    #[tokio::test]
+    async fn push_skips_foreign_layers() {
+        let (built, _tmp) = built_image_fixture();
+        let target = RecordingPushTarget::new();
+
+        push_impl(&built, &built.tag, &RegistryAuth::Anonymous, &target)
+            .await
+            .expect("push must succeed against a noop target");
+
+        let rec = target.snapshot();
+        // The foreign layer must NEVER be uploaded.
+        assert!(
+            !rec.uploaded_blob_digests
+                .iter()
+                .any(|d| d.contains("foreign")),
+            "foreign layer was uploaded but must be skipped; uploads = {:?}",
+            rec.uploaded_blob_digests
+        );
+        // The OCI builder-produced layer must be uploaded exactly once.
+        let oci_uploads = rec
+            .uploaded_blob_digests
+            .iter()
+            .filter(|d| d.starts_with("sha256:oci"))
+            .count();
+        assert_eq!(
+            oci_uploads, 1,
+            "OCI layer must be uploaded exactly once; uploads = {:?}",
+            rec.uploaded_blob_digests
+        );
+        // The image config blob must be uploaded.
+        assert!(
+            rec.uploaded_blob_digests
+                .iter()
+                .any(|d| d == "sha256:config0000"),
+            "image config blob must be uploaded; uploads = {:?}",
+            rec.uploaded_blob_digests
+        );
+        // Manifest PUT happened once with the right content type.
+        let (tag, _bytes, ct) = rec.manifest_put.as_ref().expect("manifest PUT recorded");
+        assert_eq!(tag, &built.tag);
+        assert_eq!(ct, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_preserves_foreign_urls() {
+        let (built, _tmp) = built_image_fixture();
+        let target = RecordingPushTarget::new();
+
+        push_impl(&built, &built.tag, &RegistryAuth::Anonymous, &target)
+            .await
+            .expect("push must succeed");
+
+        let rec = target.snapshot();
+        let (_tag, bytes, _ct) = rec.manifest_put.expect("manifest PUT recorded");
+        // The PUT bytes must be EXACTLY the bytes BuiltImage built —
+        // not a re-serialised round-trip — so the digest BuiltImage
+        // computed matches what the registry indexes.
+        assert_eq!(
+            bytes, built.manifest_blob,
+            "manifest PUT bytes must be byte-identical to BuiltImage::manifest_blob"
+        );
+        // And the foreign-layer urls[] must be in there.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("PUT bytes must be valid JSON");
+        let layer0 = &manifest["layers"][0];
+        assert_eq!(layer0["mediaType"], FOREIGN_WINDOWS_LAYER_MEDIA_TYPE);
+        let urls = layer0["urls"]
+            .as_array()
+            .expect("foreign layer urls[] must survive the PUT");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(
+            urls[0].as_str().unwrap(),
+            "https://mcr.microsoft.com/v2/windows/nanoserver/blobs/sha256:foreign"
+        );
+        // Non-foreign layer must NOT carry urls[].
+        assert!(
+            manifest["layers"][1].get("urls").is_none(),
+            "non-foreign layer must not carry a urls[] array on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_failure_surfaces_typed_error() {
+        let (built, _tmp) = built_image_fixture();
+        // Fail on the OCI layer digest so the failure is mid-push, not
+        // at the manifest PUT.
+        let oci_digest = built.layers[1].digest.clone();
+        let target = RecordingPushTarget::with_failure(&oci_digest);
+
+        let err = push_impl(&built, &built.tag, &RegistryAuth::Anonymous, &target)
+            .await
+            .expect_err("push must fail when upload_blob errors");
+        match err {
+            BuildError::BlobUploadFailed { digest, tag, .. } => {
+                assert_eq!(digest, oci_digest);
+                assert_eq!(tag, built.tag);
+            }
+            other => panic!("expected BuildError::BlobUploadFailed, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live network: requires GHCR creds + mcr.microsoft.com/windows/nanoserver:ltsc2022 base + Windows host"]
+    async fn build_and_push_e2e() {
+        // Skipped by default; the WCOW build E2E lives in 4.F as its
+        // own integration test. This stub exists so `cargo test -- \
+        // --ignored` lists the entry point and a future operator can
+        // wire it to the live test harness without re-discovering the
+        // call shape.
+        let cfg = dummy_config();
+        let builder = WindowsBuilder::new(cfg);
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let ctx_dir = tmp.path().join("ctx");
+        std::fs::create_dir_all(&ctx_dir).expect("mk ctx");
+        std::fs::write(
+            ctx_dir.join("Dockerfile"),
+            "FROM mcr.microsoft.com/windows/nanoserver:ltsc2022\n",
+        )
+        .expect("write dockerfile");
+        let ctx = BuildContext {
+            context_dir: ctx_dir,
+            dockerfile_path: PathBuf::from("Dockerfile"),
+            build_args: HashMap::new(),
+            tag: "ghcr.io/zorpxinc/zlayer-wcow-e2e:latest".to_string(),
+        };
+        builder
+            .build_and_push(&ctx)
+            .await
+            .expect("live build_and_push");
     }
 }
