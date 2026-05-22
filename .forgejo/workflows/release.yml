@@ -19,6 +19,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
+  # Baked into release binaries via option_env! at compile time. Propagates to
+  # every step in this workflow, so any cargo invocation (publish-crate /
+  # publish-all-crates verification builds, plus any future in-workflow
+  # `cargo build --release`) sees the secret. Resolves to empty when the
+  # secret is unset, which option_env! treats as None — safe.
+  ZLAYER_REPOSYNC_HMAC_SECRET: ${{ secrets.ZLAYER_REPOSYNC_HMAC_SECRET }}
 
 jobs:
   # ===========================================
