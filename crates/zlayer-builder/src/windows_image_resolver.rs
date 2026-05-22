@@ -39,7 +39,7 @@ const PACKAGE_MAP_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
 const REPOSYNC_HMAC_SECRET_ENV: &str = "ZLAYER_REPOSYNC_HMAC_SECRET";
 
 /// Endpoint that accepts cache-warm hints from clients.
-const REPOSYNC_HINT_ENDPOINT: &str = "https://reposync.blackleafdigital.com/choco";
+const REPOSYNC_HINT_ENDPOINT: &str = "https://reposync.blackleafdigital.com/choco-hint";
 
 /// Sentinel value placed in shard mappings to indicate that a Linux package
 /// has no Chocolatey equivalent because it is Linux-only (e.g.
