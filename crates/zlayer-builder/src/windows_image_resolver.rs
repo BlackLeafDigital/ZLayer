@@ -403,9 +403,9 @@ fn compute_reposync_signature(secret: &str, body: &[u8]) -> String {
 /// Fire-and-forget cache-warm hint POST to `RepoSourceSyncer`. No-op when
 /// `ZLAYER_REPOSYNC_HMAC_SECRET` was unset at build time.
 fn fire_reposync_hint(distro: &str, shard: &str) {
-    let Some(secret) = REPOSYNC_HMAC_SECRET else {
+    let Some(secret) = REPOSYNC_HMAC_SECRET.filter(|s| !s.is_empty()) else {
         debug!(
-            "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary; skipping reposync cache warm for choco/{distro}/{shard}"
+            "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary (or empty); skipping reposync cache warm for choco/{distro}/{shard}"
         );
         return;
     };

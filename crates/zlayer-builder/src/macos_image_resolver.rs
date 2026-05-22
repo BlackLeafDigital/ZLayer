@@ -667,7 +667,7 @@ async fn resolve_package(
         // binary at build time. If the secret was unset at build time (dev
         // builds, CI without the credential), skip the POST — the resolver
         // still works, the upstream cache just doesn't get warmed.
-        if let Some(secret) = REPOSYNC_HMAC_SECRET {
+        if let Some(secret) = REPOSYNC_HMAC_SECRET.filter(|s| !s.is_empty()) {
             let formula_name = formula.to_string();
             let body_clone = body.to_vec();
             tokio::spawn(async move {
@@ -687,7 +687,7 @@ async fn resolve_package(
             });
         } else {
             debug!(
-                "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary; skipping reposync cache warm for {}",
+                "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary (or empty); skipping reposync cache warm for {}",
                 formula
             );
         }
