@@ -12156,6 +12156,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
+name = "xtask"
+version = "0.0.0-dev"
+
+[[package]]
 name = "xxhash-rust"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12433,6 +12437,7 @@ version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bollard",
  "bytes",
  "chrono",

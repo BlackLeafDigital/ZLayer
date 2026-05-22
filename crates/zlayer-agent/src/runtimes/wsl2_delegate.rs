@@ -1956,10 +1956,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     fn cid(service: &str, replica: u32) -> ContainerId {
-        ContainerId {
-            service: service.to_string(),
-            replica,
-        }
+        ContainerId::new(service, replica)
     }
 
     #[cfg(target_os = "windows")]

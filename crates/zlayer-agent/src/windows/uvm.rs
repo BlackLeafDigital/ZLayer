@@ -262,7 +262,7 @@ fn remove_scratch_vhdx(path: &Path) -> io::Result<()> {
 /// Create an empty sparse VHDX at `path` sized at `size_gb` gigabytes.
 ///
 /// Uses the dynamic ("expandable") VHDX format — only allocates host disk
-/// space as the guest writes. Equivalent to PowerShell's `New-VHD -Dynamic`.
+/// space as the guest writes. Equivalent to `PowerShell`'s `New-VHD -Dynamic`.
 ///
 /// # Errors
 ///

@@ -31,6 +31,7 @@ members = [
   "crates/zlayer-hns",
   "crates/zlayer-types",
   "crates/zlayer-cluster-rpc",
+  "xtask",
 ]
 
 [workspace.package]

@@ -615,15 +615,15 @@ async fn windows_build_e2e_foreign_layer_round_trips() {
             .as_array()
             .expect("manifest must carry a `layers` array");
         assert!(!layers.is_empty(), "manifest must carry at least one layer");
-        let layer0 = &layers[0];
-        let media_type = layer0["mediaType"]
+        let foreign_layer = &layers[0];
+        let media_type = foreign_layer["mediaType"]
             .as_str()
             .expect("layer 0 must have a mediaType");
         assert_eq!(
             media_type, "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
             "layer 0 must be a foreign Windows base layer"
         );
-        let urls = layer0["urls"]
+        let urls = foreign_layer["urls"]
             .as_array()
             .expect("foreign layer 0 must carry a non-empty urls[] array");
         assert!(
@@ -631,10 +631,8 @@ async fn windows_build_e2e_foreign_layer_round_trips() {
             "foreign layer urls[] must survive the push verbatim"
         );
         assert!(
-            urls.iter().any(|u| u
-                .as_str()
-                .map(|s| s.contains("mcr.microsoft.com"))
-                .unwrap_or(false)),
+            urls.iter()
+                .any(|u| u.as_str().is_some_and(|s| s.contains("mcr.microsoft.com"))),
             "foreign layer urls[] must contain an MCR mirror URL; got {urls:?}"
         );
 

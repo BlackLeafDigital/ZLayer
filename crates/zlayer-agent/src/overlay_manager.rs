@@ -837,11 +837,14 @@ impl OverlayManager {
     /// Returns an error only if a netlink delete operation fails in a way
     /// other than "link not found" (e.g. permission denied). The IP
     /// release step never fails.
+    // async required by callers (`.await`ed in service.rs); only the Linux
+    // body actually awaits, so clippy flags the non-Linux build.
+    #[allow(clippy::unused_async)]
     pub async fn detach_container(&self, pid: u32) -> Result<(), AgentError> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = pid;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(target_os = "linux")]
@@ -890,6 +893,10 @@ impl OverlayManager {
     ///
     /// Linux-only. No-op on other platforms because there are no veths
     /// to sweep.
+    // `this` is moved into the spawned task on Linux to keep the manager
+    // alive for the sweep's lifetime; on non-Linux it's discarded. Clippy
+    // only sees the non-Linux branch when checking Windows targets.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn start_periodic_orphan_sweep(this: std::sync::Arc<tokio::sync::RwLock<Self>>) {
         #[cfg(not(target_os = "linux"))]
         {
@@ -1300,6 +1307,8 @@ impl IpAllocator {
     /// before extending the monotonic counter. Idempotent: no-op if the IP is
     /// already in the free list (we do not double-track because the counter
     /// would already have moved past it).
+    // reserved for graceful peer-disconnect cleanup; not yet wired through the main release path.
+    #[allow(dead_code)]
     fn release(&self, ip: IpAddr) {
         // Light dedup: avoid pushing the same address twice. The pool is
         // small in steady state (number of live containers); linear scan is

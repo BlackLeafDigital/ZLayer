@@ -1886,6 +1886,9 @@ async fn apply_filesystem_writes(
 
 /// Windows: tar+gz the scratch directory, commit a new RO layer via
 /// `wclayer::import_layer`, and append the new layer to both chains.
+// Signature parity with the non-Windows twin (which is also `async fn`) so
+// the single call site can `.await` either implementation uniformly.
+#[allow(clippy::unused_async)]
 #[cfg(target_os = "windows")]
 async fn commit_scratch_as_layer(
     skeleton: &mut BuildSkeleton,
@@ -2191,6 +2194,10 @@ const RUN_STEP_TERMINATION_GRACE_SECS: u64 = 10 * 60;
 
 /// Windows: execute one RUN step end-to-end (translate → spawn → wait →
 /// export → commit).
+// Sequential pipeline orchestration: translate -> spawn -> wait -> export ->
+// commit. Splitting would scatter the linear state plumbing across helpers
+// without simplifying any individual stage; keep it inline.
+#[allow(clippy::too_many_lines)]
 #[cfg(target_os = "windows")]
 async fn execute_run_step_impl(
     config: &WindowsBuildConfig,
@@ -2318,7 +2325,7 @@ async fn execute_run_step_impl(
     let params = ProcessParameters {
         command_line: command_line.clone(),
         working_directory: String::new(),
-        environment: Default::default(),
+        environment: BTreeMap::default(),
         emulate_console: Some(false),
         create_std_in_pipe: Some(false),
         create_std_out_pipe: Some(true),
@@ -2510,11 +2517,10 @@ fn tar_export_folder(folder: &std::path::Path) -> std::io::Result<Vec<u8>> {
     builder
         .into_inner()
         .map_err(|e| std::io::Error::other(format!("tar finalize: {e}")))
-        .and_then(|w| {
+        .inspect(|_w| {
             // `into_inner` already returned the Vec<u8>; the
             // intermediate Write trait reference is dropped here.
             let _ = std::io::sink().flush();
-            Ok(w)
         })
 }
 

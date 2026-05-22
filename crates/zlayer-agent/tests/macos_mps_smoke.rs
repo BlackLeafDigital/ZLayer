@@ -383,10 +383,7 @@ async fn test_metal_device_available_in_sandbox() {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
 
         let service_name = unique_name("metal-dev");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
 
         let image_name = "macos-native/metal-device-check:latest";
         let yaml = format!(
@@ -470,10 +467,7 @@ async fn test_mps_compute_in_sandbox() {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
 
         let service_name = unique_name("mps-compute");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
 
         let image_name = "macos-native/mps-compute:latest";
         let yaml = format!(
@@ -558,10 +552,7 @@ async fn test_metal_shader_compile_in_sandbox() {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
 
         let service_name = unique_name("shader-compile");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
 
         let image_name = "macos-native/metal-shader-compile:latest";
         // No gpu.mode = full Metal compute (default)
@@ -651,10 +642,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("gpu-denied");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
 
         let image_name = "macos-native/gpu-denied:latest";
         // Spec requests GPU, but runtime has gpu_access=false

@@ -172,8 +172,7 @@ async fn wait_for_state(
     }
 
     Err(format!(
-        "timed out after {:?} waiting for {expected:?}; last observed = {last:?}",
-        budget
+        "timed out after {budget:?} waiting for {expected:?}; last observed = {last:?}"
     ))
 }
 

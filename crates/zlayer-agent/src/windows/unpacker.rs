@@ -14,10 +14,14 @@
 //! - Digest verification re-hashes the raw (compressed) blob bytes; we don't
 //!   independently verify `DiffIDs` on the decompressed tar.
 //! - Tombstones and `Hives/` entries are written as raw byte copies. The
-//!   `Files/` subtree is fed through [`BackupStreamWriter`] because its
-//!   entries are already BackupRead-framed in the wclayer tar.
+//!   `Files/` subtree is translated through [`backuptar`] which synthesises
+//!   the `WIN32_STREAM_ID`-framed records (`BACKUP_DATA`, plus optional
+//!   `BACKUP_SECURITY_DATA` / `BACKUP_REPARSE_DATA` / `BACKUP_EA_DATA`
+//!   pulled from the entry's PAX extensions) that [`BackupStreamWriter`]
+//!   expects.
 //!
-//! See `hcsshim/internal/wclayer/legacy.go` for the reference flow.
+//! See `hcsshim/internal/wclayer/legacy.go` and `go-winio/backuptar/tar.go`
+//! for the reference flow.
 
 #![cfg(target_os = "windows")]
 
@@ -27,7 +31,8 @@ use std::path::{Path, PathBuf};
 use oci_client::secrets::RegistryAuth;
 use zlayer_hcs::schema::Layer;
 
-use crate::windows::layer::{self, BackupStreamWriter};
+use crate::windows::backuptar;
+use crate::windows::layer;
 use crate::windows::wclayer::{self, LayerChain};
 
 /// Layer descriptor passed to the unpacker. Structurally mirrors the subset of
@@ -188,12 +193,15 @@ fn verify_digest(bytes: &[u8], expected: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Walk a wclayer-formatted tar and materialize each entry under `layer_path`.
+/// Walk an OCI Windows layer tar and materialize each entry under `layer_path`.
 ///
 /// Directory entries are skipped (their paths are implicit in child entries).
-/// `Files/`-prefixed entries are fed through [`BackupStreamWriter`] because
-/// their payload is already BackupRead-framed in the tar. Everything else
-/// (e.g. `tombstones.txt`, `Hives/`) is written as a raw byte copy.
+/// `Files/`-prefixed entries carry raw file bodies + PAX-encoded NTFS
+/// metadata in the OCI format; we hand them to
+/// [`backuptar::write_oci_entry_to_backup_stream`] which synthesises the
+/// `WIN32_STREAM_ID`-framed records expected by `BackupWrite`. Everything
+/// else (`tombstones.txt`, `Hives/`, `UtilityVM/`) is written as a raw byte
+/// copy.
 fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
     let mut archive = tar::Archive::new(tar_bytes);
     for entry in archive.entries()? {
@@ -207,16 +215,16 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
             std::fs::create_dir_all(parent)?;
         }
 
-        // wclayer tar layout:
-        //   Files/...            -> BackupWrite stream bodies
+        // OCI Windows layer tar layout:
+        //   Files/...            -> raw file body + PAX-encoded NTFS metadata
+        //                           (translated to BackupWrite framing)
         //   Hives/...            -> raw NTFS registry hive exports
         //   tombstones.txt       -> plain-text whiteout manifest
         //   UtilityVM/...        -> raw byte copies (Hyper-V UVM scratch)
         let rel_str = rel_path.to_string_lossy();
         let is_files_payload = rel_str.starts_with("Files/") || rel_str.starts_with("Files\\");
         if is_files_payload {
-            let mut writer = BackupStreamWriter::create_new(&dest)?;
-            std::io::copy(&mut entry, &mut writer)?;
+            backuptar::write_oci_entry_to_backup_stream(&mut entry, &dest)?;
         } else {
             let mut f = std::fs::File::create(&dest)?;
             std::io::copy(&mut entry, &mut f)?;

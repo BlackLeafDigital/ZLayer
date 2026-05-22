@@ -45,6 +45,8 @@
 //   / `used_underscore_binding` / `no_effect_underscore_binding` /
 //   `needless_raw_string_hashes`: style-only, not semantic issues.
 #![allow(
+    unsafe_code,
+    clippy::borrow_as_ptr,
     clippy::type_complexity,
     clippy::must_use_candidate,
     clippy::default_trait_access,
@@ -164,6 +166,10 @@ pub enum IsolationMode {
 ///
 /// Marked `#[must_use]` because the caller always needs to read the result;
 /// throwing it away would silently leave isolation unresolved.
+// Used by Hyper-V auto-detection path only when the user sets
+// `isolation: auto` in the spec; some cfg combinations compile the function
+// without any callers, so allow dead_code unconditionally.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn resolve_isolation_auto() -> IsolationMode {
     use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOEXW};
@@ -561,7 +567,7 @@ impl HcsRuntime {
     /// track in [`Self::containers`], and terminate them.
     ///
     /// This covers the daemon-crash recovery window where
-    /// [`Runtime::create_container`] succeeded (the ComputeSystem exists in the
+    /// [`Runtime::create_container`] succeeded (the `ComputeSystem` exists in the
     /// Windows kernel and is tagged with our [`owner_tag`]) but the daemon
     /// went down before recording it in any persistence — so on next boot
     /// the in-memory map has no entry and the system would otherwise leak
@@ -820,6 +826,8 @@ impl HcsRuntime {
     /// attached to. Empty means no network attachment — the resulting
     /// compute-system doc will omit the `Networking` field entirely so HCS
     /// treats the container as isolated.
+    // HCS create-container call has to plumb container_id, spec, image, network, mounts, devices, isolation, and gpu through; splitting would just shuffle the surface area.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn build_compute_system_doc(
         &self,
         hcs_id: &str,
@@ -1041,7 +1049,7 @@ const UVM_DEFAULT_VCPUS: u32 = 2;
 /// inside the UVM, not the UVM itself.
 const UVM_DEFAULT_MEMORY_MB: u64 = 1024;
 
-/// VirtualSMB share flags requesting a read-only, share-as-direct mount of the
+/// `VirtualSMB` share flags requesting a read-only, share-as-direct mount of the
 /// layer directory into the UVM. Matches hcsshim's `vsmbFlags` for read-only
 /// container layer shares (`READ_ONLY | SHARE_READ | CACHE_IO | NO_OPLOCKS |
 /// FORCE_LEVEL_2_OPLOCKS`).
@@ -1237,8 +1245,12 @@ fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
             match factory.EnumAdapters(index) {
                 Ok(a) => a,
                 Err(e) => {
-                    // DXGI_ERROR_NOT_FOUND is HRESULT 0x887A0002.
-                    if e.code().0 as u32 == 0x887A_0002 {
+                    // DXGI_ERROR_NOT_FOUND is HRESULT 0x887A0002. The HRESULT
+                    // bit pattern is what we compare against — sign-loss here
+                    // is the intended reinterpretation of the i32 as u32.
+                    #[allow(clippy::cast_sign_loss)]
+                    let code = e.code().0 as u32;
+                    if code == 0x887A_0002 {
                         break;
                     }
                     return Err(std::io::Error::other(format!(
@@ -1271,9 +1283,17 @@ fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
             .unwrap_or(desc.Description.len());
         let description = String::from_utf16_lossy(&desc.Description[..nul]);
 
+        // LUID parts are opaque bit patterns; the LUID is a 64-bit ID split
+        // across i32 high / u32 low in Win32, and our `HostGpuAdapter`
+        // stores them as `u32 high / i32 low` to match the HCS schema's
+        // `GpuAssignmentRequest` field types. Reinterpret bit patterns.
+        #[allow(clippy::cast_sign_loss)]
+        let luid_high = desc.AdapterLuid.HighPart as u32;
+        #[allow(clippy::cast_possible_wrap)]
+        let luid_low = desc.AdapterLuid.LowPart as i32;
         adapters.push(HostGpuAdapter {
-            luid_high: desc.AdapterLuid.HighPart as u32,
-            luid_low: desc.AdapterLuid.LowPart as i32,
+            luid_high,
+            luid_low,
             description,
             vendor_id: desc.VendorId,
             device_id: desc.DeviceId,
@@ -2346,9 +2366,9 @@ services:
     }
 
     /// `build_virtual_machine_doc` populates the `VirtualMachine` body with
-    /// the UVM's scratch VHDX (SCSI attachment), one read-only VirtualSMB
+    /// the UVM's scratch VHDX (SCSI attachment), one read-only `VirtualSMB`
     /// share per parent layer, the default 2 vCPU / 1024 MiB topology, the
-    /// UEFI ScsiDrive boot entry, and the boot-files path as GuestState.
+    /// UEFI `ScsiDrive` boot entry, and the boot-files path as `GuestState`.
     ///
     /// Uses [`Uvm::for_test`] so the test does not touch HCS, the VHD APIs,
     /// or the filesystem under `%ProgramData%`.
@@ -2554,7 +2574,7 @@ services:
     }
 
     /// When `spec.resources.gpu` is set AND we have candidate adapters, the
-    /// VirtualMachine document carries a `GpuAssignment` with
+    /// `VirtualMachine` document carries a `GpuAssignment` with
     /// `assignment_mode = List` and one `GpuAssignmentRequest` per adapter.
     #[test]
     fn build_virtual_machine_doc_with_gpu_populates_assignment() {

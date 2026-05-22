@@ -57,6 +57,7 @@ services:
 /// Single source-of-truth fixture: one NVIDIA GPU, default sharing,
 /// distributed coordination off. Every runtime-specific test starts from
 /// this shape and overlays its own knobs.
+#[cfg(target_os = "linux")]
 fn gpu_test_service_spec() -> ServiceSpec {
     service_spec_from_resources_yaml(
         "    resources:

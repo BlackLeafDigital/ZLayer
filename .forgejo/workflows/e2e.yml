@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'youki'
     steps:
       - name: Checkout
@@ -150,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'wasm'
     steps:
       - name: Checkout
@@ -225,7 +225,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
     if: inputs.test == '' || inputs.test == 'docker'
     steps:
       - name: Checkout
@@ -304,7 +304,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'manager-unit'
     steps:
       - name: Checkout
@@ -386,7 +386,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     # Temporarily disabled: last run hung indefinitely on the throwaway
     # daemon. Re-enable by restoring the `inputs.test == ''` branch once
     # run-suite.py is stabilised. Still selectable via the dropdown.
@@ -569,7 +569,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
@@ -694,7 +694,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:20-bullseye
-      options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: inputs.test == '' || inputs.test == 'scheduler-unit'
     steps:
       - name: Checkout
@@ -877,6 +877,9 @@ jobs:
             | sha256sum | cut -c1-16)
           echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
 
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
@@ -899,10 +902,6 @@ jobs:
           sccache-s3-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
           sccache-s3-secret-access-key: ${{ secrets.S3_ACCESS_SECRET }}
           sccache-key-prefix: sccache-windows-e2e
-
-      - name: Install Git Bash
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
 
       - name: Restore cargo registry cache
         if: steps.check.outputs.completed != 'true'
@@ -982,6 +981,9 @@ jobs:
             | sha256sum | cut -c1-16)
           echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
 
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
@@ -1004,10 +1006,6 @@ jobs:
           sccache-s3-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
           sccache-s3-secret-access-key: ${{ secrets.S3_ACCESS_SECRET }}
           sccache-key-prefix: sccache-windows-hyperv-e2e
-
-      - name: Install Git Bash
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
 
       - name: Restore cargo registry cache
         if: steps.check.outputs.completed != 'true'

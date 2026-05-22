@@ -13,6 +13,7 @@
 //! they are allowed in `zlayer-hcs` / `zlayer-hns`.
 #![allow(unsafe_code, clippy::borrow_as_ptr)]
 
+pub mod backuptar;
 pub mod layer;
 pub mod scratch;
 pub mod unpacker;

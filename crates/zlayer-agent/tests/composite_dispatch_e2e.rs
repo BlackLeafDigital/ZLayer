@@ -118,10 +118,7 @@ services:
 
 /// Construct a [`ContainerId`] with the conventional `-rep-<n>` display form.
 fn cid(service: &str, replica: u32) -> ContainerId {
-    ContainerId {
-        service: service.to_string(),
-        replica,
-    }
+    ContainerId::new(service, replica)
 }
 
 /// Parse the test slice CIDR into an [`ipnet::IpNet`]. Panics on malformed

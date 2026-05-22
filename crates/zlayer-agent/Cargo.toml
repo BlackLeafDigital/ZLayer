@@ -120,6 +120,7 @@ zlayer-cluster-rpc = { version = "0.0.0-dev", path = "../zlayer-cluster-rpc" }
 rcgen.workspace = true
 tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "transport"] }
 prost-types = "0.14.3"
+base64.workspace = true
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 # Consuming the patched fork via `zlayer-libcontainer` published from

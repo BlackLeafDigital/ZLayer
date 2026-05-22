@@ -202,8 +202,7 @@ async fn wait_for_state(
     }
 
     Err(format!(
-        "timed out after {:?} waiting for {expected:?}; last observed = {last:?}",
-        budget
+        "timed out after {budget:?} waiting for {expected:?}; last observed = {last:?}"
     ))
 }
 
@@ -391,7 +390,7 @@ async fn windows_hcs_hyperv_concurrent_pair() {
 
         let runtime_for_body = runtime.clone();
         let id_a_for_body = id_a.clone();
-        let id_b_for_body = id_b.clone();
+        let id_other_for_body = id_b.clone();
         let body = async move {
             create_a.expect("create_container(a) must succeed under Hyper-V isolation");
             create_b.expect("create_container(b) must succeed under Hyper-V isolation");
@@ -400,7 +399,7 @@ async fn windows_hcs_hyperv_concurrent_pair() {
             // collide if scratch VHDX paths or UVM IDs were shared.
             let (start_a, start_b) = tokio::join!(
                 runtime_for_body.start_container(&id_a_for_body),
-                runtime_for_body.start_container(&id_b_for_body),
+                runtime_for_body.start_container(&id_other_for_body),
             );
             start_a.expect("start_container(a) must succeed");
             start_b.expect("start_container(b) must succeed");
@@ -415,7 +414,7 @@ async fn windows_hcs_hyperv_concurrent_pair() {
                 ),
                 wait_for_state(
                     runtime_for_body.as_ref(),
-                    &id_b_for_body,
+                    &id_other_for_body,
                     ContainerState::Running,
                     Duration::from_secs(180),
                 ),
@@ -436,7 +435,7 @@ async fn windows_hcs_hyperv_concurrent_pair() {
                 .expect("remove_container(a) must succeed independently of b");
 
             let state_b = runtime_for_body
-                .container_state(&id_b_for_body)
+                .container_state(&id_other_for_body)
                 .await
                 .expect("container_state(b) must still be queryable after a is gone");
             assert_eq!(
@@ -447,11 +446,11 @@ async fn windows_hcs_hyperv_concurrent_pair() {
 
             // Now tear down `b`.
             runtime_for_body
-                .stop_container(&id_b_for_body, Duration::from_secs(10))
+                .stop_container(&id_other_for_body, Duration::from_secs(10))
                 .await
                 .expect("stop_container(b) must succeed");
             runtime_for_body
-                .remove_container(&id_b_for_body)
+                .remove_container(&id_other_for_body)
                 .await
                 .expect("remove_container(b) must succeed");
         };

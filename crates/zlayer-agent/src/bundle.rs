@@ -96,6 +96,7 @@ fn resolve_mps_dirs(gpu: &zlayer_spec::GpuSpec) -> Result<Option<MpsDirs>> {
 /// - the input has no `0::` line (cgroup-v1-only host), or
 /// - the v2 path is exactly `/` (host root — bare-metal, no enclosing cgroup), or
 /// - the input is empty.
+#[cfg(target_os = "linux")]
 fn parse_cgroup_v2_line(content: &str) -> Option<String> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("0::") {
@@ -3507,6 +3508,7 @@ services:
         }
     }
 
+    #[cfg(target_os = "linux")]
     mod cgroup_parser {
         use super::super::parse_cgroup_v2_line;
 
