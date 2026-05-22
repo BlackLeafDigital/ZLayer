@@ -224,8 +224,10 @@ jobs:
   manager-intellitester-tests:
     name: E2E Tests (Manager Intellitester)
     runs-on: ubuntu-latest
+    # Temporarily disabled: last run hung indefinitely on the throwaway
+    # daemon. Re-enable by restoring the `inputs.test == ''` branch once
+    # run-suite.py is stabilised. Still selectable via the dropdown.
     if: |
-      inputs.test == '' ||
       inputs.test == 'manager-intellitester' ||
       startsWith(inputs.test, 'manager-intellitester:')
     steps:

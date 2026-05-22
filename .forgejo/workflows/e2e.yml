@@ -359,8 +359,10 @@ jobs:
     container:
       image: node:20-bullseye
       options: --privileged --cap-add=NET_ADMIN --device=/dev/net/tun
+    # Temporarily disabled: last run hung indefinitely on the throwaway
+    # daemon. Re-enable by restoring the `inputs.test == ''` branch once
+    # run-suite.py is stabilised. Still selectable via the dropdown.
     if: |
-      inputs.test == '' ||
       inputs.test == 'manager-intellitester' ||
       startsWith(inputs.test, 'manager-intellitester:')
     steps:
