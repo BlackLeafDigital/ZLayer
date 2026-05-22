@@ -2070,7 +2070,7 @@ async fn pull_and_materialise_base(
     .await
     .map_err(BuildError::IoError)?;
 
-    let layer_refs = descriptors
+    let layer_refs: Vec<LayerRef> = descriptors
         .iter()
         .map(|d| LayerRef {
             digest: d.digest.clone(),

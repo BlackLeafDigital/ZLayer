@@ -515,10 +515,7 @@ async fn test_container_lifecycle_echo() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("lifecycle");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_echo_spec();
 
         // Prepare a native rootfs with /bin/echo
@@ -633,10 +630,7 @@ async fn test_container_stop_sigterm() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("stop");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_sleep_spec(300); // Sleep 5 minutes -- will be killed
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -701,10 +695,7 @@ async fn test_wait_container_exit_code() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("wait");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -750,10 +741,7 @@ async fn test_unique_port_allocation() {
         // Create 3 containers and collect their assigned ports
         for i in 0..3 {
             let service_name = unique_name("port");
-            let id = ContainerId {
-                service: service_name,
-                replica: i + 1,
-            };
+            let id = ContainerId::new(service_name, i + 1);
 
             runtime
                 .create_container(&id, &spec)
@@ -803,10 +791,7 @@ async fn test_container_ip_is_localhost() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("ip");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -843,10 +828,7 @@ async fn test_gpu_metal_compute_profile() {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
 
         let service_name = unique_name("gpu-metal");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_gpu_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -906,10 +888,7 @@ async fn test_gpu_mps_only_profile() {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
 
         let service_name = unique_name("gpu-mps");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_mps_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -962,10 +941,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("no-gpu");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         // Spec requests GPU, but runtime disables it
         let spec = create_gpu_spec();
 
@@ -1014,10 +990,7 @@ async fn test_network_localhost_only_profile() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("net-local");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         // Spec with endpoints -> localhost-only network
         let spec = create_echo_spec();
 
@@ -1058,10 +1031,7 @@ async fn test_network_full_access_profile() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("net-full");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         // Spec without endpoints -> full network access
         let spec = create_no_endpoints_spec();
 
@@ -1115,14 +1085,8 @@ async fn test_rootfs_cloning() {
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
 
         // Create two containers from the same image
-        let id1 = ContainerId {
-            service: unique_name("clone-a"),
-            replica: 1,
-        };
-        let id2 = ContainerId {
-            service: unique_name("clone-b"),
-            replica: 1,
-        };
+        let id1 = ContainerId::new(unique_name("clone-a"), 1);
+        let id2 = ContainerId::new(unique_name("clone-b"), 1);
 
         let _guard1 = ContainerGuard::new(runtime.clone(), id1.clone());
         let _guard2 = ContainerGuard::new(runtime.clone(), id2.clone());
@@ -1185,10 +1149,7 @@ async fn test_rootfs_cleanup_on_removal() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("cleanup");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1230,10 +1191,7 @@ async fn test_exec_in_container() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("exec");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_sleep_spec(60);
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1284,10 +1242,7 @@ async fn test_container_stats() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("stats");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_sleep_spec(60);
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1338,10 +1293,7 @@ async fn test_stats_fail_before_start() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("stats-nostart");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1375,10 +1327,7 @@ async fn test_memory_limited_container() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("memlimit");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_memory_limited_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1428,10 +1377,7 @@ async fn test_remove_nonexistent_is_idempotent() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: unique_name("nonexistent"),
-            replica: 999,
-        };
+        let id = ContainerId::new(unique_name("nonexistent"), 999);
 
         println!("Attempting to remove non-existent container: {id}");
         let result = runtime.remove_container(&id).await;
@@ -1452,10 +1398,7 @@ async fn test_state_nonexistent() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: unique_name("ghost"),
-            replica: 1,
-        };
+        let id = ContainerId::new(unique_name("ghost"), 1);
 
         let result = runtime.container_state(&id).await;
         assert!(result.is_err(), "Should fail for non-existent container");
@@ -1478,10 +1421,7 @@ async fn test_create_without_image_fails() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("no-image");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
 
         // Use a spec referencing an image that has NOT been prepared
         let yaml = r#"
@@ -1537,10 +1477,7 @@ async fn test_start_nonexistent_fails() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: unique_name("no-container"),
-            replica: 1,
-        };
+        let id = ContainerId::new(unique_name("no-container"), 1);
 
         let result = runtime.start_container(&id).await;
         assert!(
@@ -1566,10 +1503,7 @@ async fn test_exec_empty_command_fails() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("exec-empty");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_sleep_spec(60);
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1624,10 +1558,7 @@ async fn test_concurrent_containers() {
             let name = base_name.clone();
 
             handles.push(tokio::spawn(async move {
-                let id = ContainerId {
-                    service: format!("{name}-{i}"),
-                    replica: 1,
-                };
+                let id = ContainerId::new(format!("{name}-{i}"), 1);
 
                 let create_result = runtime_clone.create_container(&id, &spec_clone).await;
                 (id, create_result)
@@ -1690,10 +1621,7 @@ async fn test_stale_container_cleanup() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("stale");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1743,10 +1671,7 @@ async fn test_volume_writable_dirs_in_profile() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("vol");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_volume_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1791,10 +1716,7 @@ async fn test_get_logs_vector() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("logs-vec");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;
@@ -1848,10 +1770,7 @@ async fn test_seatbelt_profile_structure() {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let service_name = unique_name("profile");
-        let id = ContainerId {
-            service: service_name,
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name, 1);
         let spec = create_echo_spec();
 
         prepare_native_image(&runtime, &spec.image.name.to_string()).await;

@@ -65,12 +65,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent crates/zlayer-registry crates/zlayer-overlay crates/zlayer-types Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-youki
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -129,7 +136,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-youki
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -151,12 +158,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/wasm.rs crates/zlayer-agent/src/runtimes/wasm_http.rs crates/zlayer-agent/tests/wasm_runtime_test.rs crates/zlayer-agent/tests/wasip2_integration_test.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-wasm
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -197,7 +211,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-wasm
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -219,12 +233,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-docker crates/zlayer-agent/src/runtimes/docker.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-docker
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -269,7 +290,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-docker
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -291,12 +312,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-manager Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -337,7 +365,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -371,12 +399,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager-intellitester
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -514,7 +549,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager-intellitester
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -545,12 +580,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc bin/zlayer/src/commands/cluster.rs crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-raft
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -635,7 +677,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-raft
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -660,12 +702,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: scheduler-unit
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -710,7 +759,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: scheduler-unit
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -729,12 +778,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/macos_sandbox.rs crates/zlayer-agent/src/runtimes/macos_vm.rs crates/zlayer-agent/tests/macos_sandbox_e2e.rs crates/zlayer-builder/src/macos_image_resolver.rs crates/zlayer-builder/src/macos_toolchain.rs crates/zlayer-builder/src/macos_compat.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-macos
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -788,7 +844,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-macos
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -814,12 +870,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/runtimes/wsl2_delegate.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-wsl Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-windows-hcs
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -886,7 +949,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-windows-hcs
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -912,12 +975,19 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-agent/tests/windows_hcs_hyperv_e2e.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-windows-hcs-hyperv
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -981,7 +1051,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-windows-hcs-hyperv
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
