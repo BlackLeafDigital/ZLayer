@@ -32,11 +32,14 @@ const PACKAGE_MAP_CACHE_SUBDIR: &str = "package-maps-choco-v1";
 /// How long a cached Chocolatey shard is considered fresh (7 days).
 const PACKAGE_MAP_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
 
-/// Shared env var (same name as the macOS resolver) holding the HMAC secret
-/// used to sign cache-warming POSTs to `RepoSourceSyncer`. If unset, the
-/// resolver skips the POST — the resolver still works, the upstream cache
-/// just doesn't get warmed.
-const REPOSYNC_HMAC_SECRET_ENV: &str = "ZLAYER_REPOSYNC_HMAC_SECRET";
+/// HMAC secret compiled into the binary at build time.
+///
+/// Set at `cargo build` time via `ZLAYER_REPOSYNC_HMAC_SECRET=<hex>`. If unset
+/// at build time, this evaluates to `None` and `fire_reposync_hint` silently
+/// skips the POST — useful for dev builds where the cache-warm signal isn't
+/// needed. Released binaries (built by CI with the Forgejo secret in scope)
+/// carry the value forever.
+const REPOSYNC_HMAC_SECRET: Option<&str> = option_env!("ZLAYER_REPOSYNC_HMAC_SECRET");
 
 /// Endpoint that accepts cache-warm hints from clients.
 const REPOSYNC_HINT_ENDPOINT: &str = "https://reposync.blackleafdigital.com/choco-hint";
@@ -398,11 +401,11 @@ fn compute_reposync_signature(secret: &str, body: &[u8]) -> String {
 }
 
 /// Fire-and-forget cache-warm hint POST to `RepoSourceSyncer`. No-op when
-/// `ZLAYER_REPOSYNC_HMAC_SECRET` is unset.
+/// `ZLAYER_REPOSYNC_HMAC_SECRET` was unset at build time.
 fn fire_reposync_hint(distro: &str, shard: &str) {
-    let Ok(secret) = std::env::var(REPOSYNC_HMAC_SECRET_ENV) else {
+    let Some(secret) = REPOSYNC_HMAC_SECRET else {
         debug!(
-            "REPOSYNC_HMAC_SECRET unset; skipping reposync cache warm for choco/{distro}/{shard}"
+            "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary; skipping reposync cache warm for choco/{distro}/{shard}"
         );
         return;
     };
@@ -410,7 +413,7 @@ fn fire_reposync_hint(distro: &str, shard: &str) {
     let shard = shard.to_string();
     tokio::spawn(async move {
         let payload = format!(r#"{{"scope":"choco","distro":"{distro}","shard":"{shard}"}}"#);
-        let signature = compute_reposync_signature(&secret, payload.as_bytes());
+        let signature = compute_reposync_signature(secret, payload.as_bytes());
         let _ = reqwest::Client::new()
             .post(REPOSYNC_HINT_ENDPOINT)
             .header("x-reposync-signature", signature)
