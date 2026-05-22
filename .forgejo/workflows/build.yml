@@ -20,6 +20,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
+  # Compile-time secret baked into release binaries by `option_env!` in the
+  # zlayer-git reposync resolvers. Every `cargo build --release` step in this
+  # workflow inherits this so the shipped binaries can HMAC-sign reposync
+  # hint calls. If the repo secret is unset, this resolves to an empty string
+  # — the Rust side must treat `Some("")` as absent. See follow-up.
+  ZLAYER_REPOSYNC_HMAC_SECRET: ${{ secrets.ZLAYER_REPOSYNC_HMAC_SECRET }}
 
 jobs:
   # ===========================================
