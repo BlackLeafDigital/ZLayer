@@ -893,15 +893,15 @@ jobs:
   # ===========================================
   # E2E Tests (Windows HCS Hyper-V)
   #
-  # Runs the Hyper-V isolation variant on the self-hosted Windows runner
-  # tagged `hyperv` (nested virt is required; GHA windows-latest does not
-  # reliably expose it). The single suite below uses
+  # Runs the Hyper-V isolation variant on the same `windows-latest`
+  # runner used by the W2 (process-isolated) job above; nested virt is
+  # required on that host. The single suite below uses
   # `--test-threads=1` because two concurrent Hyper-V UVMs would stress
   # the runner's memory + CPU budget beyond what's comfortable.
   # ===========================================
   windows-hcs-hyperv-e2e:
     name: E2E Tests (Windows HCS Hyper-V)
-    runs-on: [self-hosted, windows, hyperv]
+    runs-on: windows-latest
     if: inputs.test == '' || inputs.test == 'windows-hcs-hyperv'
     timeout-minutes: 120
     steps:
@@ -920,14 +920,6 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-      - name: Ensure Windows Containers feature
-        if: steps.check.outputs.completed != 'true'
-        shell: pwsh
-        run: |
-          if (-not (Get-WindowsFeature -Name Containers).Installed) {
-            Install-WindowsFeature -Name Containers -IncludeAllSubFeature
-          }
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
