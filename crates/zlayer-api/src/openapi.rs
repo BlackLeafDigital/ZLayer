@@ -34,6 +34,7 @@ use crate::handlers::credentials::{
     GitCredentialResponse, RegistryAuthTypeSchema, RegistryCredentialResponse,
 };
 use crate::handlers::cron::{CronJobResponse, CronStatusResponse, TriggerCronResponse};
+use crate::handlers::daemon::{DaemonCapabilitiesResponse, DaemonModeDto};
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::environments::{CreateEnvironmentRequest, UpdateEnvironmentRequest};
 
@@ -135,6 +136,7 @@ use crate::handlers::cron::{
     __path_disable_cron_job, __path_enable_cron_job, __path_get_cron_job, __path_list_cron_jobs,
     __path_trigger_cron_job,
 };
+use crate::handlers::daemon::__path_get_daemon_capabilities;
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
     __path_get_deployment_spec, __path_list_deployments,
@@ -434,6 +436,8 @@ impl Modify for SecurityAddon {
         get_ip_allocation,
         get_dns_status,
         get_nat_status,
+        // Daemon
+        get_daemon_capabilities,
         // Tunnels
         create_tunnel,
         list_tunnels,
@@ -664,6 +668,9 @@ impl Modify for SecurityAddon {
             NatStatusResponse,
             NatCandidateDto,
             NatPeerDto,
+            // Daemon capability survey
+            DaemonCapabilitiesResponse,
+            DaemonModeDto,
             // Tunnel schemas
             CreateTunnelRequest,
             CreateTunnelResponse,
@@ -769,6 +776,7 @@ impl Modify for SecurityAddon {
         (name = "Storage", description = "Storage replication status"),
         (name = "Cron", description = "Cron job listing, triggering, and enable/disable"),
         (name = "Jobs", description = "Job execution triggering, status, and cancellation"),
+        (name = "Daemon", description = "Daemon-level introspection (capability survey)"),
     )
 )]
 pub struct ApiDoc;

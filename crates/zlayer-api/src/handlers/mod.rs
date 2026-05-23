@@ -12,6 +12,7 @@ pub mod container_networks_docker;
 pub mod containers;
 pub mod credentials;
 pub mod cron;
+pub mod daemon;
 pub mod deployments;
 pub mod environments;
 pub mod events;

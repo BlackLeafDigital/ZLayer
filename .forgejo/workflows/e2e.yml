@@ -872,6 +872,7 @@ jobs:
 
       - name: Compute step fingerprint
         id: fingerprint
+        shell: bash
         run: |
           SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/runtimes/wsl2_delegate.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-wsl Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
             | sha256sum | cut -c1-16)
@@ -976,6 +977,7 @@ jobs:
 
       - name: Compute step fingerprint
         id: fingerprint
+        shell: bash
         run: |
           SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-agent/tests/windows_hcs_hyperv_e2e.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
             | sha256sum | cut -c1-16)

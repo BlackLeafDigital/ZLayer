@@ -2175,79 +2175,103 @@ pub(crate) async fn handle_node_join(
     // This gives the joining node immediate overlay connectivity.
     // The TUN device will be cleaned up when this process exits; the daemon
     // will re-create it from the persisted bootstrap state on next start.
-    #[allow(clippy::needless_update)]
-    let overlay_config = zlayer_overlay::OverlayConfig {
-        local_endpoint: std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            overlay_port,
-        ),
-        private_key: node_config.wireguard_private_key.clone(),
-        public_key: node_config.wireguard_public_key.clone(),
-        overlay_cidr: overlay_ip_cidr,
-        peer_discovery_interval: Duration::from_secs(30),
-        ..zlayer_overlay::OverlayConfig::default()
-    };
+    //
+    // Gate the attempt on the daemon's capability survey: creating a boringtun
+    // TUN device requires both `CAP_NET_ADMIN` and a usable `/dev/net/tun`. If
+    // either is missing, skip the attempt entirely — it would only WARN-and-
+    // fail anyway, and the bootstrap state we just persisted is enough for the
+    // daemon to retry on next start once caps are restored.
+    let caps = zlayer_agent::capability::DaemonCapabilities::get();
+    if caps.has_cap_net_admin && caps.tun_device_available {
+        #[allow(clippy::needless_update)]
+        let overlay_config = zlayer_overlay::OverlayConfig {
+            local_endpoint: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                overlay_port,
+            ),
+            private_key: node_config.wireguard_private_key.clone(),
+            public_key: node_config.wireguard_public_key.clone(),
+            overlay_cidr: overlay_ip_cidr,
+            peer_discovery_interval: Duration::from_secs(30),
+            ..zlayer_overlay::OverlayConfig::default()
+        };
 
-    // Convert PeerConfig to PeerInfo for the transport layer
-    let peer_infos: Vec<zlayer_overlay::PeerInfo> = overlay_peers
-        .iter()
-        .filter_map(|p| match p.to_peer_info() {
-            Ok(info) => Some(info),
-            Err(e) => {
-                warn!(peer = %p.node_id, error = %e, "Failed to convert peer info, skipping");
-                None
-            }
-        })
-        .collect();
-
-    let interface_name = zlayer_overlay::DEFAULT_INTERFACE_NAME.to_string();
-    let mut transport = zlayer_overlay::OverlayTransport::new(overlay_config, interface_name);
-
-    match transport.create_interface().await {
-        Ok(()) => {
-            match transport.configure(&peer_infos).await {
-                Ok(()) => {
-                    info!(
-                        overlay_ip = %our_overlay_ip,
-                        peer_count = peer_infos.len(),
-                        "Overlay network interface configured successfully"
-                    );
-                    println!(
-                        "  Overlay network up: {} with {} peer(s)",
-                        our_overlay_ip,
-                        peer_infos.len()
-                    );
-                    // Keep the transport alive until we finish printing the
-                    // success message below; it will be cleaned up on exit.
-                    // The daemon re-creates the overlay from persisted state.
-                    drop(transport);
-                }
+        // Convert PeerConfig to PeerInfo for the transport layer
+        let peer_infos: Vec<zlayer_overlay::PeerInfo> = overlay_peers
+            .iter()
+            .filter_map(|p| match p.to_peer_info() {
+                Ok(info) => Some(info),
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to configure overlay transport. \
-                         The overlay bootstrap state has been saved and the daemon will \
-                         retry on next start."
-                    );
-                    println!("  Warning: Overlay interface created but configuration failed: {e}");
+                    warn!(peer = %p.node_id, error = %e, "Failed to convert peer info, skipping");
+                    None
+                }
+            })
+            .collect();
+
+        let interface_name = zlayer_overlay::DEFAULT_INTERFACE_NAME.to_string();
+        let mut transport = zlayer_overlay::OverlayTransport::new(overlay_config, interface_name);
+
+        match transport.create_interface().await {
+            Ok(()) => {
+                match transport.configure(&peer_infos).await {
+                    Ok(()) => {
+                        info!(
+                            overlay_ip = %our_overlay_ip,
+                            peer_count = peer_infos.len(),
+                            "Overlay network interface configured successfully"
+                        );
+                        println!(
+                            "  Overlay network up: {} with {} peer(s)",
+                            our_overlay_ip,
+                            peer_infos.len()
+                        );
+                        // Keep the transport alive until we finish printing the
+                        // success message below; it will be cleaned up on exit.
+                        // The daemon re-creates the overlay from persisted state.
+                        drop(transport);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to configure overlay transport. \
+                             The overlay bootstrap state has been saved and the daemon will \
+                             retry on next start."
+                        );
+                        println!(
+                            "  Warning: Overlay interface created but configuration failed: {e}"
+                        );
+                    }
                 }
             }
+            Err(e) => {
+                // Non-fatal: the overlay state is persisted, the daemon will set
+                // it up when it starts. This commonly fails in unprivileged
+                // environments or CI.
+                warn!(
+                    error = %e,
+                    "Failed to create overlay network interface. \
+                     Requires CAP_NET_ADMIN capability. The overlay bootstrap state has \
+                     been saved and the daemon will create the interface on next start."
+                );
+                println!(
+                    "  Warning: Could not create overlay interface ({e}). \
+                     The daemon will set it up on next start."
+                );
+            }
         }
-        Err(e) => {
-            // Non-fatal: the overlay state is persisted, the daemon will set
-            // it up when it starts. This commonly fails in unprivileged
-            // environments or CI.
-            warn!(
-                error = %e,
-                "Failed to create overlay network interface. \
-                 Requires CAP_NET_ADMIN capability. The overlay bootstrap state has \
-                 been saved and the daemon will create the interface on next start."
-            );
-            println!(
-                "  Warning: Could not create overlay interface ({e}). \
-                 The daemon will set it up on next start."
-            );
-        }
+    } else {
+        warn!(
+            has_cap_net_admin = caps.has_cap_net_admin,
+            tun_device_available = caps.tun_device_available,
+            mode = ?caps.effective_mode,
+            "Skipping overlay interface creation — required kernel features unavailable. \
+             Bootstrap state will be saved; the daemon will retry on next start once caps are restored.",
+        );
+        println!(
+            "  Skipping overlay interface creation (CAP_NET_ADMIN={}, /dev/net/tun={}). \
+             The daemon will set it up on next start once capabilities are restored.",
+            caps.has_cap_net_admin, caps.tun_device_available
+        );
     }
 
     // TODO: Existing peers also need to add this new node as a peer. Currently

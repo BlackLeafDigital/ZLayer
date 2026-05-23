@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod autoscale_controller;
 pub mod bundle;
+pub mod capability;
 pub mod cdi;
 pub mod cgroups_stats;
 pub mod container_supervisor;

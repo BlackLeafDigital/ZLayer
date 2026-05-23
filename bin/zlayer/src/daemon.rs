@@ -395,6 +395,11 @@ pub struct DaemonState {
     /// is populated by the API handler when a token is created and read by
     /// the tunnel server's [`TokenValidator`].
     pub tunnel_api_state: TunnelApiState,
+
+    /// Capability survey performed at daemon startup. Exposes whether the
+    /// daemon is running with full host privileges, scoped inside another
+    /// container, or in a degraded mode missing critical kernel features.
+    pub capabilities: &'static zlayer_agent::capability::DaemonCapabilities,
 }
 
 /// Bag of tunnel-server runtime handles owned by [`DaemonState`].
@@ -532,6 +537,53 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         run_dir  = %config.run_dir.display(),
         "Daemon directories ready"
     );
+
+    // ---------------------------------------------------------------------
+    // Phase 1b: Capability survey
+    //
+    // Probe the daemon's effective execution environment (host vs. nested,
+    // cgroup-write privilege, CAP_NET_ADMIN, /dev/net/tun availability) so
+    // downstream phases can degrade cleanly when running inside another
+    // container (e.g. the CI runner) instead of failing opaquely at
+    // libcontainer time.
+    // ---------------------------------------------------------------------
+    let capabilities = zlayer_agent::capability::DaemonCapabilities::seed(
+        zlayer_agent::capability::DaemonCapabilities::probe(),
+    );
+    info!(
+        mode = ?capabilities.effective_mode,
+        is_root = capabilities.is_root,
+        is_nested = capabilities.is_nested,
+        cgroup_parent = ?capabilities.cgroup_parent,
+        can_write_cgroup_root = capabilities.can_write_cgroup_root,
+        has_cap_net_admin = capabilities.has_cap_net_admin,
+        tun_device_available = capabilities.tun_device_available,
+        "Daemon capability survey complete",
+    );
+
+    // Persist the survey for post-mortem diagnostics. Failures here are
+    // non-fatal: the capability cache is already seeded in-memory and the
+    // on-disk copy is purely a debugging aid.
+    {
+        let capabilities_path = config.data_dir.join("daemon_capabilities.json");
+        match serde_json::to_vec_pretty(capabilities) {
+            Ok(bytes) => {
+                if let Err(err) = tokio::fs::write(&capabilities_path, &bytes).await {
+                    warn!(
+                        path = %capabilities_path.display(),
+                        error = %err,
+                        "Failed to persist daemon capability survey (non-fatal)"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to serialise daemon capability survey (non-fatal)"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Phase 2: Container runtime
@@ -1573,6 +1625,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         cron_scheduler,
         tunnel: tunnel_handles_opt,
         tunnel_api_state,
+        capabilities,
     })
 }
 

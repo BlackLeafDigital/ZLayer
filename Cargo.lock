@@ -12794,9 +12794,9 @@ dependencies = [
 
 [[package]]
 name = "zlayer-libcgroups"
-version = "0.6.1-zlayer.2"
+version = "0.6.1-zlayer.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d58ac5fccfa02ddf21a683b988c844919a974c7a1f370eecc288a2f03d84d6"
+checksum = "27d699fd163f624b4fd6527a2ebed830a2aa32905f88a0e3c953a8a3c2b06da3"
 dependencies = [
  "fixedbitset",
  "nix 0.29.0",
@@ -12810,9 +12810,9 @@ dependencies = [
 
 [[package]]
 name = "zlayer-libcontainer"
-version = "0.6.1-zlayer.2"
+version = "0.6.1-zlayer.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f792609e59667ec451f38d7275d227f674f5b54d59753897fa5c4907c7ba29b7"
+checksum = "ecb6e1530caecf7588425f0cd649a71de8404e369b141b437b412a8c4be94e9e"
 dependencies = [
  "caps",
  "chrono",

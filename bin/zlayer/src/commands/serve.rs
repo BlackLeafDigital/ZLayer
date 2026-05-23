@@ -1525,6 +1525,7 @@ pub(crate) async fn serve_with_external_shutdown(
         cron_scheduler,
         tunnel: tunnel_handles,
         tunnel_api_state,
+        capabilities: _capabilities,
     } = state;
 
     // -----------------------------------------------------------------------

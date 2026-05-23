@@ -127,7 +127,7 @@ base64.workspace = true
 # github.com/ZachHandley/youki@zlayer-patches. See docs/youki-fork.md for
 # patch list, publish workflow, and retirement criteria.
 [target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = { package = "zlayer-libcontainer", version = "0.6.1-zlayer.2", optional = true }
+libcontainer = { package = "zlayer-libcontainer", version = "0.6.1-zlayer.3", optional = true }
 rtnetlink = "0.14"
 # Must match the version used internally by rtnetlink 0.14 so
 # RouteScope and other route-message types line up across crate boundaries.

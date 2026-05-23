@@ -229,6 +229,7 @@ pub fn build_router_with_storage(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", deployments_api)
+        .nest("/api/v1/daemon", build_daemon_routes())
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
@@ -244,6 +245,19 @@ pub fn build_router_with_storage(
     }
 
     router
+}
+
+/// Build routes for daemon-level introspection.
+///
+/// Currently exposes only the process-wide capability survey at
+/// `GET /capabilities`. The handler is state-free — the survey is memoised
+/// in a process-wide `OnceLock` inside
+/// [`zlayer_agent::capability::DaemonCapabilities`].
+pub fn build_daemon_routes() -> Router<()> {
+    Router::new().route(
+        "/capabilities",
+        get(handlers::daemon::get_daemon_capabilities),
+    )
 }
 
 /// Build the API router with job and cron execution capabilities
@@ -473,6 +487,7 @@ pub fn build_router_with_services(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
+        .nest("/api/v1/daemon", build_daemon_routes())
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
@@ -594,6 +609,7 @@ pub fn build_router_with_deployment_state(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
+        .nest("/api/v1/daemon", build_daemon_routes())
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))

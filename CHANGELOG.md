@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.50.3] - 2026-05-23
+
+### Added
+- Daemon capability survey at startup. `zlayer_agent::capability::DaemonCapabilities` probes the runtime environment (uid, nesting via `/proc/self/cgroup`, cgroup-root writability, `CAP_NET_ADMIN`, `/dev/net/tun` availability) and derives a coarse `DaemonMode` (`Full` / `NestedAdaptive` / `Degraded`). `init_daemon` in `bin/zlayer/src/daemon.rs` seeds the process-wide memoised survey (`DaemonCapabilities::get() -> &'static`), logs a structured `INFO` banner with every bit, and persists `data/daemon_capabilities.json` for post-mortem. New `GET /api/v1/daemon/capabilities` endpoint exposes the survey via the existing axum router; registered in OpenAPI as the new `Daemon` tag. The survey makes ZLayer-in-ZLayer (running a daemon inside another container) a first-class scenario rather than a series of opaque libcontainer failures.
+- `crates/zlayer-agent/src/capability.rs` consolidates the cgroup-v2 path helper (`current_cgroup_v2_path`, moved out of `bundle.rs`) and exposes `parse_cgroup_v2_line` to a single owner.
+
+### Changed
+- `bundle.rs::build_linux_config` now logs the selected `cgroup_parent` source (`spec` / `env` / `auto` / `none`) and the final path at `INFO` level for every container build. Previously the 3-tier `or_else` chain silently fell through, masking misconfigurations until libcontainer aborted at cgroup-write time. A diagnostic `WARN` fires when the capability survey says the daemon is nested but the per-build resolution can't find a parent.
+- Overlay-interface creation in `bin/zlayer/src/commands/node.rs` is now gated on `capabilities.has_cap_net_admin && capabilities.tun_device_available`. When either is missing, the daemon skips the boringtun device creation, logs a single structured `WARN`, and proceeds — the existing `overlay_bootstrap.json` save path still runs so a subsequent restart with restored caps picks up the network. Previously the daemon always tried, always logged the same generic CAP_NET_ADMIN hint, and the failure path duplicated work.
+
+### Fixed
+- `cluster_scaling` and `cluster_upgrade` raft e2e suites no longer fail at first container deploy with `cgroup error: io error: failed to open /sys/fs/cgroup/cgroup.subtree_control: Read-only file system (os error 30)`. Root cause was in our youki fork's `crates/libcgroups/src/v2/manager.rs::create_unified_cgroup`, which unconditionally wrote controllers to the cgroup v2 ROOT regardless of whether the requested `cgroup_path` was nested. Inside the runner container (`--privileged --cgroupns=host`), the root is owned by host systemd and read-only to the container — the write failed with EROFS and aborted the function before the nested-directory walk could create the per-container cgroup. The fork now skips the unconditional root write and, in the dir walk, swallows EROFS on pre-existing ancestors (parent cgroup managers have already enabled controllers there — otherwise our process wouldn't be executing inside that hierarchy). Newly-created paths still get strict writes. Bumped `zlayer-libcontainer` / `zlayer-libcgroups` to `0.6.1-zlayer.3`.
+- Windows HCS E2E and HCS Hyper-V E2E workflow jobs no longer fail at the "Compute step fingerprint" step with `CouldNotAutoLoadModule`. The step uses bash command substitution (`SRC_HASH=$(git ls-tree ... | sha256sum | cut -c1-16)`); on Ubuntu/macOS `run:` defaults to bash, but on Windows it defaults to PowerShell which interprets the bash assignment as a module load. Added `shell: bash` to both Windows fingerprint steps (lines 873 and 977 of `.forgejo/workflows/e2e.yml`).
+
 ## [0.50.2] - 2026-05-18
 
 ### Added

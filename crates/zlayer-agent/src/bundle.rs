@@ -89,43 +89,6 @@ fn resolve_mps_dirs(gpu: &zlayer_spec::GpuSpec) -> Result<Option<MpsDirs>> {
     Ok(Some(MpsDirs { pipe_dir, log_dir }))
 }
 
-/// Pure parser for the contents of `/proc/self/cgroup`.
-///
-/// Finds the cgroup-v2 line (prefix `0::`) and returns the path suffix with
-/// surrounding whitespace trimmed. Returns `None` when:
-/// - the input has no `0::` line (cgroup-v1-only host), or
-/// - the v2 path is exactly `/` (host root — bare-metal, no enclosing cgroup), or
-/// - the input is empty.
-#[cfg(target_os = "linux")]
-fn parse_cgroup_v2_line(content: &str) -> Option<String> {
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("0::") {
-            let trimmed = rest.trim();
-            if trimmed.is_empty() || trimmed == "/" {
-                return None;
-            }
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-/// Returns the current process's cgroup-v2 path, if any.
-///
-/// On Linux reads `/proc/self/cgroup` and delegates to `parse_cgroup_v2_line`.
-/// On non-Linux always returns `None`. Returns `None` on any read error or
-/// when the process is at the cgroup-v2 root (bare-metal case).
-#[cfg(target_os = "linux")]
-pub(crate) fn current_cgroup_v2_path() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    parse_cgroup_v2_line(&content)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn current_cgroup_v2_path() -> Option<String> {
-    None
-}
-
 /// Convert a CDI device node descriptor into the OCI [`LinuxDevice`] used by
 /// the runtime.
 ///
@@ -1861,22 +1824,62 @@ impl BundleBuilder {
         //   3. /proc/self/cgroup (auto-detect when nested)
         //   4. unset (default — bare-metal happy path)
         let cid = container_id.to_string();
-        let cgroup_parent_value: Option<String> = spec
-            .cgroup_parent
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                std::env::var("ZLAYER_CGROUP_PARENT")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(current_cgroup_v2_path);
+        let (cgroup_parent_value, cgroup_parent_source): (Option<String>, &'static str) =
+            if let Some(p) = spec.cgroup_parent.as_deref().filter(|s| !s.is_empty()) {
+                (Some(p.to_string()), "spec")
+            } else if let Some(p) = std::env::var("ZLAYER_CGROUP_PARENT")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                (Some(p), "env")
+            } else if let Some(p) = crate::capability::current_cgroup_v2_path() {
+                (Some(p), "auto")
+            } else {
+                (None, "none")
+            };
+
+        // Diagnostic guard rail: capability survey says we're nested, but we
+        // couldn't resolve a cgroup parent here. This combination should not
+        // normally happen because both code paths consult the same
+        // `current_cgroup_v2_path()` helper. Surface it so an operator can
+        // investigate; do not fail container creation.
+        if cgroup_parent_value.is_none() && crate::capability::DaemonCapabilities::get().is_nested {
+            tracing::warn!(
+                container_id = %cid,
+                "capability survey reports nested daemon but cgroup_parent could not be resolved — proceeding with v2 root"
+            );
+        }
 
         if let Some(parent) = cgroup_parent_value {
             let parent = parent.trim_end_matches('/');
             let full = format!("{parent}/{cid}");
+            match cgroup_parent_source {
+                "spec" => tracing::info!(
+                    container_id = %cid,
+                    source = "spec",
+                    path = %full,
+                    "cgroup_parent selected"
+                ),
+                "env" => tracing::info!(
+                    container_id = %cid,
+                    source = "env",
+                    path = %full,
+                    "cgroup_parent selected"
+                ),
+                "auto" => tracing::info!(
+                    container_id = %cid,
+                    source = "auto",
+                    path = %full,
+                    "cgroup_parent selected (from /proc/self/cgroup)"
+                ),
+                _ => unreachable!(),
+            }
             linux_builder = linux_builder.cgroups_path(std::path::PathBuf::from(full));
+        } else {
+            tracing::info!(
+                container_id = %cid,
+                "cgroup_parent unset — libcontainer will use v2 root"
+            );
         }
 
         linux_builder
@@ -3505,40 +3508,6 @@ services:
                 read_subid_range("/this/path/does/not/exist/subuid", "anyone"),
                 None
             );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    mod cgroup_parser {
-        use super::super::parse_cgroup_v2_line;
-
-        #[test]
-        fn parse_cgroup_v2_root_returns_none() {
-            assert_eq!(parse_cgroup_v2_line("0::/\n"), None);
-        }
-
-        #[test]
-        fn parse_cgroup_v2_path_returns_some() {
-            assert_eq!(
-                parse_cgroup_v2_line("0::/system.slice/forgejo-runner.service\n"),
-                Some("/system.slice/forgejo-runner.service".to_string())
-            );
-        }
-
-        #[test]
-        fn parse_cgroup_v2_hybrid_finds_v2_line() {
-            let input = "12:devices:/user.slice\n11:memory:/user.slice\n0::/foo\n";
-            assert_eq!(parse_cgroup_v2_line(input), Some("/foo".to_string()));
-        }
-
-        #[test]
-        fn parse_cgroup_v2_no_newline() {
-            assert_eq!(parse_cgroup_v2_line("0::/bar"), Some("/bar".to_string()));
-        }
-
-        #[test]
-        fn parse_cgroup_v2_missing_returns_none() {
-            assert_eq!(parse_cgroup_v2_line(""), None);
         }
     }
 }
