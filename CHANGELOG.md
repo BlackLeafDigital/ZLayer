@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.50.4] - 2026-05-23
+
+### Fixed
+
+- Capability survey no longer reports `Full` mode when `CAP_NET_ADMIN` or `/dev/net/tun` are absent — the classifier now requires all four signals (not nested, writable cgroup root, `CAP_NET_ADMIN`, `/dev/net/tun`) before claiming `Full`.
+- `probe_can_write_cgroup_root` now uses `access(2)` with `W_OK` instead of an inode mode-bit check, so it correctly sees mount-level read-only cgroup filesystems (e.g. cgroupns=private inside a container).
+- Container creation now fails fast with a structured error when no writable cgroup parent exists (cgroup root read-only and `/proc/self/cgroup` reports root), naming the three remediation options instead of EROFS-ing deep inside libcontainer.
+- Raft E2E runner now gets `--cgroupns=host` so the daemon's `/proc/self/cgroup` reports a real parent cgroup and the auto-detect finds it.
+- Windows HCS / HCS Hyper-V `Compute step fingerprint` now runs after the `Setup Shell` action, so `shell: bash` resolves to Git Bash instead of WSL (WSL is unavailable on LocalSystem runners and was failing with `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`).
+
 ## [0.50.3] - 2026-05-23
 
 ### Added

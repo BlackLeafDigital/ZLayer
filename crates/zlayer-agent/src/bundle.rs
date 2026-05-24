@@ -1876,9 +1876,21 @@ impl BundleBuilder {
             }
             linux_builder = linux_builder.cgroups_path(std::path::PathBuf::from(full));
         } else {
+            let caps = crate::capability::DaemonCapabilities::get();
+            if !caps.can_write_cgroup_root {
+                return Err(AgentError::InvalidSpec(format!(
+                    "cannot create container {cid}: no writable cgroup parent. \
+                     /proc/self/cgroup reports the cgroup-v2 root, and \
+                     /sys/fs/cgroup is read-only to this process. Fix one of: \
+                     (a) run the daemon's outer container with --cgroupns=host \
+                     so /proc/self/cgroup reports a real parent; \
+                     (b) set ZLAYER_CGROUP_PARENT=/path/to/writable/cgroup; \
+                     (c) grant the daemon write access to /sys/fs/cgroup."
+                )));
+            }
             tracing::info!(
                 container_id = %cid,
-                "cgroup_parent unset — libcontainer will use v2 root"
+                "cgroup_parent unset — libcontainer will use v2 root (cgroup root is writable here)"
             );
         }
 

@@ -870,6 +870,9 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
       - name: Compute step fingerprint
         id: fingerprint
         shell: bash
@@ -877,9 +880,6 @@ jobs:
           SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/runtimes/wsl2_delegate.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-wsl Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
             | sha256sum | cut -c1-16)
           echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
-
-      - name: Setup Shell
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
 
       - name: Check step status
         id: check
@@ -975,6 +975,9 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
       - name: Compute step fingerprint
         id: fingerprint
         shell: bash
@@ -982,9 +985,6 @@ jobs:
           SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-agent/tests/windows_hcs_hyperv_e2e.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
             | sha256sum | cut -c1-16)
           echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
-
-      - name: Setup Shell
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
 
       - name: Check step status
         id: check

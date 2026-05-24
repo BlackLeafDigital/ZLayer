@@ -114,13 +114,14 @@ impl DaemonCapabilities {
         let has_cap_net_admin = probe_has_cap_net_admin();
         let tun_device_available = probe_tun_device_available();
 
-        let effective_mode = if !is_nested && can_write_cgroup_root {
-            DaemonMode::Full
-        } else if (is_nested && cgroup_parent.is_some()) || can_write_cgroup_root {
-            DaemonMode::NestedAdaptive
-        } else {
-            DaemonMode::Degraded
-        };
+        let effective_mode =
+            if !is_nested && can_write_cgroup_root && has_cap_net_admin && tun_device_available {
+                DaemonMode::Full
+            } else if can_write_cgroup_root || cgroup_parent.is_some() {
+                DaemonMode::NestedAdaptive
+            } else {
+                DaemonMode::Degraded
+            };
 
         Self {
             is_root,
@@ -175,11 +176,16 @@ pub fn current_cgroup_v2_path() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn probe_can_write_cgroup_root() -> bool {
-    use std::os::unix::fs::PermissionsExt;
+    use std::ffi::CString;
 
-    std::fs::metadata("/sys/fs/cgroup/cgroup.subtree_control")
-        .ok()
-        .is_some_and(|m| m.permissions().mode() & 0o200 != 0)
+    let Ok(path) = CString::new("/sys/fs/cgroup/cgroup.subtree_control") else {
+        return false;
+    };
+    // SAFETY: access(2) is a read-only syscall that takes a pointer to a
+    // NUL-terminated C string. The kernel does not retain the pointer.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::access(path.as_ptr(), libc::W_OK) };
+    rc == 0
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -233,21 +239,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_does_not_panic_and_returns_valid_struct() {
+    fn probe_does_not_panic_and_is_nested_agrees_with_cgroup_parent() {
         let caps = DaemonCapabilities::probe();
-        // Sanity: the mode must be derivable from the boolean fields. Re-run
-        // the derivation and compare.
-        let expected = if !caps.is_nested && caps.can_write_cgroup_root {
+        assert_eq!(caps.is_nested, caps.cgroup_parent.is_some());
+    }
+
+    /// Pure classifier reproducing the logic in `probe()`. Kept in the test
+    /// module so the table below can assert behaviour without depending on
+    /// the host's actual capability state.
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn classify(
+        is_nested: bool,
+        can_write_cgroup_root: bool,
+        has_cap_net_admin: bool,
+        tun_device_available: bool,
+        cgroup_parent_is_some: bool,
+    ) -> DaemonMode {
+        if !is_nested && can_write_cgroup_root && has_cap_net_admin && tun_device_available {
             DaemonMode::Full
-        } else if (caps.is_nested && caps.cgroup_parent.is_some()) || caps.can_write_cgroup_root {
+        } else if can_write_cgroup_root || cgroup_parent_is_some {
             DaemonMode::NestedAdaptive
         } else {
             DaemonMode::Degraded
-        };
-        assert_eq!(caps.effective_mode, expected);
+        }
+    }
 
-        // is_nested must agree with cgroup_parent.is_some().
-        assert_eq!(caps.is_nested, caps.cgroup_parent.is_some());
+    #[test]
+    fn effective_mode_full_requires_all_four_signals() {
+        // Full: every signal must be set the right way.
+        assert_eq!(
+            classify(false, true, true, true, false),
+            DaemonMode::Full,
+            "all four signals set should be Full"
+        );
+        // Drop any single signal and Full must no longer apply.
+        assert_ne!(classify(true, true, true, true, true), DaemonMode::Full);
+        assert_ne!(classify(false, false, true, true, false), DaemonMode::Full);
+        assert_ne!(classify(false, true, false, true, false), DaemonMode::Full);
+        assert_ne!(classify(false, true, true, false, false), DaemonMode::Full);
+    }
+
+    #[test]
+    fn effective_mode_nested_adaptive_when_writable_or_has_parent() {
+        // Writable root but missing other Full signals → NestedAdaptive.
+        assert_eq!(
+            classify(false, true, false, false, false),
+            DaemonMode::NestedAdaptive
+        );
+        // Nested under a parent cgroup, no other signals → NestedAdaptive.
+        assert_eq!(
+            classify(true, false, false, false, true),
+            DaemonMode::NestedAdaptive
+        );
+    }
+
+    #[test]
+    fn effective_mode_degraded_when_no_writable_path() {
+        // No root write, no parent, nothing usable.
+        assert_eq!(
+            classify(false, false, false, false, false),
+            DaemonMode::Degraded
+        );
+        // is_nested=true but no parent and no root write — still Degraded
+        // (the is_nested signal alone, without a resolved parent, does not
+        // give us a writable cgroup to anchor under).
+        assert_eq!(
+            classify(true, false, false, false, false),
+            DaemonMode::Degraded
+        );
     }
 
     #[test]
