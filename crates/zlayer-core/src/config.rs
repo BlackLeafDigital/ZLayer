@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+use zlayer_types::overlay::OverlayMode;
 
 /// Main agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -36,6 +37,12 @@ pub struct AgentConfig {
     /// Registry authentication configuration
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+
+    /// Cluster-level default overlay mode. When `None`, the daemon picks
+    /// (currently always [`OverlayMode::Shared`] in v0.51). Per-service
+    /// overrides live on the service spec's `overlay` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_default_mode: Option<OverlayMode>,
 }
 
 fn default_data_dir() -> PathBuf {

@@ -11,16 +11,13 @@
 //! | dedicated | Each replica gets its own node (1:1 mapping)                    |
 //! | exclusive | Service has nodes exclusively to itself (no other services)     |
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use zlayer_scheduler::{
     place_service_replicas, NodeResources, NodeState, PlacementDecision, PlacementState,
 };
 use zlayer_spec::{
-    CommandSpec, DependsSpec, DeviceSpec, EndpointSpec, ErrorsSpec, HealthCheck, HealthSpec,
-    ImageSpec, InitSpec, LifecycleSpec, NetworkMode, NodeMode, NodeSelector, PortMapping,
-    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
-    ServiceType, StorageSpec,
+    HealthCheck, HealthSpec, ImageSpec, NodeMode, PullPolicy, ResourcesSpec, ServiceSpec,
 };
 
 /// Build a healthy node with the requested CPU/memory capacity.
@@ -39,20 +36,11 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
     };
 
     ServiceSpec {
-        rtype: ResourceType::Service,
-        schedule: None,
         image: ImageSpec {
             name: "test:latest".parse().expect("valid image reference"),
             pull_policy: PullPolicy::IfNotPresent,
         },
         resources,
-        env: HashMap::default(),
-        command: CommandSpec::default(),
-        network: ServiceNetworkSpec::default(),
-        endpoints: Vec::<EndpointSpec>::new(),
-        scale: ScaleSpec::default(),
-        replica_groups: None,
-        depends: Vec::<DependsSpec>::new(),
         health: HealthSpec {
             start_grace: None,
             interval: None,
@@ -60,45 +48,8 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
             retries: 3,
             check: HealthCheck::Tcp { port: 8080 },
         },
-        init: InitSpec::default(),
-        errors: ErrorsSpec::default(),
-        lifecycle: LifecycleSpec::default(),
-        devices: Vec::<DeviceSpec>::new(),
-        storage: Vec::<StorageSpec>::new(),
-        port_mappings: Vec::<PortMapping>::new(),
-        capabilities: Vec::new(),
-        cap_drop: Vec::new(),
-        privileged: false,
         node_mode,
-        node_selector: None::<NodeSelector>,
-        service_type: ServiceType::default(),
-        wasm: None,
-        logs: None,
-        host_network: false,
-        hostname: None,
-        dns: Vec::new(),
-        extra_hosts: Vec::new(),
-        restart_policy: None,
-        platform: None,
-        labels: HashMap::new(),
-        user: None,
-        stop_signal: None,
-        stop_grace_period: None,
-        sysctls: HashMap::new(),
-        ulimits: HashMap::new(),
-        security_opt: Vec::new(),
-        pid_mode: None,
-        ipc_mode: None,
-        network_mode: NetworkMode::default(),
-        extra_groups: Vec::new(),
-        read_only_root_fs: false,
-        init_container: None,
-        tty: false,
-        stdin_open: false,
-        userns_mode: None,
-        cgroup_parent: None,
-        expose: Vec::new(),
-        isolation: None,
+        ..ServiceSpec::default()
     }
 }
 

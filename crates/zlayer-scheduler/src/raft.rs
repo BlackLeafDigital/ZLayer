@@ -20,6 +20,8 @@ use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData}
 #[cfg(feature = "persistent")]
 use zlayer_consensus::storage::redb_store::{RedbLogStore, RedbSmCache, RedbStateMachine};
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
+use zlayer_overlay::allocator::{ServiceSubnetRegistry, ServiceSubnetRegistrySnapshot};
+use zlayer_overlay::ipnet::IpNet;
 use zlayer_secrets::cluster_dek::ClusterDek;
 use zlayer_secrets::sealed::{RecipientPrivateKey, RecipientPublicKey};
 use zlayer_secrets::{NodeSideEffects, SecretsError, SecretsState};
@@ -32,6 +34,36 @@ use zlayer_paths::ZLayerDirs;
 
 /// Node ID type (u64 for simplicity)
 pub type NodeId = u64;
+
+/// Default cluster CIDR used by [`ClusterState`]'s [`ServiceSubnetRegistry`]
+/// when no operator override has been wired through. Matches the project-wide
+/// default overlay range; can be replaced in a follow-up that surfaces the
+/// value through config without touching the on-disk snapshot shape.
+pub const DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR: &str = "10.200.0.0/16";
+
+/// Default per-`(service, node)` slice prefix the [`ServiceSubnetRegistry`]
+/// carves out of the cluster CIDR. `/28` gives 14 usable host IPs per
+/// service per node, which matches the planning doc ("P7"). The prefix
+/// being configurable is a follow-up.
+pub const DEFAULT_SERVICE_SUBNET_SLICE_PREFIX: u8 = 28;
+
+/// Construct the default [`ServiceSubnetRegistry`] used by
+/// [`ClusterState::default`] / [`ClusterState::new`].
+///
+/// # Panics
+///
+/// Panics if [`DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR`] or
+/// [`DEFAULT_SERVICE_SUBNET_SLICE_PREFIX`] are mutually inconsistent. The
+/// hard-coded defaults are valid by construction (verified by a unit test
+/// below), so this is unreachable in practice.
+#[must_use]
+pub fn default_service_subnet_registry() -> ServiceSubnetRegistry {
+    let cidr: IpNet = DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR
+        .parse()
+        .expect("hard-coded default cluster CIDR is well-formed");
+    ServiceSubnetRegistry::new(cidr, DEFAULT_SERVICE_SUBNET_SLICE_PREFIX)
+        .expect("hard-coded default slice prefix is well-formed for the default CIDR")
+}
 
 // OpenRaft type configuration for ZLayer scheduler.
 // Uses `declare_raft_types!` which automatically provides v2-compatible
@@ -144,6 +176,30 @@ pub enum Request {
     /// Revoke a worker lease — admin action (e.g. `worker-evict`). Same effect
     /// as `ExpireWorkerLease` but distinct for audit/log readability.
     RevokeWorkerLease { node_id: NodeId },
+    /// Leader-side allocation of a per-`(service, node)` subnet from the
+    /// cluster CIDR via the [`ServiceSubnetRegistry`]. All nodes apply the
+    /// same delta so each node's cluster-WG knows which `AllowedIPs` to
+    /// attribute to which remote peer for cross-node service traffic.
+    ///
+    /// Appended at the end of the enum — postcard2 enum discriminants are
+    /// positional/index-based, and pure appends do not shift the
+    /// discriminants of any pre-existing variants, so older log entries
+    /// stay decodable bit-for-bit.
+    ///
+    /// `service_name` is the deployment service name; `node_id` is the
+    /// raft `NodeId` (the registry stores it as a string at the boundary).
+    AssignServiceSubnet {
+        service_name: String,
+        node_id: NodeId,
+    },
+    /// Counterpart to [`Request::AssignServiceSubnet`]: releases the slot
+    /// for `(service_name, node_id)`. Idempotent — no-op if no slot was
+    /// assigned. Also appended at the end of the enum for discriminant
+    /// stability (see [`Request::AssignServiceSubnet`]).
+    ReleaseServiceSubnet {
+        service_name: String,
+        node_id: NodeId,
+    },
 }
 
 /// Raft response types
@@ -244,7 +300,7 @@ impl WorkerLeaseRecord {
 /// This is the `S` generic parameter to the storage state machine types.
 /// It only contains application-level fields -- the Raft bookkeeping
 /// (`last_applied_log`, `last_membership`) is managed by the consensus crate.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
     /// Service states
     pub services: HashMap<String, ServiceState>,
@@ -265,6 +321,63 @@ pub struct ClusterState {
     /// snapshots loading cleanly.
     #[serde(default)]
     pub worker_leases: HashMap<NodeId, WorkerLeaseRecord>,
+    /// Per-`(service, node)` overlay-subnet assignments. Driven by the
+    /// `AssignServiceSubnet` / `ReleaseServiceSubnet` raft commands so every
+    /// node observes the same (service, node) -> subnet mapping. Used by
+    /// each node's cluster-WG to attribute `AllowedIPs` to the right remote
+    /// peer for cross-node service traffic.
+    ///
+    /// Serialized via [`ServiceSubnetRegistrySnapshot`] (the registry itself
+    /// is not `Serialize`) so the on-disk shape stays deterministic across
+    /// processes. `#[serde(default = ...)]` keeps snapshots written before
+    /// this field existed loading cleanly with an empty registry built from
+    /// the project-wide defaults.
+    #[serde(
+        serialize_with = "serialize_service_subnets",
+        deserialize_with = "deserialize_service_subnets",
+        default = "default_service_subnet_registry"
+    )]
+    pub service_subnets: ServiceSubnetRegistry,
+}
+
+impl Default for ClusterState {
+    fn default() -> Self {
+        Self {
+            services: HashMap::new(),
+            nodes: HashMap::new(),
+            scale_events: Vec::new(),
+            secrets: SecretsState::default(),
+            worker_leases: HashMap::new(),
+            service_subnets: default_service_subnet_registry(),
+        }
+    }
+}
+
+/// Serialize a [`ServiceSubnetRegistry`] through its [`ServiceSubnetRegistrySnapshot`]
+/// shape. The registry itself is not `Serialize`; round-tripping via the
+/// snapshot keeps the on-disk bytes deterministic across processes
+/// (snapshots sort assignments by key) and matches the pattern the snapshot
+/// type was designed for.
+fn serialize_service_subnets<S>(
+    registry: &ServiceSubnetRegistry,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    registry.snapshot().serialize(serializer)
+}
+
+/// Deserialize a [`ServiceSubnetRegistry`] from its [`ServiceSubnetRegistrySnapshot`]
+/// shape. Mirrors [`serialize_service_subnets`].
+fn deserialize_service_subnets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<ServiceSubnetRegistry, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let snapshot = ServiceSubnetRegistrySnapshot::deserialize(deserializer)?;
+    ServiceSubnetRegistry::restore(snapshot).map_err(serde::de::Error::custom)
 }
 
 /// Node information
@@ -586,6 +699,37 @@ impl ClusterState {
                 // Idempotent removal. Both variants share apply-logic; the
                 // distinction is only for log audit / metrics.
                 self.worker_leases.remove(node_id);
+                Response::Success { data: None }
+            }
+            Request::AssignServiceSubnet {
+                service_name,
+                node_id,
+            } => {
+                // Stringify the raft NodeId at the boundary — the registry
+                // stores node identifiers as Strings to stay symmetric with
+                // NodeSliceAllocator's interface.
+                let node_key = node_id.to_string();
+                match self.service_subnets.assign(service_name, &node_key) {
+                    Ok(subnet) => Response::Success {
+                        // CIDR is surfaced in the response so the proposer
+                        // (typically the leader's overlay manager) can
+                        // immediately program AllowedIPs without re-reading
+                        // the state machine.
+                        data: Some(subnet.to_string()),
+                    },
+                    Err(e) => Response::Error {
+                        message: format!(
+                            "AssignServiceSubnet failed for service={service_name} node={node_id}: {e}"
+                        ),
+                    },
+                }
+            }
+            Request::ReleaseServiceSubnet {
+                service_name,
+                node_id,
+            } => {
+                let node_key = node_id.to_string();
+                self.service_subnets.release(service_name, &node_key);
                 Response::Success { data: None }
             }
         }
@@ -2505,5 +2649,150 @@ mod tests {
         });
         let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
         assert!(s.worker_leases.is_empty());
+    }
+
+    // -- ServiceSubnet assignment dispatch ---------------------------------
+
+    #[test]
+    fn default_service_subnet_registry_constants_are_consistent() {
+        // Cheap correctness check for the hard-coded defaults — guards
+        // against a future edit that pairs incompatible constants.
+        let registry = default_service_subnet_registry();
+        assert_eq!(registry.slice_prefix(), DEFAULT_SERVICE_SUBNET_SLICE_PREFIX);
+        assert_eq!(
+            registry.cluster_cidr().to_string(),
+            DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR
+        );
+    }
+
+    #[test]
+    fn assign_and_release_service_subnet_roundtrip() {
+        let mut state = ClusterState::new();
+
+        // Assign: should return Success with the assigned CIDR in `data`,
+        // and the registry should contain the entry.
+        let resp = state.apply(&Request::AssignServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        let assigned_cidr = match resp {
+            Response::Success { data: Some(s) } => s,
+            other => panic!("expected Success with CIDR data, got {other:?}"),
+        };
+        assert_eq!(state.service_subnets.assigned_count(), 1);
+        let in_registry = state
+            .service_subnets
+            .get("api", "7")
+            .expect("registry has the entry");
+        assert_eq!(in_registry.to_string(), assigned_cidr);
+
+        // Release: drops the entry; second release is a no-op.
+        let resp = state.apply(&Request::ReleaseServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert!(state.service_subnets.get("api", "7").is_none());
+        assert_eq!(state.service_subnets.assigned_count(), 0);
+
+        let resp = state.apply(&Request::ReleaseServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+    }
+
+    #[test]
+    fn assign_service_subnet_is_deterministic_across_nodes() {
+        // Two independently-constructed `ClusterState`s (representing two
+        // raft replicas) must converge on the same (service, node) ->
+        // subnet mapping after applying the same sequence of commands —
+        // this is what makes the registry safe to drive through Raft.
+        let mut a = ClusterState::new();
+        let mut b = ClusterState::new();
+
+        let ops = [
+            ("api", 1u64),
+            ("api", 2u64),
+            ("worker", 1u64),
+            ("worker", 3u64),
+            ("scheduler", 42u64),
+        ];
+
+        for (svc, nid) in ops {
+            let ra = a.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            let rb = b.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            match (ra, rb) {
+                (Response::Success { data: Some(ca) }, Response::Success { data: Some(cb) }) => {
+                    assert_eq!(ca, cb, "divergent assignment for ({svc}, {nid})");
+                }
+                other => panic!("expected matching Success responses, got {other:?}"),
+            }
+        }
+
+        // Snapshot comparison — both registries must agree slot-for-slot.
+        let snap_a = a.service_subnets.snapshot();
+        let snap_b = b.service_subnets.snapshot();
+        assert_eq!(snap_a.assignments, snap_b.assignments);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_service_subnets() {
+        let mut state = ClusterState::new();
+
+        for (svc, nid) in [("a", 10u64), ("b", 20u64), ("c", 30u64)] {
+            let resp = state.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            assert!(matches!(resp, Response::Success { data: Some(_) }));
+        }
+        assert_eq!(state.service_subnets.assigned_count(), 3);
+
+        // Serialize the entire ClusterState through serde_json (mirrors the
+        // shape force-leader save/load and openraft snapshots use) and
+        // restore it; the registry must come back with the same entries.
+        let bytes = serde_json::to_vec(&state).expect("serialize ClusterState");
+        let restored: ClusterState = serde_json::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(restored.service_subnets.assigned_count(), 3);
+        for (svc, nid) in [("a", 10u64), ("b", 20u64), ("c", 30u64)] {
+            let nk = nid.to_string();
+            let before = state
+                .service_subnets
+                .get(svc, &nk)
+                .expect("pre-snapshot entry");
+            let after = restored
+                .service_subnets
+                .get(svc, &nk)
+                .expect("post-restore entry");
+            assert_eq!(before, after, "subnet mismatch for ({svc}, {nid})");
+        }
+    }
+
+    #[test]
+    fn old_snapshot_without_service_subnets_field_deserializes() {
+        // Snapshots written before `service_subnets` existed must still
+        // deserialize cleanly — they get an empty registry built from the
+        // project-wide defaults via `#[serde(default = ...)]`.
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // service_subnets, worker_leases, secrets all intentionally
+            // absent — every one is `#[serde(default)]`-style.
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert_eq!(s.service_subnets.assigned_count(), 0);
+        assert_eq!(
+            s.service_subnets.slice_prefix(),
+            DEFAULT_SERVICE_SUBNET_SLICE_PREFIX
+        );
     }
 }

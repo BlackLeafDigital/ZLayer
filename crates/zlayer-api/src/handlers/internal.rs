@@ -18,7 +18,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{ApiError, Result};
-use zlayer_agent::{AgentError, ServiceManager};
+use zlayer_agent::{AgentError, OverlayManager, ServiceManager};
 use zlayer_scheduler::RaftCoordinator;
 pub use zlayer_types::api::internal::*;
 
@@ -35,6 +35,15 @@ pub struct InternalState {
     /// `WireGuard` overlay interface name (e.g. "zl-overlay0") for add-peer operations.
     /// `None` if overlay networking is not configured.
     pub overlay_interface: Option<String>,
+    /// Live overlay manager handle. When `Some`, the internal add-peer
+    /// endpoint dispatches into [`OverlayManager::add_global_peer`] so the
+    /// peer registration takes effect on the live cluster `WireGuard`
+    /// transport (the in-kernel UAPI socket actually used for routing).
+    /// When `None`, the handler falls back to constructing an ad-hoc
+    /// `OverlayTransport` from `overlay_interface` — a legacy path that
+    /// targets the same UAPI socket name but is detached from the live
+    /// transport's state and is being phased out.
+    pub overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
     /// In-memory map of in-flight / completed daemon-binary upgrade jobs
     /// (keyed by `upgrade_id`).
     ///
@@ -64,6 +73,7 @@ impl InternalState {
             service_manager,
             internal_token,
             overlay_interface: None,
+            overlay_manager: None,
             upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
             data_dir: None,
             raft: None,
@@ -80,10 +90,22 @@ impl InternalState {
             service_manager,
             internal_token,
             overlay_interface,
+            overlay_manager: None,
             upgrade_jobs: Arc::new(RwLock::new(HashMap::new())),
             data_dir: None,
             raft: None,
         }
+    }
+
+    /// Attach a live overlay manager handle. When set, the internal
+    /// add-peer endpoint will route through
+    /// [`OverlayManager::add_global_peer`] instead of building an ad-hoc
+    /// transport — this ensures the peer registration actually affects
+    /// packet routing on the live `WireGuard` interface.
+    #[must_use]
+    pub fn with_overlay_manager(mut self, overlay_manager: Arc<RwLock<OverlayManager>>) -> Self {
+        self.overlay_manager = Some(overlay_manager);
+        self
     }
 
     /// Attach a Raft coordinator handle used by the pre-self-upgrade
@@ -658,9 +680,11 @@ pub async fn add_peer_internal(
     State(state): State<InternalState>,
     Json(request): Json<InternalAddPeerRequest>,
 ) -> Result<Json<InternalAddPeerResponse>> {
-    let interface_name = state.overlay_interface.as_deref().ok_or_else(|| {
-        ApiError::ServiceUnavailable("Overlay networking not configured on this node".into())
-    })?;
+    if state.overlay_manager.is_none() && state.overlay_interface.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "Overlay networking not configured on this node".into(),
+        ));
+    }
 
     info!(
         wg_public_key = %request.wg_public_key,
@@ -685,18 +709,50 @@ pub async fn add_peer_internal(
         std::time::Duration::from_secs(25),
     );
 
-    // Create a temporary OverlayTransport pointing at the existing interface's
-    // UAPI socket.  We only need the interface name — the UAPI socket path is
-    // derived from it (`/var/run/wireguard/{name}.sock`).
-    let transport = zlayer_overlay::OverlayTransport::new(
-        zlayer_overlay::OverlayConfig::default(),
-        interface_name.to_string(),
-    );
+    // Prefer the live overlay manager when wired in: this routes the peer
+    // through the same `OverlayTransport` actually moving packets, so the
+    // registration takes effect on routing. The legacy ad-hoc transport
+    // path opens a fresh UAPI socket whose state is detached from the live
+    // transport — the kernel WireGuard endpoint sees the peer (same socket
+    // path), but the in-process transport's own peer cache does not, which
+    // breaks any code path that reads back peer state from the transport.
+    if let Some(om) = state.overlay_manager.as_ref() {
+        let guard = om.read().await;
+        guard
+            .add_global_peer(&peer_info)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to add WireGuard peer: {e}")))?;
+    } else if let Some(interface_name) = state.overlay_interface.as_deref() {
+        // Legacy fallback: only the interface name is known. Construct an
+        // ad-hoc OverlayTransport pointing at the existing interface's UAPI
+        // socket. Callers that want correct in-process peer accounting must
+        // upgrade to `InternalState::with_overlay_manager`.
+        warn!(
+            interface = %interface_name,
+            "add_peer_internal falling back to ad-hoc OverlayTransport \
+             (no live OverlayManager wired in); in-process peer state will \
+             be inconsistent until the manager handle is plumbed through.",
+        );
+        let transport = zlayer_overlay::OverlayTransport::new(
+            zlayer_overlay::OverlayConfig::default(),
+            interface_name.to_string(),
+        );
 
-    transport
-        .add_peer(&peer_info)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to add WireGuard peer: {e}")))?;
+        transport
+            .add_peer(&peer_info)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to add WireGuard peer: {e}")))?;
+    } else {
+        // Unreachable: the early-return at the top of the handler already
+        // returns 503 when both overlay_manager and overlay_interface are
+        // None. Surface a defensive Internal error rather than panic if the
+        // invariant is ever broken in a refactor.
+        return Err(ApiError::Internal(
+            "overlay state invariant broken: neither overlay_manager nor \
+             overlay_interface present after early-return check"
+                .to_string(),
+        ));
+    }
 
     info!(
         wg_public_key = %request.wg_public_key,

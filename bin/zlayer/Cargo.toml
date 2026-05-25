@@ -148,6 +148,7 @@ humantime = "2"
 jsonwebtoken = { workspace = true }
 async-trait.workspace = true
 tonic = "0.14.5"
+openraft = { version = "0.9.24", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

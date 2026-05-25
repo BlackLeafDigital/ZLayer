@@ -59,8 +59,8 @@ use crate::handlers::notifiers::{
     CreateNotifierRequest, TestNotifierResponse, UpdateNotifierRequest,
 };
 use crate::handlers::overlay::{
-    DnsStatusResponse, IpAllocationResponse, NatCandidateDto, NatPeerDto, NatStatusResponse,
-    OverlayStatusResponse, PeerInfo, PeerListResponse,
+    BridgeInfo, DnsStatusResponse, IpAllocationResponse, NatCandidateDto, NatPeerDto,
+    NatStatusResponse, OverlayStatusResponse, PeerInfo, PeerListResponse, ServiceOverlayStatus,
 };
 use crate::handlers::projects::{
     CreateProjectRequest, LinkDeploymentRequest, ProjectPullResponse, UpdateProjectRequest,
@@ -177,7 +177,8 @@ use crate::handlers::notifiers::{
 use crate::handlers::oidc::{__path_callback, __path_list_providers, __path_start};
 use crate::handlers::overlay::{
     __path_get_dns_status, __path_get_ip_allocation, __path_get_nat_status,
-    __path_get_overlay_peers, __path_get_overlay_status,
+    __path_get_overlay_peers, __path_get_overlay_status, __path_get_service_bridge,
+    __path_get_service_overlay_status,
 };
 use crate::handlers::permissions::{
     __path_grant_permission, __path_list_permissions, __path_list_permissions_by_resource,
@@ -436,6 +437,8 @@ impl Modify for SecurityAddon {
         get_ip_allocation,
         get_dns_status,
         get_nat_status,
+        get_service_overlay_status,
+        get_service_bridge,
         // Daemon
         get_daemon_capabilities,
         // Tunnels
@@ -668,6 +671,10 @@ impl Modify for SecurityAddon {
             NatStatusResponse,
             NatCandidateDto,
             NatPeerDto,
+            // Per-service overlay (P4.5b: contract for adapter crates)
+            BridgeInfo,
+            ServiceOverlayStatus,
+            zlayer_types::overlay::OverlayMode,
             // Daemon capability survey
             DaemonCapabilitiesResponse,
             DaemonModeDto,

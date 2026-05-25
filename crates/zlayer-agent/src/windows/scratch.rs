@@ -24,7 +24,6 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
@@ -34,6 +33,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
+use crate::windows::layer::to_extended_wide;
 use crate::windows::wclayer::{self, LayerChain};
 
 /// Filename HCS uses for the writable-layer VHD inside a scratch layer
@@ -245,11 +245,11 @@ fn build_init_options_json(size_gb: u64) -> String {
 /// mirrors the flags hcsshim uses and lets the VHD driver service the handle
 /// for formatting.
 fn open_sandbox_vhd(path: &Path) -> io::Result<HANDLE> {
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    // `to_extended_wide` adds the `\\?\` long-path prefix. The sandbox VHD
+    // path itself is normally short, but layer roots can be deep enough that
+    // even `<root>/sandbox.vhdx` exceeds MAX_PATH when nested under a per-
+    // container scratch directory.
+    let wide = to_extended_wide(path)?;
     // SAFETY: `wide` is a valid null-terminated UTF-16 buffer that outlives
     // the call; all other arguments are plain values.
     unsafe {

@@ -131,7 +131,7 @@ governor = "0.10"
 tower_governor = "0.8"
 
 # Consensus
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9.24", features = ["serde"] }
 
 # Metrics
 prometheus = "0.13"

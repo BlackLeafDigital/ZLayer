@@ -226,7 +226,12 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
         if is_files_payload {
             backuptar::write_oci_entry_to_backup_stream(&mut entry, &dest)?;
         } else {
-            let mut f = std::fs::File::create(&dest)?;
+            // Non-`Files/` payloads (`Hives/`, `tombstones.txt`, `UtilityVM/`)
+            // are raw byte copies. `std::fs::File::create` here would hit
+            // ERROR_PATH_NOT_FOUND (0x80070003) on the deep UtilityVM/WinSxS
+            // paths embedded in nanoserver layers, so we route through the
+            // long-path-aware helper which adds the `\\?\` prefix.
+            let mut f = layer::create_long_path_file(&dest)?;
             std::io::copy(&mut entry, &mut f)?;
         }
     }

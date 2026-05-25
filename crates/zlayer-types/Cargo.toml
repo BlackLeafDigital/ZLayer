@@ -27,6 +27,8 @@ secrecy = { workspace = true }
 tempfile = "3"
 zeroize = { version = "1.7", features = ["derive"] }
 base64 = { workspace = true }
+tracing.workspace = true
+ipnet = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

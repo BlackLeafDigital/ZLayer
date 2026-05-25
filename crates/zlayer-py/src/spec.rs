@@ -659,6 +659,7 @@ pub fn create_service_spec(
         expose: Vec::new(),
         replica_groups: None,
         isolation: None,
+        overlay: None,
     };
 
     Ok(ServiceSpec {

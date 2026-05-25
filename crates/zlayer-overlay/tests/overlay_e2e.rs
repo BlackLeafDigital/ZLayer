@@ -797,3 +797,254 @@ async fn test_overlay_interface_lifecycle_ipv6() {
         "Interface {iface_name} should no longer exist after shutdown",
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. add_allowed_ip / remove_allowed_ip — multi-CIDR AllowedIPs management
+// ---------------------------------------------------------------------------
+// These exercise the per-cluster "one WireGuard interface carrying many
+// service subnets via AllowedIPs" pattern that OverlayManager uses when
+// services are added/removed at runtime. Requires root or CAP_NET_ADMIN
+// because they spin up a real boringtun TUN device.
+
+/// Build a minimal one-peer overlay with a stable test interface and a
+/// known starting `AllowedIPs`. Returns `(transport, peer_pubkey_b64)` so
+/// the test can call `add_allowed_ip` on the live peer and then read
+/// state back via `status()`.
+#[allow(dead_code)]
+async fn make_single_peer_overlay(
+    iface: &str,
+    port: u16,
+    overlay_cidr: &str,
+    initial_peer_allowed: &str,
+) -> (OverlayTransport, String) {
+    let (private_key, local_pub) = OverlayTransport::generate_keys()
+        .await
+        .expect("local keygen");
+    let (_peer_priv, peer_pub) = OverlayTransport::generate_keys()
+        .await
+        .expect("peer keygen");
+
+    let config = OverlayConfig {
+        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        private_key,
+        public_key: local_pub,
+        overlay_cidr: overlay_cidr.to_string(),
+        cluster_cidr: None,
+        peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
+        ..OverlayConfig::default()
+    };
+
+    let mut manager = OverlayTransport::new(config, iface.to_string());
+
+    // Best-effort cleanup of any leftover device from a previous failed run.
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+
+    manager.create_interface().await.expect("create_interface");
+
+    let peer = PeerInfo::new(
+        peer_pub.clone(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.wrapping_add(1)),
+        initial_peer_allowed,
+        Duration::from_secs(25),
+    );
+    manager
+        .configure(&[peer])
+        .await
+        .expect("configure with initial peer");
+
+    (manager, peer_pub)
+}
+
+/// Convert a base64 wireguard pubkey into hex so it can be matched
+/// against the `public_key=<hex>` lines `status()` emits on Linux/macOS.
+#[allow(dead_code)]
+fn b64_pub_to_hex(b64: &str) -> String {
+    let bytes = STANDARD.decode(b64).expect("valid base64 pubkey");
+    hex::encode(bytes)
+}
+
+/// Pull all `allowed_ip=` lines associated with `peer_pub_hex` from a
+/// UAPI-style status dump. Intentionally a separate implementation from
+/// the parser inside `transport.rs` so test failures bisect to the
+/// production parser instead of being masked by it.
+#[allow(dead_code)]
+fn extract_allowed_ips(dump: &str, peer_pub_hex: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_target = false;
+    for line in dump.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("public_key=") {
+            in_target = rest == peer_pub_hex;
+            continue;
+        }
+        if line.starts_with("errno=") {
+            break;
+        }
+        if in_target {
+            if let Some(cidr) = line.strip_prefix("allowed_ip=") {
+                out.push(cidr.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn add_allowed_ip_appends_to_peer() {
+    let iface = "wg-test-aip1";
+    let (manager, peer_pub) =
+        make_single_peer_overlay(iface, 51860, "10.252.0.1/24", "10.252.10.0/24").await;
+    let peer_hex = b64_pub_to_hex(&peer_pub);
+
+    let new_cidr: ipnet::IpNet = "10.252.20.0/24".parse().unwrap();
+    manager
+        .add_allowed_ip(&peer_pub, new_cidr)
+        .await
+        .expect("add_allowed_ip");
+
+    let dump = manager.status().await.expect("status dump");
+    let allowed = extract_allowed_ips(&dump, &peer_hex);
+    assert!(
+        allowed.contains(&"10.252.10.0/24".to_string()),
+        "original CIDR must survive add: {allowed:?}"
+    );
+    assert!(
+        allowed.contains(&"10.252.20.0/24".to_string()),
+        "newly added CIDR must be present: {allowed:?}"
+    );
+
+    drop(manager);
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn add_allowed_ip_dedupes() {
+    let iface = "wg-test-aip2";
+    let (manager, peer_pub) =
+        make_single_peer_overlay(iface, 51861, "10.253.0.1/24", "10.253.10.0/24").await;
+    let peer_hex = b64_pub_to_hex(&peer_pub);
+
+    let cidr: ipnet::IpNet = "10.253.20.0/24".parse().unwrap();
+    manager
+        .add_allowed_ip(&peer_pub, cidr)
+        .await
+        .expect("first add");
+    manager
+        .add_allowed_ip(&peer_pub, cidr)
+        .await
+        .expect("second add (idempotent)");
+
+    let dump = manager.status().await.expect("status dump");
+    let allowed = extract_allowed_ips(&dump, &peer_hex);
+    let dup_count = allowed.iter().filter(|c| *c == "10.253.20.0/24").count();
+    assert_eq!(
+        dup_count, 1,
+        "duplicate add must not produce duplicate AllowedIPs entries: {allowed:?}"
+    );
+
+    drop(manager);
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn remove_allowed_ip_drops_cidr() {
+    let iface = "wg-test-aip3";
+    let (manager, peer_pub) =
+        make_single_peer_overlay(iface, 51862, "10.254.0.1/24", "10.254.10.0/24").await;
+    let peer_hex = b64_pub_to_hex(&peer_pub);
+
+    let extra: ipnet::IpNet = "10.254.20.0/24".parse().unwrap();
+    manager
+        .add_allowed_ip(&peer_pub, extra)
+        .await
+        .expect("add extra");
+
+    // Sanity check both are present.
+    let before = extract_allowed_ips(&manager.status().await.expect("status"), &peer_hex);
+    assert!(before.contains(&"10.254.10.0/24".to_string()));
+    assert!(before.contains(&"10.254.20.0/24".to_string()));
+
+    manager
+        .remove_allowed_ip(&peer_pub, extra)
+        .await
+        .expect("remove extra");
+
+    let after = extract_allowed_ips(&manager.status().await.expect("status"), &peer_hex);
+    assert!(
+        after.contains(&"10.254.10.0/24".to_string()),
+        "untouched CIDR must remain: {after:?}"
+    );
+    assert!(
+        !after.contains(&"10.254.20.0/24".to_string()),
+        "removed CIDR must be gone: {after:?}"
+    );
+
+    drop(manager);
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn remove_allowed_ip_missing_peer_is_ok() {
+    let iface = "wg-test-aip4";
+    let (manager, _peer_pub) =
+        make_single_peer_overlay(iface, 51863, "10.255.0.1/24", "10.255.10.0/24").await;
+
+    let (_priv_g, ghost_pub) = OverlayTransport::generate_keys()
+        .await
+        .expect("ghost keygen");
+    let cidr: ipnet::IpNet = "10.255.20.0/24".parse().unwrap();
+
+    manager
+        .remove_allowed_ip(&ghost_pub, cidr)
+        .await
+        .expect("remove_allowed_ip on unknown peer must be idempotent");
+
+    drop(manager);
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn add_allowed_ip_missing_peer_is_err() {
+    let iface = "wg-test-aip5";
+    let (manager, _peer_pub) =
+        make_single_peer_overlay(iface, 51864, "10.249.0.1/24", "10.249.10.0/24").await;
+
+    let (_priv_g, ghost_pub) = OverlayTransport::generate_keys()
+        .await
+        .expect("ghost keygen");
+    let cidr: ipnet::IpNet = "10.249.20.0/24".parse().unwrap();
+
+    let result = manager.add_allowed_ip(&ghost_pub, cidr).await;
+    assert!(
+        result.is_err(),
+        "add_allowed_ip on unknown peer must return Err"
+    );
+
+    drop(manager);
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface])
+        .output()
+        .await;
+}

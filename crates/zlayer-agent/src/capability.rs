@@ -55,7 +55,7 @@ pub struct DaemonCapabilities {
     /// owner-write bit set. Coarse, non-destructive signal — does not
     /// guarantee an actual write will succeed.
     pub can_write_cgroup_root: bool,
-    /// `true` if `CAP_NET_ADMIN` is present in the process's bounding set
+    /// `true` if `CAP_NET_ADMIN` is present in the process's *effective* set
     /// (Linux only).
     pub has_cap_net_admin: bool,
     /// `true` if `/dev/net/tun` can be opened r/w in non-blocking mode without
@@ -195,17 +195,25 @@ fn probe_can_write_cgroup_root() -> bool {
 
 #[cfg(target_os = "linux")]
 fn probe_has_cap_net_admin() -> bool {
-    // The `libc` crate does not expose capability constants. CAP_NET_ADMIN is
-    // defined as 12 in `<linux/capability.h>` and is part of the stable Linux
-    // ABI.
-    const CAP_NET_ADMIN: libc::c_ulong = 12;
-
-    // SAFETY: PR_CAPBSET_READ is a read-only prctl that returns 1 if the
-    // capability is in the bounding set, 0 if not, and -1 on error. No
-    // pointer arguments are passed and the kernel does not retain state.
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_NET_ADMIN, 0, 0, 0) };
-    rc == 1
+    // CAP_NET_ADMIN is bit 12 in the Linux capability bitmask.
+    // We need it in the EFFECTIVE set (`CapEff`), not just the bounding set
+    // (`CapBnd`). A regular user process has full CapBnd by default but empty
+    // CapPrm/CapEff — checking PR_CAPBSET_READ gives a false positive that
+    // makes the daemon think it can create TUN/WG interfaces when it cannot.
+    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            let trimmed = hex.trim();
+            if let Ok(eff) = u64::from_str_radix(trimmed, 16) {
+                return eff & CAP_NET_ADMIN_BIT != 0;
+            }
+            return false;
+        }
+    }
+    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -242,6 +250,24 @@ mod tests {
     fn probe_does_not_panic_and_is_nested_agrees_with_cgroup_parent() {
         let caps = DaemonCapabilities::probe();
         assert_eq!(caps.is_nested, caps.cgroup_parent.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_has_cap_net_admin_matches_cap_eff() {
+        // Just confirm the probe agrees with what /proc/self/status reports.
+        // The actual capability state depends on how the test is run (regular
+        // user vs root vs setcap'd binary), but the probe MUST agree with the
+        // CapEff line — that's the whole point of the bug fix.
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let cap_eff_line = status
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff: present in /proc/self/status");
+        let hex = cap_eff_line.trim_start_matches("CapEff:").trim();
+        let eff: u64 = u64::from_str_radix(hex, 16).unwrap();
+        let expected = (eff & (1u64 << 12)) != 0;
+        assert_eq!(super::probe_has_cap_net_admin(), expected);
     }
 
     /// Pure classifier reproducing the logic in `probe()`. Kept in the test

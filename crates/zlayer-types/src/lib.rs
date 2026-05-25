@@ -83,6 +83,7 @@ pub mod auth;
 pub mod client;
 pub mod cluster;
 pub mod jwt;
+pub mod overlay;
 pub mod scratch;
 pub mod secrets;
 pub mod spec;

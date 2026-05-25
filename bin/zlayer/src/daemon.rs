@@ -75,6 +75,12 @@ pub(crate) struct NodeConfig {
     pub(crate) is_leader: bool,
     /// Timestamp when node was created
     pub(crate) created_at: String,
+    /// Per-node preferred overlay mode. When `None`, the node defers to the
+    /// cluster-level default (`AgentConfig::overlay_default_mode`). Per-service
+    /// overrides on the spec take precedence over both. In v0.51 every value
+    /// eventually funnels through [`zlayer_types::overlay::OverlayMode::resolve_v0_51`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) overlay_preferred_mode: Option<zlayer_types::overlay::OverlayMode>,
 }
 
 /// Generate a unique node ID.
@@ -473,6 +479,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
         wireguard_public_key: public_key,
         is_leader: true,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
 
     save_node_config(data_dir, &cfg).await?;

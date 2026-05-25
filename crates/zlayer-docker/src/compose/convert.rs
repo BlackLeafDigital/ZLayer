@@ -196,6 +196,7 @@ fn convert_service(
         expose,
         replica_groups: None,
         isolation: None,
+        overlay: None,
     })
 }
 

@@ -269,6 +269,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         cgroup_parent: None,
         expose: Vec::new(),
         isolation: None,
+        overlay: None,
     }
 }
 

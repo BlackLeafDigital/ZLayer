@@ -1033,6 +1033,7 @@ pub(crate) async fn handle_node_init(
         wireguard_public_key: public_key.clone(),
         is_leader: true,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
     save_node_config(&data_dir, &node_config).await?;
 
@@ -1249,6 +1250,7 @@ pub(crate) async fn handle_node_init(
         wireguard_public_key: public_key.clone(),
         is_leader: true,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
     save_node_config(&data_dir, &node_config).await?;
 
@@ -1622,6 +1624,7 @@ pub(crate) async fn handle_node_join(
         wireguard_public_key: public_key.clone(),
         is_leader: false,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
     save_node_config(&data_dir, &node_config).await?;
 
@@ -2055,6 +2058,7 @@ pub(crate) async fn handle_node_join(
         wireguard_public_key: public_key.clone(),
         is_leader: false,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
     save_node_config(&data_dir, &node_config).await?;
 
@@ -4285,6 +4289,7 @@ mod tests {
             wireguard_public_key: "test-pub-key-base64".to_string(),
             is_leader: true,
             created_at: super::current_timestamp(),
+            overlay_preferred_mode: None,
         };
         super::save_node_config(&data_dir, &node_config)
             .await
@@ -4362,6 +4367,7 @@ mod tests {
             wireguard_public_key: "test-pub-key-base64".to_string(),
             is_leader: true,
             created_at: super::current_timestamp(),
+            overlay_preferred_mode: None,
         };
         super::save_node_config(&data_dir, &node_config)
             .await

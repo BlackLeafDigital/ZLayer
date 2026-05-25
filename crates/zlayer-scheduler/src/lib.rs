@@ -399,69 +399,13 @@ impl Scheduler {
         placement_state: &mut placement::PlacementState,
         spec: Option<&ServiceSpec>,
     ) -> HashMap<NodeId, Vec<placement::ContainerId>> {
-        // Build a default ServiceSpec if none provided, using Shared mode
-        let default_spec = ServiceSpec {
-            rtype: zlayer_spec::ResourceType::Service,
-            schedule: None,
-            image: zlayer_spec::ImageSpec {
-                name: "unknown:latest".parse().expect("valid image reference"),
-                pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
-            },
-            resources: zlayer_spec::ResourcesSpec::default(),
-            env: HashMap::default(),
-            command: zlayer_spec::CommandSpec::default(),
-            network: zlayer_spec::ServiceNetworkSpec::default(),
-            endpoints: vec![],
-            scale: zlayer_spec::ScaleSpec::default(),
-            depends: vec![],
-            health: zlayer_spec::HealthSpec {
-                start_grace: None,
-                interval: None,
-                timeout: None,
-                retries: 3,
-                check: zlayer_spec::HealthCheck::Tcp { port: 0 },
-            },
-            init: zlayer_spec::InitSpec::default(),
-            errors: zlayer_spec::ErrorsSpec::default(),
-            lifecycle: zlayer_spec::LifecycleSpec::default(),
-            devices: vec![],
-            storage: vec![],
-            port_mappings: vec![],
-            capabilities: vec![],
-            cap_drop: vec![],
-            privileged: false,
-            node_mode: zlayer_spec::NodeMode::Shared,
-            node_selector: None,
-            service_type: zlayer_spec::ServiceType::default(),
-            wasm: None,
-            logs: None,
-            host_network: false,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            platform: None,
-            labels: HashMap::new(),
-            user: None,
-            stop_signal: None,
-            stop_grace_period: None,
-            sysctls: HashMap::new(),
-            ulimits: HashMap::new(),
-            security_opt: Vec::new(),
-            pid_mode: None,
-            ipc_mode: None,
-            network_mode: zlayer_spec::NetworkMode::default(),
-            extra_groups: Vec::new(),
-            read_only_root_fs: false,
-            init_container: None,
-            tty: false,
-            stdin_open: false,
-            userns_mode: None,
-            cgroup_parent: None,
-            expose: Vec::new(),
-            replica_groups: None,
-            isolation: None,
-        };
+        // Build a default ServiceSpec if none provided. The default `node_mode`
+        // is already `NodeMode::Shared` and the default image placeholder
+        // (`scratch:latest`) is fine here since this fallback only fires when
+        // the caller had no spec to give us — placement decisions made off
+        // this default are tagged with the synthetic image only for the
+        // duration of the scheduling pass.
+        let default_spec = ServiceSpec::default();
 
         let effective_spec = spec.unwrap_or(&default_spec);
 

@@ -329,6 +329,7 @@ mod tests {
                 cgroup_parent: None,
                 expose: Vec::new(),
                 isolation: None,
+                overlay: None,
             },
         );
 

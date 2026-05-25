@@ -1196,6 +1196,17 @@ pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
         .route("/ip-alloc", get(handlers::overlay::get_ip_allocation))
         .route("/dns", get(handlers::overlay::get_dns_status))
         .route("/nat/status", get(handlers::overlay::get_nat_status))
+        // Per-service overlay status and per-(service, node) bridge view.
+        // These are v0.51 stubs whose contract is wired now so adapter
+        // crates can consume them day-one; P9a populates the real data.
+        .route(
+            "/services/{name}",
+            get(handlers::overlay::get_service_overlay_status),
+        )
+        .route(
+            "/services/{name}/bridges/{node_id}",
+            get(handlers::overlay::get_service_bridge),
+        )
         .with_state(overlay_state)
 }
 

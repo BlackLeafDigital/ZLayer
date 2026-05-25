@@ -1017,7 +1017,7 @@ pub struct UlimitSpec {
 }
 
 /// Per-service specification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Validate)]
 #[serde(from = "ServiceSpecCompat")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServiceSpec {
@@ -1311,6 +1311,15 @@ pub struct ServiceSpec {
     /// inter-service traffic without publishing to the host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<String>,
+
+    /// Per-service overlay-network configuration.
+    ///
+    /// When `None` (default), the daemon uses the cluster-level overlay
+    /// default. When `Some`, the service opts into an explicit mode /
+    /// parent. See [`crate::overlay::OverlayConfig`] for the v0.51
+    /// implementation status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<crate::overlay::OverlayConfig>,
 }
 
 /// Deserialization shim for [`ServiceSpec`].
@@ -1426,6 +1435,8 @@ struct ServiceSpecCompat {
     cgroup_parent: Option<String>,
     #[serde(default)]
     expose: Vec<String>,
+    #[serde(default)]
+    overlay: Option<crate::overlay::OverlayConfig>,
 }
 
 impl From<ServiceSpecCompat> for ServiceSpec {
@@ -1492,6 +1503,47 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             userns_mode: c.userns_mode,
             cgroup_parent: c.cgroup_parent,
             expose: c.expose,
+            overlay: c.overlay,
+        }
+    }
+}
+
+impl ServiceSpec {
+    /// Construct a minimally-populated [`ServiceSpec`] with just the two
+    /// fields callers always have to supply explicitly: the logical service
+    /// name (used for diagnostics / labels at the call site — this struct
+    /// does not carry the service name itself; it is the key in
+    /// [`DeploymentSpec::services`]) and the container image. Every other
+    /// field is filled in from [`Default::default`].
+    ///
+    /// Intended for tests and one-off in-memory fixtures. Production code
+    /// paths that build a `ServiceSpec` from user input should still go
+    /// through `serde` deserialization or an explicit struct literal so that
+    /// every field is consciously set.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let spec = ServiceSpec::minimal("api", "ghcr.io/acme/api:1.2");
+    /// ```
+    ///
+    /// # Panics
+    /// Panics only if the fixed fallback string `"scratch:latest"` cannot
+    /// be parsed as an [`ImageReference`] — which would indicate a bug in
+    /// the OCI reference parser, not in caller input.
+    #[must_use]
+    pub fn minimal(_name: impl Into<String>, image: impl Into<String>) -> Self {
+        use std::str::FromStr;
+        let image_str = image.into();
+        let image_ref = crate::ImageReference::from_str(&image_str).unwrap_or_else(|_| {
+            crate::ImageReference::from_str("scratch:latest")
+                .expect("'scratch:latest' is a valid image reference")
+        });
+        Self {
+            image: ImageSpec {
+                name: image_ref,
+                pull_policy: default_pull_policy(),
+            },
+            ..Self::default()
         }
     }
 }
@@ -1528,10 +1580,11 @@ fn default_health() -> HealthSpec {
 }
 
 /// Resource type - determines container lifecycle
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResourceType {
     /// Long-running container, receives traffic, load-balanced
+    #[default]
     Service,
     /// Run-to-completion, triggered by endpoint/CLI/internal system
     Job,
@@ -1554,6 +1607,24 @@ pub struct ImageSpec {
 
 fn default_pull_policy() -> PullPolicy {
     PullPolicy::IfNotPresent
+}
+
+impl Default for ImageSpec {
+    /// Placeholder default used by [`ServiceSpec::default`] (and downstream
+    /// tests). The wrapped reference (`scratch:latest`) is not meaningful on
+    /// its own — every real construction path should override this via
+    /// [`ServiceSpec::minimal`] or an explicit literal. The point of having a
+    /// `Default` is to make `ServiceSpec` itself `Default`-able so adding a new
+    /// optional field on it does not force every existing literal site to be
+    /// touched.
+    fn default() -> Self {
+        use std::str::FromStr;
+        Self {
+            name: crate::ImageReference::from_str("scratch:latest")
+                .expect("'scratch:latest' is a valid image reference"),
+            pull_policy: default_pull_policy(),
+        }
+    }
 }
 
 /// Image pull policy
@@ -2328,6 +2399,16 @@ fn default_retries() -> u32 {
     3
 }
 
+impl Default for HealthSpec {
+    /// Returns the same shape as the per-field serde defaults: a 5-second
+    /// start grace, 3 retries, and a TCP check against port 0 ("use first
+    /// endpoint"). Matches [`default_health`] which is the serde fallback
+    /// when no `health:` block is supplied in a deployment spec.
+    fn default() -> Self {
+        default_health()
+    }
+}
+
 /// Health check type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -2823,6 +2904,41 @@ pub struct PortMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_spec_default_round_trips_through_json() {
+        // Building `ServiceSpec::default()` must succeed (no panics on the
+        // placeholder image reference) and the result must round-trip through
+        // serde_json so callers can store / transport a default spec without
+        // surprises.
+        let spec = ServiceSpec::default();
+
+        // Sanity on a handful of fields that depend on custom Default impls.
+        assert_eq!(spec.rtype, ResourceType::Service);
+        assert_eq!(spec.image.pull_policy, PullPolicy::IfNotPresent);
+        assert_eq!(spec.health.retries, 3);
+        assert_eq!(spec.network_mode, NetworkMode::Default);
+        assert!(spec.env.is_empty());
+        assert!(spec.endpoints.is_empty());
+        assert!(spec.overlay.is_none());
+
+        let json = serde_json::to_string(&spec).expect("serialize default ServiceSpec");
+        let parsed: ServiceSpec =
+            serde_json::from_str(&json).expect("re-parse default ServiceSpec");
+        assert_eq!(spec, parsed);
+    }
+
+    #[test]
+    fn service_spec_minimal_sets_name_and_image() {
+        let spec = ServiceSpec::minimal("api", "ghcr.io/acme/api:1.2");
+        assert_eq!(spec.image.name.repository(), "acme/api");
+        assert_eq!(spec.image.name.tag(), Some("1.2"));
+        // Everything else should match Default exactly.
+        let baseline = ServiceSpec::default();
+        assert_eq!(spec.rtype, baseline.rtype);
+        assert_eq!(spec.scale, baseline.scale);
+        assert_eq!(spec.network_mode, baseline.network_mode);
+    }
 
     #[test]
     fn port_mapping_defaults_via_serde() {

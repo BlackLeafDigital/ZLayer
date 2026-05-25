@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.51.0] - 2026-05-24
+
+### Changed
+- Overlay: per-service WireGuard TUN devices replaced with a single per-cluster WireGuard interface (`zl-overlay0`) carrying multiple service subnets as multi-CIDR `AllowedIPs`. Each service now has a per-node Linux bridge (`br-svc-<hash>`) for container attachment. Reduces interface count from O(services × nodes) to O(services + 1) per node and aligns with CNI conventions (Cilium/Calico/Flannel). See `docs/overlay-architecture.md`.
+- Service-subnet assignment is now Raft-propagated via new `AssignServiceSubnet` / `ReleaseServiceSubnet` commands so every node knows which subnet routes to which node.
+- openraft pin tightened from `"0.9"` to `"0.9.24"`.
+- Added `OverlayMode { Auto (default), Shared, Dedicated }` enum + `overlay: { mode, parent }` spec/node/cluster config fields. `Auto` is the default and currently resolves to `Shared` (no telemetry inputs yet to decide otherwise). `Shared` is fully implemented. `Dedicated` is reserved for a future round (bandwidth opt-out via per-service WG) and currently warns + falls back to `Shared`. Non-cluster `parent` values also fall back with a warning.
+- New HTTP endpoints `GET /api/v1/overlay/services/{name}` and `GET /api/v1/overlay/services/{name}/bridges/{node_id}` expose `BridgeInfo` / `ServiceOverlayStatus` (defined in `zlayer-types::api::overlay`). Stubs today; populated by `OverlayManager` once the scheduler client is plumbed.
+
+### Fixed
+- Windows HCS unpacker: deep nanoserver layer paths (`Files/Windows/WinSxS/<long SxS component>/<long filename>.dll`) no longer fail `CreateFileW` with `ERROR_PATH_NOT_FOUND` (0x80070003). Added `to_extended_wide` helper in `crates/zlayer-agent/src/windows/layer.rs` that applies the `\\?\` / `\\?\UNC\` extended-length-path prefix and is now used by every `CreateFileW` call site (`BackupStreamWriter::create`, `BackupStreamReader::open`, `open_sandbox_vhd`). Added `create_long_path_file` to replace the `std::fs::File::create` calls in `unpacker.rs` and `BackupStreamWriter::create_new`, since std's file APIs do not auto-prefix. Unblocks the `windows_hcs_hyperv_smoke_create_start_stop_remove`, `windows_hcs_hyperv_exec_inside_container`, and `windows_hcs_hyperv_concurrent_pair` e2e tests against `mcr.microsoft.com/windows/nanoserver:ltsc2022`.
+- cgroup v2: per-controller errno-tolerant `subtree_control` writes match runc/crun behavior (ZLayer's `zlayer-libcgroups` 0.6.1-zlayer.5). Fixes startup failure on rootless setups where systemd does not delegate all controllers (e.g. `hugetlb`) to `user@.service`. Previously aborted on `ENOENT` for unsupported controllers; now silently skips per-controller with `{EROFS, EACCES, ENOENT, EPERM, EOPNOTSUPP, EBUSY}` matching crun's allowlist.
+- ForgejoRunner workflow `container.options` (`--privileged`, `--cgroupns`) are now honored. Patched the runner's vendored act source (separate repo).
+- Latent bug: `internal.rs` peer-add path was constructing an ad-hoc `OverlayTransport::new()` detached from the live cluster transport. Fix infrastructure (handler dual-path, `with_overlay_manager` builder) landed; production wire-up in `serve.rs` is pending (`OverlayManager` → `InternalState`).
+
 ## [0.50.4] - 2026-05-23
 
 ### Fixed

@@ -63,20 +63,91 @@ pub fn make_interface_name(parts: &[&str], suffix: &str) -> String {
     }
 }
 
+/// First usable host address in `subnet`.
+///
+/// For IPv4 this is `network() + 1` (skipping the network address). For IPv6
+/// the same rule applies — the network address is conventionally reserved.
+/// Used by [`OverlayManager::setup_service_overlay`] to pick the service
+/// bridge's L3 gateway IP.
+#[cfg(target_os = "linux")]
+fn first_usable_ip(subnet: ipnet::IpNet) -> IpAddr {
+    match subnet {
+        ipnet::IpNet::V4(v4) => {
+            let net = u32::from(v4.network());
+            IpAddr::V4(std::net::Ipv4Addr::from(net.wrapping_add(1)))
+        }
+        ipnet::IpNet::V6(v6) => {
+            let net = u128::from(v6.network());
+            IpAddr::V6(std::net::Ipv6Addr::from(net.wrapping_add(1)))
+        }
+    }
+}
+
 /// Tracking info recorded by `OverlayManager::attach_container` for every
 /// container that successfully attaches to an overlay interface on Linux.
 /// Used by `detach_container(pid)` to release the IPs back to the
 /// allocator and tear down host-side veths.
+/// Parameters threaded from `attach_container` into
+/// [`OverlayManager::attach_to_interface`] when a container is being
+/// attached to a per-service Linux bridge (the v0.51+ topology).
+///
+/// `None` from `attach_to_interface`'s caller means "use the legacy
+/// per-veth `/32` host route model" — used by the global overlay path
+/// until it is also bridge-backed.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BridgeAttachParams<'a> {
+    /// Linux bridge name on the host to enslave the host-side veth into.
+    bridge_name: &'a str,
+    /// Bridge's L3 gateway IP. The container's default route is set to
+    /// this address so cross-subnet traffic egresses through the bridge.
+    gateway: IpAddr,
+    /// Prefix length of the bridge's subnet. The container's veth gets
+    /// its IP assigned with this prefix so the bridge's gateway is
+    /// on-link.
+    subnet_prefix_len: u8,
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 struct AttachInfo {
     /// IP allocated on the per-service overlay (eth0 inside the container).
     service_ip: IpAddr,
+    /// Name of the service whose bridge owns `service_ip`. Used by
+    /// `detach_container` to release the IP through the per-service
+    /// bridge's allocator (added in P9b alongside the bridge rewrite of
+    /// `attach_to_interface`). `Option<>` to keep migration ergonomic;
+    /// any path that didn't allocate from a `ServiceBridge` leaves this
+    /// `None` and the legacy manager-level allocator handles release.
+    service_name: Option<String>,
     /// IP allocated on the global overlay (eth1 inside the container), if
     /// the container joined the global mesh.
     global_ip: Option<IpAddr>,
     /// True iff the container also attached to the global overlay (eth1).
     joined_global: bool,
+}
+
+/// Per-service Linux bridge state, replacing the v0.50-era per-service
+/// `OverlayTransport`. One bridge per service per node; containers attach to
+/// it via veth pairs (P9b) and cross-node packets ride the single cluster
+/// `OverlayTransport` with the service subnet plumbed into its `AllowedIPs`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ServiceBridge {
+    /// Linux bridge name, kept under `IFNAMSIZ - 1 = 15` chars by
+    /// [`make_interface_name`].
+    pub name: String,
+    /// CIDR of the service's subnet on this node (assigned via the
+    /// `ServiceSubnetRegistry` — locally for now, by Raft once
+    /// `setup_service_overlay` is wired to a scheduler client in P9b /
+    /// the follow-up "wire `OverlayManager` into `InternalState`" task).
+    pub subnet: ipnet::IpNet,
+    /// Gateway IP within the subnet (first usable address); the bridge's own
+    /// L3 address. Containers' default route points here.
+    pub gateway: IpAddr,
+    /// Per-service IP allocator covering `subnet`. Containers attached to
+    /// this bridge get IPs from here, not from the manager-level pool.
+    pub ip_allocator: zlayer_overlay::allocator::IpAllocator,
 }
 
 /// Manages overlay networks for a deployment
@@ -89,12 +160,43 @@ pub struct OverlayManager {
     instance_id: String,
     /// Global overlay interface name
     global_interface: Option<String>,
-    /// Global overlay transport (must be kept alive for the TUN device lifetime)
+    /// Global overlay transport (must be kept alive for the TUN device lifetime).
+    /// In v0.51+ this is the SINGLE cluster-wide `WireGuard` transport; every
+    /// service subnet is plumbed through its `AllowedIPs`, replacing the
+    /// per-service overlay transports that lived here in v0.50.
     global_transport: Option<OverlayTransport>,
-    /// Service-specific overlay interfaces (`service_name` -> `interface_name`)
+    /// Service-name -> per-service Linux bridge name.
+    /// Pre-v0.51 this held the TUN device name for the per-service
+    /// `OverlayTransport`. The mapping shape (and the field name) is
+    /// preserved so callers that only need "the L2 device for this service"
+    /// keep working; the values are now bridge names (e.g. `zl-...-s`)
+    /// instead of TUN names.
     service_interfaces: RwLock<HashMap<String, String>>,
-    /// Service-specific overlay transports (must be kept alive for TUN device lifetimes)
-    service_transports: RwLock<HashMap<String, OverlayTransport>>,
+    /// Per-service bridge state (Linux only). Replaces the v0.50
+    /// `service_transports` map. Owned by `setup_service_overlay`; consumed
+    /// (drop + netlink delete) by `teardown_service_overlay` and `cleanup`.
+    #[cfg(target_os = "linux")]
+    service_bridges: tokio::sync::RwLock<HashMap<String, ServiceBridge>>,
+    /// Local fallback `ServiceSubnetRegistry` used when no scheduler /
+    /// Raft client has been plumbed into the manager. In production the
+    /// authoritative registry lives in Raft (see
+    /// [`zlayer_scheduler::raft::Request::AssignServiceSubnet`]); the
+    /// follow-up "wire `OverlayManager` into `InternalState`" task swaps this
+    /// for a real client. Until then this lets single-node deployments work
+    /// and keeps the public API stable.
+    #[cfg(target_os = "linux")]
+    service_subnet_registry:
+        tokio::sync::Mutex<Option<zlayer_overlay::allocator::ServiceSubnetRegistry>>,
+    /// Local node id used as the partition key when calling
+    /// [`ServiceSubnetRegistry::assign`]. Defaults to `0` (single-node) when
+    /// not explicitly set via [`Self::with_local_node_id`].
+    local_node_id: u64,
+    /// Base64-encoded `WireGuard` public key of THIS node's cluster transport.
+    /// Used as the peer key when adding/removing service subnets to the
+    /// cluster transport's `AllowedIPs`. Optional because legacy code paths
+    /// (tests, host-network mode) never set it. P9b is expected to make this
+    /// authoritative once the cluster transport is the canonical source.
+    local_wg_pubkey: tokio::sync::RwLock<Option<String>>,
     /// IP allocator for overlay networks
     ip_allocator: IpAllocator,
     /// This node's IP address on the global overlay network.
@@ -242,7 +344,12 @@ impl OverlayManager {
             global_interface: None,
             global_transport: None,
             service_interfaces: RwLock::new(HashMap::new()),
-            service_transports: RwLock::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            service_bridges: tokio::sync::RwLock::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            service_subnet_registry: tokio::sync::Mutex::new(None),
+            local_node_id: 0,
+            local_wg_pubkey: tokio::sync::RwLock::new(None),
             ip_allocator: IpAllocator::new(default_cidr),
             node_ip: None,
             overlay_port: zlayer_core::DEFAULT_WG_PORT,
@@ -287,7 +394,12 @@ impl OverlayManager {
             global_interface: None,
             global_transport: None,
             service_interfaces: RwLock::new(HashMap::new()),
-            service_transports: RwLock::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            service_bridges: tokio::sync::RwLock::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            service_subnet_registry: tokio::sync::Mutex::new(None),
+            local_node_id: 0,
+            local_wg_pubkey: tokio::sync::RwLock::new(None),
             ip_allocator: IpAllocator::new(slice_cidr),
             node_ip: None,
             overlay_port: port,
@@ -343,6 +455,68 @@ impl OverlayManager {
     pub fn with_uapi_sock_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.uapi_sock_dir = Some(dir.into());
         self
+    }
+
+    /// Set the local raft node id used as the partition key when assigning
+    /// service subnets via [`Self::setup_service_overlay`]. Defaults to `0`
+    /// when not set (single-node deployments).
+    #[must_use]
+    pub fn with_local_node_id(mut self, node_id: u64) -> Self {
+        self.local_node_id = node_id;
+        self
+    }
+
+    /// Post-construction setter for the local raft node id. Used by the
+    /// daemon's `init_daemon`/`serve.rs` wiring path, where the manager is
+    /// already wrapped in `Arc<RwLock<_>>` by the time the node config is
+    /// loaded; the builder-style [`Self::with_local_node_id`] cannot be
+    /// called through an `Arc<RwLock<_>>` because it consumes `self`.
+    pub fn set_local_node_id(&mut self, node_id: u64) {
+        self.local_node_id = node_id;
+    }
+
+    /// Record this node's cluster `WireGuard` public key (base64) so service
+    /// subnets can be added to the cluster transport's local `AllowedIPs`.
+    pub async fn set_local_wg_pubkey(&self, pubkey: String) {
+        *self.local_wg_pubkey.write().await = Some(pubkey);
+    }
+
+    /// Initialize the local fallback [`ServiceSubnetRegistry`] from the
+    /// configured cluster CIDR. Called by [`Self::setup_service_overlay`] on
+    /// first use when no Raft client has been wired up yet. `slice_prefix`
+    /// defaults to `/28` for IPv4 clusters and `/120` for IPv6 — matches the
+    /// per-service subnet shape the rest of the codebase assumes. Pre-v0.51
+    /// callers passed services through the per-service WG transport, so this
+    /// path did not exist.
+    #[cfg(target_os = "linux")]
+    async fn ensure_service_subnet_registry(&self) -> Result<(), AgentError> {
+        use zlayer_overlay::allocator::ServiceSubnetRegistry;
+
+        let mut guard = self.service_subnet_registry.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let cluster_cidr = self.cluster_cidr.ok_or_else(|| {
+            AgentError::Configuration(
+                "service subnet registry needs a cluster CIDR; \
+                 use OverlayManager::with_slice"
+                    .to_string(),
+            )
+        })?;
+        let cluster_ipnet: ipnet::IpNet = cluster_cidr.to_string().parse().map_err(|e| {
+            AgentError::Configuration(format!(
+                "failed to convert cluster CIDR {cluster_cidr} to ipnet::IpNet: {e}"
+            ))
+        })?;
+        let slice_prefix: u8 = match cluster_ipnet {
+            ipnet::IpNet::V4(_) => 28,
+            ipnet::IpNet::V6(_) => 120,
+        };
+        let registry = ServiceSubnetRegistry::new(cluster_ipnet, slice_prefix).map_err(|e| {
+            AgentError::Configuration(format!("failed to build ServiceSubnetRegistry: {e}"))
+        })?;
+        *guard = Some(registry);
+        Ok(())
     }
 
     /// Returns the number of services currently registered with this manager.
@@ -563,97 +737,191 @@ impl OverlayManager {
         Ok(())
     }
 
-    /// Setup a service-scoped overlay network
+    /// Set up the per-service Linux bridge that backs `service_name` on this
+    /// node. Replaces the v0.50 per-service `OverlayTransport`.
+    ///
+    /// Steps:
+    /// 1. Idempotent: returns the existing bridge name if one is already live
+    ///    for `service_name`.
+    /// 2. Assign a subnet via the (local fallback) `ServiceSubnetRegistry`.
+    ///    P9b / the "wire `OverlayManager` into `InternalState`" follow-up
+    ///    will replace this with a real `Request::AssignServiceSubnet` Raft
+    ///    round-trip; the returned CIDR is parsed identically either way.
+    /// 3. `netlink::create_bridge` + STP off + L3 gateway IP + link up.
+    /// 4. If the cluster `OverlayTransport` and this node's pubkey are both
+    ///    known, plumb the service subnet into the local cluster
+    ///    `AllowedIPs`. Cross-node propagation happens via the Raft apply
+    ///    handler on the other nodes (P8).
+    /// 5. Build the per-service `IpAllocator`, reserving the gateway IP.
+    /// 6. Insert into `service_bridges` + `service_interfaces` under both
+    ///    locks held for the duration of state mutation.
+    ///
+    /// Returns the bridge name on success.
     ///
     /// # Errors
-    /// Returns an error if the overlay interface cannot be created.
+    ///
+    /// Returns an error if subnet assignment fails (exhaustion), if the
+    /// bridge cannot be created (permission denied / kernel error), or if
+    /// the cluster transport rejects the `AllowedIPs` update.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `ensure_service_subnet_registry` succeeds but the
+    /// resulting registry is `None` — which is a programmer error (the
+    /// helper is contractually guaranteed to leave `Some` in place).
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_lines)]
     pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
-        // Hold the service_transports write lock across the entire check-and-create.
-        // This closes the TOCTOU race where two concurrent callers (e.g. restore_deployments
-        // racing the deploy API handler) both passed the read-lock idempotency check, both
-        // entered transport creation, and the second one's netlink activity killed the
-        // first's live TUN -> boringtun worker EBADFD.
-        let mut transports = self.service_transports.write().await;
+        use zlayer_overlay::allocator::IpAllocator;
 
-        if let Some(existing) = transports.get(service_name) {
-            let existing_name = existing.interface_name().to_string();
-            tracing::debug!(
-                service = %service_name,
-                interface = %existing_name,
-                "Service overlay already active, reusing existing transport"
-            );
-            drop(transports);
-            return Ok(existing_name);
-        }
-
-        let interface_name =
-            make_interface_name(&[&self.deployment, &self.instance_id, service_name], "s");
-
-        // Attempt overlay creation (for inter-node communication).
-        // Non-fatal: single-node deployments work fine without it.
-        match self
-            .build_service_transport(&interface_name, service_name)
-            .await
+        // 1. Idempotency check.
         {
-            Ok(transport) => {
-                let actual_name = transport.interface_name().to_string();
-                transports.insert(service_name.to_string(), transport);
-                drop(transports);
-                tracing::info!(
+            let guard = self.service_bridges.read().await;
+            if let Some(existing) = guard.get(service_name) {
+                let name = existing.name.clone();
+                tracing::debug!(
                     service = %service_name,
-                    interface = %actual_name,
-                    "Service overlay created"
+                    bridge = %name,
+                    "Service bridge already active, reusing"
                 );
-                // Always register service so attach_container can proceed.
-                self.service_interfaces
-                    .write()
-                    .await
-                    .insert(service_name.to_string(), actual_name.clone());
-                Ok(actual_name)
-            }
-            Err(e) => {
-                drop(transports);
-                tracing::warn!(
-                    service = %service_name,
-                    error = %e,
-                    "Overlay unavailable, using direct networking"
-                );
-                // Always register service so attach_container can proceed
-                // (veth pair creation doesn't require the overlay interface).
-                self.service_interfaces
-                    .write()
-                    .await
-                    .insert(service_name.to_string(), interface_name.clone());
-                Ok(interface_name)
+                return Ok(name);
             }
         }
+
+        // 2. Assign subnet via the (currently local) ServiceSubnetRegistry.
+        //    P9b: replace this block with a scheduler/Raft client roundtrip
+        //    that submits Request::AssignServiceSubnet and parses the
+        //    Response::Success { data: Some(cidr_str) }.
+        self.ensure_service_subnet_registry().await?;
+        let subnet: ipnet::IpNet = {
+            let mut guard = self.service_subnet_registry.lock().await;
+            let registry = guard
+                .as_mut()
+                .expect("ensure_service_subnet_registry leaves Some");
+            let node_key = self.local_node_id.to_string();
+            registry.assign(service_name, &node_key).map_err(|e| {
+                AgentError::Network(format!(
+                    "ServiceSubnetRegistry::assign({service_name}, {node_key}) failed: {e}"
+                ))
+            })?
+        };
+
+        // 3. Compute bridge name + create bridge.
+        let bridge_name =
+            make_interface_name(&[&self.deployment, &self.instance_id, service_name], "b");
+
+        if let Err(e) = crate::netlink::create_bridge(&bridge_name).await {
+            return Err(AgentError::Network(format!(
+                "create_bridge({bridge_name}) failed: {e}"
+            )));
+        }
+        if let Err(e) = crate::netlink::set_bridge_stp(&bridge_name, false) {
+            tracing::warn!(
+                bridge = %bridge_name,
+                error = %e,
+                "set_bridge_stp(off) failed (non-fatal)"
+            );
+        }
+
+        // 5. Pick gateway = first usable host in the subnet, assign to bridge.
+        let gateway = first_usable_ip(subnet);
+        if let Err(e) =
+            crate::netlink::add_address_to_link_by_name(&bridge_name, gateway, subnet.prefix_len())
+                .await
+        {
+            // Best-effort cleanup so we don't leak the bridge on the failure
+            // path; teardown is idempotent.
+            let _ = crate::netlink::delete_bridge(&bridge_name).await;
+            return Err(AgentError::Network(format!(
+                "add_address_to_link_by_name({bridge_name}, {gateway}/{}) failed: {e}",
+                subnet.prefix_len()
+            )));
+        }
+        if let Err(e) = crate::netlink::set_link_up_by_name(&bridge_name).await {
+            let _ = crate::netlink::delete_bridge(&bridge_name).await;
+            return Err(AgentError::Network(format!(
+                "set_link_up_by_name({bridge_name}) failed: {e}"
+            )));
+        }
+
+        // 4. Plumb subnet into the cluster transport's local AllowedIPs.
+        //    Best-effort: skipped silently when either the cluster transport
+        //    or the local pubkey hasn't been set (host-network / test paths).
+        if let Some(ref cluster) = self.global_transport {
+            let pubkey_opt = self.local_wg_pubkey.read().await.clone();
+            if let Some(pubkey) = pubkey_opt {
+                if let Err(e) = cluster.add_allowed_ip(&pubkey, subnet).await {
+                    tracing::warn!(
+                        service = %service_name,
+                        subnet = %subnet,
+                        error = %e,
+                        "Failed to add service subnet to cluster transport AllowedIPs (non-fatal)"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    service = %service_name,
+                    "local_wg_pubkey not yet set; skipping cluster AllowedIPs update"
+                );
+            }
+        }
+
+        // 6. Build per-service IpAllocator, reserve gateway.
+        let mut ip_allocator = IpAllocator::new(&subnet.to_string())
+            .map_err(|e| AgentError::Network(format!("IpAllocator::new({subnet}) failed: {e}")))?;
+        let _ = ip_allocator.allocate_specific(gateway);
+
+        // Insert into state.
+        {
+            let mut bridges = self.service_bridges.write().await;
+            let mut ifaces = self.service_interfaces.write().await;
+            bridges.insert(
+                service_name.to_string(),
+                ServiceBridge {
+                    name: bridge_name.clone(),
+                    subnet,
+                    gateway,
+                    ip_allocator,
+                },
+            );
+            ifaces.insert(service_name.to_string(), bridge_name.clone());
+        }
+
+        tracing::info!(
+            service = %service_name,
+            bridge = %bridge_name,
+            subnet = %subnet,
+            gateway = %gateway,
+            "Service bridge created"
+        );
+
+        Ok(bridge_name)
     }
 
-    /// Build an overlay transport for a service without touching the manager's maps.
-    /// Caller is responsible for inserting the returned transport into
-    /// `service_transports` while holding the write lock.
-    async fn build_service_transport(
-        &self,
-        interface_name: &str,
-        service_name: &str,
-    ) -> Result<OverlayTransport, AgentError> {
-        let (private_key, public_key) = OverlayTransport::generate_keys()
+    /// Non-Linux stub for `setup_service_overlay`. Per-service overlay
+    /// bridges require Linux netlink; on other platforms callers fall
+    /// through to host networking. Registers the service in
+    /// `service_interfaces` with a placeholder name so any downstream code
+    /// that only checks for presence keeps working.
+    ///
+    /// # Errors
+    ///
+    /// Infallible on non-Linux; the `Result` is preserved only for ABI
+    /// parity with the Linux implementation.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_async)]
+    pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
+        let placeholder =
+            make_interface_name(&[&self.deployment, &self.instance_id, service_name], "b");
+        self.service_interfaces
+            .write()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to generate keys: {e}")))?;
-
-        let service_ip = self.ip_allocator.allocate_for_service(service_name)?;
-        let config = self.build_config(private_key, public_key, service_ip, 24, 0);
-        let mut transport = OverlayTransport::new(config, interface_name.to_string());
-
-        transport
-            .create_interface()
-            .await
-            .map_err(|e| AgentError::Network(format!("Failed to create service overlay: {e}")))?;
-        transport.configure(&[]).await.map_err(|e| {
-            AgentError::Network(format!("Failed to configure service overlay: {e}"))
-        })?;
-
-        Ok(transport)
+            .insert(service_name.to_string(), placeholder.clone());
+        tracing::debug!(
+            service = %service_name,
+            "Service overlay bridge setup is Linux-only; using direct networking placeholder"
+        );
+        Ok(placeholder)
     }
 
     /// Add a container to the appropriate overlay networks.
@@ -694,30 +962,59 @@ impl OverlayManager {
 
         #[cfg(target_os = "linux")]
         {
-            let interfaces = self.service_interfaces.read().await;
-            let service_iface = interfaces.get(service_name).ok_or_else(|| {
-                AgentError::Network(format!("No overlay for service: {service_name}"))
-            })?;
+            // Look up the per-service bridge: name, subnet (for the
+            // container-side prefix length), gateway (for the container's
+            // default route), and allocator (for the container IP itself).
+            let (bridge_name, bridge_subnet, bridge_gateway, container_ip) = {
+                let mut bridges = self.service_bridges.write().await;
+                let bridge = bridges.get_mut(service_name).ok_or_else(|| {
+                    AgentError::Configuration(format!(
+                        "no service bridge for service {service_name}; \
+                         call setup_service_overlay() first"
+                    ))
+                })?;
+                let ip = bridge.ip_allocator.allocate().ok_or_else(|| {
+                    AgentError::Network(format!(
+                        "service bridge {} subnet {} exhausted",
+                        bridge.name, bridge.subnet
+                    ))
+                })?;
+                (bridge.name.clone(), bridge.subnet, bridge.gateway, ip)
+            };
 
-            let container_ip = self.ip_allocator.allocate()?;
-            self.attach_to_interface(
-                container_pid,
-                service_iface,
-                container_ip,
-                "s",
-                "eth0",
-                true,
-            )
-            .await?;
+            // Service-side veth: attach the host end to the service bridge
+            // (no per-container /32 host route) and point the container's
+            // default route at the bridge gateway.
+            let bridge_params = BridgeAttachParams {
+                bridge_name: &bridge_name,
+                gateway: bridge_gateway,
+                subnet_prefix_len: bridge_subnet.prefix_len(),
+            };
+            // If attach_to_interface fails the IP must go back to the
+            // service-bridge allocator, not be leaked.
+            if let Err(e) = self
+                .attach_to_interface(
+                    container_pid,
+                    container_ip,
+                    "s",
+                    "eth0",
+                    Some(&bridge_params),
+                )
+                .await
+            {
+                let mut bridges = self.service_bridges.write().await;
+                if let Some(bridge) = bridges.get_mut(service_name) {
+                    bridge.ip_allocator.release(container_ip);
+                }
+                return Err(e);
+            }
 
             let mut global_ip: Option<IpAddr> = None;
-            if join_global {
-                if let Some(global_iface) = &self.global_interface {
-                    let g_ip = self.ip_allocator.allocate()?;
-                    self.attach_to_interface(container_pid, global_iface, g_ip, "g", "eth1", false)
-                        .await?;
-                    global_ip = Some(g_ip);
-                }
+            if join_global && self.global_interface.is_some() {
+                let g_ip = self.ip_allocator.allocate()?;
+                self.attach_to_interface(container_pid, g_ip, "g", "eth1", None)
+                    .await?;
+                global_ip = Some(g_ip);
             }
 
             // Record the attachment so detach_container can clean it up later.
@@ -727,6 +1024,7 @@ impl OverlayManager {
                     container_pid,
                     AttachInfo {
                         service_ip: container_ip,
+                        service_name: Some(service_name.to_string()),
                         global_ip,
                         joined_global: global_ip.is_some(),
                     },
@@ -868,8 +1166,28 @@ impl OverlayManager {
                 }
             }
 
-            // Release the IPs back to the slice allocator.
-            self.ip_allocator.release(info.service_ip);
+            // Release the service-side IP back to the per-service bridge
+            // allocator when we know which bridge owns it. Falls through
+            // to the legacy manager-level allocator for any pre-P9b
+            // AttachInfo entries that have no `service_name` recorded.
+            if let Some(svc) = info.service_name.as_deref() {
+                let mut bridges = self.service_bridges.write().await;
+                if let Some(bridge) = bridges.get_mut(svc) {
+                    bridge.ip_allocator.release(info.service_ip);
+                } else {
+                    // The bridge was torn down before the container was
+                    // detached; the allocator is gone with it, nothing to
+                    // release. Log so we can spot ordering bugs.
+                    tracing::debug!(
+                        service = %svc,
+                        ip = %info.service_ip,
+                        "detach_container: service bridge already torn down; \
+                         dropping service IP release"
+                    );
+                }
+            } else {
+                self.ip_allocator.release(info.service_ip);
+            }
             if let Some(g) = info.global_ip {
                 self.ip_allocator.release(g);
             }
@@ -930,17 +1248,26 @@ impl OverlayManager {
     async fn attach_to_interface(
         &self,
         container_pid: u32,
-        _interface: &str,
         ip: IpAddr,
         tag: &str,
         container_iface: &str,
-        add_default_route: bool,
+        bridge: Option<&BridgeAttachParams<'_>>,
     ) -> Result<(), AgentError> {
         // Best-effort cleanup of orphan veths left by a previous daemon crash.
         self.sweep_orphan_veths().await;
 
         let is_v6 = ip.is_ipv6();
-        let prefix_len: u8 = if is_v6 { 64 } else { 24 };
+        // Container-side address prefix: when attaching to a service
+        // bridge, use the bridge's subnet prefix so the container has a
+        // sane on-link route to its peers; the legacy global path keeps
+        // the v0.50 default of /24 (v4) or /64 (v6).
+        let prefix_len: u8 = if let Some(b) = bridge {
+            b.subnet_prefix_len
+        } else if is_v6 {
+            64
+        } else {
+            24
+        };
         let host_prefix: u8 = if is_v6 { 128 } else { 32 };
 
         let veth_host = format!("veth-{container_pid}-{tag}");
@@ -964,6 +1291,13 @@ impl OverlayManager {
             .await
             .map_err(|e| AgentError::Network(format!("pre-cleanup delete {veth_pending}: {e}")))?;
 
+        // Capture the bits of `bridge` we need into owned values so the
+        // spawn_blocking closure (which must be `'static`) doesn't borrow
+        // from `bridge`'s lifetime. The bridge name is also needed in the
+        // host-side enslave call after the netns task returns.
+        let bridge_gateway: Option<IpAddr> = bridge.map(|b| b.gateway);
+        let bridge_name: Option<String> = bridge.map(|b| b.bridge_name.to_string());
+
         // Main setup wrapped in a block so we can clean up on error.
         let result: Result<(), AgentError> = async {
             // (a) Create the veth pair in the host netns.
@@ -981,17 +1315,24 @@ impl OverlayManager {
             .map_err(|e| AgentError::Network(format!("move veth into netns: {e}")))?;
 
             // (c) Container-netns operations: assign IP, bring up links,
-            //     optionally add default route. Runs on a dedicated thread
-            //     that enters the container netns via setns(2).
+            //     and install the default route. When attaching to a
+            //     service bridge the default route goes through the
+            //     bridge's L3 gateway IP; the legacy global path keeps
+            //     the direct via-dev default route.
             let vc = veth_container.clone();
+            let bridge_gateway_for_netns = bridge_gateway;
             tokio::task::spawn_blocking(move || {
                 crate::netlink::with_netns_fd_async(container_ns_fd, move || async move {
                     crate::netlink::add_address_to_link_by_name(&vc, ip, prefix_len).await?;
                     crate::netlink::set_link_up_by_name(&vc).await?;
                     crate::netlink::set_link_up_by_name("lo").await?;
-                    if add_default_route {
-                        crate::netlink::add_default_route_via_dev(&vc, is_v6).await?;
+                    if let Some(gw) = bridge_gateway_for_netns {
+                        crate::netlink::add_default_route_via_gateway(gw).await?;
                     }
+                    // Non-bridge (global) attachments do not install a
+                    // default route here; the global path historically
+                    // relied on the host's main routing table for cross-
+                    // node traffic.
                     Ok(())
                 })
             })
@@ -1004,12 +1345,26 @@ impl OverlayManager {
                 .await
                 .map_err(|e| AgentError::Network(format!("set {veth_host} up: {e}")))?;
 
-            // (e) Host route: /32 (v4) or /128 (v6) pointing at the veth.
-            crate::netlink::replace_route_via_dev(ip, host_prefix, &veth_host, self.node_ip)
-                .await
-                .map_err(|e| {
-                    AgentError::Network(format!("host route for {ip}/{host_prefix}: {e}"))
-                })?;
+            // (e) Host-side topology:
+            //   * Service path: enslave the host veth to the service
+            //     bridge so L2 frames flow between containers and the
+            //     bridge handles cross-subnet routing via its gateway IP.
+            //   * Global path: install a /32 (v4) or /128 (v6) host route
+            //     pointing at the veth (legacy behaviour, kept until the
+            //     global mesh is also bridge-backed).
+            if let Some(bname) = bridge_name.as_deref() {
+                crate::netlink::add_link_to_bridge(&veth_host, bname)
+                    .await
+                    .map_err(|e| {
+                        AgentError::Network(format!("enslave {veth_host} to bridge {bname}: {e}"))
+                    })?;
+            } else {
+                crate::netlink::replace_route_via_dev(ip, host_prefix, &veth_host, self.node_ip)
+                    .await
+                    .map_err(|e| {
+                        AgentError::Network(format!("host route for {ip}/{host_prefix}: {e}"))
+                    })?;
+            }
 
             // (f) Sysctls: best-effort, don't fail the attach on these.
             let _ = crate::netlink::set_sysctl("net.ipv4.ip_forward", "1");
@@ -1040,25 +1395,81 @@ impl OverlayManager {
         sweep_orphan_veths_inner().await;
     }
 
-    /// Tear down the overlay network for a single service.
+    /// Tear down the per-service Linux bridge for `service_name`.
     ///
-    /// Removes the service's TUN transport (destroying the interface) and
-    /// clears its entry from the interface tracking map.  This is safe to call
-    /// even if no overlay was created for the service (it will be a no-op).
+    /// Idempotent — no-op if no bridge was registered for this service.
+    /// Cleans up in the inverse order of `setup_service_overlay`:
+    /// 1. Remove from `service_bridges` + `service_interfaces`.
+    /// 2. Remove the subnet from the cluster transport's local
+    ///    `AllowedIPs` (best-effort).
+    /// 3. `netlink::delete_bridge` (best-effort, idempotent).
+    /// 4. Release the subnet in the local `ServiceSubnetRegistry`
+    ///    (P9b: also fire `Request::ReleaseServiceSubnet` against Raft).
     pub async fn teardown_service_overlay(&self, service_name: &str) {
-        // Remove and shut down the transport (destroys TUN device)
-        if let Some(mut transport) = self.service_transports.write().await.remove(service_name) {
-            tracing::info!(service = %service_name, "Shutting down service overlay transport");
-            transport.shutdown();
-        }
+        #[cfg(target_os = "linux")]
+        {
+            let removed = {
+                let mut bridges = self.service_bridges.write().await;
+                bridges.remove(service_name)
+            };
+            {
+                let mut ifaces = self.service_interfaces.write().await;
+                ifaces.remove(service_name);
+            }
+            let Some(bridge) = removed else {
+                return;
+            };
 
-        // Remove from interface tracking
-        if let Some(iface) = self.service_interfaces.write().await.remove(service_name) {
+            // Best-effort cluster AllowedIPs cleanup.
+            if let Some(ref cluster) = self.global_transport {
+                let pubkey_opt = self.local_wg_pubkey.read().await.clone();
+                if let Some(pubkey) = pubkey_opt {
+                    if let Err(e) = cluster.remove_allowed_ip(&pubkey, bridge.subnet).await {
+                        tracing::warn!(
+                            service = %service_name,
+                            subnet = %bridge.subnet,
+                            error = %e,
+                            "Failed to remove service subnet from cluster AllowedIPs (non-fatal)"
+                        );
+                    }
+                }
+            }
+
+            if let Err(e) = crate::netlink::delete_bridge(&bridge.name).await {
+                tracing::warn!(
+                    service = %service_name,
+                    bridge = %bridge.name,
+                    error = %e,
+                    "delete_bridge failed (non-fatal — sweep will retry)"
+                );
+            }
+
+            // Release the slot in the local registry. P9b will also issue
+            // Request::ReleaseServiceSubnet against Raft for cross-node
+            // propagation.
+            {
+                let mut guard = self.service_subnet_registry.lock().await;
+                if let Some(registry) = guard.as_mut() {
+                    let node_key = self.local_node_id.to_string();
+                    let _ = registry.release(service_name, &node_key);
+                }
+            }
+
             tracing::info!(
                 service = %service_name,
-                interface = %iface,
-                "Removed service overlay interface"
+                bridge = %bridge.name,
+                "Tore down service bridge"
             );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(iface) = self.service_interfaces.write().await.remove(service_name) {
+                tracing::info!(
+                    service = %service_name,
+                    interface = %iface,
+                    "Removed service overlay interface (placeholder, non-Linux)"
+                );
+            }
         }
     }
 
@@ -1067,13 +1478,31 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if cleanup operations fail.
     pub async fn cleanup(&mut self) -> Result<(), AgentError> {
-        // Drop service transports (destroys TUN devices)
-        let mut transports = self.service_transports.write().await;
-        for (name, mut transport) in transports.drain() {
-            tracing::info!(service = %name, "Shutting down service overlay");
-            transport.shutdown();
+        #[cfg(target_os = "linux")]
+        {
+            // Drain bridges and delete them (best-effort) + remove from
+            // cluster AllowedIPs.
+            let mut bridges = self.service_bridges.write().await;
+            let drained: Vec<(String, ServiceBridge)> = bridges.drain().collect();
+            drop(bridges);
+
+            let pubkey_opt = self.local_wg_pubkey.read().await.clone();
+            for (name, bridge) in drained {
+                if let Some(ref cluster) = self.global_transport {
+                    if let Some(ref pubkey) = pubkey_opt {
+                        let _ = cluster.remove_allowed_ip(pubkey, bridge.subnet).await;
+                    }
+                }
+                if let Err(e) = crate::netlink::delete_bridge(&bridge.name).await {
+                    tracing::warn!(
+                        service = %name,
+                        bridge = %bridge.name,
+                        error = %e,
+                        "delete_bridge during cleanup failed (non-fatal)"
+                    );
+                }
+            }
         }
-        drop(transports);
 
         // Drop global transport
         if let Some(mut transport) = self.global_transport.take() {
@@ -1115,9 +1544,44 @@ impl OverlayManager {
         self.global_transport.is_some()
     }
 
-    /// Returns the number of service-specific overlay transports currently active.
-    pub async fn service_transport_count(&self) -> usize {
-        self.service_transports.read().await.len()
+    /// Returns the number of per-service overlay bridges currently active on
+    /// this node. Renamed from `service_transport_count` in v0.51 to match
+    /// the bridge-based topology that replaces per-service `WireGuard`
+    /// transports.
+    pub async fn service_bridge_count(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            self.service_bridges.read().await.len()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.service_interfaces.read().await.len()
+        }
+    }
+
+    /// Add a peer to the live global overlay transport.
+    ///
+    /// Proxies to the live cluster `OverlayTransport`'s `add_peer` so the
+    /// peer registration takes effect on the kernel-resident `WireGuard`
+    /// interface used for actual packet routing. This is the canonical
+    /// entry point for the internal add-peer endpoint; constructing an
+    /// ad-hoc `OverlayTransport` and calling `add_peer` on it would
+    /// register the peer in a detached UAPI socket whose state never feeds
+    /// back into routing decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AgentError::OverlayNotInitialized`] when the global
+    /// overlay has not yet been set up (no `WireGuard` interface is live),
+    /// or wraps the underlying transport error if the UAPI write fails.
+    pub async fn add_global_peer(&self, peer: &zlayer_overlay::PeerInfo) -> Result<(), AgentError> {
+        let transport = self.global_transport.as_ref().ok_or_else(|| {
+            AgentError::Configuration("global overlay not set up; cannot add peer".to_string())
+        })?;
+        transport
+            .add_peer(peer)
+            .await
+            .map_err(|e| AgentError::Network(format!("add_peer failed: {e}")))
     }
 
     /// Returns the CIDR string for the overlay IP allocator.
@@ -1307,7 +1771,11 @@ impl IpAllocator {
     /// before extending the monotonic counter. Idempotent: no-op if the IP is
     /// already in the free list (we do not double-track because the counter
     /// would already have moved past it).
-    // reserved for graceful peer-disconnect cleanup; not yet wired through the main release path.
+    ///
+    /// Production callers live in Linux-only code paths, but the unit test
+    /// `ip_allocator_release_recycles` exercises it on all targets, so we
+    /// silence the cross-target dead-code warning rather than `cfg`-gating
+    /// the function itself.
     #[allow(dead_code)]
     fn release(&self, ip: IpAddr) {
         // Light dedup: avoid pushing the same address twice. The pool is
@@ -1317,10 +1785,6 @@ impl IpAllocator {
         if !released.contains(&ip) {
             released.push(ip);
         }
-    }
-
-    fn allocate_for_service(&self, _service: &str) -> Result<IpAddr, AgentError> {
-        self.allocate()
     }
 
     /// Serialize allocator state (cidr + counter) to `path` as JSON.
@@ -1603,16 +2067,6 @@ mod tests {
         assert_eq!(ip1, "fd00:200::1".parse::<IpAddr>().unwrap());
         assert_eq!(ip2, "fd00:200::2".parse::<IpAddr>().unwrap());
         assert_eq!(ip3, "fd00:200::3".parse::<IpAddr>().unwrap());
-    }
-
-    /// `allocate_for_service` delegates to `allocate` regardless of IP version.
-    #[test]
-    fn ip_allocator_service_delegates() {
-        let alloc = IpAllocator::new("fd00:200::0/48".parse().unwrap());
-        let ip1 = alloc.allocate_for_service("web").unwrap();
-        let ip2 = alloc.allocate().unwrap();
-        assert_eq!(ip1, "fd00:200::1".parse::<IpAddr>().unwrap());
-        assert_eq!(ip2, "fd00:200::2".parse::<IpAddr>().unwrap());
     }
 
     /// A /28 slice has 14 usable hosts (16 total - network - broadcast).

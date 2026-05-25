@@ -603,6 +603,60 @@ pub async fn add_default_route_via_dev(_dev_name: &str, _is_v6: bool) -> Result<
     ))
 }
 
+/// Add a default route pointing at the given gateway IP in the current
+/// network namespace.
+///
+/// Replaces (in combination with [`with_netns`]):
+///   nsenter -t `<pid>` -n ip \[-6\] route add default via `<gateway>`
+///
+/// Used by the per-service bridge attach path: containers join the
+/// service bridge via a veth pair and reach the rest of the overlay
+/// through the bridge's L3 gateway IP. The address family of the route
+/// is inferred from `gateway`.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::Netlink`] for any rtnetlink failure.
+#[cfg(target_os = "linux")]
+pub async fn add_default_route_via_gateway(gateway: std::net::IpAddr) -> Result<(), NetlinkError> {
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| NetlinkError::Netlink(format!("new_connection failed: {e}")))?;
+    tokio::spawn(connection);
+
+    match gateway {
+        std::net::IpAddr::V4(gw) => handle
+            .route()
+            .add()
+            .v4()
+            .destination_prefix(std::net::Ipv4Addr::UNSPECIFIED, 0)
+            .gateway(gw)
+            .execute()
+            .await
+            .map_err(|e| {
+                NetlinkError::Netlink(format!("default route add v4 via gateway {gw} failed: {e}"))
+            }),
+        std::net::IpAddr::V6(gw) => handle
+            .route()
+            .add()
+            .v6()
+            .destination_prefix(std::net::Ipv6Addr::UNSPECIFIED, 0)
+            .gateway(gw)
+            .execute()
+            .await
+            .map_err(|e| {
+                NetlinkError::Netlink(format!("default route add v6 via gateway {gw} failed: {e}"))
+            }),
+    }
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub async fn add_default_route_via_gateway(_gateway: std::net::IpAddr) -> Result<(), NetlinkError> {
+    Err(NetlinkError::Netlink(
+        "add_default_route_via_gateway is only supported on Linux".to_string(),
+    ))
+}
+
 /// Add or replace a route to `dest/prefix_len` that forwards via the
 /// interface named `dev_name`. Optional `src` sets the preferred source
 /// address.
@@ -969,4 +1023,373 @@ where
     Err(NetlinkError::Netlink(
         "with_netns_async is only supported on Linux".to_string(),
     ))
+}
+
+/// Create a Linux bridge interface with the given name.
+///
+/// Replaces the shell-out:
+///   ip link add name `<name>` type bridge
+///
+/// Idempotent: if a link with that name already exists this returns
+/// `Ok(())`. This matches how the overlay manager's per-service bridge
+/// creation path needs to behave — multiple containers landing on the
+/// same service-on-node bridge must all see "bridge ready" after a
+/// successful call without racing against existence checks.
+///
+/// The bridge is created in the current network namespace. Callers
+/// that need a different netns should wrap with [`with_netns_async`].
+/// The bridge is created in the administratively-down state — call
+/// [`set_link_up_by_name`] separately once any other attributes
+/// ([`set_bridge_stp`] etc.) have been applied.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::Netlink`] for any RTNETLINK failure other
+/// than `EEXIST` (which is treated as success).
+#[cfg(target_os = "linux")]
+pub async fn create_bridge(name: &str) -> Result<(), NetlinkError> {
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| NetlinkError::Netlink(format!("new_connection failed: {e}")))?;
+    tokio::spawn(connection);
+
+    match handle.link().add().bridge(name.to_string()).execute().await {
+        Ok(()) => Ok(()),
+        Err(rtnetlink::Error::NetlinkError(err)) => {
+            // EEXIST means a link with this name already exists. We
+            // intentionally do NOT verify that the existing link is
+            // actually a bridge — callers using stable per-service
+            // names own that invariant, and re-checking here would
+            // require another rtnetlink round-trip on the hot path.
+            let is_eexist = err
+                .code
+                .is_some_and(|c| c.get().unsigned_abs() == libc::EEXIST as u32);
+            let msg = err.to_string();
+            if is_eexist || msg.contains("File exists") {
+                Ok(())
+            } else {
+                Err(NetlinkError::Netlink(format!(
+                    "bridge create failed for {name}: {msg}"
+                )))
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("File exists") {
+                Ok(())
+            } else {
+                Err(NetlinkError::Netlink(format!(
+                    "bridge create failed for {name}: {msg}"
+                )))
+            }
+        }
+    }
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub async fn create_bridge(_name: &str) -> Result<(), NetlinkError> {
+    Err(NetlinkError::Netlink(
+        "create_bridge is only supported on Linux".to_string(),
+    ))
+}
+
+/// Delete the bridge interface with the given name.
+///
+/// Replaces the shell-out:
+///   ip link delete `<name>` type bridge
+///
+/// Idempotent: returns `Ok(())` if the bridge does not exist.
+/// Delegates to [`delete_link_by_name`] — from RTNETLINK's perspective
+/// deleting a bridge is the same `RTM_DELLINK` as deleting any other
+/// link, and `delete_link_by_name` already has the ENODEV-as-success
+/// handling we want.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::Netlink`] for any RTNETLINK failure other
+/// than `ENODEV` (which is treated as success).
+#[cfg(target_os = "linux")]
+pub async fn delete_bridge(name: &str) -> Result<(), NetlinkError> {
+    delete_link_by_name(name).await
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub async fn delete_bridge(_name: &str) -> Result<(), NetlinkError> {
+    Err(NetlinkError::Netlink(
+        "delete_bridge is only supported on Linux".to_string(),
+    ))
+}
+
+/// Attach `link` to `bridge` by setting the link's `IFLA_MASTER` to
+/// the bridge's ifindex.
+///
+/// Replaces the shell-out:
+///   ip link set `<link>` master `<bridge>`
+///
+/// Both interfaces must already exist in the current network
+/// namespace. This is what the overlay manager will call to splice a
+/// container's host-side veth end into the per-service bridge instead
+/// of /32-routing it directly.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::NotFound`] if either `link` or `bridge`
+/// does not exist in the current netns. Returns
+/// [`NetlinkError::Netlink`] for any other RTNETLINK failure.
+#[cfg(target_os = "linux")]
+pub async fn add_link_to_bridge(link: &str, bridge: &str) -> Result<(), NetlinkError> {
+    use futures_util::stream::TryStreamExt;
+
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| NetlinkError::Netlink(format!("new_connection failed: {e}")))?;
+    tokio::spawn(connection);
+
+    let bridge_link = handle
+        .link()
+        .get()
+        .match_name(bridge.to_string())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("No such device") {
+                NetlinkError::NotFound(bridge.to_string())
+            } else {
+                NetlinkError::Netlink(format!("link lookup failed for {bridge}: {msg}"))
+            }
+        })?
+        .ok_or_else(|| NetlinkError::NotFound(bridge.to_string()))?;
+    let bridge_idx = bridge_link.header.index;
+
+    let member_link = handle
+        .link()
+        .get()
+        .match_name(link.to_string())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("No such device") {
+                NetlinkError::NotFound(link.to_string())
+            } else {
+                NetlinkError::Netlink(format!("link lookup failed for {link}: {msg}"))
+            }
+        })?
+        .ok_or_else(|| NetlinkError::NotFound(link.to_string()))?;
+    let member_idx = member_link.header.index;
+
+    handle
+        .link()
+        .set(member_idx)
+        .controller(bridge_idx)
+        .execute()
+        .await
+        .map_err(|e| {
+            NetlinkError::Netlink(format!(
+                "set master failed: link={link} bridge={bridge}: {e}"
+            ))
+        })
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub async fn add_link_to_bridge(_link: &str, _bridge: &str) -> Result<(), NetlinkError> {
+    Err(NetlinkError::Netlink(
+        "add_link_to_bridge is only supported on Linux".to_string(),
+    ))
+}
+
+/// Enable or disable Spanning Tree Protocol (STP) on the named bridge.
+///
+/// STP is disabled by default on bridges created via [`create_bridge`]
+/// (the kernel default for a freshly-created bridge is STP off), and
+/// for `ZLayer`'s per-service bridges we want to keep it off: each
+/// bridge is single-host, has no possibility of a loop, and STP's
+/// initial 30s forwarding-delay would stall container traffic on
+/// attach.
+///
+/// rtnetlink 0.14 does not expose a typed builder for `IFLA_BR_STP_STATE`
+/// (it lives inside the nested `IFLA_LINKINFO` -> `IFLA_INFO_DATA` ->
+/// `IFLA_BR_STP_STATE` attribute and the crate's bridge builder only
+/// covers it at create-time, not as a post-create modification). The
+/// portable kernel-supported alternative is the sysfs knob at
+/// `/sys/class/net/<name>/bridge/stp_state`, which is what
+/// `brctl stp <name> on|off` writes under the hood. We use the sysfs
+/// path so the helper works on every kernel that has bridge support
+/// without depending on an rtnetlink API surface that may move
+/// between crate versions.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::NotFound`] if the bridge does not exist (no
+/// `/sys/class/net/<name>/bridge` directory). Returns
+/// [`NetlinkError::Io`] for any other write failure (permission
+/// denied, the link exists but is not a bridge, etc.).
+#[cfg(target_os = "linux")]
+pub fn set_bridge_stp(name: &str, stp_on: bool) -> Result<(), NetlinkError> {
+    let bridge_dir = format!("/sys/class/net/{name}/bridge");
+    if !std::path::Path::new(&bridge_dir).exists() {
+        return Err(NetlinkError::NotFound(name.to_string()));
+    }
+    let path = format!("{bridge_dir}/stp_state");
+    let value = if stp_on { "1" } else { "0" };
+    std::fs::write(&path, value)?;
+    Ok(())
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn set_bridge_stp(_name: &str, _stp_on: bool) -> Result<(), NetlinkError> {
+    Err(NetlinkError::Netlink(
+        "set_bridge_stp is only supported on Linux".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    // The helpers and tests in this module are Linux-only (they require
+    // netlink + CAP_NET_ADMIN). Keep imports/fixtures gated so the lib
+    // tests still compile on Windows/macOS cross-checks.
+    #[cfg(target_os = "linux")]
+    use super::*;
+
+    /// Generate a short random-ish suffix for test interface names so
+    /// parallel `cargo test` invocations don't collide. Bounded to 6
+    /// chars so the full name (`zlb-` prefix + suffix) stays under the
+    /// 15-char `IFNAMSIZ` limit.
+    #[cfg(target_os = "linux")]
+    fn rand_suffix() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        // base36-ish, 6 chars
+        let mut n = u64::from(nanos);
+        let mut out = String::new();
+        let base = CHARS.len() as u64;
+        for _ in 0..6 {
+            let idx = usize::try_from(n % base).unwrap_or(0);
+            out.push(CHARS[idx] as char);
+            n /= base;
+        }
+        out
+    }
+
+    /// Create a dummy interface with the given name (used as a stand-in
+    /// for a host-side veth end in `bridge_add_link_membership`).
+    #[cfg(target_os = "linux")]
+    async fn create_dummy(name: &str) -> Result<(), NetlinkError> {
+        let (connection, handle, _) = rtnetlink::new_connection()
+            .map_err(|e| NetlinkError::Netlink(format!("new_connection failed: {e}")))?;
+        tokio::spawn(connection);
+        handle
+            .link()
+            .add()
+            .dummy(name.to_string())
+            .execute()
+            .await
+            .map_err(|e| NetlinkError::Netlink(format!("dummy create failed for {name}: {e}")))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires CAP_NET_ADMIN; run manually or in privileged CI"]
+    async fn bridge_create_idempotent() {
+        let name = format!("zlb-{}", rand_suffix());
+        assert!(name.len() <= 15, "interface name exceeds IFNAMSIZ: {name}");
+
+        // First create.
+        create_bridge(&name).await.expect("first create_bridge");
+        assert!(
+            std::path::Path::new(&format!("/sys/class/net/{name}")).exists(),
+            "bridge {name} should exist after create"
+        );
+
+        // Second create on same name must be Ok.
+        create_bridge(&name)
+            .await
+            .expect("second create_bridge should be idempotent");
+
+        // Delete and confirm gone.
+        delete_bridge(&name).await.expect("delete_bridge");
+        assert!(
+            !std::path::Path::new(&format!("/sys/class/net/{name}")).exists(),
+            "bridge {name} should be gone after delete"
+        );
+
+        // Second delete on missing name must be Ok.
+        delete_bridge(&name)
+            .await
+            .expect("second delete_bridge should be idempotent");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires CAP_NET_ADMIN; run manually or in privileged CI"]
+    async fn bridge_add_link_membership() {
+        let suffix = rand_suffix();
+        let bridge = format!("zlb-{suffix}");
+        let dummy = format!("zld-{suffix}");
+        assert!(bridge.len() <= 15);
+        assert!(dummy.len() <= 15);
+
+        create_bridge(&bridge).await.expect("create_bridge");
+        create_dummy(&dummy).await.expect("create_dummy");
+
+        add_link_to_bridge(&dummy, &bridge)
+            .await
+            .expect("add_link_to_bridge");
+
+        // The dummy's master/ifindex symlink should resolve to the
+        // bridge's ifindex.
+        let master_ifindex_path = format!("/sys/class/net/{dummy}/master/ifindex");
+        let dummy_master_ifindex = std::fs::read_to_string(&master_ifindex_path)
+            .expect("read dummy master ifindex")
+            .trim()
+            .parse::<u32>()
+            .expect("parse dummy master ifindex");
+
+        let bridge_ifindex = std::fs::read_to_string(format!("/sys/class/net/{bridge}/ifindex"))
+            .expect("read bridge ifindex")
+            .trim()
+            .parse::<u32>()
+            .expect("parse bridge ifindex");
+
+        assert_eq!(
+            dummy_master_ifindex, bridge_ifindex,
+            "dummy's master ifindex should equal bridge's ifindex"
+        );
+
+        // Cleanup.
+        delete_link_by_name(&dummy).await.expect("delete dummy");
+        delete_bridge(&bridge).await.expect("delete bridge");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires CAP_NET_ADMIN; run manually or in privileged CI"]
+    async fn bridge_stp_off() {
+        let name = format!("zlb-{}", rand_suffix());
+        assert!(name.len() <= 15);
+
+        create_bridge(&name).await.expect("create_bridge");
+
+        set_bridge_stp(&name, false).expect("set_bridge_stp off");
+        let stp_state = std::fs::read_to_string(format!("/sys/class/net/{name}/bridge/stp_state"))
+            .expect("read stp_state")
+            .trim()
+            .to_string();
+        assert_eq!(
+            stp_state, "0",
+            "stp_state should be 0 after set_bridge_stp(false)"
+        );
+
+        // Cleanup.
+        delete_bridge(&name).await.expect("delete_bridge");
+    }
 }

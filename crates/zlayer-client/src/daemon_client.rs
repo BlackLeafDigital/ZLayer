@@ -5144,6 +5144,44 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// Per-service overlay status (P4.5b stub contract).
+    ///
+    /// `GET /api/v1/overlay/services/{name}`. Returns the resolved
+    /// overlay mode and the per-node bridge map. Until P9a lands the
+    /// bridge map is always empty and the mode is always `Shared`; the
+    /// endpoint is wired now so adapter crates (zlayer-docker, manager
+    /// UI, Python SDK) can pin against it day-one.
+    pub async fn get_service_overlay_status(
+        &self,
+        name: &str,
+    ) -> Result<zlayer_types::api::overlay::ServiceOverlayStatus> {
+        let path = format!("/api/v1/overlay/services/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Bridge attachment for a service on a specific node (P4.5b stub).
+    ///
+    /// `GET /api/v1/overlay/services/{service}/bridges/{node_id}`. Until
+    /// P9a populates the bridge map this always responds 404; the
+    /// endpoint contract is fixed now so adapter crates can adopt the
+    /// typed call site without rewrites later.
+    pub async fn get_service_bridge(
+        &self,
+        service: &str,
+        node_id: &str,
+    ) -> Result<zlayer_types::api::overlay::BridgeInfo> {
+        let path = format!(
+            "/api/v1/overlay/services/{}/bridges/{}",
+            urlencoding(service),
+            urlencoding(node_id),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
     // ------------------------------------------------------------------
     // Secrets (typed)
     //

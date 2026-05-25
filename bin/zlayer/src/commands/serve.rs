@@ -1529,6 +1529,29 @@ pub(crate) async fn serve_with_external_shutdown(
     } = state;
 
     // -----------------------------------------------------------------------
+    // 2c. Seed the live OverlayManager with this node's raft id and cluster
+    // WG public key. Both values are needed for the P9a service-overlay
+    // bridge: `setup_service_overlay` uses the raft node id as the
+    // partition key when assigning per-service subnets, and the pubkey is
+    // the local peer key used when extending the cluster transport's
+    // `AllowedIPs`. The manager is already inside `Arc<RwLock<_>>` at this
+    // point (init_daemon wrapped it), so the builder-style
+    // `with_local_node_id` is not callable; we use the post-construction
+    // setter instead, and the async `&self` `set_local_wg_pubkey` over a
+    // read guard.
+    if let Some(om_arc) = overlay.as_ref() {
+        {
+            let mut guard = om_arc.write().await;
+            guard.set_local_node_id(node_config.raft_node_id);
+        }
+        om_arc
+            .read()
+            .await
+            .set_local_wg_pubkey(node_config.wireguard_public_key.clone())
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
     // 3. Write daemon metadata JSON
     // -----------------------------------------------------------------------
     let metadata = DaemonMetadata {
@@ -2273,6 +2296,16 @@ pub(crate) async fn serve_with_external_shutdown(
         internal_token.clone(),
         overlay_interface,
     );
+    // Attach the live OverlayManager (when present) so the internal
+    // add-peer endpoint routes through `OverlayManager::add_global_peer`
+    // instead of constructing an ad-hoc `OverlayTransport`. Without this,
+    // peer registrations succeed in-process but never reach the running
+    // WireGuard interface and packets continue to be dropped.
+    let internal_state = if let Some(om) = overlay.as_ref() {
+        internal_state.with_overlay_manager(om.clone())
+    } else {
+        internal_state
+    };
     // Attach the Raft handle when clustered so the pre-self-upgrade
     // `trigger-elect` endpoint can nudge this node into campaigning when
     // the leader steps down for a binary swap.

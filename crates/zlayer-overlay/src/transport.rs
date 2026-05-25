@@ -92,6 +92,62 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
     Ok(response)
 }
 
+/// Return `true` if the given hex-encoded peer pubkey appears as a
+/// `public_key=` line in a UAPI `get` response.
+///
+/// Used by `add_allowed_ip` / `remove_allowed_ip` on Linux/macOS to
+/// distinguish "peer absent" from "peer present with empty `AllowedIPs`".
+#[cfg(not(windows))]
+fn peer_exists_in_uapi(uapi_get_response: &str, peer_pub_hex: &str) -> bool {
+    for line in uapi_get_response.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("public_key=") {
+            if rest == peer_pub_hex {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse the `allowed_ip=` entries belonging to a specific peer from a
+/// UAPI `get` response.
+///
+/// The UAPI response groups per-peer fields under successive
+/// `public_key=...` headers. Each subsequent key=value line (including
+/// `allowed_ip=`) belongs to the most recent peer until the next
+/// `public_key=` line, the trailing `errno=` marker, or EOF. Malformed
+/// CIDRs are silently skipped (boringtun should never emit invalid
+/// strings, but we don't want a corrupted UAPI dump to brick a service
+/// teardown).
+#[cfg(not(windows))]
+fn parse_allowed_ips_for_peer(uapi_get_response: &str, peer_pub_hex: &str) -> Vec<ipnet::IpNet> {
+    let mut out = Vec::new();
+    let mut in_target = false;
+    for line in uapi_get_response.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("public_key=") {
+            in_target = rest == peer_pub_hex;
+            continue;
+        }
+        if line.starts_with("errno=") {
+            // End of payload — any further data is not per-peer.
+            break;
+        }
+        if in_target {
+            if let Some(cidr_str) = line.strip_prefix("allowed_ip=") {
+                if let Ok(net) = cidr_str.parse::<ipnet::IpNet>() {
+                    out.push(net);
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Windows-only helpers (packet parsing, key decoding, Tunn construction)
 // ---------------------------------------------------------------------------
@@ -1109,6 +1165,180 @@ impl OverlayTransport {
         }
     }
 
+    /// Add a CIDR to an existing peer's `AllowedIPs` list.
+    ///
+    /// The peer must already be configured via [`Self::add_peer`].
+    /// Returns an error if the peer is not found.
+    ///
+    /// On Linux/macOS this issues a UAPI `set` request with
+    /// `replace_allowed_ips=true` and the new full set (old set ∪ {cidr}).
+    /// On Windows this mutates the in-memory peer entry's `allowed_ips`
+    /// (which the egress loop consults on every packet) by replacing the
+    /// `Arc<Vec<IpNet>>` wholesale; snapshot clones taken by in-flight
+    /// loops continue to see the old set until they take their next
+    /// snapshot.
+    ///
+    /// Idempotent: if `cidr` is already present in the peer's
+    /// `AllowedIPs`, the set is left unchanged (but a UAPI replay still
+    /// happens on Linux/macOS to keep the kernel/user view authoritative).
+    ///
+    /// Used by `OverlayManager` to add a per-service subnet to the
+    /// cluster transport's `AllowedIPs` when a new service overlay is set
+    /// up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer public key is invalid, the peer is
+    /// not found in the wireguard configuration, or the UAPI / Wintun
+    /// state update fails.
+    #[cfg_attr(windows, allow(clippy::unused_async))]
+    pub async fn add_allowed_ip(
+        &self,
+        public_key: &str,
+        cidr: ipnet::IpNet,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let pub_hex = key_to_hex(public_key)?;
+
+            // Read current allowed_ips for this peer from UAPI so we can
+            // re-issue the full set (boringtun's UAPI is replace-or-append:
+            // without `replace_allowed_ips=true`, lone `allowed_ip=` lines
+            // append; with it, they fully replace).
+            let current = uapi_get(&sock).await?;
+            let mut current_set = parse_allowed_ips_for_peer(&current, &pub_hex);
+
+            if !peer_exists_in_uapi(&current, &pub_hex) {
+                return Err(
+                    format!("cannot add allowed_ip {cidr} to unknown peer {public_key}").into(),
+                );
+            }
+
+            // Idempotent insert.
+            if !current_set.contains(&cidr) {
+                current_set.push(cidr);
+            }
+
+            let mut body = format!("public_key={pub_hex}\nreplace_allowed_ips=true\n");
+            for net in &current_set {
+                let _ = writeln!(body, "allowed_ip={net}");
+            }
+
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(
+                peer_key = %public_key,
+                cidr = %cidr,
+                count = current_set.len(),
+                "Added allowed_ip via UAPI"
+            );
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let pk = decode_key_b64(public_key)?;
+            let mut entry = self.peers.get_mut(&pk).ok_or_else(|| {
+                format!("cannot add allowed_ip {cidr} to unknown peer {public_key}")
+            })?;
+            let mut new_set: Vec<ipnet::IpNet> = entry.value().allowed_ips.as_ref().clone();
+            if !new_set.contains(&cidr) {
+                new_set.push(cidr);
+            }
+            entry.value_mut().allowed_ips = Arc::new(new_set);
+            tracing::debug!(
+                peer_key = %public_key,
+                cidr = %cidr,
+                "Added allowed_ip to Windows overlay peer map"
+            );
+            Ok(())
+        }
+    }
+
+    /// Remove a CIDR from an existing peer's `AllowedIPs` list.
+    ///
+    /// Idempotent in two ways:
+    /// - If the CIDR is not present in the peer's `AllowedIPs`, returns
+    ///   `Ok(())` without error.
+    /// - If the peer itself is not found, returns `Ok(())` without
+    ///   error (mirrors the "missing == already-removed" semantics
+    ///   `OverlayManager` needs during teardown races).
+    ///
+    /// On Linux/macOS this issues a UAPI `set` request with
+    /// `replace_allowed_ips=true` and the new full set (old set ∖ {cidr}).
+    /// On Windows this mutates the in-memory peer entry's `allowed_ips`
+    /// by replacing the `Arc<Vec<IpNet>>` wholesale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the peer public key is malformed or the
+    /// UAPI / Wintun state update fails.
+    #[cfg_attr(windows, allow(clippy::unused_async))]
+    pub async fn remove_allowed_ip(
+        &self,
+        public_key: &str,
+        cidr: ipnet::IpNet,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let pub_hex = key_to_hex(public_key)?;
+
+            let current = uapi_get(&sock).await?;
+            if !peer_exists_in_uapi(&current, &pub_hex) {
+                // Peer not configured — nothing to remove. Idempotent.
+                tracing::debug!(
+                    peer_key = %public_key,
+                    cidr = %cidr,
+                    "remove_allowed_ip: peer not found in UAPI; treating as no-op"
+                );
+                return Ok(());
+            }
+            let current_set = parse_allowed_ips_for_peer(&current, &pub_hex);
+            let new_set: Vec<ipnet::IpNet> =
+                current_set.into_iter().filter(|c| *c != cidr).collect();
+
+            let mut body = format!("public_key={pub_hex}\nreplace_allowed_ips=true\n");
+            for net in &new_set {
+                let _ = writeln!(body, "allowed_ip={net}");
+            }
+
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(
+                peer_key = %public_key,
+                cidr = %cidr,
+                count = new_set.len(),
+                "Removed allowed_ip via UAPI"
+            );
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let pk = decode_key_b64(public_key)?;
+            let Some(mut entry) = self.peers.get_mut(&pk) else {
+                tracing::debug!(
+                    peer_key = %public_key,
+                    cidr = %cidr,
+                    "remove_allowed_ip: peer not found in Windows peer map; no-op"
+                );
+                return Ok(());
+            };
+            let new_set: Vec<ipnet::IpNet> = entry
+                .value()
+                .allowed_ips
+                .iter()
+                .copied()
+                .filter(|c| *c != cidr)
+                .collect();
+            entry.value_mut().allowed_ips = Arc::new(new_set);
+            tracing::debug!(
+                peer_key = %public_key,
+                cidr = %cidr,
+                "Removed allowed_ip from Windows overlay peer map"
+            );
+            Ok(())
+        }
+    }
+
     /// Query interface status.
     ///
     /// On Linux/macOS this reads boringtun's UAPI socket. On Windows it
@@ -1534,6 +1764,51 @@ mod tests {
             key1, key2,
             "Sequential key generation should produce unique keys"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_parse_allowed_ips_for_peer_basic() {
+        let resp = "\
+private_key=aaaa\n\
+listen_port=51820\n\
+public_key=1111\n\
+endpoint=127.0.0.1:51821\n\
+allowed_ip=10.0.0.0/24\n\
+allowed_ip=10.1.0.0/24\n\
+public_key=2222\n\
+allowed_ip=10.2.0.0/24\n\
+errno=0\n";
+        let out = super::parse_allowed_ips_for_peer(resp, "1111");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].to_string(), "10.0.0.0/24");
+        assert_eq!(out[1].to_string(), "10.1.0.0/24");
+        let out2 = super::parse_allowed_ips_for_peer(resp, "2222");
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].to_string(), "10.2.0.0/24");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_parse_allowed_ips_for_peer_unknown_peer_returns_empty() {
+        let resp = "\
+public_key=1111\n\
+allowed_ip=10.0.0.0/24\n\
+errno=0\n";
+        assert!(super::parse_allowed_ips_for_peer(resp, "ffff").is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_peer_exists_in_uapi() {
+        let resp = "\
+public_key=1111\n\
+allowed_ip=10.0.0.0/24\n\
+public_key=2222\n\
+errno=0\n";
+        assert!(super::peer_exists_in_uapi(resp, "1111"));
+        assert!(super::peer_exists_in_uapi(resp, "2222"));
+        assert!(!super::peer_exists_in_uapi(resp, "3333"));
     }
 
     #[cfg(not(windows))]

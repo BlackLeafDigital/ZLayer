@@ -817,6 +817,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         expose: Vec::new(),
         replica_groups: None,
         isolation: None,
+        overlay: None,
     })
 }
 
