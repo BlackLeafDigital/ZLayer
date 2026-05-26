@@ -106,7 +106,9 @@ pub async fn unpack_windows_image(
     for desc in layers {
         let layer_id = new_layer_id();
         let layer_path = dest_root.join(&layer_id);
+        let staging_path = dest_root.join(format!("{layer_id}.staging"));
         std::fs::create_dir_all(&layer_path)?;
+        std::fs::create_dir_all(&staging_path)?;
 
         // 1. Pull blob (MCR `urls[]` redirect fallback lives inside the
         //    registry client; we just hand it the descriptor.urls list).
@@ -121,14 +123,15 @@ pub async fn unpack_windows_image(
         verify_digest(&bytes, &desc.digest)?;
         let raw = decompress(&bytes, &desc.media_type)?;
 
-        // 4+5. Materialize tar entries via BackupStreamWriter.
-        extract_tar_to_backup_stream(&raw, &layer_path)?;
+        // 4+5. Materialize tar entries into the OCI staging dir via BackupStreamWriter.
+        extract_tar_to_backup_stream(&raw, &staging_path)?;
 
-        // 6. Build parent chain and call HcsImportLayer.
+        // 6. Import staging dir into the HCS layer dir (see `wclayer.rs:91-94`: source must differ from dest).
         let parent_chain = build_parent_chain(&chain_so_far);
-        wclayer::import_layer(&layer_path, &layer_path, &parent_chain).map_err(|e| {
+        wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
             io::Error::other(format!("HcsImportLayer({}): {e}", layer_path.display()))
         })?;
+        let _ = std::fs::remove_dir_all(&staging_path);
 
         chain_so_far.push(Layer {
             id: layer_id,
