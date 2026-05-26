@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use serde::Serialize;
-use windows::core::{HSTRING, PWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::System::HostComputeSystem::{
     HcsAttachLayerStorageFilter, HcsDestroyLayer, HcsDetachLayerStorageFilter, HcsExportLayer,
@@ -264,6 +264,43 @@ pub fn setup_base_os_layer(
         HcsSetupBaseOSLayer(&lp, vhd_handle, &opts)
             .map_err(|e| io::Error::other(format!("HcsSetupBaseOSLayer: {e}")))?;
     }
+    Ok(())
+}
+
+/// Materialize the read-only base OS layer at `layer_path` after a successful
+/// [`import_layer`] of a base layer (i.e. one imported with an empty
+/// parent chain). This is the rough equivalent of hcsshim's
+/// `wclayer.ProcessBaseLayer` — it translates the staged `Hives/*` registry
+/// hive exports into the live `Files\Windows\System32\config\*` files that
+/// HCS expects when a child layer chain-walks back to this base.
+///
+/// Without this call, importing a child layer that lists this base in its
+/// parent chain can fail with `0x80070002` ("file not found") because the
+/// derived `config\` materializations don't exist yet and HCS's
+/// `NtQueryDirectoryFile` walk hits an absent directory.
+///
+/// Backing FFI: `vmcompute.dll!ProcessBaseImage(path: *uint16) -> HRESULT`
+/// (matches `hcsshim/internal/wclayer/zsyscall_windows.go`). This symbol is
+/// not exposed by `windows::Win32::System::HostComputeSystem` in
+/// `windows-rs 0.62`, so we declare the link inline.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if the syscall returns a non-success HRESULT.
+pub fn process_base_layer(layer_path: &Path) -> io::Result<()> {
+    let lp = path_to_hstring(layer_path);
+    // Link directly to vmcompute.dll's `ProcessBaseImage`. Single PCWSTR in,
+    // HRESULT out.
+    windows::core::link!(
+        "vmcompute.dll" "system" fn ProcessBaseImage(path: PCWSTR) -> windows::core::HRESULT
+    );
+    // SAFETY: `lp` is a live `HSTRING` whose backing buffer is null-terminated
+    // UTF-16 (per `HSTRING`'s `Deref<Target = [u16]>` invariant) and outlives
+    // the call. `ProcessBaseImage` only reads the wide-string path argument
+    // and returns an HRESULT; no out-pointers or shared resources.
+    let hr = unsafe { ProcessBaseImage(PCWSTR::from_raw(lp.as_ptr())) };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("ProcessBaseImage: {e}")))?;
     Ok(())
 }
 

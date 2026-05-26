@@ -17,13 +17,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    BackupRead, BackupWrite, CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    BackupRead, BackupWrite, CreateDirectoryW, CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -143,6 +144,40 @@ pub(crate) fn create_long_path_file(path: &Path) -> io::Result<std::fs::File> {
     // will call `CloseHandle` for us.
     let file = unsafe { std::fs::File::from_raw_handle(handle.0.cast()) };
     Ok(file)
+}
+
+/// Create a single directory at `path` using `CreateDirectoryW` with the
+/// extended-length-path prefix so it works for paths longer than `MAX_PATH`.
+/// `ERROR_ALREADY_EXISTS` is treated as success (matches `std::fs::create_dir`
+/// behaviour when paired with `create_dir_all`-style walks).
+///
+/// Used by the OCI Windows layer unpacker's `create_long_path_dir_all`
+/// fallback when `std::fs::create_dir_all` returns `ERROR_PATH_NOT_FOUND`
+/// (`0x80070003`) on the deep `WinSxS` / `Catroot` directory chains embedded
+/// in `mcr.microsoft.com/windows/nanoserver` layers.
+///
+/// # Errors
+///
+/// Returns the OS error from `CreateDirectoryW` (except for
+/// `ERROR_ALREADY_EXISTS`, which is swallowed).
+pub(crate) fn create_long_path_dir(path: &Path) -> io::Result<()> {
+    let wide = to_extended_wide(path)?;
+    // SAFETY: `wide` is a valid null-terminated UTF-16 buffer that outlives
+    // the call. `lpsecurityattributes = None` requests default ACLs.
+    let res = unsafe { CreateDirectoryW(PCWSTR::from_raw(wide.as_ptr()), None) };
+    if let Err(e) = res {
+        // Idempotent: already-exists is fine for a create_dir_all-style walk.
+        // windows-rs returns a `windows::core::Error` whose `code()` is the
+        // HRESULT-wrapped Win32 status; check both flavours.
+        #[allow(clippy::cast_sign_loss)]
+        let raw = e.code().0 as u32;
+        let already_exists_hresult = 0x8007_0000u32 | (ERROR_ALREADY_EXISTS.0 & 0xFFFF);
+        if raw == already_exists_hresult || raw == ERROR_ALREADY_EXISTS.0 {
+            return Ok(());
+        }
+        return Err(io::Error::other(format!("CreateDirectoryW: {e}")));
+    }
+    Ok(())
 }
 
 /// Enable `SeBackupPrivilege` and `SeRestorePrivilege` on the current process

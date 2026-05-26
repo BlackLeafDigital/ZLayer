@@ -103,7 +103,7 @@ pub async fn unpack_windows_image(
     // we reverse it into child-to-parent to satisfy HCS.
     let mut chain_so_far: Vec<Layer> = Vec::with_capacity(layers.len());
 
-    for desc in layers {
+    for (layer_idx, desc) in layers.iter().enumerate() {
         let layer_id = new_layer_id();
         let layer_path = dest_root.join(&layer_id);
         let staging_path = dest_root.join(format!("{layer_id}.staging"));
@@ -128,9 +128,30 @@ pub async fn unpack_windows_image(
 
         // 6. Import staging dir into the HCS layer dir (see `wclayer.rs:91-94`: source must differ from dest).
         let parent_chain = build_parent_chain(&chain_so_far);
+        let is_base_layer = chain_so_far.is_empty();
         wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
-            io::Error::other(format!("HcsImportLayer({}): {e}", layer_path.display()))
+            io::Error::other(format!(
+                "HcsImportLayer(layer={layer_idx} digest={} dest={}): {e}",
+                desc.digest,
+                layer_path.display()
+            ))
         })?;
+
+        // 6b. For the base (parent-less) layer, run ProcessBaseImage so the
+        //     Hives/* registry exports are materialized into the
+        //     Files\Windows\System32\config\* paths that child layers expect.
+        //     Skipping this is the canonical cause of `0x80070002` on a
+        //     subsequent child-layer HcsImportLayer call.
+        if is_base_layer {
+            wclayer::process_base_layer(&layer_path).map_err(|e| {
+                io::Error::other(format!(
+                    "ProcessBaseImage(layer={layer_idx} digest={} dest={}): {e}",
+                    desc.digest,
+                    layer_path.display()
+                ))
+            })?;
+        }
+
         let _ = std::fs::remove_dir_all(&staging_path);
 
         chain_so_far.push(Layer {
@@ -198,24 +219,94 @@ fn verify_digest(bytes: &[u8], expected: &str) -> io::Result<()> {
 
 /// Walk an OCI Windows layer tar and materialize each entry under `layer_path`.
 ///
-/// Directory entries are skipped (their paths are implicit in child entries).
-/// `Files/`-prefixed entries carry raw file bodies + PAX-encoded NTFS
+/// Three categories of entry get special treatment beyond the plain
+/// `Files/`-vs-other split:
+///
+/// 1. **Directory entries** (`tar::EntryType::Dir`). These MUST be created on
+///    disk — `mcr.microsoft.com/windows/nanoserver` ships thousands of empty
+///    leaf directories (`Files/Windows/INF/`, `Files/Windows/System32/Catroot/`,
+///    registry/UtilityVM scaffolding) that HCS's `NtQueryDirectoryFile` walk
+///    expects to find during `HcsImportLayer`. Silently dropping them yields
+///    `STATUS_OBJECT_NAME_NOT_FOUND` → `ERROR_FILE_NOT_FOUND` (`0x80070002`).
+/// 2. **Hardlink entries** (`tar::EntryType::Link`). We replay them after the
+///    main walk because the tar ordering of `Link` vs. the target it references
+///    is not guaranteed in OCI layers.
+/// 3. **Whiteouts** — basename-prefixed `.wh.<name>` entries (the OCI
+///    overlayfs-style convention). These are NOT extracted as files; instead
+///    we append the target path (sibling with `.wh.` stripped) to
+///    `tombstones.txt`, which is the on-disk whiteout manifest the wclayer
+///    importer consumes. If a raw `tombstones.txt` entry was also present in
+///    the tar we APPEND to (not overwrite) it.
+///
+/// `Files/`-prefixed regular files carry raw file bodies + PAX-encoded NTFS
 /// metadata in the OCI format; we hand them to
 /// [`backuptar::write_oci_entry_to_backup_stream`] which synthesises the
 /// `WIN32_STREAM_ID`-framed records expected by `BackupWrite`. Everything
-/// else (`tombstones.txt`, `Hives/`, `UtilityVM/`) is written as a raw byte
-/// copy.
+/// else (`Hives/`, raw `tombstones.txt`, `UtilityVM/`) is written as a raw
+/// byte copy via the long-path-aware helper.
 fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+    use std::collections::HashSet;
+
     let mut archive = tar::Archive::new(tar_bytes);
+    // Hardlink replay queue: (link_path, target_path), both relative.
+    let mut pending_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Whiteout collector: relative target paths (forward-slash, no `.wh.`).
+    let mut pending_tombstones: Vec<String> = Vec::new();
+    // Track raw `tombstones.txt` presence so we APPEND rather than overwrite.
+    let mut raw_tombstones_written = false;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if entry.header().entry_type().is_dir() {
+        let rel_path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+
+        // (1) Directory entries: create the directory (with all ancestors via
+        // the long-path-aware helper) and move on. We deliberately do NOT
+        // skip them anymore.
+        if entry_type.is_dir() {
+            let dest = layer_path.join(&rel_path);
+            create_long_path_dir_all(&dest)?;
             continue;
         }
-        let rel_path = entry.path()?.into_owned();
+
+        // (3) Whiteout detection — check basename for `.wh.` prefix. We do
+        // this before path construction so we never materialise a `.wh.*`
+        // file on disk (HCS would otherwise see it as a literal payload).
+        if let Some(basename) = rel_path.file_name().and_then(|s| s.to_str()) {
+            if let Some(stripped) = basename.strip_prefix(".wh.") {
+                // Reconstruct the tombstone target as the sibling path with
+                // `.wh.` stripped, normalised to forward slashes.
+                let sibling: PathBuf = match rel_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.join(stripped),
+                    _ => PathBuf::from(stripped),
+                };
+                let normalised: String = sibling
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+                    .to_string();
+                if !normalised.is_empty() {
+                    pending_tombstones.push(normalised);
+                }
+                continue;
+            }
+        }
+
         let dest = layer_path.join(&rel_path);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_long_path_dir_all(parent)?;
+        }
+
+        // (2) Hardlink entries: defer until all targets are materialised.
+        if entry_type == tar::EntryType::Link {
+            let link_target = entry.link_name()?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "tar hardlink entry missing link_name: {}",
+                    rel_path.display()
+                ))
+            })?;
+            pending_links.push((rel_path.clone(), link_target.into_owned()));
+            continue;
         }
 
         // OCI Windows layer tar layout:
@@ -236,9 +327,102 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
             // long-path-aware helper which adds the `\\?\` prefix.
             let mut f = layer::create_long_path_file(&dest)?;
             std::io::copy(&mut entry, &mut f)?;
+            if rel_str == "tombstones.txt" || rel_str == "tombstones" {
+                raw_tombstones_written = true;
+            }
         }
     }
+
+    // Replay pending hardlinks. The target must exist on disk by now (the
+    // main walk is complete) — if it doesn't we surface the error rather
+    // than silently degrade, since downstream HCS will fail anyway.
+    for (link_rel, target_rel) in pending_links {
+        let link_abs = layer_path.join(&link_rel);
+        // Resolve target relative to the staging root. OCI hardlinks use
+        // archive-relative target paths.
+        let target_abs = layer_path.join(&target_rel);
+        if let Some(parent) = link_abs.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+        if let Err(e) = std::fs::hard_link(&target_abs, &link_abs) {
+            return Err(io::Error::other(format!(
+                "hard_link({} -> {}): {e}",
+                link_abs.display(),
+                target_abs.display()
+            )));
+        }
+    }
+
+    // Replay whiteouts into `tombstones.txt`. De-duplicate so a malformed
+    // tar that lists the same `.wh.foo` twice doesn't bloat the manifest.
+    if !pending_tombstones.is_empty() {
+        let tombstones_path = layer_path.join("tombstones.txt");
+        let mut existing: Vec<String> = Vec::new();
+        if raw_tombstones_written && tombstones_path.exists() {
+            // Pull current contents back via the long-path helper to avoid
+            // a `0x80070003` re-read of a deep path. tombstones.txt itself
+            // lives at the layer root so this is mostly defensive.
+            let bytes = std::fs::read(&tombstones_path)?;
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                existing.push(String::from_utf8_lossy(line).trim().to_string());
+            }
+        }
+        let mut seen: HashSet<String> = existing.iter().cloned().collect();
+        let mut all_lines = existing;
+        for line in pending_tombstones {
+            if seen.insert(line.clone()) {
+                all_lines.push(line);
+            }
+        }
+        let body = all_lines.join("\n") + "\n";
+        let mut f = layer::create_long_path_file(&tombstones_path)?;
+        std::io::Write::write_all(&mut f, body.as_bytes())?;
+    }
+
     Ok(())
+}
+
+/// `std::fs::create_dir_all` analogue that uses the `\\?\`-prefixed long-path
+/// helper so we don't trip `ERROR_PATH_NOT_FOUND` (`0x80070003`) on the deep
+/// `WinSxS`/`Catroot`/`UtilityVM` directories embedded in nanoserver layers.
+///
+/// This walks ancestors top-down and calls a `CreateDirectoryW`-equivalent
+/// for each; we re-use the file helper to materialise a placeholder when the
+/// directory does not yet exist, except we route to the dedicated dir API.
+fn create_long_path_dir_all(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    // Fast path: std handles short paths fine. Try it first; on
+    // `ERROR_PATH_NOT_FOUND` / `ERROR_FILENAME_EXCED_RANGE` fall back.
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Walk ancestors and create them one-by-one through the long-path
+            // helper. We accumulate the components first because `Path` doesn't
+            // give us a top-down ancestor iterator without an extra collect.
+            let mut to_create: Vec<&Path> = dir.ancestors().collect();
+            to_create.reverse();
+            for component in to_create {
+                if component.as_os_str().is_empty() {
+                    continue;
+                }
+                if component.is_dir() {
+                    continue;
+                }
+                layer::create_long_path_dir(component).map_err(|inner| {
+                    io::Error::other(format!(
+                        "create_dir_all fallback for {} (initial {e}): {inner}",
+                        component.display()
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

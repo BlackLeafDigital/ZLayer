@@ -1485,9 +1485,15 @@ impl Runtime for HcsRuntime {
             &chain,
             self.config.default_scratch_size_gb,
             // `is_base_os_bootstrap` is only true for the very first scratch
-            // layer built over a given base OS layer. For the MVP we leave
-            // this at `false`; the unpacker already handled base-layer
-            // preparation during `HcsImportLayer`.
+            // layer built over a given base OS layer. The read-only base
+            // layer's registry hives are already materialised by the
+            // unpacker via `wclayer::process_base_layer` (the
+            // `ProcessBaseImage` analogue) immediately after the base
+            // `HcsImportLayer` call. The remaining
+            // `HcsSetupBaseOSLayer`-on-VHD bootstrap is a per-scratch-layer
+            // step which we leave disabled for the MVP because scratch
+            // VHD initialisation does not require it for the standard
+            // process-isolated / Hyper-V container paths we use today.
             false,
         )
         .map_err(|e| AgentError::CreateFailed {
