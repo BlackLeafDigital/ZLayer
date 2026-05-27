@@ -74,9 +74,12 @@ const OVERLAY_DNS_SUFFIX: &str = "overlay.local";
 /// Default local daemon endpoint when `ZLAYER_DAEMON_ADDR` is unset.
 const DEFAULT_DAEMON_ADDR: &str = "http://127.0.0.1:3669";
 
-/// Alpine image used for the Linux service. Pulled on the Linux peer (or via
-/// the local WSL2 delegate) as part of deployment orchestration.
-const LINUX_IMAGE: &str = "alpine:3.19";
+/// Alpine fixture image used for the Linux service. Pulled on the Linux
+/// peer (or via the local WSL2 delegate) as part of deployment
+/// orchestration. We use our own GHCR-hosted retag of `alpine:3.19` rather
+/// than docker.io directly to dodge unauthenticated-pull rate limits and
+/// keep fixture provenance under our control.
+const LINUX_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer/test-fixtures:latest";
 
 /// Nanoserver image used for the Windows service.
 const WINDOWS_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";

@@ -79,9 +79,14 @@ const TEST_OWNER_TAG: &str = "zlayer-e2e-test";
 /// that the first `pull_image` on a cold host completes in a minute or two.
 const WINDOWS_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";
 
-/// Alpine image used for the Linux-dispatch assertions. Pulled inside the
-/// `zlayer` WSL2 distro by `youki pull`.
-const LINUX_IMAGE: &str = "alpine:3.19";
+/// Alpine fixture image used for the Linux-dispatch assertions. Pulled
+/// through the WSL2 delegate's registry path. We use our own GHCR-hosted
+/// retag of `alpine:3.19` rather than `docker.io/library/alpine:3.19`
+/// directly to (a) avoid docker.io's unauthenticated-pull rate limit, which
+/// trips repeatedly on CI runners that share egress IPs, and (b) keep
+/// fixture-image provenance under our control so a future tag rotation
+/// doesn't silently change test behavior.
+const LINUX_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer/test-fixtures:latest";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -218,12 +223,18 @@ async fn best_effort_remove(rt: &CompositeRuntime, id: &ContainerId) {
 }
 
 /// Fallback cleanup for stragglers we could not clear through the trait. Runs
-/// `wsl.exe -d zlayer -- youki delete <slug>` and ignores every error — this
-/// is a last line of defence after a mid-test panic.
+/// `wsl.exe -d zlayer -- /usr/local/bin/zlayer runtime delete <slug> --force`
+/// and ignores every error — this is a last line of defence after a mid-test
+/// panic.
 #[cfg(feature = "wsl")]
 async fn cleanup_distro_container(container_id_slug: &str) {
-    if let Err(e) = zlayer_wsl::distro::wsl_exec("youki", &["delete", container_id_slug]).await {
-        eprintln!("cleanup: youki delete {container_id_slug} failed: {e}");
+    if let Err(e) = zlayer_wsl::distro::wsl_exec(
+        "/usr/local/bin/zlayer",
+        &["runtime", "delete", container_id_slug, "--force"],
+    )
+    .await
+    {
+        eprintln!("cleanup: zlayer runtime delete {container_id_slug} failed: {e}");
     }
 }
 
@@ -357,8 +368,8 @@ async fn composite_dispatches_windows_spec_to_hcs() {
 }
 
 /// Dispatches a service spec with `platform.os = Linux` to the WSL2 delegate.
-/// Verifies the container appears in `wsl.exe -d zlayer -- youki list`
-/// output. Skips cleanly if no WSL2 is available.
+/// Verifies the container appears in `wsl.exe -d zlayer -- /usr/local/bin/zlayer
+/// runtime state <slug>` output. Skips cleanly if no WSL2 is available.
 ///
 /// Post-G-2: the delegate now writes a full OCI bundle into the distro before
 /// invoking `youki create`, so `create_container` must return `Ok` — the old
@@ -400,30 +411,44 @@ async fn composite_dispatches_linux_spec_to_wsl2() {
             .expect("create_container for Linux spec must succeed via the WSL2 delegate (G-2)");
     }));
 
-    // After a successful create the container must actually show up in the
-    // distro's `youki list`. If it doesn't, dispatch reached the delegate but
-    // the bundle-write / youki-create pipeline is broken.
+    // After a successful create the container must actually show up under
+    // `zlayer runtime state <slug>` inside the distro. If it doesn't, dispatch
+    // reached the delegate but the bundle-write / `zlayer runtime create`
+    // pipeline is broken.
     let list_check: std::result::Result<(), String> = if create_result.is_ok() {
         #[cfg(feature = "wsl")]
         {
-            match zlayer_wsl::distro::wsl_exec("youki", &["list"]).await {
+            match zlayer_wsl::distro::wsl_exec(
+                "/usr/local/bin/zlayer",
+                &["runtime", "state", &slug],
+            )
+            .await
+            {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    if stdout.contains(&slug) {
-                        eprintln!("PASS: youki list inside the zlayer distro includes {slug}");
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "youki list stdout does not mention {slug}: {stdout}"
-                        ))
+                    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                        Ok(json) if json["id"].as_str() == Some(slug.as_str()) => {
+                            eprintln!(
+                                "PASS: zlayer runtime state inside the zlayer distro reports {slug}"
+                            );
+                            Ok(())
+                        }
+                        Ok(json) => Err(format!(
+                            "zlayer runtime state stdout does not name {slug}: {json}"
+                        )),
+                        Err(e) => Err(format!(
+                            "zlayer runtime state stdout is not valid JSON ({e}): {stdout}"
+                        )),
                     }
                 }
                 Ok(out) => Err(format!(
-                    "youki list failed (status {:?}): {}",
+                    "zlayer runtime state failed (status {:?}): {}",
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 )),
-                Err(e) => Err(format!("wsl.exe -d zlayer -- youki list: {e}")),
+                Err(e) => Err(format!(
+                    "wsl.exe -d zlayer -- /usr/local/bin/zlayer runtime state {slug}: {e}"
+                )),
             }
         }
         #[cfg(not(feature = "wsl"))]
@@ -555,26 +580,37 @@ async fn composite_uses_image_os_cache_after_pull() {
     let list_check: std::result::Result<(), String> = if create_result.is_ok() {
         #[cfg(feature = "wsl")]
         {
-            match zlayer_wsl::distro::wsl_exec("youki", &["list"]).await {
+            match zlayer_wsl::distro::wsl_exec(
+                "/usr/local/bin/zlayer",
+                &["runtime", "state", &slug],
+            )
+            .await
+            {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    if stdout.contains(&slug) {
-                        eprintln!(
-                            "PASS: cache-routed Linux spec created container {slug} in the distro"
-                        );
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "youki list stdout does not mention {slug}: {stdout}"
-                        ))
+                    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                        Ok(json) if json["id"].as_str() == Some(slug.as_str()) => {
+                            eprintln!(
+                                "PASS: cache-routed Linux spec created container {slug} in the distro"
+                            );
+                            Ok(())
+                        }
+                        Ok(json) => Err(format!(
+                            "zlayer runtime state stdout does not name {slug}: {json}"
+                        )),
+                        Err(e) => Err(format!(
+                            "zlayer runtime state stdout is not valid JSON ({e}): {stdout}"
+                        )),
                     }
                 }
                 Ok(out) => Err(format!(
-                    "youki list failed (status {:?}): {}",
+                    "zlayer runtime state failed (status {:?}): {}",
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 )),
-                Err(e) => Err(format!("wsl.exe -d zlayer -- youki list: {e}")),
+                Err(e) => Err(format!(
+                    "wsl.exe -d zlayer -- /usr/local/bin/zlayer runtime state {slug}: {e}"
+                )),
             }
         }
         #[cfg(not(feature = "wsl"))]
