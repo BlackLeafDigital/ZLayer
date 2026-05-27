@@ -1520,25 +1520,11 @@ impl Runtime for HcsRuntime {
         // Convert the HCS-ordered parent list into the wclayer LayerChain
         // expected by `scratch::create`.
         let chain = crate::windows::wclayer::LayerChain::new(parent_layers.clone());
-        let scratch_layer = scratch::create(
-            &scratch_dir,
-            &chain,
-            // `is_base_os_bootstrap` is only true for the very first scratch
-            // layer built over a given base OS layer. The read-only base
-            // layer's registry hives are already materialised by the
-            // unpacker via `wclayer::process_base_layer` (the
-            // `ProcessBaseImage` analogue) immediately after the base
-            // `HcsImportLayer` call. The remaining
-            // `HcsSetupBaseOSLayer`-on-VHD bootstrap is a per-scratch-layer
-            // step which we leave disabled for the MVP because scratch
-            // VHD initialisation does not require it for the standard
-            // process-isolated / Hyper-V container paths we use today.
-            false,
-        )
-        .map_err(|e| AgentError::CreateFailed {
-            id: hcs_id.clone(),
-            reason: format!("scratch layer create: {e}"),
-        })?;
+        let scratch_layer =
+            scratch::create(&scratch_dir, &chain).map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.clone(),
+                reason: format!("scratch layer create: {e}"),
+            })?;
 
         // 3. Attach the container to the daemon's HCN Transparent overlay
         //    network. If HCN is unavailable (e.g. non-admin daemon on a dev

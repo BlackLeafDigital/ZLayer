@@ -58,8 +58,8 @@ pub struct ResolvedLayerDescriptor {
 pub struct UnpackedImage {
     /// HCS-ordered parent chain (child-to-parent). The first element is the
     /// topmost image layer; the last is the base OS layer. Safe to hand
-    /// directly to [`wclayer::attach_layer_storage_filter`] or
-    /// [`wclayer::initialize_writable_layer`].
+    /// directly to [`wclayer::create_sandbox_layer`] or
+    /// [`wclayer::prepare_layer`].
     pub chain: LayerChain,
     /// Root directory that holds all the individual `<layer_id>/` folders.
     pub root: PathBuf,

@@ -2269,13 +2269,10 @@ async fn execute_run_step_impl(
     // means a caller does not need to remember the prerequisite.
     zlayer_agent::windows::layer::enable_backup_restore_privileges()
         .map_err(BuildError::IoError)?;
-    let scratch_layer = agent_scratch::create(
-        &scratch_dir,
-        &parent_chain,
-        /* is_base_os_bootstrap = */ false,
-    )
-    .map_err(|e| BuildError::LayerCreate {
-        message: format!("scratch layer create at {}: {e}", scratch_dir.display()),
+    let scratch_layer = agent_scratch::create(&scratch_dir, &parent_chain).map_err(|e| {
+        BuildError::LayerCreate {
+            message: format!("scratch layer create at {}: {e}", scratch_dir.display()),
+        }
     })?;
 
     // 4. Build the compute-system doc and create + start the system.

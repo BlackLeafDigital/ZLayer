@@ -182,11 +182,7 @@ pub fn create_writable_layer(
     // SeRestorePrivilege on the current process token.
     zlayer_agent::windows::layer::enable_backup_restore_privileges()?;
 
-    zlayer_agent::windows::scratch::create(
-        layer_path,
-        parent_chain,
-        /* is_base_os_bootstrap = */ false,
-    )
+    zlayer_agent::windows::scratch::create(layer_path, parent_chain)
 }
 
 // ---------------------------------------------------------------------------

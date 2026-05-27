@@ -23,14 +23,89 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use serde::Serialize;
-use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
-use windows::Win32::System::HostComputeSystem::{
-    HcsAttachLayerStorageFilter, HcsDestroyLayer, HcsDetachLayerStorageFilter, HcsExportLayer,
-    HcsFormatWritableLayerVhd, HcsGetLayerVhdMountPath, HcsImportLayer, HcsSetupBaseOSLayer,
-};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::System::HostComputeSystem::{HcsDestroyLayer, HcsExportLayer, HcsImportLayer};
 
 use zlayer_hcs::schema::{Layer, SchemaVersion};
+
+// ---------------------------------------------------------------------------
+// Shared FFI types for `vmcompute.dll` legacy `wclayer` APIs.
+//
+// `CreateSandboxLayer`, `ActivateLayer`, `PrepareLayer`, `UnprepareLayer`,
+// `DeactivateLayer`, and `GetLayerMountPath` all take a `WC_DRIVER_INFO*` as
+// their first argument. `PrepareLayer` and `CreateSandboxLayer` additionally
+// take an array of `WC_LAYER_DESCRIPTOR`. These structs and the empty
+// home-dir buffer are shared across every wrapper below.
+// ---------------------------------------------------------------------------
+
+/// `WC_DRIVER_INFO`. See [`create_sandbox_layer`] for the full ABI write-up
+/// (flavour discriminant width, info_buffer null-pointer trap, etc.).
+#[repr(C)]
+struct WcDriverInfo {
+    flavour: u32,
+    info_buffer: *const u16,
+}
+
+/// `WC_LAYER_DESCRIPTOR`: 16-byte GUID + 4-byte flags + 4-byte pad + 8-byte
+/// path pointer = 32 bytes on x64. Matches hcsshim's `WC_LAYER_DESCRIPTOR`
+/// and the .NET `LayerDescriptor` reference.
+#[repr(C)]
+struct WcLayerDescriptor {
+    layer_id: windows::core::GUID,
+    flags: u32,
+    _flags_pad: u32,
+    path: *const u16,
+}
+
+/// Empty null-terminated UTF-16 string the driver-info points at. Static so
+/// the pointer is stable for any caller's `WcDriverInfo` literal — matches
+/// hcsshim's `var utf16EmptyString uint16` + `&utf16EmptyString`.
+static EMPTY_HOME_DIR: [u16; 1] = [0];
+
+/// Build a `WcDriverInfo` configured for the filter-driver flavour (the only
+/// one we ever use). The returned struct borrows `&EMPTY_HOME_DIR` which has
+/// `'static` lifetime, so the returned value is safe to pass through to FFI.
+fn driver_info() -> WcDriverInfo {
+    WcDriverInfo {
+        flavour: 1,
+        info_buffer: EMPTY_HOME_DIR.as_ptr(),
+    }
+}
+
+/// Convert a parent chain into the parallel `(path_buffers, descriptors)`
+/// vectors expected by `CreateSandboxLayer` / `PrepareLayer`.
+///
+/// `path_buffers` owns the wide-string path data that each descriptor's
+/// `path` pointer refers to; it MUST outlive the descriptor slice across the
+/// FFI call.
+fn parent_chain_to_descriptors(
+    parent_chain: &LayerChain,
+) -> io::Result<(Vec<Vec<u16>>, Vec<WcLayerDescriptor>)> {
+    let path_buffers: Vec<Vec<u16>> = parent_chain
+        .0
+        .iter()
+        .map(|l| {
+            let mut w: Vec<u16> = Path::new(&l.path).as_os_str().encode_wide().collect();
+            w.push(0);
+            w
+        })
+        .collect();
+    let descriptors: Vec<WcLayerDescriptor> = parent_chain
+        .0
+        .iter()
+        .zip(path_buffers.iter())
+        .map(|(l, buf)| {
+            let id = parse_guid_str(&l.id)?;
+            Ok(WcLayerDescriptor {
+                layer_id: id,
+                flags: 0,
+                _flags_pad: 0,
+                path: buf.as_ptr(),
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok((path_buffers, descriptors))
+}
 
 // ---------------------------------------------------------------------------
 // Parent chain + LayerData serialization
@@ -158,85 +233,119 @@ pub fn destroy_layer(layer_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Attach the WCIFS storage filter onto a scratch layer at `layer_path`,
-/// using `parent_chain` as the read-only parents. After a successful call,
-/// reads from `layer_path` present the merged filesystem view to the host.
+/// Activate a layer at `layer_path` (mount its sandbox.vhdx via the layer
+/// filter driver, allowing subsequent `PrepareLayer` + `GetLayerMountPath`).
 ///
-/// Typical use: after [`create_sandbox_layer`], attach the filter so the
-/// compute system can bind-mount `layer_path` as its root filesystem.
+/// Wraps `vmcompute.dll!ActivateLayer`. Matches hcsshim's
+/// `internal/wclayer/activatelayer.go::ActivateLayer`. Pair every successful
+/// `activate_layer` with a `deactivate_layer` once the consumer is done.
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT.
-pub fn attach_layer_storage_filter(layer_path: &Path, parent_chain: &LayerChain) -> io::Result<()> {
-    let layer_data = parent_chain.to_layer_data_json()?;
-    let lp = path_to_hstring(layer_path);
-    let ld = HSTRING::from(layer_data);
-    // SAFETY: Both arguments are live `HSTRING`s that outlive the call.
-    unsafe {
-        HcsAttachLayerStorageFilter(&lp, &ld)
-            .map_err(|e| io::Error::other(format!("HcsAttachLayerStorageFilter: {e}")))?;
-    }
+/// Returns an [`io::Error`] if `ActivateLayer` returns a non-success HRESULT.
+pub fn activate_layer(layer_path: &Path) -> io::Result<()> {
+    windows::core::link!(
+        "vmcompute.dll" "system" fn ActivateLayer(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+        ) -> windows::core::HRESULT
+    );
+    let info = driver_info();
+    let lp = HSTRING::from(layer_path.as_os_str());
+    // SAFETY: `info` borrows `EMPTY_HOME_DIR` (static); `lp` is a live
+    // `HSTRING` whose null-terminated buffer outlives the call.
+    let hr = unsafe { ActivateLayer(&info, PCWSTR::from_raw(lp.as_ptr())) };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("ActivateLayer: {e}")))?;
     Ok(())
 }
 
-/// Detach the WCIFS storage filter from a scratch layer previously attached
-/// via [`attach_layer_storage_filter`]. Must be called before
-/// [`destroy_layer`] on writable layers.
+/// Deactivate a layer previously activated via [`activate_layer`]. Must be
+/// called after `unprepare_layer` and before `destroy_layer`.
+///
+/// Wraps `vmcompute.dll!DeactivateLayer`. Matches hcsshim's
+/// `internal/wclayer/deactivatelayer.go::DeactivateLayer`.
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT.
-pub fn detach_layer_storage_filter(layer_path: &Path) -> io::Result<()> {
-    let lp = path_to_hstring(layer_path);
-    // SAFETY: `lp` is a live `HSTRING` that outlives the call.
-    unsafe {
-        HcsDetachLayerStorageFilter(&lp)
-            .map_err(|e| io::Error::other(format!("HcsDetachLayerStorageFilter: {e}")))?;
-    }
+/// Returns an [`io::Error`] if `DeactivateLayer` returns a non-success HRESULT.
+pub fn deactivate_layer(layer_path: &Path) -> io::Result<()> {
+    windows::core::link!(
+        "vmcompute.dll" "system" fn DeactivateLayer(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+        ) -> windows::core::HRESULT
+    );
+    let info = driver_info();
+    let lp = HSTRING::from(layer_path.as_os_str());
+    // SAFETY: same as `activate_layer`.
+    let hr = unsafe { DeactivateLayer(&info, PCWSTR::from_raw(lp.as_ptr())) };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("DeactivateLayer: {e}")))?;
     Ok(())
 }
 
-/// Format an open VHDX file handle as a scratch (writable) layer volume.
-/// The handle must have been opened with read/write access and refer to a
-/// pre-existing, correctly-sized VHDX file.
+/// Prepare a writable layer at `layer_path` over `parent_chain` so that the
+/// host (or a container) can read/write through the layered view. Must be
+/// called after [`activate_layer`] and before [`get_layer_mount_path`].
+///
+/// Wraps `vmcompute.dll!PrepareLayer`. Matches hcsshim's
+/// `internal/wclayer/preparelayer.go::PrepareLayer`. Pair every successful
+/// `prepare_layer` with an `unprepare_layer` once the consumer is done.
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT.
-pub fn format_writable_layer_vhd(vhd_handle: HANDLE) -> io::Result<()> {
-    // SAFETY: The caller owns `vhd_handle` and guarantees it is open with
-    // read/write access for the duration of this call.
-    unsafe {
-        HcsFormatWritableLayerVhd(vhd_handle)
-            .map_err(|e| io::Error::other(format!("HcsFormatWritableLayerVhd: {e}")))?;
-    }
+/// Returns an [`io::Error`] if `PrepareLayer` returns a non-success HRESULT.
+pub fn prepare_layer(layer_path: &Path, parent_chain: &LayerChain) -> io::Result<()> {
+    windows::core::link!(
+        "vmcompute.dll" "system" fn PrepareLayer(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+            descriptors: *const WcLayerDescriptor,
+            descriptor_count: usize,
+        ) -> windows::core::HRESULT
+    );
+    let info = driver_info();
+    let lp = HSTRING::from(layer_path.as_os_str());
+    let (_path_buffers, descriptors) = parent_chain_to_descriptors(parent_chain)?;
+    // SAFETY: `info` borrows `EMPTY_HOME_DIR` (static); `lp` is a live
+    // `HSTRING`; `descriptors` and the wide-string buffers it points into
+    // (`_path_buffers`) outlive the call.
+    let hr = unsafe {
+        PrepareLayer(
+            &info,
+            PCWSTR::from_raw(lp.as_ptr()),
+            descriptors.as_ptr(),
+            descriptors.len(),
+        )
+    };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("PrepareLayer: {e}")))?;
     Ok(())
 }
 
-/// Populate the base-OS VHD backing `layer_path` using the NT filesystem
-/// contents already staged there. Called once per base image to transform a
-/// "raw" imported base layer into one HCS can chain.
+/// Tear down the prepared state of a layer at `layer_path`. Pair with
+/// [`prepare_layer`].
 ///
-/// `options_json` is typically `""` or `"{\"Kind\":\"BaseOSLayer\"}"`
-/// depending on host version; pass an empty string for defaults.
+/// Wraps `vmcompute.dll!UnprepareLayer`. Matches hcsshim's
+/// `internal/wclayer/unpreparelayer.go::UnprepareLayer`.
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT.
-pub fn setup_base_os_layer(
-    layer_path: &Path,
-    vhd_handle: HANDLE,
-    options_json: &str,
-) -> io::Result<()> {
-    let lp = path_to_hstring(layer_path);
-    let opts = HSTRING::from(options_json);
-    // SAFETY: `lp` and `opts` are live `HSTRING`s; `vhd_handle` is owned by
-    // the caller and valid for the duration of the call.
-    unsafe {
-        HcsSetupBaseOSLayer(&lp, vhd_handle, &opts)
-            .map_err(|e| io::Error::other(format!("HcsSetupBaseOSLayer: {e}")))?;
-    }
+/// Returns an [`io::Error`] if `UnprepareLayer` returns a non-success HRESULT.
+pub fn unprepare_layer(layer_path: &Path) -> io::Result<()> {
+    windows::core::link!(
+        "vmcompute.dll" "system" fn UnprepareLayer(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+        ) -> windows::core::HRESULT
+    );
+    let info = driver_info();
+    let lp = HSTRING::from(layer_path.as_os_str());
+    // SAFETY: same as `activate_layer`.
+    let hr = unsafe { UnprepareLayer(&info, PCWSTR::from_raw(lp.as_ptr())) };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("UnprepareLayer: {e}")))?;
     Ok(())
 }
 
@@ -283,95 +392,62 @@ pub fn process_base_layer(layer_path: &Path) -> io::Result<()> {
 /// This is the canonical scratch-layer-creation path for Windows containers:
 /// matches `hcsshim/internal/wclayer/createscratchlayer.go::CreateScratchLayer`,
 /// which is the production code path used by hcsshim, containerd-shim-runhcs,
-/// runhcs, and Moby. Allocates a sparse `sandbox.vhdx` and supporting metadata
-/// inside `layer_path`; the caller then drives `HcsFormatWritableLayerVhd`,
-/// optional `HcsSetupBaseOSLayer`, `HcsGetLayerVhdMountPath`, and
-/// `HcsAttachLayerStorageFilter` to complete the writable layer.
+/// runhcs, and Moby. `CreateSandboxLayer` produces a fully-formatted
+/// `sandbox.vhdx` and supporting metadata inside `layer_path` in a single
+/// call — there is no separate `Format` step. To make the layer mountable,
+/// the caller chains [`activate_layer`] → [`prepare_layer`] →
+/// [`get_layer_mount_path`], mirroring hcsshim's
+/// `internal/layers/wcow_mount.go::mountProcessIsolatedWCIFSLayers`.
 ///
 /// `parent_chain` is child-to-parent ordered (first entry = immediate parent,
 /// last entry = base OS layer).
 ///
+/// # ABI notes
+///
+/// * `WC_DRIVER_INFO` carries a 4-byte flavour discriminant (.NET reference
+///   `int Type; IntPtr Path;`) and an 8-byte pointer to a UTF-16 home-dir
+///   string. Both hcsshim and the .NET reference initialise it with
+///   `{flavour: 1, info_buffer: &""}` — `FilterDriver` flavour with a
+///   pointer to an *empty UTF-16 string*, NOT a NULL pointer. `vmcompute`
+///   unconditionally dereferences `info_buffer`; NULL crashes inside
+///   `vmcompute.dll` with `STATUS_ACCESS_VIOLATION` at ~offset 0x30e6a.
+/// * `WC_LAYER_DESCRIPTOR` is 16-byte GUID + 4-byte `Flags` + 4-byte pad +
+///   8-byte path pointer = 32 bytes on x64.
+/// * Descriptor count is passed as `usize` to match hcsshim's
+///   `internal/wclayer/wclayer.go` Go binding; the underlying C signature
+///   is `ULONG count`, and both bindings place a correctly-extended 4-byte
+///   value in the stack slot.
+///
 /// # Errors
 ///
 /// Returns an [`io::Error`] if `CreateSandboxLayer` returns a non-success
-/// HRESULT or if the descriptor count overflows `u32`.
+/// HRESULT or if the descriptor `id` field cannot be parsed as a GUID.
 pub fn create_sandbox_layer(layer_path: &Path, parent_chain: &LayerChain) -> io::Result<()> {
-    // Mirrors `WC_DRIVER_INFO` from the Windows SDK: a USHORT flavour followed
-    // by an LPCWSTR info buffer. `#[repr(C)]` keeps the field ordering and lets
-    // the compiler insert the natural 6-byte pad to 8-byte align the pointer
-    // on x64 (total size = 16 bytes), which matches what vmcompute.dll expects.
-    #[repr(C)]
-    struct WcDriverInfo {
-        flavour: u16,
-        info_buffer: *const u16,
-    }
-    // Mirrors `WC_LAYER_DESCRIPTOR`: 16-byte GUID, 8-byte flags, 8-byte path
-    // pointer = 32 bytes total on x64. `#[repr(C)]` preserves layout.
-    #[repr(C)]
-    struct WcLayerDescriptor {
-        layer_id: windows::core::GUID,
-        flags: u64,
-        path: *const u16,
-    }
-
-    // Own the wide-string path buffers locally so the raw pointers stored in
-    // each descriptor stay valid across the FFI call.
-    let path_buffers: Vec<Vec<u16>> = parent_chain
-        .0
-        .iter()
-        .map(|l| {
-            let mut w: Vec<u16> = Path::new(&l.path).as_os_str().encode_wide().collect();
-            w.push(0);
-            w
-        })
-        .collect();
-
-    let descriptors: Vec<WcLayerDescriptor> = parent_chain
-        .0
-        .iter()
-        .zip(path_buffers.iter())
-        .map(|(l, buf)| {
-            let id = parse_guid_str(&l.id)?;
-            Ok(WcLayerDescriptor {
-                layer_id: id,
-                flags: 0,
-                path: buf.as_ptr(),
-            })
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-
-    let info = WcDriverInfo {
-        flavour: 0,
-        info_buffer: std::ptr::null(),
-    };
-    let layer_path_w = HSTRING::from(layer_path.as_os_str());
-
     windows::core::link!(
         "vmcompute.dll" "system" fn CreateSandboxLayer(
             info: *const WcDriverInfo,
             id: PCWSTR,
             parent: usize,
             descriptors: *const WcLayerDescriptor,
-            descriptor_count: u32,
+            descriptor_count: usize,
         ) -> windows::core::HRESULT
     );
 
-    // Descriptor count is well under 2^32 — chains are a handful of layers,
-    // never billions — so the `as u32` cast cannot truncate in practice.
-    let descriptor_count = u32::try_from(descriptors.len())
-        .map_err(|_| io::Error::other("CreateSandboxLayer: descriptor count overflows u32"))?;
+    let info = driver_info();
+    let layer_path_w = HSTRING::from(layer_path.as_os_str());
+    let (_path_buffers, descriptors) = parent_chain_to_descriptors(parent_chain)?;
 
-    // SAFETY: `info`, `layer_path_w`, `descriptors`, and `path_buffers` all
-    // outlive the call. The descriptors point into `path_buffers` which we
-    // also hold by value. `CreateSandboxLayer` only reads through these
-    // pointers and returns an HRESULT.
+    // SAFETY: `info` borrows `EMPTY_HOME_DIR` (static); `layer_path_w` is a
+    // live `HSTRING`; `descriptors` and the wide-string buffers it points
+    // into (`_path_buffers`) outlive the call. `CreateSandboxLayer` only
+    // reads through these pointers and returns an HRESULT.
     let hr = unsafe {
         CreateSandboxLayer(
             &info,
             PCWSTR::from_raw(layer_path_w.as_ptr()),
             0,
             descriptors.as_ptr(),
-            descriptor_count,
+            descriptors.len(),
         )
     };
     hr.ok()
@@ -473,47 +549,74 @@ pub fn layer_id_for_path(layer_path: &Path) -> io::Result<String> {
     ))
 }
 
-/// Retrieve the host mount path of a layer's VHD, given an open VHD handle.
+/// Retrieve the host mount path of a layer at `layer_path`. The layer must
+/// already be activated + prepared ([`activate_layer`] + [`prepare_layer`]).
 ///
-/// HCS allocates the returned wide string with `LocalAlloc`; this wrapper
-/// copies it into an owned `String` and frees the original with `LocalFree`
-/// before returning, so callers never deal with the raw buffer.
+/// Wraps `vmcompute.dll!GetLayerMountPath`. Matches hcsshim's
+/// `internal/wclayer/getlayermountpath.go::GetLayerMountPath`: a two-call
+/// pattern (first call with `buffer=NULL` to learn the required length,
+/// second call to fill an allocated buffer of that length).
+///
+/// Returns an empty string when the layer has no mount path (e.g. an
+/// activated read-only layer that has not been prepared).
 ///
 /// # Errors
 ///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT or if the
-/// returned wide string is not valid UTF-16.
-pub fn get_layer_vhd_mount_path(vhd_handle: HANDLE) -> io::Result<String> {
-    // The windows-rs 0.62 wrapper already threads the `*mut PWSTR` out-param
-    // for us and returns `Result<PWSTR>`. The underlying HCS contract is that
-    // the returned buffer was allocated with `LocalAlloc` and must be freed
-    // by the caller via `LocalFree` (matches hcsshim's Go binding).
-    //
-    // SAFETY: The caller owns `vhd_handle` and guarantees it is valid for the
-    // duration of the call.
-    let pwstr: PWSTR = unsafe {
-        HcsGetLayerVhdMountPath(vhd_handle)
-            .map_err(|e| io::Error::other(format!("HcsGetLayerVhdMountPath: {e}")))?
-    };
+/// Returns an [`io::Error`] if either call returns a non-success HRESULT.
+pub fn get_layer_mount_path(layer_path: &Path) -> io::Result<String> {
+    windows::core::link!(
+        "vmcompute.dll" "system" fn GetLayerMountPath(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+            length: *mut usize,
+            buffer: *mut u16,
+        ) -> windows::core::HRESULT
+    );
+    let info = driver_info();
+    let lp = HSTRING::from(layer_path.as_os_str());
 
-    if pwstr.is_null() {
+    // Pass 1: discover the required wide-char length (HCS writes it through
+    // `length`; `buffer=NULL` signals "size query only", same as hcsshim's
+    // first `_getLayerMountPath` call).
+    let mut length: usize = 0;
+    // SAFETY: `info` borrows `EMPTY_HOME_DIR` (static); `lp` is live; `&mut
+    // length` is an exclusively-borrowed out-pointer; the buffer is
+    // explicitly null which `GetLayerMountPath` accepts for the size query.
+    let hr = unsafe {
+        GetLayerMountPath(
+            &info,
+            PCWSTR::from_raw(lp.as_ptr()),
+            &mut length,
+            std::ptr::null_mut(),
+        )
+    };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("GetLayerMountPath(size query): {e}")))?;
+
+    if length == 0 {
         return Ok(String::new());
     }
 
-    // Decode then free. We intentionally decode before LocalFree so that a
-    // UTF-16 error path still releases the buffer.
-    // SAFETY: `pwstr` is non-null and points at a HCS-allocated, null-
-    // terminated UTF-16 buffer that remains valid until we `LocalFree` it.
-    let decoded = unsafe { pwstr.to_string() };
+    // Pass 2: allocate `length` u16s and fill them. `length` already includes
+    // the null terminator.
+    let mut buf = vec![0u16; length];
+    // SAFETY: same as pass 1 plus `buf.as_mut_ptr()` is a valid writable
+    // pointer to a `length`-element u16 buffer that outlives the call.
+    let hr = unsafe {
+        GetLayerMountPath(
+            &info,
+            PCWSTR::from_raw(lp.as_ptr()),
+            &mut length,
+            buf.as_mut_ptr(),
+        )
+    };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("GetLayerMountPath(fill): {e}")))?;
 
-    // SAFETY: `pwstr.0` was allocated by HCS via `LocalAlloc` (per
-    // `HcsGetLayerVhdMountPath` docs), so `LocalFree` on the same pointer
-    // correctly releases it.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(pwstr.0.cast())));
-    }
-
-    decoded.map_err(|e| io::Error::other(format!("UTF-16 mount path decode: {e}")))
+    // Decode up to the first null (HCS guarantees one within `length`).
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16(&buf[..end])
+        .map_err(|e| io::Error::other(format!("UTF-16 mount path decode: {e}")))
 }
 
 // ---------------------------------------------------------------------------
