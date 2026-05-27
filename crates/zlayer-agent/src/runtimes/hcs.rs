@@ -166,10 +166,10 @@ pub enum IsolationMode {
 ///
 /// Marked `#[must_use]` because the caller always needs to read the result;
 /// throwing it away would silently leave isolation unresolved.
-// Used by Hyper-V auto-detection path only when the user sets
-// `isolation: auto` in the spec; some cfg combinations compile the function
-// without any callers, so allow dead_code unconditionally.
-#[allow(dead_code)]
+///
+/// Called once from [`HcsConfig::default`] to seed `default_isolation`, so the
+/// host-SKU probe runs at config-construction time rather than on the
+/// per-container hot path.
 #[must_use]
 pub(crate) fn resolve_isolation_auto() -> IsolationMode {
     use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOEXW};
@@ -216,11 +216,10 @@ pub(crate) fn resolve_isolation_auto() -> IsolationMode {
 /// * `None` (spec did not set a value) and `Some(Auto)` both defer to the
 ///   `config_default` argument — typically [`HcsConfig::default_isolation`].
 ///
-/// `HcsConfig::default_isolation` is already a concrete
-/// [`IsolationMode`], so the caller decides whether that default itself was
-/// derived from [`resolve_isolation_auto`] at config-load time or pinned by
-/// the operator. This keeps the per-call hot path free of an OS-probe FFI
-/// call.
+/// `HcsConfig::default_isolation` is already a concrete [`IsolationMode`].
+/// [`HcsConfig::default`] seeds it from [`resolve_isolation_auto`] at
+/// config-construction time (an operator may still override it), so this
+/// per-call path stays free of an OS-probe FFI call.
 fn spec_isolation_to_internal(
     spec: Option<zlayer_spec::IsolationMode>,
     config_default: IsolationMode,
@@ -266,7 +265,11 @@ impl Default for HcsConfig {
         Self {
             storage_root: std::env::var("ZLAYER_HCS_STORAGE_ROOT")
                 .map_or_else(|_| dirs.containers().join("hcs"), PathBuf::from),
-            default_isolation: IsolationMode::default(),
+            // Resolve isolation from the host SKU once, at config-construction
+            // time: Hyper-V on client SKUs (where process isolation can only
+            // run kernel-matched images), Process on Server. Both the daemon
+            // and the tests inherit this through `..HcsConfig::default()`.
+            default_isolation: resolve_isolation_auto(),
             default_scratch_size_gb: 20,
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,

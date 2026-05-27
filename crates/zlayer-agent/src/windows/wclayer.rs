@@ -39,7 +39,7 @@ use zlayer_hcs::schema::{Layer, SchemaVersion};
 // ---------------------------------------------------------------------------
 
 /// `WC_DRIVER_INFO`. See [`create_sandbox_layer`] for the full ABI write-up
-/// (flavour discriminant width, info_buffer null-pointer trap, etc.).
+/// (flavour discriminant width, `info_buffer` null-pointer trap, etc.).
 #[repr(C)]
 struct WcDriverInfo {
     flavour: u32,
