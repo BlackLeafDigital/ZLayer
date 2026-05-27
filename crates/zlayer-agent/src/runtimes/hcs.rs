@@ -167,9 +167,13 @@ pub enum IsolationMode {
 /// Marked `#[must_use]` because the caller always needs to read the result;
 /// throwing it away would silently leave isolation unresolved.
 ///
-/// Called once from [`HcsConfig::default`] to seed `default_isolation`, so the
-/// host-SKU probe runs at config-construction time rather than on the
-/// per-container hot path.
+/// NOT yet wired as the [`HcsConfig::default`] default: Hyper-V isolation
+/// needs the UVM subsystem (tracked as C6) which is not implemented, so
+/// promoting a client SKU to Hyper-V today would route to non-functional
+/// code. Once the UVM path lands, wire this here (and ideally extend it to be
+/// container-build-vs-host-build aware, since process isolation works on
+/// 24H2 client for build-matched images).
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn resolve_isolation_auto() -> IsolationMode {
     use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOEXW};
@@ -265,11 +269,16 @@ impl Default for HcsConfig {
         Self {
             storage_root: std::env::var("ZLAYER_HCS_STORAGE_ROOT")
                 .map_or_else(|_| dirs.containers().join("hcs"), PathBuf::from),
-            // Resolve isolation from the host SKU once, at config-construction
-            // time: Hyper-V on client SKUs (where process isolation can only
-            // run kernel-matched images), Process on Server. Both the daemon
-            // and the tests inherit this through `..HcsConfig::default()`.
-            default_isolation: resolve_isolation_auto(),
+            // Default to process isolation — the only isolation mode wired
+            // end-to-end today. Hyper-V isolation needs the UVM subsystem
+            // (boot the image's UtilityVM as a separate compute system + host
+            // the container in it over the GCS bridge), which is not yet
+            // implemented (tracked as C6). Process isolation works on Windows
+            // Server and, since Windows 11 24H2 (build 26100), on Windows
+            // client too — provided the container image build matches the host
+            // build. See [`resolve_isolation_auto`] for the SKU-aware logic to
+            // wire here once Hyper-V isolation lands.
+            default_isolation: IsolationMode::Process,
             default_scratch_size_gb: 20,
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,
@@ -978,9 +987,21 @@ impl HcsRuntime {
                 })
         });
 
+        // `Storage.Path` for a process-isolated container must be the prepared
+        // writable layer's *volume GUID path* (`\\?\Volume{GUID}\`, with a
+        // trailing backslash), as returned by `GetLayerMountPath` and captured
+        // in `vhd_mount_path()` — NOT the layer directory. HCS validates this
+        // format and rejects a plain directory with `ERROR_NOT_A_REPARSE_POINT`
+        // (0x80071126) during "Construct". Matches hcsshim's
+        // `internal/hcsoci/hcsdoc_wcow.go` (`v2Container.Storage.Path =
+        // coi.Spec.Root.Path`, a volume GUID path).
+        let mut root_path = scratch_layer.vhd_mount_path().to_string();
+        if !root_path.is_empty() && !root_path.ends_with('\\') {
+            root_path.push('\\');
+        }
         let storage = HcsStorage {
             layers: parent_layers,
-            path: Some(scratch_layer.layer_path().to_string_lossy().into_owned()),
+            path: Some(root_path),
         };
 
         let networking = if namespace_ids.is_empty() {

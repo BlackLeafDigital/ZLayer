@@ -81,8 +81,10 @@ const DEFAULT_DAEMON_ADDR: &str = "http://127.0.0.1:3669";
 /// keep fixture provenance under our control.
 const LINUX_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer/test-fixtures:latest";
 
-/// Nanoserver image used for the Windows service.
-const WINDOWS_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";
+/// Nanoserver image used for the Windows service. `ltsc2025` (build 26100)
+/// so it build-matches a Windows 11 24H2 host and runs process-isolated
+/// without the not-yet-implemented Hyper-V UVM path.
+const WINDOWS_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2025";
 
 /// How long to poll before declaring the deployment "not Running". Cold pulls
 /// of nanoserver can take several minutes, so the ceiling is generous.

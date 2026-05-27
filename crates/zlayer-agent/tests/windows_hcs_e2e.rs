@@ -35,9 +35,11 @@ use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime, IsolationMode};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
-/// MCR nanoserver tag known to be available for ltsc2022. Chosen because
-/// it is small (~120 MB compressed) and exits-on-empty-entrypoint friendly.
-const TEST_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";
+/// MCR nanoserver `ltsc2025` (Windows Server 2025, build 26100). Chosen so the
+/// container build matches a Windows 11 24H2 host (26100) and process
+/// isolation works without Hyper-V; small (~120 MB compressed) and
+/// exits-on-empty-entrypoint friendly.
+const TEST_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2025";
 
 /// Generate a unique short suffix so parallel CI shards do not collide on
 /// the per-test storage root or HCS system id.
