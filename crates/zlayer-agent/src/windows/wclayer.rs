@@ -19,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use serde::Serialize;
@@ -26,8 +27,7 @@ use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::System::HostComputeSystem::{
     HcsAttachLayerStorageFilter, HcsDestroyLayer, HcsDetachLayerStorageFilter, HcsExportLayer,
-    HcsFormatWritableLayerVhd, HcsGetLayerVhdMountPath, HcsImportLayer, HcsInitializeWritableLayer,
-    HcsSetupBaseOSLayer,
+    HcsFormatWritableLayerVhd, HcsGetLayerVhdMountPath, HcsImportLayer, HcsSetupBaseOSLayer,
 };
 
 use zlayer_hcs::schema::{Layer, SchemaVersion};
@@ -162,7 +162,7 @@ pub fn destroy_layer(layer_path: &Path) -> io::Result<()> {
 /// using `parent_chain` as the read-only parents. After a successful call,
 /// reads from `layer_path` present the merged filesystem view to the host.
 ///
-/// Typical use: after [`initialize_writable_layer`], attach the filter so the
+/// Typical use: after [`create_sandbox_layer`], attach the filter so the
 /// compute system can bind-mount `layer_path` as its root filesystem.
 ///
 /// # Errors
@@ -193,33 +193,6 @@ pub fn detach_layer_storage_filter(layer_path: &Path) -> io::Result<()> {
     unsafe {
         HcsDetachLayerStorageFilter(&lp)
             .map_err(|e| io::Error::other(format!("HcsDetachLayerStorageFilter: {e}")))?;
-    }
-    Ok(())
-}
-
-/// Initialize a writable (scratch) sandbox layer at `writable_layer_path`.
-/// HCS creates a sparse `sandbox.vhdx` inside the directory and, together
-/// with `parent_chain`, prepares it for use as the container's scratch space.
-///
-/// `options_json` is an optional JSON document with sandbox-specific knobs
-/// (e.g. `{"SandboxSize": 21474836480}`). Pass `""` for HCS defaults.
-///
-/// # Errors
-///
-/// Returns an [`io::Error`] if HCS returns a non-success HRESULT.
-pub fn initialize_writable_layer(
-    writable_layer_path: &Path,
-    parent_chain: &LayerChain,
-    options_json: &str,
-) -> io::Result<()> {
-    let layer_data = parent_chain.to_layer_data_json()?;
-    let wp = path_to_hstring(writable_layer_path);
-    let ld = HSTRING::from(layer_data);
-    let opts = HSTRING::from(options_json);
-    // SAFETY: All three arguments are live `HSTRING`s that outlive the call.
-    unsafe {
-        HcsInitializeWritableLayer(&wp, &ld, &opts)
-            .map_err(|e| io::Error::other(format!("HcsInitializeWritableLayer: {e}")))?;
     }
     Ok(())
 }
@@ -302,6 +275,202 @@ pub fn process_base_layer(layer_path: &Path) -> io::Result<()> {
     hr.ok()
         .map_err(|e| io::Error::other(format!("ProcessBaseImage: {e}")))?;
     Ok(())
+}
+
+/// Create a fresh scratch (writable) layer on disk via
+/// `vmcompute.dll!CreateSandboxLayer`.
+///
+/// This is the canonical scratch-layer-creation path for Windows containers:
+/// matches `hcsshim/internal/wclayer/createscratchlayer.go::CreateScratchLayer`,
+/// which is the production code path used by hcsshim, containerd-shim-runhcs,
+/// runhcs, and Moby. Allocates a sparse `sandbox.vhdx` and supporting metadata
+/// inside `layer_path`; the caller then drives `HcsFormatWritableLayerVhd`,
+/// optional `HcsSetupBaseOSLayer`, `HcsGetLayerVhdMountPath`, and
+/// `HcsAttachLayerStorageFilter` to complete the writable layer.
+///
+/// `parent_chain` is child-to-parent ordered (first entry = immediate parent,
+/// last entry = base OS layer).
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if `CreateSandboxLayer` returns a non-success
+/// HRESULT or if the descriptor count overflows `u32`.
+pub fn create_sandbox_layer(layer_path: &Path, parent_chain: &LayerChain) -> io::Result<()> {
+    // Mirrors `WC_DRIVER_INFO` from the Windows SDK: a USHORT flavour followed
+    // by an LPCWSTR info buffer. `#[repr(C)]` keeps the field ordering and lets
+    // the compiler insert the natural 6-byte pad to 8-byte align the pointer
+    // on x64 (total size = 16 bytes), which matches what vmcompute.dll expects.
+    #[repr(C)]
+    struct WcDriverInfo {
+        flavour: u16,
+        info_buffer: *const u16,
+    }
+    // Mirrors `WC_LAYER_DESCRIPTOR`: 16-byte GUID, 8-byte flags, 8-byte path
+    // pointer = 32 bytes total on x64. `#[repr(C)]` preserves layout.
+    #[repr(C)]
+    struct WcLayerDescriptor {
+        layer_id: windows::core::GUID,
+        flags: u64,
+        path: *const u16,
+    }
+
+    // Own the wide-string path buffers locally so the raw pointers stored in
+    // each descriptor stay valid across the FFI call.
+    let path_buffers: Vec<Vec<u16>> = parent_chain
+        .0
+        .iter()
+        .map(|l| {
+            let mut w: Vec<u16> = Path::new(&l.path).as_os_str().encode_wide().collect();
+            w.push(0);
+            w
+        })
+        .collect();
+
+    let descriptors: Vec<WcLayerDescriptor> = parent_chain
+        .0
+        .iter()
+        .zip(path_buffers.iter())
+        .map(|(l, buf)| {
+            let id = parse_guid_str(&l.id)?;
+            Ok(WcLayerDescriptor {
+                layer_id: id,
+                flags: 0,
+                path: buf.as_ptr(),
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let info = WcDriverInfo {
+        flavour: 0,
+        info_buffer: std::ptr::null(),
+    };
+    let layer_path_w = HSTRING::from(layer_path.as_os_str());
+
+    windows::core::link!(
+        "vmcompute.dll" "system" fn CreateSandboxLayer(
+            info: *const WcDriverInfo,
+            id: PCWSTR,
+            parent: usize,
+            descriptors: *const WcLayerDescriptor,
+            descriptor_count: u32,
+        ) -> windows::core::HRESULT
+    );
+
+    // Descriptor count is well under 2^32 — chains are a handful of layers,
+    // never billions — so the `as u32` cast cannot truncate in practice.
+    let descriptor_count = u32::try_from(descriptors.len())
+        .map_err(|_| io::Error::other("CreateSandboxLayer: descriptor count overflows u32"))?;
+
+    // SAFETY: `info`, `layer_path_w`, `descriptors`, and `path_buffers` all
+    // outlive the call. The descriptors point into `path_buffers` which we
+    // also hold by value. `CreateSandboxLayer` only reads through these
+    // pointers and returns an HRESULT.
+    let hr = unsafe {
+        CreateSandboxLayer(
+            &info,
+            PCWSTR::from_raw(layer_path_w.as_ptr()),
+            0,
+            descriptors.as_ptr(),
+            descriptor_count,
+        )
+    };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("CreateSandboxLayer: {e}")))?;
+    Ok(())
+}
+
+/// Parse a canonical-format GUID string (lowercase 8-4-4-4-12) into a
+/// `windows::core::GUID`. Returns an error if `s` is not exactly 36 chars in
+/// the expected layout. The `layer_id_for_path` helper produces this format.
+fn parse_guid_str(s: &str) -> io::Result<windows::core::GUID> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+    {
+        return Err(io::Error::other(format!(
+            "parse_guid_str: malformed GUID {s:?}"
+        )));
+    }
+    let d1 = u32::from_str_radix(&s[0..8], 16)
+        .map_err(|e| io::Error::other(format!("parse_guid_str d1: {e}")))?;
+    let d2 = u16::from_str_radix(&s[9..13], 16)
+        .map_err(|e| io::Error::other(format!("parse_guid_str d2: {e}")))?;
+    let d3 = u16::from_str_radix(&s[14..18], 16)
+        .map_err(|e| io::Error::other(format!("parse_guid_str d3: {e}")))?;
+    let mut d4 = [0u8; 8];
+    d4[0] = u8::from_str_radix(&s[19..21], 16)
+        .map_err(|e| io::Error::other(format!("parse_guid_str d4[0]: {e}")))?;
+    d4[1] = u8::from_str_radix(&s[21..23], 16)
+        .map_err(|e| io::Error::other(format!("parse_guid_str d4[1]: {e}")))?;
+    for i in 0..6 {
+        let start = 24 + i * 2;
+        d4[2 + i] = u8::from_str_radix(&s[start..start + 2], 16)
+            .map_err(|e| io::Error::other(format!("parse_guid_str d4[{}]: {e}", 2 + i)))?;
+    }
+    Ok(windows::core::GUID {
+        data1: d1,
+        data2: d2,
+        data3: d3,
+        data4: d4,
+    })
+}
+
+/// Derive the HCS layer-id for a given on-disk layer path.
+///
+/// HCS keys parent layers by `NameToGuid(basename(layer_path))`, NOT by any
+/// caller-supplied id. The id field in a `LayerData` JSON record MUST be the
+/// GUID returned here for HCS to find the parent's backing VHD during
+/// `HcsImportLayer` / `CreateSandboxLayer` / `HcsAttachLayerStorageFilter`
+/// chain walks. Passing an unrelated UUID yields `ERROR_PATH_NOT_FOUND`
+/// (`0x80070003`) the moment HCS tries to resolve a parent.
+///
+/// Equivalent to hcsshim's `internal/wclayer/layerid.go::LayerID(path)`. Must
+/// be called for every layer path that goes into a [`LayerChain`] consumed by
+/// HCS.
+///
+/// Backing FFI: `vmcompute.dll!NameToGuid(name: PCWSTR, guid: *mut GUID)
+/// -> HRESULT` — not surfaced by `windows::Win32::System::HostComputeSystem`
+/// in `windows-rs 0.62`, so the link is declared inline.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if the path has no basename or if `NameToGuid`
+/// returns a non-success HRESULT.
+pub fn layer_id_for_path(layer_path: &Path) -> io::Result<String> {
+    let basename = layer_path.file_name().ok_or_else(|| {
+        io::Error::other(format!(
+            "layer_id_for_path: no basename in {}",
+            layer_path.display()
+        ))
+    })?;
+    let name_w = HSTRING::from(basename);
+    windows::core::link!(
+        "vmcompute.dll" "system" fn NameToGuid(name: PCWSTR, guid: *mut windows::core::GUID) -> windows::core::HRESULT
+    );
+    let mut guid = windows::core::GUID::zeroed();
+    // SAFETY: `name_w` is a live `HSTRING` whose null-terminated UTF-16 buffer
+    // outlives the call; `&mut guid` is a valid, exclusively-borrowed out-pointer.
+    let hr = unsafe { NameToGuid(PCWSTR::from_raw(name_w.as_ptr()), &mut guid) };
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("NameToGuid({basename:?}): {e}")))?;
+    // Canonical lowercase 8-4-4-4-12 form (matches hcsshim's `LayerID` output).
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    ))
 }
 
 /// Retrieve the host mount path of a layer's VHD, given an open VHD handle.

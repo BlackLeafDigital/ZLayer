@@ -14,6 +14,7 @@
 #   8. clippy on native workspace     (host, -D warnings)
 #   9. clippy (msvc)                  (x86_64-pc-windows-msvc, no UI crates)
 #  10. clippy (apple aarch64)         (aarch64-apple-darwin, no UI crates)
+#  11. zlayer check (musl)            (x86_64-unknown-linux-musl, zlayer only)
 #
 # Notes:
 #   - The Leptos UI crates (zlayer-manager, zlayer-web) have `default = []`
@@ -112,6 +113,38 @@ cargo clippy --workspace --all-targets "${UI_EXCLUDES[@]}" --target "$WIN_TARGET
 
 section "10/10 clippy ($MAC_TARGET, excluding UI crates, -D warnings)"
 cargo clippy --workspace --all-targets "${UI_EXCLUDES[@]}" --target "$MAC_TARGET" -- -D warnings
+
+# 11: static-musl Linux build mirrors what build.yml's build-linux-amd64-musl
+# job does on CI. It's gated because the host needs either:
+#   - `cross` on PATH (which spawns the cross/x86_64-unknown-linux-musl
+#     docker image, complete with musl libc + libseccomp + openssl), OR
+#   - the x86_64-unknown-linux-musl rustup target AND host-side musl C libs
+#     (libseccomp-musl, etc.) — which most dev machines don't have.
+# If neither is workable, we print a diagnostic and skip — the dev box not
+# having musl set up shouldn't abort the rest of the workspace check.
+MUSL_TARGET="x86_64-unknown-linux-musl"
+section "11/11 zlayer check ($MUSL_TARGET, musl static)"
+if command -v cross >/dev/null 2>&1; then
+  echo "    using cross"
+  cross check \
+    --target "$MUSL_TARGET" \
+    -p zlayer \
+    --features youki-runtime \
+    --all-targets
+elif rustup target list --installed | grep -q "^${MUSL_TARGET}$"; then
+  echo "    cross not on PATH; falling back to cargo check + rustup musl target."
+  echo "    NOTE: this will likely fail without host musl C libs (libseccomp-musl, etc.)."
+  echo "    If it does, install cross (cargo install --locked --version 0.2.5 cross) and re-run."
+  cargo check \
+    --target "$MUSL_TARGET" \
+    -p zlayer \
+    --features youki-runtime \
+    --all-targets
+else
+  echo "    SKIP: neither 'cross' (cargo install --locked --version 0.2.5 cross)"
+  echo "          nor rustup target $MUSL_TARGET (rustup target add $MUSL_TARGET)"
+  echo "          is available. CI runs this via cross-rs in build-linux-amd64-musl."
+fi
 
 if [[ "$WITH_TESTS" == "1" ]]; then
   section "optional: cargo test --workspace (host, excluding UI crates)"

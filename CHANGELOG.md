@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.51.1 - 2026-05-26
+
+### Fixed
+- Windows HCS runtime no longer invokes `vmcompute.dll!ProcessBaseImage` on non-Windows images. `CompositeRuntime::pull_image` fans out to both the HCS primary and the WSL2 delegate; when an alpine/linux image landed on the HCS path, the unpacker called `ProcessBaseLayer` against a layer chain that has no `Hives/` / `UtilityVM/` / `Files/Windows/System32/` layout, returning `ERROR_PATH_NOT_FOUND (0x80070003)` and failing the whole composite pull. `HcsRuntime::do_pull` now inspects the OCI image config's `os` field via `ImagePuller::image_os` before invoking the unpacker; non-Windows images bail early with the new `AgentError::WrongPlatform { runtime, expected, actual, image }` variant. `CompositeRuntime::pull_image` / `pull_image_with_policy` treat that specific variant as a soft skip, log at debug, and let the delegate's parallel pull own the image. Other primary errors still propagate as `PullFailed`.
+- Image resolution no longer silently routes unqualified names (e.g. `zarcrunner-executor:latest`) to Docker Hub. ZLayer now resolves locally-built images first, with multiple name forms (bare, `library/<bare>`, `docker.io/library/<bare>`), so an image built via `zlayer build -t myapp:latest` is found regardless of how the reference normalized in spec parsing. If an unqualified name is not present locally, the pull fails with a clear error directing the user to use a full registry URL or run `zlayer build` — no more 401s from `index.docker.io` for images that were never on Docker Hub.
+- `PullPolicy::IfNotPresent` now matches Docker/Kubernetes semantics literally: when the image is present locally, no manifest revalidation against the remote registry is attempted, regardless of whether the tag is `:latest`. The previous behaviour silently upgraded `IfNotPresent` → `Newer` for `:latest` images, which broke deploys of locally-built artifacts against unreachable/auth-walled registries. Users who want redeploy-picks-up-new-`:latest` behaviour must now set `pull_policy: newer` explicitly.
+- `ImageRef` wrapper type added to `zlayer-types` so the user's original image string survives round-trips through the spec, API, and Docker-compatibility surfaces (no more silent `docker.io/library/` prepending). The parsed canonical form is still available via `.parsed()` for equality / dedup. Compose, Swarm, and API DTOs now preserve verbatim what the user wrote.
+- Registry `pull_manifest_with_policy`, `pull_image_with_policy`, and `pull_image_config_with_policy` now take a typed `PullPolicy` instead of `force_refresh: bool`, so `IfNotPresent` / `Never` can short-circuit remote checks at the cache layer rather than only inverting at the runtime layer.
+
+### Changed
+- Local-registry lookup in `zlayer-registry` (`try_local_registry`) now tries multiple name forms in priority order: the normalized name first, then `docker.io/` / `docker.io/library/` / `library/` strips, then the bare last segment, with deduplication. Logs a debug line when a non-primary candidate is the one that hit.
+
 ## [0.51.0] - 2026-05-24
 
 ### Changed

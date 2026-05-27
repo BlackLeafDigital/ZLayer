@@ -1,9 +1,14 @@
 //! Writable (scratch) sandbox layer for a Windows container.
 //!
-//! The scratch layer overlays the parent read-only chain. HCS requires us to:
+//! Mirrors hcsshim's canonical scratch-creation sequence
+//! (`internal/wclayer/createscratchlayer.go::CreateScratchLayer` + the
+//! `internal/layers/wcow_mount.go` activation/format flow). HCS requires us
+//! to:
 //!   1. Create a new layer directory on disk.
-//!   2. `HcsInitializeWritableLayer` — scaffold the layer metadata and
-//!      allocate a sparse `sandbox.vhdx` inside the directory.
+//!   2. `vmcompute.dll!CreateSandboxLayer` (via
+//!      [`crate::windows::wclayer::create_sandbox_layer`]) — scaffold the
+//!      layer metadata and allocate a sparse `sandbox.vhdx` inside the
+//!      directory.
 //!   3. Open `sandbox.vhdx` for read/write and run
 //!      `HcsFormatWritableLayerVhd` against the handle.
 //!   4. For a fresh base-OS bootstrap, run `HcsSetupBaseOSLayer` to
@@ -16,7 +21,7 @@
 //! We return the mount path of the VHD so the caller can reference it in the
 //! container/VM document. On drop we detach the filter and destroy the layer.
 //!
-//! The `sandbox.vhdx` file itself is created by `HcsInitializeWritableLayer`;
+//! The `sandbox.vhdx` file itself is created by `CreateSandboxLayer`;
 //! we do not `CreateFileW(CREATE_ALWAYS)` because that would overwrite the
 //! VHD HCS just scaffolded. We open it with `OPEN_EXISTING` instead.
 
@@ -120,14 +125,17 @@ impl Drop for WritableLayer {
     }
 }
 
-/// Build a fresh writable scratch layer backed by a new `sandbox.vhdx` sized
-/// at `size_gb`. `parent_chain` is the child-to-parent chain of the
-/// underlying read-only image layers (the first entry is the immediate
-/// parent; the last is the base OS layer).
+/// Build a fresh writable scratch layer backed by a new `sandbox.vhdx`.
+/// `parent_chain` is the child-to-parent chain of the underlying read-only
+/// image layers (the first entry is the immediate parent; the last is the
+/// base OS layer).
 ///
 /// If `is_base_os_bootstrap` is `true`, runs `HcsSetupBaseOSLayer` — needed
 /// only the first time an image's base OS layer is prepared. For subsequent
 /// container starts off the same base, pass `false`.
+///
+/// Sandbox size is not configurable: the `CreateSandboxLayer` ABI takes no
+/// size option, matching hcsshim's `CreateScratchLayer` behavior.
 ///
 /// Requires `SeBackupPrivilege` + `SeRestorePrivilege` on the calling process
 /// token (see [`crate::windows::layer::enable_backup_restore_privileges`]).
@@ -140,16 +148,14 @@ impl Drop for WritableLayer {
 pub fn create(
     layer_path: &Path,
     parent_chain: &LayerChain,
-    size_gb: u64,
     is_base_os_bootstrap: bool,
 ) -> io::Result<WritableLayer> {
     std::fs::create_dir_all(layer_path)?;
 
-    // 1. Initialize the writable layer. HCS scaffolds metadata files and
-    //    allocates a sparse sandbox.vhdx inside `layer_path`. The options
-    //    JSON carries the requested sandbox size in bytes.
-    let options_json = build_init_options_json(size_gb);
-    if let Err(e) = wclayer::initialize_writable_layer(layer_path, parent_chain, &options_json) {
+    // 1. Create the scratch layer via CreateSandboxLayer (hcsshim's
+    //    CreateScratchLayer equivalent). HCS scaffolds metadata files and
+    //    allocates a sparse sandbox.vhdx inside `layer_path`.
+    if let Err(e) = wclayer::create_sandbox_layer(layer_path, parent_chain) {
         cleanup_best_effort(layer_path, false);
         return Err(e);
     }
@@ -229,18 +235,6 @@ pub fn create(
     })
 }
 
-/// Build the `options_json` argument passed to `HcsInitializeWritableLayer`.
-///
-/// HCS recognizes `SandboxSize` (bytes) as the allocation hint for the
-/// sparse backing VHDX. `0` means "use HCS default".
-fn build_init_options_json(size_gb: u64) -> String {
-    if size_gb == 0 {
-        return String::from("{}");
-    }
-    let bytes = size_gb.saturating_mul(1024 * 1024 * 1024);
-    format!(r#"{{"SandboxSize":{bytes}}}"#)
-}
-
 /// Open an existing `sandbox.vhdx` for read/write. `FILE_FLAG_BACKUP_SEMANTICS`
 /// mirrors the flags hcsshim uses and lets the VHD driver service the handle
 /// for formatting.
@@ -287,33 +281,5 @@ fn cleanup_best_effort(layer_path: &Path, filter_attached: bool) {
             error = %e,
             "destroy_layer failed during rollback",
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests (no HCS calls — only pure helpers).
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn init_options_zero_size_is_defaults() {
-        assert_eq!(build_init_options_json(0), "{}");
-    }
-
-    #[test]
-    fn init_options_size_encodes_bytes() {
-        let json = build_init_options_json(20);
-        assert!(json.contains("\"SandboxSize\""));
-        assert!(json.contains(&(20u64 * 1024 * 1024 * 1024).to_string()));
-    }
-
-    #[test]
-    fn init_options_saturates_on_huge_size() {
-        // No panic on absurd inputs.
-        let json = build_init_options_json(u64::MAX);
-        assert!(json.starts_with("{\"SandboxSize\":"));
     }
 }

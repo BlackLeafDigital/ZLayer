@@ -14,6 +14,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::instrument;
+use zlayer_spec::PullPolicy;
 
 #[cfg(feature = "local")]
 use crate::wasm_export::WasmExportResult;
@@ -155,23 +156,180 @@ fn is_mutable_tag(image: &str) -> bool {
     }
 }
 
-/// Parse an image reference into (name, tag/reference) for local registry lookup.
+/// Generate candidate `(name, reference)` pairs to try against the local
+/// registry, in priority order.
+///
+/// `oci_client::Reference::from_str` normalizes bare names like
+/// `zarcrunner-executor:latest` into `docker.io/library/zarcrunner-executor:latest`,
+/// but locally-built images are stored under whatever name the user passed to
+/// `zlayer build`. To bridge that gap we probe several plausible name forms
+/// before giving up and falling through to a remote pull.
+///
+/// Returns candidates in this priority order (deduplicated, preserving the
+/// first occurrence):
+/// 1. The primary name as parsed.
+/// 2. With `docker.io/` prefix stripped.
+/// 3. With `docker.io/library/` prefix stripped.
+/// 4. With `library/` prefix stripped.
+/// 5. With `library/` prefix added (only when the primary name has no `/`).
+/// 6. The bare last path segment.
 #[cfg(feature = "local")]
-#[allow(clippy::unnecessary_wraps)]
-fn parse_local_image_ref(image: &str) -> Option<(String, String)> {
-    if let Some(at_pos) = image.find('@') {
-        let name = &image[..at_pos];
-        let digest = &image[at_pos + 1..];
-        return Some((name.to_string(), digest.to_string()));
-    }
-    if let Some(colon_pos) = image.rfind(':') {
+fn local_image_ref_candidates(image: &str) -> Vec<(String, String)> {
+    // Split off digest/tag to get the primary name + reference.
+    let (primary, reference) = if let Some(at_pos) = image.find('@') {
+        (image[..at_pos].to_string(), image[at_pos + 1..].to_string())
+    } else if let Some(colon_pos) = image.rfind(':') {
         let potential_tag = &image[colon_pos + 1..];
         if !potential_tag.contains('/') && !potential_tag.is_empty() {
-            let name = &image[..colon_pos];
-            return Some((name.to_string(), potential_tag.to_string()));
+            (image[..colon_pos].to_string(), potential_tag.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        }
+    } else {
+        (image.to_string(), "latest".to_string())
+    };
+
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let push = |name: String,
+                candidates: &mut Vec<(String, String)>,
+                seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(name.clone()) {
+            candidates.push((name, reference.clone()));
+        }
+    };
+
+    // 1. Primary name as-is.
+    push(primary.clone(), &mut candidates, &mut seen);
+
+    // 2. Strip `docker.io/` prefix.
+    if let Some(rest) = primary.strip_prefix("docker.io/") {
+        push(rest.to_string(), &mut candidates, &mut seen);
+    }
+
+    // 3. Strip `docker.io/library/` prefix.
+    if let Some(rest) = primary.strip_prefix("docker.io/library/") {
+        push(rest.to_string(), &mut candidates, &mut seen);
+    }
+
+    // 4. Strip `library/` prefix.
+    if let Some(rest) = primary.strip_prefix("library/") {
+        push(rest.to_string(), &mut candidates, &mut seen);
+    }
+
+    // 5. Add `library/` prefix when the primary has no `/` at all.
+    if !primary.contains('/') {
+        push(format!("library/{primary}"), &mut candidates, &mut seen);
+    }
+
+    // 6. Bare last path segment.
+    if let Some(last) = primary.rsplit('/').next() {
+        if !last.is_empty() {
+            push(last.to_string(), &mut candidates, &mut seen);
         }
     }
-    Some((image.to_string(), "latest".to_string()))
+
+    candidates
+}
+
+#[cfg(all(test, feature = "local"))]
+mod local_image_ref_candidates_tests {
+    use super::local_image_ref_candidates;
+
+    fn contains(candidates: &[(String, String)], name: &str, reference: &str) -> bool {
+        candidates.iter().any(|(n, r)| n == name && r == reference)
+    }
+
+    #[test]
+    fn bare_name_with_tag_produces_library_and_self() {
+        let c = local_image_ref_candidates("zarcrunner-executor:latest");
+        assert!(
+            contains(&c, "zarcrunner-executor", "latest"),
+            "missing bare candidate in {c:?}",
+        );
+        assert!(
+            contains(&c, "library/zarcrunner-executor", "latest"),
+            "missing library/ candidate in {c:?}",
+        );
+    }
+
+    #[test]
+    fn fully_qualified_docker_hub_strips_prefixes() {
+        let c = local_image_ref_candidates("docker.io/library/zarcrunner-executor:latest");
+        assert!(
+            contains(&c, "docker.io/library/zarcrunner-executor", "latest"),
+            "missing primary in {c:?}",
+        );
+        assert!(
+            contains(&c, "library/zarcrunner-executor", "latest"),
+            "missing docker.io-stripped form in {c:?}",
+        );
+        assert!(
+            contains(&c, "zarcrunner-executor", "latest"),
+            "missing docker.io/library-stripped form in {c:?}",
+        );
+    }
+
+    #[test]
+    fn ghcr_keeps_qualified_and_bare_segment_but_no_library_prefix() {
+        let c = local_image_ref_candidates("ghcr.io/team/svc:1.2");
+        assert!(
+            contains(&c, "ghcr.io/team/svc", "1.2"),
+            "missing primary in {c:?}",
+        );
+        assert!(
+            contains(&c, "svc", "1.2"),
+            "missing bare last-segment fallback in {c:?}",
+        );
+        // The `library/` prefix only applies to bare (slash-free) names. A
+        // fully-qualified non-docker-hub name must NOT acquire `library/...`.
+        assert!(
+            !c.iter().any(|(n, _)| n.starts_with("library/")),
+            "unexpected library/ prefix in {c:?}",
+        );
+    }
+
+    #[test]
+    fn digest_reference_is_preserved() {
+        let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let input = format!("foo@{digest}");
+        let c = local_image_ref_candidates(&input);
+        assert!(
+            contains(&c, "foo", digest),
+            "missing foo@digest candidate in {c:?}",
+        );
+        assert!(
+            contains(&c, "library/foo", digest),
+            "missing library/foo@digest candidate in {c:?}",
+        );
+        // The reference column is always the digest, never "latest".
+        for (_, r) in &c {
+            assert_eq!(r, digest, "non-digest reference leaked into {c:?}");
+        }
+    }
+
+    #[test]
+    fn deterministic_input_has_no_duplicates() {
+        for input in [
+            "zarcrunner-executor:latest",
+            "docker.io/library/zarcrunner-executor:latest",
+            "ghcr.io/team/svc:1.2",
+            "foo",
+            "library/foo:1.0",
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let c = local_image_ref_candidates(input);
+            let mut sorted: Vec<_> = c.clone();
+            sorted.sort();
+            let original_len = sorted.len();
+            sorted.dedup();
+            assert_eq!(
+                original_len,
+                sorted.len(),
+                "duplicate candidates produced for {input}: {c:?}",
+            );
+        }
+    }
 }
 
 /// Build a `platform_resolver` closure that picks manifests matching `target`.
@@ -565,6 +723,7 @@ impl ImagePuller {
         auth: &RegistryAuth,
         cache_key: &str,
         digest_key: &str,
+        policy: PullPolicy,
     ) -> Option<(OciImageManifest, String)> {
         let data = self.cache.get(cache_key).await.ok().flatten()?;
         let manifest = serde_json::from_slice::<OciImageManifest>(&data).ok()?;
@@ -576,6 +735,13 @@ impl ImagePuller {
             .ok()
             .flatten()
             .and_then(|bytes| String::from_utf8(bytes).ok());
+
+        // IfNotPresent / Never: cached manifest is good enough, regardless of mutable tag.
+        if matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never) {
+            let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+            tracing::debug!(image = %image, "manifest cache hit (IfNotPresent/Never, no revalidation)");
+            return Some((manifest, digest));
+        }
 
         // Pinned refs: trust the cache without revalidation.
         if !is_mutable_tag(image) {
@@ -642,24 +808,55 @@ impl ImagePuller {
     }
 
     /// Try to resolve a manifest from the local registry.
+    ///
+    /// Probes every candidate `(name, reference)` form produced by
+    /// [`local_image_ref_candidates`] in order, returning the first that
+    /// resolves to a parseable `OciImageManifest`. This is what lets a
+    /// deployment spec say `image: zarcrunner-executor:latest` and still hit
+    /// a locally-built image, even though `oci_client::Reference` normalized
+    /// the lookup name to `docker.io/library/zarcrunner-executor`.
     #[cfg(feature = "local")]
     async fn try_local_registry(&self, image: &str) -> Option<(OciImageManifest, String)> {
         let registry = self.local_registry.as_ref()?;
-        let (name, reference) = parse_local_image_ref(image)?;
-        match registry.get_manifest(&name, &reference).await {
-            Ok(data) => match serde_json::from_slice::<OciImageManifest>(&data) {
-                Ok(manifest) => {
-                    let digest = crate::cache::compute_digest(&data);
-                    tracing::debug!(image = %image, digest = %digest, "manifest found in local registry");
-                    Some((manifest, digest))
+        let candidates = local_image_ref_candidates(image);
+        let primary = candidates.first().map(|(n, _)| n.clone());
+        for (name, reference) in candidates {
+            // `Err` arm (miss on this candidate) is a no-op — we just try the
+            // next form, so `if let Ok` is clearer than a `match` with a stub
+            // `Err(_)` arm (clippy::single-match-else).
+            if let Ok(data) = registry.get_manifest(&name, &reference).await {
+                match serde_json::from_slice::<OciImageManifest>(&data) {
+                    Ok(manifest) => {
+                        let digest = crate::cache::compute_digest(&data);
+                        if primary.as_deref() == Some(name.as_str()) {
+                            tracing::debug!(
+                                image = %image,
+                                digest = %digest,
+                                "manifest found in local registry",
+                            );
+                        } else {
+                            tracing::debug!(
+                                image = %image,
+                                matched_name = %name,
+                                digest = %digest,
+                                "manifest found in local registry via name-form fallback",
+                            );
+                        }
+                        return Some((manifest, digest));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            image = %image,
+                            candidate = %name,
+                            error = %e,
+                            "local registry manifest parse failed",
+                        );
+                        // Keep probing — the next candidate may still parse.
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(image = %image, error = %e, "local registry manifest parse failed");
-                    None
-                }
-            },
-            Err(_) => None,
+            }
         }
+        None
     }
 
     /// Pull an image manifest from the registry.
@@ -687,12 +884,30 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
+        self.pull_manifest_inner(image, auth, PullPolicy::Newer)
+            .await
+    }
+
+    /// Internal manifest pull driven by an explicit [`PullPolicy`].
+    ///
+    /// `PullPolicy::IfNotPresent` and `PullPolicy::Never` short-circuit any
+    /// remote revalidation when the manifest is already available locally
+    /// (either in the blob cache or in the local registry). `PullPolicy::Newer`
+    /// preserves the legacy behavior of revalidating mutable tags against the
+    /// remote. `PullPolicy::Always` is handled at the `*_with_policy` entry
+    /// points by invalidating the cache before delegating here.
+    async fn pull_manifest_inner(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        policy: PullPolicy,
+    ) -> Result<(OciImageManifest, String)> {
         let cache_key = manifest_cache_key(image);
         let digest_key = manifest_digest_cache_key(image);
 
         // 1. Blob cache hit?
         if let Some(hit) = self
-            .try_cached_manifest(image, auth, &cache_key, &digest_key)
+            .try_cached_manifest(image, auth, &cache_key, &digest_key, policy)
             .await
         {
             return Ok(hit);
@@ -704,6 +919,15 @@ impl ImagePuller {
             if let Ok(bytes) = serde_json::to_vec(&manifest) {
                 let _ = self.cache.put(&cache_key, &bytes).await;
                 let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
+            }
+
+            // IfNotPresent/Never: trust local, no remote check.
+            if matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never) {
+                tracing::debug!(
+                    image = %image,
+                    "local manifest hit, IfNotPresent/Never policy, skipping remote check"
+                );
+                return Ok((manifest, digest));
             }
 
             if is_mutable_tag(image) {
@@ -735,7 +959,27 @@ impl ImagePuller {
             }
         }
 
-        // 3. Pull from remote registry
+        // 3. Refuse to silently route unqualified names to Docker Hub.
+        //
+        // `oci_client::Reference::from_str` happily turns `foo:latest` into
+        // `docker.io/library/foo:latest` — but if the user wanted Docker Hub
+        // they should have written it explicitly. A bare name almost always
+        // refers to a locally-built image; falling through to docker.io here
+        // is how a locally-built `zarcrunner-executor:latest` becomes a 401
+        // against `index.docker.io/v2/library/zarcrunner-executor`.
+        if zlayer_types::image_str_is_unqualified(image) {
+            return Err(RegistryError::NotFound {
+                registry: "local".to_string(),
+                image: format!(
+                    "{image} (unqualified image not found locally; ZLayer does not silently \
+                     pull bare names from Docker Hub — use a full registry URL such as \
+                     docker.io/library/{image} for a remote pull, or run `zlayer build` to \
+                     produce it locally)"
+                ),
+            });
+        }
+
+        // 4. Pull from remote registry
         let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
             registry: "unknown".to_string(),
             image: image.to_string(),
@@ -777,16 +1021,14 @@ impl ImagePuller {
         }
     }
 
-    /// Pull an image manifest, optionally forcing a cache bypass.
+    /// Pull an image manifest, honoring the requested [`PullPolicy`].
     ///
-    /// When `force_refresh` is `true`, any cached entry for this image is
-    /// deleted before the fetch, guaranteeing a round-trip to the registry.
-    /// This is the implementation hook for `PullPolicy::Always` — higher-level
-    /// runtimes translate their policy into this boolean.
-    ///
-    /// When `force_refresh` is `false`, this behaves identically to
-    /// [`pull_manifest`], which already revalidates cached entries for mutable
-    /// tags.
+    /// `PullPolicy::Always` invalidates any cached manifest entry before the
+    /// fetch, guaranteeing a fresh round-trip to the registry.
+    /// `PullPolicy::Newer` preserves the legacy revalidate-mutable-tag
+    /// behavior. `PullPolicy::IfNotPresent` and `PullPolicy::Never` trust the
+    /// blob cache / local registry and skip the remote HEAD revalidation that
+    /// would otherwise fail for locally-built images sitting behind a 401.
     ///
     /// # Errors
     ///
@@ -796,8 +1038,9 @@ impl ImagePuller {
         &self,
         image: &str,
         auth: &RegistryAuth,
-        force_refresh: bool,
+        policy: PullPolicy,
     ) -> Result<(OciImageManifest, String)> {
+        let force_refresh = matches!(policy, PullPolicy::Always);
         if force_refresh {
             let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
@@ -816,7 +1059,7 @@ impl ImagePuller {
                 );
             }
         }
-        self.pull_manifest(image, auth).await
+        self.pull_manifest_inner(image, auth, policy).await
     }
 
     /// Pull and parse the image configuration from the registry.
@@ -841,7 +1084,18 @@ impl ImagePuller {
     /// Returns an error if the manifest or config blob cannot be fetched, or if
     /// the config blob cannot be parsed as valid JSON.
     pub async fn pull_image_config(&self, image: &str, auth: &RegistryAuth) -> Result<ImageConfig> {
-        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+        self.pull_image_config_inner(image, auth, PullPolicy::Newer)
+            .await
+    }
+
+    /// Internal config pull driven by an explicit [`PullPolicy`].
+    async fn pull_image_config_inner(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        policy: PullPolicy,
+    ) -> Result<ImageConfig> {
+        let (manifest, _digest) = self.pull_manifest_inner(image, auth, policy).await?;
 
         let config_digest = &manifest.config.digest;
 
@@ -882,14 +1136,16 @@ impl ImagePuller {
         Ok(config)
     }
 
-    /// Pull and parse the image configuration, optionally forcing a cache
-    /// bypass on the underlying manifest fetch.
+    /// Pull and parse the image configuration, honoring the requested
+    /// [`PullPolicy`].
     ///
-    /// When `force_refresh` is `true`, the manifest cache entry for this image
-    /// is invalidated before fetching. The config blob itself is
-    /// content-addressed by digest, so it does not need explicit invalidation
-    /// — once the refreshed manifest points at a new config digest, the
-    /// existing blob-cache lookup will naturally miss and refetch.
+    /// `PullPolicy::Always` invalidates the cached manifest entry before
+    /// fetching. The config blob itself is content-addressed by digest, so it
+    /// does not need explicit invalidation — once the refreshed manifest
+    /// points at a new config digest, the existing blob-cache lookup will
+    /// naturally miss and refetch. `PullPolicy::IfNotPresent` and
+    /// `PullPolicy::Never` skip remote revalidation entirely when a manifest
+    /// is already cached.
     ///
     /// # Errors
     ///
@@ -899,8 +1155,9 @@ impl ImagePuller {
         &self,
         image: &str,
         auth: &RegistryAuth,
-        force_refresh: bool,
+        policy: PullPolicy,
     ) -> Result<ImageConfig> {
+        let force_refresh = matches!(policy, PullPolicy::Always);
         if force_refresh {
             let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
@@ -919,7 +1176,7 @@ impl ImagePuller {
                 );
             }
         }
-        self.pull_image_config(image, auth).await
+        self.pull_image_config_inner(image, auth, policy).await
     }
 
     /// Fetch the operating system targeted by `image` from its OCI config blob.
@@ -1099,8 +1356,18 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<Vec<(Vec<u8>, String)>> {
+        self.pull_image_inner(image, auth, PullPolicy::Newer).await
+    }
+
+    /// Internal image pull driven by an explicit [`PullPolicy`].
+    async fn pull_image_inner(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        policy: PullPolicy,
+    ) -> Result<Vec<(Vec<u8>, String)>> {
         // Pull manifest first
-        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+        let (manifest, _digest) = self.pull_manifest_inner(image, auth, policy).await?;
 
         tracing::info!(
             image = %image,
@@ -1143,15 +1410,15 @@ impl ImagePuller {
         Ok(layers)
     }
 
-    /// Pull a complete image, optionally forcing a cache bypass on the
-    /// underlying manifest fetch.
+    /// Pull a complete image, honoring the requested [`PullPolicy`].
     ///
-    /// When `force_refresh` is `true`, the manifest cache entry for this image
-    /// is invalidated before fetching. Layer blobs are content-addressed by
-    /// digest, so they do not need explicit invalidation — once the refreshed
-    /// manifest points at new layer digests, the existing blob-cache lookups
-    /// will naturally miss and refetch the new layers. Shared layer blobs
-    /// remain valid cache hits.
+    /// `PullPolicy::Always` invalidates the cached manifest entry before
+    /// fetching. Layer blobs are content-addressed by digest, so they do not
+    /// need explicit invalidation — once the refreshed manifest points at new
+    /// layer digests, the existing blob-cache lookups will naturally miss and
+    /// refetch the new layers. Shared layer blobs remain valid cache hits.
+    /// `PullPolicy::IfNotPresent` and `PullPolicy::Never` trust the cache /
+    /// local registry without revalidating mutable tags against the remote.
     ///
     /// # Errors
     ///
@@ -1160,8 +1427,9 @@ impl ImagePuller {
         &self,
         image: &str,
         auth: &RegistryAuth,
-        force_refresh: bool,
+        policy: PullPolicy,
     ) -> Result<Vec<(Vec<u8>, String)>> {
+        let force_refresh = matches!(policy, PullPolicy::Always);
         if force_refresh {
             let cache_key = manifest_cache_key(image);
             let digest_key = manifest_digest_cache_key(image);
@@ -1180,7 +1448,7 @@ impl ImagePuller {
                 );
             }
         }
-        self.pull_image(image, auth).await
+        self.pull_image_inner(image, auth, policy).await
     }
 
     /// Push a blob to a remote registry

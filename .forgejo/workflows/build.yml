@@ -197,6 +197,136 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz zlayer-completions.tar.gz completions
 
+  # Static-musl Linux amd64 build. The canonical build-linux-amd64 job above
+  # links against glibc (node:20-bullseye -> glibc 2.31), which means the
+  # resulting binary cannot run on Alpine/musl hosts and is unusable as the
+  # /usr/local/bin/zlayer inside the WSL2 rootfs we ship (Alpine minirootfs
+  # has musl libc; gcompat does not backport __isoc23_* and friends). This
+  # sibling job produces a fully static musl binary via cross-rs, which the
+  # build-rootfs job below consumes instead of the glibc tarball.
+  #
+  # cross-rs (https://github.com/cross-rs/cross) is a Cargo-based
+  # cross-compiler driver. For --target x86_64-unknown-linux-musl it spawns
+  # the cross/x86_64-unknown-linux-musl docker image, which already has musl
+  # libc + libseccomp + openssl + lzma + bzip2 + zstd cross-linked, so we
+  # get a portable static binary without juggling apt cross packages on the
+  # runner. We do NOT run this job inside a container — cross needs to spawn
+  # its own docker images, so the host must be a plain runner with docker.
+  build-linux-amd64-musl:
+    needs: [check-existing]
+    if: needs.check-existing.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.check-existing.outputs.version }}
+          step: build-linux-amd64-musl
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+      - name: Install cross
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # cross-rs version is looked up at workflow-edit time via
+          #   gh release list -R cross-rs/cross --limit 1
+          # See https://github.com/cross-rs/cross/releases — bump when a
+          # newer stable lands. Pinned via --locked --version so a fresh
+          # release can't silently change cross behavior in CI.
+          CROSS_VERSION="0.2.5"
+          cargo install --locked --version "$CROSS_VERSION" cross
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          VERSION="${{ needs.check-existing.outputs.version }}"
+          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
+          grep '^version = ' Cargo.toml
+      - name: Build (musl static)
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        # Unset CARGO_TARGET_DIR for this step: cross writes outputs to
+        # `target/<triple>/release/` relative to the workspace root, and
+        # forcing a non-default CARGO_TARGET_DIR can confuse the
+        # docker-mounted build. Locally on the runner the path remains
+        # `./target/x86_64-unknown-linux-musl/release/zlayer`.
+        run: |
+          set -euo pipefail
+          unset CARGO_TARGET_DIR
+          cross build --release \
+            --package zlayer \
+            --features youki-runtime \
+            --target x86_64-unknown-linux-musl
+      - name: Verify binary is statically linked
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/x86_64-unknown-linux-musl/release/zlayer"
+          file "$BIN"
+          # cross-rs musl images produce statically-linked binaries (no
+          # NEEDED libc entry). If `file` reports "dynamically linked"
+          # something has regressed in the cross image and the artifact
+          # would NOT run inside the Alpine rootfs we ship for WSL2.
+          if file "$BIN" | grep -q 'dynamically linked'; then
+            echo "::error::zlayer is dynamically linked, expected static musl"
+            exit 1
+          fi
+      - name: Package
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Musl tarball ships ONLY the binary — no completions/ subdir.
+          # Shell completions are already published in the glibc tarball
+          # and in the standalone zlayer-completions artifact. The
+          # build-rootfs job extracts this tarball flat into
+          # rootfs-stage/usr/local/bin/.
+          tar czf "zlayer-linux-amd64-musl.tar.gz" \
+            -C "target/x86_64-unknown-linux-musl/release" zlayer
+      - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: zlayer-linux-amd64-musl
+          path: zlayer-linux-amd64-musl.tar.gz
+          retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.check-existing.outputs.version }}
+          step: build-linux-amd64-musl
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
+        run: rm -rf target zlayer-linux-amd64-musl.tar.gz
+
   build-macos-arm64:
     needs: [check-existing]
     if: needs.check-existing.outputs.need_build == 'true'
@@ -508,6 +638,240 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
+  # ===========================================
+  # Build the zlayer WSL2 rootfs tarball
+  #
+  # Produces zlayer-rootfs.tar.gz: an Alpine minirootfs with
+  # iproute2/iptables/ca-certificates installed plus our Linux zlayer
+  # binary at /usr/local/bin/zlayer. Used by the Windows agent's WSL2
+  # delegate (`wsl --import zlayer ... zlayer-rootfs.tar.gz`) so a fresh
+  # Windows host has a ready-made distro it can shell into for Linux
+  # workloads. Published as both a Forgejo release asset and an OCI image
+  # at forge.blackleafdigital.com/blackleafdigital/zlayer-rootfs by the
+  # release workflow; this job only stages it.
+  #
+  # The Alpine minirootfs version is looked up at job-run time against
+  # https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml
+  # — never hardcoded, so a stale CI workflow can't silently pin an EOL
+  # branch. apk.static (statically linked apk-tools) is downloaded from
+  # the same Alpine mirror and used with `--root` to install packages
+  # into the staging dir without requiring chroot/proot, since the
+  # ubuntu-latest runner is x86_64 just like the target rootfs.
+  build-rootfs:
+    name: Build WSL2 rootfs
+    # Consumes the musl-static artifact (build-linux-amd64-musl), NOT the
+    # canonical glibc tarball: Alpine ships musl libc and gcompat does not
+    # backport modern glibc symbols (__isoc23_*, etc.), so the glibc binary
+    # would fail to start inside this rootfs at WSL2 boot. The musl binary
+    # is fully static and runs on Alpine without any libc shim.
+    needs: [check-existing, build-linux-amd64-musl]
+    if: needs.check-existing.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.check-existing.outputs.version }}
+          step: build-rootfs
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Install tooling
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl ca-certificates python3-yaml tar gzip
+      - name: Download zlayer linux-amd64 (musl static) artifact
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
+        with:
+          name: zlayer-linux-amd64-musl
+      - name: Look up current Alpine minirootfs version
+        if: steps.check.outputs.completed != 'true'
+        id: alpine
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o latest-releases.yaml \
+            "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml"
+          echo "::group::latest-releases.yaml (raw)"
+          cat latest-releases.yaml
+          echo "::endgroup::"
+          # Parse with python+yaml (apt-installed python3-yaml). The schema
+          # is a top-level list of dicts; the entry we want has
+          # `flavor: alpine-minirootfs` (verified live before commit).
+          # We need: version (e.g. 3.23.4), branch (e.g. v3.23), file.
+          eval "$(python3 - <<'PY'
+          import sys, yaml
+          with open("latest-releases.yaml") as f:
+              data = yaml.safe_load(f)
+          for entry in data:
+              if entry.get("flavor") == "alpine-minirootfs" and entry.get("arch") == "x86_64":
+                  print(f"VERSION={entry['version']}")
+                  print(f"BRANCH={entry['branch']}")
+                  print(f"FILE={entry['file']}")
+                  print(f"SHA256={entry['sha256']}")
+                  break
+          else:
+              sys.exit("no alpine-minirootfs x86_64 entry found")
+          PY
+          )"
+          echo "Resolved Alpine: version=${VERSION} branch=${BRANCH} file=${FILE}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}"   >> "$GITHUB_OUTPUT"
+          echo "file=${FILE}"       >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}"   >> "$GITHUB_OUTPUT"
+      - name: Download Alpine minirootfs
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.alpine.outputs.branch }}
+          FILE:   ${{ steps.alpine.outputs.file }}
+          SHA256: ${{ steps.alpine.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/releases/x86_64/${FILE}"
+          echo "${SHA256}  ${FILE}" | sha256sum -c -
+      - name: Download apk.static
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.alpine.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # Discover the latest apk-tools-static package in main/x86_64.
+          # We do NOT hardcode the apk-tools-static version — let the mirror
+          # tell us what it currently ships.
+          INDEX_URL="https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/main/x86_64/"
+          APK_FILE=$(curl -fsSL "$INDEX_URL" \
+            | grep -oE 'apk-tools-static-[^"]+\.apk' \
+            | sort -V \
+            | tail -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::could not find apk-tools-static in $INDEX_URL"
+            exit 1
+          fi
+          echo "Using $APK_FILE"
+          curl -fsSLO "${INDEX_URL}${APK_FILE}"
+          mkdir -p apk-static-extract
+          # apk packages are gzipped tarballs; warnings about extended
+          # headers (APK-TOOLS.checksum.SHA1) are expected and harmless.
+          tar -C apk-static-extract -xzf "$APK_FILE" || true
+          test -x apk-static-extract/sbin/apk.static
+          ./apk-static-extract/sbin/apk.static --version
+      - name: Stage Alpine rootfs
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          FILE: ${{ steps.alpine.outputs.file }}
+        run: |
+          set -euo pipefail
+          mkdir rootfs-stage
+          sudo tar -C rootfs-stage -xzf "$FILE"
+      - name: Install runtime packages into rootfs
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.alpine.outputs.branch }}
+        run: |
+          set -euo pipefail
+          sudo ./apk-static-extract/sbin/apk.static \
+            --root "$(pwd)/rootfs-stage" \
+            --arch x86_64 \
+            --no-cache \
+            --allow-untrusted \
+            --repository "https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/main" \
+            --repository "https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/community" \
+            --initdb add \
+            alpine-base ca-certificates iproute2 iptables
+      - name: Install zlayer binary into rootfs
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The musl tarball ships ONLY the binary — no completions/ subdir,
+          # unlike the glibc tarball — so `tar xzf` lands `zlayer` directly
+          # in the extract dir.
+          mkdir -p extracted
+          tar -C extracted -xzf zlayer-linux-amd64-musl.tar.gz
+          test -x extracted/zlayer
+          # Defense in depth: confirm the binary is statically linked.
+          # build-linux-amd64-musl already enforces this, but a manual
+          # rebuild of just this job that picked up the wrong artifact would
+          # silently produce a broken rootfs otherwise.
+          file extracted/zlayer
+          if file extracted/zlayer | grep -q 'dynamically linked'; then
+            echo "::error::rootfs source binary is dynamically linked, expected static musl"
+            exit 1
+          fi
+          sudo mkdir -p rootfs-stage/usr/local/bin
+          sudo cp extracted/zlayer rootfs-stage/usr/local/bin/zlayer
+          sudo chmod 0755 rootfs-stage/usr/local/bin/zlayer
+          # Drop a version marker for future debugging. Format is
+          # intentionally trivial (key=value), no jq dependency at read time.
+          sudo tee rootfs-stage/etc/zlayer-rootfs-version >/dev/null <<EOF
+          version=${{ needs.check-existing.outputs.version }}
+          git_sha=${{ inputs.sha || github.sha }}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          alpine_version=${{ steps.alpine.outputs.version }}
+          alpine_branch=${{ steps.alpine.outputs.branch }}
+          EOF
+      - name: Package rootfs tarball
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # -C so the archive starts at the rootfs root (no leading
+          # rootfs-stage/ prefix). This matches what `wsl --import` expects
+          # and what `buildah add --chown 0:0 <tarball> /` lays out.
+          sudo tar czf zlayer-rootfs.tar.gz -C rootfs-stage .
+          sudo chown "$(id -u):$(id -g)" zlayer-rootfs.tar.gz
+          ls -la zlayer-rootfs.tar.gz
+      - name: Sanity-check rootfs tarball
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== first 20 entries ==="
+          tar tzf zlayer-rootfs.tar.gz | head -20
+          echo "=== zlayer binary presence ==="
+          count=$(tar tzf zlayer-rootfs.tar.gz | grep -cE '(^|/)usr/local/bin/zlayer$' || true)
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly 1 usr/local/bin/zlayer entry, got ${count}"
+            exit 1
+          fi
+          echo "=== version marker ==="
+          tar tzf zlayer-rootfs.tar.gz | grep -E '(^|/)etc/zlayer-rootfs-version$'
+          echo "=== iproute2/iptables presence ==="
+          tar tzf zlayer-rootfs.tar.gz | grep -E '(^|/)sbin/(ip|iptables)$' | head -5
+      - name: Upload rootfs artifact
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: zlayer-rootfs
+          path: zlayer-rootfs.tar.gz
+          retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.check-existing.outputs.version }}
+          step: build-rootfs
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          sudo rm -rf rootfs-stage extracted apk-static-extract zlayer-rootfs.tar.gz zlayer-linux-amd64-musl.tar.gz alpine-minirootfs-*.tar.gz apk-tools-static-*.apk latest-releases.yaml || true
+
   build-macos-amd64:
     needs: [check-existing, build-macos-arm64, build-linux-amd64]
     if: needs.check-existing.outputs.need_build == 'true'
@@ -696,7 +1060,7 @@ jobs:
   # Verify all builds passed
   # ===========================================
   verify:
-    needs: [check-existing, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, build-windows-amd64, image-build]
+    needs: [check-existing, build-linux-amd64, build-linux-amd64-musl, build-linux-arm64, build-macos-amd64, build-macos-arm64, build-windows-amd64, image-build, build-rootfs]
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5

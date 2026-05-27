@@ -174,6 +174,87 @@ pub fn current_cgroup_v2_path() -> Option<String> {
     None
 }
 
+/// Pure path computation: given a cgroup-v2 scope reported by
+/// `/proc/self/cgroup`, return the sibling `<scope>/containers` parent that
+/// should be used for new container cgroups.
+///
+/// If `scope` already ends with `/init` (the daemon has already been migrated
+/// into the `init` leaf by a previous call), the `/init` suffix is stripped
+/// and the result anchored at the real scope. This makes
+/// [`ensure_daemon_leaf_and_container_parent`] idempotent.
+#[cfg(target_os = "linux")]
+fn compute_target_parent(scope: &str) -> String {
+    let base = scope.strip_suffix("/init").unwrap_or(scope);
+    let base = base.trim_end_matches('/');
+    format!("{base}/containers")
+}
+
+/// Migrate the current daemon process into a `<scope>/init` sub-cgroup and
+/// return the sibling `<scope>/containers` path as the parent for future
+/// container cgroups. Idempotent — safe to call multiple times.
+///
+/// Returns `None` on non-Linux, when `/proc/self/cgroup` can't be parsed,
+/// when `/sys/fs/cgroup` is read-only, or when the mkdir/PID-write fails.
+/// Callers should fall back to the raw `current_cgroup_v2_path()` value in
+/// those cases (the auto-detect path will surface the underlying error).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn ensure_daemon_leaf_and_container_parent() -> Option<String> {
+    let scope = current_cgroup_v2_path()?;
+    let containers = compute_target_parent(&scope);
+    // Idempotency: if we're already in `<base>/init`, just return the sibling.
+    if scope.ends_with("/init") {
+        let containers_fs = format!("/sys/fs/cgroup{containers}");
+        match std::fs::create_dir_all(&containers_fs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        return Some(containers);
+    }
+
+    let scope = scope.trim_end_matches('/').to_string();
+    let mount = "/sys/fs/cgroup";
+    let init_dir = format!("{mount}{scope}/init");
+
+    match std::fs::create_dir_all(&init_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+
+    let pid_path = format!("{init_dir}/cgroup.procs");
+    let pid_str = format!("{}", std::process::id());
+    if std::fs::write(&pid_path, &pid_str).is_err() {
+        // Already migrated? Re-check /proc/self/cgroup before giving up.
+        let now = current_cgroup_v2_path()?;
+        if now != format!("{scope}/init") {
+            return None;
+        }
+    }
+
+    // Verify the migration actually moved us into <scope>/init.
+    let after = current_cgroup_v2_path()?;
+    if after != format!("{scope}/init") {
+        return None;
+    }
+
+    let containers_dir = format!("{mount}{containers}");
+    match std::fs::create_dir_all(&containers_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+
+    Some(containers)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn ensure_daemon_leaf_and_container_parent() -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn probe_can_write_cgroup_root() -> bool {
     use std::ffi::CString;
@@ -363,6 +444,35 @@ mod tests {
             serde_json::to_string(&DaemonMode::Degraded).unwrap(),
             "\"degraded\""
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod target_parent {
+        use super::super::compute_target_parent;
+
+        #[test]
+        fn idempotent_when_already_under_init() {
+            // Pre-fix path: scope is the systemd-run scope itself.
+            assert_eq!(
+                compute_target_parent(
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope"
+                ),
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/containers"
+            );
+            // Already migrated: scope ends with /init — strip and re-anchor.
+            assert_eq!(
+                compute_target_parent(
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/init"
+                ),
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/containers"
+            );
+            // Trailing slash on either form is harmless.
+            assert_eq!(compute_target_parent("/foo/bar/"), "/foo/bar/containers");
+            assert_eq!(
+                compute_target_parent("/foo/bar/init"),
+                "/foo/bar/containers"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

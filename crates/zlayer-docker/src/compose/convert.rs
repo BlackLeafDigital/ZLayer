@@ -1258,7 +1258,7 @@ volumes:
         assert_eq!(spec.services.len(), 2);
 
         let web = &spec.services["web"];
-        assert_eq!(web.image.name.to_string(), "docker.io/library/nginx:latest");
+        assert_eq!(web.image.name.to_string(), "nginx:latest");
         assert_eq!(web.endpoints.len(), 1);
         assert_eq!(web.endpoints[0].port, 8080);
         assert_eq!(web.endpoints[0].target_port, Some(80));
@@ -1266,7 +1266,7 @@ volumes:
         assert_eq!(web.env.get("FOO").unwrap(), "bar");
 
         let db = &spec.services["db"];
-        assert_eq!(db.image.name.to_string(), "docker.io/library/postgres:16");
+        assert_eq!(db.image.name.to_string(), "postgres:16");
         assert_eq!(db.endpoints.len(), 1);
         assert_eq!(db.endpoints[0].port, 5432);
         assert_eq!(db.endpoints[0].protocol, Protocol::Tcp);
@@ -1298,10 +1298,7 @@ services:
 
         let app = &spec.services["app"];
         // Compose-style tag: `<project>-<service>:latest`.
-        assert_eq!(
-            app.image.name.to_string(),
-            "docker.io/library/build-test-app:latest",
-        );
+        assert_eq!(app.image.name.to_string(), "build-test-app:latest");
         assert_eq!(app.image.pull_policy, PullPolicy::IfNotPresent);
     }
 
@@ -1319,7 +1316,7 @@ services:
         let api = &spec.services["api"];
         assert_eq!(
             api.image.name.to_string(),
-            "docker.io/library/myproj-api:latest",
+            "myproj-api:latest",
             "short-form `build:` must produce <project>-<service>:latest",
         );
         // Confirm the helper emits the same un-canonicalised form too.
@@ -1352,10 +1349,7 @@ services:
         let compose = parse_compose(yaml).unwrap();
         let spec = compose_to_deployment(&compose, "fullbuild").unwrap();
         let worker = &spec.services["worker"];
-        assert_eq!(
-            worker.image.name.to_string(),
-            "docker.io/library/fullbuild-worker:latest",
-        );
+        assert_eq!(worker.image.name.to_string(), "fullbuild-worker:latest");
 
         // The build directive itself stays attached to the compose model so
         // `compose build` can read it; assert via the parsed compose, not the

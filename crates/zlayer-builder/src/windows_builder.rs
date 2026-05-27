@@ -2200,7 +2200,7 @@ const RUN_STEP_TERMINATION_GRACE_SECS: u64 = 10 * 60;
 #[allow(clippy::too_many_lines)]
 #[cfg(target_os = "windows")]
 async fn execute_run_step_impl(
-    config: &WindowsBuildConfig,
+    _config: &WindowsBuildConfig,
     skeleton: &mut BuildSkeleton,
     run: &RunInstruction,
     step_index: usize,
@@ -2261,11 +2261,10 @@ async fn execute_run_step_impl(
     //    cleanup is deterministic.
     let scratch_id = format!("scratch-{}", uuid::Uuid::new_v4());
     let scratch_dir = skeleton.working_layer_chain_dir.join(&scratch_id);
-    let scratch_size_gb = if config.scratch_size_gb == 0 {
-        WindowsBuildConfig::default_scratch_size_gb()
-    } else {
-        config.scratch_size_gb
-    };
+    // `config.scratch_size_gb` is preserved on the public config for
+    // forward-compat but ignored here: `CreateSandboxLayer` (the canonical
+    // HCS scratch-creation path used by hcsshim) takes no size option, so
+    // matching its ABI means dropping the GB hint at this layer.
     // Privileges are idempotent; enabling here costs ~one syscall and
     // means a caller does not need to remember the prerequisite.
     zlayer_agent::windows::layer::enable_backup_restore_privileges()
@@ -2273,7 +2272,6 @@ async fn execute_run_step_impl(
     let scratch_layer = agent_scratch::create(
         &scratch_dir,
         &parent_chain,
-        scratch_size_gb,
         /* is_base_os_bootstrap = */ false,
     )
     .map_err(|e| BuildError::LayerCreate {

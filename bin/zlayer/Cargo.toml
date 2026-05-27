@@ -15,7 +15,16 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands and capabilities
-full = ["docker", "docker-compat", "wasm", "s3", "persistent", "observability", "nat"]
+full = [
+    "docker",
+    "docker-compat",
+    "wasm",
+    "s3",
+    "persistent",
+    "observability",
+    "nat",
+    "youki-runtime",
+]
 
 # WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
 wsl = ["dep:zlayer-wsl"]
@@ -25,6 +34,15 @@ wsl = ["dep:zlayer-wsl"]
 # and forwards the `hcs-runtime` marker feature. Can coexist with `wsl`:
 # WSL2 handles distro bootstrap, HCS handles native Windows containers.
 hcs-runtime = ["dep:zlayer-agent", "zlayer-agent/hcs-runtime"]
+
+# Linux-only `zlayer runtime` runc-compatible CLI surface. Gates both the
+# subcommand tree that `Wsl2DelegateRuntime` shells out to inside the
+# `zlayer` WSL2 distro and the direct dependency on `zlayer-libcontainer`
+# that backs each verb. `zlayer-agent`'s own copy of the libcontainer dep is
+# enabled unconditionally on Unix (see `[target.'cfg(unix)'.dependencies]`
+# below) — this feature only flips on the version compiled INTO the CLI for
+# the runc-compatible verbs.
+youki-runtime = ["dep:libcontainer"]
 
 # Runtime capabilities (forwarded to deps)
 # The `zlayer-api/docker` forwarding enables the Docker-backed
@@ -183,6 +201,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = { version = "0.6.1-zlayer.5", package = "zlayer-libcontainer", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

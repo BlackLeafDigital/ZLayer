@@ -5,7 +5,7 @@
 //! already shipped by `zlayer-agent` for running containers:
 //!
 //! - [`zlayer_agent::windows::scratch`] — writable (sandbox) layer creation via
-//!   `HcsInitializeWritableLayer` / `HcsAttachLayerStorageFilter`.
+//!   `CreateSandboxLayer` / `HcsAttachLayerStorageFilter`.
 //! - [`zlayer_agent::windows::layer`] — `BackupRead`/`BackupWrite` streaming
 //!   for NTFS metadata-preserving layer capture.
 //! - [`zlayer_agent::windows::wclayer`] — direct HCS layer storage wrappers
@@ -84,10 +84,10 @@ use crate::tui::BuildEvent;
 
 use super::{BuildBackend, ImageOs};
 
-/// Default scratch layer size in GiB used when a build does not specify one.
-/// Matches the agent's production default so hosts that already tuned the
-/// size don't see a different value at build time.
-const DEFAULT_SCRATCH_SIZE_GB: u64 = 20;
+// `CreateSandboxLayer` (hcsshim's canonical scratch-creation API used by
+// containerd/runhcs/Moby) takes no size option, so DEFAULT_SCRATCH_SIZE_GB
+// and `parse_scratch_size_gb` are unused — kept removed for the same reason
+// the per-call `size_gb` arg was dropped.
 
 /// Root directory under the user's local app data where the HCS builder
 /// stages scratch layers, pulled base-image chains, and written OCI blobs.
@@ -276,19 +276,16 @@ impl BuildBackend for HcsBackend {
             })?;
 
         // 2. Create the writable scratch layer on top of the parent chain.
+        // Note: `CreateSandboxLayer` (hcsshim's canonical scratch path) takes
+        // no size option, so the `--platform "scratch-size=NN"` hint and
+        // DEFAULT_SCRATCH_SIZE_GB are no longer consulted here.
         let scratch_path = build_dir.join("scratch");
-        let scratch_layer = scratch::create_writable_layer(
-            &scratch_path,
-            &base_artifacts.parent_chain,
-            options
-                .platform
-                .as_deref()
-                .and_then(parse_scratch_size_gb)
-                .unwrap_or(DEFAULT_SCRATCH_SIZE_GB),
-        )
-        .map_err(|e| BuildError::LayerCreate {
-            message: format!("create scratch layer at {}: {e}", scratch_path.display()),
-        })?;
+        let scratch_layer =
+            scratch::create_writable_layer(&scratch_path, &base_artifacts.parent_chain).map_err(
+                |e| BuildError::LayerCreate {
+                    message: format!("create scratch layer at {}: {e}", scratch_path.display()),
+                },
+            )?;
 
         debug!(
             scratch = %scratch_layer.layer_path().display(),
@@ -605,18 +602,6 @@ async fn dispatch_instruction(
 /// Parse a `ZLAYER_HCS_SCRATCH_SIZE_GB=<n>` style hint out of the user's
 /// `--platform` flag.
 ///
-/// `BuildOptions` does not currently carry an explicit scratch-size knob and
-/// plumbing one through would churn every caller. Instead we accept a
-/// `scratch:<n>g` suffix on the platform string — cheap to thread through,
-/// trivially removable when a real field lands.
-fn parse_scratch_size_gb(platform: &str) -> Option<u64> {
-    let s = platform
-        .rsplit(',')
-        .find_map(|chunk| chunk.trim().strip_prefix("scratch:"))?;
-    let digits = s.strip_suffix('g').or_else(|| s.strip_suffix('G'))?;
-    digits.parse::<u64>().ok()
-}
-
 /// Generate a fresh build identifier. Matches the shape the buildah backend
 /// uses (6-hex chars from a time + pid + counter hash) so log lines line up
 /// across backends.

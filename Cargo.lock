@@ -12431,6 +12431,7 @@ dependencies = [
  "zlayer-core",
  "zlayer-docker",
  "zlayer-init-actions",
+ "zlayer-libcontainer",
  "zlayer-observability",
  "zlayer-overlay",
  "zlayer-paths",
@@ -13039,6 +13040,7 @@ dependencies = [
  "tracing",
  "zlayer-paths",
  "zlayer-spec",
+ "zlayer-types",
  "zstd",
 ]
 

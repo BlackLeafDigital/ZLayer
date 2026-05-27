@@ -143,7 +143,20 @@ jobs:
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
-          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-completions; do
+          # zlayer-rootfs.tar.gz is the WSL2 distro tarball produced by
+          # build.yml's build-rootfs job (Alpine minirootfs + iproute2 +
+          # iptables + /usr/local/bin/zlayer). It gets published as a
+          # release asset alongside the platform binaries so a fresh
+          # Windows host can `wsl --import` it directly from the release
+          # URL without needing the OCI registry. The docker-push job
+          # additionally publishes the same tarball as an OCI image.
+          # zlayer-linux-amd64-musl.tar.gz is a fully static (musl) build of
+          # the same `zlayer` binary, produced by build.yml's
+          # build-linux-amd64-musl job. It's the binary baked into the WSL2
+          # rootfs (Alpine/musl), and we ship it as a release asset too so
+          # users on Alpine/musl hosts (or any glibc-less environment) can
+          # grab a working portable binary without rebuilding.
+          for name in zlayer-linux-amd64 zlayer-linux-amd64-musl zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-completions zlayer-rootfs; do
             echo "Downloading ${name}.tar.gz..."
             curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
               --user "$AUTH" \
@@ -443,6 +456,22 @@ jobs:
             echo "OK ${img}-oci.tar downloaded"
           done
 
+      - name: Download WSL2 rootfs tarball
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloading zlayer-rootfs.tar.gz..."
+          curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
+            "${{ inputs.artifact_base_url }}/zlayer-rootfs.tar.gz" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            -o "zlayer-rootfs.tar.gz"
+          ls -la zlayer-rootfs.tar.gz
+
+      - name: Login to Forgejo registry
+        if: steps.check.outputs.completed != 'true'
+        run: echo "${{ secrets.FORGEJO_ACTIONS_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin forge.blackleafdigital.com
+
       - name: Login to Docker Hub
         if: steps.check.outputs.completed != 'true'
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin docker.io
@@ -529,6 +558,38 @@ jobs:
 
           rm -f zlayer
           echo "Done: zlayer"
+
+      - name: Build and push zlayer-rootfs OCI image
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.detect.outputs.version }}"
+          IMAGE="forge.blackleafdigital.com/blackleafdigital/zlayer-rootfs"
+
+          # Build a single-layer OCI image straight from the rootfs
+          # tarball. `buildah add --chown 0:0 <tarball> /` extracts the
+          # tarball into the container's root, producing exactly one
+          # layer whose contents match what `wsl --import` would lay out.
+          # This way the same artifact is consumable as both a WSL2
+          # distro tar AND an OCI image — single source of truth.
+          ctr=$(sudo buildah from scratch)
+          sudo buildah add --chown 0:0 "$ctr" zlayer-rootfs.tar.gz /
+          sudo buildah config \
+            --label "org.opencontainers.image.title=zlayer-rootfs" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.source=https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer" \
+            --label "org.opencontainers.image.description=zlayer WSL2 rootfs (Alpine + iproute2 + iptables + /usr/local/bin/zlayer)" \
+            --label "org.opencontainers.image.revision=${{ inputs.sha || github.sha }}" \
+            --created-by "release.yml docker-push" \
+            "$ctr"
+          IMAGE_ID=$(sudo buildah commit "$ctr" "${IMAGE}:${VERSION}")
+          sudo buildah tag "${IMAGE_ID}" "${IMAGE}:latest"
+
+          # Push both tags. Versioned tag is immutable; :latest moves.
+          sudo buildah push "${IMAGE}:${VERSION}"
+          sudo buildah push "${IMAGE}:latest"
+          echo "Done: zlayer-rootfs ${VERSION} (and :latest)"
 
       - name: Upload image archives to Forgejo Packages
         if: steps.check.outputs.completed != 'true'
@@ -677,6 +738,18 @@ jobs:
           containing bash/zsh/fish/powershell/elvish scripts. A standalone
           [zlayer-completions.tar.gz](${PACKAGES_URL}/zlayer-completions.tar.gz)
           is also published for package maintainers.
+
+          ### Windows WSL2 rootfs
+
+          The [zlayer-rootfs.tar.gz](${PACKAGES_URL}/zlayer-rootfs.tar.gz)
+          tarball is an Alpine minirootfs with `iproute2` / `iptables` /
+          `ca-certificates` and `/usr/local/bin/zlayer` baked in. It is
+          imported automatically on first run by `zlayer.exe` on Windows
+          (the WSL2 delegate uses `wsl --import zlayer ...` to materialize
+          a Linux distro for running Linux workloads). The same content is
+          also available as an OCI image at
+          `forge.blackleafdigital.com/blackleafdigital/zlayer-rootfs:${VERSION}`
+          (and `:latest`).
 
           ### Python (PyPI)
 

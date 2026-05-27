@@ -1534,8 +1534,8 @@ impl ServiceSpec {
     pub fn minimal(_name: impl Into<String>, image: impl Into<String>) -> Self {
         use std::str::FromStr;
         let image_str = image.into();
-        let image_ref = crate::ImageReference::from_str(&image_str).unwrap_or_else(|_| {
-            crate::ImageReference::from_str("scratch:latest")
+        let image_ref = crate::ImageRef::from_str(&image_str).unwrap_or_else(|_| {
+            crate::ImageRef::from_str("scratch:latest")
                 .expect("'scratch:latest' is a valid image reference")
         });
         Self {
@@ -1597,8 +1597,7 @@ pub enum ResourceType {
 #[serde(deny_unknown_fields)]
 pub struct ImageSpec {
     /// Image name (e.g., "ghcr.io/org/api:latest")
-    #[serde(with = "crate::image_ref_serde")]
-    pub name: crate::ImageReference,
+    pub name: crate::ImageRef,
 
     /// When to pull the image
     #[serde(default = "default_pull_policy")]
@@ -1620,7 +1619,7 @@ impl Default for ImageSpec {
     fn default() -> Self {
         use std::str::FromStr;
         Self {
-            name: crate::ImageReference::from_str("scratch:latest")
+            name: crate::ImageRef::from_str("scratch:latest")
                 .expect("'scratch:latest' is a valid image reference"),
             pull_policy: default_pull_policy(),
         }
@@ -1631,47 +1630,18 @@ impl Default for ImageSpec {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PullPolicy {
-    /// Always pull the image, even if cached
+    /// Always pull the image, even if cached.
     Always,
-    /// Resolve remote digest; pull and recreate when it differs from local/running
+    /// Resolve remote digest; pull and recreate when it differs from local/running.
     Newer,
-    /// Pull only if not present locally
+    /// Use the local image if present; otherwise pull. Never contact a
+    /// registry for revalidation when the image is already cached locally.
+    /// This is the literal Docker/Kubernetes semantics — no silent upgrade
+    /// to `Newer` for `:latest` tags (set `pull_policy: newer` explicitly
+    /// when you want redeploy-picks-up-new-latest behavior).
     IfNotPresent,
-    /// Never pull, use local image only
+    /// Never pull, use local image only.
     Never,
-}
-
-/// Resolve the effective pull policy for a deploy/scale operation.
-///
-/// The serde default for `pull_policy` is `IfNotPresent` (preserved for
-/// backwards compatibility). When the user has not opted out (i.e. the policy
-/// is the default `IfNotPresent`) AND the image tag is `:latest` or unspecified,
-/// we auto-upgrade to `Newer` so freshly-pushed `:latest` images get picked up
-/// on redeploy. Users who explicitly want immutable behaviour on a `:latest`
-/// tag can set `pull_policy: never`.
-#[must_use]
-pub fn effective_pull_policy(image: &crate::ImageReference, spec_policy: PullPolicy) -> PullPolicy {
-    match spec_policy {
-        PullPolicy::Always | PullPolicy::Never | PullPolicy::Newer => spec_policy,
-        PullPolicy::IfNotPresent => {
-            // Auto-upgrade IfNotPresent to Newer for :latest / no-tag images
-            if image_is_latest_or_untagged(image) {
-                PullPolicy::Newer
-            } else {
-                PullPolicy::IfNotPresent
-            }
-        }
-    }
-}
-
-fn image_is_latest_or_untagged(image: &crate::ImageReference) -> bool {
-    // `ImageReference` is `oci_spec::distribution::Reference`, which exposes a
-    // clean `tag()` accessor returning `Option<&str>`. No tag, or tag "latest",
-    // is treated as the rolling case.
-    match image.tag() {
-        None => true,
-        Some(tag) => tag == "latest",
-    }
 }
 
 /// Device passthrough specification

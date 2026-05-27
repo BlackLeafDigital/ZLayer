@@ -170,7 +170,6 @@ pub async fn prepare_base_chain(
 pub fn create_writable_layer(
     layer_path: &Path,
     parent_chain: &LayerChain,
-    size_gb: u64,
 ) -> io::Result<WritableLayer> {
     if parent_chain.0.is_empty() {
         return Err(io::Error::other(
@@ -186,7 +185,6 @@ pub fn create_writable_layer(
     zlayer_agent::windows::scratch::create(
         layer_path,
         parent_chain,
-        size_gb,
         /* is_base_os_bootstrap = */ false,
     )
 }
@@ -244,7 +242,7 @@ mod tests {
             .scratch_dir("empty-parent-chain-rejected-before-hcs-call-")
             .expect("tmpdir");
         let chain = LayerChain::default();
-        let err = create_writable_layer(tmp.path(), &chain, 20)
+        let err = create_writable_layer(tmp.path(), &chain)
             .expect_err("empty chain must fail before calling HCS");
         assert!(
             err.to_string().contains("non-empty parent chain"),

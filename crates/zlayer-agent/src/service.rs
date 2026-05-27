@@ -20,10 +20,7 @@ use tokio::sync::{RwLock, Semaphore};
 use zlayer_observability::logs::LogEntry;
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::{StreamRegistry, StreamService};
-use zlayer_spec::{
-    effective_pull_policy, DependsSpec, HealthCheck, Protocol, PullPolicy, ResourceType,
-    ServiceSpec,
-};
+use zlayer_spec::{DependsSpec, HealthCheck, Protocol, PullPolicy, ResourceType, ServiceSpec};
 
 /// Service instance manages a single service's containers
 pub struct ServiceInstance {
@@ -155,10 +152,11 @@ impl ServiceInstance {
         self.last_pulled_digest.read().await.clone()
     }
 
-    /// Pull the service image using `effective_pull_policy` (so a default
-    /// `IfNotPresent` on a `:latest` tag auto-upgrades to `Newer`) and refresh
-    /// the cached digest from `Runtime::list_images` when the runtime exposes
-    /// it. Returns the digest observed after the pull, when known.
+    /// Pull the service image using the spec's pull policy (literal Docker /
+    /// Kubernetes semantics — no silent auto-upgrade of `IfNotPresent` to
+    /// `Newer` for `:latest` tags) and refresh the cached digest from
+    /// `Runtime::list_images` when the runtime exposes it. Returns the digest
+    /// observed after the pull, when known.
     ///
     /// For `Never`, the runtime is still called so it can load the image
     /// config from the local cache (without any remote round-trip); only the
@@ -166,10 +164,10 @@ impl ServiceInstance {
     /// has no image entrypoint/cmd and falls back to `/bin/sh`.
     async fn pull_and_refresh_digest(&self) -> Result<Option<String>> {
         let image_str = self.spec.image.name.to_string();
-        let effective = effective_pull_policy(&self.spec.image.name, self.spec.image.pull_policy);
+        let policy = self.spec.image.pull_policy;
 
         self.runtime
-            .pull_image_with_policy(&image_str, effective, None)
+            .pull_image_with_policy(&image_str, policy, None)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: self.spec.image.name.to_string(),
@@ -1575,7 +1573,7 @@ impl ServiceManager {
                         instance.set_dns_server(Arc::clone(dns));
                     }
 
-                    let effective = effective_pull_policy(&spec.image.name, spec.image.pull_policy);
+                    let effective = spec.image.pull_policy;
                     let old_digest = instance.last_pulled_digest().await;
                     let current_replicas =
                         u32::try_from(instance.replica_count().await).unwrap_or(u32::MAX);

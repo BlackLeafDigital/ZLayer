@@ -230,11 +230,29 @@ async fn finalize_wsl_backend(
         setup_distro().await?;
     }
 
-    // Verify binary exists inside distro
+    // Verify binary exists inside distro.
     let check = distro::wsl_exec("test", &["-x", "/usr/local/bin/zlayer"]).await?;
     if !check.status.success() {
         tracing::info!("ZLayer binary not found in WSL2 distro, installing...");
         install_binary().await?;
+    }
+
+    // Sanity-check that the installed binary actually exposes the
+    // `runtime <verb>` subcommand surface the WSL2 delegate relies on. A
+    // present-but-stale binary (wrong arch, built without the
+    // `youki-runtime` feature) would otherwise only blow up on first
+    // container dispatch with a confusing argv-parse error. Bail clearly
+    // here instead.
+    let runtime_check = distro::wsl_exec("/usr/local/bin/zlayer", &["runtime", "--help"]).await?;
+    if !runtime_check.status.success() {
+        return Err(anyhow::anyhow!(
+            "/usr/local/bin/zlayer in the WSL2 distro does not expose the `runtime` \
+             subcommand (status {:?}): {} — the installed binary is likely the wrong \
+             architecture or was built without the `youki-runtime` feature; \
+             rebuild and reinstall the Linux `zlayer` binary",
+            runtime_check.status.code(),
+            String::from_utf8_lossy(&runtime_check.stderr).trim(),
+        ));
     }
 
     Ok(WslBackendConfig::default())

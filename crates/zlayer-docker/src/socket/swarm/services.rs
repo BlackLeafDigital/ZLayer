@@ -566,19 +566,20 @@ fn replica_only_change(body: &DockerServiceSpec, existing: &ZServiceSpec) -> Opt
     // is present and different, this is not a replica-only update.
     if let Some(tt) = &body.task_template {
         if let Some(cs) = &tt.container_spec {
-            // ImageReference normalises short forms ("nginx" ->
-            // "docker.io/library/nginx:latest"), so we round-trip the
-            // incoming string through the same parser to compare in the
-            // same canonical shape. Unparseable images count as a change
-            // — the daemon would reject them anyway.
+            // Compare on the parsed canonical form so a user-supplied
+            // short name ("nginx") matches an existing reference stored
+            // verbatim. `ImageRef` preserves the original string in
+            // `to_string()`, so we must reach through to `.parsed()` here.
+            // Unparseable images count as a change — the daemon would
+            // reject them anyway.
             if !cs.image.is_empty() {
-                let existing_str = format!("{}", existing.image.name);
-                let incoming = cs
+                let existing_canonical = existing.image.name.parsed().to_string();
+                let incoming_canonical = cs
                     .image
                     .parse::<zlayer_types::ImageReference>()
                     .ok()
-                    .map(|r| format!("{r}"));
-                if incoming.as_deref() != Some(existing_str.as_str()) {
+                    .map(|r| r.to_string());
+                if incoming_canonical.as_deref() != Some(existing_canonical.as_str()) {
                     return None;
                 }
             }
@@ -838,7 +839,7 @@ fn translate_service_only(body: &DockerServiceSpec) -> Result<ZServiceSpec, Stri
     if image_str.is_empty() {
         return Err("Spec.TaskTemplate.ContainerSpec.Image is required".to_string());
     }
-    let image_ref: zlayer_types::ImageReference = image_str
+    let image_ref: zlayer_types::ImageRef = image_str
         .parse()
         .map_err(|e| format!("invalid image reference '{image_str}': {e}"))?;
 
@@ -1276,11 +1277,9 @@ mod tests {
             ..Default::default()
         };
         let zspec = translate_service_only(&body).expect("translate");
-        // ImageReference normalises "nginx:1.25" -> "docker.io/library/nginx:1.25".
-        assert_eq!(
-            format!("{}", zspec.image.name),
-            "docker.io/library/nginx:1.25"
-        );
+        // `ImageRef` preserves the user's original string verbatim; the
+        // parsed canonical form lives behind `.parsed()` if needed.
+        assert_eq!(format!("{}", zspec.image.name), "nginx:1.25");
         assert_eq!(
             zspec.command.entrypoint,
             Some(vec!["/usr/bin/nginx".to_string()])
@@ -1347,10 +1346,11 @@ mod tests {
         let replicated = docker.spec.mode.replicated.expect("replicated mode");
         assert_eq!(replicated.replicas, 3);
         assert!(docker.spec.mode.global.is_none());
-        // ImageReference normalises "nginx:latest" -> "docker.io/library/nginx:latest".
+        // `ImageRef` preserves the user's original string verbatim across the
+        // ZLayer<->Docker round trip; no silent `docker.io/library/` prefix.
         assert_eq!(
             docker.spec.task_template.container_spec.image,
-            "docker.io/library/nginx:latest"
+            "nginx:latest"
         );
         assert_eq!(
             docker.spec.task_template.container_spec.command,

@@ -827,6 +827,19 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 32)]
     Windows(WindowsCommands),
 
+    /// Internal runc-compatible runtime CLI used by `Wsl2DelegateRuntime`.
+    /// Hidden from top-level `--help` because it is not a user-facing
+    /// surface — operators interact with containers via `zlayer container`
+    /// and `zlayer image`, which talk to the daemon over UDS.
+    #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+    #[command(display_order = 32, hide = true)]
+    Runtime {
+        #[command(flatten)]
+        global: RuntimeGlobal,
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+
     /// Tunnel management commands
     ///
     /// Create, manage, and connect tunnels for secure access to services.
@@ -1123,6 +1136,90 @@ pub enum WindowsCommands {
         /// Skip the graceful daemon-stop wait; go straight to `wsl --shutdown`.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// Shared flags for every `zlayer runtime` subcommand. `state_root` is the
+/// directory libcontainer uses to persist per-container state (config.json,
+/// pid file, etc.) and matches runc's `--root`.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+#[derive(clap::Args, Debug)]
+pub struct RuntimeGlobal {
+    /// Root directory where container state files live. Defaults to
+    /// `/var/lib/zlayer/oci/state`.
+    #[arg(long, default_value = "/var/lib/zlayer/oci/state", global = true)]
+    pub state_root: std::path::PathBuf,
+}
+
+/// Internal runc-compatible runtime CLI used by `Wsl2DelegateRuntime` to
+/// drive containers inside the `zlayer` WSL2 distro via
+/// `wsl.exe -d zlayer -- /usr/local/bin/zlayer runtime <verb>`. Mirrors the
+/// in-process libcontainer logic in `crates/zlayer-agent/src/runtimes/youki.rs`.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+#[derive(Debug, clap::Subcommand)]
+pub enum RuntimeCommand {
+    /// Query container state. Emits runc-compatible JSON to stdout.
+    State {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Create a container from an OCI bundle (does not start it).
+    Create {
+        /// Container ID.
+        id: String,
+        /// Path to the OCI bundle directory (must contain `config.json`).
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+        /// Optional log file path (runc compatibility).
+        #[arg(long)]
+        log: Option<std::path::PathBuf>,
+    },
+
+    /// Start a previously-created container.
+    Start {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Send a signal to one or all processes in a container.
+    Kill {
+        /// Container ID.
+        id: String,
+        /// Signal name (e.g. `SIGTERM`, `SIGKILL`) or number.
+        signal: String,
+        /// Send the signal to every process in the container, not just init.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Delete a stopped container and free its state.
+    Delete {
+        /// Container ID.
+        id: String,
+        /// Forcefully delete a running container (SIGKILL + remove).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Exec a process inside a running container. Trailing args after `--`
+    /// are the command and its arguments.
+    Exec {
+        /// Container ID.
+        id: String,
+        /// Command and arguments to exec (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Emit cgroup events/stats. With `--stats`, prints a one-shot snapshot
+    /// instead of streaming.
+    Events {
+        /// Container ID.
+        id: String,
+        /// Emit a single stats snapshot and exit.
+        #[arg(long)]
+        stats: bool,
     },
 }
 

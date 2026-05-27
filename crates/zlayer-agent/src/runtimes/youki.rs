@@ -520,17 +520,18 @@ impl YoukiRuntime {
     /// Pull image layers and return them for extraction
     ///
     /// Uses the shared blob cache to avoid repeated network requests for cached layers.
-    /// The `policy` parameter is translated to a `force_refresh` flag: `PullPolicy::Always`
-    /// clears the manifest cache before fetching, while `IfNotPresent` reuses any cached
-    /// manifest (the puller still revalidates mutable tags via HEAD).
+    /// The `policy: PullPolicy` is forwarded straight to the puller: `PullPolicy::Always`
+    /// clears the manifest cache before fetching, `PullPolicy::Newer` revalidates
+    /// mutable tags via HEAD, and `PullPolicy::IfNotPresent` / `PullPolicy::Never`
+    /// trust the local cache without revalidating against the remote.
     ///
-    /// `PullPolicy::Never` short-circuits to a local-cache-only path: the puller is
-    /// invoked with `force_refresh = false` so it consults the local registry and blob
-    /// cache first. If the image is not present locally and the puller falls through to
-    /// a remote fetch that fails, the error is remapped to a Never-specific message so
-    /// callers can distinguish "missing locally" from a transient network failure. With
-    /// the Phase 0 import fix, locally-imported images always satisfy the local lookup
-    /// and no remote round-trip occurs.
+    /// `PullPolicy::Never` short-circuits to a local-cache-only path. The puller is
+    /// invoked with the same policy so it consults the local registry and blob cache
+    /// without any remote HEAD revalidation. If the image is not present locally and
+    /// the puller falls through to a remote fetch that fails, the error is remapped
+    /// to a Never-specific message so callers can distinguish "missing locally" from
+    /// a transient network failure. With the Phase 0 import fix, locally-imported
+    /// images always satisfy the local lookup and no remote round-trip occurs.
     async fn pull_image_layers(
         &self,
         image: &str,
@@ -553,7 +554,7 @@ impl YoukiRuntime {
                 "pull_policy=Never; serving layers from local cache only"
             );
             return puller
-                .pull_image_with_policy(image, &auth, false)
+                .pull_image_with_policy(image, &auth, policy)
                 .await
                 .map_err(|e| AgentError::PullFailed {
                     image: image.to_string(),
@@ -561,10 +562,8 @@ impl YoukiRuntime {
                 });
         }
 
-        let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
-
         puller
-            .pull_image_with_policy(image, &auth, force_refresh)
+            .pull_image_with_policy(image, &auth, policy)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
@@ -793,12 +792,11 @@ impl Runtime for YoukiRuntime {
         // For IfNotPresent, check if image layers are in cache by trying to pull
         // Use the shared blob cache to avoid repeated opens and ensure persistence
         // For Always, force a round-trip to the registry by clearing the manifest cache.
-        let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
-        tracing::info!(image = %image, force_refresh, "pulling image layers to cache");
+        tracing::info!(image = %image, ?policy, "pulling image layers to cache");
 
         // Pull image layers from registry (cached layers are retrieved from cache)
         let layers = puller
-            .pull_image_with_policy(image, &auth, force_refresh)
+            .pull_image_with_policy(image, &auth, policy)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
@@ -813,7 +811,7 @@ impl Runtime for YoukiRuntime {
 
         // Also pull and cache the image config (entrypoint, cmd, env, etc.)
         match puller
-            .pull_image_config_with_policy(image, &auth, force_refresh)
+            .pull_image_config_with_policy(image, &auth, policy)
             .await
         {
             Ok(config) => {
@@ -2987,9 +2985,9 @@ impl Runtime for YoukiRuntime {
 
             // Step 4: do the actual pull (uses the shared blob cache;
             // already-cached layers are no-ops).
-            let force_refresh = false;
+            let policy = zlayer_spec::PullPolicy::Newer;
             match puller
-                .pull_image_with_policy(&image_owned, &auth, force_refresh)
+                .pull_image_with_policy(&image_owned, &auth, policy)
                 .await
             {
                 Ok(_layers) => {
@@ -2997,7 +2995,7 @@ impl Runtime for YoukiRuntime {
                     // the `Done` event can carry a content-addressed
                     // identifier when one is available.
                     let _ = puller
-                        .pull_image_config_with_policy(&image_owned, &auth, force_refresh)
+                        .pull_image_config_with_policy(&image_owned, &auth, policy)
                         .await;
 
                     let _ = tx

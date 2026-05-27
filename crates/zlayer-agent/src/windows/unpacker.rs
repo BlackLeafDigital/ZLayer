@@ -13,12 +13,13 @@
 //!   stream each blob to disk to cap RAM at large-image boundaries.
 //! - Digest verification re-hashes the raw (compressed) blob bytes; we don't
 //!   independently verify `DiffIDs` on the decompressed tar.
-//! - Tombstones and `Hives/` entries are written as raw byte copies. The
-//!   `Files/` subtree is translated through [`backuptar`] which synthesises
-//!   the `WIN32_STREAM_ID`-framed records (`BACKUP_DATA`, plus optional
-//!   `BACKUP_SECURITY_DATA` / `BACKUP_REPARSE_DATA` / `BACKUP_EA_DATA`
-//!   pulled from the entry's PAX extensions) that [`BackupStreamWriter`]
-//!   expects.
+//! - Tombstones and `Hives/` entries are written as raw byte copies (hcsshim's
+//!   `BackupFileWriter` interprets framing on the fly and writes only the body
+//!   to disk, so the staging layout on disk is unframed). The `Files/` subtree
+//!   is translated through [`backuptar`] which synthesises the full
+//!   `WIN32_STREAM_ID`-framed records (`BACKUP_DATA`, plus optional
+//!   `BACKUP_SECURITY_DATA` / `BACKUP_REPARSE_DATA` / `BACKUP_EA_DATA` pulled
+//!   from the entry's PAX extensions) that [`BackupStreamWriter`] expects.
 //!
 //! See `hcsshim/internal/wclayer/legacy.go` and `go-winio/backuptar/tar.go`
 //! for the reference flow.
@@ -28,6 +29,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use oci_client::secrets::RegistryAuth;
 use zlayer_hcs::schema::Layer;
 
@@ -106,9 +108,7 @@ pub async fn unpack_windows_image(
     for (layer_idx, desc) in layers.iter().enumerate() {
         let layer_id = new_layer_id();
         let layer_path = dest_root.join(&layer_id);
-        let staging_path = dest_root.join(format!("{layer_id}.staging"));
         std::fs::create_dir_all(&layer_path)?;
-        std::fs::create_dir_all(&staging_path)?;
 
         // 1. Pull blob (MCR `urls[]` redirect fallback lives inside the
         //    registry client; we just hand it the descriptor.urls list).
@@ -123,39 +123,42 @@ pub async fn unpack_windows_image(
         verify_digest(&bytes, &desc.digest)?;
         let raw = decompress(&bytes, &desc.media_type)?;
 
-        // 4+5. Materialize tar entries into the OCI staging dir via BackupStreamWriter.
-        extract_tar_to_backup_stream(&raw, &staging_path)?;
-
-        // 6. Import staging dir into the HCS layer dir (see `wclayer.rs:91-94`: source must differ from dest).
-        let parent_chain = build_parent_chain(&chain_so_far);
         let is_base_layer = chain_so_far.is_empty();
-        wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
-            io::Error::other(format!(
-                "HcsImportLayer(layer={layer_idx} digest={} dest={}): {e}",
-                desc.digest,
-                layer_path.display()
-            ))
-        })?;
-
-        // 6b. For the base (parent-less) layer, run ProcessBaseImage so the
-        //     Hives/* registry exports are materialized into the
-        //     Files\Windows\System32\config\* paths that child layers expect.
-        //     Skipping this is the canonical cause of `0x80070002` on a
-        //     subsequent child-layer HcsImportLayer call.
         if is_base_layer {
+            // hcsshim's `baseLayerWriter` writes real NTFS files directly into
+            // the final layer dir and finalizes via `ProcessBaseLayer` — no
+            // `HcsImportLayer` involved (that's only for `legacyLayerWriter`
+            // staging dirs, i.e. diff layers).
+            extract_tar_to_backup_stream(&raw, &layer_path, true)?;
             wclayer::process_base_layer(&layer_path).map_err(|e| {
                 io::Error::other(format!(
-                    "ProcessBaseImage(layer={layer_idx} digest={} dest={}): {e}",
+                    "ProcessBaseLayer(layer={layer_idx} digest={} dest={}): {e}",
                     desc.digest,
                     layer_path.display()
                 ))
             })?;
+        } else {
+            // Diff layer: materialize the legacy framed staging format, then
+            // hand it to `HcsImportLayer` (source must differ from dest — see
+            // `wclayer.rs:91-94`).
+            let staging_path = dest_root.join(format!("{layer_id}.staging"));
+            std::fs::create_dir_all(&staging_path)?;
+            extract_tar_to_backup_stream(&raw, &staging_path, false)?;
+            let parent_chain = build_parent_chain(&chain_so_far);
+            wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
+                io::Error::other(format!(
+                    "HcsImportLayer(layer={layer_idx} digest={} dest={}): {e}",
+                    desc.digest,
+                    layer_path.display()
+                ))
+            })?;
+            let _ = std::fs::remove_dir_all(&staging_path);
         }
 
-        let _ = std::fs::remove_dir_all(&staging_path);
-
+        // HCS keys parent layers by `NameToGuid(basename(path))`, not by the
+        // directory's UUID name. Derive the canonical id so HCS can chain-walk.
         chain_so_far.push(Layer {
-            id: layer_id,
+            id: wclayer::layer_id_for_path(&layer_path)?,
             path: layer_path.to_string_lossy().into_owned(),
         });
     }
@@ -242,9 +245,27 @@ fn verify_digest(bytes: &[u8], expected: &str) -> io::Result<()> {
 /// metadata in the OCI format; we hand them to
 /// [`backuptar::write_oci_entry_to_backup_stream`] which synthesises the
 /// `WIN32_STREAM_ID`-framed records expected by `BackupWrite`. Everything
-/// else (`Hives/`, raw `tombstones.txt`, `UtilityVM/`) is written as a raw
-/// byte copy via the long-path-aware helper.
-fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+/// else (raw `tombstones.txt`, `Hives/*`, `UtilityVM/`) is written as a raw
+/// byte copy via the long-path-aware helper — hcsshim's `BackupFileWriter`
+/// interprets framing on the fly, so the staging-dir layout on disk is
+/// unframed.
+fn extract_tar_to_backup_stream(
+    tar_bytes: &[u8],
+    layer_path: &Path,
+    is_base_layer: bool,
+) -> io::Result<()> {
+    if is_base_layer {
+        extract_tar_as_base_layer(tar_bytes, layer_path)
+    } else {
+        extract_tar_as_diff_layer(tar_bytes, layer_path)
+    }
+}
+
+/// Diff-layer (parent-chain non-empty) tar walk — emits the hcsshim
+/// `legacyLayerWriter` on-disk staging format: `.$wcidirs$` markers,
+/// 4-byte LE `FileAttributes` headers, verbatim `WIN32_STREAM_ID` records,
+/// raw `Hives/*` byte copies, and a `tombstones.txt` whiteout manifest.
+fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
     use std::collections::HashSet;
 
     let mut archive = tar::Archive::new(tar_bytes);
@@ -266,6 +287,7 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
         if entry_type.is_dir() {
             let dest = layer_path.join(&rel_path);
             create_long_path_dir_all(&dest)?;
+            write_wcidirs_sidecar(&mut entry, &rel_path, &dest)?;
             continue;
         }
 
@@ -320,7 +342,7 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
         if is_files_payload {
             backuptar::write_oci_entry_to_backup_stream(&mut entry, &dest)?;
         } else {
-            // Non-`Files/` payloads (`Hives/`, `tombstones.txt`, `UtilityVM/`)
+            // Non-`Files/` payloads (`tombstones.txt`, `Hives/*`, `UtilityVM/`)
             // are raw byte copies. `std::fs::File::create` here would hit
             // ERROR_PATH_NOT_FOUND (0x80070003) on the deep UtilityVM/WinSxS
             // paths embedded in nanoserver layers, so we route through the
@@ -382,6 +404,161 @@ fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Resu
         std::io::Write::write_all(&mut f, body.as_bytes())?;
     }
 
+    Ok(())
+}
+
+/// Base-layer (parent-chain empty) tar walk — emits the hcsshim
+/// `baseLayerWriter` on-disk format: REAL NTFS directories (no
+/// `.$wcidirs$` markers), real NTFS files with metadata stamped via
+/// `BackupWrite` (no 4-byte attr header, no verbatim framing), and NO
+/// tombstones (`baseLayerWriter.Remove` explicitly rejects them).
+///
+/// Hardlinks are deferred to a replay pass exactly like the diff layer so
+/// out-of-order tar entries still resolve.
+fn extract_tar_as_base_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    let mut pending_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let rel_path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+
+        // Directory entries: materialize a real NTFS directory. No
+        // `.$wcidirs$` sibling marker — baseLayerWriter does not emit one.
+        if entry_type.is_dir() {
+            let dest = layer_path.join(&rel_path);
+            create_long_path_dir_all(&dest)?;
+            continue;
+        }
+
+        // Whiteouts are illegal in base layers — hcsshim's baseLayerWriter
+        // returns `errors.New("base layer cannot have tombstones")`.
+        if let Some(basename) = rel_path.file_name().and_then(|s| s.to_str()) {
+            if basename.starts_with(".wh.") {
+                return Err(io::Error::other(format!(
+                    "base layer cannot have tombstones (got whiteout entry {})",
+                    rel_path.display()
+                )));
+            }
+        }
+
+        let dest = layer_path.join(&rel_path);
+        if let Some(parent) = dest.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+
+        // Defer hardlinks until all primary entries have been materialized.
+        if entry_type == tar::EntryType::Link {
+            let link_target = entry.link_name()?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "tar hardlink entry missing link_name: {}",
+                    rel_path.display()
+                ))
+            })?;
+            pending_links.push((rel_path.clone(), link_target.into_owned()));
+            continue;
+        }
+
+        let rel_str = rel_path.to_string_lossy();
+        let is_files_payload = rel_str.starts_with("Files/")
+            || rel_str.starts_with("Files\\")
+            || rel_str.starts_with("UtilityVM/")
+            || rel_str.starts_with("UtilityVM\\");
+        if is_files_payload {
+            // Real NTFS file: metadata stamped via BackupWrite, no verbatim
+            // framing on disk.
+            backuptar::write_oci_entry_as_base_layer(&mut entry, &dest)?;
+        } else {
+            // `Hives/*` and any auxiliary base-layer files: raw byte copies
+            // through the long-path-aware helper (hcsshim's baseLayerWriter
+            // also raw-copies Hives — they are NTFS registry hive exports,
+            // not BackupStream blobs).
+            let mut f = layer::create_long_path_file(&dest)?;
+            std::io::copy(&mut entry, &mut f)?;
+        }
+    }
+
+    // Replay pending hardlinks now that every primary file is on disk.
+    for (link_rel, target_rel) in pending_links {
+        let link_abs = layer_path.join(&link_rel);
+        let target_abs = layer_path.join(&target_rel);
+        if let Some(parent) = link_abs.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+        if let Err(e) = std::fs::hard_link(&target_abs, &link_abs) {
+            return Err(io::Error::other(format!(
+                "hard_link({} -> {}): {e}",
+                link_abs.display(),
+                target_abs.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Write the `<dirname>.$wcidirs$` sibling marker that hcsshim's
+/// `legacyLayerWriter.Add` emits for every non-UVM directory. Without it,
+/// `HcsImportLayer`'s NTFS walker returns `0x80070002`. The marker carries
+/// a 4-byte LE `FileAttributes` header, optionally followed by a
+/// `BACKUP_REPARSE_DATA` record when the tar entry has `MSWINDOWS.reparse`.
+fn write_wcidirs_sidecar<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    rel_path: &Path,
+    dest: &Path,
+) -> io::Result<()> {
+    let rel_norm = rel_path.to_string_lossy().replace('\\', "/");
+    let is_uvm =
+        rel_norm == "UtilityVM" || rel_norm == "UtilityVM/" || rel_norm.starts_with("UtilityVM/");
+    if is_uvm {
+        return Ok(());
+    }
+
+    let mut attrs: u32 = 0x0000_0010;
+    let mut reparse: Option<Vec<u8>> = None;
+    if let Some(pax) = entry.pax_extensions()? {
+        let engine = base64::engine::general_purpose::STANDARD;
+        for ext in pax {
+            let ext = ext?;
+            match ext.key().unwrap_or("") {
+                "MSWINDOWS.fileattr" => {
+                    if let Some(parsed) = std::str::from_utf8(ext.value_bytes())
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                    {
+                        attrs = parsed;
+                    }
+                }
+                "MSWINDOWS.reparse" => {
+                    reparse = Some(engine.decode(ext.value_bytes()).map_err(|e| {
+                        io::Error::other(format!("PAX MSWINDOWS.reparse base64 decode: {e}"))
+                    })?);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let dirname = dest.file_name().ok_or_else(|| {
+        io::Error::other(format!(
+            "tar dir entry has no file_name: {}",
+            rel_path.display()
+        ))
+    })?;
+    let mut marker_name = dirname.to_os_string();
+    marker_name.push(".$wcidirs$");
+    let marker_path = match dest.parent() {
+        Some(p) => p.join(&marker_name),
+        None => PathBuf::from(&marker_name),
+    };
+
+    let mut f = layer::create_long_path_file(&marker_path)?;
+    std::io::Write::write_all(&mut f, &attrs.to_le_bytes())?;
+    if let Some(rp) = reparse {
+        backuptar::write_stream_header(&mut f, backuptar::BACKUP_REPARSE_DATA, 0, rp.len() as u64)?;
+        std::io::Write::write_all(&mut f, &rp)?;
+    }
     Ok(())
 }
 

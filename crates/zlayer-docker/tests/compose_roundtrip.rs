@@ -49,10 +49,7 @@ fn roundtrip_top_level() {
 fn roundtrip_nginx() {
     let spec = load_and_convert();
     let nginx = &spec.services["nginx"];
-    assert_eq!(
-        nginx.image.name.to_string(),
-        "docker.io/library/nginx:alpine"
-    );
+    assert_eq!(nginx.image.name.to_string(), "nginx:alpine");
     assert_eq!(nginx.endpoints.len(), 2, "nginx should have 2 ports");
 
     let port80 = nginx.endpoints.iter().find(|e| e.port == 80).unwrap();
@@ -87,10 +84,7 @@ fn roundtrip_api() {
     // `api:` ships a `build:` directive without an explicit `image:`, so
     // the converter assigns the Compose-style `<project>-<service>:latest`
     // tag (matching what `compose build` will emit for this service).
-    assert_eq!(
-        api.image.name.to_string(),
-        "docker.io/library/example-webapp-api:latest",
-    );
+    assert_eq!(api.image.name.to_string(), "example-webapp-api:latest");
     assert_eq!(api.endpoints.len(), 1);
     assert_eq!(api.endpoints[0].port, 3000);
     assert_eq!(api.endpoints[0].target_port, Some(3000));
@@ -127,10 +121,7 @@ fn roundtrip_api() {
 fn roundtrip_db() {
     let spec = load_and_convert();
     let db = &spec.services["db"];
-    assert_eq!(
-        db.image.name.to_string(),
-        "docker.io/library/postgres:16-alpine"
-    );
+    assert_eq!(db.image.name.to_string(), "postgres:16-alpine");
     assert_eq!(db.env.get("POSTGRES_USER").unwrap(), "user");
     assert_eq!(db.env.get("POSTGRES_PASSWORD").unwrap(), "pass");
     assert_eq!(db.env.get("POSTGRES_DB").unwrap(), "myapp");
@@ -160,10 +151,7 @@ fn roundtrip_db() {
 fn roundtrip_redis() {
     let spec = load_and_convert();
     let redis = &spec.services["redis"];
-    assert_eq!(
-        redis.image.name.to_string(),
-        "docker.io/library/redis:7-alpine"
-    );
+    assert_eq!(redis.image.name.to_string(), "redis:7-alpine");
     assert_eq!(redis.endpoints.len(), 1);
     assert_eq!(redis.endpoints[0].port, 6379);
     assert_eq!(redis.endpoints[0].protocol, Protocol::Tcp);
