@@ -129,6 +129,37 @@ pub enum AgentError {
         /// Human-readable explanation (e.g. "no WSL2 delegate configured on this Windows node").
         reason: String,
     },
+
+    /// The local runtime cannot service this image because the image's OS
+    /// does not match the runtime's expected OS.
+    ///
+    /// Returned by the HCS runtime when an image's OCI config reports
+    /// `os != "windows"` (e.g. a Linux alpine image landing on a Windows host
+    /// that also has a WSL2 delegate). Calling `vmcompute.dll!ProcessBaseImage`
+    /// on a non-Windows base layer is guaranteed to fail with
+    /// `ERROR_PATH_NOT_FOUND (0x80070003)` because the HCS API expects the
+    /// Windows-specific `Hives/` / `UtilityVM/` / `Files/Windows/System32/`
+    /// layout. Bailing early with this variant lets the composite runtime
+    /// treat the call as a soft skip (the delegate's parallel pull is the one
+    /// that actually owns the image) instead of failing the whole pull.
+    ///
+    /// This is *not* a container failure: callers in the composite layer
+    /// should distinguish this from a real `PullFailed` and continue with the
+    /// delegate's result.
+    #[error(
+        "wrong-platform: {runtime} runtime cannot handle image '{image}' (expected os={expected}, got os={actual})"
+    )]
+    WrongPlatform {
+        /// Identifier of the runtime that rejected the image (e.g. `"hcs"`,
+        /// `"wsl2"`).
+        runtime: String,
+        /// OCI-canonical OS this runtime expects (e.g. `"windows"`, `"linux"`).
+        expected: String,
+        /// OCI-canonical OS the image manifest reports.
+        actual: String,
+        /// Image reference that triggered the mismatch.
+        image: String,
+    },
 }
 
 pub type Result<T, E = AgentError> = std::result::Result<T, E>;

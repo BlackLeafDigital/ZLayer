@@ -1819,30 +1819,60 @@ impl BundleBuilder {
         // is required when running inside another container (e.g. Forgejo CI
         // `container:` block) where `/sys/fs/cgroup/cgroup.subtree_control` is
         // read-only. Precedence:
-        //   1. spec.cgroup_parent (per-service override)
-        //   2. ZLAYER_CGROUP_PARENT env var (host-wide override)
-        //   3. /proc/self/cgroup (auto-detect when nested)
-        //   4. unset (default — bare-metal happy path)
+        //   1. spec.cgroup_parent (per-service override)         — all platforms
+        //   2. ZLAYER_CGROUP_PARENT env var (host-wide override) — all platforms
+        //   3. /proc/self/cgroup (auto-detect when nested)       — Linux only
+        //   4. unset (default — bare-metal happy path; also the WSL2-delegate
+        //      case on non-Linux hosts, where libcontainer inside the WSL
+        //      distro resolves the parent at `zlayer runtime create` time)
         let cid = container_id.to_string();
-        let (cgroup_parent_value, cgroup_parent_source): (Option<String>, &'static str) =
+
+        // Explicit overrides are honored on every platform: a user might pin a
+        // cgroup_parent for a WSL-delegate-bound spec even when this process
+        // is running on Windows.
+        let explicit_parent: Option<(String, &'static str)> =
             if let Some(p) = spec.cgroup_parent.as_deref().filter(|s| !s.is_empty()) {
-                (Some(p.to_string()), "spec")
+                Some((p.to_string(), "spec"))
             } else if let Some(p) = std::env::var("ZLAYER_CGROUP_PARENT")
                 .ok()
                 .filter(|s| !s.is_empty())
             {
-                (Some(p), "env")
-            } else if let Some(p) = crate::capability::current_cgroup_v2_path() {
-                (Some(p), "auto")
+                Some((p, "env"))
             } else {
-                (None, "none")
+                None
             };
+
+        // Auto-detect (and the "no writable parent" hard error below) are
+        // Linux-only: they inspect /proc/self/cgroup and /sys/fs/cgroup, which
+        // don't exist on Windows hosts. When the bundle is destined for the
+        // WSL2 delegate, cgroup-parent resolution happens inside the distro
+        // at `zlayer runtime create` time, not here on the host.
+        #[cfg(target_os = "linux")]
+        let auto_parent: Option<(String, &'static str)> =
+            if let Some(p) = crate::capability::ensure_daemon_leaf_and_container_parent() {
+                Some((p, "auto-init"))
+            } else if let Some(p) = crate::capability::current_cgroup_v2_path() {
+                // Fallback: migration failed (likely cgroup root is read-only); use the
+                // raw scope path. Pre-fix behaviour — surfaces the original error.
+                Some((p, "auto"))
+            } else {
+                None
+            };
+        #[cfg(not(target_os = "linux"))]
+        let auto_parent: Option<(String, &'static str)> = None;
+
+        let (cgroup_parent_value, cgroup_parent_source): (Option<String>, &'static str) =
+            explicit_parent
+                .or(auto_parent)
+                .map_or((None, "none"), |(p, s)| (Some(p), s));
 
         // Diagnostic guard rail: capability survey says we're nested, but we
         // couldn't resolve a cgroup parent here. This combination should not
         // normally happen because both code paths consult the same
         // `current_cgroup_v2_path()` helper. Surface it so an operator can
-        // investigate; do not fail container creation.
+        // investigate; do not fail container creation. Linux-only — the
+        // capability survey is itself a no-op on non-Linux.
+        #[cfg(target_os = "linux")]
         if cgroup_parent_value.is_none() && crate::capability::DaemonCapabilities::get().is_nested {
             tracing::warn!(
                 container_id = %cid,
@@ -1872,25 +1902,47 @@ impl BundleBuilder {
                     path = %full,
                     "cgroup_parent selected (from /proc/self/cgroup)"
                 ),
+                "auto-init" => tracing::info!(
+                    container_id = %cid,
+                    source = "auto-init",
+                    path = %full,
+                    "cgroup_parent selected (migrated daemon to <scope>/init; containers go under <scope>/containers)"
+                ),
                 _ => unreachable!(),
             }
             linux_builder = linux_builder.cgroups_path(std::path::PathBuf::from(full));
         } else {
-            let caps = crate::capability::DaemonCapabilities::get();
-            if !caps.can_write_cgroup_root {
-                return Err(AgentError::InvalidSpec(format!(
-                    "cannot create container {cid}: no writable cgroup parent. \
-                     /proc/self/cgroup reports the cgroup-v2 root, and \
-                     /sys/fs/cgroup is read-only to this process. Fix one of: \
-                     (a) run the daemon's outer container with --cgroupns=host \
-                     so /proc/self/cgroup reports a real parent; \
-                     (b) set ZLAYER_CGROUP_PARENT=/path/to/writable/cgroup; \
-                     (c) grant the daemon write access to /sys/fs/cgroup."
-                )));
+            // Auto-detect found nothing AND no explicit override. Behaviour
+            // differs by platform:
+            //   - Linux: this is a real error in nested-container envs where
+            //     the cgroup root is read-only. Emit the hard error so an
+            //     operator fixes the env.
+            //   - Non-Linux (Windows host building a bundle for the WSL2
+            //     delegate): expected path; cgroup setup happens inside the
+            //     distro at runtime-create time.
+            #[cfg(target_os = "linux")]
+            {
+                let caps = crate::capability::DaemonCapabilities::get();
+                if !caps.can_write_cgroup_root {
+                    return Err(AgentError::InvalidSpec(format!(
+                        "cannot create container {cid}: no writable cgroup parent. \
+                         /proc/self/cgroup reports the cgroup-v2 root, and \
+                         /sys/fs/cgroup is read-only to this process. Fix one of: \
+                         (a) run the daemon's outer container with --cgroupns=host \
+                         so /proc/self/cgroup reports a real parent; \
+                         (b) set ZLAYER_CGROUP_PARENT=/path/to/writable/cgroup; \
+                         (c) grant the daemon write access to /sys/fs/cgroup."
+                    )));
+                }
+                tracing::info!(
+                    container_id = %cid,
+                    "cgroup_parent unset — libcontainer will use v2 root (cgroup root is writable here)"
+                );
             }
-            tracing::info!(
+            #[cfg(not(target_os = "linux"))]
+            tracing::debug!(
                 container_id = %cid,
-                "cgroup_parent unset — libcontainer will use v2 root (cgroup root is writable here)"
+                "non-Linux host — cgroup_parent unset; libcontainer inside the WSL distro will resolve a parent from its cgroup-v2 root"
             );
         }
 
@@ -2589,6 +2641,7 @@ services:
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn mock_spec_with_resources() -> ServiceSpec {
         serde_yaml::from_str::<DeploymentSpec>(
             r"
@@ -2617,6 +2670,7 @@ services:
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn mock_privileged_spec() -> ServiceSpec {
         serde_yaml::from_str::<DeploymentSpec>(
             r"
@@ -2679,6 +2733,7 @@ services:
         assert_eq!(builder.rootfs_path, Some(dirs.rootfs().join("myimage")));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_basic() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -2700,6 +2755,7 @@ services:
         assert!(oci_spec.linux().is_some());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_with_resources() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -2725,6 +2781,7 @@ services:
         assert_eq!(memory.limit(), Some(512 * 1024 * 1024)); // 512Mi
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_privileged() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -2752,6 +2809,7 @@ services:
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_environment() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -2776,6 +2834,7 @@ services:
         assert!(env.iter().any(|e| e.starts_with("PATH=")));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_namespaces() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -2801,6 +2860,7 @@ services:
         assert!(namespace_types.contains(&LinuxNamespaceType::Network));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_namespaces_host_network() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -3043,6 +3103,7 @@ services:
         assert!(result.is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_oci_spec_includes_storage_mounts() {
         let id = ContainerId::new("test".to_string(), 1);
@@ -3142,6 +3203,7 @@ services:
         }"#
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gpu_spec_translates_to_cdi_device_nodes() {
         let dir = tempfile::tempdir().unwrap();
@@ -3247,6 +3309,7 @@ services:
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gpu_spec_with_all_devices_expands_to_all_in_spec() {
         // Fixture with two declared devices ("0" and "1").
@@ -3318,6 +3381,7 @@ services:
         std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir]))
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gpu_spec_with_mps_sharing_injects_env_and_mounts() {
         // Stage host-side MPS directories in a tempdir so the resolver's
@@ -3412,6 +3476,7 @@ services:
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gpu_spec_with_timeslicing_injects_visible_devices() {
         let cdi_dir = tempfile::tempdir().unwrap();
@@ -3449,6 +3514,7 @@ services:
         assert_eq!(cuda_entries[0], "CUDA_VISIBLE_DEVICES=2");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn gpu_spec_without_sharing_omits_mps_env() {
         let cdi_dir = tempfile::tempdir().unwrap();

@@ -253,7 +253,23 @@ impl CompositeRuntime {
 #[async_trait]
 impl Runtime for CompositeRuntime {
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.primary.pull_image(image).await?;
+        // Primary pull. `WrongPlatform` here means the image's OCI config
+        // reports an OS the primary cannot service (e.g. a Linux image on the
+        // Windows HCS runtime). That is a *soft* failure: the delegate's pull
+        // below owns the image, so we log and continue rather than failing
+        // the whole composite call. Any other error is a real pull failure
+        // and must bubble.
+        if let Err(e) = self.primary.pull_image(image).await {
+            if matches!(e, AgentError::WrongPlatform { .. }) {
+                tracing::debug!(
+                    image,
+                    error = %e,
+                    "primary runtime cannot service image (wrong platform); delegating",
+                );
+            } else {
+                return Err(e);
+            }
+        }
         if let Some(delegate) = &self.delegate {
             if let Err(e) = delegate.pull_image(image).await {
                 // Foreign-OS images will reliably fail one of the two pulls
@@ -283,9 +299,22 @@ impl Runtime for CompositeRuntime {
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
     ) -> Result<()> {
-        self.primary
+        // See `pull_image` above for the `WrongPlatform` soft-skip rationale.
+        if let Err(e) = self
+            .primary
             .pull_image_with_policy(image, policy, auth)
-            .await?;
+            .await
+        {
+            if matches!(e, AgentError::WrongPlatform { .. }) {
+                tracing::debug!(
+                    image,
+                    error = %e,
+                    "primary runtime cannot service image (wrong platform); delegating",
+                );
+            } else {
+                return Err(e);
+            }
+        }
         if let Some(delegate) = &self.delegate {
             if let Err(e) = delegate.pull_image_with_policy(image, policy, auth).await {
                 tracing::debug!(
@@ -541,6 +570,11 @@ mod tests {
         calls: CallLog,
         list_images_response: Vec<ImageInfo>,
         pull_image_error: Option<String>,
+        /// When set, both `pull_image` and `pull_image_with_policy` return a
+        /// freshly-built [`AgentError::WrongPlatform`] using these fields
+        /// (`expected`, `actual`). Takes precedence over `pull_image_error`
+        /// so tests can simulate a wrong-platform soft skip end-to-end.
+        pull_image_wrong_platform: Option<(&'static str, &'static str)>,
     }
 
     impl MockRuntime {
@@ -550,7 +584,21 @@ mod tests {
                 calls,
                 list_images_response: Vec::new(),
                 pull_image_error: None,
+                pull_image_wrong_platform: None,
             }
+        }
+
+        fn build_wrong_platform_error(&self, image: &str) -> Option<AgentError> {
+            self.pull_image_wrong_platform
+                .map(|(expected, actual)| AgentError::WrongPlatform {
+                    runtime: match self.role {
+                        Role::Primary => "primary-mock".to_string(),
+                        Role::Delegate => "delegate-mock".to_string(),
+                    },
+                    expected: expected.to_string(),
+                    actual: actual.to_string(),
+                    image: image.to_string(),
+                })
         }
 
         fn record(&self, method: &str, id: Option<&ContainerId>) {
@@ -563,8 +611,11 @@ mod tests {
 
     #[async_trait]
     impl Runtime for MockRuntime {
-        async fn pull_image(&self, _image: &str) -> Result<()> {
+        async fn pull_image(&self, image: &str) -> Result<()> {
             self.record("pull_image", None);
+            if let Some(err) = self.build_wrong_platform_error(image) {
+                return Err(err);
+            }
             if let Some(msg) = &self.pull_image_error {
                 return Err(AgentError::Internal(msg.clone()));
             }
@@ -573,11 +624,17 @@ mod tests {
 
         async fn pull_image_with_policy(
             &self,
-            _image: &str,
+            image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
         ) -> Result<()> {
             self.record("pull_image_with_policy", None);
+            if let Some(err) = self.build_wrong_platform_error(image) {
+                return Err(err);
+            }
+            if let Some(msg) = &self.pull_image_error {
+                return Err(AgentError::Internal(msg.clone()));
+            }
             Ok(())
         }
 
@@ -963,6 +1020,98 @@ services:
         assert!(
             pull_calls.contains(&Role::Primary) && pull_calls.contains(&Role::Delegate),
             "both runtimes should have been called: {pull_calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_image_primary_wrong_platform_does_not_fail() {
+        // The HCS runtime returns `AgentError::WrongPlatform` when the image's
+        // OCI config reports a non-Windows OS (calling `ProcessBaseImage` on a
+        // Linux base layer is guaranteed to fail with 0x80070003). The
+        // composite must treat that as a soft skip and let the delegate's
+        // pull own the image — the overall pull must NOT fail.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        primary.pull_image_wrong_platform = Some(("windows", "linux"));
+        let delegate = MockRuntime::new(Role::Delegate, Arc::clone(&calls));
+        let rt = CompositeRuntime::new(
+            Arc::new(primary) as Arc<dyn Runtime>,
+            Some(Arc::new(delegate) as Arc<dyn Runtime>),
+        );
+
+        // Top-level call must succeed despite the primary's wrong-platform err.
+        rt.pull_image("docker.io/library/alpine:3.19")
+            .await
+            .expect("composite pull must tolerate WrongPlatform from primary");
+
+        let recorded = calls.lock().unwrap();
+        let pull_calls: Vec<Role> = recorded
+            .iter()
+            .filter(|(_, m, _)| m == "pull_image")
+            .map(|(r, _, _)| *r)
+            .collect();
+        assert!(
+            pull_calls.contains(&Role::Primary) && pull_calls.contains(&Role::Delegate),
+            "delegate must still be called when primary soft-skips: {pull_calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_image_with_policy_primary_wrong_platform_does_not_fail() {
+        // Same contract as `pull_image_primary_wrong_platform_does_not_fail`
+        // but exercising the `pull_image_with_policy` entry point. The
+        // policy/auth path is what the daemon's create-container hot loop
+        // actually invokes, so it has to honour the same soft-skip rule.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        primary.pull_image_wrong_platform = Some(("windows", "linux"));
+        let delegate = MockRuntime::new(Role::Delegate, Arc::clone(&calls));
+        let rt = CompositeRuntime::new(
+            Arc::new(primary) as Arc<dyn Runtime>,
+            Some(Arc::new(delegate) as Arc<dyn Runtime>),
+        );
+
+        rt.pull_image_with_policy(
+            "docker.io/library/alpine:3.19",
+            PullPolicy::IfNotPresent,
+            None,
+        )
+        .await
+        .expect("composite pull_image_with_policy must tolerate WrongPlatform from primary");
+
+        let recorded = calls.lock().unwrap();
+        let pull_calls: Vec<Role> = recorded
+            .iter()
+            .filter(|(_, m, _)| m == "pull_image_with_policy")
+            .map(|(r, _, _)| *r)
+            .collect();
+        assert!(
+            pull_calls.contains(&Role::Primary) && pull_calls.contains(&Role::Delegate),
+            "delegate must still be called when primary soft-skips: {pull_calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_image_primary_non_wrong_platform_error_still_fails() {
+        // Sanity check: only `WrongPlatform` is soft-skipped. Any other error
+        // from the primary must still bubble up so real pull failures aren't
+        // silently swallowed.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        primary.pull_image_error = Some("simulated real failure".to_string());
+        let delegate = MockRuntime::new(Role::Delegate, Arc::clone(&calls));
+        let rt = CompositeRuntime::new(
+            Arc::new(primary) as Arc<dyn Runtime>,
+            Some(Arc::new(delegate) as Arc<dyn Runtime>),
+        );
+
+        let err = rt
+            .pull_image("docker.io/library/alpine:3.19")
+            .await
+            .expect_err("real primary error must propagate");
+        assert!(
+            matches!(err, AgentError::Internal(_)),
+            "expected Internal, got {err:?}",
         );
     }
 

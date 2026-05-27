@@ -795,6 +795,46 @@ impl HcsRuntime {
                 reason: format!("manifest pull: {e}"),
             })?;
 
+        // Inspect the OCI image config's `os` field before invoking the
+        // unpacker. The unpacker calls `vmcompute.dll!ProcessBaseImage` on the
+        // base layer, which expects the Windows-specific `Hives/` /
+        // `UtilityVM/` / `Files/Windows/System32/` layout. Running it against
+        // a non-Windows image (e.g. an alpine layer chain when the composite
+        // fans the pull out to both HCS and the WSL2 delegate) is guaranteed
+        // to return `ERROR_PATH_NOT_FOUND (0x80070003)`. Bail out cleanly with
+        // a typed `WrongPlatform` error so the composite can treat us as a
+        // soft skip and consume the delegate's result instead.
+        //
+        // `image_os` returns `Ok(None)` when the manifest has no recognized
+        // OS field; in that case we fall through to the unpacker (it might
+        // still be a valid Windows image with a non-canonical config).
+        match self.registry.image_os(image, &auth).await {
+            Ok(Some(os)) if os != zlayer_spec::OsKind::Windows => {
+                tracing::debug!(
+                    image,
+                    image_os = os.as_oci_str(),
+                    "HCS runtime skipping unpack: image is not a Windows image"
+                );
+                return Err(AgentError::WrongPlatform {
+                    runtime: "hcs".to_string(),
+                    expected: zlayer_spec::OsKind::Windows.as_oci_str().to_string(),
+                    actual: os.as_oci_str().to_string(),
+                    image: image.to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Non-fatal: we couldn't fetch / parse the config. Log and
+                // continue — if the image really is non-Windows the unpacker
+                // will fail with a clearer message from `ProcessBaseImage`.
+                tracing::warn!(
+                    image,
+                    error = %e,
+                    "failed to inspect image OS before HCS unpack; proceeding optimistically",
+                );
+            }
+        }
+
         let descriptors = Self::manifest_to_descriptors(&manifest);
         let dest_root = self.image_layer_dir(image);
 
@@ -1483,7 +1523,6 @@ impl Runtime for HcsRuntime {
         let scratch_layer = scratch::create(
             &scratch_dir,
             &chain,
-            self.config.default_scratch_size_gb,
             // `is_base_os_bootstrap` is only true for the very first scratch
             // layer built over a given base OS layer. The read-only base
             // layer's registry hives are already materialised by the
