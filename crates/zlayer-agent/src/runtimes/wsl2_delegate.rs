@@ -1806,8 +1806,8 @@ fn parse_stat_hex_devno(s: &str) -> Option<(i64, i64)> {
     Some((major, minor))
 }
 
-/// Inject `/dev/dxg` + the WSLg shim mounts into a bundle's mounts/devices
-/// and prepend the WSLg lib paths to `LD_LIBRARY_PATH`.
+/// Inject `/dev/dxg` + the `WSLg` shim mounts into a bundle's mounts/devices
+/// and prepend the `WSLg` lib paths to `LD_LIBRARY_PATH`.
 ///
 /// Returns `Err(AgentError::WslGpuUnavailable)` when GPU was requested but
 /// the host cannot deliver it (no `/dev/dxg`). Idempotent w.r.t. existing
@@ -1900,7 +1900,7 @@ pub(crate) fn inject_wsl_gpu_mounts(
     if !new_prefix.is_empty() {
         let prefix_joined = new_prefix.join(":");
         if let Some(entry) = env.iter_mut().find(|e| e.starts_with("LD_LIBRARY_PATH=")) {
-            let existing = entry.splitn(2, '=').nth(1).unwrap_or("").to_string();
+            let existing = entry.split_once('=').map_or("", |(_, v)| v).to_string();
             *entry = if existing.is_empty() {
                 format!("LD_LIBRARY_PATH={prefix_joined}")
             } else {
@@ -2872,6 +2872,14 @@ services:
 
     #[tokio::test]
     async fn apply_wsl_gpu_to_spec_no_op_when_gpu_not_requested() {
+        struct ExplodingProbe;
+        #[async_trait]
+        impl WslGpuHostProbe for ExplodingProbe {
+            async fn probe(&self) -> Result<WslGpuHostState> {
+                panic!("probe must not run when no GPU is requested");
+            }
+        }
+
         // Build a minimal Spec via the OCI default; the apply function should
         // leave it untouched when the service spec doesn't request a GPU.
         let mut oci_spec = Spec::default();
@@ -2900,27 +2908,15 @@ services:
             "fixture must not request GPU"
         );
 
-        struct ExplodingProbe;
-        #[async_trait]
-        impl WslGpuHostProbe for ExplodingProbe {
-            async fn probe(&self) -> Result<WslGpuHostState> {
-                panic!("probe must not run when no GPU is requested");
-            }
-        }
-
         apply_wsl_gpu_to_spec(&mut oci_spec, &service, &ExplodingProbe)
             .await
             .expect("no-op should succeed");
 
         assert_eq!(oci_spec.mounts(), &mounts_before);
-        let has_dxg = oci_spec
-            .mounts()
-            .as_ref()
-            .map(|ms| {
-                ms.iter()
-                    .any(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"))
-            })
-            .unwrap_or(false);
+        let has_dxg = oci_spec.mounts().as_ref().is_some_and(|ms| {
+            ms.iter()
+                .any(|m| m.destination().as_path() == std::path::Path::new("/dev/dxg"))
+        });
         assert!(
             !has_dxg,
             "no /dev/dxg mount should appear for CPU-only spec"

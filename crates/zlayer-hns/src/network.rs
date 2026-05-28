@@ -29,7 +29,7 @@ use windows::Win32::System::HostComputeNetwork::{
 
 use crate::error::{HnsError, HnsResult};
 use crate::handle::{HcnNetworkHandle, OwnedNetwork};
-use crate::schema::{HostComputeNetwork, Ipam, NetworkType, SchemaVersion, Subnet};
+use crate::schema::{HostComputeNetwork, Ipam, NetworkType, Route, SchemaVersion, Subnet};
 
 /// Owning wrapper around an HCN network. Drop closes (but does not delete)
 /// the underlying handle.
@@ -169,6 +169,16 @@ impl Network {
         subnet: &str,
         uplink_adapter_name: &str,
     ) -> HnsResult<Self> {
+        // Without an explicit gateway in the IPAM subnet, HCN's Transparent
+        // driver picks one itself AND silently reserves additional addresses
+        // beyond the gateway, causing `HcnCreateEndpoint` to reject low-numbered
+        // host addresses (e.g. `.2` on a `/28`) with `HCN_E_ADDR_INVALID_OR_RESERVED`
+        // (`0x803b002f`). Declare the gateway via a default route on the subnet
+        // so HCN treats every other address in the prefix as available.
+        let gateway = first_host_address(subnet).ok_or_else(|| HnsError::Other {
+            hresult: 0,
+            message: format!("create_transparent: invalid subnet CIDR '{subnet}'"),
+        })?;
         let settings = HostComputeNetwork {
             id: None,
             name: name.to_string(),
@@ -180,7 +190,11 @@ impl Network {
                 ty: "Static".to_string(),
                 subnets: vec![Subnet {
                     ip_address_prefix: subnet.to_string(),
-                    routes: Vec::new(),
+                    routes: vec![Route {
+                        next_hop: gateway,
+                        destination_prefix: "0.0.0.0/0".to_string(),
+                        metric: None,
+                    }],
                     policies: Vec::new(),
                 }],
             }],
@@ -202,6 +216,23 @@ impl Network {
     pub fn handle(&self) -> &OwnedNetwork {
         &self.handle
     }
+}
+
+/// First usable host address in a CIDR — the conventional default-gateway
+/// address for the subnet (`network + 1`). Returns `None` for malformed CIDR
+/// strings or subnets too small to contain a usable host (`/31`, `/32`).
+fn first_host_address(cidr: &str) -> Option<String> {
+    let net: ipnet::IpNet = cidr.parse().ok()?;
+    let ipnet::IpNet::V4(v4) = net else {
+        // HCN Transparent overlay is IPv4-only in the current schema.
+        return None;
+    };
+    if v4.prefix_len() >= 31 {
+        return None;
+    }
+    let network = u32::from(v4.network());
+    let gateway = std::net::Ipv4Addr::from(network.checked_add(1)?);
+    Some(gateway.to_string())
 }
 
 /// Build the `NetAdapterName` network policy that binds a Transparent or

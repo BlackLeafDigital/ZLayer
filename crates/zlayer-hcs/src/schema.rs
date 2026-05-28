@@ -55,7 +55,12 @@ pub struct ComputeSystem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_machine: Option<VirtualMachine>,
     /// When true, HCS terminates the compute system once the last handle
-    /// closes instead of leaving it running detached.
+    /// closes. Containerd's `containerd-shim-runhcs-v1` sets this to `true`
+    /// on every container it creates — verified May 2026 via ETW capture of
+    /// `Microsoft-Windows-Hyper-V-Compute` provider during a `ctr run`.
+    /// Omitting it was an over-correction in an earlier iteration; HCS
+    /// `Construct` accepts the doc with or without it, but omitting it
+    /// leaves orphaned systems if the agent crashes mid-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub should_terminate_on_last_handle_closed: Option<bool>,
 }
@@ -68,6 +73,14 @@ pub struct ComputeSystem {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Container {
+    /// Guest-OS-level configuration. Holds the container's `NetBIOS` hostname.
+    /// HCS requires this field to be present (with a non-empty `HostName`)
+    /// when `Networking.Namespace` is set, otherwise `HcsCreateComputeSystem`
+    /// rejects the doc with `E_INVALIDARG` (`0x80070057`) at
+    /// `OperationFailure.Detail="Construct"`. Matches hcsshim
+    /// `internal/hcs/schema2/container.go` (`GuestOs *GuestOs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_os: Option<GuestOs>,
     /// Layered storage configuration (parent layers + scratch path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<Storage>,
@@ -80,15 +93,27 @@ pub struct Container {
     /// Host named pipes projected into the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapped_pipes: Vec<MappedPipe>,
-    /// Hostname observed from inside the container.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
     /// CPU resource constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processor: Option<ContainerProcessor>,
     /// Memory resource constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<ContainerMemory>,
+}
+
+/// Guest-OS configuration nested under [`Container`]. Currently only carries
+/// the container's `NetBIOS` hostname; further fields (e.g. `BootType` for OS
+/// containers) may be added as new isolation modes land. Matches hcsshim's
+/// `internal/hcs/schema2/guest_os.go` (`type GuestOs struct { HostName string }`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct GuestOs {
+    /// `NetBIOS`-format hostname observed from inside the container. Must be
+    /// 1..=15 ASCII alphanumeric-or-hyphen characters, starting with a letter,
+    /// no underscores, no dots. Longer values are silently truncated by some
+    /// HCS builds and rejected by others — callers should pre-truncate to 15.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
 }
 
 /// Layered storage document for a container.
@@ -123,9 +148,13 @@ pub struct ContainerNetworking {
     /// DNS search-suffix list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_search_list: Vec<String>,
-    /// HCN namespace ids the container is attached to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub namespace: Vec<String>,
+    /// HCN namespace id the container is attached to. HCS's
+    /// `Container.Networking.Namespace` is a **single** GUID string
+    /// (`hcsshim/internal/hcs/schema2/networking.go`: `Namespace string`), not
+    /// an array — serializing an array yields a `0xC037010D Invalid JSON
+    /// document` rejection from `HcsCreateComputeSystem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Name of another container whose network namespace is shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_shared_container_name: Option<String>,
@@ -552,7 +581,9 @@ mod tests {
                 networking: None,
                 mapped_directories: Vec::new(),
                 mapped_pipes: Vec::new(),
-                hostname: Some("test-host".to_string()),
+                guest_os: Some(GuestOs {
+                    host_name: Some("test-host".to_string()),
+                }),
                 processor: Some(ContainerProcessor {
                     count: Some(2),
                     maximum: None,
@@ -563,16 +594,14 @@ mod tests {
                 }),
             }),
             virtual_machine: None,
-            should_terminate_on_last_handle_closed: Some(true),
         };
 
         let json = serde_json::to_string(&doc).expect("serialize");
         // Sanity-check that we're producing PascalCase keys as HCS expects.
         assert!(json.contains("\"Owner\":\"zlayer\""));
         assert!(json.contains("\"SchemaVersion\":{\"Major\":2,\"Minor\":1}"));
-        assert!(json.contains("\"HostName\"") || json.contains("\"Hostname\":\"test-host\""));
+        assert!(json.contains("\"GuestOs\":{\"HostName\":\"test-host\"}"));
         assert!(json.contains("\"SizeInMB\":1024"));
-        assert!(json.contains("\"ShouldTerminateOnLastHandleClosed\":true"));
 
         let back: ComputeSystem = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.owner, "zlayer");
@@ -585,10 +614,12 @@ mod tests {
             storage.path.as_deref(),
             Some(r"C:\ProgramData\zlayer\scratch\abc"),
         );
-        assert_eq!(container.hostname.as_deref(), Some("test-host"));
+        assert_eq!(
+            container.guest_os.and_then(|g| g.host_name).as_deref(),
+            Some("test-host"),
+        );
         assert_eq!(container.processor.and_then(|p| p.count), Some(2));
         assert_eq!(container.memory.and_then(|m| m.size_in_mb), Some(1024));
-        assert_eq!(back.should_terminate_on_last_handle_closed, Some(true));
     }
 
     #[test]

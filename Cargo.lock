@@ -12787,6 +12787,7 @@ name = "zlayer-hns"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "ipnet",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

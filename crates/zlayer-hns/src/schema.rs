@@ -67,23 +67,28 @@ pub enum NetworkType {
 }
 
 /// Top-level HCN network object.
+///
+/// `#[serde(default)]` on the container makes deserialization tolerant of
+/// arbitrary host networks (WSL, Default Switch, etc.) whose query response
+/// omits fields like `SchemaVersion` or even `Name`. This affects the
+/// **deserialize** side only — the create/serialize path still emits every
+/// populated field (including `SchemaVersion`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct HostComputeNetwork {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>, // GUID string
     pub name: String,
     #[serde(rename = "Type")]
     pub ty: NetworkType,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub policies: Vec<serde_json::Value>, // network-level policies (passthrough)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mac_pool: Option<MacPool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns: Option<Dns>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ipams: Vec<Ipam>,
-    #[serde(default)]
     pub flags: u32,
     pub schema_version: SchemaVersion,
 }
@@ -416,8 +421,14 @@ impl EndpointPolicy {
             remote_addresses: remote_addresses.into(),
             local_ports: String::new(),
             remote_ports: String::new(),
-            rule_type: String::new(),
-            priority: 0,
+            // HCN requires both RuleType and Priority on an ACL applied to a
+            // Transparent-network endpoint; omitting either gets the whole
+            // endpoint create rejected with `HCN policy rejected`. "Switch"
+            // RuleType applies the ACL at the vSwitch port; 65500 is the
+            // low-precedence priority hcsshim/Calico-Windows use for a
+            // broad allow rule.
+            rule_type: "Switch".to_string(),
+            priority: 65500,
         };
         Self {
             ty: EndpointPolicyType::Acl,
@@ -439,8 +450,20 @@ impl From<EndpointPolicy> for serde_json::Value {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NamespaceType {
-    #[serde(rename = "HostDefault")]
+    /// Per-container host namespace. Each call to `HcnCreateNamespace` with
+    /// `Type=Host` returns a fresh unique GUID. This is what `containerd-shim-runhcs-v1`
+    /// creates for every process-isolated WCOW container (verified May 2026
+    /// via ETW capture of `Microsoft-Windows-Hyper-V-Compute`).
+    #[serde(rename = "Host")]
     #[default]
+    Host,
+    /// Singleton host namespace shared by every process-isolated container on
+    /// the host. `HcnCreateNamespace` ignores the GUID passed in and always
+    /// returns the system-assigned ID (`910F7D92-…`). Was previously the
+    /// default — DON'T USE for new container attachments; HCS `Construct`
+    /// rejects compute-system docs that reference `HostDefault` with
+    /// `E_INVALIDARG (0x80070057)`.
+    #[serde(rename = "HostDefault")]
     HostDefault,
     #[serde(rename = "HostInterface")]
     HostInterface,
@@ -510,11 +533,17 @@ pub enum ModifyRequestType {
 }
 
 /// Envelope for `HcnModifyNamespace`. Used to attach or detach an endpoint
-/// from a namespace. `resource_type` is `1` for `Endpoint` per the HCN schema.
+/// from a namespace.
+///
+/// `resource_type` is the **string** `"Endpoint"` (or `"Container"`), matching
+/// hcsshim's `NamespaceResourceType` constants
+/// (`hcn/hcnnamespace.go::NamespaceResourceTypeEndpoint = "Endpoint"`). HCN
+/// rejects the request with a bare `HcnModifyNamespace` failure if this is sent
+/// as the integer `1` instead of the string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ModifyNamespaceSettingRequest {
-    pub resource_type: u32,
+    pub resource_type: String,
     pub request_type: ModifyRequestType,
     pub settings: serde_json::Value, // e.g. { "EndpointId": "<guid>" }
 }
@@ -628,6 +657,29 @@ mod tests {
     }
 
     #[test]
+    fn network_query_tolerates_missing_schema_version() {
+        // A real host network (WSL / Default Switch) query response can omit
+        // SchemaVersion entirely. Deserialization must still succeed.
+        let raw = json!({
+            "Name": "Default Switch",
+            "Type": "ICS"
+        });
+        let net: HostComputeNetwork = serde_json::from_value(raw).unwrap();
+        assert_eq!(net.name, "Default Switch");
+        assert!(matches!(net.ty, NetworkType::Ics));
+        // Absent SchemaVersion falls back to the v2.0 default.
+        assert_eq!(net.schema_version, SchemaVersion::default());
+    }
+
+    #[test]
+    fn network_query_tolerates_empty_object() {
+        // Even an empty object must deserialize (every field is defaulted).
+        let net: HostComputeNetwork = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(net.name, "");
+        assert_eq!(net.schema_version, SchemaVersion::default());
+    }
+
+    #[test]
     fn endpoint_stats_all_u64_fields_roundtrip() {
         let raw = json!({
             "EndpointId": "ep-guid",
@@ -653,12 +705,12 @@ mod tests {
     #[test]
     fn modify_namespace_request_add_endpoint() {
         let req = ModifyNamespaceSettingRequest {
-            resource_type: 1,
+            resource_type: "Endpoint".to_string(),
             request_type: ModifyRequestType::Add,
             settings: json!({ "EndpointId": "ep-guid" }),
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["ResourceType"], json!(1));
+        assert_eq!(v["ResourceType"], json!("Endpoint"));
         assert_eq!(v["RequestType"], json!("Add"));
         assert_eq!(v["Settings"]["EndpointId"], json!("ep-guid"));
     }
@@ -737,13 +789,17 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&policy).unwrap();
 
         // Action + Direction always emit (no skip_if_default). Protocols +
-        // address/port fields all skip-if-empty.
+        // address/port fields all skip-if-empty. RuleType + Priority are
+        // always set by the builder because a Transparent-network endpoint
+        // rejects an ACL that omits either (see `acl_in_allow`).
         let expected = json!({
             "Type": "ACL",
             "Settings": {
                 "Action": "Allow",
                 "Direction": "In",
                 "RemoteAddresses": "10.200.0.0/16",
+                "RuleType": "Switch",
+                "Priority": 65500,
             }
         });
         assert_eq!(v, expected);

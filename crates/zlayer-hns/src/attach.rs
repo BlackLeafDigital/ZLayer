@@ -26,28 +26,55 @@ use crate::error::{HnsError, HnsResult};
 use crate::namespace::Namespace;
 use crate::schema::{Dns, EndpointPolicy, HostComputeEndpoint, IpConfig, Route, SchemaVersion};
 
+/// GUID of the legacy `HostDefault` singleton HCN namespace. We avoid creating
+/// new attachments against it (HCS rejects compute-system docs that reference
+/// it), but `teardown` may still encounter it on attachments persisted by an
+/// older agent version — guard `HcnDeleteNamespace` against this ID since the
+/// singleton is shared by every process-isolated container on the host.
+const HOST_DEFAULT_NS: GUID = GUID::from_u128(0x910f7d92_ba2d_4c3f_98ae_7c0ac590d2dc);
+
 /// An active endpoint-in-namespace attachment. Keep it alive for the lifetime
 /// of the container; call [`EndpointAttachment::teardown`] when removing the
 /// container.
+///
+/// # Why the namespace handle is kept alive
+///
+/// `namespace` holds the `Namespace` wrapper (which owns the `HcnOpenNamespace`/
+/// `HcnCreateNamespace` handle). Microsoft's hcsshim keeps the namespace handle
+/// open for the lifetime of the container — closing it (via `HcnCloseNamespace`)
+/// while the HCS compute system still references the namespace GUID causes
+/// `HcsCreateComputeSystem` Construct to fail with `0x80070490`
+/// `ERROR_NOT_FOUND` when it tries to resolve the namespace's network
+/// compartment. Storing the handle here keeps the namespace open until the
+/// container is torn down. It's `Option<Namespace>` so unit tests that
+/// fabricate an `EndpointAttachment` without going through `create_overlay`
+/// can pass `None`.
 #[derive(Debug)]
 pub struct EndpointAttachment {
     endpoint_id: GUID,
     namespace_id: GUID,
     ip: Option<String>,
+    /// Live `HcnOpenNamespace` handle held open for the container's lifetime.
+    /// `None` in tests that don't create a real namespace.
+    namespace: Option<Namespace>,
 }
 
 impl EndpointAttachment {
     /// Create an endpoint on `network_id` with a **caller-chosen overlay IP**
-    /// and the three Transparent-network policies required for cluster
-    /// routing to work end-to-end:
+    /// and the two Transparent-network endpoint policies a Transparent HCN
+    /// network accepts (bisected against a live network, May 2026):
     ///
     /// 1. `OutBoundNAT` with `Exceptions=[cluster_cidr]` — SNAT egress to the
     ///    host IP unless the destination is another container on the overlay.
-    /// 2. `SDNRoute { DestinationPrefix=cluster_cidr, NeedEncap=false }` —
-    ///    tells HCN that cluster-CIDR traffic must not be VXLAN-encapsulated
-    ///    (we encapsulate via `WireGuard` on the host, not via HCN Overlay).
-    /// 3. `ACL { Allow, In, RemoteAddresses=cluster_cidr }` — allows inbound
-    ///    traffic from any other overlay container.
+    /// 2. `ACL { Allow, In, RemoteAddresses=cluster_cidr, RuleType=Switch,
+    ///    Priority=65500 }` — allows inbound traffic from any other overlay
+    ///    container (`RuleType` + `Priority` are mandatory on Transparent or
+    ///    the whole endpoint create is rejected).
+    ///
+    /// `SDNRoute` is intentionally *not* applied: a Transparent network
+    /// rejects it (`HCN policy rejected: HcnCreateEndpoint`). Cluster-CIDR
+    /// routing is done by the `WireGuard` host route, not an in-container HCN
+    /// route, so no `SDNRoute` is needed.
     ///
     /// The endpoint's `IpConfigurations` is pre-populated with `ip/prefix_length`
     /// so the caller doesn't rely on HCN's IPAM — the IP comes from the agent's
@@ -109,9 +136,20 @@ impl EndpointAttachment {
                 ip_address: ip_str,
                 prefix_length,
             }],
+            // Transparent-network endpoint policies. Bisected against a live
+            // HCN Transparent network (May 2026):
+            //   - `OutBoundNAT` (Exceptions=[cluster_cidr]) — ACCEPTED.
+            //   - `ACL` (Allow/In, RemoteAddresses=cluster_cidr) — ACCEPTED,
+            //     but ONLY with both `Priority` and `RuleType` set (the
+            //     `acl_in_allow` builder sets them; omitting either gets the
+            //     whole endpoint create rejected with `HCN policy rejected`).
+            //   - `SDNRoute` — REJECTED by a Transparent network with
+            //     `HCN policy rejected: HcnCreateEndpoint`. SDNRoute is an
+            //     SDN/Overlay construct the Transparent driver does not accept;
+            //     cluster-CIDR routing is handled by the WireGuard host route,
+            //     not by an in-container HCN route, so dropping it is correct.
             policies: vec![
                 EndpointPolicy::out_bound_nat(vec![cluster_cidr.to_string()]).into(),
-                EndpointPolicy::sdn_route(cluster_cidr, false).into(),
                 EndpointPolicy::acl_in_allow(cluster_cidr).into(),
             ],
             routes: vec![Route {
@@ -132,6 +170,17 @@ impl EndpointAttachment {
                 );
             }
         };
+
+        // Diagnostic: emit the exact JSON we hand to HCN so reproducible
+        // HCN_E_ADDR_INVALID_OR_RESERVED failures can be diffed against hcsshim.
+        if let Ok(s) = serde_json::to_string(&settings) {
+            tracing::error!(target: "zlayer_hns::attach::diag", endpoint_id = %format!("{endpoint_id:?}"), doc = %s, "HCN_CREATE_ENDPOINT_DOC");
+            if let Ok(dir) = std::env::var("ZLAYER_HCN_DOC_DUMP_DIR") {
+                let path = std::path::PathBuf::from(&dir).join(format!("ep-{container_id}.json"));
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(&path, &s);
+            }
+        }
 
         let _endpoint = match Endpoint::create(network_id, endpoint_id, &settings) {
             Ok(e) => e,
@@ -157,35 +206,57 @@ impl EndpointAttachment {
             endpoint_id,
             namespace_id,
             ip: Some(ip.to_string()),
+            namespace: Some(namespace),
         })
     }
 
-    /// Detach + delete both endpoint and namespace.
-    ///
-    /// HCN auto-detaches endpoints when they are deleted, so we skip an
-    /// explicit `remove_endpoint` modify and rely on `HcnDeleteEndpoint`
-    /// followed by `HcnDeleteNamespace`. Best-effort on partial failure:
-    /// warns on each failure and returns the first error encountered,
-    /// preferring the endpoint error since the endpoint is the primary
-    /// resource holding kernel state.
+    /// Detach the endpoint from its (per-container `Host`) namespace, delete
+    /// the endpoint, and delete the namespace. Per-container namespaces are
+    /// no longer shared singletons, so a full teardown is now appropriate.
+    /// Best-effort on partial failure: warns on each step and returns the
+    /// endpoint-delete error if it fails.
     pub fn teardown(self) -> HnsResult<()> {
-        let ep_res = Endpoint::delete(self.endpoint_id);
+        let Self {
+            endpoint_id,
+            namespace_id,
+            ip: _,
+            namespace,
+        } = self;
+        if let Some(ns) = namespace.as_ref() {
+            if let Err(e) = ns.remove_endpoint(endpoint_id) {
+                tracing::warn!(
+                    ep = %format!("{:?}", endpoint_id),
+                    error = %e,
+                    "teardown: failed to detach endpoint from namespace; \
+                     proceeding to endpoint delete anyway",
+                );
+            }
+        }
+        // Drop the namespace handle BEFORE deleting the endpoint so the
+        // close-then-modify-then-delete sequencing doesn't race HCN's
+        // internal refcount on the namespace's resource list.
+        drop(namespace);
+        let ep_res = Endpoint::delete(endpoint_id);
         if let Err(ref e) = ep_res {
             tracing::warn!(
-                ep = %format!("{:?}", self.endpoint_id),
+                ep = %format!("{:?}", endpoint_id),
                 error = %e,
                 "teardown: HcnDeleteEndpoint failed",
             );
         }
-        let ns_res = Namespace::delete(self.namespace_id);
-        if let Err(ref e) = ns_res {
-            tracing::warn!(
-                ns = %format!("{:?}", self.namespace_id),
-                error = %e,
-                "teardown: HcnDeleteNamespace failed",
-            );
+        // Per-container namespace cleanup. Skip if the ID looks like the
+        // legacy `HostDefault` singleton (would nuke every other container's
+        // endpoint refs); for `Type=Host` IDs this is safe and necessary.
+        if namespace_id != HOST_DEFAULT_NS {
+            if let Err(e) = Namespace::delete(namespace_id) {
+                tracing::warn!(
+                    ns = %format!("{:?}", namespace_id),
+                    error = %e,
+                    "teardown: HcnDeleteNamespace failed; namespace may leak",
+                );
+            }
         }
-        ep_res.or(ns_res)
+        ep_res
     }
 
     #[must_use]
@@ -366,6 +437,7 @@ mod tests {
             endpoint_id: ep,
             namespace_id: ns,
             ip: Some("10.0.0.42".to_string()),
+            namespace: None,
         };
         assert_eq!(att.endpoint_id(), ep);
         assert_eq!(att.namespace_id(), ns);
@@ -378,6 +450,7 @@ mod tests {
             endpoint_id: GUID::zeroed(),
             namespace_id: GUID::zeroed(),
             ip: None,
+            namespace: None,
         };
         assert!(att.ip().is_none());
     }

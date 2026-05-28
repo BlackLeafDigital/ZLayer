@@ -125,7 +125,6 @@ fn empty_vm_document(owner: &str) -> CsDoc {
             guest_state: None,
             runtime_state_file_path: None,
         }),
-        should_terminate_on_last_handle_closed: Some(true),
     }
 }
 
@@ -149,7 +148,6 @@ fn schema_round_trip() {
     assert_eq!(back.owner, "zlayer-test");
     assert_eq!(back.schema_version, SchemaVersion { major: 2, minor: 1 });
     assert!(back.container.is_none());
-    assert_eq!(back.should_terminate_on_last_handle_closed, Some(true));
 
     let vm = back.virtual_machine.expect("virtual machine present");
     let topology = vm.compute_topology.expect("topology present");

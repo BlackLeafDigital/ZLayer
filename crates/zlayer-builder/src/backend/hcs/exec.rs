@@ -169,6 +169,9 @@ fn build_compute_system_doc(scratch_root: &Path, parents: &[Layer]) -> HcsSystem
         schema_version: SchemaVersion::default(),
         hosting_system_id: String::new(),
         container: Some(Container {
+            guest_os: Some(zlayer_hcs::schema::GuestOs {
+                host_name: Some("zlayer-build".to_string()),
+            }),
             storage: Some(Storage {
                 layers: parents.to_vec(),
                 path: Some(scratch_root.to_string_lossy().into_owned()),
@@ -176,12 +179,10 @@ fn build_compute_system_doc(scratch_root: &Path, parents: &[Layer]) -> HcsSystem
             networking: None,
             mapped_directories: Vec::new(),
             mapped_pipes: Vec::new(),
-            hostname: Some("zlayer-build".to_string()),
             processor: None,
             memory: None,
         }),
         virtual_machine: None,
-        should_terminate_on_last_handle_closed: Some(true),
     }
 }
 

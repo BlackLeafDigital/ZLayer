@@ -54,7 +54,7 @@ use std::time::Duration;
 use zlayer_agent::error::Result;
 use zlayer_agent::runtime::{ContainerId, Runtime};
 use zlayer_agent::runtimes::composite::CompositeRuntime;
-use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime};
+use zlayer_agent::runtimes::hcs::{overlay_network_name, HcsConfig, HcsRuntime};
 #[cfg(feature = "wsl")]
 use zlayer_agent::runtimes::wsl2_delegate::Wsl2DelegateRuntime;
 use zlayer_overlay::ipnet;
@@ -269,6 +269,50 @@ fn cleanup_hcn_test_owner() {
     }
 }
 
+/// Best-effort: delete the Transparent HCN network the runtime self-allocates
+/// for the test slice. The test leaves `daemon_name` at the default `"zlayer"`,
+/// so the runtime creates `overlay_network_name("zlayer") == "zlayer-overlay"`.
+/// HCN networks are not owner-tagged, so we enumerate every network, open each
+/// to read its name, and delete the one that matches — without this the next
+/// run hits a name/subnet conflict. Every error is logged and swallowed so the
+/// cleanup phase always makes forward progress.
+fn cleanup_hcn_test_network() {
+    // Matches what the runtime creates with the default daemon name.
+    let target = overlay_network_name("zlayer");
+    let guids = match zlayer_hns::network::list("{}") {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("cleanup: HcnEnumerateNetworks failed: {e}");
+            return;
+        }
+    };
+    for guid in guids {
+        let net = match zlayer_hns::network::Network::open(guid) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("cleanup: HcnOpenNetwork({guid:?}) failed: {e}");
+                continue;
+            }
+        };
+        let props = match net.query("{}") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cleanup: HcnQueryNetworkProperties({guid:?}) failed: {e}");
+                continue;
+            }
+        };
+        if props.name != target {
+            continue;
+        }
+        // Drop the owning handle before HcnDeleteNetwork — per network.rs,
+        // best practice is to close the wrapper first.
+        drop(net);
+        if let Err(e) = zlayer_hns::network::Network::delete(guid) {
+            eprintln!("cleanup: HcnDeleteNetwork({guid:?}, name={target}) failed: {e}");
+        }
+    }
+}
+
 /// Verify that a container has an HCN endpoint whose IP falls inside `slice`.
 /// Returns `Ok(ip)` on success; `Err` flows up with a message describing the
 /// first discrepancy so failures are pinpointable.
@@ -349,26 +393,12 @@ async fn composite_dispatches_windows_spec_to_hcs() {
                      — composite did not dispatch to the HCS primary"
                 ));
             }
-            // HCN overlay networking is best-effort here. The per-container IP
-            // is assigned by the overlay manager (via `set_next_container_ip`)
-            // against a real cluster overlay network — infrastructure this
-            // single-host dispatch harness does not stand up, and which we must
-            // not fabricate by creating a Transparent network that could hijack
-            // the dev host's NIC. `create_container` itself degrades gracefully
-            // to "no network" in that situation, so we mirror that: validate
-            // the IP-in-slice when an overlay endpoint exists, otherwise log and
-            // skip. End-to-end overlay networking is covered by the cluster
-            // e2e (`windows_cluster_join_e2e`).
-            match assert_container_ip_in_slice(runtime_for_async, id_for_async, test_slice()).await
-            {
-                Ok(ip) => {
-                    eprintln!("PASS: Windows container {id_for_async} has HCN endpoint IP {ip}")
-                }
-                Err(e) => eprintln!(
-                    "SKIP networking assertion for {id_for_async}: {e} \
-                     (no overlay manager / cluster overlay network on this standalone host)"
-                ),
-            }
+            // The runtime self-allocates a real overlay IP for every Windows
+            // container, so the endpoint MUST exist and its IP MUST fall in the
+            // node slice. This is a hard assertion — no skipping.
+            let ip =
+                assert_container_ip_in_slice(runtime_for_async, id_for_async, test_slice()).await?;
+            eprintln!("PASS: Windows container {id_for_async} has HCN endpoint IP {ip}");
             Ok(())
         }
         .await
@@ -379,6 +409,7 @@ async fn composite_dispatches_windows_spec_to_hcs() {
     // --- Cleanup (always runs) ---
     best_effort_remove(&composite, &id).await;
     cleanup_hcn_test_owner();
+    cleanup_hcn_test_network();
 
     if let Err(p) = assertion_outcome {
         std::panic::resume_unwind(p);

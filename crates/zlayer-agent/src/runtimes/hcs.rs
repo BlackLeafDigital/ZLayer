@@ -93,9 +93,9 @@ use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
     Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
     ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
-    GuestState, ProcessParameters, SchemaVersion, ScsiAttachment, ScsiController, Statistics,
-    Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi, UefiBootEntry,
-    VirtualMachine, VirtualSmbShare,
+    GuestOs as HcsGuestOs, GuestState, ProcessParameters, SchemaVersion, ScsiAttachment,
+    ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor,
+    Uefi, UefiBootEntry, VirtualMachine, VirtualSmbShare,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -132,6 +132,60 @@ pub fn overlay_network_name(daemon_name: &str) -> String {
         "zlayer-overlay".to_string()
     } else {
         format!("{daemon_name}-overlay")
+    }
+}
+
+/// Format a GUID as the **bare, lowercase, un-braced** string HCN/HCS use to
+/// identify a namespace inside a compute-system document's
+/// `Container.Networking.Namespace` field (e.g. `aabbccdd-eeff-...`).
+///
+/// The windows-rs `{:?}` formatter emits the brace-wrapped, upper-case form
+/// (`{AABBCCDD-...}`); HCS's `Construct` step then fails to resolve the
+/// namespace against HCN and returns `0x80070490 ERROR_NOT_FOUND`. Normalising
+/// to the bare form here keeps the lookup string byte-identical to the id HCN
+/// registered.
+fn format_guid_bare(id: GUID) -> String {
+    // hcsshim uses bare lowercase GUIDs (`aabbccdd-eeff-...`) for HCN/HCS
+    // wire references. The previous "braced uppercase" experiment failed; the
+    // real bug was that `Namespace::create` returned our random GUID instead
+    // of HCN's actual assigned ID (HostDefault is a singleton). With that
+    // fixed, bare lowercase should now resolve.
+    format!("{id:?}")
+        .trim_matches(|c: char| c == '{' || c == '}')
+        .to_ascii_lowercase()
+}
+
+/// Coerce an arbitrary identifier into a `NetBIOS`-shaped hostname suitable for
+/// `Container.GuestOs.HostName`.
+///
+/// `NetBIOS` rules: 1..=15 ASCII characters, alphanumerics and hyphens only, no
+/// underscores, no dots, must start with an ASCII letter. `hcs_id` strings such
+/// as `fallthrough-svc-rep-0` are >15 chars; longer values are silently
+/// truncated by some HCS builds and rejected by others. We pre-truncate to 15
+/// after stripping disallowed characters so HCS never sees a malformed value.
+fn netbios_hostname(raw: &str) -> String {
+    let mut cleaned: String = raw
+        .chars()
+        .filter_map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' => Some(c),
+            '_' | '.' | ' ' => Some('-'),
+            _ => None,
+        })
+        .collect();
+    // NetBIOS requires the first character to be an ASCII letter; prepend `z`
+    // if the cleaned string starts with a digit or hyphen.
+    if !cleaned
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        cleaned.insert(0, 'z');
+    }
+    cleaned.truncate(15);
+    if cleaned.is_empty() {
+        "zlayer".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -320,6 +374,15 @@ struct ContainerEntry {
     /// entries. Dropped on remove so the per-container scratch VHDX is
     /// cleaned up via [`Uvm::Drop`].
     uvm: Option<Uvm>,
+    /// Parent (read-only) layer paths that were `ActivateLayer` +
+    /// `PrepareLayer`d into HCS before this container's compute system was
+    /// created. Stored in original child-to-parent order (matching
+    /// `parent_layers` from [`HcsRuntime::resolve_parent_chain`]). On
+    /// [`HcsRuntime::remove_container`] each entry is `UnprepareLayer` +
+    /// `DeactivateLayer`d in **reverse order** (parent-to-child) so HCS's
+    /// internal layer table is cleared and a subsequent container with the
+    /// same parents can activate them again.
+    activated_parent_layers: Vec<PathBuf>,
 }
 
 /// Per-daemon HCN Transparent overlay network created lazily on first
@@ -375,6 +438,12 @@ pub struct HcsRuntime {
     /// set any DNS configuration at all for the next container — the endpoint
     /// is created without a `Dns` field (legacy behavior).
     next_container_dns: Arc<Mutex<Option<(Option<IpAddr>, Option<String>)>>>,
+    /// Per-node IP allocator seeded from [`HcsConfig::slice_cidr`]. `Some` once
+    /// this node has an assigned slice. The slice gateway (`network + 1`) is
+    /// reserved at construction via `allocate_first` so the first container gets
+    /// `.2` and never collides with the Transparent network's gateway. `Mutex`
+    /// because allocate/release take `&mut self`; never held across an `.await`.
+    ip_allocator: Mutex<Option<zlayer_overlay::IpAllocator>>,
 }
 
 impl std::fmt::Debug for HcsRuntime {
@@ -449,6 +518,28 @@ impl HcsRuntime {
         std::fs::create_dir_all(config.storage_root.join("scratch")).map_err(|e| {
             AgentError::Configuration(format!("failed to create HCS scratch dir: {e}"))
         })?;
+        // Seed the per-node IP allocator from the assigned slice (if any),
+        // reserving the slice gateway (`network + 1`) so container IPs start at
+        // `.2` and never collide with the Transparent network's default-route
+        // gateway. A parse failure is unreachable (the source is a validated
+        // `IpNet`); degrade to `None` (no-network) rather than failing.
+        let ip_allocator = config.slice_cidr.and_then(|slice| {
+            match zlayer_overlay::IpAllocator::new(&slice.to_string()) {
+                Ok(mut alloc) => {
+                    let _ = alloc.allocate_first(); // reserve the .1 gateway
+                    Some(alloc)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slice = %slice,
+                        error = %e,
+                        "failed to build IP allocator from slice_cidr; Windows \
+                         containers will start without overlay networking"
+                    );
+                    None
+                }
+            }
+        });
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
@@ -458,6 +549,7 @@ impl HcsRuntime {
             overlay_network: Arc::new(Mutex::new(None)),
             next_container_ip: Arc::new(Mutex::new(None)),
             next_container_dns: Arc::new(Mutex::new(None)),
+            ip_allocator: Mutex::new(ip_allocator),
         })
     }
 
@@ -508,6 +600,49 @@ impl HcsRuntime {
             return Ok(net.id);
         }
 
+        let net_name = overlay_network_name(&self.config.daemon_name);
+
+        // Idempotency: a network with this name may already exist on the host
+        // from a previous run that crashed, or from a daemon restart where the
+        // in-memory cache is empty. Enumerate host networks and reuse the one
+        // whose queried name matches ours instead of blindly recreating (which
+        // would fail with a name/subnet conflict HRESULT). The HCN syscalls
+        // (`list`/`open`/`query`) are synchronous, so run them on a blocking
+        // thread to match the `create_transparent` path below.
+        let target_name = net_name.clone();
+        let existing =
+            tokio::task::spawn_blocking(move || -> Option<(GUID, zlayer_hns::network::Network)> {
+                let guids = zlayer_hns::network::list("{}").ok()?;
+                for guid in guids {
+                    let Ok(network) = zlayer_hns::network::Network::open(guid) else {
+                        continue;
+                    };
+                    match network.query("{}") {
+                        Ok(props) if props.name == target_name => {
+                            return Some((guid, network));
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            })
+            .await
+            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?;
+
+        if let Some((existing_id, network)) = existing {
+            *guard = Some(OverlayNetwork {
+                id: existing_id,
+                subnet: slice_cidr.to_string(),
+                _network: network,
+            });
+            tracing::info!(
+                network_id = %format!("{existing_id:?}"),
+                name = %net_name,
+                "reusing existing HCN Transparent overlay network"
+            );
+            return Ok(existing_id);
+        }
+
         let net_id = GUID::new().map_err(|e| {
             AgentError::Internal(format!("GUID::new for overlay network failed: {e}"))
         })?;
@@ -516,7 +651,6 @@ impl HcsRuntime {
         let subnet_str = slice_cidr.to_string();
         let subnet_for_create = subnet_str.clone();
         let uplink_for_create = uplink.clone();
-        let net_name = overlay_network_name(&self.config.daemon_name);
         let net_name_for_create = net_name.clone();
 
         let network = tokio::task::spawn_blocking(move || {
@@ -530,6 +664,16 @@ impl HcsRuntime {
         .await
         .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
         .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork({net_name}): {e}")))?;
+
+        // HCN's Transparent IPAM needs ~1-2s after network create to settle its
+        // address pool. Without this wait the FIRST `HcnCreateEndpoint` against
+        // a freshly-created network frequently fails with
+        // `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)` for what should be a
+        // valid host address (verified May 2026: first endpoint at the first
+        // usable IP fails, second endpoint same IP succeeds). hcsshim avoids
+        // this race because containerd's snapshotter creates the network once
+        // at daemon startup, far before any endpoint attaches.
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
         *guard = Some(OverlayNetwork {
             id: net_id,
@@ -587,10 +731,9 @@ impl HcsRuntime {
     ///
     /// At startup the live set is whatever [`Self::containers`] currently
     /// holds (usually empty); every enumerated system not in that set is an
-    /// orphan. Each orphan is opened with default access, terminated, and
-    /// then the handle is dropped — releasing our handle and the
-    /// `should_terminate_on_last_handle_closed: true` flag on the compute-
-    /// system doc means the system is removed entirely.
+    /// orphan. Each orphan is opened with default access, terminated via
+    /// `HcsTerminateComputeSystem`, and the handle is dropped — HCS removes
+    /// the system entirely once the explicit terminate completes.
     ///
     /// Individual failures (open, terminate) are logged and swallowed so one
     /// stuck system cannot block the rest of reconciliation; the enumeration
@@ -631,9 +774,8 @@ impl HcsRuntime {
                             state = %sys.state,
                             "reconcile: terminated orphan HCS compute system"
                         );
-                        // Drop the handle so HCS finalizes removal via the
-                        // `should_terminate_on_last_handle_closed` flag set
-                        // on every system this runtime creates.
+                        // Drop the handle so HCS releases its internal
+                        // refcount and finalizes the post-terminate cleanup.
                         drop(system);
                     }
                     Err(e) => {
@@ -959,21 +1101,31 @@ impl HcsRuntime {
             }
         };
 
-        let processor = spec.resources.cpu.and_then(|cpu| {
-            // `count` must be at least 1 vCPU; we round up fractional requests.
-            let count = cpu.ceil();
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let count_u32 = if count.is_finite() && count >= 1.0 {
-                count as u32
-            } else {
-                return None;
-            };
-            Some(ContainerProcessor {
-                count: Some(count_u32),
-                maximum: None,
-                weight: None,
-            })
-        });
+        // `Container.Processor` is always present in containerd-shim-runhcs-v1
+        // docs (verified via ETW capture, May 2026), even when the spec sets
+        // no CPU limits — containerd emits an empty `{}` object. Match that
+        // behavior so HCS `Construct` sees the field unconditionally; without
+        // CPU limits we send a default (all fields `None`/skipped → `{}`).
+        let processor = Some(
+            spec.resources
+                .cpu
+                .and_then(|cpu| {
+                    // `count` must be at least 1 vCPU; we round up fractional requests.
+                    let count = cpu.ceil();
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let count_u32 = if count.is_finite() && count >= 1.0 {
+                        count as u32
+                    } else {
+                        return None;
+                    };
+                    Some(ContainerProcessor {
+                        count: Some(count_u32),
+                        maximum: None,
+                        weight: None,
+                    })
+                })
+                .unwrap_or_default(),
+        );
 
         let memory = spec.resources.memory.as_ref().and_then(|mem_str| {
             crate::bundle::parse_memory_string(mem_str)
@@ -1004,23 +1156,42 @@ impl HcsRuntime {
             path: Some(root_path),
         };
 
-        let networking = if namespace_ids.is_empty() {
-            None
-        } else {
-            Some(zlayer_hcs::schema::ContainerNetworking {
-                allow_unqualified_dns_query: None,
-                dns_search_list: Vec::new(),
-                namespace: namespace_ids,
-                network_shared_container_name: None,
-            })
-        };
+        // HCS's `Container.Networking.Namespace` is a single GUID string, so
+        // collapse the id list to its first entry (a container attaches to
+        // exactly one HCN namespace).
+        //
+        // `AllowUnqualifiedDnsQuery: true` is set by containerd's
+        // `containerd-shim-runhcs-v1` on every container it creates (verified
+        // via ETW capture of `Microsoft-Windows-Hyper-V-Compute`, May 2026).
+        // The flag enables lookups of unqualified hostnames against the
+        // namespace's DNS suffix list — required for typical service-discovery
+        // patterns inside a container.
+        let networking =
+            namespace_ids
+                .into_iter()
+                .next()
+                .map(|ns| zlayer_hcs::schema::ContainerNetworking {
+                    allow_unqualified_dns_query: Some(true),
+                    dns_search_list: Vec::new(),
+                    namespace: Some(ns),
+                    network_shared_container_name: None,
+                });
 
+        // GuestOs.HostName: hcsshim only populates this when `Spec.Hostname`
+        // is non-empty (`internal/hcsoci/hcsdoc_wcow.go:218`). Always-emitting
+        // it (with a defaulted netbios-coerced hcs_id) was an over-correction
+        // — match hcsshim's "only when explicitly requested" behavior so the
+        // doc stays minimal and HCS's `Construct` validator does not see an
+        // unexpected field on builds where the field is absent by default.
+        let guest_os = spec.hostname.as_deref().map(|raw| HcsGuestOs {
+            host_name: Some(netbios_hostname(raw)),
+        });
         let container = HcsContainer {
+            guest_os,
             storage: Some(storage),
             networking,
             mapped_directories: Vec::new(),
             mapped_pipes: Vec::new(),
-            hostname: spec.hostname.clone(),
             processor,
             memory,
         };
@@ -1055,6 +1226,67 @@ impl HcsRuntime {
             reason: format!("image '{image}' not pulled before create_container"),
         })?;
         Ok(entry.unpacked.chain.0.clone())
+    }
+
+    /// Activate + Prepare every parent (read-only) layer with HCS before its
+    /// `Path` may legally appear in a `Container.Storage.Layers[].Path` entry.
+    ///
+    /// HCS's `Construct` step rejects compute-system documents whose layer
+    /// paths have not been registered with the host-side layer table; the
+    /// observed failure is `E_INVALIDARG (0x80070057)`. hcsshim handles this
+    /// in its snapshotter by calling `HcsActivateLayer` for every parent layer
+    /// (and `HcsPrepareLayer` so the merged read-only view materialises) prior
+    /// to writing the `MountedLayerPaths` block into the container doc — see
+    /// `internal/layers/wcow_mount.go::mountProcessIsolatedWCIFSLayers` for
+    /// the canonical ordering.
+    ///
+    /// `parent_layers` is the child-to-parent vec from
+    /// [`Self::resolve_parent_chain`]. We iterate **oldest to newest**
+    /// (reverse) so each `PrepareLayer` call sees a chain whose parents are
+    /// already active, mirroring hcsshim. Each layer's `PrepareLayer` parent
+    /// chain is the slice **older** than itself (child-to-parent ordered).
+    ///
+    /// On error, every layer that was activated (and possibly prepared) is
+    /// rolled back in reverse order so a partial failure leaves the host
+    /// layer table clean.
+    ///
+    /// Returns the list of successfully activated+prepared layer paths in the
+    /// original child-to-parent order. The caller must hand this list to
+    /// [`ContainerEntry::activated_parent_layers`] so `remove_container` can
+    /// `UnprepareLayer` + `DeactivateLayer` each one on teardown.
+    fn activate_parent_layers(
+        parent_layers: &[zlayer_hcs::schema::Layer],
+    ) -> std::io::Result<Vec<PathBuf>> {
+        // Read-only parent layers ONLY need `ActivateLayer` — calling
+        // `PrepareLayer` on a parent puts it into a "ready for writes" state,
+        // which is the SCRATCH layer's role, not a parent's. hcsshim's
+        // snapshotter calls `ActivateLayer` on every parent then
+        // `ActivateLayer`+`PrepareLayer` on the scratch only
+        // (`Microsoft/hcsshim/internal/wclayer` + `containerd-shim-runhcs-v1`
+        // snapshotter `Mount`). Misordered prepare on a parent makes HCS
+        // `Construct` reject the eventual compute-system doc with
+        // `E_INVALIDARG (0x80070057)`.
+        let mut activated: Vec<PathBuf> = Vec::with_capacity(parent_layers.len());
+        let n = parent_layers.len();
+        // Oldest-to-newest: walk reverse indices.
+        for i in (0..n).rev() {
+            let layer = &parent_layers[i];
+            let layer_path = PathBuf::from(&layer.path);
+
+            if let Err(e) = crate::windows::wclayer::activate_layer(&layer_path) {
+                rollback_parent_activations(&activated);
+                return Err(std::io::Error::other(format!(
+                    "ActivateLayer({}) failed: {e}",
+                    layer_path.display()
+                )));
+            }
+            activated.push(layer_path);
+        }
+
+        // Reverse into the original child-to-parent order for storage in
+        // [`ContainerEntry::activated_parent_layers`].
+        activated.reverse();
+        Ok(activated)
     }
 
     /// Spawn a background task that subscribes to the compute system's
@@ -1432,6 +1664,75 @@ fn filter_adapters_by_gpu_spec(
     filtered
 }
 
+/// RAII guard that owns a list of parent layer paths that have been
+/// `ActivateLayer` + `PrepareLayer`d. On drop (unless [`Self::disarm`]ed) it
+/// `UnprepareLayer` + `DeactivateLayer`s each entry in reverse order
+/// (parent-to-child of the original child-to-parent list, i.e. newest-first)
+/// so a `create_container` failure between activation and successful
+/// `ContainerEntry` insertion does not leak host layer table entries.
+struct ParentLayerActivationGuard {
+    layers: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl ParentLayerActivationGuard {
+    fn new(layers: Vec<PathBuf>) -> Self {
+        Self {
+            layers,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard and return ownership of the path list. The caller is
+    /// now responsible for `UnprepareLayer` + `DeactivateLayer` on each path
+    /// during container teardown (via [`ContainerEntry::activated_parent_layers`]).
+    fn disarm(mut self) -> Vec<PathBuf> {
+        self.armed = false;
+        std::mem::take(&mut self.layers)
+    }
+}
+
+impl Drop for ParentLayerActivationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The stored order is child-to-parent. Deactivate newest-first so
+        // we mirror hcsshim's teardown direction. Parents were only
+        // `ActivateLayer`d (no `PrepareLayer`), so the matching teardown
+        // is just `DeactivateLayer`.
+        for path in &self.layers {
+            if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+                tracing::warn!(
+                    layer = %path.display(),
+                    error = %e,
+                    "DeactivateLayer failed during create_container rollback",
+                );
+            }
+        }
+    }
+}
+
+/// Roll back a partial parent-layer activation. `activated` is the running
+/// log built by [`HcsRuntime::activate_parent_layers`]: oldest-to-newest in
+/// the order they were activated, with a `was_prepared` flag indicating
+/// whether `PrepareLayer` also succeeded for that entry. We iterate the log
+/// in reverse (newest-back-to-oldest of the activated set) and best-effort
+/// unprepare-then-deactivate each layer. All failures are logged; none are
+/// propagated, because the caller is already returning an error and we do
+/// not want to mask the original cause.
+fn rollback_parent_activations(activated: &[PathBuf]) {
+    for path in activated.iter().rev() {
+        if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+            tracing::warn!(
+                layer = %path.display(),
+                error = %e,
+                "DeactivateLayer failed during parent-activation rollback",
+            );
+        }
+    }
+}
+
 /// Parse a GUID that may or may not be brace-wrapped, as HCN emits them on
 /// the wire (`"{aabbccdd-...}"` or bare `"aabbccdd-..."`). Returns `None` for
 /// any malformed input so callers can fall back gracefully.
@@ -1539,6 +1840,28 @@ impl Runtime for HcsRuntime {
         }
         let parent_layers = self.resolve_parent_chain(&image_name).await?;
 
+        // 1b. Activate + Prepare every parent (read-only) layer with HCS.
+        //     Without this, HCS's `Construct` step rejects the eventual
+        //     compute-system doc with `E_INVALIDARG (0x80070057)` because the
+        //     `Container.Storage.Layers[].Path` values point at unpacked
+        //     directories that the host-side layer table has never seen.
+        //     Mirrors hcsshim's `mountProcessIsolatedWCIFSLayers`.
+        let parent_activation_guard = {
+            let parents = parent_layers.clone();
+            let activated =
+                tokio::task::spawn_blocking(move || Self::activate_parent_layers(&parents))
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("spawn_blocking join for parent layer activation: {e}"),
+                    })?
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("parent layer activation: {e}"),
+                    })?;
+            ParentLayerActivationGuard::new(activated)
+        };
+
         // 2. Build a scratch layer for this container.
         let scratch_dir = self.scratch_dir(&hcs_id);
         // Convert the HCS-ordered parent list into the wclayer LayerChain
@@ -1562,10 +1885,29 @@ impl Runtime for HcsRuntime {
         //    slice, and the cluster CIDR drives the OutBoundNAT / SDNRoute /
         //    ACL policies on the endpoint.
         let slice_cidr = self.config.slice_cidr;
-        let allocated_ip = self.next_container_ip.lock().await.take();
+        // Prefer an explicitly-stashed IP (set_next_container_ip path); otherwise
+        // self-allocate from this node's slice allocator. `None` when no slice is
+        // assigned (allocator is `None`) or the slice is exhausted — either way we
+        // fall through to the no-network arm below.
+        let allocated_ip = match self.next_container_ip.lock().await.take() {
+            Some(ip) => Some(ip),
+            None => self
+                .ip_allocator
+                .lock()
+                .await
+                .as_mut()
+                .and_then(zlayer_overlay::IpAllocator::allocate),
+        };
         let dns_config = self.next_container_dns.lock().await.take();
         let cluster_cidr = self.config.cluster_cidr.clone();
         let owner_tag_for_endpoint = owner_tag(&self.config.daemon_name);
+        // Overlay attachment is a hard requirement for an HCS-managed container:
+        // without an IP the workload has no addressable network surface, and
+        // `get_container_ip` will return `None` which downstream callers (proxy,
+        // service discovery, health checks) treat as a permanent fault. Each
+        // failure mode below maps to a distinct `AgentError::CreateFailed` so
+        // the operator (or test harness) sees the exact cause rather than a
+        // late "no IP" mystery.
         let network_attachment = match (slice_cidr, allocated_ip) {
             (Some(slice), Some(ip)) => match self.ensure_overlay_network(slice).await {
                 Ok(net_id) => {
@@ -1588,59 +1930,53 @@ impl Runtime for HcsRuntime {
                     })
                     .await
                     {
-                        Ok(Ok(att)) => Some(att),
+                        Ok(Ok(att)) => att,
                         Ok(Err(e)) => {
-                            tracing::warn!(
-                                hcs_id = %hcs_id,
-                                error = %e,
-                                "HCN overlay endpoint attach failed; starting container without network"
-                            );
-                            None
+                            return Err(AgentError::CreateFailed {
+                                id: hcs_id.clone(),
+                                reason: format!("HCN overlay endpoint attach failed: {e}"),
+                            });
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                hcs_id = %hcs_id,
-                                error = %e,
-                                "spawn_blocking join for overlay endpoint attach failed; starting container without network"
-                            );
-                            None
+                            return Err(AgentError::CreateFailed {
+                                id: hcs_id.clone(),
+                                reason: format!(
+                                    "spawn_blocking join for overlay endpoint attach failed: {e}"
+                                ),
+                            });
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        hcs_id = %hcs_id,
-                        error = %e,
-                        "HCN Transparent overlay network unavailable; starting container without network"
-                    );
-                    None
+                    return Err(AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("HCN Transparent overlay network unavailable: {e}"),
+                    });
                 }
             },
             (None, _) => {
-                tracing::warn!(
-                    hcs_id = %hcs_id,
-                    "HcsConfig.slice_cidr is None (node has no assigned slice yet); starting container without network"
-                );
-                None
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: "HcsConfig.slice_cidr is None (node has no assigned slice yet)"
+                        .to_string(),
+                });
             }
             (Some(_), None) => {
-                tracing::warn!(
-                    hcs_id = %hcs_id,
-                    "no container IP stashed via set_next_container_ip; starting container without network"
-                );
-                None
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: "no overlay IP could be allocated for this container".to_string(),
+                });
             }
         };
 
         // 4. Build the compute-system JSON document, populating
         //    `Container.Networking.Namespace` with the namespace GUID we just
-        //    created. HCS expects the namespace GUID as a brace-wrapped
-        //    string (matching the `{:?}` debug formatter for
-        //    `windows::core::GUID`).
-        let namespace_strs: Vec<String> = network_attachment
-            .as_ref()
-            .map(|att| vec![format!("{:?}", att.namespace_id())])
-            .unwrap_or_default();
+        //    created. HCS resolves this GUID against HCN during its `Construct`
+        //    step; it must be the **bare, lowercase, un-braced** form
+        //    (`aabbccdd-...`). The brace-wrapped upper-case `{:?}` form makes
+        //    Construct fail with `0x80070490 ERROR_NOT_FOUND` because the
+        //    lookup string doesn't match the namespace HCN registered.
+        let namespace_strs: Vec<String> = vec![format_guid_bare(network_attachment.namespace_id())];
         // Resolve the spec-side isolation choice (which may be `Auto` or
         // absent) to the concrete runtime-internal isolation mode. `Auto`
         // and absence both fall back to [`HcsConfig::default_isolation`];
@@ -1682,6 +2018,15 @@ impl Runtime for HcsRuntime {
             id: hcs_id.clone(),
             reason: format!("serialize ComputeSystem doc: {e}"),
         })?;
+        // Diagnostic: emit the exact JSON we hand to HCS so reproducible E_INVALIDARG
+        // failures can be diffed against hcsshim's known-good docs. error! so it
+        // shows without RUST_LOG configuration.
+        tracing::error!(target: "zlayer_agent::hcs::diag", hcs_id = %hcs_id, doc = %doc_json, "HCS_CREATE_DOC");
+        if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
+            let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.json"));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, &doc_json);
+        }
 
         // 5. Create the compute system.
         let system = ComputeSystem::create(&hcs_id, &doc_json)
@@ -1703,13 +2048,20 @@ impl Runtime for HcsRuntime {
         self.spawn_exit_watcher(hcs_id.clone(), *system.raw(), sink.clone());
 
         // 7. Register the entry.
+        //
+        // Disarm the parent-layer activation guard and transfer its path list
+        // into the entry. Teardown of these layers now happens during
+        // [`Self::remove_container`] (in reverse order) so subsequent
+        // containers sharing the same parent chain can re-activate them.
+        let activated_parent_layers = parent_activation_guard.disarm();
         let entry = ContainerEntry {
             system,
             scratch_layer: Some(scratch_layer),
             hcs_id: hcs_id.clone(),
             last_exit_code: sink,
-            network_attachment,
+            network_attachment: Some(network_attachment),
             uvm,
+            activated_parent_layers,
         };
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
@@ -1807,6 +2159,31 @@ impl Runtime for HcsRuntime {
                 .map_err(|e| AgentError::Internal(format!("scratch teardown: {e}")))?;
         }
 
+        // Deactivate every parent (read-only) layer this container's
+        // `create_container` activated. The stored vec is in child-to-parent
+        // order (matching `resolve_parent_chain`); we iterate **reverse** of
+        // activation order — child-most first — mirroring hcsshim's teardown
+        // direction. Parents were only `ActivateLayer`d (not `PrepareLayer`d)
+        // so the matching teardown is `DeactivateLayer` only. Best-effort:
+        // log failures, do NOT propagate.
+        if !entry.activated_parent_layers.is_empty() {
+            let layers = std::mem::take(&mut entry.activated_parent_layers);
+            let hcs_id_for_log = entry.hcs_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                for path in &layers {
+                    if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+                        tracing::warn!(
+                            hcs_id = %hcs_id_for_log,
+                            layer = %path.display(),
+                            error = %e,
+                            "DeactivateLayer failed during remove_container; layer table may leak until reboot",
+                        );
+                    }
+                }
+            })
+            .await;
+        }
+
         // Tear down the UVM (if any). The scratch VHDX cleanup happens in
         // `Uvm::Drop` — we explicitly `drop` here so the order with respect to
         // the scratch-layer teardown above is deterministic and any
@@ -1824,6 +2201,9 @@ impl Runtime for HcsRuntime {
         // caller expects success once we reach this point.
         if let Some(attachment) = entry.network_attachment.take() {
             let hcs_id_for_log = entry.hcs_id.clone();
+            // Capture the endpoint IP before `teardown()` consumes the
+            // attachment so we can release it back to the node allocator.
+            let released_ip = attachment.ip().and_then(|s| s.parse::<IpAddr>().ok());
             let res = tokio::task::spawn_blocking(move || attachment.teardown()).await;
             match res {
                 Ok(Ok(())) => {}
@@ -1840,6 +2220,14 @@ impl Runtime for HcsRuntime {
                         error = %e,
                         "spawn_blocking join failed during HCN teardown"
                     );
+                }
+            }
+            // Release the IP regardless of teardown result so a failed teardown
+            // does not leak the address. `release` is idempotent and safe for
+            // unknown IPs (e.g. the reserved gateway).
+            if let Some(ip) = released_ip {
+                if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
+                    alloc.release(ip);
                 }
             }
         }

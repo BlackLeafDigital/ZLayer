@@ -2,6 +2,10 @@
 
 This document provides guidance for AI assistants working on the ZLayer codebase.
 
+## NEVER DEFER OR DECLARE WORK "OUT OF SCOPE"
+
+Never unilaterally declare anything "out of scope," "future work," "separate effort," "not implemented — leaving it," "tracked as CX," or any equivalent escape hatch. If a task is large, implement ALL of it across as many phases as it takes. The hard, build-from-scratch piece (a protocol, a subsystem) IS the job — not a stretch goal. The ONLY thing that makes work out of scope is the user saying so explicitly, in the current conversation. Past sessions built the easy 60% of features and hid the hard remainder behind `#[allow(dead_code)]` and "C6 / not yet implemented" labels; that is avoidance dressed as scope and is forbidden.
+
 ## Repository Overview
 
 ZLayer is a lightweight, Rust-based container orchestration platform with built-in networking, scaling, and observability. It uses libcontainer (from youki) for direct container management without requiring a daemon.
