@@ -183,6 +183,7 @@ fn build_compute_system_doc(scratch_root: &Path, parents: &[Layer]) -> HcsSystem
             memory: None,
         }),
         virtual_machine: None,
+        should_terminate_on_last_handle_closed: Some(true),
     }
 }
 

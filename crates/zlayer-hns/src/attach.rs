@@ -24,7 +24,7 @@ use windows::core::GUID;
 use crate::endpoint::{self, Endpoint};
 use crate::error::{HnsError, HnsResult};
 use crate::namespace::Namespace;
-use crate::schema::{Dns, EndpointPolicy, HostComputeEndpoint, IpConfig, Route, SchemaVersion};
+use crate::schema::{Dns, HostComputeEndpoint, IpConfig, Route, SchemaVersion};
 
 /// GUID of the legacy `HostDefault` singleton HCN namespace. We avoid creating
 /// new attachments against it (HCS rejects compute-system docs that reference
@@ -108,7 +108,11 @@ impl EndpointAttachment {
         container_id: &str,
         ip: std::net::IpAddr,
         prefix_length: u8,
-        cluster_cidr: &str,
+        // Cluster CIDR is accepted by the API but no longer used for endpoint
+        // policies — Transparent-network endpoints have empty policies (see
+        // policies field below). Kept in the signature for callers (and so we
+        // don't need to bump the call sites just to drop a string).
+        _cluster_cidr: &str,
         dns_server: Option<std::net::IpAddr>,
         dns_domain: Option<&str>,
     ) -> HnsResult<Self> {
@@ -136,22 +140,25 @@ impl EndpointAttachment {
                 ip_address: ip_str,
                 prefix_length,
             }],
-            // Transparent-network endpoint policies. Bisected against a live
-            // HCN Transparent network (May 2026):
-            //   - `OutBoundNAT` (Exceptions=[cluster_cidr]) — ACCEPTED.
-            //   - `ACL` (Allow/In, RemoteAddresses=cluster_cidr) — ACCEPTED,
-            //     but ONLY with both `Priority` and `RuleType` set (the
-            //     `acl_in_allow` builder sets them; omitting either gets the
-            //     whole endpoint create rejected with `HCN policy rejected`).
-            //   - `SDNRoute` — REJECTED by a Transparent network with
-            //     `HCN policy rejected: HcnCreateEndpoint`. SDNRoute is an
-            //     SDN/Overlay construct the Transparent driver does not accept;
-            //     cluster-CIDR routing is handled by the WireGuard host route,
-            //     not by an in-container HCN route, so dropping it is correct.
-            policies: vec![
-                EndpointPolicy::out_bound_nat(vec![cluster_cidr.to_string()]).into(),
-                EndpointPolicy::acl_in_allow(cluster_cidr).into(),
-            ],
+            // Transparent-network endpoint policies. HCN's `HcnCreateEndpoint`
+            // accepts `OutBoundNAT` and `ACL(RuleType=Switch)` on Transparent
+            // endpoints at create time, but `HcsCreateComputeSystem`'s async
+            // `Construct` step rejects the same endpoint with `E_INVALIDARG`
+            // (`0x80070057`) inside `vmcompute.exe!networkutilities.cpp(450)`
+            // (verified May 2026 via ETW on 10.0.26100). Transparent networks
+            // bind directly to the host's physical NIC and have NO vSwitch
+            // port to attach a Switch-tier ACL to and NO in-stack SNAT engine
+            // for `OutBoundNAT` to program — both are Overlay/NAT/L2Bridge
+            // constructs. Cluster-CIDR isolation on a Transparent overlay is
+            // already enforced by the WireGuard host route (only members of
+            // the slice are reachable); SNAT-style egress masquerade is
+            // unnecessary because every container has a real routable IP on
+            // the overlay. Leaving `policies` empty is what containerd-shim
+            // does for Transparent endpoints; HCS Construct accepts the doc.
+            // Note: `out_bound_nat` and `acl_in_allow` builders are still
+            // available in `EndpointPolicy` for callers that need them on
+            // NAT/Overlay endpoints in the future.
+            policies: Vec::new(),
             routes: vec![Route {
                 next_hop: gateway.clone(),
                 destination_prefix: "0.0.0.0/0".to_string(),

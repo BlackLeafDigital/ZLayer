@@ -1177,14 +1177,21 @@ impl HcsRuntime {
                     network_shared_container_name: None,
                 });
 
-        // GuestOs.HostName: hcsshim only populates this when `Spec.Hostname`
-        // is non-empty (`internal/hcsoci/hcsdoc_wcow.go:218`). Always-emitting
-        // it (with a defaulted netbios-coerced hcs_id) was an over-correction
-        // — match hcsshim's "only when explicitly requested" behavior so the
-        // doc stays minimal and HCS's `Construct` validator does not see an
-        // unexpected field on builds where the field is absent by default.
-        let guest_os = spec.hostname.as_deref().map(|raw| HcsGuestOs {
-            host_name: Some(netbios_hostname(raw)),
+        // GuestOs.HostName: hcsshim's WCOW path only emits this when
+        // `Spec.Hostname != ""` (`internal/hcsoci/hcsdoc_wcow.go:218`), but in
+        // its production callers (containerd-shim-runhcs-v1, CRI, Docker) the
+        // OCI runtime spec ALWAYS defaults `Spec.Hostname` to a non-empty
+        // value (typically the first 12 chars of the container id), so that
+        // branch is never taken in practice. When `Networking.Namespace` is
+        // set and `GuestOs` is absent, `HcsCreateComputeSystem` rejects the
+        // doc with `E_INVALIDARG (0x80070057)` at
+        // `OperationFailure.Detail="Construct"` (verified on
+        // 10.0.26100/Windows 11 24H2, May 2026). Match the de-facto behavior:
+        // always populate `GuestOs.HostName`, defaulting to the netbios-safe
+        // form of `hcs_id` when the spec doesn't supply one.
+        let hostname_source = spec.hostname.as_deref().unwrap_or(hcs_id);
+        let guest_os = Some(HcsGuestOs {
+            host_name: Some(netbios_hostname(hostname_source)),
         });
         let container = HcsContainer {
             guest_os,
@@ -2028,13 +2035,37 @@ impl Runtime for HcsRuntime {
             let _ = std::fs::write(&path, &doc_json);
         }
 
-        // 5. Create the compute system.
-        let system = ComputeSystem::create(&hcs_id, &doc_json)
-            .await
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.clone(),
-                reason: format!("HcsCreateComputeSystem: {e}"),
-            })?;
+        // 5. Create the compute system. On failure, tear down the HCN
+        //    endpoint we created in step 3 — otherwise the endpoint (and the
+        //    IP it owns) leaks, and the next test/deploy attempt that tries
+        //    to claim the same IP gets `HCN_E_ADDR_INVALID_OR_RESERVED
+        //    (0x803b002f)`. Also release the IP back to the allocator. The
+        //    parent-layer guard and scratch layer cleanup are handled by
+        //    their own Drop / orphan-reconcile paths.
+        let system = match ComputeSystem::create(&hcs_id, &doc_json).await {
+            Ok(s) => s,
+            Err(e) => {
+                let ip_to_release = network_attachment
+                    .ip()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+                if let Err(td_err) = network_attachment.teardown() {
+                    tracing::warn!(
+                        hcs_id = %hcs_id,
+                        error = %td_err,
+                        "HCS create failed; HCN endpoint teardown also failed (endpoint may leak)"
+                    );
+                }
+                if let Some(ip) = ip_to_release {
+                    if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
+                        alloc.release(ip);
+                    }
+                }
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!("HcsCreateComputeSystem: {e}"),
+                });
+            }
+        };
 
         // 6. Subscribe to exit events before returning so we don't miss a
         //    fast-exiting container.

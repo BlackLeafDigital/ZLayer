@@ -2297,6 +2297,7 @@ async fn execute_run_step_impl(
             memory: None,
         }),
         virtual_machine: None,
+        should_terminate_on_last_handle_closed: Some(true),
     };
     let doc_json = serde_json::to_string(&doc).map_err(|e| BuildError::LayerCreate {
         message: format!("serialize HCS compute-system doc: {e}"),
