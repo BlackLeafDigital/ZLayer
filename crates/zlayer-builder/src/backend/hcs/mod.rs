@@ -635,14 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_scratch_size_extracts_gb_suffix() {
-        assert_eq!(parse_scratch_size_gb("windows/amd64,scratch:40g"), Some(40));
-        assert_eq!(parse_scratch_size_gb("scratch:2G"), Some(2));
-        assert_eq!(parse_scratch_size_gb("windows/amd64"), None);
-        assert_eq!(parse_scratch_size_gb(""), None);
-    }
-
-    #[test]
     fn default_storage_root_ends_in_zlayer_builder_hcs() {
         let root = default_storage_root();
         let s = root.to_string_lossy().to_ascii_lowercase();

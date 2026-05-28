@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime, IsolationMode};
+use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
@@ -70,10 +70,10 @@ fn fresh_storage_root(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("zlayer-hcs-hyperv-e2e-{}", unique_name(tag)))
 }
 
-/// Build the test-local `HcsConfig`. `default_isolation` is pinned to
-/// `Hyperv` so even a spec that forgets to set `isolation: hyperv` would
-/// still resolve to Hyper-V — but every spec in this file sets it
-/// explicitly too, defense in depth.
+/// Build the test-local `HcsConfig`. Every spec in this file sets
+/// `isolation: hyperv` explicitly, so the runtime's image-aware resolver
+/// (`resolve_isolation_for_image`) routes them through the Hyper-V path
+/// regardless of the host's Windows build.
 ///
 /// `slice_cidr` is intentionally left at `None`: the runtime warns and
 /// proceeds without overlay networking, which is fine for these tests —
@@ -83,7 +83,6 @@ fn test_config(tag: &str) -> (HcsConfig, PathBuf) {
     let storage_root = fresh_storage_root(tag);
     let cfg = HcsConfig {
         storage_root: storage_root.clone(),
-        default_isolation: IsolationMode::Hyperv,
         default_scratch_size_gb: 20,
         ..HcsConfig::default()
     };

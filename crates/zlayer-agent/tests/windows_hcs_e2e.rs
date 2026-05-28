@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime, IsolationMode};
+use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
@@ -70,7 +70,6 @@ fn test_config(tag: &str) -> (HcsConfig, PathBuf) {
     let storage_root = fresh_storage_root(tag);
     let cfg = HcsConfig {
         storage_root: storage_root.clone(),
-        default_isolation: IsolationMode::Process,
         default_scratch_size_gb: 20,
         ..HcsConfig::default()
     };

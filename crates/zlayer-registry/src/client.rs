@@ -1227,6 +1227,50 @@ impl ImagePuller {
             .and_then(zlayer_spec::OsKind::from_oci_str))
     }
 
+    /// Fetch the `os.version` string carried by `image`'s OCI config blob.
+    ///
+    /// For Windows images this corresponds to the host build identifier
+    /// (e.g. `"10.0.20348.2031"`) recorded by the image builder, and is the
+    /// value the HCS runtime needs to auto-resolve process vs. Hyper-V
+    /// isolation against the running host's build. Most Linux images do not
+    /// record this field.
+    ///
+    /// Returns:
+    /// * `Ok(Some(version))` when the config blob carries an `os.version`.
+    /// * `Ok(None)` when the field is absent — callers should treat this as
+    ///   "no builder-asserted version, fall through to a runtime default"
+    ///   rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or
+    /// if the config blob cannot be parsed as valid JSON.
+    pub async fn image_os_version(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Option<String>> {
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+
+        let config_digest = &manifest.config.digest;
+        let config_blob = self.pull_blob(image, config_digest, auth).await?;
+
+        let config_root: OciImageConfigRoot =
+            serde_json::from_slice(&config_blob).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    image = %image,
+                    config_digest = %config_digest,
+                    "failed to parse image config JSON for os.version inspection"
+                );
+                RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+                    "failed to parse image config for {image}: {e}"
+                )))
+            })?;
+
+        Ok(config_root.os_version)
+    }
+
     /// Detect the artifact type of an image from its manifest
     ///
     /// This method pulls the manifest and determines whether the image is a

@@ -93,9 +93,9 @@ use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
     Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
     ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
-    GuestOs as HcsGuestOs, GuestState, ProcessParameters, SchemaVersion, ScsiAttachment,
-    ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor,
-    Uefi, UefiBootEntry, VirtualMachine, VirtualSmbShare,
+    GuestOs as HcsGuestOs, ProcessParameters, SchemaVersion, ScsiAttachment, ScsiController,
+    Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi,
+    UefiBootEntry, VirtualMachine, VirtualSmbShare, VirtualSmbShareOptions,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -205,89 +205,113 @@ pub enum IsolationMode {
     Hyperv,
 }
 
-/// Resolve [`zlayer_spec::IsolationMode::Auto`] to a concrete runtime-internal
-/// isolation mode based on host SKU.
+/// Cached host Windows version as `(major, minor, build)`. The host's build
+/// number is immutable for the process lifetime, so we cache the first
+/// successful probe and never re-query.
+static HOST_WIN_BUILD: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+
+/// Return the host's `(major, minor, build)` Windows version via
+/// `ntdll!RtlGetVersion` — the only API that returns the actual build number
+/// even when the calling process has no manifest declaring Windows 10/11
+/// compatibility. `GetVersionExW` and `GetVersion` are manifest-shimmed and
+/// will return 6.2 (Windows 8) on a 10.0.26100 host without an explicit
+/// manifest entry, which would make isolation-mode detection wrong.
 ///
-/// Picks [`IsolationMode::Hyperv`] on Windows 10/11 client SKUs (detected by
-/// `OSVERSIONINFOEXW.wProductType == VER_NT_WORKSTATION`) and
-/// [`IsolationMode::Process`] on Server SKUs (`VER_NT_SERVER` /
-/// `VER_NT_DOMAIN_CONTROLLER`). If detection fails (missing API, unrecognized
-/// SKU, non-zero HRESULT from `GetVersionExW`) we default to
-/// [`IsolationMode::Process`] — process isolation fails predictably when the
-/// container OS build does not match the host, so a wrong-on-Server choice is
-/// less surprising than a wrong-on-client one (Hyper-V on a host without
-/// Hyper-V installed is a hard error at start time).
+/// Backing FFI: `ntdll.dll!RtlGetVersion(version_info: *mut OSVERSIONINFOW)
+/// -> NTSTATUS`. We declare the link inline (matching the pattern used in
+/// `crate::windows::wclayer::layer_id_for_path`) so we don't need to widen
+/// the agent's `windows` crate feature set.
 ///
-/// Marked `#[must_use]` because the caller always needs to read the result;
-/// throwing it away would silently leave isolation unresolved.
-///
-/// NOT yet wired as the [`HcsConfig::default`] default: Hyper-V isolation
-/// needs the UVM subsystem (tracked as C6) which is not implemented, so
-/// promoting a client SKU to Hyper-V today would route to non-functional
-/// code. Once the UVM path lands, wire this here (and ideally extend it to be
-/// container-build-vs-host-build aware, since process isolation works on
-/// 24H2 client for build-matched images).
-#[allow(dead_code)]
-#[must_use]
-pub(crate) fn resolve_isolation_auto() -> IsolationMode {
-    use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOEXW};
+/// Returns `None` only if the syscall fails — never observed in practice on
+/// any supported Windows host.
+fn host_windows_build() -> Option<(u32, u32, u32)> {
+    *HOST_WIN_BUILD.get_or_init(|| {
+        use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 
-    // `VER_NT_*` are documented Win32 constants that the `windows` crate
-    // does not re-export (they originate as `#define`s in `winnt.h`). Inline
-    // them as documented. Source: Microsoft Learn — OSVERSIONINFOEXW.
-    const VER_NT_WORKSTATION: u8 = 0x0000_0001;
+        windows::core::link!(
+            "ntdll.dll" "system" fn RtlGetVersion(
+                version_info: *mut OSVERSIONINFOW,
+            ) -> windows::core::HRESULT
+        );
 
-    let mut info = OSVERSIONINFOEXW {
-        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOEXW>())
-            .unwrap_or(u32::MAX),
-        ..Default::default()
-    };
-
-    // SAFETY: `info` is a stack-resident, properly-sized `OSVERSIONINFOEXW`
-    // with `dwOSVersionInfoSize` set per the Win32 contract; `GetVersionExW`
-    // is documented to accept an `OSVERSIONINFOEXW*` via the
-    // `OSVERSIONINFOW*` parameter when the size field reflects the EX
-    // variant. The cast matches the pattern used inside the `windows` crate's
-    // own wrapper (see windows-0.62.2 SystemInformation/mod.rs:216).
-    let ok =
-        unsafe { GetVersionExW(std::ptr::from_mut::<OSVERSIONINFOEXW>(&mut info).cast()).is_ok() };
-
-    if !ok {
-        return IsolationMode::Process;
-    }
-
-    if info.wProductType == VER_NT_WORKSTATION {
-        IsolationMode::Hyperv
-    } else {
-        // VER_NT_SERVER (3) or VER_NT_DOMAIN_CONTROLLER (2) — Server SKU.
-        // Anything else (0, unrecognized) also funnels here, which is the
-        // documented "safer fallback" path.
-        IsolationMode::Process
-    }
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `info` is a live, exclusively-borrowed, correctly-sized
+        // OSVERSIONINFOW. RtlGetVersion only writes through the pointer and
+        // returns an NTSTATUS-as-HRESULT. (RtlGetVersion's signature is
+        // documented as NTSTATUS, but `windows::core::link!` accepts HRESULT
+        // as a thin wrapper around the same i32 — STATUS_SUCCESS = 0 maps
+        // to HRESULT 0 which `.is_ok()` accepts.)
+        let hr = unsafe { RtlGetVersion(&mut info) };
+        if hr.is_ok() {
+            Some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
+        } else {
+            None
+        }
+    })
 }
 
-/// Convert a spec-side [`zlayer_spec::IsolationMode`] (which carries the
-/// `Auto` variant exposed to users) into the runtime-internal
-/// [`IsolationMode`] (which only knows about concrete `Process` / `Hyperv`).
+/// Parse a Windows `os.version` string (e.g. `"10.0.20348.2700"`) into
+/// `(major, minor, build)`. Ignores the UBR (revision) component since
+/// different MCR tags within the same build (UBR drift) are
+/// isolation-compatible — process isolation tolerates a UBR delta but not a
+/// build delta. Returns `None` on parse failure or when the string has
+/// fewer than three dotted components.
+fn parse_os_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.').map(str::parse::<u32>);
+    let major = parts.next()?.ok()?;
+    let minor = parts.next()?.ok()?;
+    let build = parts.next()?.ok()?;
+    Some((major, minor, build))
+}
+
+/// Pure-logic decision matrix used by [`resolve_isolation_for_image`].
 ///
-/// * `Some(Process)` / `Some(Hyperv)` map through directly.
-/// * `None` (spec did not set a value) and `Some(Auto)` both defer to the
-///   `config_default` argument — typically [`HcsConfig::default_isolation`].
+/// Extracted as a separate function so tests can drive every cell of the
+/// matrix without depending on [`host_windows_build`]'s Windows FFI.
 ///
-/// `HcsConfig::default_isolation` is already a concrete [`IsolationMode`].
-/// [`HcsConfig::default`] seeds it from [`resolve_isolation_auto`] at
-/// config-construction time (an operator may still override it), so this
-/// per-call path stays free of an OS-probe FFI call.
-fn spec_isolation_to_internal(
+/// | spec    | image build       | host build       | result   | reason |
+/// |---------|-------------------|------------------|----------|--------|
+/// | Process | *                 | *                | Process  | explicit operator choice |
+/// | Hyperv  | *                 | *                | Hyperv   | explicit operator choice |
+/// | Auto    | known + matches   | known            | Process  | build-matched, no UVM needed |
+/// | Auto    | known + mismatch  | known            | Hyperv   | cross-build, UVM required |
+/// | Auto    | known             | unknown          | Hyperv   | safer (UVM works on any host) |
+/// | Auto    | unknown           | *                | Process  | preserves prior default; documented |
+fn decide_isolation(
     spec: Option<zlayer_spec::IsolationMode>,
-    config_default: IsolationMode,
+    image_build: Option<(u32, u32, u32)>,
+    host_build: Option<(u32, u32, u32)>,
 ) -> IsolationMode {
     use zlayer_spec::IsolationMode as Spec;
     match spec {
-        None | Some(Spec::Auto) => config_default,
         Some(Spec::Process) => IsolationMode::Process,
         Some(Spec::Hyperv) => IsolationMode::Hyperv,
+        None | Some(Spec::Auto) => match (image_build, host_build) {
+            (Some(img), Some(host)) if img == host => IsolationMode::Process,
+            (Some(_), Some(_) | None) => IsolationMode::Hyperv,
+            (None, _) => IsolationMode::Process,
+        },
     }
+}
+
+/// Resolve the runtime-internal [`IsolationMode`] for a container, picking
+/// Process vs. Hyper-V based on the spec, the image's builder-asserted
+/// `os.version`, and the host's Windows build.
+///
+/// Spec values flow through [`decide_isolation`]; the only side effects are
+/// the cached [`host_windows_build`] probe and `image_os_version` parsing.
+fn resolve_isolation_for_image(
+    spec: Option<zlayer_spec::IsolationMode>,
+    image_os_version: Option<&str>,
+) -> IsolationMode {
+    decide_isolation(
+        spec,
+        image_os_version.and_then(parse_os_version),
+        host_windows_build(),
+    )
 }
 
 /// Configuration for [`HcsRuntime`].
@@ -296,8 +320,6 @@ pub struct HcsConfig {
     /// Root directory for the read-only image layer cache (`<root>/images/`)
     /// and the per-container scratch layers (`<root>/scratch/<id>/`).
     pub storage_root: PathBuf,
-    /// Default isolation mode applied when a service spec does not pin one.
-    pub default_isolation: IsolationMode,
     /// Default scratch layer size in GiB. `0` requests the HCS default.
     pub default_scratch_size_gb: u64,
     /// Cluster CIDR (e.g. "10.200.0.0/16") used for per-endpoint policy
@@ -323,16 +345,11 @@ impl Default for HcsConfig {
         Self {
             storage_root: std::env::var("ZLAYER_HCS_STORAGE_ROOT")
                 .map_or_else(|_| dirs.containers().join("hcs"), PathBuf::from),
-            // Default to process isolation — the only isolation mode wired
-            // end-to-end today. Hyper-V isolation needs the UVM subsystem
-            // (boot the image's UtilityVM as a separate compute system + host
-            // the container in it over the GCS bridge), which is not yet
-            // implemented (tracked as C6). Process isolation works on Windows
-            // Server and, since Windows 11 24H2 (build 26100), on Windows
-            // client too — provided the container image build matches the host
-            // build. See [`resolve_isolation_auto`] for the SKU-aware logic to
-            // wire here once Hyper-V isolation lands.
-            default_isolation: IsolationMode::Process,
+            // Per-container isolation is resolved per-image at
+            // `create_container` time via [`resolve_isolation_for_image`]
+            // (matrix: spec choice × image `os.version` × host build). There
+            // is no operator-level default anymore — the image-aware
+            // resolver is always correct given the inputs.
             default_scratch_size_gb: 20,
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,
@@ -347,6 +364,12 @@ struct CachedImage {
     /// Parent chain (child-to-parent order) ready to be plugged into a
     /// compute-system document.
     unpacked: unpacker::UnpackedImage,
+    /// Builder-asserted Windows OS version (e.g. `"10.0.20348.2031"`) from
+    /// the OCI image config's top-level `os.version` field. `None` when the
+    /// field is absent in the config or the pre-fetch failed (best-effort —
+    /// only the build-vs-host isolation auto-resolver consumes this, and it
+    /// gracefully degrades to Hyper-V when the image's build is unknown).
+    os_version: Option<String>,
 }
 
 /// Per-running-container state tracked by the runtime.
@@ -1005,8 +1028,31 @@ impl HcsRuntime {
             reason: format!("unpack: {e}"),
         })?;
 
+        // Best-effort fetch of the image's `os.version` (Windows build
+        // identifier the image was authored against). The isolation
+        // auto-resolver uses this to pick Process-vs-Hyper-V based on
+        // build-vs-host match. Failure here is non-fatal: a `None` value
+        // simply funnels Auto resolution to the safer Hyper-V fallback.
+        let os_version = match self.registry.image_os_version(image, &auth).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    image,
+                    error = %e,
+                    "failed to fetch image os.version; isolation auto-resolution will fall back to Hyper-V",
+                );
+                None
+            }
+        };
+
         let mut cache = self.images.write().await;
-        cache.insert(image.to_string(), CachedImage { unpacked });
+        cache.insert(
+            image.to_string(),
+            CachedImage {
+                unpacked,
+                os_version,
+            },
+        );
         Ok(())
     }
 
@@ -1235,6 +1281,16 @@ impl HcsRuntime {
         Ok(entry.unpacked.chain.0.clone())
     }
 
+    /// Return the cached image's `os.version` (Windows build the image was
+    /// authored against), or `None` when the image was never pulled or its
+    /// config blob did not record an `os.version`. Used by
+    /// [`resolve_isolation_for_image`] to pick Process-vs-Hyper-V isolation
+    /// based on whether the image build matches the host build.
+    async fn resolve_image_os_version(&self, image: &str) -> Option<String> {
+        let cache = self.images.read().await;
+        cache.get(image).and_then(|e| e.os_version.clone())
+    }
+
     /// Activate + Prepare every parent (read-only) layer with HCS before its
     /// `Path` may legally appear in a `Container.Storage.Layers[].Path` entry.
     ///
@@ -1352,27 +1408,32 @@ const UVM_DEFAULT_VCPUS: u32 = 2;
 /// inside the UVM, not the UVM itself.
 const UVM_DEFAULT_MEMORY_MB: u64 = 1024;
 
-/// `VirtualSMB` share flags requesting a read-only, share-as-direct mount of the
-/// layer directory into the UVM. Matches hcsshim's `vsmbFlags` for read-only
-/// container layer shares (`READ_ONLY | SHARE_READ | CACHE_IO | NO_OPLOCKS |
-/// FORCE_LEVEL_2_OPLOCKS`).
-const VSMB_FLAGS_READONLY_LAYER: u32 = 0x0008_0000;
+/// Stable controller GUID hcsshim uses for the primary (boot) SCSI controller
+/// on a Hyper-V-isolated WCOW UVM. Matches
+/// `internal/uvm/scsi.go::guestPrimaryScsiControllerGUID` in hcsshim — HCS keys
+/// the controller in `Devices.Scsi` by this exact string and rejects the
+/// document if it sees the legacy ordinal `"0"` form for a VM that boots from
+/// `VmbFs`.
+const PRIMARY_SCSI_CTRL_GUID: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
 
 /// Build a [`VirtualMachine`] document populated from a freshly-provisioned
 /// [`Uvm`] plus the parent read-only layer chain.
 ///
 /// Layout follows the hcsshim convention for Hyper-V-isolated WCOW containers:
 ///
-/// * `chipset.uefi` boots from the SCSI drive at controller 0, LUN 0 — the
-///   scratch VHDX the UVM owns.
+/// * `chipset.uefi` boots from `VmbFs` at `\EFI\Microsoft\Boot\bootmgfw.efi`,
+///   served out of the image's `UtilityVM\Files` directory via the `"os"`
+///   `VirtualSMB` share — there is no host-side `GuestState` VHD.
 /// * `compute_topology` defaults to [`UVM_DEFAULT_VCPUS`] vCPUs and
 ///   [`UVM_DEFAULT_MEMORY_MB`] MiB of memory.
-/// * `devices.scsi["0"]` carries one attachment at LUN `"0"` for the scratch
-///   VHDX (writable).
-/// * `devices.virtual_smb` shares the read-only layer chain into the UVM so
-///   the container workload can mount its image.
-/// * `guest_state.guest_state_file_path` points at the boot-files directory
-///   exposed by the UVM.
+/// * `devices.scsi[<PRIMARY_SCSI_CTRL_GUID>]` carries one attachment at LUN
+///   `"0"` for the scratch VHDX (writable). The controller is keyed by the
+///   hcsshim-canonical primary SCSI controller GUID.
+/// * `devices.virtual_smb` exposes the `"os"` boot-files share plus one
+///   read-only share per parent layer so the container workload can mount its
+///   image.
+/// * `guest_state` is omitted entirely — VmbFs-boot UVMs persist VM state via
+///   the SCSI scratch alone; no `.vmgs` host file is needed.
 ///
 /// `spec` carries the workload's [`zlayer_spec::GpuSpec`] (if any) so GPU-PV
 /// adapters can be attached when the caller has already enumerated and
@@ -1387,6 +1448,7 @@ const VSMB_FLAGS_READONLY_LAYER: u32 = 0x0008_0000;
 /// populated `spec.resources.gpu` produces a [`GpuAssignmentMode::Default`]
 /// block (let HCS pick); a non-empty slice produces a
 /// [`GpuAssignmentMode::List`] block.
+#[allow(clippy::too_many_lines)] // construction is sequential by HCS field; splitting hurts readability
 fn build_virtual_machine_doc(
     uvm: &Uvm,
     parent_layers: &[zlayer_hcs::schema::Layer],
@@ -1407,24 +1469,51 @@ fn build_virtual_machine_doc(
 
     let mut scsi: BTreeMap<String, ScsiController> = BTreeMap::new();
     scsi.insert(
-        "0".to_string(),
+        PRIMARY_SCSI_CTRL_GUID.to_string(),
         ScsiController {
             attachments: scsi_attachments,
         },
     );
 
-    // One VirtualSMB share per read-only parent layer. The share name is the
-    // layer's HCS id (already a stable GUID) so two containers attached to the
-    // same layer dir on the same UVM (we don't do that today, but the schema
-    // permits it) never collide.
+    // VirtualSMB shares: first the `"os"` share that exposes the image's
+    // `UtilityVM\Files` directory as the UVM's boot volume (UEFI boots from
+    // `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`), then one read-only share per
+    // parent layer keyed by the layer's HCS id (already a stable GUID) so
+    // multiple containers attached to the same layer dir on the same UVM never
+    // collide. The `"os"` options match hcsshim's `DefaultVSMBOptions(true)`
+    // from `internal/uvm/vsmb.go` — read-only, share-read, cache-io,
+    // pseudo-oplocks, take-backup-privilege.
     let mut virtual_smb: BTreeMap<String, VirtualSmbShare> = BTreeMap::new();
+    virtual_smb.insert(
+        "os".to_string(),
+        VirtualSmbShare {
+            name: "os".to_string(),
+            path: uvm.os_files_dir().to_string_lossy().into_owned(),
+            options: Some(VirtualSmbShareOptions {
+                read_only: true,
+                share_read: true,
+                cache_io: true,
+                pseudo_oplocks: true,
+                take_backup_privilege: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
     for layer in parent_layers {
         virtual_smb.insert(
             layer.id.clone(),
             VirtualSmbShare {
                 name: layer.id.clone(),
                 path: layer.path.clone(),
-                flags: Some(VSMB_FLAGS_READONLY_LAYER),
+                options: Some(VirtualSmbShareOptions {
+                    read_only: true,
+                    share_read: true,
+                    cache_io: true,
+                    pseudo_oplocks: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
             },
         );
     }
@@ -1462,9 +1551,9 @@ fn build_virtual_machine_doc(
         chipset: Some(Chipset {
             uefi: Some(Uefi {
                 boot_this: Some(UefiBootEntry {
-                    device_type: "ScsiDrive".to_string(),
-                    device_path: String::new(),
-                    disk_number: Some(0),
+                    device_type: "VmbFs".to_string(),
+                    device_path: r"\EFI\Microsoft\Boot\bootmgfw.efi".to_string(),
+                    disk_number: None,
                 }),
             }),
         }),
@@ -1481,9 +1570,10 @@ fn build_virtual_machine_doc(
             virtual_smb,
             gpu,
         }),
-        guest_state: Some(GuestState {
-            guest_state_file_path: uvm.boot_files().to_string_lossy().into_owned(),
-        }),
+        // VmbFs boot path means HCS persists VM state via the SCSI scratch
+        // alone; no host-side `.vmgs` guest-state file is needed (or wanted —
+        // supplying one with VmbFs boot triggers an HCS validation error).
+        guest_state: None,
         runtime_state_file_path: None,
     }
 }
@@ -1985,10 +2075,12 @@ impl Runtime for HcsRuntime {
         //    lookup string doesn't match the namespace HCN registered.
         let namespace_strs: Vec<String> = vec![format_guid_bare(network_attachment.namespace_id())];
         // Resolve the spec-side isolation choice (which may be `Auto` or
-        // absent) to the concrete runtime-internal isolation mode. `Auto`
-        // and absence both fall back to [`HcsConfig::default_isolation`];
-        // explicit `Process` / `Hyperv` flow through.
-        let isolation = spec_isolation_to_internal(spec.isolation, self.config.default_isolation);
+        // absent) to the concrete runtime-internal isolation mode using the
+        // image's builder-asserted `os.version` and the host's Windows
+        // build. Explicit `Process` / `Hyperv` from the spec bypass the
+        // matrix and flow through directly. See [`decide_isolation`].
+        let image_os_version = self.resolve_image_os_version(&image_name).await;
+        let isolation = resolve_isolation_for_image(spec.isolation, image_os_version.as_deref());
 
         // For Hyper-V isolation, provision the utility VM BEFORE building the
         // compute-system doc so the doc can reference the UVM's scratch VHDX,
@@ -1997,20 +2089,33 @@ impl Runtime for HcsRuntime {
         // path it lands in `ContainerEntry.uvm` and is dropped on
         // `remove_container`. Process-isolated containers never allocate a
         // UVM (it would just waste a few hundred MiB of host memory).
-        let uvm = match isolation {
-            IsolationMode::Hyperv => Some(
-                Uvm::create(
-                    &hcs_id,
-                    &self.config.storage_root,
-                    self.config.default_scratch_size_gb,
-                )
-                .map_err(|e| AgentError::CreateFailed {
-                    id: hcs_id.clone(),
-                    reason: format!("UVM provisioning failed: {e}"),
-                })?,
-            ),
-            IsolationMode::Process => None,
-        };
+        let uvm =
+            match isolation {
+                IsolationMode::Hyperv => {
+                    // Locate the UVM boot payload bundled inside the image's
+                    // parent chain. Hyper-V isolation REQUIRES a Windows base
+                    // image that ships `UtilityVM\Files\...` and
+                    // `UtilityVM\SystemTemplate.vhdx`; non-Windows or
+                    // nanoserver-without-UVM images fail loudly here rather
+                    // than producing a UVM that can't boot.
+                    let boot_files = crate::windows::unpacker::locate_uvm_boot_files(&chain)
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: hcs_id.clone(),
+                            reason: format!(
+                            "Hyper-V isolation requires a Windows base image with UVM payload: {e}"
+                        ),
+                        })?;
+                    Some(
+                        Uvm::create(&hcs_id, &self.config.storage_root, &boot_files).map_err(
+                            |e| AgentError::CreateFailed {
+                                id: hcs_id.clone(),
+                                reason: format!("UVM provisioning failed: {e}"),
+                            },
+                        )?,
+                    )
+                }
+                IsolationMode::Process => None,
+            };
 
         let doc = self.build_compute_system_doc(
             &hcs_id,
@@ -2549,9 +2654,12 @@ impl Runtime for HcsRuntime {
                 reason: "source image not cached".to_string(),
             });
         };
-        // Clone the UnpackedImage (LayerChain + root are both Clone).
+        // Clone the UnpackedImage (LayerChain + root are both Clone) and
+        // carry the source's builder-asserted `os.version` forward so the
+        // isolation auto-resolver sees the same value for the alias.
         let cloned = CachedImage {
             unpacked: entry.unpacked.clone(),
+            os_version: entry.os_version.clone(),
         };
         cache.insert(target.to_string(), cloned);
         Ok(())
@@ -2758,63 +2866,137 @@ mod tests {
         assert_eq!(overlay_network_name("zlayer-dev"), "zlayer-dev-overlay");
     }
 
-    /// Smoke-check that [`resolve_isolation_auto`] is callable and returns
-    /// one of the two concrete variants. The exact value depends on host
-    /// SKU; both `Process` (Server) and `Hyperv` (Client) are acceptable.
-    /// Real Hyper-V behaviour against a live host is covered by Phase 2
-    /// task 3.E E2E tests.
+    /// `parse_os_version` accepts the canonical `major.minor.build.ubr`
+    /// shape MCR emits and discards the UBR component.
     #[test]
-    fn resolve_isolation_auto_returns_a_concrete_variant() {
-        let mode = resolve_isolation_auto();
+    fn parse_os_version_four_components() {
+        assert_eq!(parse_os_version("10.0.20348.2700"), Some((10, 0, 20348)));
+    }
+
+    /// `parse_os_version` also accepts a three-component string (no UBR).
+    #[test]
+    fn parse_os_version_three_components() {
+        assert_eq!(parse_os_version("10.0.26100"), Some((10, 0, 26100)));
+    }
+
+    /// `parse_os_version` returns `None` when fewer than three components
+    /// are present or any component fails to parse as `u32`.
+    #[test]
+    fn parse_os_version_rejects_malformed() {
+        assert_eq!(parse_os_version(""), None);
+        assert_eq!(parse_os_version("10"), None);
+        assert_eq!(parse_os_version("10.0"), None);
+        assert_eq!(parse_os_version("10.0.x"), None);
+        assert_eq!(parse_os_version("not.a.version"), None);
+    }
+
+    /// Auto + matching builds → Process (no UVM overhead needed).
+    #[test]
+    fn decide_isolation_auto_matched_builds_picks_process() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 26100)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Process,
+        );
+        // UBR is stripped, so 26100.1742 and 26100.2700 both parse to
+        // (10, 0, 26100) and resolve as matched.
+        assert_eq!(
+            decide_isolation(None, Some((10, 0, 26100)), Some((10, 0, 26100))),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Auto + mismatched builds → Hyper-V (UVM required for cross-build).
+    #[test]
+    fn decide_isolation_auto_mismatched_builds_picks_hyperv() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 20348)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// Auto + known image build but unknown host build → Hyper-V (safer:
+    /// UVM tolerates any host configuration we can detect).
+    #[test]
+    fn decide_isolation_auto_known_image_unknown_host_picks_hyperv() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 26100)),
+                None,
+            ),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// Auto + unknown image build → Process (documented prior default;
+    /// we cannot argue for UVM without a build to compare against).
+    #[test]
+    fn decide_isolation_auto_unknown_image_picks_process() {
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Auto), None, None),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            decide_isolation(None, None, Some((10, 0, 26100))),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Explicit `Process` from the spec wins even when the matrix would
+    /// otherwise pick Hyper-V (operator override).
+    #[test]
+    fn decide_isolation_explicit_process_overrides_matrix() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Process),
+                Some((10, 0, 20348)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Process), None, None),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Explicit `Hyperv` from the spec wins even when the matrix would
+    /// otherwise pick Process (operator override).
+    #[test]
+    fn decide_isolation_explicit_hyperv_overrides_matrix() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Hyperv),
+                Some((10, 0, 26100)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Hyperv,
+        );
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Hyperv), None, None),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// `resolve_isolation_for_image` is the production entry point that
+    /// supplies the live host build via [`host_windows_build`]. We can't
+    /// pin the host value cross-machine, so the smoke check just confirms
+    /// the function is callable and returns a concrete variant. The pure
+    /// matrix is covered by the `decide_isolation_*` tests above.
+    #[test]
+    fn resolve_isolation_for_image_smoke() {
+        let mode = resolve_isolation_for_image(None, None);
         assert!(
             matches!(mode, IsolationMode::Process | IsolationMode::Hyperv),
-            "resolve_isolation_auto returned an unexpected variant: {mode:?}",
-        );
-    }
-
-    /// `None` from the spec defers to the config default.
-    #[test]
-    fn spec_isolation_none_uses_config_default() {
-        assert_eq!(
-            spec_isolation_to_internal(None, IsolationMode::Process),
-            IsolationMode::Process,
-        );
-        assert_eq!(
-            spec_isolation_to_internal(None, IsolationMode::Hyperv),
-            IsolationMode::Hyperv,
-        );
-    }
-
-    /// `Some(Auto)` also defers to the config default (Auto is the
-    /// user-visible "let the runtime decide" sentinel).
-    #[test]
-    fn spec_isolation_auto_uses_config_default() {
-        assert_eq!(
-            spec_isolation_to_internal(
-                Some(zlayer_spec::IsolationMode::Auto),
-                IsolationMode::Hyperv,
-            ),
-            IsolationMode::Hyperv,
-        );
-    }
-
-    /// Explicit `Process` / `Hyperv` from the spec wins over the config
-    /// default.
-    #[test]
-    fn spec_isolation_explicit_overrides_config_default() {
-        assert_eq!(
-            spec_isolation_to_internal(
-                Some(zlayer_spec::IsolationMode::Process),
-                IsolationMode::Hyperv,
-            ),
-            IsolationMode::Process,
-        );
-        assert_eq!(
-            spec_isolation_to_internal(
-                Some(zlayer_spec::IsolationMode::Hyperv),
-                IsolationMode::Process,
-            ),
-            IsolationMode::Hyperv,
+            "resolve_isolation_for_image returned an unexpected variant: {mode:?}",
         );
     }
 
@@ -2840,9 +3022,12 @@ services:
     }
 
     /// `build_virtual_machine_doc` populates the `VirtualMachine` body with
-    /// the UVM's scratch VHDX (SCSI attachment), one read-only `VirtualSMB`
-    /// share per parent layer, the default 2 vCPU / 1024 MiB topology, the
-    /// UEFI `ScsiDrive` boot entry, and the boot-files path as `GuestState`.
+    /// the UVM's scratch VHDX (SCSI attachment under the primary controller
+    /// GUID), the `"os"` VSMB share that exposes `UtilityVM\Files` as the
+    /// boot volume, one read-only `VirtualSMB` share per parent layer, the
+    /// default 2 vCPU / 1024 MiB topology, and the UEFI `VmbFs` boot entry.
+    /// `guest_state` is omitted entirely — VmbFs boot does not use a
+    /// host-side `.vmgs`.
     ///
     /// Uses [`Uvm::for_test`] so the test does not touch HCS, the VHD APIs,
     /// or the filesystem under `%ProgramData%`.
@@ -2852,8 +3037,8 @@ services:
         use zlayer_hcs::schema::Layer;
 
         let scratch = PathBuf::from(r"C:\zlayer\uvms\test-container\scratch.vhdx");
-        let boot = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Hyper-V\Containers");
-        let uvm = Uvm::for_test("test-container", scratch.clone(), boot.clone());
+        let os_files = PathBuf::from(r"C:\zlayer\images\app\UtilityVM\Files");
+        let uvm = Uvm::for_test("test-container", scratch.clone(), os_files.clone());
 
         let parent_layers = vec![
             Layer {
@@ -2869,48 +3054,90 @@ services:
         let spec = fixture_spec();
         let vm = build_virtual_machine_doc(&uvm, &parent_layers, &spec, &[]);
 
-        // Chipset / UEFI: boot from SCSI controller 0, LUN 0.
+        // Chipset / UEFI: boot from VmbFs at the standard Windows boot manager path.
         let chipset = vm.chipset.expect("chipset");
         let uefi = chipset.uefi.expect("uefi");
         let boot_entry = uefi.boot_this.expect("boot_this");
-        assert_eq!(boot_entry.device_type, "ScsiDrive");
-        assert_eq!(boot_entry.disk_number, Some(0));
+        assert_eq!(boot_entry.device_type, "VmbFs");
+        assert_eq!(boot_entry.device_path, r"\EFI\Microsoft\Boot\bootmgfw.efi");
+        assert_eq!(boot_entry.disk_number, None);
 
-        // Devices.scsi: one controller `"0"` with one attachment `"0"` ↦ scratch VHDX.
+        // Devices.scsi: one controller keyed by the hcsshim primary-SCSI GUID
+        // with one attachment at LUN `"0"` ↦ scratch VHDX (writable).
         let devices = vm.devices.expect("devices");
-        let controller = devices.scsi.get("0").expect("scsi controller 0");
+        let controller = devices
+            .scsi
+            .get(PRIMARY_SCSI_CTRL_GUID)
+            .expect("scsi controller keyed by primary GUID");
         let attachment = controller.attachments.get("0").expect("scsi attachment 0");
         assert_eq!(attachment.path, scratch.to_string_lossy());
         assert_eq!(attachment.r#type, "VirtualDisk");
         assert_eq!(attachment.read_only, Some(false));
 
-        // Devices.virtual_smb: one share per parent layer, keyed by layer id.
+        // Devices.virtual_smb: one `"os"` boot-files share + one share per parent layer.
         assert_eq!(
             devices.virtual_smb.len(),
-            2,
-            "expected one VirtualSMB share per parent layer",
+            3,
+            "expected `os` share + one VirtualSMB share per parent layer",
         );
+        let os_share = devices
+            .virtual_smb
+            .get("os")
+            .expect("os boot-files VSMB share");
+        assert_eq!(os_share.name, "os");
+        assert_eq!(os_share.path, os_files.to_string_lossy());
+        let os_opts = os_share
+            .options
+            .as_ref()
+            .expect("os share carries named options");
+        assert!(os_opts.read_only, "os share must be read-only");
+        assert!(os_opts.share_read, "os share must set ShareRead");
+        assert!(os_opts.cache_io, "os share must set CacheIo");
+        assert!(os_opts.pseudo_oplocks, "os share must set PseudoOplocks");
+        assert!(
+            os_opts.take_backup_privilege,
+            "os share must set TakeBackupPrivilege per hcsshim DefaultVSMBOptions(true)",
+        );
+        assert!(
+            os_share.flags.is_none(),
+            "named options replace the legacy raw flags bitmask",
+        );
+
         let share = devices
             .virtual_smb
             .get("11111111-1111-1111-1111-111111111111")
             .expect("smb share for base layer");
         assert_eq!(share.path, r"C:\zlayer\images\base");
-        assert_eq!(share.flags, Some(VSMB_FLAGS_READONLY_LAYER));
+        assert!(
+            share.flags.is_none(),
+            "parent-layer shares use named options, not legacy flags",
+        );
+        let layer_opts = share
+            .options
+            .as_ref()
+            .expect("parent-layer share carries named options");
+        assert!(layer_opts.read_only);
+        assert!(layer_opts.share_read);
+        assert!(layer_opts.cache_io);
+        assert!(layer_opts.pseudo_oplocks);
 
         // Compute topology: defaults to 2 vCPU / 1024 MiB.
         let topology = vm.compute_topology.expect("compute_topology");
         assert_eq!(topology.processor.expect("processor").count, 2);
         assert_eq!(topology.memory.expect("memory").size_in_mb, 1024);
 
-        // GuestState: boot-files directory path.
-        let gs = vm.guest_state.expect("guest_state");
-        assert_eq!(gs.guest_state_file_path, boot.to_string_lossy());
+        // GuestState: omitted with VmbFs boot.
+        assert!(
+            vm.guest_state.is_none(),
+            "VmbFs-boot UVMs must not carry a host GuestState path",
+        );
     }
 
     /// `build_virtual_machine_doc` against an empty parent chain still
     /// produces a valid SCSI + chipset + topology block; the `virtual_smb`
-    /// map is simply empty. This pins the contract that a zero-layer image
-    /// (theoretical edge case) does not panic.
+    /// map carries only the mandatory `"os"` boot-files share. This pins the
+    /// contract that a zero-layer image (theoretical edge case) does not
+    /// panic and still boots.
     #[test]
     fn build_virtual_machine_doc_handles_empty_parent_chain() {
         use std::path::PathBuf;
@@ -2918,14 +3145,20 @@ services:
         let uvm = Uvm::for_test(
             "empty-chain",
             PathBuf::from(r"C:\scratch.vhdx"),
-            PathBuf::from(r"C:\boot"),
+            PathBuf::from(r"C:\os-files"),
         );
         let spec = fixture_spec();
         let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
 
         let devices = vm.devices.expect("devices");
-        assert!(devices.virtual_smb.is_empty());
+        assert_eq!(devices.virtual_smb.len(), 1);
+        assert!(devices.virtual_smb.contains_key("os"));
         assert_eq!(devices.scsi.len(), 1);
+        assert!(devices.scsi.contains_key(PRIMARY_SCSI_CTRL_GUID));
+        assert!(
+            vm.guest_state.is_none(),
+            "VmbFs-boot UVMs must not carry a host GuestState path",
+        );
     }
 
     // -----------------------------------------------------------------------

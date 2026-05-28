@@ -399,6 +399,67 @@ pub struct VirtualSmbShare {
     /// Raw HCS share flags (see hcsshim for bit definitions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flags: Option<u32>,
+    /// Optional list of files within `path` that are allowed to be accessed
+    /// from inside the guest. Empty means all files are accessible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_files: Vec<String>,
+    /// Named option flags for this share. Preferred over the legacy `flags`
+    /// bitmask; see [`VirtualSmbShareOptions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<VirtualSmbShareOptions>,
+}
+
+/// Named options for a [`VirtualSmbShare`], replacing the legacy raw `Flags`
+/// bitmask. Matches hcsshim's
+/// `internal/hcs/schema2/virtual_smb_share_options.go`. Each field defaults to
+/// `false` and is omitted from the wire JSON when unset.
+///
+/// The `"os"` share for a UVM boot dir uses
+/// `{ReadOnly:true, ShareRead:true, CacheIo:true, PseudoOplocks:true,
+/// TakeBackupPrivilege:true}` — `DefaultVSMBOptions(true)` in hcsshim's
+/// `internal/uvm/vsmb.go`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::struct_excessive_bools)] // mirrors hcsshim's wire schema (17 named flags)
+pub struct VirtualSmbShareOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub share_read: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_io: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_oplocks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub take_backup_privilege: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_share_root_identity: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_directmap: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_locks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_dirnotify: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vm_shared_memory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restrict_file_access: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        rename = "ForceLevelIIOplocks"
+    )]
+    pub force_level_ii_oplocks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reparse_base_layer: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pseudo_oplocks: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_cache_io: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pseudo_dirnotify: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_file_mapping: bool,
 }
 
 /// Guest-state block — path to the VHDX holding persisted guest state.

@@ -602,6 +602,83 @@ fn create_long_path_dir_all(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Paths to a Windows image's bundled Utility VM boot artifacts.
+///
+/// Hyper-V-isolated Windows containers boot a UVM whose root filesystem is
+/// the image's own `UtilityVM\Files` tree (surfaced over a VSMB share named
+/// `"os"`) and whose initial scratch VHDX is a copy of the image's
+/// `UtilityVM\SystemTemplate.vhdx`. The UEFI firmware then chain-loads
+/// `\EFI\Microsoft\Boot\bootmgfw.efi` over the `VmbFs` surface.
+///
+/// `locate_uvm_boot_files` resolves the absolute paths for the current
+/// process; the consumer (HCS doc builder, scratch copier) uses them
+/// verbatim — no further path arithmetic required.
+#[derive(Debug, Clone)]
+pub struct UvmBootFiles {
+    /// Absolute path to `<layer>\UtilityVM` (the layer subdir).
+    pub uvm_layer_dir: std::path::PathBuf,
+    /// Absolute path to `<layer>\UtilityVM\Files` — the OS root surfaced
+    /// over the `"os"` VSMB share.
+    pub os_files_dir: std::path::PathBuf,
+    /// Absolute path to `<layer>\UtilityVM\SystemTemplate.vhdx` — the read-only
+    /// template the caller copies to produce a per-UVM `sandbox.vhdx`.
+    pub system_template_vhdx: std::path::PathBuf,
+    /// Guest-relative UEFI boot path (`\EFI\Microsoft\Boot\bootmgfw.efi`).
+    /// Fed verbatim into `Chipset.Uefi.BootThis.DevicePath`.
+    pub boot_rel_path: &'static str,
+}
+
+/// Walk `chain` (child-to-parent — base layer is `.last()`) and return the
+/// first layer that contains a `UtilityVM\Files\EFI\Microsoft\Boot\bootmgfw.efi`
+/// file. Iterates in reverse so the OS base layer is checked first, matching
+/// hcsshim's `internal/uvm/uvmfolder.go::LocateUVMFolder`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::NotFound`] with a descriptive message if no layer
+/// in the chain carries a UVM payload. Daemons should map this to a typed
+/// "Hyper-V isolation unavailable: image has no `UtilityVM` payload" error so
+/// non-Windows images cannot be silently routed into the Hyper-V path.
+pub fn locate_uvm_boot_files(
+    chain: &crate::windows::wclayer::LayerChain,
+) -> std::io::Result<UvmBootFiles> {
+    const BOOT_REL: &str = r"\EFI\Microsoft\Boot\bootmgfw.efi";
+    for layer in chain.0.iter().rev() {
+        let layer_dir = std::path::PathBuf::from(&layer.path);
+        let uvm_dir = layer_dir.join("UtilityVM");
+        let files_dir = uvm_dir.join("Files");
+        let bootmgfw = files_dir
+            .join("EFI")
+            .join("Microsoft")
+            .join("Boot")
+            .join("bootmgfw.efi");
+        if bootmgfw.is_file() {
+            let template = uvm_dir.join("SystemTemplate.vhdx");
+            if !template.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "layer {:?} has UtilityVM\\Files but is missing SystemTemplate.vhdx — \
+                         image's UVM payload is incomplete",
+                        layer.path
+                    ),
+                ));
+            }
+            return Ok(UvmBootFiles {
+                uvm_layer_dir: uvm_dir,
+                os_files_dir: files_dir,
+                system_template_vhdx: template,
+                boot_rel_path: BOOT_REL,
+            });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no layer in chain contains a UtilityVM payload \
+         (image is not a Hyper-V-bootable Windows base image)",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tests (no HCS calls, no registry)
 // ---------------------------------------------------------------------------

@@ -144,6 +144,16 @@ pub(crate) struct OciImageConfigRoot {
     /// callers should fall through to a platform-agnostic default.
     #[serde(default)]
     pub os: Option<String>,
+    /// Operating system version the image targets, when the builder records
+    /// one. For Windows images this is the host build identifier (e.g.
+    /// `"10.0.20348.2031"`) that drives isolation-mode auto-resolution; for
+    /// most Linux images this is absent.
+    #[serde(
+        rename = "os.version",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub os_version: Option<String>,
 }
 
 #[cfg(test)]

@@ -252,7 +252,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime, IsolationMode};
+use zlayer_agent::runtimes::hcs::{HcsConfig, HcsRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_builder::windows_builder::{BuildContext, WindowsBuildConfig, WindowsBuilder};
 use zlayer_registry::RegistryAuth;
@@ -303,7 +303,6 @@ async fn fresh_runtime(slot: &str) -> (Arc<HcsRuntime>, PathBuf) {
     let storage_root = std::env::temp_dir().join(format!("zlayer-builder-4f-rt-{slot}"));
     let cfg = HcsConfig {
         storage_root: storage_root.clone(),
-        default_isolation: IsolationMode::Process,
         default_scratch_size_gb: 20,
         ..HcsConfig::default()
     };
