@@ -95,7 +95,7 @@ use zlayer_hcs::schema::{
     ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
     GuestOs as HcsGuestOs, ProcessParameters, SchemaVersion, ScsiAttachment, ScsiController,
     Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi,
-    UefiBootEntry, VirtualMachine, VirtualSmbShare, VirtualSmbShareOptions,
+    UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare, VirtualSmbShareOptions,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -1521,10 +1521,56 @@ impl HcsRuntime {
         }
 
         // ----------------------------------------------------------------
-        // Step 2: HcsCreateComputeSystem for the UVM.
+        // Step 1b: HcsGrantVmAccess on every parent layer dir.
+        //
+        // Grant the UVM's per-VM virtual SID read access to every parent
+        // layer dir surfaced via VSMB into the guest. Same root cause as
+        // the sandbox VHDX grant in `Uvm::create`: without these the VM's
+        // effective identity has no ACL on host-owned files and the UVM
+        // fails to start. hcsshim does this in `internal/uvm/vsmb.go::Add`
+        // when each VSMB share is added; we batch here since we know the
+        // full parent set up front.
         // ----------------------------------------------------------------
-        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 2: HcsCreateComputeSystem (UVM)");
-        let uvm_system = ComputeSystem::create(hcs_id, &uvm_doc_json)
+        tracing::info!(
+            hcs_id = %hcs_id,
+            parents = parent_layers.len(),
+            "Hyper-V step 1b: HcsGrantVmAccess on parent layer dirs",
+        );
+        for layer in parent_layers {
+            crate::windows::wclayer::grant_vm_access(
+                uvm.runtime_id(),
+                std::path::Path::new(&layer.path),
+            )
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 1b: HcsGrantVmAccess(parent layer {}): {e}",
+                    layer.path
+                ),
+            })?;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 2: HcsCreateComputeSystem for the UVM.
+        //
+        // The UVM's compute-system ID handed to HCS must be the runtime GUID
+        // (bare lowercase form). HCS uses this ID as the hvsock VM ID for
+        // routing GCS connections — mirrors hcsshim's `internal/uvm/create_wcow.go`
+        // where `uvm.id` (the runtime GUID) is passed as the first arg to
+        // `HcsCreateComputeSystem`. The runtime GUID is NEVER serialized into
+        // the compute-system JSON document itself.
+        //
+        // `hcs_id` (the human slug like `pair-a-…-rep-1`) stays as the
+        // in-process key for `ContainerEntry` indexing — it is unrelated to
+        // the string handed to HCS for the UVM.
+        // ----------------------------------------------------------------
+        let uvm_system_id = format_guid_bare(uvm.runtime_id());
+        tracing::info!(
+            hcs_id = %hcs_id,
+            uvm_system_id = %uvm_system_id,
+            "Hyper-V step 2: HcsCreateComputeSystem (UVM)"
+        );
+        let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
@@ -1964,40 +2010,39 @@ fn build_virtual_machine_doc(
     // collide. The `"os"` options match hcsshim's `DefaultVSMBOptions(true)`
     // from `internal/uvm/vsmb.go` — read-only, share-read, cache-io,
     // pseudo-oplocks, take-backup-privilege.
-    let mut virtual_smb: BTreeMap<String, VirtualSmbShare> = BTreeMap::new();
-    virtual_smb.insert(
-        "os".to_string(),
-        VirtualSmbShare {
-            name: "os".to_string(),
-            path: uvm.os_files_dir().to_string_lossy().into_owned(),
+    let mut shares: Vec<VirtualSmbShare> = Vec::with_capacity(parent_layers.len() + 1);
+    // `"os"` share goes FIRST per hcsshim convention (it is the OS root).
+    shares.push(VirtualSmbShare {
+        name: "os".to_string(),
+        path: uvm.os_files_dir().to_string_lossy().into_owned(),
+        options: Some(VirtualSmbShareOptions {
+            read_only: true,
+            share_read: true,
+            cache_io: true,
+            pseudo_oplocks: true,
+            take_backup_privilege: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    for layer in parent_layers {
+        shares.push(VirtualSmbShare {
+            name: layer.id.clone(),
+            path: layer.path.clone(),
             options: Some(VirtualSmbShareOptions {
                 read_only: true,
                 share_read: true,
                 cache_io: true,
                 pseudo_oplocks: true,
-                take_backup_privilege: true,
                 ..Default::default()
             }),
             ..Default::default()
-        },
-    );
-    for layer in parent_layers {
-        virtual_smb.insert(
-            layer.id.clone(),
-            VirtualSmbShare {
-                name: layer.id.clone(),
-                path: layer.path.clone(),
-                options: Some(VirtualSmbShareOptions {
-                    read_only: true,
-                    share_read: true,
-                    cache_io: true,
-                    pseudo_oplocks: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
+        });
     }
+    let virtual_smb = Some(VirtualSmb {
+        shares,
+        direct_file_mapping_in_mb: None,
+    });
 
     // Populate the GPU-PV block when the workload requested a GPU. With no
     // candidate adapters we emit `Default` so HCS picks the host default
@@ -2056,11 +2101,6 @@ fn build_virtual_machine_doc(
         // supplying one with VmbFs boot triggers an HCS validation error).
         guest_state: None,
         runtime_state_file_path: None,
-        // Inject the UVM's pre-allocated VM-ID GUID so HCS uses it as the
-        // hvsock routing key. The host-side GCS bridge connects via the
-        // same GUID after start. Bare lowercase form (no braces); mirrors
-        // hcsshim's `internal/uvm/runtime_id.go`.
-        runtime_id: Some(format_guid_bare(uvm.runtime_id())),
     }
 }
 
@@ -3761,16 +3801,20 @@ services:
         assert_eq!(attachment.read_only, Some(false));
 
         // Devices.virtual_smb: one `"os"` boot-files share + one share per parent layer.
+        let vsmb = devices
+            .virtual_smb
+            .as_ref()
+            .expect("VirtualSmb block populated");
         assert_eq!(
-            devices.virtual_smb.len(),
+            vsmb.shares.len(),
             3,
             "expected `os` share + one VirtualSMB share per parent layer",
         );
-        let os_share = devices
-            .virtual_smb
-            .get("os")
-            .expect("os boot-files VSMB share");
-        assert_eq!(os_share.name, "os");
+        assert_eq!(
+            vsmb.shares[0].name, "os",
+            "`os` boot-files share must be first per hcsshim convention",
+        );
+        let os_share = &vsmb.shares[0];
         assert_eq!(os_share.path, os_files.to_string_lossy());
         let os_opts = os_share
             .options
@@ -3789,9 +3833,10 @@ services:
             "named options replace the legacy raw flags bitmask",
         );
 
-        let share = devices
-            .virtual_smb
-            .get("11111111-1111-1111-1111-111111111111")
+        let share = vsmb
+            .shares
+            .iter()
+            .find(|s| s.name == "11111111-1111-1111-1111-111111111111")
             .expect("smb share for base layer");
         assert_eq!(share.path, r"C:\zlayer\images\base");
         assert!(
@@ -3837,8 +3882,12 @@ services:
         let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
 
         let devices = vm.devices.expect("devices");
-        assert_eq!(devices.virtual_smb.len(), 1);
-        assert!(devices.virtual_smb.contains_key("os"));
+        let vsmb = devices
+            .virtual_smb
+            .as_ref()
+            .expect("VirtualSmb block populated");
+        assert_eq!(vsmb.shares.len(), 1);
+        assert_eq!(vsmb.shares[0].name, "os");
         assert_eq!(devices.scsi.len(), 1);
         assert!(devices.scsi.contains_key(PRIMARY_SCSI_CTRL_GUID));
         assert!(

@@ -376,13 +376,71 @@ pub fn process_base_layer(layer_path: &Path) -> io::Result<()> {
     windows::core::link!(
         "vmcompute.dll" "system" fn ProcessBaseImage(path: PCWSTR) -> windows::core::HRESULT
     );
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        path = %layer_path.display(),
+        "calling vmcompute.dll!ProcessBaseImage",
+    );
     // SAFETY: `lp` is a live `HSTRING` whose backing buffer is null-terminated
     // UTF-16 (per `HSTRING`'s `Deref<Target = [u16]>` invariant) and outlives
     // the call. `ProcessBaseImage` only reads the wide-string path argument
     // and returns an HRESULT; no out-pointers or shared resources.
     let hr = unsafe { ProcessBaseImage(PCWSTR::from_raw(lp.as_ptr())) };
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        path = %layer_path.display(),
+        hr = ?hr,
+        "vmcompute.dll!ProcessBaseImage returned",
+    );
     hr.ok()
         .map_err(|e| io::Error::other(format!("ProcessBaseImage: {e}")))?;
+    Ok(())
+}
+
+/// Materialize a base OS layer's Utility VM (`<layer>\UtilityVM`) so the
+/// derived `UtilityVM\SystemTemplate.vhdx` and `UtilityVM\SystemTemplateBase.vhdx`
+/// artifacts exist on disk. Must be called **after** [`process_base_layer`]
+/// on the same layer, and only when `<layer>\UtilityVM\Files\` actually
+/// exists (process-only sideloaded images may not ship a UVM payload).
+///
+/// Without this call, [`crate::windows::unpacker::locate_uvm_boot_files`]
+/// rejects the layer with "missing SystemTemplate.vhdx", and
+/// `Uvm::create` cannot stage the per-UVM sandbox VHDX, blocking every
+/// Hyper-V-isolated container boot. Equivalent to hcsshim's
+/// `internal/wclayer/processimage.go::ProcessUtilityVMImage` — the
+/// containerd-shim-runhcs-v1 snapshotter calls this on every base layer
+/// during unpack.
+///
+/// Backing FFI: `vmcompute.dll!ProcessUtilityImage(path: *uint16) -> HRESULT`.
+/// Not exposed by `windows::Win32::System::HostComputeSystem` in
+/// `windows-rs 0.62`, so we declare the link inline.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if the syscall returns a non-success HRESULT.
+pub fn process_utility_vm_image(utility_vm_path: &Path) -> io::Result<()> {
+    let lp = path_to_hstring(utility_vm_path);
+    windows::core::link!(
+        "vmcompute.dll" "system" fn ProcessUtilityImage(path: PCWSTR) -> windows::core::HRESULT
+    );
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        path = %utility_vm_path.display(),
+        "calling vmcompute.dll!ProcessUtilityImage",
+    );
+    // SAFETY: `lp` is a live `HSTRING` whose backing buffer is null-terminated
+    // UTF-16 (per `HSTRING`'s `Deref<Target = [u16]>` invariant) and outlives
+    // the call. `ProcessUtilityImage` only reads the wide-string path
+    // argument and returns an HRESULT; no out-pointers or shared resources.
+    let hr = unsafe { ProcessUtilityImage(PCWSTR::from_raw(lp.as_ptr())) };
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        path = %utility_vm_path.display(),
+        hr = ?hr,
+        "vmcompute.dll!ProcessUtilityImage returned",
+    );
+    hr.ok()
+        .map_err(|e| io::Error::other(format!("ProcessUtilityImage: {e}")))?;
     Ok(())
 }
 
@@ -617,6 +675,83 @@ pub fn get_layer_mount_path(layer_path: &Path) -> io::Result<String> {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16(&buf[..end])
         .map_err(|e| io::Error::other(format!("UTF-16 mount path decode: {e}")))
+}
+
+/// Grant the per-VM virtual SID (`NT VIRTUAL MACHINE\<vm_id>`) read/write
+/// access to `file_path` so a Hyper-V UVM with that VM ID can open the file
+/// after `HcsStartComputeSystem`. Without this, the VM's effective identity
+/// has no ACL on the host-owned file and `Start` fails with
+/// `0x80070005 (Access is denied)` from the synthetic storage device's
+/// `PowerOnCold` step.
+///
+/// hcsshim calls this on every host file projected into a UVM: the sandbox
+/// VHDX, every read-only parent layer dir surfaced as a VSMB share, the
+/// `UtilityVM\Files` boot tree, and the original `SystemTemplate.vhdx` (used
+/// as the SOURCE of the sandbox copy — even though we copy it, hcsshim's
+/// convention is to grant on the source too in case any code path re-opens).
+///
+/// `vm_id` is the runtime GUID we pass to `HcsCreateComputeSystem` as the
+/// system id. `file_path` must be an absolute Windows path.
+///
+/// Backing FFI: `vmcompute.dll!GrantVmAccess(VmId: PCWSTR, FilePath: PCWSTR)
+/// -> HRESULT`. Not exposed by `windows-rs 0.62`, so we declare the link inline.
+/// Mirrors hcsshim `internal/wclayer/grantvmaccess.go::GrantVmAccess`.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if the syscall returns a non-success HRESULT.
+pub fn grant_vm_access(vm_id: windows::core::GUID, file_path: &Path) -> io::Result<()> {
+    let vm_id_str = format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        vm_id.data1,
+        vm_id.data2,
+        vm_id.data3,
+        vm_id.data4[0],
+        vm_id.data4[1],
+        vm_id.data4[2],
+        vm_id.data4[3],
+        vm_id.data4[4],
+        vm_id.data4[5],
+        vm_id.data4[6],
+        vm_id.data4[7],
+    );
+    let vm_id_h = windows::core::HSTRING::from(vm_id_str.as_str());
+    let path_h = path_to_hstring(file_path);
+    windows::core::link!(
+        "vmcompute.dll" "system" fn GrantVmAccess(
+            vm_id: windows::core::PCWSTR,
+            file_path: windows::core::PCWSTR,
+        ) -> windows::core::HRESULT
+    );
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        vm_id = %vm_id_str,
+        path = %file_path.display(),
+        "calling vmcompute.dll!GrantVmAccess",
+    );
+    // SAFETY: both HSTRINGs hold live null-terminated UTF-16 buffers that
+    // outlive the call. The FFI only reads the two PCWSTRs and returns an
+    // HRESULT; no out-pointers, no shared resources.
+    let hr = unsafe {
+        GrantVmAccess(
+            windows::core::PCWSTR::from_raw(vm_id_h.as_ptr()),
+            windows::core::PCWSTR::from_raw(path_h.as_ptr()),
+        )
+    };
+    tracing::debug!(
+        target: "zlayer_agent::wclayer",
+        vm_id = %vm_id_str,
+        path = %file_path.display(),
+        hr = ?hr,
+        "vmcompute.dll!GrantVmAccess returned",
+    );
+    hr.ok().map_err(|e| {
+        io::Error::other(format!(
+            "GrantVmAccess({vm_id_str}, {}): {e}",
+            file_path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

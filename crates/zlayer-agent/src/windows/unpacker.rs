@@ -137,6 +137,23 @@ pub async fn unpack_windows_image(
                     layer_path.display()
                 ))
             })?;
+
+            // Materialize UVM artifacts if this layer ships a UtilityVM payload.
+            // nanoserver/servercore base layers ship `UtilityVM\Files\` and need
+            // `ProcessUtilityImage` to produce the `UtilityVM\SystemTemplate*.vhdx`
+            // artifacts the consumer's `Uvm::create` later copies into a per-UVM
+            // sandbox. Sideloaded process-only images without a UVM payload are
+            // skipped silently.
+            let uvm_dir = layer_path.join("UtilityVM");
+            if uvm_dir.join("Files").is_dir() {
+                wclayer::process_utility_vm_image(&uvm_dir).map_err(|e| {
+                    io::Error::other(format!(
+                        "ProcessUtilityVMImage(layer={layer_idx} digest={} dest={}): {e}",
+                        desc.digest,
+                        uvm_dir.display()
+                    ))
+                })?;
+            }
         } else {
             // Diff layer: materialize the legacy framed staging format, then
             // hand it to `HcsImportLayer` (source must differ from dest — see

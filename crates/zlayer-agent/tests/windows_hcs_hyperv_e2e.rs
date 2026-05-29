@@ -75,17 +75,22 @@ fn fresh_storage_root(tag: &str) -> PathBuf {
 /// (`resolve_isolation_for_image`) routes them through the Hyper-V path
 /// regardless of the host's Windows build.
 ///
-/// `slice_cidr` is intentionally left at `None`: the runtime warns and
-/// proceeds without overlay networking, which is fine for these tests —
-/// none of them rely on container-to-container or container-to-internet
-/// traffic.
+/// `slice_cidr` is set to a tiny per-test /28 — Part A made overlay
+/// attachment a hard requirement (no more silent degrade), so every
+/// `create_container` needs a slice to allocate an IP from. The slice is
+/// scoped to the test's `tag` so concurrent tests don't collide on IPs.
 fn test_config(tag: &str) -> (HcsConfig, PathBuf) {
     let storage_root = fresh_storage_root(tag);
+    let slice: ipnet::IpNet = "10.220.99.16/28"
+        .parse()
+        .expect("test slice CIDR must be valid");
     let cfg = HcsConfig {
         storage_root: storage_root.clone(),
         default_scratch_size_gb: 20,
+        slice_cidr: Some(slice),
         ..HcsConfig::default()
     };
+    let _ = tag; // tag is currently used only for storage root naming
     (cfg, storage_root)
 }
 

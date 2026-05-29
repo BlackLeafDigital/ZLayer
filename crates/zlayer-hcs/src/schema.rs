@@ -230,15 +230,6 @@ pub struct VirtualMachine {
     /// Optional path where HCS should persist runtime state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_state_file_path: Option<String>,
-    /// Stable VM identifier hcsshim uses to route hvsock connections into
-    /// the guest. Must be unique per running UVM. When omitted, HCS
-    /// auto-generates one — but then the host can't address it for hvsock
-    /// (the GCS bridge needs to know the VM-ID GUID up front). Set this on
-    /// the UVM-only doc whenever the caller intends to open a GCS bridge
-    /// to the running UVM. Mirrors hcsshim's `internal/uvm/runtime_id.go`
-    /// behavior of pre-generating the VM ID before `HcsCreateComputeSystem`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_id: Option<String>,
 }
 
 /// Chipset / firmware block of a virtual machine.
@@ -309,9 +300,10 @@ pub struct Devices {
     /// SCSI controllers keyed by their controller id (string-encoded index).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scsi: BTreeMap<String, ScsiController>,
-    /// `VirtualSMB` shares keyed by share name.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub virtual_smb: BTreeMap<String, VirtualSmbShare>,
+    /// `VirtualSMB` device block. Wraps the list of [`VirtualSmbShare`]
+    /// entries; serializes as `{"Shares": [...]}` on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_smb: Option<VirtualSmb>,
     /// GPU-PV (paravirtualized GPU) device assignment for Hyper-V-isolated
     /// containers. Populated only when the workload requests a GPU; otherwise
     /// omitted so HCS does not attach any host adapter.
@@ -395,6 +387,31 @@ pub struct ScsiAttachment {
     /// When true, the attachment is presented read-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+}
+
+/// `Devices.VirtualSmb` body — wraps a list of [`VirtualSmbShare`] entries.
+/// Matches hcsshim `internal/hcs/schema2/virtual_smb.go`:
+/// `type VirtualSmb struct { Shares []VirtualSmbShare; DirectFileMappingInMB int64 }`.
+///
+/// Earlier iterations modeled this as a `BTreeMap<String, VirtualSmbShare>`
+/// keyed by share name, which serializes as a JSON object and is rejected by
+/// `HcsCreateComputeSystem` with `0xC037010D` (`HCS_E_INVALID_JSON`, generic
+/// `Construct` failure with no specific field cited in the error envelope).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VirtualSmb {
+    /// Ordered list of shares projected into the VM. The `"os"` boot-files
+    /// share goes first by hcsshim convention; parent-layer shares follow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<VirtualSmbShare>,
+    /// Optional hint (in MiB) to enable direct file mapping for VSMB; omitted
+    /// when unset so HCS uses its default.
+    #[serde(
+        rename = "DirectFileMappingInMB",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub direct_file_mapping_in_mb: Option<i64>,
 }
 
 /// `VirtualSMB` share projected into the VM.

@@ -138,13 +138,56 @@ impl Uvm {
         // on Windows are slow via `std::fs::copy` but acceptable for now —
         // hcsshim itself does the same.
         match std::fs::copy(&boot_files.system_template_vhdx, &scratch_vhdx) {
-            Ok(_) => Ok(Self {
-                container_id: container_id.to_string(),
-                scratch_vhdx,
-                os_files_dir: boot_files.os_files_dir.clone(),
-                needs_cleanup: true,
-                runtime_id,
-            }),
+            Ok(_) => {
+                // hcsshim calls HcsGrantVmAccess on every host file/dir
+                // projected into the UVM so its per-VM virtual SID
+                // (`NT VIRTUAL MACHINE\<runtime_id>`) has read access. Without
+                // these grants, `HcsStartComputeSystem` fails with
+                // `0x80070005 (Access is denied)` at the synthetic storage
+                // device's `PowerOnCold` step before the GCS bridge ever
+                // comes up.
+                //
+                // We grant on:
+                //  1. The per-UVM sandbox VHDX (mounted via SCSI) — THIS is
+                //     the file that fails today.
+                //  2. The image's `UtilityVM\Files` directory, surfaced via
+                //     the `"os"` VSMB share.
+                //  3. The original `SystemTemplate.vhdx` we just copied —
+                //     hcsshim grants on the source too even though we copy,
+                //     for parity with any code path that re-opens it.
+                //
+                // Parent layer dirs (also surfaced as VSMB shares) are
+                // constructed by the caller in
+                // `runtimes::hcs::build_virtual_machine_doc`; granting on
+                // those is tracked separately and lives in that file so we
+                // don't have to plumb the parent chain through `Uvm::create`.
+                // TODO(B-verify.5): grant on each parent layer path in
+                // `runtimes::hcs::hyperv_create_via_gcs` before
+                // `system.start("")`.
+                for path in [
+                    scratch_vhdx.as_path(),
+                    boot_files.os_files_dir.as_path(),
+                    boot_files.system_template_vhdx.as_path(),
+                ] {
+                    if let Err(e) = crate::windows::wclayer::grant_vm_access(runtime_id, path) {
+                        // Roll back the sandbox copy + UVM directory so we
+                        // leave no per-container state behind on failure.
+                        let _ = std::fs::remove_file(&scratch_vhdx);
+                        let _ = std::fs::remove_dir(&uvm_dir);
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("HcsGrantVmAccess({}) failed: {e}", path.display()),
+                        ));
+                    }
+                }
+                Ok(Self {
+                    container_id: container_id.to_string(),
+                    scratch_vhdx,
+                    os_files_dir: boot_files.os_files_dir.clone(),
+                    needs_cleanup: true,
+                    runtime_id,
+                })
+            }
             Err(e) => {
                 // Roll back the directory we just created so we don't leave
                 // empty `<storage_root>/uvms/<id>/` litter on failure.
