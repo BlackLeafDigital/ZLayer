@@ -12754,6 +12754,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer-gcs"
+version = "0.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "zlayer-git"
 version = "0.0.0-dev"
 dependencies = [

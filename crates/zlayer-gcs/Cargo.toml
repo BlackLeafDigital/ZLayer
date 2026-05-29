@@ -1,0 +1,33 @@
+[package]
+name = "zlayer-gcs"
+description = "Host-side bridge to the Hyper-V Guest Compute Service (GCS) running inside a UVM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "net", "io-util"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "test-util"] }
