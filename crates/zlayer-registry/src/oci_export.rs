@@ -42,7 +42,6 @@ use crate::local_registry::LocalRegistry;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use oci_client::Reference;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -645,36 +644,15 @@ pub async fn import_image_from_bytes(
         if let Some(at_pos) = tag_str.find('@') {
             // Digest reference - just use name, no tag
             (tag_str[..at_pos].to_string(), None)
-        } else if !tag_str.is_empty() {
-            // Canonicalize via oci_client::Reference so downstream lookups
-            // (which query the canonical "registry/repository:tag" form)
-            // match what we store here.
-            match tag_str.parse::<Reference>() {
-                Ok(parsed) => {
-                    let name = format!("{}/{}", parsed.registry(), parsed.repository());
-                    let final_tag = parsed
-                        .tag()
-                        .map(String::from)
-                        .or_else(|| Some("latest".to_string()));
-                    (name, final_tag)
-                }
-                Err(_) => {
-                    // Fallback: preserve backwards-compat with the old
-                    // hand-rolled parsing for weird inputs.
-                    if let Some(colon_pos) = tag_str.rfind(':') {
-                        let potential_tag = &tag_str[colon_pos + 1..];
-                        if !potential_tag.contains('/') && !potential_tag.is_empty() {
-                            (
-                                tag_str[..colon_pos].to_string(),
-                                Some(potential_tag.to_string()),
-                            )
-                        } else {
-                            (tag_str.to_string(), Some("latest".to_string()))
-                        }
-                    } else {
-                        (tag_str.to_string(), Some("latest".to_string()))
-                    }
-                }
+        } else if let Some(colon_pos) = tag_str.rfind(':') {
+            let potential_tag = &tag_str[colon_pos + 1..];
+            if !potential_tag.contains('/') && !potential_tag.is_empty() {
+                (
+                    tag_str[..colon_pos].to_string(),
+                    Some(potential_tag.to_string()),
+                )
+            } else {
+                (tag_str.to_string(), Some("latest".to_string()))
             }
         } else {
             (tag_str.to_string(), Some("latest".to_string()))
@@ -880,17 +858,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(import_info.layers, 1);
-        assert_eq!(
-            import_info.tag,
-            Some("docker.io/library/imported:v1".to_string())
-        );
+        assert_eq!(import_info.tag, Some("imported:v1".to_string()));
 
         // Verify the imported image exists
-        assert!(
-            import_registry
-                .has_manifest("docker.io/library/imported", "v1")
-                .await
-        );
+        assert!(import_registry.has_manifest("imported", "v1").await);
         assert!(import_registry.has_blob(&layer_digest).await);
         assert!(import_registry.has_blob(&config_digest).await);
     }
