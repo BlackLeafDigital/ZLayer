@@ -309,6 +309,53 @@ pub struct Devices {
     /// omitted so HCS does not attach any host adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuAssignment>,
+    /// `HvSocket` device configuration. Required for the in-guest GCS to
+    /// accept the host's hvsock connection (the `DefaultBindSecurityDescriptor`
+    /// authorizes SYSTEM/admin binds). Omitted when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hv_socket: Option<HvSocket2>,
+}
+
+/// Per-service `HvSocket` ACL entry. Mirrors hcsshim hcsschema `HvSocketServiceConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct HvSocketServiceConfig {
+    /// Security descriptor authorizing binds for this service GUID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bind_security_descriptor: String,
+    /// Security descriptor authorizing connects for this service GUID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connect_security_descriptor: String,
+    /// Allow wildcard binds for this service.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_wildcard_binds: bool,
+    /// Disable this service entry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+}
+
+/// System-wide `HvSocket` config for a VM. Mirrors hcsshim hcsschema `HvSocketSystemConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct HvSocketSystemConfig {
+    /// Default security descriptor authorizing binds when no per-service entry matches.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_bind_security_descriptor: String,
+    /// Default security descriptor authorizing connects when no per-service entry matches.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_connect_security_descriptor: String,
+    /// Per-service ACL entries keyed by service GUID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_table: BTreeMap<String, HvSocketServiceConfig>,
+}
+
+/// `HvSocket` device block on a `VirtualMachine`. Mirrors hcsshim hcsschema `HvSocket2`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct HvSocket2 {
+    /// System-wide `HvSocket` configuration for the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hv_socket_config: Option<HvSocketSystemConfig>,
 }
 
 /// GPU-PV assignment block attached under [`Devices::gpu`].

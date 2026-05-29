@@ -44,6 +44,16 @@ pub const HV_GUID_LOOPBACK: windows::core::GUID =
 pub const HV_GUID_WILDCARD: windows::core::GUID =
     windows::core::GUID::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0000);
 
+/// `WindowsGcsHvHostID` — the hvsock "parent" (host) partition address the
+/// in-guest GCS uses when it dials out to the host.
+///
+/// Needed as the
+/// `ParentAddress` of the post-connect `HvSocket` `ModifySettings` that external
+/// GCS connections must send. Matches hcsshim `internal/gcs/prot/protocol.go`
+/// `WindowsGcsHvHostID` (894cc2d6-9d79-424f-93fe-42969ae6d8d1).
+pub const WINDOWS_GCS_HV_HOST_ID: windows::core::GUID =
+    windows::core::GUID::from_u128(0x894c_c2d6_9d79_424f_93fe_4296_9ae6_d8d1);
+
 /// `AF_HYPERV` socket address family (34 / `0x22`). Held as `u16` because
 /// that is the type of the `family` field in `SOCKADDR_HV`; widened to
 /// `i32` at the `WSASocketW` call site.

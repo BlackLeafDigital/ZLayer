@@ -15,13 +15,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{oneshot, Mutex};
 
 use crate::error::{GcsError, GcsResult};
 use crate::frame::{self, RpcMessageType, HEADER_LEN, RESPONSE_TYPE_OFFSET};
 use crate::protocol::{NegotiateProtocolRequest, NegotiateProtocolResponse, RequestBase};
-use crate::transport::{HvSockStream, GCS_SERVICE_GUID};
+use crate::transport::{HvSockListener, HvSockStream, GCS_SERVICE_GUID};
 
 /// Default min/max GCS protocol version we negotiate. v4 is the version
 /// hcsshim's `internal/gcs/guestconnection.go` declares as of May 2026.
@@ -37,8 +38,8 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<(u32, Vec<u8>)>>>>;
 ///
 /// Cheap to clone — all internal state is `Arc`-shared so multiple tasks may
 /// issue RPCs concurrently. The background reader task is spawned exactly
-/// once in [`GcsBridge::connect`] and lives until the underlying stream is
-/// closed (peer hangup, transport error, or process exit).
+/// once in [`PendingGcsBridge::accept`] and lives until the underlying stream
+/// is closed (peer hangup, transport error, or process exit).
 #[derive(Clone, Debug)]
 pub struct GcsBridge {
     /// Shared, cloneable hvsock stream — both this handle and the background
@@ -52,18 +53,13 @@ pub struct GcsBridge {
 }
 
 impl GcsBridge {
-    /// Connect to the GCS endpoint inside the UVM identified by `vm_id`.
-    /// Spawns the background reader task and negotiates protocol version.
-    pub async fn connect(vm_id: windows::core::GUID) -> GcsResult<Self> {
-        let stream = HvSockStream::connect(vm_id, GCS_SERVICE_GUID).await?;
-        let bridge = Self {
-            stream,
-            next_id: Arc::new(AtomicU64::new(1)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-        };
-        bridge.spawn_reader();
-        bridge.negotiate_protocol().await?;
-        Ok(bridge)
+    /// Bind the host hvsock listener for the UVM identified by `vm_id` (its
+    /// runtime GUID). Must be called BEFORE `HcsStartComputeSystem` so the
+    /// host is listening when the in-guest GCS boots and dials out. Returns a
+    /// [`PendingGcsBridge`]; call [`PendingGcsBridge::accept`] after start.
+    pub async fn listen(vm_id: windows::core::GUID) -> GcsResult<PendingGcsBridge> {
+        let listener = HvSockListener::bind(vm_id, GCS_SERVICE_GUID).await?;
+        Ok(PendingGcsBridge { listener })
     }
 
     /// Negotiate the GCS protocol version (returns the chosen version).
@@ -188,6 +184,42 @@ impl GcsBridge {
             // with GcsError::Closed.
             pending.lock().await.clear();
         });
+    }
+}
+
+/// A bound-but-not-yet-accepted GCS listener.
+///
+/// Created by
+/// [`GcsBridge::listen`] BEFORE the UVM is started; the host must be
+/// listening when the in-guest GCS boots and dials out. Call
+/// [`PendingGcsBridge::accept`] AFTER `HcsStartComputeSystem` to accept the
+/// guest's inbound connection and finish bringing up the bridge.
+pub struct PendingGcsBridge {
+    listener: HvSockListener,
+}
+
+impl PendingGcsBridge {
+    /// Accept the in-guest GCS's outbound connection (it dials the host after
+    /// boot), then spawn the reader task and negotiate the protocol version.
+    ///
+    /// `timeout` bounds how long we wait for the guest GCS to come up and
+    /// connect; hcsshim uses a multi-minute `GCSConnectionTimeout`.
+    pub async fn accept(self, timeout: Duration) -> GcsResult<GcsBridge> {
+        let stream = tokio::time::timeout(timeout, self.listener.accept())
+            .await
+            .map_err(|_| {
+                GcsError::Hvsock(format!(
+                    "timed out after {timeout:?} waiting for in-guest GCS to connect"
+                ))
+            })??;
+        let bridge = GcsBridge {
+            stream,
+            next_id: Arc::new(AtomicU64::new(1)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+        bridge.spawn_reader();
+        bridge.negotiate_protocol().await?;
+        Ok(bridge)
     }
 }
 

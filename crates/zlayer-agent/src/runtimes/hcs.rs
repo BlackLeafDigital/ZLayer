@@ -93,9 +93,10 @@ use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
     Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
     ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
-    GuestOs as HcsGuestOs, ProcessParameters, SchemaVersion, ScsiAttachment, ScsiController,
-    Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi,
-    UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare, VirtualSmbShareOptions,
+    GuestOs as HcsGuestOs, HvSocket2, HvSocketSystemConfig, ProcessParameters, SchemaVersion,
+    ScsiAttachment, ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory,
+    TopologyProcessor, Uefi, UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare,
+    VirtualSmbShareOptions,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -1426,7 +1427,9 @@ impl HcsRuntime {
     ///    pre-injected `RuntimeId` GUID.
     ///
     /// 3. Connect the GCS bridge over hvsock and negotiate the protocol
-    ///    version. `GcsBridge::connect` does both in one shot.
+    ///    version. `GcsBridge::listen` binds the host listener before start;
+    ///    `PendingGcsBridge::accept` accepts the guest's dial-out and
+    ///    negotiates after start.
     ///
     /// 4. Hot-attach each parent layer as a read-only VSMB share via
     ///    `system.add_vsmb` (host-side `HcsModifyComputeSystem` with
@@ -1578,6 +1581,26 @@ impl HcsRuntime {
             })?;
 
         // ----------------------------------------------------------------
+        // Step 3a: bind the host GCS hvsock listener BEFORE starting the UVM.
+        // Windows' model (hcsshim create_wcow.go / start.go): the HOST listens
+        // on (runtimeID, GCS service GUID) and the in-guest GCS dials OUT once
+        // it boots. The listener must already exist when the UVM powers on, so
+        // we bind here — between create and start — and accept after start.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            runtime_id = %format_guid_bare(uvm.runtime_id()),
+            "Hyper-V step 3a: GcsBridge::listen (bind host hvsock listener)"
+        );
+        let pending_bridge =
+            GcsBridge::listen(uvm.runtime_id())
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 3a: GcsBridge::listen: {e}"),
+                })?;
+
+        // ----------------------------------------------------------------
         // Step 3: HcsStartComputeSystem — power the UVM on.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 3: HcsStartComputeSystem (UVM)");
@@ -1590,20 +1613,71 @@ impl HcsRuntime {
             })?;
 
         // ----------------------------------------------------------------
-        // Step 4: connect the GCS bridge over hvsock to the running UVM.
+        // Step 4: accept the in-guest GCS's inbound hvsock connection (it
+        // dials out after boot) and negotiate the protocol. 120s mirrors
+        // hcsshim's GCSConnectionTimeout — the guest GCS can take a while to
+        // come up on a cold UVM.
         // ----------------------------------------------------------------
         tracing::info!(
             hcs_id = %hcs_id,
             runtime_id = %format_guid_bare(uvm.runtime_id()),
-            "Hyper-V step 4: GcsBridge::connect"
+            "Hyper-V step 4: PendingGcsBridge::accept (await guest GCS dial-out)"
         );
-        let bridge =
-            GcsBridge::connect(uvm.runtime_id())
-                .await
-                .map_err(|e| AgentError::CreateFailed {
-                    id: hcs_id.to_string(),
-                    reason: format!("Hyper-V step 4: GcsBridge::connect: {e}"),
-                })?;
+        let bridge = pending_bridge
+            .accept(std::time::Duration::from_secs(120))
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 4: GcsBridge accept: {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 4b: external-GCS HvSocket setup (hcsshim's
+        // configureHvSocketForGCS, start.go:36-59). Sent immediately after the
+        // GCS connection is established and BEFORE any container resource ops.
+        // It makes the guest GCS set up registry keys required to run
+        // containers in the UVM. HCS does this automatically for an internal
+        // GCS connection; an external GCS connection (our model) must issue it
+        // by hand. It is a guest-routed Update of ResourceType "HvSocket" whose
+        // Settings is an HvSocketAddress {LocalAddress: <UVM runtime GUID>,
+        // ParentAddress: WindowsGcsHvHostID}.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 4b: configureHvSocketForGCS");
+        let hvsocket_setup_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            request: serde_json::json!({
+                "GuestRequest": {
+                    "ResourceType": "HvSocket",
+                    "RequestType": "Update",
+                    "Settings": {
+                        "LocalAddress": format_guid_bare(uvm.runtime_id()),
+                        "ParentAddress": format_guid_bare(
+                            zlayer_gcs::transport::WINDOWS_GCS_HV_HOST_ID
+                        ),
+                    }
+                }
+            }),
+        };
+        let hvsocket_setup_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &hvsocket_setup_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 4b: GCS HvSocket setup: {e}"),
+            })?;
+        if hvsocket_setup_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(hvsocket_setup_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 4b: GCS HvSocket setup returned HRESULT 0x{hresult_u32:08x}: {}",
+                    hvsocket_setup_resp.error_message,
+                ),
+            });
+        }
 
         // ----------------------------------------------------------------
         // Step 5: hot-attach each parent layer as a read-only VSMB share
@@ -2095,6 +2169,16 @@ fn build_virtual_machine_doc(
             scsi,
             virtual_smb,
             gpu,
+            // The in-guest GCS only accepts the host's hvsock connection when
+            // the UVM authorizes SYSTEM/admin binds. "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+            // = DACL granting Full Access to NT AUTHORITY\SYSTEM (SY) and
+            // BUILTIN\Administrators (BA). Mirrors hcsshim create_wcow.go.
+            hv_socket: Some(HvSocket2 {
+                hv_socket_config: Some(HvSocketSystemConfig {
+                    default_bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                    ..Default::default()
+                }),
+            }),
         }),
         // VmbFs boot path means HCS persists VM state via the SCSI scratch
         // alone; no host-side `.vmgs` guest-state file is needed (or wanted —
