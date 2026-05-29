@@ -125,6 +125,7 @@ fn empty_vm_document(owner: &str) -> CsDoc {
             guest_state: None,
             runtime_state_file_path: None,
         }),
+        should_terminate_on_last_handle_closed: None,
     }
 }
 

@@ -406,6 +406,22 @@ struct ContainerEntry {
     /// internal layer table is cleared and a subsequent container with the
     /// same parents can activate them again.
     activated_parent_layers: Vec<PathBuf>,
+    /// Connected GCS bridge into this container's hosting UVM. `Some` only
+    /// for [`IsolationMode::Hyperv`] entries; `None` for Process-isolated
+    /// entries (which have no UVM to bridge into). Created during
+    /// [`HcsRuntime::create_container`] after the UVM is started; held here
+    /// so a future patch can route container lifecycle RPCs (start/shutdown,
+    /// exec, hot-attach) through the in-guest GCS rather than through host-
+    /// side HCS APIs.
+    ///
+    /// Currently the entry is recorded but lifecycle routing through the
+    /// bridge is NOT YET wired — `start_container` / `stop_container` still
+    /// drive the host-side `ComputeSystem` handle. That swap lives in the
+    /// next patch (B4.3); see TODO at the bottom of the Hyper-V branch in
+    /// `create_container`.
+    #[cfg(feature = "hcs-runtime")]
+    #[allow(dead_code)] // read by B4.3 lifecycle routing
+    gcs: Option<zlayer_gcs::bridge::GcsBridge>,
 }
 
 /// Per-daemon HCN Transparent overlay network created lazily on first
@@ -1391,6 +1407,471 @@ impl HcsRuntime {
             }
         });
     }
+
+    /// Orchestrate the Hyper-V-isolated boot of a container via the GCS
+    /// bridge. Returns the host-side UVM `ComputeSystem` handle (so the
+    /// caller can subscribe to UVM exit events / drive lifecycle) plus the
+    /// connected GCS bridge wrapped in `HyperVGcsState` (so it can be
+    /// stashed on the container's `ContainerEntry` for later RPCs).
+    ///
+    /// The flow mirrors hcsshim's `internal/hcsoci/create.go`:
+    ///
+    /// 1. Build the UVM-only compute-system doc (via
+    ///    [`build_uvm_only_doc`]) and `HcsCreateComputeSystem` it. This
+    ///    cold-creates the utility VM with its sandbox VHDX on SCSI LUN 0
+    ///    and the image's `UtilityVM\Files` over the `"os"` VSMB share.
+    ///
+    /// 2. `HcsStartComputeSystem` to power the UVM on. After this the
+    ///    in-guest GCS listener is reachable over hvsock at the UVM's
+    ///    pre-injected `RuntimeId` GUID.
+    ///
+    /// 3. Connect the GCS bridge over hvsock and negotiate the protocol
+    ///    version. `GcsBridge::connect` does both in one shot.
+    ///
+    /// 4. Hot-attach each parent layer as a read-only VSMB share via
+    ///    `system.add_vsmb` (host-side `HcsModifyComputeSystem` with
+    ///    resource-path `VirtualMachine/Devices/VirtualSmb/Shares/N`).
+    ///
+    /// 5. Hot-attach the container's writable scratch VHDX as a SCSI
+    ///    attachment on LUN 1 (LUN 0 is already taken by the UVM's
+    ///    sandbox).
+    ///
+    /// 6. Issue `RpcModifySettings` over the bridge to drive
+    ///    `CombineLayersWCOW` inside the guest — combining the just-added
+    ///    VSMB read-only layers and the SCSI scratch into a single WCIFS
+    ///    root that the hosted container can use as its `Storage.Path`.
+    ///
+    /// 7. Build the hosted-container body (via
+    ///    [`build_hosted_container_doc`]) and `RpcCreate` it over the
+    ///    bridge with the container's HCS id as the RPC container id.
+    ///
+    /// 8. `RpcStart` the hosted container to actually launch the workload.
+    ///
+    /// All in-guest paths used in step 6 and step 7 are placeholders today
+    /// — hcsshim derives them from the actual guest VSMB/SCSI mount paths
+    /// returned by the in-guest `MountVSMB` / `AttachSCSI` responses,
+    /// which we do not yet round-trip through the bridge. The placeholders
+    /// produce a well-formed JSON document so HCS accepts the RPCs; real
+    /// mount-path discovery is tracked for a follow-up patch (see TODO in
+    /// the body for the exact spots that need replacement).
+    #[cfg(all(target_os = "windows", feature = "hcs-runtime"))]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn hyperv_create_via_gcs(
+        &self,
+        hcs_id: &str,
+        spec: &ServiceSpec,
+        scratch_layer: &scratch::WritableLayer,
+        parent_layers: &[zlayer_hcs::schema::Layer],
+        namespace_strs: &[String],
+        uvm: &Uvm,
+        network_attachment: &EndpointAttachment,
+    ) -> Result<(ComputeSystem, HyperVGcsState)> {
+        use uuid::Uuid;
+        use zlayer_gcs::bridge::GcsBridge;
+        use zlayer_gcs::frame::RpcMessageType;
+        use zlayer_gcs::protocol::{
+            CreateRequest, CreateResponse, ModifySettingsRequest, ModifySettingsResponse,
+            RequestBase, StartRequest, StartResponse,
+        };
+
+        // GPU adapter probe — Hyper-V isolation supports GPU-PV when the
+        // workload requests it. Mirrors the gating in
+        // `build_compute_system_doc` so the UVM-only doc carries the
+        // same GpuAssignment block.
+        let gpu_adapters: Vec<HostGpuAdapter> = if let Some(gpu_spec) = spec.resources.gpu.as_ref()
+        {
+            if matches!(gpu_spec.sharing, Some(zlayer_spec::GpuSharingMode::Mps)) {
+                return Err(AgentError::GpuSharingUnavailable {
+                    mode: "mps".to_string(),
+                    reason: "MPS is not supported with Hyper-V isolation; use Process \
+                                 isolation or remove the sharing config"
+                        .to_string(),
+                });
+            }
+            let all_adapters =
+                enumerate_host_gpu_adapters().map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("DXGI host GPU enumeration: {e}"),
+                })?;
+            filter_adapters_by_gpu_spec(&all_adapters, gpu_spec)
+        } else {
+            Vec::new()
+        };
+
+        // ----------------------------------------------------------------
+        // Step 1: build the UVM-only compute-system doc.
+        // ----------------------------------------------------------------
+        let owner = owner_tag(&self.config.daemon_name);
+        let uvm_doc = build_uvm_only_doc(&owner, hcs_id, uvm, parent_layers, spec, &gpu_adapters);
+        let uvm_doc_json =
+            serde_json::to_string(&uvm_doc).map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 1: serialize UVM doc: {e}"),
+            })?;
+        tracing::error!(
+            target: "zlayer_agent::hcs::diag",
+            hcs_id = %hcs_id,
+            doc = %uvm_doc_json,
+            "HCS_CREATE_UVM_DOC"
+        );
+        if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
+            let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.uvm.json"));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, &uvm_doc_json);
+        }
+
+        // ----------------------------------------------------------------
+        // Step 2: HcsCreateComputeSystem for the UVM.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 2: HcsCreateComputeSystem (UVM)");
+        let uvm_system = ComputeSystem::create(hcs_id, &uvm_doc_json)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 2: HcsCreateComputeSystem (UVM): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 3: HcsStartComputeSystem — power the UVM on.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 3: HcsStartComputeSystem (UVM)");
+        uvm_system
+            .start("")
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 3: HcsStartComputeSystem (UVM): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 4: connect the GCS bridge over hvsock to the running UVM.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            runtime_id = %format_guid_bare(uvm.runtime_id()),
+            "Hyper-V step 4: GcsBridge::connect"
+        );
+        let bridge =
+            GcsBridge::connect(uvm.runtime_id())
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 4: GcsBridge::connect: {e}"),
+                })?;
+
+        // ----------------------------------------------------------------
+        // Step 5: hot-attach each parent layer as a read-only VSMB share
+        //         on the UVM. Indices are sequential from 0 (host-side
+        //         resource path keying); guest-side VSMB paths are
+        //         `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            layer_count = parent_layers.len(),
+            "Hyper-V step 5: hot-attach per-layer VSMB shares"
+        );
+        for (idx, layer) in parent_layers.iter().enumerate() {
+            let share = VirtualSmbShare {
+                name: layer.id.clone(),
+                path: layer.path.clone(),
+                options: Some(VirtualSmbShareOptions {
+                    read_only: true,
+                    share_read: true,
+                    cache_io: true,
+                    pseudo_oplocks: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            uvm_system
+                .add_vsmb(idx, &share)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 5: add_vsmb({idx}, {}): {e}", layer.id,),
+                })?;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 6: hot-attach the container's writable scratch VHDX as a
+        //         SCSI attachment on LUN 1 (LUN 0 holds the UVM sandbox).
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            "Hyper-V step 6: hot-attach scratch VHDX on SCSI LUN 1"
+        );
+        let scratch_vhd = scratch_layer.vhd_mount_path().to_string();
+        let scratch_attachment = ScsiAttachment {
+            path: scratch_vhd.clone(),
+            r#type: "VirtualDisk".to_string(),
+            read_only: Some(false),
+        };
+        uvm_system
+            .add_scsi(0, 1, &scratch_attachment)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 6: add_scsi(0, 1, {scratch_vhd}): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 7: drive CombineLayersWCOW inside the guest over the GCS
+        //         bridge. The exact `ResourcePath` string hcsshim uses for
+        //         this varies between builds — what we send below is the
+        //         starting shape derived from hcsshim's Combine handler;
+        //         live ETW capture from a Windows host will let us pin the
+        //         canonical form. See `crates/zlayer-gcs/src/protocol.rs`
+        //         `ModifySettingsRequest` for the wire envelope.
+        //
+        //         TODO(B4.3): replace the placeholder guest paths below
+        //         with the real per-VSMB / per-SCSI guest paths returned
+        //         by the in-guest `MountVSMB` / `AttachSCSI` responses.
+        //         hcsshim's convention for the placeholders we emit:
+        //           - VSMB share index `N` mounts at
+        //             `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`
+        //           - SCSI LUN `N` on controller `M` mounts at a guest-
+        //             chosen `\\?\Volume{<guid>}\`
+        //         The guest will reply with the actual chosen path in a
+        //         future protocol round-trip we do not yet implement.
+        // ----------------------------------------------------------------
+        // hcsshim's well-known VSMB controller GUID — same across all
+        // hcsshim builds; lives in `internal/uvm/vsmb.go`.
+        let vsmb_controller_guid = "{dcc079ae-60ba-4d07-847c-3493609c0870}";
+        let guest_vsmb_paths: Vec<String> = (0..parent_layers.len())
+            .map(|n| format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{n}"))
+            .collect();
+        // Placeholder guest scratch mount + WCIFS root — freshly-allocated
+        // GUID per create. Real values come from the in-guest mount
+        // responses (see TODO above); a UUID v5 derivation from `hcs_id`
+        // would be nicer for byte-stability across restarts but the `uuid`
+        // workspace dep is configured `features = ["v4", "serde"]` only
+        // and we are not permitted to hand-edit `Cargo.toml`. Random per
+        // create yields a well-formed document just the same and is
+        // harmless under the placeholder regime — the value gets
+        // overwritten by the real mount path once B4.3 wires the round
+        // trip with the in-guest `MountVSMB` / `AttachSCSI` responses.
+        let placeholder_volume_guid = Uuid::new_v4();
+        let guest_scratch_path = format!(r"\\?\Volume{{{placeholder_volume_guid}}}\");
+        let guest_root_path = guest_scratch_path.clone();
+
+        tracing::info!(
+            hcs_id = %hcs_id,
+            guest_root = %guest_root_path,
+            "Hyper-V step 7: CombineLayersWCOW via GCS"
+        );
+        let combine_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                // CombineLayersWCOW targets the UVM-scoped setting, not a
+                // specific hosted container — the null GUID is hcsshim's
+                // convention for "this UVM".
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            request: serde_json::json!({
+                "ResourcePath": "Container/WCOWLayerPaths",
+                "RequestType": "Add",
+                "Settings": {
+                    "ContainerRootPath": guest_root_path,
+                    "Layers": guest_vsmb_paths,
+                    "ScratchPath": guest_scratch_path,
+                },
+            }),
+        };
+        let _combine_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &combine_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 7: GCS ModifySettings (CombineLayersWCOW): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 7.5: surface the host-side HCN endpoint inside the UVM's
+        //           network compartment so the workload can actually use
+        //           it. The endpoint was already created on the host
+        //           (zlayer-hns `create_overlay`, earlier in
+        //           `create_container`) and added to its per-container HCN
+        //           namespace, BUT in Hyper-V isolation the namespace's
+        //           compartment lives INSIDE the UVM — the in-guest GCS
+        //           has to be told explicitly to attach the endpoint to
+        //           that compartment. Mirrors hcsshim's
+        //           `internal/hcsoci/network.go::addEndpointsToNS` which
+        //           issues `ModifySettings({ResourcePath:"Container/Networks",
+        //           RequestType:"Add",Settings:{NamespaceId, EndpointId,
+        //           AllocatedIPAddress}})` after CombineLayersWCOW and
+        //           before RpcCreate of the hosted container.
+        //
+        //           TODO(B-verify): the exact JSON shape below is derived
+        //           from a read-only audit of hcsshim's source — verify
+        //           against a live ETW capture from a Hyper-V isolated
+        //           container create on a real Windows host and adjust if
+        //           the wire payload diverges.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            endpoint_id = %format_guid_bare(network_attachment.endpoint_id()),
+            namespace_id = %format_guid_bare(network_attachment.namespace_id()),
+            "Hyper-V step 7.5: wiring HCN endpoint into UVM network compartment"
+        );
+        let add_endpoint_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            request: serde_json::json!({
+                "ResourcePath": "Container/Networks",
+                "RequestType": "Add",
+                "Settings": {
+                    "NamespaceId": format_guid_bare(network_attachment.namespace_id()),
+                    "EndpointId": format_guid_bare(network_attachment.endpoint_id()),
+                    "AllocatedIPAddress": network_attachment.ip().unwrap_or_default(),
+                },
+            }),
+        };
+        let add_endpoint_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &add_endpoint_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 7.5 (network compartment attach): {e}"),
+            })?;
+        if add_endpoint_resp.result != 0 {
+            // Reinterpret the HRESULT bit pattern as u32 for `{:08x}` printing
+            // (HRESULT severity-bit set ⇒ i32 < 0, but the canonical Windows
+            // textual form is the 8-hex-digit unsigned value, e.g. 0x80070057).
+            let hresult_u32 = u32::from_ne_bytes(add_endpoint_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 7.5 (network compartment attach): guest GCS returned \
+                     HRESULT 0x{:08x}: {}",
+                    hresult_u32, add_endpoint_resp.error_message,
+                ),
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Step 8: build the hosted-container body using guest paths.
+        // ----------------------------------------------------------------
+        let guest_layers: Vec<zlayer_hcs::schema::Layer> = parent_layers
+            .iter()
+            .zip(guest_vsmb_paths.iter())
+            .map(|(orig, guest_path)| zlayer_hcs::schema::Layer {
+                id: orig.id.clone(),
+                path: guest_path.clone(),
+            })
+            .collect();
+        let namespace_id = namespace_strs.first().cloned();
+        let hosted_doc =
+            build_hosted_container_doc(spec, guest_layers, guest_root_path, namespace_id, hcs_id);
+
+        // ----------------------------------------------------------------
+        // Step 9: RpcCreate the hosted container over the bridge.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 9: GCS RpcCreate (hosted container)");
+        let create_settings =
+            serde_json::to_value(&hosted_doc).map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 9: serialize hosted-container body: {e}"),
+            })?;
+        let create_req = CreateRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            settings: create_settings,
+        };
+        let _create_resp: CreateResponse = bridge
+            .send_rpc_json(RpcMessageType::Create, &create_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 9: GCS RpcCreate: {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 10: RpcStart the hosted container.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 10: GCS RpcStart (hosted container)");
+        let start_req = StartRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+        };
+        let _start_resp: StartResponse = bridge
+            .send_rpc_json(RpcMessageType::Start, &start_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 10: GCS RpcStart: {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 11: hand back the UVM ComputeSystem + the live bridge.
+        //          The caller stashes the bridge on the ContainerEntry so
+        //          B4.3 can route lifecycle through it; for now lifecycle
+        //          (start/stop) still drives the host-side ComputeSystem
+        //          handle. That is harmless on the create path because
+        //          we have just RpcStart'd the workload — subsequent
+        //          `start_container` calls (idempotent re-arms after a
+        //          warm restart) are routed via the host handle, which is
+        //          a no-op on an already-started system.
+        // ----------------------------------------------------------------
+        Ok((
+            uvm_system,
+            HyperVGcsState {
+                bridge: Some(bridge),
+            },
+        ))
+    }
+}
+
+/// Stub-out the Hyper-V-via-GCS path when the `hcs-runtime` feature is
+/// disabled — the call site in `create_container` is feature-agnostic, so
+/// we surface a typed error rather than gating the whole match arm. This
+/// keeps the Process-isolation path compiling and testable on Windows
+/// without pulling in the `zlayer-gcs` dependency.
+#[cfg(all(target_os = "windows", not(feature = "hcs-runtime")))]
+impl HcsRuntime {
+    async fn hyperv_create_via_gcs(
+        &self,
+        hcs_id: &str,
+        _spec: &ServiceSpec,
+        _scratch_layer: &scratch::WritableLayer,
+        _parent_layers: &[zlayer_hcs::schema::Layer],
+        _namespace_strs: &[String],
+        _uvm: &Uvm,
+        _network_attachment: &EndpointAttachment,
+    ) -> Result<(ComputeSystem, HyperVGcsState)> {
+        Err(AgentError::Unsupported(format!(
+            "Hyper-V isolation requires the `hcs-runtime` cargo feature \
+             (zlayer-gcs); rebuild zlayer-agent with --features hcs-runtime \
+             or set `isolation: process` for {hcs_id}",
+        )))
+    }
+}
+
+/// HCS-conventional "null" GUID used as the `ContainerId` field on GCS
+/// RPCs that target the UVM itself rather than a hosted container (e.g.
+/// `CombineLayersWCOW`).
+#[cfg(all(target_os = "windows", feature = "hcs-runtime"))]
+const NULL_GUID_STR: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Per-Hyper-V-create state returned by [`HcsRuntime::hyperv_create_via_gcs`]
+/// alongside the UVM's [`ComputeSystem`] handle. Process-isolated creates
+/// produce an empty default value via [`HyperVGcsState::default`].
+///
+/// The struct exists so [`HcsRuntime::create_container`] can use one
+/// expression to bind both halves of the create result without a tuple of
+/// `Option`s in the Process path. The `bridge` field is only populated for
+/// successful Hyper-V creates.
+#[derive(Default)]
+struct HyperVGcsState {
+    /// Live GCS bridge into the freshly-booted UVM. Populated by the
+    /// Hyper-V path; always `None` for the Process path.
+    #[cfg(feature = "hcs-runtime")]
+    bridge: Option<zlayer_gcs::bridge::GcsBridge>,
 }
 
 /// Default vCPU count assigned to a freshly-provisioned UVM.
@@ -1575,6 +2056,156 @@ fn build_virtual_machine_doc(
         // supplying one with VmbFs boot triggers an HCS validation error).
         guest_state: None,
         runtime_state_file_path: None,
+        // Inject the UVM's pre-allocated VM-ID GUID so HCS uses it as the
+        // hvsock routing key. The host-side GCS bridge connects via the
+        // same GUID after start. Bare lowercase form (no braces); mirrors
+        // hcsshim's `internal/uvm/runtime_id.go`.
+        runtime_id: Some(format_guid_bare(uvm.runtime_id())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hyper-V two-document builders (B4.1)
+//
+// The Hyper-V isolation flow needs TWO separate payloads:
+//
+//   1. A UVM-only `ComputeSystem` doc (`virtual_machine: Some(_)`,
+//      `container: None`) handed to `HcsCreateComputeSystem` to boot the
+//      utility VM.
+//   2. A hosted-container `Container` body (NOT a full ComputeSystem) handed
+//      to the GCS bridge's `RpcCreate.settings` field after the UVM is up.
+//
+// `build_compute_system_doc` above still produces the legacy single-doc form;
+// the new builders below are not yet wired into the create-container flow.
+// B4.2 will swap callers over to use both helpers in sequence.
+// ---------------------------------------------------------------------------
+
+/// Shared `Container.Processor` constructor used by both the legacy single-doc
+/// path and the new hosted-container builder. Matches containerd-shim-runhcs-v1
+/// behavior: always `Some(_)`, defaulting to `ContainerProcessor::default()`
+/// when the spec sets no CPU limits.
+//
+// `Option<_>` is intentional even though we always return `Some(_)` — the
+// HCS schema's `Container.Processor` field is `Option<ContainerProcessor>`
+// and callers assign the return value directly into it; collapsing to a bare
+// `ContainerProcessor` would force every caller to re-wrap.
+#[allow(clippy::unnecessary_wraps)]
+fn build_container_processor(spec: &ServiceSpec) -> Option<ContainerProcessor> {
+    Some(
+        spec.resources
+            .cpu
+            .and_then(|cpu| {
+                let count = cpu.ceil();
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let count_u32 = if count.is_finite() && count >= 1.0 {
+                    count as u32
+                } else {
+                    return None;
+                };
+                Some(ContainerProcessor {
+                    count: Some(count_u32),
+                    maximum: None,
+                    weight: None,
+                })
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// Shared `Container.Memory` constructor. Returns `None` when the spec sets no
+/// memory limit; HCS treats absence as "no memory constraint."
+fn build_container_memory(spec: &ServiceSpec) -> Option<ContainerMemory> {
+    spec.resources.memory.as_ref().and_then(|mem_str| {
+        crate::bundle::parse_memory_string(mem_str)
+            .ok()
+            .map(|bytes| {
+                // HCS takes MiB. Round up so 512Mi → 512, 1.5GiB → 1536, etc.
+                let mib = bytes.div_ceil(1024 * 1024);
+                ContainerMemory {
+                    size_in_mb: Some(mib),
+                }
+            })
+    })
+}
+
+/// Build the UVM-only compute-system document for a Hyper-V-isolated
+/// container. This is the FIRST `HcsCreateComputeSystem` call in the Hyper-V
+/// flow — it boots the UVM. The container itself is created INSIDE the UVM via
+/// a subsequent GCS `RpcCreate` (see [`build_hosted_container_doc`]).
+///
+/// `parent_layers` populates the per-layer `VirtualSMB` shares in the UVM doc.
+/// `uvm` provides the scratch VHDX + image's `UtilityVM\Files` os-share path.
+/// `spec` provides resource constraints (gpu) consulted by
+/// [`build_virtual_machine_doc`]; the UVM's own CPU/memory topology stays
+/// fixed at [`UVM_DEFAULT_VCPUS`] / [`UVM_DEFAULT_MEMORY_MB`] — per-container
+/// limits live on the hosted-container body instead.
+#[allow(dead_code)] // B4.2 will wire this into create_container.
+fn build_uvm_only_doc(
+    owner_tag: &str,
+    uvm_id: &str,
+    uvm: &Uvm,
+    parent_layers: &[zlayer_hcs::schema::Layer],
+    spec: &ServiceSpec,
+    gpu_adapters: &[HostGpuAdapter],
+) -> HcsDoc {
+    let vm_doc = build_virtual_machine_doc(uvm, parent_layers, spec, gpu_adapters);
+    HcsDoc {
+        owner: owner_tag.to_string(),
+        schema_version: SchemaVersion::default(),
+        hosting_system_id: String::new(),
+        container: None,
+        virtual_machine: Some(vm_doc),
+        should_terminate_on_last_handle_closed: Some(true),
+    }
+    .apply_service_id(uvm_id)
+}
+
+/// Build the hosted-container body for a Hyper-V-isolated container. This is
+/// the SECOND payload — it's a [`HcsContainer`] body, fed to the GCS bridge's
+/// `RpcCreate` `settings` field (NOT to `HcsCreateComputeSystem`).
+///
+/// IMPORTANT: the layer paths inside this Container body are GUEST paths
+/// (in-UVM `\\?\VMSMB\VSMB-{dcc079ae-...}\sN`), NOT host paths. The caller
+/// (B4.2) provides them after `CombineLayersWCOW` via GCS resolves the per-VSMB
+/// guest path. This builder accepts a `Vec<Layer>` of guest layer paths
+/// verbatim and a `guest_root_volume` (the guest-side prepared-volume path)
+/// for `Storage.Path`.
+///
+/// `namespace_id` attaches the container to a single HCN namespace inside the
+/// guest; `None` means no network — `Networking` is omitted entirely, matching
+/// the legacy single-doc path.
+#[allow(dead_code)] // B4.2 will wire this into create_container.
+fn build_hosted_container_doc(
+    spec: &ServiceSpec,
+    guest_layers: Vec<zlayer_hcs::schema::Layer>,
+    guest_root_volume: String,
+    namespace_id: Option<String>,
+    hcs_id: &str,
+) -> HcsContainer {
+    let processor = build_container_processor(spec);
+    let memory = build_container_memory(spec);
+    let storage = HcsStorage {
+        layers: guest_layers,
+        path: Some(guest_root_volume),
+    };
+    let networking = namespace_id.map(|ns| zlayer_hcs::schema::ContainerNetworking {
+        allow_unqualified_dns_query: Some(true),
+        dns_search_list: Vec::new(),
+        namespace: Some(ns),
+        network_shared_container_name: None,
+    });
+    let hostname_source = spec.hostname.as_deref().unwrap_or(hcs_id);
+    let guest_os = Some(HcsGuestOs {
+        host_name: Some(netbios_hostname(hostname_source)),
+    });
+    HcsContainer {
+        guest_os,
+        storage: Some(storage),
+        networking,
+        mapped_directories: Vec::new(),
+        mapped_pipes: Vec::new(),
+        processor,
+        memory,
     }
 }
 
@@ -1912,6 +2543,7 @@ impl Runtime for HcsRuntime {
         self.do_pull(image, policy, auth).await
     }
 
+    #[allow(clippy::too_many_lines)]
     #[instrument(
         skip(self, spec),
         fields(
@@ -2117,38 +2749,83 @@ impl Runtime for HcsRuntime {
                 IsolationMode::Process => None,
             };
 
-        let doc = self.build_compute_system_doc(
-            &hcs_id,
-            spec,
-            &scratch_layer,
-            parent_layers,
-            namespace_strs,
-            isolation,
-            uvm.as_ref(),
-        )?;
-        let doc_json = serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
-            id: hcs_id.clone(),
-            reason: format!("serialize ComputeSystem doc: {e}"),
-        })?;
-        // Diagnostic: emit the exact JSON we hand to HCS so reproducible E_INVALIDARG
-        // failures can be diffed against hcsshim's known-good docs. error! so it
-        // shows without RUST_LOG configuration.
-        tracing::error!(target: "zlayer_agent::hcs::diag", hcs_id = %hcs_id, doc = %doc_json, "HCS_CREATE_DOC");
-        if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
-            let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.json"));
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(&path, &doc_json);
-        }
+        // 5. Create the compute system. The shape of this differs by
+        //    isolation mode:
+        //
+        //    - Process: build the single legacy doc (Container body only) and
+        //      hand it to `HcsCreateComputeSystem`. One call, one system.
+        //
+        //    - Hyper-V: orchestrate the multi-step GCS-bridge boot sequence
+        //      (build UVM-only doc → create + start UVM → connect GCS over
+        //      hvsock → hot-attach per-layer VSMB + per-container SCSI scratch
+        //      → CombineLayersWCOW inside the guest → RpcCreate the hosted
+        //      container → RpcStart it). See `hyperv_create_via_gcs` for the
+        //      step-by-step.
+        //
+        //    On failure, tear down the HCN endpoint we created in step 3 —
+        //    otherwise the endpoint (and the IP it owns) leaks, and the next
+        //    test/deploy attempt that tries to claim the same IP gets
+        //    `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)`. Also release the
+        //    IP back to the allocator. The parent-layer guard and scratch
+        //    layer cleanup are handled by their own Drop / orphan-reconcile
+        //    paths.
+        let create_result: Result<(ComputeSystem, HyperVGcsState)> = match isolation {
+            IsolationMode::Process => {
+                let doc = self.build_compute_system_doc(
+                    &hcs_id,
+                    spec,
+                    &scratch_layer,
+                    parent_layers.clone(),
+                    namespace_strs.clone(),
+                    isolation,
+                    uvm.as_ref(),
+                )?;
+                let doc_json =
+                    serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("serialize ComputeSystem doc: {e}"),
+                    })?;
+                // Diagnostic: emit the exact JSON we hand to HCS so reproducible
+                // E_INVALIDARG failures can be diffed against hcsshim's known-good
+                // docs. error! so it shows without RUST_LOG configuration.
+                tracing::error!(
+                    target: "zlayer_agent::hcs::diag",
+                    hcs_id = %hcs_id,
+                    doc = %doc_json,
+                    "HCS_CREATE_DOC"
+                );
+                if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
+                    let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.json"));
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(&path, &doc_json);
+                }
+                ComputeSystem::create(&hcs_id, &doc_json)
+                    .await
+                    .map(|s| (s, HyperVGcsState::default()))
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("HcsCreateComputeSystem: {e}"),
+                    })
+            }
+            IsolationMode::Hyperv => {
+                let uvm_ref = uvm.as_ref().ok_or_else(|| AgentError::Internal(
+                    "Hyper-V isolation selected but no Uvm was provisioned earlier in create_container".to_string(),
+                ))?;
+                self.hyperv_create_via_gcs(
+                    &hcs_id,
+                    spec,
+                    &scratch_layer,
+                    &parent_layers,
+                    &namespace_strs,
+                    uvm_ref,
+                    &network_attachment,
+                )
+                .await
+            }
+        };
 
-        // 5. Create the compute system. On failure, tear down the HCN
-        //    endpoint we created in step 3 — otherwise the endpoint (and the
-        //    IP it owns) leaks, and the next test/deploy attempt that tries
-        //    to claim the same IP gets `HCN_E_ADDR_INVALID_OR_RESERVED
-        //    (0x803b002f)`. Also release the IP back to the allocator. The
-        //    parent-layer guard and scratch layer cleanup are handled by
-        //    their own Drop / orphan-reconcile paths.
-        let system = match ComputeSystem::create(&hcs_id, &doc_json).await {
-            Ok(s) => s,
+        let (system, hyperv_state) = match create_result {
+            Ok(v) => v,
             Err(e) => {
                 let ip_to_release = network_attachment
                     .ip()
@@ -2165,10 +2842,7 @@ impl Runtime for HcsRuntime {
                         alloc.release(ip);
                     }
                 }
-                return Err(AgentError::CreateFailed {
-                    id: hcs_id.clone(),
-                    reason: format!("HcsCreateComputeSystem: {e}"),
-                });
+                return Err(e);
             }
         };
 
@@ -2198,7 +2872,19 @@ impl Runtime for HcsRuntime {
             network_attachment: Some(network_attachment),
             uvm,
             activated_parent_layers,
+            // Carry the GCS bridge through to the entry. Hyper-V path
+            // populates it via `hyperv_create_via_gcs`; Process path leaves
+            // it as `None`. See `ContainerEntry::gcs` for the eventual
+            // lifecycle-routing migration (B4.3).
+            #[cfg(feature = "hcs-runtime")]
+            gcs: hyperv_state.bridge,
         };
+        // Suppress "unused" when the `hcs-runtime` feature is off — the
+        // state is only consumed via the gated entry field above. The
+        // Process branch always produces an empty state, so dropping it
+        // here is safe.
+        #[cfg(not(feature = "hcs-runtime"))]
+        drop(hyperv_state);
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
     }

@@ -53,6 +53,16 @@ pub struct Uvm {
     /// Whether the sandbox VHDX still needs deleting on drop. Cleared by
     /// [`Self::cleanup`] so the `Drop` impl does not double-delete.
     needs_cleanup: bool,
+    /// The hvsock VM-ID GUID HCS uses to route GCS-bridge connections into
+    /// this UVM. Generated fresh at [`Uvm::create`] time and stashed here so
+    /// the caller can (a) inject it into the UVM doc's `RuntimeId` field
+    /// before `HcsCreateComputeSystem` and (b) use it to open the GCS
+    /// bridge via [`zlayer_gcs::bridge::GcsBridge::connect`]. Mirrors
+    /// hcsshim's `internal/uvm/runtime_id.go` — the runtime GUID is the VM
+    /// id, one-to-one with the UVM. Container IDs in this codebase are
+    /// short slugs (`fallthrough-svc-rep-0`), not GUIDs, so we cannot
+    /// derive this from the container id.
+    runtime_id: windows::core::GUID,
 }
 
 impl Uvm {
@@ -114,6 +124,14 @@ impl Uvm {
             })?;
         }
 
+        // Allocate the UVM's hvsock VM-ID GUID up-front so the caller can
+        // both inject it into the UVM doc's `RuntimeId` field AND hand it to
+        // [`zlayer_gcs::bridge::GcsBridge::connect`] after start. Falls back
+        // to a zeroed GUID if CoCreateGuid fails — defensive only; in
+        // practice this RPC never fails on a healthy host.
+        let runtime_id =
+            windows::core::GUID::new().unwrap_or_else(|_| windows::core::GUID::zeroed());
+
         // Copy the image's read-only `SystemTemplate.vhdx` to the per-UVM
         // sandbox path. This is hcsshim's documented flow: the sandbox is a
         // writable copy of the template, not an empty disk. Multi-GB copies
@@ -125,6 +143,7 @@ impl Uvm {
                 scratch_vhdx,
                 os_files_dir: boot_files.os_files_dir.clone(),
                 needs_cleanup: true,
+                runtime_id,
             }),
             Err(e) => {
                 // Roll back the directory we just created so we don't leave
@@ -161,6 +180,23 @@ impl Uvm {
         &self.container_id
     }
 
+    /// The hvsock VM-ID GUID HCS uses to route GCS connections into this
+    /// UVM. The same GUID is what the caller must:
+    ///
+    /// 1. Inject into the UVM compute-system doc's `RuntimeId` field
+    ///    (`VirtualMachine.RuntimeId`) BEFORE `HcsCreateComputeSystem` so
+    ///    HCS pins this VM id rather than auto-generating one.
+    /// 2. Pass to [`zlayer_gcs::bridge::GcsBridge::connect`] AFTER the UVM
+    ///    is started, so the host-side bridge can address the in-guest GCS
+    ///    listener over hvsock.
+    ///
+    /// Mirrors hcsshim's `internal/uvm/runtime_id.go` — the runtime GUID
+    /// IS the VM id, one-to-one with the UVM.
+    #[must_use]
+    pub fn runtime_id(&self) -> windows::core::GUID {
+        self.runtime_id
+    }
+
     /// Test-only constructor that fabricates a [`Uvm`] from caller-supplied
     /// paths without touching the filesystem or copying any VHDX. Used by
     /// integration tests in [`crate::runtimes::hcs`] that exercise the
@@ -177,6 +213,9 @@ impl Uvm {
             scratch_vhdx,
             os_files_dir,
             needs_cleanup: false,
+            // Deterministic per-test GUID. Tests don't open a GCS bridge,
+            // so the exact value doesn't matter — only that it's stable.
+            runtime_id: windows::core::GUID::from_u128(0xdead_beef_cafe_f00d_1234_5678_9abc_def0),
         }
     }
 

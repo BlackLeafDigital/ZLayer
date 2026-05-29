@@ -24,7 +24,7 @@ youki-runtime = ["dep:libcontainer"]
 # `cfg(target_os = "windows")`, so this feature is primarily a user-facing
 # opt-in marker for CI / bin/zlayer configuration. Enabling it on non-Windows
 # targets is a no-op.
-hcs-runtime = []
+hcs-runtime = ["dep:zlayer-gcs"]
 # WSL2 delegate runtime. When enabled on Windows targets, pulls in the
 # `zlayer-wsl` crate so `Wsl2DelegateRuntime` can shell out to `youki` inside
 # the dedicated `zlayer` WSL2 distro. Off by default; enabled explicitly by
@@ -49,6 +49,7 @@ s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3", "dep:zlayer-storage"]
 # `cargo test -p zlayer-agent` works out of the box; downstream consumers can
 # opt out with `default-features = false`.
 nat = ["zlayer-overlay/nat"]
+zlayer-gcs = ["dep:zlayer-gcs"]
 
 [dependencies]
 async-trait.workspace = true
@@ -122,6 +123,7 @@ tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "trans
 prost-types = "0.14.3"
 base64.workspace = true
 ipnet.workspace = true
+zlayer-gcs = { version = "0.0.0-dev", path = "../zlayer-gcs", optional = true }
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 # Consuming the patched fork via `zlayer-libcontainer` published from

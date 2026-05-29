@@ -12501,6 +12501,7 @@ dependencies = [
  "windows 0.62.2",
  "zlayer-cluster-rpc",
  "zlayer-core",
+ "zlayer-gcs",
  "zlayer-hcs",
  "zlayer-hns",
  "zlayer-init-actions",

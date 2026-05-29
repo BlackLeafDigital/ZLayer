@@ -230,6 +230,15 @@ pub struct VirtualMachine {
     /// Optional path where HCS should persist runtime state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_state_file_path: Option<String>,
+    /// Stable VM identifier hcsshim uses to route hvsock connections into
+    /// the guest. Must be unique per running UVM. When omitted, HCS
+    /// auto-generates one — but then the host can't address it for hvsock
+    /// (the GCS bridge needs to know the VM-ID GUID up front). Set this on
+    /// the UVM-only doc whenever the caller intends to open a GCS bridge
+    /// to the running UVM. Mirrors hcsshim's `internal/uvm/runtime_id.go`
+    /// behavior of pre-generating the VM ID before `HcsCreateComputeSystem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
 }
 
 /// Chipset / firmware block of a virtual machine.
@@ -608,14 +617,61 @@ pub struct StorageStats {
 }
 
 // ---------------------------------------------------------------------------
+// Modify-setting request
+// ---------------------------------------------------------------------------
+
+/// Hot-modification request for a running compute system. Submitted to
+/// `HcsModifyComputeSystem` (host-side) or the GCS `ModifySettings` RPC
+/// (guest-side). Matches hcsshim's
+/// `internal/hcs/schema2/modify_setting_request.go`.
+///
+/// `resource_path` is a slash-separated path into the compute-system tree
+/// (e.g. `"VirtualMachine/Devices/VirtualSmb/Shares"`,
+/// `"VirtualMachine/Devices/Scsi/0/Attachments/1"`,
+/// `"Container/Networks"`).
+///
+/// `request_type` is one of `Add` / `Remove` / `Update`.
+///
+/// `settings` is the new value for the resource — its schema depends on the
+/// `resource_path`. We keep it as `serde_json::Value` for flexibility;
+/// helpers in [`crate::system`] build common shapes typed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ModifySettingRequest {
+    /// Slash-separated path identifying the resource to modify.
+    pub resource_path: String,
+    /// Whether to add, remove, or update the resource.
+    pub request_type: ModifyRequestType,
+    /// New value for the resource. Schema depends on `resource_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
+    /// Optional guest-side request bundled along — e.g. `CombineLayers`
+    /// instructions that need both a host-side hot-add AND a guest RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_request: Option<serde_json::Value>,
+}
+
+/// Operation kind for a [`ModifySettingRequest`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModifyRequestType {
+    /// Attach / hot-add the resource described by `settings`.
+    #[default]
+    Add,
+    /// Detach / hot-remove the resource identified by `resource_path`.
+    Remove,
+    /// Update an existing resource's settings in place.
+    Update,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeSystem, Container, ContainerMemory, ContainerProcessor, Layer, SchemaVersion,
-        Statistics, Storage,
+        ComputeSystem, Container, ContainerMemory, ContainerProcessor, GuestOs, Layer,
+        ModifyRequestType, ModifySettingRequest, SchemaVersion, Statistics, Storage,
     };
 
     #[test]
@@ -655,6 +711,7 @@ mod tests {
                 }),
             }),
             virtual_machine: None,
+            should_terminate_on_last_handle_closed: None,
         };
 
         let json = serde_json::to_string(&doc).expect("serialize");
@@ -707,5 +764,21 @@ mod tests {
         assert_eq!(storage.read_size_bytes, 1_048_576);
         assert_eq!(storage.write_count_normalized, 13);
         assert_eq!(storage.write_size_bytes, 262_144);
+    }
+
+    #[test]
+    fn modify_setting_request_round_trip() {
+        let req = ModifySettingRequest {
+            resource_path: "VirtualMachine/Devices/VirtualSmb/Shares".to_string(),
+            request_type: ModifyRequestType::Add,
+            settings: Some(serde_json::json!({"Name": "layer1", "Path": "C:\\foo"})),
+            guest_request: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"ResourcePath\""));
+        assert!(s.contains("\"RequestType\":\"Add\""));
+        assert!(s.contains("\"Settings\""));
+        assert!(!s.contains("\"GuestRequest\""));
+        let _back: ModifySettingRequest = serde_json::from_str(&s).unwrap();
     }
 }
