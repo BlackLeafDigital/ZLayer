@@ -2,6 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
+<<<<<<< Updated upstream
 ## [Unreleased]
 
 ### Added
@@ -89,6 +90,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Local-registry lookup in `zlayer-registry` (`try_local_registry`) now tries multiple name forms in priority order: the normalized name first, then `docker.io/` / `docker.io/library/` / `library/` strips, then the bare last segment, with deduplication. Logs a debug line when a non-primary candidate is the one that hit.
+=======
+## [0.51.1] - 2026-05-27
+
+### Changed
+- `scripts/install-dev.sh` now supports macOS in addition to Linux. Mirrors the OS-handling pattern from `install.sh`: skips systemd / SELinux / libseccomp / cgroups-v2 / WireGuard-interface cleanup on Darwin, defaults the dev data dir to `$HOME/.${ZLAYER_DEV_NAME}` (matching `zlayer-paths::platform_default_data_dir`), drops `sudo` for `daemon install` on macOS (registers a per-instance launchd agent under `~/Library/LaunchAgents/com.zlayer.daemon-<suffix>.plist`), and runs the pre-install `daemon stop` without sudo on macOS so the bootout hits the user's `gui/$uid` launchd domain instead of `system/`. Final inspect/stop hints are now OS-aware (`launchctl list` + log tail on macOS, `systemctl status` + `journalctl` on Linux). Hard `uname -s != Linux` check replaced with a Linux/Darwin allowlist that points Windows users at `scripts/install-dev.ps1`.
+>>>>>>> Stashed changes
 
 ## [0.51.0] - 2026-05-24
 
