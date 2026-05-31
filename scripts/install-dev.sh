@@ -10,11 +10,17 @@ set -eu
 #
 # Flags:
 #   --replace        Install AS the production `zlayer` (not `zlayer-dev`):
-#                    overwrites /usr/local/bin/zlayer, uses production data
-#                    directory, registers + starts the daemon with
-#                    --docker-socket (and --with-overlay on Linux), then
-#                    fixes /var/run/docker.sock to point at the zlayer
-#                    Docker socket (backing up any existing entry).
+#                    overwrites /usr/local/bin/zlayer, fully uninstalls the
+#                    running prod daemon, then re-registers + starts it
+#                    using the production defaults (no --data-dir or
+#                    --daemon-name overrides), with --docker-socket and
+#                    --with-overlay (Linux), and symlinks
+#                    /var/run/docker.sock to the zlayer Docker socket.
+#                    `--replace --data-dir <PATH>` still takes the place
+#                    of the running zlayer daemon, but installs the new
+#                    one with that explicit data dir.
+#   --data-dir PATH  Override the data directory for the new install.
+#                    Equivalent to ZLAYER_DEV_DATA_DIR=PATH.
 #   --register       Register and start the service after install.
 #                    Equivalent to ZLAYER_DEV_REGISTER=1.
 #   --skip-build     Skip `cargo build --release -p zlayer`.
@@ -40,12 +46,34 @@ usage() {
 }
 
 # --- CLI args ---
+# Track whether the user explicitly specified a data dir (via env var preset
+# OR --data-dir flag). In --replace mode this controls whether we pass
+# --data-dir to the daemon at install time: without it we let the daemon
+# pick the production default, exactly as the release install.sh does.
 REPLACE=""
+DATA_DIR_EXPLICIT=""
+if [ -n "${ZLAYER_DEV_DATA_DIR:-}" ]; then
+    DATA_DIR_EXPLICIT=1
+fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --replace)    REPLACE=1; shift ;;
         --register)   ZLAYER_DEV_REGISTER=1; shift ;;
         --skip-build) ZLAYER_DEV_SKIP_BUILD=1; shift ;;
+        --data-dir)
+            if [ $# -lt 2 ]; then
+                echo "Error: --data-dir requires a path argument" >&2
+                exit 2
+            fi
+            ZLAYER_DEV_DATA_DIR="$2"
+            DATA_DIR_EXPLICIT=1
+            shift 2
+            ;;
+        --data-dir=*)
+            ZLAYER_DEV_DATA_DIR="${1#--data-dir=}"
+            DATA_DIR_EXPLICIT=1
+            shift
+            ;;
         -h|--help)    usage; exit 0 ;;
         *)
             echo "Error: unknown argument: $1" >&2
@@ -69,12 +97,21 @@ esac
 
 # --- --replace overrides ---
 # Replace mode hijacks the install target so it stands in for the production
-# `zlayer` install: same binary name, same data dir, daemon registered, docker
-# socket exposed, /var/run/docker.sock symlinked, overlay caps on Linux.
-# Honors any explicit env overrides the user set.
+# `zlayer` install: same binary name, daemon registered, docker socket
+# exposed, /var/run/docker.sock symlinked, overlay caps on Linux.
+# Honors any explicit env / CLI overrides the user set.
+#
+# REPLACE_PROD_DATA_DIR is the data dir of the *running* prod daemon being
+# replaced — always the platform default, separate from ZLAYER_DEV_DATA_DIR
+# (which is where the *new* install will land, possibly elsewhere). Used by
+# the cleanup pass to wipe leftover state from the old daemon.
 if [ -n "$REPLACE" ]; then
     ZLAYER_DEV_NAME="${ZLAYER_DEV_NAME:-zlayer}"
     ZLAYER_DEV_REGISTER="${ZLAYER_DEV_REGISTER:-1}"
+    case "$(uname -s)" in
+        Linux)  REPLACE_PROD_DATA_DIR="/var/lib/zlayer" ;;
+        Darwin) REPLACE_PROD_DATA_DIR="${HOME}/.zlayer" ;;
+    esac
 fi
 
 # --- Config ---
@@ -123,39 +160,67 @@ if [ ! -f "$TARGET_BIN" ]; then
     exit 1
 fi
 
-# --- Stop existing dev daemon (idempotent) ---
+# --- Stop the existing daemon ---
+# In --replace mode we fully uninstall the running production zlayer
+# (removes the systemd unit / launchd plist and stops it). In dev mode
+# we just stop the side-by-side dev daemon by its dev name.
 echo ""
-echo "Stopping any existing ${ZLAYER_DEV_NAME} instance..."
-if [ "$OS" = "linux" ]; then
-    sudo systemctl stop "${ZLAYER_DEV_NAME}.service" 2>/dev/null || true
-fi
-if [ -x "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" ]; then
-    case "$OS" in
-        linux)
-            sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" daemon stop --daemon-name "${ZLAYER_DEV_NAME}" 2>/dev/null || true
-            ;;
-        darwin)
-            # No sudo — a user-level launchd install lives under gui/$uid; bootout
-            # must run as that user to target the right launchd domain.
-            "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" daemon stop --daemon-name "${ZLAYER_DEV_NAME}" 2>/dev/null || true
-            ;;
-    esac
+if [ -n "$REPLACE" ]; then
+    echo "Uninstalling running zlayer daemon (if any)..."
+    if [ "$OS" = "linux" ]; then
+        sudo systemctl stop zlayer.service 2>/dev/null || true
+    fi
+    if [ -x "${ZLAYER_DEV_BIN_DIR}/zlayer" ]; then
+        case "$OS" in
+            linux)
+                sudo "${ZLAYER_DEV_BIN_DIR}/zlayer" daemon uninstall 2>/dev/null || true
+                ;;
+            darwin)
+                # No sudo — user-level launchd lives under gui/$uid; bootout must
+                # run as that user to target the right launchd domain.
+                "${ZLAYER_DEV_BIN_DIR}/zlayer" daemon uninstall 2>/dev/null || true
+                ;;
+        esac
+    fi
+else
+    echo "Stopping any existing ${ZLAYER_DEV_NAME} instance..."
+    if [ "$OS" = "linux" ]; then
+        sudo systemctl stop "${ZLAYER_DEV_NAME}.service" 2>/dev/null || true
+    fi
+    if [ -x "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" ]; then
+        case "$OS" in
+            linux)
+                sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" daemon stop --daemon-name "${ZLAYER_DEV_NAME}" 2>/dev/null || true
+                ;;
+            darwin)
+                "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" daemon stop --daemon-name "${ZLAYER_DEV_NAME}" 2>/dev/null || true
+                ;;
+        esac
+    fi
 fi
 
 # --- Clean stale WireGuard interfaces scoped to this daemon (Linux only) ---
 # macOS has no overlay/WireGuard interfaces — the sandbox runtime doesn't use
 # overlay networking (see daemon.rs around the with_overlay handling).
+# Deployment-name prefix is "zlayer" in --replace mode, ZLAYER_DEV_NAME otherwise.
 if [ "$OS" = "linux" ]; then
-    for iface in $(ip -br link 2>/dev/null | awk -v p="zl-${ZLAYER_DEV_NAME}-" '$1 ~ "^"p {print $1}'); do
+    if [ -n "$REPLACE" ]; then
+        iface_prefix="zl-zlayer-"
+    else
+        iface_prefix="zl-${ZLAYER_DEV_NAME}-"
+    fi
+    for iface in $(ip -br link 2>/dev/null | awk -v p="$iface_prefix" '$1 ~ "^"p {print $1}'); do
         echo "  Removing stale interface: $iface"
         sudo ip link delete "$iface" 2>/dev/null || true
     done
 fi
 
 # --- Extra cleanup in --replace mode (mirrors install.sh) ---
-# When we're stomping on the production install, also clean WireGuard UAPI
-# sockets, kill stale boringtun/zlayer holders of the WG port, and remove
-# stale state files so the freshly-installed daemon comes up clean.
+# Stomping on the production install: also clean WireGuard UAPI sockets,
+# kill stale boringtun/zlayer holders of the WG port, and remove stale
+# state files of the OLD daemon (always at platform defaults — not at
+# ZLAYER_DEV_DATA_DIR, which is where the NEW install will land) so the
+# freshly-installed daemon comes up clean.
 if [ -n "$REPLACE" ] && [ "$OS" = "linux" ]; then
     sudo rm -f /var/run/wireguard/zl-*.sock 2>/dev/null || true
     if command -v ss >/dev/null 2>&1; then
@@ -169,15 +234,15 @@ if [ -n "$REPLACE" ] && [ "$OS" = "linux" ]; then
             esac
         done
     fi
-    sudo rm -f "${ZLAYER_DEV_DATA_DIR}/daemon.json" 2>/dev/null || true
-    sudo rm -f "/var/run/${ZLAYER_DEV_NAME}.sock" 2>/dev/null || true
-    sudo rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.pid" 2>/dev/null || true
+    sudo rm -f "${REPLACE_PROD_DATA_DIR}/daemon.json" 2>/dev/null || true
+    sudo rm -f /var/run/zlayer.sock 2>/dev/null || true
+    sudo rm -f "${REPLACE_PROD_DATA_DIR}/run/zlayer.pid" 2>/dev/null || true
     sleep 3
 fi
 if [ -n "$REPLACE" ] && [ "$OS" = "darwin" ]; then
-    rm -f "${ZLAYER_DEV_DATA_DIR}/daemon.json" 2>/dev/null || true
-    rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.sock" 2>/dev/null || true
-    rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.pid" 2>/dev/null || true
+    rm -f "${REPLACE_PROD_DATA_DIR}/daemon.json" 2>/dev/null || true
+    rm -f "${REPLACE_PROD_DATA_DIR}/run/zlayer.sock" 2>/dev/null || true
+    rm -f "${REPLACE_PROD_DATA_DIR}/run/zlayer.pid" 2>/dev/null || true
 fi
 
 # --- Install binary ---
@@ -265,13 +330,29 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
         fi
     fi
 
+    # In --replace mode we call the install the same way install.sh does:
+    # no --data-dir / --daemon-name overrides — let the daemon use its
+    # built-in production defaults. EXCEPT when the user explicitly passed
+    # --data-dir / ZLAYER_DEV_DATA_DIR; then forward that, but still no
+    # --daemon-name (it's always "zlayer" in --replace mode).
+    GLOBAL_ARGS=()
+    DAEMON_NAME_ARGS=()
+    if [ -n "$REPLACE" ]; then
+        if [ -n "$DATA_DIR_EXPLICIT" ]; then
+            GLOBAL_ARGS=(--data-dir "${ZLAYER_DEV_DATA_DIR}")
+        fi
+    else
+        GLOBAL_ARGS=(--data-dir "${ZLAYER_DEV_DATA_DIR}")
+        DAEMON_NAME_ARGS=(--daemon-name "${ZLAYER_DEV_NAME}")
+    fi
+
     case "$OS" in
         linux)
             # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
             # shellcheck disable=SC2086
             sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
-                --data-dir "${ZLAYER_DEV_DATA_DIR}" \
-                daemon --daemon-name "${ZLAYER_DEV_NAME}" \
+                "${GLOBAL_ARGS[@]}" \
+                daemon "${DAEMON_NAME_ARGS[@]}" \
                 install ${DAEMON_INSTALL_FLAGS}
             ;;
         darwin)
@@ -280,8 +361,8 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
             # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
             # shellcheck disable=SC2086
             "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
-                --data-dir "${ZLAYER_DEV_DATA_DIR}" \
-                daemon --daemon-name "${ZLAYER_DEV_NAME}" \
+                "${GLOBAL_ARGS[@]}" \
+                daemon "${DAEMON_NAME_ARGS[@]}" \
                 install ${DAEMON_INSTALL_FLAGS}
             ;;
     esac
@@ -299,16 +380,19 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
     # clobbers $HOME to /var/root on macOS — which would point the
     # symlink at a non-existent /var/root/.zlayer/run/docker.sock.
     if [ -n "$REPLACE" ]; then
+        # The docker socket path is fixed by the daemon at install time
+        # via `default_docker_socket_path()` — which uses the *platform-
+        # default* data dir, not whatever --data-dir override the user
+        # passed. So even with a custom --data-dir, the actual socket
+        # lives at the platform default.
         case "$OS" in
             linux)
-                # The Linux daemon runs as root via systemd, so its
-                # docker socket always lives at the system path.
+                # Linux daemon runs as root via systemd → hardcoded.
                 DOCKER_SOCKET_TARGET="/var/run/zlayer/docker.sock"
                 ;;
             darwin)
-                # macOS daemon runs as user via launchd; socket lives
-                # under the user's data dir.
-                DOCKER_SOCKET_TARGET="${ZLAYER_DEV_DATA_DIR}/run/docker.sock"
+                # macOS daemon runs as user via launchd → under HOME.
+                DOCKER_SOCKET_TARGET="${REPLACE_PROD_DATA_DIR}/run/docker.sock"
                 ;;
         esac
         echo ""
