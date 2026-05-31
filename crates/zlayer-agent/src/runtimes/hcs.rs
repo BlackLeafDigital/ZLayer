@@ -2578,7 +2578,12 @@ fn build_virtual_machine_doc(
             // The in-guest GCS only accepts the host's hvsock connection when
             // the UVM authorizes SYSTEM/admin binds. "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
             // = DACL granting Full Access to NT AUTHORITY\SYSTEM (SY) and
-            // BUILTIN\Administrators (BA). Mirrors hcsshim create_wcow.go.
+            // BUILTIN\Administrators (BA). Mirrors hcsshim create_wcow.go:270-274,
+            // which sets ONLY DefaultBindSecurityDescriptor for WCOW (the guest
+            // GCS dials OUT, authorized guest-side; DefaultConnectSecurityDescriptor
+            // is LCOW-only, where the host dials the guest — verified against the
+            // hcsshim tree, and an e2e with the connect SD set still hit the 120s
+            // accept timeout with bridge_started=0, confirming it is not the gap).
             hv_socket: Some(HvSocket2 {
                 hv_socket_config: Some(HvSocketSystemConfig {
                     default_bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),

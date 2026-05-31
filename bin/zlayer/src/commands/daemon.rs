@@ -1255,9 +1255,9 @@ async fn uninstall(
                     let brew_bin = PathBuf::from(prefix).join("bin").join(daemon_name);
                     if brew_bin.exists() {
                         match std::fs::remove_file(&brew_bin) {
-                            Ok(_) => println!("Removed brew binary: {}", brew_bin.display()),
+                            Ok(()) => println!("Removed brew binary: {}", brew_bin.display()),
                             Err(e) => {
-                                eprintln!("Warning: failed to remove {}: {e}", brew_bin.display())
+                                eprintln!("Warning: failed to remove {}: {e}", brew_bin.display());
                             }
                         }
                     }
