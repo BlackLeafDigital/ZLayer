@@ -8,8 +8,22 @@ set -eu
 # data directory, and service name (systemd unit on Linux, launchd label on
 # macOS) so it does not collide with the release daemon.
 #
-# Env knobs:
-#   ZLAYER_DEV_NAME       Binary/unit/data-dir basename (default: zlayer-dev)
+# Flags:
+#   --replace        Install AS the production `zlayer` (not `zlayer-dev`):
+#                    overwrites /usr/local/bin/zlayer, uses production data
+#                    directory, registers + starts the daemon with
+#                    --docker-socket (and --with-overlay on Linux), then
+#                    fixes /var/run/docker.sock to point at the zlayer
+#                    Docker socket (backing up any existing entry).
+#   --register       Register and start the service after install.
+#                    Equivalent to ZLAYER_DEV_REGISTER=1.
+#   --skip-build     Skip `cargo build --release -p zlayer`.
+#                    Equivalent to ZLAYER_DEV_SKIP_BUILD=1.
+#   -h | --help      Show this help.
+#
+# Env knobs (override flag-driven defaults):
+#   ZLAYER_DEV_NAME       Binary/unit/data-dir basename (default: zlayer-dev,
+#                           or `zlayer` when --replace).
 #   ZLAYER_DEV_DATA_DIR   Data directory
 #                           Linux default: /var/lib/${ZLAYER_DEV_NAME}
 #                           macOS default: ${HOME}/.${ZLAYER_DEV_NAME}
@@ -21,6 +35,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+usage() {
+    sed -n '4,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# --- CLI args ---
+REPLACE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --replace)    REPLACE=1; shift ;;
+        --register)   ZLAYER_DEV_REGISTER=1; shift ;;
+        --skip-build) ZLAYER_DEV_SKIP_BUILD=1; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *)
+            echo "Error: unknown argument: $1" >&2
+            echo "" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
 # --- OS detection ---
 case "$(uname -s)" in
     Linux)  OS="linux" ;;
@@ -31,6 +66,16 @@ case "$(uname -s)" in
         exit 1
         ;;
 esac
+
+# --- --replace overrides ---
+# Replace mode hijacks the install target so it stands in for the production
+# `zlayer` install: same binary name, same data dir, daemon registered, docker
+# socket exposed, /var/run/docker.sock symlinked, overlay caps on Linux.
+# Honors any explicit env overrides the user set.
+if [ -n "$REPLACE" ]; then
+    ZLAYER_DEV_NAME="${ZLAYER_DEV_NAME:-zlayer}"
+    ZLAYER_DEV_REGISTER="${ZLAYER_DEV_REGISTER:-1}"
+fi
 
 # --- Config ---
 ZLAYER_DEV_NAME="${ZLAYER_DEV_NAME:-zlayer-dev}"
@@ -107,6 +152,34 @@ if [ "$OS" = "linux" ]; then
     done
 fi
 
+# --- Extra cleanup in --replace mode (mirrors install.sh) ---
+# When we're stomping on the production install, also clean WireGuard UAPI
+# sockets, kill stale boringtun/zlayer holders of the WG port, and remove
+# stale state files so the freshly-installed daemon comes up clean.
+if [ -n "$REPLACE" ] && [ "$OS" = "linux" ]; then
+    sudo rm -f /var/run/wireguard/zl-*.sock 2>/dev/null || true
+    if command -v ss >/dev/null 2>&1; then
+        for pid in $(ss -ulnp 'sport = :51420' 2>/dev/null | grep -oP 'pid=\K[0-9]+'); do
+            pname=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+            case "$pname" in
+                *zlayer*|*boringtun*)
+                    echo "  Killing stale process: $pname (PID $pid)"
+                    sudo kill "$pid" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+    sudo rm -f "${ZLAYER_DEV_DATA_DIR}/daemon.json" 2>/dev/null || true
+    sudo rm -f "/var/run/${ZLAYER_DEV_NAME}.sock" 2>/dev/null || true
+    sudo rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.pid" 2>/dev/null || true
+    sleep 3
+fi
+if [ -n "$REPLACE" ] && [ "$OS" = "darwin" ]; then
+    rm -f "${ZLAYER_DEV_DATA_DIR}/daemon.json" 2>/dev/null || true
+    rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.sock" 2>/dev/null || true
+    rm -f "${ZLAYER_DEV_DATA_DIR}/run/${ZLAYER_DEV_NAME}.pid" 2>/dev/null || true
+fi
+
 # --- Install binary ---
 echo ""
 echo "Installing binary to ${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}..."
@@ -180,22 +253,73 @@ maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0750 "${ZLAYER_DEV_DATA_DIR}/s
 if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
     echo ""
     echo "Installing ${ZLAYER_DEV_NAME} daemon..."
+
+    # --replace mode wires the daemon up the same way the production install.sh
+    # does when ZLAYER_DOCKER_SOCKET=1 + ZLAYER_WITH_OVERLAY=1: docker socket
+    # exposed, and overlay caps on Linux (no-op on macOS sandbox runtime).
+    DAEMON_INSTALL_FLAGS="--no-admin-prompt"
+    if [ -n "$REPLACE" ]; then
+        DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --docker-socket"
+        if [ "$OS" = "linux" ]; then
+            DAEMON_INSTALL_FLAGS="${DAEMON_INSTALL_FLAGS} --with-overlay"
+        fi
+    fi
+
     case "$OS" in
         linux)
+            # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
+            # shellcheck disable=SC2086
             sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
                 --data-dir "${ZLAYER_DEV_DATA_DIR}" \
                 daemon --daemon-name "${ZLAYER_DEV_NAME}" \
-                install --no-admin-prompt
+                install ${DAEMON_INSTALL_FLAGS}
             ;;
         darwin)
             # No sudo on macOS — the daemon installs into ~/Library/LaunchAgents
             # for non-root users (see launchd_context() in daemon.rs).
+            # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
+            # shellcheck disable=SC2086
             "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
                 --data-dir "${ZLAYER_DEV_DATA_DIR}" \
                 daemon --daemon-name "${ZLAYER_DEV_NAME}" \
-                install --no-admin-prompt
+                install ${DAEMON_INSTALL_FLAGS}
             ;;
     esac
+
+    # --- Fix /var/run/docker.sock symlink in --replace mode ---
+    # `zlayer docker install` is the canonical way to repoint
+    # /var/run/docker.sock at the zlayer Docker API socket (it handles
+    # missing / ours-already / foreign-symlink / foreign-file cases and
+    # writes a backup before replacing). We skip the rest of its work
+    # (shims, env vars, daemon restart) since `daemon install` above
+    # already restarted the daemon with --docker-socket.
+    #
+    # We must pass --socket-path explicitly because the default resolves
+    # against $HOME, and `sudo` (used to write /var/run/docker.sock)
+    # clobbers $HOME to /var/root on macOS — which would point the
+    # symlink at a non-existent /var/root/.zlayer/run/docker.sock.
+    if [ -n "$REPLACE" ]; then
+        case "$OS" in
+            linux)
+                # The Linux daemon runs as root via systemd, so its
+                # docker socket always lives at the system path.
+                DOCKER_SOCKET_TARGET="/var/run/zlayer/docker.sock"
+                ;;
+            darwin)
+                # macOS daemon runs as user via launchd; socket lives
+                # under the user's data dir.
+                DOCKER_SOCKET_TARGET="${ZLAYER_DEV_DATA_DIR}/run/docker.sock"
+                ;;
+        esac
+        echo ""
+        echo "Fixing /var/run/docker.sock symlink (target: ${DOCKER_SOCKET_TARGET})..."
+        if ! sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" docker install \
+            --socket-path "${DOCKER_SOCKET_TARGET}" \
+            --no-shim --no-env --no-daemon-restart \
+            --replace-docker-sock --skip-symlink-prompt; then
+            echo "  Warning: docker symlink fix failed (continuing)."
+        fi
+    fi
 else
     echo ""
     echo "ZLAYER_DEV_REGISTER not set — skipping service registration."
@@ -251,7 +375,18 @@ install_completion fish "${HOME}/.config/fish/completions/${ZLAYER_DEV_NAME}.fis
 
 # --- Final message ---
 echo ""
-echo "${ZLAYER_DEV_NAME} installed."
+if [ -n "$REPLACE" ]; then
+    INSTALLED_VERSION="$("${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" --version 2>/dev/null | awk '{print $2}')" || INSTALLED_VERSION="(unknown)"
+    echo "${ZLAYER_DEV_NAME} (local ${INSTALLED_VERSION}) installed AS the production zlayer."
+    echo "  Binary:        ${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}"
+    echo "  Data dir:      ${ZLAYER_DEV_DATA_DIR}"
+    echo "  Docker socket: /var/run/docker.sock (symlinked to zlayer)"
+    if [ "$OS" = "linux" ]; then
+        echo "  Overlay:       enabled (CAP_NET_ADMIN / CAP_SYS_ADMIN)"
+    fi
+else
+    echo "${ZLAYER_DEV_NAME} installed."
+fi
 echo ""
 if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
     echo "Inspect:"
