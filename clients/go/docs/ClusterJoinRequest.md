@@ -6,13 +6,17 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **AdvertiseAddr** | **string** | Joining node&#39;s advertise address (IP) | 
 **ApiPort** | Pointer to **int32** | Joining node&#39;s API server port | [optional] 
+**Arch** | Pointer to [**NullableArchKind**](ArchKind.md) | CPU architecture of the joining agent. Same legacy semantics as &#x60;os&#x60;. | [optional] 
 **CpuTotal** | Pointer to **float64** | Total CPU cores on the joining node | [optional] 
 **DiskTotal** | Pointer to **int64** | Total disk in bytes | [optional] 
 **Gpus** | Pointer to [**[]GpuInfoSummary**](GpuInfoSummary.md) | Detected GPUs | [optional] 
+**Labels** | Pointer to **map[string]string** | Free-form labels advertised by the joining agent, used for &#x60;NodeSelector&#x60; placement matching. Empty on legacy clients. | [optional] 
 **MemoryTotal** | Pointer to **int64** | Total memory in bytes | [optional] 
 **Mode** | Pointer to **string** | Node mode: \&quot;full\&quot; or \&quot;replicate\&quot; | [optional] 
+**Os** | Pointer to [**NullableOsKind**](OsKind.md) | Operating system of the joining agent. &#x60;None&#x60; &#x3D; legacy client that did not report platform info. | [optional] 
 **OverlayPort** | **int32** | Joining node&#39;s overlay port (&#x60;WireGuard&#x60;) | 
 **RaftPort** | **int32** | Joining node&#39;s Raft RPC port | 
+**SecretsPubkey** | Pointer to **[]int32** | Joiner&#39;s 32-byte X25519 pubkey for sealed-box DEK wrapping. Present on Phase-1+ joiners; absent on legacy clients (in which case the leader treats the node as not eligible to host replicated-secret ciphertext until it re-joins with a pubkey). | [optional] 
 **Services** | Pointer to **[]string** | Services to replicate (only if mode &#x3D;&#x3D; \&quot;replicate\&quot;) | [optional] 
 **Token** | **string** | Base64-encoded join token (contains &#x60;auth_secret&#x60; for validation) | 
 **WgPublicKey** | **string** | Joining node&#39;s &#x60;WireGuard&#x60; public key | 
@@ -81,6 +85,41 @@ SetApiPort sets ApiPort field to given value.
 
 HasApiPort returns a boolean if a field has been set.
 
+### GetArch
+
+`func (o *ClusterJoinRequest) GetArch() ArchKind`
+
+GetArch returns the Arch field if non-nil, zero value otherwise.
+
+### GetArchOk
+
+`func (o *ClusterJoinRequest) GetArchOk() (*ArchKind, bool)`
+
+GetArchOk returns a tuple with the Arch field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetArch
+
+`func (o *ClusterJoinRequest) SetArch(v ArchKind)`
+
+SetArch sets Arch field to given value.
+
+### HasArch
+
+`func (o *ClusterJoinRequest) HasArch() bool`
+
+HasArch returns a boolean if a field has been set.
+
+### SetArchNil
+
+`func (o *ClusterJoinRequest) SetArchNil(b bool)`
+
+ SetArchNil sets the value for Arch to be an explicit nil
+
+### UnsetArch
+`func (o *ClusterJoinRequest) UnsetArch()`
+
+UnsetArch ensures that no value is present for Arch, not even an explicit nil
 ### GetCpuTotal
 
 `func (o *ClusterJoinRequest) GetCpuTotal() float64`
@@ -156,6 +195,31 @@ SetGpus sets Gpus field to given value.
 
 HasGpus returns a boolean if a field has been set.
 
+### GetLabels
+
+`func (o *ClusterJoinRequest) GetLabels() map[string]string`
+
+GetLabels returns the Labels field if non-nil, zero value otherwise.
+
+### GetLabelsOk
+
+`func (o *ClusterJoinRequest) GetLabelsOk() (*map[string]string, bool)`
+
+GetLabelsOk returns a tuple with the Labels field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetLabels
+
+`func (o *ClusterJoinRequest) SetLabels(v map[string]string)`
+
+SetLabels sets Labels field to given value.
+
+### HasLabels
+
+`func (o *ClusterJoinRequest) HasLabels() bool`
+
+HasLabels returns a boolean if a field has been set.
+
 ### GetMemoryTotal
 
 `func (o *ClusterJoinRequest) GetMemoryTotal() int64`
@@ -206,6 +270,41 @@ SetMode sets Mode field to given value.
 
 HasMode returns a boolean if a field has been set.
 
+### GetOs
+
+`func (o *ClusterJoinRequest) GetOs() OsKind`
+
+GetOs returns the Os field if non-nil, zero value otherwise.
+
+### GetOsOk
+
+`func (o *ClusterJoinRequest) GetOsOk() (*OsKind, bool)`
+
+GetOsOk returns a tuple with the Os field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetOs
+
+`func (o *ClusterJoinRequest) SetOs(v OsKind)`
+
+SetOs sets Os field to given value.
+
+### HasOs
+
+`func (o *ClusterJoinRequest) HasOs() bool`
+
+HasOs returns a boolean if a field has been set.
+
+### SetOsNil
+
+`func (o *ClusterJoinRequest) SetOsNil(b bool)`
+
+ SetOsNil sets the value for Os to be an explicit nil
+
+### UnsetOs
+`func (o *ClusterJoinRequest) UnsetOs()`
+
+UnsetOs ensures that no value is present for Os, not even an explicit nil
 ### GetOverlayPort
 
 `func (o *ClusterJoinRequest) GetOverlayPort() int32`
@@ -246,6 +345,41 @@ and a boolean to check if the value has been set.
 SetRaftPort sets RaftPort field to given value.
 
 
+### GetSecretsPubkey
+
+`func (o *ClusterJoinRequest) GetSecretsPubkey() []int32`
+
+GetSecretsPubkey returns the SecretsPubkey field if non-nil, zero value otherwise.
+
+### GetSecretsPubkeyOk
+
+`func (o *ClusterJoinRequest) GetSecretsPubkeyOk() (*[]int32, bool)`
+
+GetSecretsPubkeyOk returns a tuple with the SecretsPubkey field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetSecretsPubkey
+
+`func (o *ClusterJoinRequest) SetSecretsPubkey(v []int32)`
+
+SetSecretsPubkey sets SecretsPubkey field to given value.
+
+### HasSecretsPubkey
+
+`func (o *ClusterJoinRequest) HasSecretsPubkey() bool`
+
+HasSecretsPubkey returns a boolean if a field has been set.
+
+### SetSecretsPubkeyNil
+
+`func (o *ClusterJoinRequest) SetSecretsPubkeyNil(b bool)`
+
+ SetSecretsPubkeyNil sets the value for SecretsPubkey to be an explicit nil
+
+### UnsetSecretsPubkey
+`func (o *ClusterJoinRequest) UnsetSecretsPubkey()`
+
+UnsetSecretsPubkey ensures that no value is present for SecretsPubkey, not even an explicit nil
 ### GetServices
 
 `func (o *ClusterJoinRequest) GetServices() []string`

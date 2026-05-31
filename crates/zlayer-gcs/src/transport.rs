@@ -170,10 +170,22 @@ impl HvSocketInner {
 impl Drop for HvSocketInner {
     fn drop(&mut self) {
         if self.raw != INVALID_SOCKET.0 {
+            // Best-effort `shutdown(SD_BOTH)` BEFORE `closesocket`. Winsock
+            // documents that `closesocket` on a socket with pending blocking
+            // calls from other threads forces those calls to fail with
+            // `WSAEINTR` — but only after a brief grace period, and only for
+            // some blocking ops. A prior `shutdown` makes the wake-up of an
+            // in-flight blocking `accept`/`recv` on another thread immediate
+            // and deterministic, which is the difference between a clean
+            // teardown and a wedged tokio blocking-pool thread that prevents
+            // the runtime (and the test process) from ever exiting.
+            //
             // SAFETY: `raw` came from a successful `WSASocketW`/`accept`
             // call; we own the handle and have not closed it elsewhere
             // (Inner is wrapped in `Arc` so Drop only runs when the last
             // clone is released).
+            let _ = unsafe { shutdown(self.socket(), SD_BOTH) };
+            // SAFETY: same as above — exactly one `closesocket` per handle.
             let _ = unsafe { closesocket(self.socket()) };
         }
     }
@@ -376,13 +388,27 @@ impl HvSockListener {
 
     /// Accept the next inbound connection. Blocks (on the tokio blocking
     /// thread pool) until a peer connects.
+    ///
+    /// Cancellation safety: the blocking task captures only the raw `SOCKET`
+    /// handle (a `usize` newtype) — NOT an `Arc<HvSocketInner>` clone. If the
+    /// caller's future is dropped (e.g. `tokio::time::timeout` fires), the
+    /// listener's only remaining `Arc` reference drops, [`HvSocketInner::Drop`]
+    /// runs, and the `shutdown` + `closesocket` there force the blocking
+    /// `accept` to return `WSAEINTR`/`WSAENOTSOCK` instead of wedging the
+    /// blocking-pool thread forever (which would prevent the tokio runtime
+    /// — and the test process — from ever exiting).
     pub async fn accept(&self) -> GcsResult<HvSockStream> {
-        let inner = self.inner.clone();
+        let raw_socket = self.inner.socket();
         let accepted = tokio::task::spawn_blocking(move || -> GcsResult<SOCKET> {
-            // SAFETY: `inner.socket()` is a valid, bound, listening socket.
-            // `accept` allocates a new socket handle which we take
-            // ownership of (wrapped in `HvSocketInner` below).
-            let s = unsafe { accept(inner.socket(), None, None) }
+            // SAFETY: `raw_socket` is a valid, bound, listening socket owned
+            // by the caller's `HvSockListener` for the lifetime of this
+            // blocking call. If the listener is dropped concurrently, the
+            // socket will be `closesocket`-ed which makes `accept` return
+            // an error — but it will never be a use-after-free because
+            // Winsock handle values are not reused while the call is in
+            // flight on this thread. `accept` allocates a new socket handle
+            // which we take ownership of (wrapped in `HvSocketInner` below).
+            let s = unsafe { accept(raw_socket, None, None) }
                 .map_err(|e| GcsError::Hvsock(format!("accept: {e}")))?;
             Ok(s)
         })
@@ -425,5 +451,57 @@ mod tests {
         // Sanity check that the wildcard GUID literal is all zeros, as the
         // hcsshim source documents.
         assert_eq!(HV_GUID_WILDCARD.to_u128(), 0);
+    }
+
+    /// Regression test for the hour-long hang observed in the Hyper-V e2e
+    /// runs (`run-g4-retry` / `run-g4-retry-2`): when the bridge's `accept`
+    /// future hit its 120s timeout, the underlying blocking `accept()` on a
+    /// tokio blocking-pool thread wedged forever because the blocking task
+    /// captured a clone of the `Arc<HvSocketInner>` — preventing `Drop` from
+    /// ever running and `closesocket` from waking the syscall.
+    ///
+    /// With the fix, the blocking task only captures the raw `SOCKET` value;
+    /// when the listener drops, `HvSocketInner::Drop` runs `shutdown` +
+    /// `closesocket`, the blocking `accept` returns an error, and the
+    /// tokio runtime is free to shut down.
+    ///
+    /// Gated on Windows because hvsock is Windows-only and binding requires
+    /// the Hyper-V hvsock provider. If `bind` fails (no Hyper-V on the host)
+    /// we skip — the bug only manifests on a host that can actually bind.
+    #[tokio::test]
+    async fn accept_timeout_does_not_wedge_runtime() {
+        use std::time::{Duration, Instant};
+
+        // Use the wildcard listen address with a fresh per-process service
+        // GUID so reruns don't collide with leftover bound sockets.
+        let svc = windows::core::GUID::from_u128(
+            0xdead_beef_0000_4000_8000_0000_0000_0001_u128 ^ u128::from(std::process::id()),
+        );
+
+        let listener = match super::HvSockListener::bind(HV_GUID_WILDCARD, svc).await {
+            Ok(l) => l,
+            Err(_) => return, // No Hyper-V on this host — fix is unverifiable here.
+        };
+
+        let started = Instant::now();
+        let res = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            res.is_err(),
+            "accept should hit the timeout (no peer dials)"
+        );
+
+        // Drop the listener; this must trigger `HvSocketInner::Drop` which
+        // closes the socket and unblocks the wedged blocking-pool accept.
+        drop(listener);
+
+        // Give the blocking task a generous-but-bounded chance to return.
+        // Pre-fix this would hang for ~hours; post-fix it returns immediately
+        // once `closesocket` runs. We assert under 5s to leave huge headroom
+        // for slow CI hosts without making a regression invisible.
+        let total = started.elapsed();
+        assert!(
+            total < Duration::from_secs(5),
+            "accept_timeout test took {total:?}; regression: blocking pool wedged"
+        );
     }
 }

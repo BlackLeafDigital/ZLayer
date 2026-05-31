@@ -5,7 +5,7 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **CreatedAt** | **string** | RFC 3339 creation timestamp. For volumes without a sidecar this is the directory&#39;s mtime (best-effort). | 
-**InUseBy** | Pointer to **[]string** | Container IDs currently mounting this volume. Empty when no [&#x60;VolumeUsageSource&#x60;] is wired. | [optional] 
+**InUseBy** | Pointer to **[]string** | Container IDs currently mounting this volume. Empty when no &#x60;VolumeUsageSource&#x60; is wired. | [optional] 
 **Labels** | Pointer to **map[string]string** | Labels from the sidecar. Empty when no sidecar is present. | [optional] 
 **Name** | **string** | Volume name (directory name). | 
 **Path** | **string** | Host filesystem path. | 

@@ -5,7 +5,7 @@ All URIs are relative to *http://localhost*
 Method | HTTP request | Description
 ------------- | ------------- | -------------
 [**CreateUser**](UsersAPI.md#CreateUser) | **Post** /api/v1/users | Create a new user. Admin only.
-[**DeleteUser**](UsersAPI.md#DeleteUser) | **Delete** /api/v1/users/{id} | Delete a user. Admin only. Callers cannot delete their own account.
+[**DeleteUser**](UsersAPI.md#DeleteUser) | **Delete** /api/v1/users/{id} | Delete a user. Admin only. Callers cannot delete their own account. Idempotent — returns 204 whether the user existed or not.
 [**GetUser**](UsersAPI.md#GetUser) | **Get** /api/v1/users/{id} | Fetch a single user. Admins can read any record; regular users can read only their own.
 [**ListUsers**](UsersAPI.md#ListUsers) | **Get** /api/v1/users | List all users. Admin only.
 [**SetPassword**](UsersAPI.md#SetPassword) | **Post** /api/v1/users/{id}/password | Set a user&#39;s password. Admins may change any user&#39;s password; regular users may only change their own, and must supply &#x60;current_password&#x60;.
@@ -30,7 +30,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -83,7 +83,7 @@ No authorization required
 
 > DeleteUser(ctx, id).Execute()
 
-Delete a user. Admin only. Callers cannot delete their own account.
+Delete a user. Admin only. Callers cannot delete their own account. Idempotent — returns 204 whether the user existed or not.
 
 
 
@@ -96,7 +96,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -164,7 +164,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -234,7 +234,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -295,7 +295,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -365,7 +365,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {

@@ -122,6 +122,20 @@ pub struct ContainerApiState {
     /// daemon attached interactively — non-TTY containers have no entry, and
     /// the resize endpoint returns `400` for those.
     pub container_pty_resizers: Arc<DashMap<ContainerId, mpsc::Sender<(u16, u16)>>>,
+    /// Optional cluster handle. When `Some`, a create request carrying
+    /// `node_selector` / `platform` triggers cross-node placement: the leader
+    /// chooses a matching node and either creates locally or forwards the
+    /// request to the chosen node's internal create endpoint. `None` on
+    /// single-node / non-clustered daemons — placement fields are then ignored
+    /// and the container is always created locally.
+    pub cluster: Option<Arc<dyn zlayer_scheduler::cluster::Cluster>>,
+    /// Shared secret presented as `X-ZLayer-Internal-Token` on cross-node
+    /// container dispatch (both signing outbound forwards and validating the
+    /// inbound `/api/v1/internal/containers` endpoint). `None` disables the
+    /// internal endpoint and cross-node forwarding.
+    pub internal_token: Option<String>,
+    /// HTTP client reused for cross-node container forwarding.
+    pub http_client: reqwest::Client,
 }
 
 /// Metadata for a standalone container (not managed by a deployment)
@@ -167,6 +181,9 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -185,6 +202,9 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -207,6 +227,9 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -275,6 +298,24 @@ impl ContainerApiState {
     #[must_use]
     pub fn with_compose_storage(mut self, compose_storage: Arc<dyn ComposeProjectStorage>) -> Self {
         self.compose_storage = compose_storage;
+        self
+    }
+
+    /// Attach a cluster handle so container-create honors `node_selector` /
+    /// `platform` by placing across the cluster. Without it, those fields are
+    /// ignored and containers are always created locally.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<dyn zlayer_scheduler::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Set the shared internal token used to authenticate cross-node container
+    /// dispatch (outbound forwards and the inbound `/internal/containers`
+    /// endpoint).
+    #[must_use]
+    pub fn with_internal_token(mut self, token: String) -> Self {
+        self.internal_token = Some(token);
         self
     }
 
@@ -784,8 +825,8 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         cap_drop: request.cap_drop.clone(),
         privileged: request.privileged.unwrap_or(false),
         node_mode: NodeMode::default(),
-        node_selector: None,
-        platform: None,
+        node_selector: request.node_selector.clone(),
+        platform: request.platform.clone(),
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,
@@ -1153,6 +1194,21 @@ async fn rollback_attachments(
 ///
 /// Returns an error if image pull fails, container creation fails, or the
 /// user lacks the operator role.
+/// Header carrying the chosen node id on a leader→target dispatch. Its
+/// presence tells the receiving node "you were selected — create locally, do
+/// not re-run placement", which prevents forwarding loops.
+const PLACED_HEADER: &str = "X-ZLayer-Placed";
+
+/// Create and start a container (public, JWT-authenticated entry point).
+///
+/// When the daemon has a cluster handle and the request carries
+/// `node_selector` / `platform`, the request is placed across the cluster
+/// (see [`place_or_create`]); otherwise the container is created locally.
+///
+/// # Errors
+///
+/// Returns an error if image pull fails, container creation fails, no node
+/// satisfies the placement constraints, or the user lacks the operator role.
 #[utoipa::path(
     post,
     path = "/api/v1/containers",
@@ -1162,19 +1218,162 @@ async fn rollback_attachments(
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - operator role required"),
+        (status = 409, description = "No node satisfies the placement constraints"),
         (status = 500, description = "Internal error"),
     ),
     security(("bearer_auth" = [])),
     tag = "Containers"
 )]
-#[allow(clippy::too_many_lines)]
 pub async fn create_container(
     user: AuthUser,
     State(state): State<ContainerApiState>,
     Json(request): Json<CreateContainerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
     user.require_role("operator")?;
+    // Public clients never set the placed marker; placement (if any) is decided
+    // here, on the receiving node.
+    place_or_create(&state, request, false).await
+}
 
+/// Internal, token-authenticated container-create endpoint used for cross-node
+/// dispatch. Carries the same body as the public endpoint plus the
+/// [`PLACED_HEADER`]: when present the node creates locally (it was chosen by
+/// the leader); when absent the receiving node runs placement itself (used
+/// when a follower forwards to the leader).
+///
+/// # Errors
+///
+/// Returns `401` if the internal token is missing/invalid, or any error from
+/// [`place_or_create`].
+pub async fn create_container_internal(
+    State(state): State<ContainerApiState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CreateContainerRequest>,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let expected = state.internal_token.as_deref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("internal container API is not configured".to_string())
+    })?;
+    let provided = headers
+        .get(crate::handlers::internal::INTERNAL_AUTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if provided.is_empty() || provided != expected {
+        return Err(ApiError::Unauthorized(
+            "invalid or missing internal token".to_string(),
+        ));
+    }
+    let already_placed = headers
+        .get(PLACED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.is_empty());
+    place_or_create(&state, request, already_placed).await
+}
+
+/// Decide where a container runs and create it.
+///
+/// Fast path (create locally) when: there is no cluster handle, the request
+/// carries no `node_selector`/`platform`, or `already_placed` is set. Otherwise
+/// the leader computes placement via [`Cluster::place_container`]; a follower
+/// forwards the request to the leader first.
+async fn place_or_create(
+    state: &ContainerApiState,
+    request: CreateContainerRequest,
+    already_placed: bool,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let has_constraints = request.platform.is_some() || request.node_selector.is_some();
+    let Some(cluster) = state.cluster.clone() else {
+        return create_container_local(state, request).await;
+    };
+    if already_placed || !has_constraints {
+        return create_container_local(state, request).await;
+    }
+
+    // Placement is a leader-only decision. A follower forwards the (unplaced)
+    // request to the leader, which then runs this same logic.
+    if !cluster.is_leader().await {
+        let leader = cluster.leader_addr().await.ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "no cluster leader currently available to place the container".to_string(),
+            )
+        })?;
+        return forward_create(state, &format!("http://{leader}"), &request, false).await;
+    }
+
+    let spec = build_service_spec(&request)?;
+    let placement = cluster
+        .place_container(&spec)
+        .await
+        .map_err(|e| ApiError::Internal(format!("container placement failed: {e}")))?;
+    match placement {
+        None => Err(ApiError::Conflict(format!(
+            "no cluster node satisfies the requested placement (platform={:?}, node_selector={:?}, \
+             cpu={:?}, memory={:?})",
+            request.platform, request.node_selector, spec.resources.cpu, spec.resources.memory
+        ))),
+        Some(p) if p.is_self => create_container_local(state, request).await,
+        Some(p) => {
+            info!(
+                node_id = p.node_id,
+                target = %p.api_base_url,
+                "Dispatching one-off container to remote node"
+            );
+            forward_create(state, &p.api_base_url, &request, true).await
+        }
+    }
+}
+
+/// Forward a create request to another node's internal container endpoint.
+/// `placed` sets the [`PLACED_HEADER`] so the target creates locally instead of
+/// re-placing (used for leader→target); leave it `false` for follower→leader.
+async fn forward_create(
+    state: &ContainerApiState,
+    base_url: &str,
+    request: &CreateContainerRequest,
+    placed: bool,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let token = state.internal_token.clone().ok_or_else(|| {
+        ApiError::Internal(
+            "internal token not configured; cannot dispatch container cross-node".to_string(),
+        )
+    })?;
+    let url = format!("{base_url}/api/v1/containers/_dispatch");
+    let mut req = state
+        .http_client
+        .post(&url)
+        .header(crate::handlers::internal::INTERNAL_AUTH_HEADER, token)
+        .json(request)
+        .timeout(std::time::Duration::from_secs(300));
+    if placed {
+        req = req.header(PLACED_HEADER, "1");
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("forwarding container to {url} failed: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!(
+            "remote container create at {url} failed (HTTP {status}): {body}"
+        )));
+    }
+    let info: ContainerInfo = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("invalid response from {url}: {e}")))?;
+    Ok((axum::http::StatusCode::CREATED, Json(info)))
+}
+
+/// Create and start a container on the local node (no placement / forwarding).
+///
+/// # Errors
+///
+/// Returns an error if image pull fails or container creation/start fails.
+#[allow(clippy::too_many_lines)]
+async fn create_container_local(
+    state: &ContainerApiState,
+    request: CreateContainerRequest,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
     // Validate image
     if request.image.is_empty() {
         return Err(ApiError::BadRequest("Image is required".to_string()));

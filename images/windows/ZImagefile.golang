@@ -1,0 +1,12 @@
+base: ${REGISTRY}/base:windows-${LTSC}
+os: windows
+
+steps:
+  # Resolved by the Windows toolchain provisioner (download-once + cache in
+  # C:\toolchains, junction into the build) rather than choco — see
+  # crates/zlayer-builder/src/windows_toolchain.rs.
+  - run: apt-get install -y golang
+
+labels:
+  org.opencontainers.image.title: "ZLayer Windows Go"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

@@ -215,6 +215,17 @@ pub struct ContainerMemory {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct VirtualMachine {
+    /// Stop (rather than reboot) the VM when the guest issues a reset. hcsshim
+    /// sets this `true` for every utility VM (`create_wcow.go` /
+    /// `create_lcow.go`) so a guest-side bugcheck/reset surfaces as a clean
+    /// stop instead of an endless reboot loop. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_on_reset: bool,
+    /// Offline registry edits HCS applies to the guest's hives before first
+    /// boot. hcsshim populates this for WCOW UVMs (e.g. the `gns`
+    /// `EnableCompartmentNamespace` networking workaround). Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_changes: Option<RegistryChanges>,
     /// Chipset / firmware configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chipset: Option<Chipset>,
@@ -224,12 +235,106 @@ pub struct VirtualMachine {
     /// Attached devices (SCSI, `VirtualSMB`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devices: Option<Devices>,
+    /// Bugcheck / saved-state capture paths. When the guest OS bugchecks, HCS
+    /// snapshots VM state to these host-side files. hcsshim sets these whenever
+    /// a dump directory is configured (`create_wcow.go`); we use them to
+    /// diagnose early-boot guest crashes. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_options: Option<DebugOptions>,
     /// Guest-state (VHDX) configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_state: Option<GuestState>,
     /// Optional path where HCS should persist runtime state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_state_file_path: Option<String>,
+}
+
+/// Offline guest-registry edits applied before first boot. Mirrors hcsshim
+/// hcsschema `RegistryChanges` (`internal/hcs/schema2/registry_changes.go`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct RegistryChanges {
+    /// Registry values to add (or overwrite) in the guest hives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_values: Vec<RegistryValue>,
+}
+
+/// A single registry value to write. Mirrors hcsshim hcsschema `RegistryValue`.
+/// Exactly one of `string_value` / `binary_value` / `d_word_value` should be
+/// set depending on `r#type`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct RegistryValue {
+    /// The hive + subkey the value lives under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<RegistryKey>,
+    /// Value name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Value type — `DWord`, `String`, etc.
+    #[serde(rename = "Type", default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<RegistryValueType>,
+    /// `REG_SZ` / `REG_EXPAND_SZ` payload. For `REG_EXPAND_SZ`, embed
+    /// environment variable references like `%SystemRoot%` literally.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub string_value: String,
+    /// `REG_BINARY` payload, base64-encoded per HCS schema.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub binary_value: String,
+    /// `REG_DWORD` payload. Hcsshim's schema types this as `int32`.
+    #[serde(
+        rename = "DWordValue",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub d_word_value: Option<i32>,
+}
+
+/// A registry key location (hive + subkey path). Mirrors hcsshim
+/// hcsschema `RegistryKey`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct RegistryKey {
+    /// Which guest hive the subkey lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive: Option<RegistryHive>,
+    /// Subkey path relative to the hive root.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// Guest registry hive. Mirrors hcsshim hcsschema `RegistryHive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistryHive {
+    /// `HKLM\System`.
+    System,
+    /// `HKLM\Software`.
+    Software,
+    /// `HKLM\Security`.
+    Security,
+    /// `HKLM\Sam`.
+    Sam,
+}
+
+/// Guest registry value type. Mirrors hcsshim hcsschema `RegistryValueType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistryValueType {
+    /// `REG_NONE`.
+    None,
+    /// `REG_SZ`.
+    String,
+    /// `REG_EXPAND_SZ`.
+    ExpandedString,
+    /// `REG_MULTI_SZ`.
+    MultiString,
+    /// `REG_BINARY`.
+    Binary,
+    /// `REG_DWORD`.
+    #[serde(rename = "DWord")]
+    DWord,
+    /// `REG_QWORD`.
+    #[serde(rename = "QWord")]
+    QWord,
 }
 
 /// Chipset / firmware block of a virtual machine.
@@ -241,13 +346,36 @@ pub struct Chipset {
     pub uefi: Option<Uefi>,
 }
 
-/// UEFI firmware configuration.
+/// UEFI firmware configuration. Mirrors hcsshim
+/// `internal/hcs/schema2/uefi.go`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Uefi {
+    /// Tells the firmware to expose a UEFI-debugger transport. Distinct
+    /// from Windows kernel debug (that's a BCD setting). Wire field name
+    /// `EnableDebugger`, `omitempty` Go-side — we drop when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enable_debugger: bool,
+    /// One of the hcsshim Secure Boot template tokens (e.g. `"Skip"`,
+    /// `"MicrosoftWindows"`). Empty means "leave HCS default". Required
+    /// `"Skip"` value when the BCD has been patched to enable Windows
+    /// kernel debug — debug-mode kernels fail Secure Boot.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub apply_secure_boot_template: String,
+    /// Specific Secure Boot template GUID, when overriding the default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub secure_boot_template_id: String,
     /// Boot target selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_this: Option<UefiBootEntry>,
+    /// Redirect firmware POST output to a host-visible channel. Values
+    /// observed in hcsshim: `"Default"` (no redirect), `"ComPort1"` /
+    /// `"ComPort2"` (route to a `Devices.ComPorts[N]` named pipe). Setting
+    /// `"ComPort1"` paired with `Devices.ComPorts["0"].NamedPipe` gives
+    /// the host a readable stream of UEFI boot diagnostics without any
+    /// BCD patching of the guest VHDX.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console: String,
 }
 
 /// Single UEFI boot entry.
@@ -283,6 +411,16 @@ pub struct TopologyMemory {
     /// RAM assigned to the VM, in MiB.
     #[serde(rename = "SizeInMB")]
     pub size_in_mb: u64,
+    /// Enable memory overcommit. Hcsshim sets this on every WCOW UVM
+    /// (`internal/uvm/create_wcow.go` `prepareCommonConfigDoc`). Without it
+    /// Hyper-V's memory manager may refuse the reservation or pick a mode
+    /// that the in-guest GCS init path doesn't tolerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_overcommit: Option<bool>,
+    /// Hint to enable dynamic memory hot-add. Paired with `AllowOvercommit`
+    /// in hcsshim's reference doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_hot_hint: Option<bool>,
 }
 
 /// VM processor sizing.
@@ -293,10 +431,36 @@ pub struct TopologyProcessor {
     pub count: u32,
 }
 
+/// Hyper-V virtual serial port → host-side named pipe. Mirrors hcsshim
+/// `internal/hcs/schema2/com_port.go`.
+///
+/// Used to capture early-boot UEFI / firmware / (with BCD patch) kernel
+/// debug output that has no other channel — the in-guest GCS doesn't
+/// expose this and the standard event log is post-bugcheck-only.
+/// `OptimizeForDebugger=true` flips the emulated UART into KD-friendly
+/// framing (low latency, no buffering).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct ComPort {
+    /// Host named-pipe path the COM port is bridged to (e.g.
+    /// `\\.\pipe\zlayer-uvm-<guid>-com1`). Empty means "disconnected"
+    /// per hcsshim's docstring.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub named_pipe: String,
+    /// When true, emulate the UART in low-latency / no-buffering mode
+    /// suitable for windbg attach. Defaults false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optimize_for_debugger: bool,
+}
+
 /// VM device attachments.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Devices {
+    /// Virtual serial ports keyed by port index ("0" = COM1, "1" = COM2).
+    /// Empty when no COM redirect is wanted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub com_ports: BTreeMap<String, ComPort>,
     /// SCSI controllers keyed by their controller id (string-encoded index).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scsi: BTreeMap<String, ScsiController>,
@@ -314,6 +478,64 @@ pub struct Devices {
     /// authorizes SYSTEM/admin binds). Omitted when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hv_socket: Option<HvSocket2>,
+    /// Guest crash-dump reporting. When set, HCS writes a Windows kernel dump
+    /// to the configured host path on a guest bugcheck (subject to the guest
+    /// reaching crashdump init). Mirrors hcsshim
+    /// `Devices.GuestCrashReporting`. Omitted when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_crash_reporting: Option<GuestCrashReporting>,
+}
+
+/// Bugcheck / saved-state capture options for a `VirtualMachine`. Mirrors
+/// hcsshim hcsschema `DebugOptions` (`internal/hcs/schema2/debug_options.go`).
+///
+/// `BugcheckNoCrashdumpSavedStateFileName` is the load-bearing one for
+/// early-boot crashes: when the guest bugchecks before crashdump
+/// infrastructure is ready, HCS can still snapshot raw VM state to this file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct DebugOptions {
+    /// Host path for the saved-state (`.vmrs`) file written when the guest
+    /// crashes and a crashdump WAS produced.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bugcheck_saved_state_file_name: String,
+    /// Host path for the saved-state file written when the guest crashes but
+    /// could not produce a crashdump (typical of early-boot failures).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bugcheck_no_crashdump_saved_state_file_name: String,
+}
+
+/// Guest crash-reporting device block. Mirrors hcsshim hcsschema
+/// `GuestCrashReporting` (`internal/hcs/schema2/guest_crash_reporting.go`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct GuestCrashReporting {
+    /// Windows kernel-dump settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_crash_settings: Option<WindowsCrashReporting>,
+}
+
+/// Windows kernel crash-dump settings. Mirrors hcsshim hcsschema
+/// `WindowsCrashReporting` (`internal/hcs/schema2/windows_crash_reporting.go`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct WindowsCrashReporting {
+    /// Host path for the kernel dump (`.dmp`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dump_file_name: String,
+    /// Maximum dump size in bytes (0 = unlimited).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub max_dump_size: i64,
+    /// Dump type — e.g. `"Full"`, `"Mini"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dump_type: String,
+}
+
+/// Serde `skip_serializing_if` predicate for the `MaxDumpSize` field — omit it
+/// from the wire payload when zero (HCS treats absent as unlimited).
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires `&T`
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 /// Per-service `HvSocket` ACL entry. Mirrors hcsshim hcsschema `HvSocketServiceConfig`.

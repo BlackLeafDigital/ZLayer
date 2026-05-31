@@ -17,22 +17,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::diagnostics::ts_us;
+
 use tokio::sync::{oneshot, Mutex};
 
 use crate::error::{GcsError, GcsResult};
-use crate::frame::{self, RpcMessageType, HEADER_LEN, RESPONSE_TYPE_OFFSET};
-use crate::protocol::{NegotiateProtocolRequest, NegotiateProtocolResponse, RequestBase};
+use crate::frame::{self, RpcMessageType, HEADER_LEN, MSG_TYPE_MASK, MSG_TYPE_RESPONSE};
+use crate::protocol::{
+    NegotiateProtocolRequest, NegotiateProtocolResponse, ProtocolSupport, RequestBase, ResponseBase,
+};
 use crate::transport::{HvSockListener, HvSockStream, GCS_SERVICE_GUID};
+
+/// Null-GUID container ID sent on bridge-level RPCs that target the UVM
+/// itself rather than a hosted container. Mirrors hcsshim's
+/// `internal/gcs/guestconnection.go::nullContainerID`.
+const NULL_CONTAINER_ID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Default min/max GCS protocol version we negotiate. v4 is the version
 /// hcsshim's `internal/gcs/guestconnection.go` declares as of May 2026.
 pub const GCS_PROTOCOL_VERSION: u32 = 4;
 
-/// Map of message-id → oneshot sender awaiting the matching response frame.
-/// Entries are inserted by [`GcsBridge::send_rpc_json`] just before the
-/// request frame is written, and removed by the background reader when the
-/// response arrives (or by the sender path on write failure).
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<(u32, Vec<u8>)>>>>;
+/// Reader/writer rendezvous state, guarded by a single mutex so that "reader
+/// has exited" and "new waiter inserted" are mutually exclusive.
+///
+/// Without the `closed` flag, an RPC whose frame is written into a half-open
+/// socket *after* the background reader already drained `waiters` would block
+/// forever on its oneshot — there is no reader left to deliver a response or
+/// drop the sender. We observed exactly that: once the in-guest GCS closed the
+/// bridge immediately after `NegotiateProtocol`, the cold-start `Create` hung
+/// the whole test until the 1200s outer budget tripped.
+#[derive(Debug)]
+struct PendingState {
+    /// Set once the background reader exits (peer hangup / transport error).
+    /// Any [`GcsBridge::send_rpc_json`] that observes this returns
+    /// [`GcsError::Closed`] instead of installing a waiter that would never be
+    /// woken.
+    closed: bool,
+    /// In-flight message-id → oneshot sender awaiting the matching response
+    /// frame. Entries are inserted by [`GcsBridge::send_rpc_json`] just before
+    /// the request frame is written, and removed by the background reader when
+    /// the response arrives (or by the sender path on write failure).
+    waiters: HashMap<u64, oneshot::Sender<(u32, Vec<u8>)>>,
+}
+
+/// Shared, cloneable handle to the [`PendingState`].
+type PendingMap = Arc<Mutex<PendingState>>;
 
 /// Host-side GCS bridge to a single UVM.
 ///
@@ -62,11 +91,14 @@ impl GcsBridge {
         Ok(PendingGcsBridge { listener })
     }
 
-    /// Negotiate the GCS protocol version (returns the chosen version).
+    /// Negotiate the GCS protocol version and return the guest's declared
+    /// capabilities so the caller can drive the cold-start follow-up
+    /// (`Create`/`Start` against the null container id) per hcsshim's
+    /// `internal/gcs/guestconnection.go::connect`.
     ///
     /// Fails with [`GcsError::Negotiation`] if the guest returns a non-zero
     /// HRESULT or chooses a version outside the host's supported range.
-    pub async fn negotiate_protocol(&self) -> GcsResult<u32> {
+    pub async fn negotiate_protocol(&self) -> GcsResult<ProtocolSupport> {
         let req = NegotiateProtocolRequest {
             base: RequestBase {
                 activity_id: uuid::Uuid::new_v4(),
@@ -94,7 +126,78 @@ impl GcsBridge {
                 resp.version
             )));
         }
-        Ok(resp.version)
+        Ok(resp.capabilities)
+    }
+
+    /// Drive the cold-start RPC sequence the in-guest GCS expects
+    /// IMMEDIATELY after a successful `NegotiateProtocol`: an `RPCCreate`
+    /// against the null container id carrying `UvmConfig{SystemType:"Container"}`,
+    /// then (conditionally) `RPCStart`. Mirrors hcsshim's
+    /// `internal/gcs/guestconnection.go::connect` (lines 144-167) — if the
+    /// host skips these or sends an unrelated RPC first, the GCS closes the
+    /// bridge (we observed this verbatim:
+    /// `gcs-bridge-reader: header read failed after 1 frame(s): bridge closed`).
+    async fn cold_start_create_start(&self, caps: &ProtocolSupport) -> GcsResult<()> {
+        if !caps.send_host_create_message {
+            return Ok(());
+        }
+        // `ContainerConfig` is hcsshim's `AnyInString` — a JSON value
+        // serialised into a string field. The inner UvmConfig carries
+        // `SystemType` plus a `TimeZoneInformation` block: hcsshim's
+        // `internal/uvm/start.go::Start` ALWAYS sets a Timezone for Windows
+        // UVMs (the host's tz, or UTC when `noInheritHostTimezone` is set),
+        // so the in-guest gcs.exe is reached only via that code path in
+        // production. Omitting the field altogether (our prior `{SystemType}`-
+        // only body) causes the guest GCS to critical-process-die ~0.87ms
+        // after receiving Create — the bridge sees `header read failed
+        // after 1 frame(s): bridge closed` and Hyper-V-Worker eventid 18590
+        // fires with bugcheck 0xEF (`CRITICAL_PROCESS_DIED`). UTC is the
+        // safe default: matches hcsshim's `noInheritHostTimezone` branch
+        // and avoids plumbing the host's tz through (which would need a
+        // `windows`-only `GetDynamicTimeZoneInformation` call). All fields
+        // beyond `StandardName`/`DaylightName` are `omitempty` Go-side, so
+        // we send the minimum non-empty object the deserialiser will accept.
+        let uvm_config_str = serde_json::to_string(&serde_json::json!({
+            "SystemType": "Container",
+            "TimeZoneInformation": {
+                "StandardName": "UTC",
+                "DaylightName": "UTC",
+            },
+        }))?;
+        let create_body = serde_json::json!({
+            "ActivityId": uuid::Uuid::new_v4().to_string(),
+            "ContainerId": NULL_CONTAINER_ID,
+            "ContainerConfig": uvm_config_str,
+        });
+        let create_resp: ResponseBase = self
+            .send_rpc_json(RpcMessageType::Create, &create_body)
+            .await?;
+        if create_resp.result != 0 {
+            let hresult = u32::from_ne_bytes(create_resp.result.to_ne_bytes());
+            return Err(GcsError::Negotiation(format!(
+                "cold-start Create returned HRESULT {hresult:#x}: {}",
+                create_resp.error_message
+            )));
+        }
+
+        if !caps.send_host_start_message {
+            return Ok(());
+        }
+        let start_body = serde_json::json!({
+            "ActivityId": uuid::Uuid::new_v4().to_string(),
+            "ContainerId": NULL_CONTAINER_ID,
+        });
+        let start_resp: ResponseBase = self
+            .send_rpc_json(RpcMessageType::Start, &start_body)
+            .await?;
+        if start_resp.result != 0 {
+            let hresult = u32::from_ne_bytes(start_resp.result.to_ne_bytes());
+            return Err(GcsError::Negotiation(format!(
+                "cold-start Start returned HRESULT {hresult:#x}: {}",
+                start_resp.error_message
+            )));
+        }
+        Ok(())
     }
 
     /// Generic JSON-over-frame RPC dispatch with message-id correlation.
@@ -116,19 +219,33 @@ impl GcsBridge {
         let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
         frame::encode_frame(rpc.as_request_type(), message_id, &payload, &mut frame);
 
+        eprintln!(
+            "[t=+{}us] gcs-bridge-send: rpc={rpc:?} msg_id={message_id} frame_size={} payload_size={} payload={}",
+            ts_us(),
+            frame.len(),
+            payload.len(),
+            std::str::from_utf8(&payload).unwrap_or("<non-utf8>"),
+        );
+
         let (tx, rx) = oneshot::channel();
         {
             // Scoped lock — do not hold across the stream.write_all().await
             // below. This keeps the pending map available to the background
-            // reader task while the write is in flight.
+            // reader task while the write is in flight. If the reader has
+            // already exited (`closed`), bail now: writing the frame would
+            // either fail or buffer into a half-open socket, and the oneshot
+            // would never be woken.
             let mut guard = self.pending.lock().await;
-            guard.insert(message_id, tx);
+            if guard.closed {
+                return Err(GcsError::Closed);
+            }
+            guard.waiters.insert(message_id, tx);
         }
 
         if let Err(e) = self.stream.write_all(&frame).await {
             // Eagerly drop the waiter so the entry doesn't linger and so the
             // caller sees the underlying write error instead of Closed.
-            self.pending.lock().await.remove(&message_id);
+            self.pending.lock().await.waiters.remove(&message_id);
             return Err(e);
         }
 
@@ -151,28 +268,72 @@ impl GcsBridge {
         let stream = self.stream.clone();
         let pending = Arc::clone(&self.pending);
         tokio::spawn(async move {
+            // Diagnostic: emit to stderr (not tracing — the integration test
+            // doesn't init a subscriber) so the cause of any "bridge closed"
+            // lands in `stdout.log`. Verbose by design while the GCS protocol
+            // handshake is still being debugged on nanoserver:ltsc2022.
+            eprintln!("[t=+{}us] gcs-bridge-reader: started", ts_us());
+            let mut frames_seen: u32 = 0;
             loop {
                 let mut hdr_buf = [0u8; HEADER_LEN];
-                if stream.read_exact(&mut hdr_buf).await.is_err() {
+                if let Err(e) = stream.read_exact(&mut hdr_buf).await {
+                    eprintln!(
+                        "[t=+{}us] gcs-bridge-reader: header read failed after {frames_seen} frame(s): {e}",
+                        ts_us(),
+                    );
                     break;
                 }
-                let Ok(hdr) = frame::decode_header(&hdr_buf) else {
-                    break;
+                let hdr = match frame::decode_header(&hdr_buf) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!(
+                            "[t=+{}us] gcs-bridge-reader: header decode failed (bytes={hdr_buf:02x?}): {e}",
+                            ts_us(),
+                        );
+                        break;
+                    }
                 };
+                eprintln!(
+                    "[t=+{}us] gcs-bridge-reader: frame#{frames_seen} type=0x{:08x} size={} msg_id={}",
+                    ts_us(),
+                    hdr.r#type,
+                    hdr.size,
+                    hdr.message_id,
+                );
                 let body_len = (hdr.size as usize) - HEADER_LEN;
                 let mut body = vec![0u8; body_len];
-                if body_len > 0 && stream.read_exact(&mut body).await.is_err() {
-                    break;
+                if body_len > 0 {
+                    if let Err(e) = stream.read_exact(&mut body).await {
+                        eprintln!(
+                            "[t=+{}us] gcs-bridge-reader: body read failed (need {body_len} bytes): {e}",
+                            ts_us(),
+                        );
+                        break;
+                    }
+                    // Cap dumped payload at 512B so a verbose stream event
+                    // doesn't flood stdout.log.
+                    let cap = body.len().min(512);
+                    eprintln!(
+                        "[t=+{}us] gcs-bridge-reader: body[..{cap}]={:?}",
+                        ts_us(),
+                        String::from_utf8_lossy(&body[..cap]),
+                    );
                 }
-                // Stream events (CATEGORY_STREAM, asynchronous notifications)
-                // have no waiting request — currently we drop them. A future
-                // task can route them to a notification channel on the bridge.
-                if hdr.r#type & RESPONSE_TYPE_OFFSET == 0 {
+                frames_seen = frames_seen.saturating_add(1);
+                // Only RESPONSE frames are routed to an awaiting RPC waiter.
+                // Notification / stream frames have no caller — drop them
+                // here (a future task can plumb them to a notification
+                // channel). The previous bit check used `RESPONSE_TYPE_OFFSET
+                // = 0x1000_0000`, which is actually `MSG_TYPE_REQUEST` per
+                // hcsshim — so it would have routed REQUESTS and dropped
+                // RESPONSES, the exact opposite. We now use the proper top-4-
+                // bit mask so the dispatch only fires for responses.
+                if hdr.r#type & MSG_TYPE_MASK != MSG_TYPE_RESPONSE {
                     continue;
                 }
                 let waiter = {
                     let mut guard = pending.lock().await;
-                    guard.remove(&hdr.message_id)
+                    guard.waiters.remove(&hdr.message_id)
                 };
                 if let Some(tx) = waiter {
                     // Receiver may have been dropped (caller cancelled);
@@ -180,9 +341,21 @@ impl GcsBridge {
                     let _ = tx.send((hdr.r#type, body));
                 }
             }
-            // On reader exit, drop every pending sender to wake stuck RPCs
-            // with GcsError::Closed.
-            pending.lock().await.clear();
+            // On reader exit, mark the bridge closed and drop every pending
+            // sender to wake stuck RPCs with GcsError::Closed. Marking
+            // `closed` under the same lock that gates waiter insertion closes
+            // the race where a `send_rpc_json` that just passed the `closed`
+            // check installs a waiter no reader will ever wake.
+            {
+                let mut g = pending.lock().await;
+                eprintln!(
+                    "[t=+{}us] gcs-bridge-reader: exiting; dropping {} pending waiters",
+                    ts_us(),
+                    g.waiters.len(),
+                );
+                g.closed = true;
+                g.waiters.clear();
+            }
         });
     }
 }
@@ -215,10 +388,18 @@ impl PendingGcsBridge {
         let bridge = GcsBridge {
             stream,
             next_id: Arc::new(AtomicU64::new(1)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(PendingState {
+                closed: false,
+                waiters: HashMap::new(),
+            })),
         };
         bridge.spawn_reader();
-        bridge.negotiate_protocol().await?;
+        let caps = bridge.negotiate_protocol().await?;
+        // hcsshim sends Create+Start IMMEDIATELY after a successful
+        // negotiate, before any other RPC. Skipping this causes the peer to
+        // close the bridge ~instantly. See `cold_start_create_start` for
+        // the load-bearing detail.
+        bridge.cold_start_create_start(&caps).await?;
         Ok(bridge)
     }
 }

@@ -21,6 +21,7 @@
 )]
 
 pub mod bridge;
+pub mod diagnostics;
 pub mod error;
 pub mod frame;
 pub mod protocol;

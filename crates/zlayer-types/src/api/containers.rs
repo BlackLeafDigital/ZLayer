@@ -327,6 +327,20 @@ pub struct CreateContainerRequest {
     /// matches the historical behavior for callers that omit the field.
     #[serde(default)]
     pub lifecycle: crate::spec::LifecycleSpec,
+
+    // -- Placement ----------------------------------------------------------
+    /// Node selection constraints (required / preferred labels). When set on a
+    /// daemon that has a cluster handle, the leader places the container on a
+    /// node whose labels satisfy the required set; otherwise the field is
+    /// ignored and the container is created locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<crate::spec::NodeSelector>,
+    /// Target platform (OS + arch) the container must run on, e.g.
+    /// `darwin/arm64`. When set on a clustered daemon, the leader places the
+    /// container on a node whose reported platform matches; when no node
+    /// matches, the request is rejected. Ignored on single-node daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<crate::spec::TargetPlatform>,
 }
 
 /// A request to attach a freshly-created container to a user-defined bridge
@@ -921,6 +935,39 @@ mod tests {
             image: "nginx:latest".to_string(),
             ..CreateContainerRequest::default()
         }
+    }
+
+    #[test]
+    fn create_request_round_trips_placement_fields() {
+        use crate::spec::{ArchKind, NodeSelector, OsKind, TargetPlatform};
+
+        let mut req = baseline_request();
+        req.platform = Some(TargetPlatform::new(OsKind::Macos, ArchKind::Arm64));
+        req.node_selector = Some(NodeSelector {
+            labels: [("zone".to_string(), "us-east".to_string())]
+                .into_iter()
+                .collect(),
+            prefer_labels: std::collections::HashMap::new(),
+        });
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: CreateContainerRequest =
+            serde_json::from_str(&json).expect("deserialize round-trip");
+
+        let platform = back.platform.expect("platform present");
+        assert_eq!(platform.os, OsKind::Macos);
+        assert_eq!(platform.arch, ArchKind::Arm64);
+        let selector = back.node_selector.expect("node_selector present");
+        assert_eq!(
+            selector.labels.get("zone").map(String::as_str),
+            Some("us-east")
+        );
+
+        // Omitted placement fields must round-trip as None (skip_serializing_if).
+        let bare: CreateContainerRequest =
+            serde_json::from_str(r#"{"image":"nginx:latest"}"#).expect("deserialize bare");
+        assert!(bare.platform.is_none());
+        assert!(bare.node_selector.is_none());
     }
 
     #[test]

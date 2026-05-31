@@ -117,7 +117,7 @@ pub enum StorageTier {
 }
 
 /// Node selection constraints for service placement
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSelector {
     /// Required labels that nodes must have (all must match)

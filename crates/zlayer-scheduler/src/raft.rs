@@ -122,6 +122,10 @@ pub enum Request {
         /// Empty string for pre-slice-aware registrations — treated as "no slice".
         #[serde(default)]
         slice_cidr: String,
+        /// Free-form labels advertised by the node's agent for `NodeSelector`
+        /// placement matching. Empty for legacy registrations.
+        #[serde(default)]
+        labels: HashMap<String, String>,
     },
     /// Update node heartbeat with current resource usage
     UpdateNodeHeartbeat {
@@ -199,6 +203,15 @@ pub enum Request {
     ReleaseServiceSubnet {
         service_name: String,
         node_id: NodeId,
+    },
+    /// Set / remove labels on a registered node's `NodeInfo`. `set` entries are
+    /// inserted (overwriting any existing value); `remove` keys are deleted.
+    /// Backs `zlayer node label`. Appended at the end of the enum for postcard2
+    /// discriminant stability (see [`Request::AssignServiceSubnet`]).
+    SetNodeLabels {
+        node_id: NodeId,
+        set: HashMap<String, String>,
+        remove: Vec<String>,
     },
 }
 
@@ -445,6 +458,10 @@ pub struct NodeInfo {
     /// Empty string for pre-slice-aware registrations — treated as "no slice".
     #[serde(default)]
     pub slice_cidr: String,
+    /// Free-form labels advertised by this node's agent, used for
+    /// `NodeSelector` placement matching. Empty for legacy registrations.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 fn default_node_status() -> String {
@@ -516,6 +533,9 @@ pub struct AddMemberParams {
     /// Per-node slice of the cluster CIDR assigned by the leader (e.g. "10.200.42.0/28").
     /// Empty string for pre-slice-aware registrations — treated as "no slice".
     pub slice_cidr: String,
+    /// Free-form labels advertised by the joining agent for `NodeSelector`
+    /// placement matching. Empty when the joiner reported none.
+    pub labels: HashMap<String, String>,
 }
 
 impl ClusterState {
@@ -570,6 +590,7 @@ impl ClusterState {
                 os,
                 arch,
                 slice_cidr,
+                labels,
             } => self.apply_register_node(
                 *node_id,
                 address,
@@ -586,6 +607,7 @@ impl ClusterState {
                 *os,
                 *arch,
                 slice_cidr,
+                labels,
             ),
             Request::UpdateNodeHeartbeat {
                 node_id,
@@ -622,6 +644,27 @@ impl ClusterState {
                     node.mode.clone_from(mode);
                     Response::Success {
                         data: Some(format!("node {node_id} mode = {mode}")),
+                    }
+                } else {
+                    Response::Error {
+                        message: format!("Node not found: {node_id}"),
+                    }
+                }
+            }
+            Request::SetNodeLabels {
+                node_id,
+                set,
+                remove,
+            } => {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    for (k, v) in set {
+                        node.labels.insert(k.clone(), v.clone());
+                    }
+                    for k in remove {
+                        node.labels.remove(k);
+                    }
+                    Response::Success {
+                        data: Some(format!("node {node_id} labels updated")),
                     }
                 } else {
                     Response::Error {
@@ -815,6 +858,7 @@ impl ClusterState {
         os: Option<zlayer_spec::OsKind>,
         arch: Option<zlayer_spec::ArchKind>,
         slice_cidr: &str,
+        labels: &HashMap<String, String>,
     ) -> Response {
         let now = u64::try_from(
             std::time::SystemTime::now()
@@ -849,6 +893,7 @@ impl ClusterState {
                 os,
                 arch,
                 slice_cidr: slice_cidr.to_owned(),
+                labels: labels.clone(),
             },
         );
 
@@ -1364,6 +1409,7 @@ impl RaftCoordinator {
             os: params.os,
             arch: params.arch,
             slice_cidr: params.slice_cidr,
+            labels: params.labels,
         })
         .await?;
 
@@ -2124,6 +2170,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         let node = state.get_node(1).unwrap();
@@ -2153,6 +2200,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         let resp = state.apply(&Request::UpdateNodeMode {
@@ -2174,6 +2222,62 @@ mod tests {
         let missing = state.apply(&Request::UpdateNodeMode {
             node_id: 999,
             mode: "full".to_string(),
+        });
+        assert!(matches!(missing, Response::Error { .. }));
+    }
+
+    #[test]
+    fn set_node_labels_inserts_and_removes() {
+        let mut state = ClusterState::new();
+        state.apply(&Request::RegisterNode {
+            node_id: 7,
+            address: "10.0.0.7:9000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 4.0,
+            memory_total: 8_000_000_000,
+            disk_total: 100_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+            labels: HashMap::from([("zone".to_string(), "a".to_string())]),
+        });
+
+        // Insert one, overwrite an existing, then a second apply removes a key.
+        let set = HashMap::from([
+            ("zone".to_string(), "b".to_string()),
+            ("tier".to_string(), "edge".to_string()),
+        ]);
+        let resp = state.apply(&Request::SetNodeLabels {
+            node_id: 7,
+            set,
+            remove: vec![],
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        let labels = &state.get_node(7).unwrap().labels;
+        assert_eq!(labels.get("zone").map(String::as_str), Some("b"));
+        assert_eq!(labels.get("tier").map(String::as_str), Some("edge"));
+
+        let resp = state.apply(&Request::SetNodeLabels {
+            node_id: 7,
+            set: HashMap::new(),
+            remove: vec!["tier".to_string()],
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        let labels = &state.get_node(7).unwrap().labels;
+        assert!(!labels.contains_key("tier"));
+        assert_eq!(labels.get("zone").map(String::as_str), Some("b"));
+
+        // Unknown node id surfaces as an error.
+        let missing = state.apply(&Request::SetNodeLabels {
+            node_id: 999,
+            set: HashMap::new(),
+            remove: vec![],
         });
         assert!(matches!(missing, Response::Error { .. }));
     }
@@ -2222,6 +2326,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         // Save
@@ -2270,6 +2375,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         // Save
@@ -2315,6 +2421,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         let node = state.get_node(3).unwrap();

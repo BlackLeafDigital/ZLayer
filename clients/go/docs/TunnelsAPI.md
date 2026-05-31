@@ -4,6 +4,7 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
+[**CreateAccessSession**](TunnelsAPI.md#CreateAccessSession) | **Post** /api/v1/tunnels/access/sessions | Create a temporary access session for an existing tunneled service.
 [**CreateNodeTunnel**](TunnelsAPI.md#CreateNodeTunnel) | **Post** /api/v1/tunnels/node | Create a node-to-node tunnel.
 [**CreateTunnel**](TunnelsAPI.md#CreateTunnel) | **Post** /api/v1/tunnels | Create a new tunnel token.
 [**GetTunnelStatus**](TunnelsAPI.md#GetTunnelStatus) | **Get** /api/v1/tunnels/{id}/status | Get tunnel status.
@@ -11,6 +12,72 @@ Method | HTTP request | Description
 [**RemoveNodeTunnel**](TunnelsAPI.md#RemoveNodeTunnel) | **Delete** /api/v1/tunnels/node/{name} | Remove a node-to-node tunnel.
 [**RevokeTunnel**](TunnelsAPI.md#RevokeTunnel) | **Delete** /api/v1/tunnels/{id} | Revoke (delete) a tunnel.
 
+
+
+## CreateAccessSession
+
+> CreateAccessSessionResponse CreateAccessSession(ctx).CreateAccessSessionRequest(createAccessSessionRequest).Execute()
+
+Create a temporary access session for an existing tunneled service.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
+)
+
+func main() {
+	createAccessSessionRequest := *openapiclient.NewCreateAccessSessionRequest("Endpoint_example") // CreateAccessSessionRequest | 
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.TunnelsAPI.CreateAccessSession(context.Background()).CreateAccessSessionRequest(createAccessSessionRequest).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `TunnelsAPI.CreateAccessSession``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `CreateAccessSession`: CreateAccessSessionResponse
+	fmt.Fprintf(os.Stdout, "Response from `TunnelsAPI.CreateAccessSession`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiCreateAccessSessionRequest struct via the builder pattern
+
+
+Name | Type | Description  | Notes
+------------- | ------------- | ------------- | -------------
+ **createAccessSessionRequest** | [**CreateAccessSessionRequest**](CreateAccessSessionRequest.md) |  | 
+
+### Return type
+
+[**CreateAccessSessionResponse**](CreateAccessSessionResponse.md)
+
+### Authorization
+
+[bearer_auth](../README.md#bearer_auth)
+
+### HTTP request headers
+
+- **Content-Type**: application/json
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
 
 
 ## CreateNodeTunnel
@@ -30,7 +97,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -96,7 +163,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -162,7 +229,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -232,7 +299,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -293,7 +360,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -363,7 +430,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {

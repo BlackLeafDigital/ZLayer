@@ -177,40 +177,6 @@ pub async fn get_node(
     Err(ApiError::NotFound(format!("Node '{id}' not found")))
 }
 
-/// Update labels on a node.
-///
-/// # Errors
-///
-/// Returns an error if the node is not found or the user lacks permission.
-#[utoipa::path(
-    post,
-    path = "/api/v1/nodes/{id}/labels",
-    params(
-        ("id" = u64, Path, description = "Node identifier"),
-    ),
-    request_body = UpdateLabelsRequest,
-    responses(
-        (status = 200, description = "Labels updated", body = UpdateLabelsResponse),
-        (status = 404, description = "Node not found"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin role required"),
-    ),
-    security(("bearer_auth" = [])),
-    tag = "Nodes"
-)]
-pub async fn update_node_labels(
-    user: AuthUser,
-    State(_state): State<NodeApiState>,
-    Path(id): Path<u64>,
-    Json(_request): Json<UpdateLabelsRequest>,
-) -> Result<Json<UpdateLabelsResponse>> {
-    // Require admin role
-    user.require_role("admin")?;
-
-    // Placeholder: return not found until scheduler integration
-    Err(ApiError::NotFound(format!("Node '{id}' not found")))
-}
-
 /// Generate a join token for new nodes to join the cluster.
 ///
 /// # Errors

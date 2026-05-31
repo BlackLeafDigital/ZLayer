@@ -21,12 +21,26 @@ var _ MappedNullable = &CreateContainerRequest{}
 
 // CreateContainerRequest Request to create and start a container
 type CreateContainerRequest struct {
+	// Block IO weight, 10-1000 (Docker `--blkio-weight`).
+	BlkioWeight NullableInt32 `json:"blkio_weight,omitempty"`
+	// Linux capabilities to add (Docker `--cap-add`). Maps to `ServiceSpec::capabilities`.
+	CapAdd []string `json:"cap_add,omitempty"`
+	// Linux capabilities to drop (Docker `--cap-drop`).
+	CapDrop []string `json:"cap_drop,omitempty"`
 	// Command to run (overrides image entrypoint)
 	Command []string `json:"command,omitempty"`
+	// Relative CPU shares (Docker `--cpu-shares`). Default weight is 1024.
+	CpuShares NullableInt32 `json:"cpu_shares,omitempty"`
+	// CPUs that the container is allowed to execute on (Docker `--cpuset-cpus`).
+	Cpuset NullableString `json:"cpuset,omitempty"`
+	// Host devices to expose to the container (Docker `--device`).
+	Devices []DeviceSpec `json:"devices,omitempty"`
 	// Additional DNS servers (maps to Docker's `--dns`). Each entry must be a plausible IPv4 or IPv6 address.
 	Dns []string `json:"dns,omitempty"`
 	// Environment variables
 	Env map[string]string `json:"env,omitempty"`
+	// Additional groups to add to the container process (Docker `--group-add`).
+	ExtraGroups []string `json:"extra_groups,omitempty"`
 	// Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's `--add-host`). The special literal `host-gateway` is accepted as the `ip` half.
 	ExtraHosts []string `json:"extra_hosts,omitempty"`
 	// Optional health check. When omitted, the daemon installs a no-op placeholder (`HealthCheck::Tcp { port: 0 }`) matching the current default; the health monitor treats `port == 0` as \"skip\".
@@ -35,16 +49,46 @@ type CreateContainerRequest struct {
 	Hostname NullableString `json:"hostname,omitempty"`
 	// OCI image reference (e.g., \"nginx:latest\", \"ubuntu:22.04\")
 	Image string `json:"image"`
+	// Run a Docker-supplied init process (PID 1) inside the container (Docker `--init`). Distinct from `ZLayer`'s pre-start init actions.
+	InitContainer NullableBool `json:"init_container,omitempty"`
+	// IPC namespace mode (Docker `--ipc`). Accepts e.g. `\"host\"`, `\"shareable\"`, `\"private\"`, or `\"container:<id>\"`.
+	IpcMode NullableString `json:"ipc_mode,omitempty"`
 	// Labels for filtering and grouping
 	Labels map[string]string `json:"labels,omitempty"`
+	// Container lifecycle policy. Carries the `delete_on_exit` knob (Docker `--rm` / `HostConfig.AutoRemove`) so the daemon can remove terminated container records and bundles once they exit. Defaults to [`crate::spec::LifecycleSpec::default()`] (i.e. retain on exit), which matches the historical behavior for callers that omit the field.
+	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
+	// Soft memory limit (Docker `--memory-reservation`).
+	MemoryReservation NullableString `json:"memory_reservation,omitempty"`
+	// Total memory limit including swap (Docker `--memory-swap`).
+	MemorySwap NullableString `json:"memory_swap,omitempty"`
+	// Container memory swappiness, 0-100 (Docker `--memory-swappiness`).
+	MemorySwappiness NullableInt32 `json:"memory_swappiness,omitempty"`
 	// Optional human-readable name
 	Name NullableString `json:"name,omitempty"`
+	// Network mode (Docker `--network`). Accepts `\"default\"`, `\"host\"`, `\"none\"`, `\"bridge\"`, `\"bridge:<name>\"`, or `\"container:<id>\"`. When omitted, defaults to [`crate::spec::NetworkMode::Default`].
+	NetworkMode NullableNetworkMode `json:"network_mode,omitempty"`
 	// User-defined bridge/overlay networks to attach the newly-created container to. Each entry references a network by id or name and is attached after the container is successfully started. If any attachment fails, the partially-started container is rolled back (stopped + removed) and the request is failed.
 	Networks []NetworkAttachmentRequest `json:"networks,omitempty"`
+	// Node selection constraints (required / preferred labels). When set on a daemon that has a cluster handle, the leader places the container on a node whose labels satisfy the required set; otherwise the field is ignored and the container is created locally.
+	NodeSelector NullableNodeSelector `json:"node_selector,omitempty"`
+	// Disable the OOM killer for the container (Docker `--oom-kill-disable`).
+	OomKillDisable NullableBool `json:"oom_kill_disable,omitempty"`
+	// OOM-killer score adjustment (Docker `--oom-score-adj`).
+	OomScoreAdj NullableInt32 `json:"oom_score_adj,omitempty"`
+	// PID namespace mode (Docker `--pid`). Accepts e.g. `\"host\"` or `\"container:<id>\"`.
+	PidMode NullableString `json:"pid_mode,omitempty"`
+	// Maximum number of processes the container may spawn (Docker `--pids-limit`).
+	PidsLimit NullableInt64 `json:"pids_limit,omitempty"`
+	// Target platform (OS + arch) the container must run on, e.g. `darwin/arm64`. When set on a clustered daemon, the leader places the container on a node whose reported platform matches; when no node matches, the request is rejected. Ignored on single-node daemons.
+	Platform NullableTargetPlatform `json:"platform,omitempty"`
 	// Published ports (Docker's `-p host:container/proto`). When omitted, the container is created without any host port publishing.
 	Ports []PortMapping `json:"ports,omitempty"`
+	// Run the container in privileged mode (Docker `--privileged`). When omitted, defaults to `false`.
+	Privileged NullableBool `json:"privileged,omitempty"`
 	// Image pull policy: \"always\", \"`if_not_present`\", or \"never\"
 	PullPolicy NullableString `json:"pull_policy,omitempty"`
+	// Mount the container's root filesystem read-only (Docker `--read-only`).
+	ReadOnlyRootFs *bool `json:"read_only_root_fs,omitempty"`
 	// Inline Docker/OCI registry credentials used for this pull only. Not persisted, never logged, never echoed back on a response. When both `registry_credential_id` and `registry_auth` are set, this field takes precedence.
 	RegistryAuth NullableRegistryAuth `json:"registry_auth,omitempty"`
 	// Id of a persisted registry credential (from `POST /api/v1/credentials/registry`) to use when pulling the image. Ignored when [`Self::registry_auth`] is also supplied (inline auth wins). Requires the daemon to be configured with a credential store — otherwise the request is rejected with `400`.
@@ -53,6 +97,18 @@ type CreateContainerRequest struct {
 	Resources NullableContainerResourceLimits `json:"resources,omitempty"`
 	// Container restart policy (Docker-style). When omitted, the runtime applies no explicit restart policy (Docker default: `\"no\"`).
 	RestartPolicy NullableContainerRestartPolicy `json:"restart_policy,omitempty"`
+	// Security options such as `apparmor=...`, `seccomp=...`, `no-new-privileges:true` (Docker `--security-opt`).
+	SecurityOpt []string `json:"security_opt,omitempty"`
+	// Grace period to wait between the stop signal and a forced kill (Docker `--stop-timeout`). Wire format is a humantime string (e.g. `\"30s\"`, `\"500ms\"`, `\"1m\"`).
+	StopGracePeriod NullableString `json:"stop_grace_period,omitempty"`
+	// Signal sent to the container's main process to request a graceful shutdown (Docker `--stop-signal`). Accepts e.g. `\"SIGTERM\"` or `\"15\"`.
+	StopSignal NullableString `json:"stop_signal,omitempty"`
+	// Kernel sysctl overrides (Docker `--sysctl`).
+	Sysctls map[string]string `json:"sysctls,omitempty"`
+	// Per-process ulimits (Docker `--ulimit`).
+	Ulimits map[string]UlimitSpec `json:"ulimits,omitempty"`
+	// User and group override for the container's main process (Docker `--user uid:gid`).
+	User NullableString `json:"user,omitempty"`
 	// Volume mounts
 	Volumes []VolumeMount `json:"volumes,omitempty"`
 	// Working directory inside the container
@@ -77,6 +133,112 @@ func NewCreateContainerRequest(image string) *CreateContainerRequest {
 func NewCreateContainerRequestWithDefaults() *CreateContainerRequest {
 	this := CreateContainerRequest{}
 	return &this
+}
+
+// GetBlkioWeight returns the BlkioWeight field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetBlkioWeight() int32 {
+	if o == nil || IsNil(o.BlkioWeight.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.BlkioWeight.Get()
+}
+
+// GetBlkioWeightOk returns a tuple with the BlkioWeight field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetBlkioWeightOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.BlkioWeight.Get(), o.BlkioWeight.IsSet()
+}
+
+// HasBlkioWeight returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasBlkioWeight() bool {
+	if o != nil && o.BlkioWeight.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetBlkioWeight gets a reference to the given NullableInt32 and assigns it to the BlkioWeight field.
+func (o *CreateContainerRequest) SetBlkioWeight(v int32) {
+	o.BlkioWeight.Set(&v)
+}
+// SetBlkioWeightNil sets the value for BlkioWeight to be an explicit nil
+func (o *CreateContainerRequest) SetBlkioWeightNil() {
+	o.BlkioWeight.Set(nil)
+}
+
+// UnsetBlkioWeight ensures that no value is present for BlkioWeight, not even an explicit nil
+func (o *CreateContainerRequest) UnsetBlkioWeight() {
+	o.BlkioWeight.Unset()
+}
+
+// GetCapAdd returns the CapAdd field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetCapAdd() []string {
+	if o == nil || IsNil(o.CapAdd) {
+		var ret []string
+		return ret
+	}
+	return o.CapAdd
+}
+
+// GetCapAddOk returns a tuple with the CapAdd field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetCapAddOk() ([]string, bool) {
+	if o == nil || IsNil(o.CapAdd) {
+		return nil, false
+	}
+	return o.CapAdd, true
+}
+
+// HasCapAdd returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasCapAdd() bool {
+	if o != nil && !IsNil(o.CapAdd) {
+		return true
+	}
+
+	return false
+}
+
+// SetCapAdd gets a reference to the given []string and assigns it to the CapAdd field.
+func (o *CreateContainerRequest) SetCapAdd(v []string) {
+	o.CapAdd = v
+}
+
+// GetCapDrop returns the CapDrop field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetCapDrop() []string {
+	if o == nil || IsNil(o.CapDrop) {
+		var ret []string
+		return ret
+	}
+	return o.CapDrop
+}
+
+// GetCapDropOk returns a tuple with the CapDrop field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetCapDropOk() ([]string, bool) {
+	if o == nil || IsNil(o.CapDrop) {
+		return nil, false
+	}
+	return o.CapDrop, true
+}
+
+// HasCapDrop returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasCapDrop() bool {
+	if o != nil && !IsNil(o.CapDrop) {
+		return true
+	}
+
+	return false
+}
+
+// SetCapDrop gets a reference to the given []string and assigns it to the CapDrop field.
+func (o *CreateContainerRequest) SetCapDrop(v []string) {
+	o.CapDrop = v
 }
 
 // GetCommand returns the Command field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -110,6 +272,122 @@ func (o *CreateContainerRequest) HasCommand() bool {
 // SetCommand gets a reference to the given []string and assigns it to the Command field.
 func (o *CreateContainerRequest) SetCommand(v []string) {
 	o.Command = v
+}
+
+// GetCpuShares returns the CpuShares field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetCpuShares() int32 {
+	if o == nil || IsNil(o.CpuShares.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.CpuShares.Get()
+}
+
+// GetCpuSharesOk returns a tuple with the CpuShares field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetCpuSharesOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.CpuShares.Get(), o.CpuShares.IsSet()
+}
+
+// HasCpuShares returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasCpuShares() bool {
+	if o != nil && o.CpuShares.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetCpuShares gets a reference to the given NullableInt32 and assigns it to the CpuShares field.
+func (o *CreateContainerRequest) SetCpuShares(v int32) {
+	o.CpuShares.Set(&v)
+}
+// SetCpuSharesNil sets the value for CpuShares to be an explicit nil
+func (o *CreateContainerRequest) SetCpuSharesNil() {
+	o.CpuShares.Set(nil)
+}
+
+// UnsetCpuShares ensures that no value is present for CpuShares, not even an explicit nil
+func (o *CreateContainerRequest) UnsetCpuShares() {
+	o.CpuShares.Unset()
+}
+
+// GetCpuset returns the Cpuset field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetCpuset() string {
+	if o == nil || IsNil(o.Cpuset.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Cpuset.Get()
+}
+
+// GetCpusetOk returns a tuple with the Cpuset field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetCpusetOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Cpuset.Get(), o.Cpuset.IsSet()
+}
+
+// HasCpuset returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasCpuset() bool {
+	if o != nil && o.Cpuset.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetCpuset gets a reference to the given NullableString and assigns it to the Cpuset field.
+func (o *CreateContainerRequest) SetCpuset(v string) {
+	o.Cpuset.Set(&v)
+}
+// SetCpusetNil sets the value for Cpuset to be an explicit nil
+func (o *CreateContainerRequest) SetCpusetNil() {
+	o.Cpuset.Set(nil)
+}
+
+// UnsetCpuset ensures that no value is present for Cpuset, not even an explicit nil
+func (o *CreateContainerRequest) UnsetCpuset() {
+	o.Cpuset.Unset()
+}
+
+// GetDevices returns the Devices field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetDevices() []DeviceSpec {
+	if o == nil || IsNil(o.Devices) {
+		var ret []DeviceSpec
+		return ret
+	}
+	return o.Devices
+}
+
+// GetDevicesOk returns a tuple with the Devices field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetDevicesOk() ([]DeviceSpec, bool) {
+	if o == nil || IsNil(o.Devices) {
+		return nil, false
+	}
+	return o.Devices, true
+}
+
+// HasDevices returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasDevices() bool {
+	if o != nil && !IsNil(o.Devices) {
+		return true
+	}
+
+	return false
+}
+
+// SetDevices gets a reference to the given []DeviceSpec and assigns it to the Devices field.
+func (o *CreateContainerRequest) SetDevices(v []DeviceSpec) {
+	o.Devices = v
 }
 
 // GetDns returns the Dns field value if set, zero value otherwise.
@@ -174,6 +452,38 @@ func (o *CreateContainerRequest) HasEnv() bool {
 // SetEnv gets a reference to the given map[string]string and assigns it to the Env field.
 func (o *CreateContainerRequest) SetEnv(v map[string]string) {
 	o.Env = v
+}
+
+// GetExtraGroups returns the ExtraGroups field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetExtraGroups() []string {
+	if o == nil || IsNil(o.ExtraGroups) {
+		var ret []string
+		return ret
+	}
+	return o.ExtraGroups
+}
+
+// GetExtraGroupsOk returns a tuple with the ExtraGroups field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetExtraGroupsOk() ([]string, bool) {
+	if o == nil || IsNil(o.ExtraGroups) {
+		return nil, false
+	}
+	return o.ExtraGroups, true
+}
+
+// HasExtraGroups returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasExtraGroups() bool {
+	if o != nil && !IsNil(o.ExtraGroups) {
+		return true
+	}
+
+	return false
+}
+
+// SetExtraGroups gets a reference to the given []string and assigns it to the ExtraGroups field.
+func (o *CreateContainerRequest) SetExtraGroups(v []string) {
+	o.ExtraGroups = v
 }
 
 // GetExtraHosts returns the ExtraHosts field value if set, zero value otherwise.
@@ -316,6 +626,90 @@ func (o *CreateContainerRequest) SetImage(v string) {
 	o.Image = v
 }
 
+// GetInitContainer returns the InitContainer field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetInitContainer() bool {
+	if o == nil || IsNil(o.InitContainer.Get()) {
+		var ret bool
+		return ret
+	}
+	return *o.InitContainer.Get()
+}
+
+// GetInitContainerOk returns a tuple with the InitContainer field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetInitContainerOk() (*bool, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.InitContainer.Get(), o.InitContainer.IsSet()
+}
+
+// HasInitContainer returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasInitContainer() bool {
+	if o != nil && o.InitContainer.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetInitContainer gets a reference to the given NullableBool and assigns it to the InitContainer field.
+func (o *CreateContainerRequest) SetInitContainer(v bool) {
+	o.InitContainer.Set(&v)
+}
+// SetInitContainerNil sets the value for InitContainer to be an explicit nil
+func (o *CreateContainerRequest) SetInitContainerNil() {
+	o.InitContainer.Set(nil)
+}
+
+// UnsetInitContainer ensures that no value is present for InitContainer, not even an explicit nil
+func (o *CreateContainerRequest) UnsetInitContainer() {
+	o.InitContainer.Unset()
+}
+
+// GetIpcMode returns the IpcMode field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetIpcMode() string {
+	if o == nil || IsNil(o.IpcMode.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.IpcMode.Get()
+}
+
+// GetIpcModeOk returns a tuple with the IpcMode field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetIpcModeOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.IpcMode.Get(), o.IpcMode.IsSet()
+}
+
+// HasIpcMode returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasIpcMode() bool {
+	if o != nil && o.IpcMode.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetIpcMode gets a reference to the given NullableString and assigns it to the IpcMode field.
+func (o *CreateContainerRequest) SetIpcMode(v string) {
+	o.IpcMode.Set(&v)
+}
+// SetIpcModeNil sets the value for IpcMode to be an explicit nil
+func (o *CreateContainerRequest) SetIpcModeNil() {
+	o.IpcMode.Set(nil)
+}
+
+// UnsetIpcMode ensures that no value is present for IpcMode, not even an explicit nil
+func (o *CreateContainerRequest) UnsetIpcMode() {
+	o.IpcMode.Unset()
+}
+
 // GetLabels returns the Labels field value if set, zero value otherwise.
 func (o *CreateContainerRequest) GetLabels() map[string]string {
 	if o == nil || IsNil(o.Labels) {
@@ -346,6 +740,164 @@ func (o *CreateContainerRequest) HasLabels() bool {
 // SetLabels gets a reference to the given map[string]string and assigns it to the Labels field.
 func (o *CreateContainerRequest) SetLabels(v map[string]string) {
 	o.Labels = v
+}
+
+// GetLifecycle returns the Lifecycle field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetLifecycle() LifecycleSpec {
+	if o == nil || IsNil(o.Lifecycle) {
+		var ret LifecycleSpec
+		return ret
+	}
+	return *o.Lifecycle
+}
+
+// GetLifecycleOk returns a tuple with the Lifecycle field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetLifecycleOk() (*LifecycleSpec, bool) {
+	if o == nil || IsNil(o.Lifecycle) {
+		return nil, false
+	}
+	return o.Lifecycle, true
+}
+
+// HasLifecycle returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasLifecycle() bool {
+	if o != nil && !IsNil(o.Lifecycle) {
+		return true
+	}
+
+	return false
+}
+
+// SetLifecycle gets a reference to the given LifecycleSpec and assigns it to the Lifecycle field.
+func (o *CreateContainerRequest) SetLifecycle(v LifecycleSpec) {
+	o.Lifecycle = &v
+}
+
+// GetMemoryReservation returns the MemoryReservation field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetMemoryReservation() string {
+	if o == nil || IsNil(o.MemoryReservation.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.MemoryReservation.Get()
+}
+
+// GetMemoryReservationOk returns a tuple with the MemoryReservation field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetMemoryReservationOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.MemoryReservation.Get(), o.MemoryReservation.IsSet()
+}
+
+// HasMemoryReservation returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasMemoryReservation() bool {
+	if o != nil && o.MemoryReservation.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetMemoryReservation gets a reference to the given NullableString and assigns it to the MemoryReservation field.
+func (o *CreateContainerRequest) SetMemoryReservation(v string) {
+	o.MemoryReservation.Set(&v)
+}
+// SetMemoryReservationNil sets the value for MemoryReservation to be an explicit nil
+func (o *CreateContainerRequest) SetMemoryReservationNil() {
+	o.MemoryReservation.Set(nil)
+}
+
+// UnsetMemoryReservation ensures that no value is present for MemoryReservation, not even an explicit nil
+func (o *CreateContainerRequest) UnsetMemoryReservation() {
+	o.MemoryReservation.Unset()
+}
+
+// GetMemorySwap returns the MemorySwap field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetMemorySwap() string {
+	if o == nil || IsNil(o.MemorySwap.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.MemorySwap.Get()
+}
+
+// GetMemorySwapOk returns a tuple with the MemorySwap field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetMemorySwapOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.MemorySwap.Get(), o.MemorySwap.IsSet()
+}
+
+// HasMemorySwap returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasMemorySwap() bool {
+	if o != nil && o.MemorySwap.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetMemorySwap gets a reference to the given NullableString and assigns it to the MemorySwap field.
+func (o *CreateContainerRequest) SetMemorySwap(v string) {
+	o.MemorySwap.Set(&v)
+}
+// SetMemorySwapNil sets the value for MemorySwap to be an explicit nil
+func (o *CreateContainerRequest) SetMemorySwapNil() {
+	o.MemorySwap.Set(nil)
+}
+
+// UnsetMemorySwap ensures that no value is present for MemorySwap, not even an explicit nil
+func (o *CreateContainerRequest) UnsetMemorySwap() {
+	o.MemorySwap.Unset()
+}
+
+// GetMemorySwappiness returns the MemorySwappiness field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetMemorySwappiness() int32 {
+	if o == nil || IsNil(o.MemorySwappiness.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.MemorySwappiness.Get()
+}
+
+// GetMemorySwappinessOk returns a tuple with the MemorySwappiness field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetMemorySwappinessOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.MemorySwappiness.Get(), o.MemorySwappiness.IsSet()
+}
+
+// HasMemorySwappiness returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasMemorySwappiness() bool {
+	if o != nil && o.MemorySwappiness.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetMemorySwappiness gets a reference to the given NullableInt32 and assigns it to the MemorySwappiness field.
+func (o *CreateContainerRequest) SetMemorySwappiness(v int32) {
+	o.MemorySwappiness.Set(&v)
+}
+// SetMemorySwappinessNil sets the value for MemorySwappiness to be an explicit nil
+func (o *CreateContainerRequest) SetMemorySwappinessNil() {
+	o.MemorySwappiness.Set(nil)
+}
+
+// UnsetMemorySwappiness ensures that no value is present for MemorySwappiness, not even an explicit nil
+func (o *CreateContainerRequest) UnsetMemorySwappiness() {
+	o.MemorySwappiness.Unset()
 }
 
 // GetName returns the Name field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -390,6 +942,48 @@ func (o *CreateContainerRequest) UnsetName() {
 	o.Name.Unset()
 }
 
+// GetNetworkMode returns the NetworkMode field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetNetworkMode() NetworkMode {
+	if o == nil || IsNil(o.NetworkMode.Get()) {
+		var ret NetworkMode
+		return ret
+	}
+	return *o.NetworkMode.Get()
+}
+
+// GetNetworkModeOk returns a tuple with the NetworkMode field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetNetworkModeOk() (*NetworkMode, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.NetworkMode.Get(), o.NetworkMode.IsSet()
+}
+
+// HasNetworkMode returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasNetworkMode() bool {
+	if o != nil && o.NetworkMode.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetNetworkMode gets a reference to the given NullableNetworkMode and assigns it to the NetworkMode field.
+func (o *CreateContainerRequest) SetNetworkMode(v NetworkMode) {
+	o.NetworkMode.Set(&v)
+}
+// SetNetworkModeNil sets the value for NetworkMode to be an explicit nil
+func (o *CreateContainerRequest) SetNetworkModeNil() {
+	o.NetworkMode.Set(nil)
+}
+
+// UnsetNetworkMode ensures that no value is present for NetworkMode, not even an explicit nil
+func (o *CreateContainerRequest) UnsetNetworkMode() {
+	o.NetworkMode.Unset()
+}
+
 // GetNetworks returns the Networks field value if set, zero value otherwise.
 func (o *CreateContainerRequest) GetNetworks() []NetworkAttachmentRequest {
 	if o == nil || IsNil(o.Networks) {
@@ -422,6 +1016,258 @@ func (o *CreateContainerRequest) SetNetworks(v []NetworkAttachmentRequest) {
 	o.Networks = v
 }
 
+// GetNodeSelector returns the NodeSelector field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetNodeSelector() NodeSelector {
+	if o == nil || IsNil(o.NodeSelector.Get()) {
+		var ret NodeSelector
+		return ret
+	}
+	return *o.NodeSelector.Get()
+}
+
+// GetNodeSelectorOk returns a tuple with the NodeSelector field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetNodeSelectorOk() (*NodeSelector, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.NodeSelector.Get(), o.NodeSelector.IsSet()
+}
+
+// HasNodeSelector returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasNodeSelector() bool {
+	if o != nil && o.NodeSelector.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetNodeSelector gets a reference to the given NullableNodeSelector and assigns it to the NodeSelector field.
+func (o *CreateContainerRequest) SetNodeSelector(v NodeSelector) {
+	o.NodeSelector.Set(&v)
+}
+// SetNodeSelectorNil sets the value for NodeSelector to be an explicit nil
+func (o *CreateContainerRequest) SetNodeSelectorNil() {
+	o.NodeSelector.Set(nil)
+}
+
+// UnsetNodeSelector ensures that no value is present for NodeSelector, not even an explicit nil
+func (o *CreateContainerRequest) UnsetNodeSelector() {
+	o.NodeSelector.Unset()
+}
+
+// GetOomKillDisable returns the OomKillDisable field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetOomKillDisable() bool {
+	if o == nil || IsNil(o.OomKillDisable.Get()) {
+		var ret bool
+		return ret
+	}
+	return *o.OomKillDisable.Get()
+}
+
+// GetOomKillDisableOk returns a tuple with the OomKillDisable field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetOomKillDisableOk() (*bool, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.OomKillDisable.Get(), o.OomKillDisable.IsSet()
+}
+
+// HasOomKillDisable returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasOomKillDisable() bool {
+	if o != nil && o.OomKillDisable.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetOomKillDisable gets a reference to the given NullableBool and assigns it to the OomKillDisable field.
+func (o *CreateContainerRequest) SetOomKillDisable(v bool) {
+	o.OomKillDisable.Set(&v)
+}
+// SetOomKillDisableNil sets the value for OomKillDisable to be an explicit nil
+func (o *CreateContainerRequest) SetOomKillDisableNil() {
+	o.OomKillDisable.Set(nil)
+}
+
+// UnsetOomKillDisable ensures that no value is present for OomKillDisable, not even an explicit nil
+func (o *CreateContainerRequest) UnsetOomKillDisable() {
+	o.OomKillDisable.Unset()
+}
+
+// GetOomScoreAdj returns the OomScoreAdj field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetOomScoreAdj() int32 {
+	if o == nil || IsNil(o.OomScoreAdj.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.OomScoreAdj.Get()
+}
+
+// GetOomScoreAdjOk returns a tuple with the OomScoreAdj field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetOomScoreAdjOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.OomScoreAdj.Get(), o.OomScoreAdj.IsSet()
+}
+
+// HasOomScoreAdj returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasOomScoreAdj() bool {
+	if o != nil && o.OomScoreAdj.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetOomScoreAdj gets a reference to the given NullableInt32 and assigns it to the OomScoreAdj field.
+func (o *CreateContainerRequest) SetOomScoreAdj(v int32) {
+	o.OomScoreAdj.Set(&v)
+}
+// SetOomScoreAdjNil sets the value for OomScoreAdj to be an explicit nil
+func (o *CreateContainerRequest) SetOomScoreAdjNil() {
+	o.OomScoreAdj.Set(nil)
+}
+
+// UnsetOomScoreAdj ensures that no value is present for OomScoreAdj, not even an explicit nil
+func (o *CreateContainerRequest) UnsetOomScoreAdj() {
+	o.OomScoreAdj.Unset()
+}
+
+// GetPidMode returns the PidMode field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetPidMode() string {
+	if o == nil || IsNil(o.PidMode.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.PidMode.Get()
+}
+
+// GetPidModeOk returns a tuple with the PidMode field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetPidModeOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.PidMode.Get(), o.PidMode.IsSet()
+}
+
+// HasPidMode returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPidMode() bool {
+	if o != nil && o.PidMode.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetPidMode gets a reference to the given NullableString and assigns it to the PidMode field.
+func (o *CreateContainerRequest) SetPidMode(v string) {
+	o.PidMode.Set(&v)
+}
+// SetPidModeNil sets the value for PidMode to be an explicit nil
+func (o *CreateContainerRequest) SetPidModeNil() {
+	o.PidMode.Set(nil)
+}
+
+// UnsetPidMode ensures that no value is present for PidMode, not even an explicit nil
+func (o *CreateContainerRequest) UnsetPidMode() {
+	o.PidMode.Unset()
+}
+
+// GetPidsLimit returns the PidsLimit field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetPidsLimit() int64 {
+	if o == nil || IsNil(o.PidsLimit.Get()) {
+		var ret int64
+		return ret
+	}
+	return *o.PidsLimit.Get()
+}
+
+// GetPidsLimitOk returns a tuple with the PidsLimit field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetPidsLimitOk() (*int64, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.PidsLimit.Get(), o.PidsLimit.IsSet()
+}
+
+// HasPidsLimit returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPidsLimit() bool {
+	if o != nil && o.PidsLimit.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetPidsLimit gets a reference to the given NullableInt64 and assigns it to the PidsLimit field.
+func (o *CreateContainerRequest) SetPidsLimit(v int64) {
+	o.PidsLimit.Set(&v)
+}
+// SetPidsLimitNil sets the value for PidsLimit to be an explicit nil
+func (o *CreateContainerRequest) SetPidsLimitNil() {
+	o.PidsLimit.Set(nil)
+}
+
+// UnsetPidsLimit ensures that no value is present for PidsLimit, not even an explicit nil
+func (o *CreateContainerRequest) UnsetPidsLimit() {
+	o.PidsLimit.Unset()
+}
+
+// GetPlatform returns the Platform field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetPlatform() TargetPlatform {
+	if o == nil || IsNil(o.Platform.Get()) {
+		var ret TargetPlatform
+		return ret
+	}
+	return *o.Platform.Get()
+}
+
+// GetPlatformOk returns a tuple with the Platform field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetPlatformOk() (*TargetPlatform, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Platform.Get(), o.Platform.IsSet()
+}
+
+// HasPlatform returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPlatform() bool {
+	if o != nil && o.Platform.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetPlatform gets a reference to the given NullableTargetPlatform and assigns it to the Platform field.
+func (o *CreateContainerRequest) SetPlatform(v TargetPlatform) {
+	o.Platform.Set(&v)
+}
+// SetPlatformNil sets the value for Platform to be an explicit nil
+func (o *CreateContainerRequest) SetPlatformNil() {
+	o.Platform.Set(nil)
+}
+
+// UnsetPlatform ensures that no value is present for Platform, not even an explicit nil
+func (o *CreateContainerRequest) UnsetPlatform() {
+	o.Platform.Unset()
+}
+
 // GetPorts returns the Ports field value if set, zero value otherwise.
 func (o *CreateContainerRequest) GetPorts() []PortMapping {
 	if o == nil || IsNil(o.Ports) {
@@ -452,6 +1298,48 @@ func (o *CreateContainerRequest) HasPorts() bool {
 // SetPorts gets a reference to the given []PortMapping and assigns it to the Ports field.
 func (o *CreateContainerRequest) SetPorts(v []PortMapping) {
 	o.Ports = v
+}
+
+// GetPrivileged returns the Privileged field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetPrivileged() bool {
+	if o == nil || IsNil(o.Privileged.Get()) {
+		var ret bool
+		return ret
+	}
+	return *o.Privileged.Get()
+}
+
+// GetPrivilegedOk returns a tuple with the Privileged field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetPrivilegedOk() (*bool, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Privileged.Get(), o.Privileged.IsSet()
+}
+
+// HasPrivileged returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPrivileged() bool {
+	if o != nil && o.Privileged.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetPrivileged gets a reference to the given NullableBool and assigns it to the Privileged field.
+func (o *CreateContainerRequest) SetPrivileged(v bool) {
+	o.Privileged.Set(&v)
+}
+// SetPrivilegedNil sets the value for Privileged to be an explicit nil
+func (o *CreateContainerRequest) SetPrivilegedNil() {
+	o.Privileged.Set(nil)
+}
+
+// UnsetPrivileged ensures that no value is present for Privileged, not even an explicit nil
+func (o *CreateContainerRequest) UnsetPrivileged() {
+	o.Privileged.Unset()
 }
 
 // GetPullPolicy returns the PullPolicy field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -494,6 +1382,38 @@ func (o *CreateContainerRequest) SetPullPolicyNil() {
 // UnsetPullPolicy ensures that no value is present for PullPolicy, not even an explicit nil
 func (o *CreateContainerRequest) UnsetPullPolicy() {
 	o.PullPolicy.Unset()
+}
+
+// GetReadOnlyRootFs returns the ReadOnlyRootFs field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetReadOnlyRootFs() bool {
+	if o == nil || IsNil(o.ReadOnlyRootFs) {
+		var ret bool
+		return ret
+	}
+	return *o.ReadOnlyRootFs
+}
+
+// GetReadOnlyRootFsOk returns a tuple with the ReadOnlyRootFs field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetReadOnlyRootFsOk() (*bool, bool) {
+	if o == nil || IsNil(o.ReadOnlyRootFs) {
+		return nil, false
+	}
+	return o.ReadOnlyRootFs, true
+}
+
+// HasReadOnlyRootFs returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasReadOnlyRootFs() bool {
+	if o != nil && !IsNil(o.ReadOnlyRootFs) {
+		return true
+	}
+
+	return false
+}
+
+// SetReadOnlyRootFs gets a reference to the given bool and assigns it to the ReadOnlyRootFs field.
+func (o *CreateContainerRequest) SetReadOnlyRootFs(v bool) {
+	o.ReadOnlyRootFs = &v
 }
 
 // GetRegistryAuth returns the RegistryAuth field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -664,6 +1584,228 @@ func (o *CreateContainerRequest) UnsetRestartPolicy() {
 	o.RestartPolicy.Unset()
 }
 
+// GetSecurityOpt returns the SecurityOpt field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetSecurityOpt() []string {
+	if o == nil || IsNil(o.SecurityOpt) {
+		var ret []string
+		return ret
+	}
+	return o.SecurityOpt
+}
+
+// GetSecurityOptOk returns a tuple with the SecurityOpt field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetSecurityOptOk() ([]string, bool) {
+	if o == nil || IsNil(o.SecurityOpt) {
+		return nil, false
+	}
+	return o.SecurityOpt, true
+}
+
+// HasSecurityOpt returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasSecurityOpt() bool {
+	if o != nil && !IsNil(o.SecurityOpt) {
+		return true
+	}
+
+	return false
+}
+
+// SetSecurityOpt gets a reference to the given []string and assigns it to the SecurityOpt field.
+func (o *CreateContainerRequest) SetSecurityOpt(v []string) {
+	o.SecurityOpt = v
+}
+
+// GetStopGracePeriod returns the StopGracePeriod field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetStopGracePeriod() string {
+	if o == nil || IsNil(o.StopGracePeriod.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.StopGracePeriod.Get()
+}
+
+// GetStopGracePeriodOk returns a tuple with the StopGracePeriod field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetStopGracePeriodOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.StopGracePeriod.Get(), o.StopGracePeriod.IsSet()
+}
+
+// HasStopGracePeriod returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasStopGracePeriod() bool {
+	if o != nil && o.StopGracePeriod.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetStopGracePeriod gets a reference to the given NullableString and assigns it to the StopGracePeriod field.
+func (o *CreateContainerRequest) SetStopGracePeriod(v string) {
+	o.StopGracePeriod.Set(&v)
+}
+// SetStopGracePeriodNil sets the value for StopGracePeriod to be an explicit nil
+func (o *CreateContainerRequest) SetStopGracePeriodNil() {
+	o.StopGracePeriod.Set(nil)
+}
+
+// UnsetStopGracePeriod ensures that no value is present for StopGracePeriod, not even an explicit nil
+func (o *CreateContainerRequest) UnsetStopGracePeriod() {
+	o.StopGracePeriod.Unset()
+}
+
+// GetStopSignal returns the StopSignal field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetStopSignal() string {
+	if o == nil || IsNil(o.StopSignal.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.StopSignal.Get()
+}
+
+// GetStopSignalOk returns a tuple with the StopSignal field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetStopSignalOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.StopSignal.Get(), o.StopSignal.IsSet()
+}
+
+// HasStopSignal returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasStopSignal() bool {
+	if o != nil && o.StopSignal.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetStopSignal gets a reference to the given NullableString and assigns it to the StopSignal field.
+func (o *CreateContainerRequest) SetStopSignal(v string) {
+	o.StopSignal.Set(&v)
+}
+// SetStopSignalNil sets the value for StopSignal to be an explicit nil
+func (o *CreateContainerRequest) SetStopSignalNil() {
+	o.StopSignal.Set(nil)
+}
+
+// UnsetStopSignal ensures that no value is present for StopSignal, not even an explicit nil
+func (o *CreateContainerRequest) UnsetStopSignal() {
+	o.StopSignal.Unset()
+}
+
+// GetSysctls returns the Sysctls field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetSysctls() map[string]string {
+	if o == nil || IsNil(o.Sysctls) {
+		var ret map[string]string
+		return ret
+	}
+	return o.Sysctls
+}
+
+// GetSysctlsOk returns a tuple with the Sysctls field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetSysctlsOk() (map[string]string, bool) {
+	if o == nil || IsNil(o.Sysctls) {
+		return map[string]string{}, false
+	}
+	return o.Sysctls, true
+}
+
+// HasSysctls returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasSysctls() bool {
+	if o != nil && !IsNil(o.Sysctls) {
+		return true
+	}
+
+	return false
+}
+
+// SetSysctls gets a reference to the given map[string]string and assigns it to the Sysctls field.
+func (o *CreateContainerRequest) SetSysctls(v map[string]string) {
+	o.Sysctls = v
+}
+
+// GetUlimits returns the Ulimits field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetUlimits() map[string]UlimitSpec {
+	if o == nil || IsNil(o.Ulimits) {
+		var ret map[string]UlimitSpec
+		return ret
+	}
+	return o.Ulimits
+}
+
+// GetUlimitsOk returns a tuple with the Ulimits field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetUlimitsOk() (map[string]UlimitSpec, bool) {
+	if o == nil || IsNil(o.Ulimits) {
+		return map[string]UlimitSpec{}, false
+	}
+	return o.Ulimits, true
+}
+
+// HasUlimits returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasUlimits() bool {
+	if o != nil && !IsNil(o.Ulimits) {
+		return true
+	}
+
+	return false
+}
+
+// SetUlimits gets a reference to the given map[string]UlimitSpec and assigns it to the Ulimits field.
+func (o *CreateContainerRequest) SetUlimits(v map[string]UlimitSpec) {
+	o.Ulimits = v
+}
+
+// GetUser returns the User field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetUser() string {
+	if o == nil || IsNil(o.User.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.User.Get()
+}
+
+// GetUserOk returns a tuple with the User field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetUserOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.User.Get(), o.User.IsSet()
+}
+
+// HasUser returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasUser() bool {
+	if o != nil && o.User.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetUser gets a reference to the given NullableString and assigns it to the User field.
+func (o *CreateContainerRequest) SetUser(v string) {
+	o.User.Set(&v)
+}
+// SetUserNil sets the value for User to be an explicit nil
+func (o *CreateContainerRequest) SetUserNil() {
+	o.User.Set(nil)
+}
+
+// UnsetUser ensures that no value is present for User, not even an explicit nil
+func (o *CreateContainerRequest) UnsetUser() {
+	o.User.Unset()
+}
+
 // GetVolumes returns the Volumes field value if set, zero value otherwise.
 func (o *CreateContainerRequest) GetVolumes() []VolumeMount {
 	if o == nil || IsNil(o.Volumes) {
@@ -748,14 +1890,35 @@ func (o CreateContainerRequest) MarshalJSON() ([]byte, error) {
 
 func (o CreateContainerRequest) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
+	if o.BlkioWeight.IsSet() {
+		toSerialize["blkio_weight"] = o.BlkioWeight.Get()
+	}
+	if !IsNil(o.CapAdd) {
+		toSerialize["cap_add"] = o.CapAdd
+	}
+	if !IsNil(o.CapDrop) {
+		toSerialize["cap_drop"] = o.CapDrop
+	}
 	if o.Command != nil {
 		toSerialize["command"] = o.Command
+	}
+	if o.CpuShares.IsSet() {
+		toSerialize["cpu_shares"] = o.CpuShares.Get()
+	}
+	if o.Cpuset.IsSet() {
+		toSerialize["cpuset"] = o.Cpuset.Get()
+	}
+	if !IsNil(o.Devices) {
+		toSerialize["devices"] = o.Devices
 	}
 	if !IsNil(o.Dns) {
 		toSerialize["dns"] = o.Dns
 	}
 	if !IsNil(o.Env) {
 		toSerialize["env"] = o.Env
+	}
+	if !IsNil(o.ExtraGroups) {
+		toSerialize["extra_groups"] = o.ExtraGroups
 	}
 	if !IsNil(o.ExtraHosts) {
 		toSerialize["extra_hosts"] = o.ExtraHosts
@@ -767,20 +1930,65 @@ func (o CreateContainerRequest) ToMap() (map[string]interface{}, error) {
 		toSerialize["hostname"] = o.Hostname.Get()
 	}
 	toSerialize["image"] = o.Image
+	if o.InitContainer.IsSet() {
+		toSerialize["init_container"] = o.InitContainer.Get()
+	}
+	if o.IpcMode.IsSet() {
+		toSerialize["ipc_mode"] = o.IpcMode.Get()
+	}
 	if !IsNil(o.Labels) {
 		toSerialize["labels"] = o.Labels
+	}
+	if !IsNil(o.Lifecycle) {
+		toSerialize["lifecycle"] = o.Lifecycle
+	}
+	if o.MemoryReservation.IsSet() {
+		toSerialize["memory_reservation"] = o.MemoryReservation.Get()
+	}
+	if o.MemorySwap.IsSet() {
+		toSerialize["memory_swap"] = o.MemorySwap.Get()
+	}
+	if o.MemorySwappiness.IsSet() {
+		toSerialize["memory_swappiness"] = o.MemorySwappiness.Get()
 	}
 	if o.Name.IsSet() {
 		toSerialize["name"] = o.Name.Get()
 	}
+	if o.NetworkMode.IsSet() {
+		toSerialize["network_mode"] = o.NetworkMode.Get()
+	}
 	if !IsNil(o.Networks) {
 		toSerialize["networks"] = o.Networks
+	}
+	if o.NodeSelector.IsSet() {
+		toSerialize["node_selector"] = o.NodeSelector.Get()
+	}
+	if o.OomKillDisable.IsSet() {
+		toSerialize["oom_kill_disable"] = o.OomKillDisable.Get()
+	}
+	if o.OomScoreAdj.IsSet() {
+		toSerialize["oom_score_adj"] = o.OomScoreAdj.Get()
+	}
+	if o.PidMode.IsSet() {
+		toSerialize["pid_mode"] = o.PidMode.Get()
+	}
+	if o.PidsLimit.IsSet() {
+		toSerialize["pids_limit"] = o.PidsLimit.Get()
+	}
+	if o.Platform.IsSet() {
+		toSerialize["platform"] = o.Platform.Get()
 	}
 	if !IsNil(o.Ports) {
 		toSerialize["ports"] = o.Ports
 	}
+	if o.Privileged.IsSet() {
+		toSerialize["privileged"] = o.Privileged.Get()
+	}
 	if o.PullPolicy.IsSet() {
 		toSerialize["pull_policy"] = o.PullPolicy.Get()
+	}
+	if !IsNil(o.ReadOnlyRootFs) {
+		toSerialize["read_only_root_fs"] = o.ReadOnlyRootFs
 	}
 	if o.RegistryAuth.IsSet() {
 		toSerialize["registry_auth"] = o.RegistryAuth.Get()
@@ -793,6 +2001,24 @@ func (o CreateContainerRequest) ToMap() (map[string]interface{}, error) {
 	}
 	if o.RestartPolicy.IsSet() {
 		toSerialize["restart_policy"] = o.RestartPolicy.Get()
+	}
+	if !IsNil(o.SecurityOpt) {
+		toSerialize["security_opt"] = o.SecurityOpt
+	}
+	if o.StopGracePeriod.IsSet() {
+		toSerialize["stop_grace_period"] = o.StopGracePeriod.Get()
+	}
+	if o.StopSignal.IsSet() {
+		toSerialize["stop_signal"] = o.StopSignal.Get()
+	}
+	if !IsNil(o.Sysctls) {
+		toSerialize["sysctls"] = o.Sysctls
+	}
+	if !IsNil(o.Ulimits) {
+		toSerialize["ulimits"] = o.Ulimits
+	}
+	if o.User.IsSet() {
+		toSerialize["user"] = o.User.Get()
 	}
 	if !IsNil(o.Volumes) {
 		toSerialize["volumes"] = o.Volumes

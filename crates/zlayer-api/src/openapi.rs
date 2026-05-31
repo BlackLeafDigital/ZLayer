@@ -22,12 +22,13 @@ use crate::handlers::container_networks::{
 };
 use crate::handlers::containers::{
     ContainerChangeEntry, ContainerExecRequest, ContainerExecResponse, ContainerHealthInfo,
-    ContainerInfo, ContainerPortBinding, ContainerPortResponse, ContainerPruneResponse,
-    ContainerResourceLimits, ContainerStatsResponse, ContainerTopResponse, ContainerUpdateRequest,
-    ContainerUpdateResponse, ContainerUpdateRestartPolicy, ContainerWaitDockerError,
-    ContainerWaitDockerResponse, ContainerWaitResponse, CreateContainerRequest, HealthCheckRequest,
-    KillContainerRequest, NetworkAttachmentInfo, NetworkAttachmentRequest, RestartContainerRequest,
-    StopContainerRequest, VolumeMount, VolumeMountType,
+    ContainerInfo, ContainerLogFormat, ContainerPortBinding, ContainerPortResponse,
+    ContainerPruneResponse, ContainerResourceLimits, ContainerStatsResponse, ContainerTopResponse,
+    ContainerUpdateRequest, ContainerUpdateResponse, ContainerUpdateRestartPolicy,
+    ContainerWaitDockerError, ContainerWaitDockerResponse, ContainerWaitResponse,
+    CreateContainerRequest, HealthCheckRequest, KillContainerRequest, NetworkAttachmentInfo,
+    NetworkAttachmentRequest, RestartContainerRequest, StopContainerRequest, VolumeMount,
+    VolumeMountType,
 };
 use crate::handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, GitCredentialKindSchema,
@@ -111,7 +112,7 @@ use crate::handlers::build::{
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
     __path_cluster_list_gossip_peers, __path_cluster_list_nodes, __path_cluster_list_workers,
-    __path_cluster_upgrade, __path_cluster_upgrade_self,
+    __path_cluster_set_node_labels, __path_cluster_upgrade, __path_cluster_upgrade_self,
 };
 use crate::handlers::container_networks::{
     __path_connect_container_network, __path_create_container_network,
@@ -141,6 +142,9 @@ use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
     __path_get_deployment_spec, __path_list_deployments,
 };
+use crate::handlers::edge_cache::{
+    __path_disable_edge_cache, __path_edge_cache_stats, __path_enable_edge_cache,
+};
 use crate::handlers::environments::{
     __path_create_environment, __path_delete_environment, __path_get_environment,
     __path_list_environments, __path_update_environment,
@@ -167,9 +171,7 @@ use crate::handlers::networks::{
     __path_create_network, __path_delete_network, __path_get_network, __path_list_networks,
     __path_update_network,
 };
-use crate::handlers::nodes::{
-    __path_generate_join_token, __path_get_node, __path_list_nodes, __path_update_node_labels,
-};
+use crate::handlers::nodes::{__path_generate_join_token, __path_get_node, __path_list_nodes};
 use crate::handlers::notifiers::{
     __path_create_notifier, __path_delete_notifier, __path_get_notifier, __path_list_notifiers,
     __path_test_notifier, __path_update_notifier,
@@ -257,7 +259,7 @@ impl Modify for SecurityAddon {
         title = "ZLayer API",
         description = "Container orchestration API for ZLayer",
         version = "0.1.0",
-        license(name = "MIT OR Apache-2.0"),
+        license(name = "MIT OR Apache-2.0", identifier = "MIT OR Apache-2.0"),
         contact(
             name = "ZLayer",
             url = "https://zlayer.dev"
@@ -429,7 +431,7 @@ impl Modify for SecurityAddon {
         // Nodes
         list_nodes,
         get_node,
-        update_node_labels,
+        cluster_set_node_labels,
         generate_join_token,
         // Overlay
         get_overlay_status,
@@ -449,6 +451,10 @@ impl Modify for SecurityAddon {
         create_node_tunnel,
         remove_node_tunnel,
         create_access_session,
+        // Edge cache (Track A — upstream control-plane eligibility API)
+        enable_edge_cache,
+        disable_edge_cache,
+        edge_cache_stats,
         // Networks
         list_networks,
         get_network,
@@ -536,6 +542,7 @@ impl Modify for SecurityAddon {
             // Container schemas
             CreateContainerRequest,
             ContainerInfo,
+            ContainerLogFormat,
             ContainerResourceLimits,
             VolumeMount,
             VolumeMountType,
@@ -689,6 +696,10 @@ impl Modify for SecurityAddon {
             SuccessResponse,
             CreateAccessSessionRequest,
             CreateAccessSessionResponse,
+            // Edge-cache schemas
+            zlayer_types::api::edge_cache::EnableEdgeCacheRequest,
+            zlayer_types::api::edge_cache::EdgeCacheStatsResponse,
+            zlayer_types::api::edge_cache::NodeCapacityDto,
             // Network schemas
             NetworkSummary,
             // Container bridge / overlay network schemas

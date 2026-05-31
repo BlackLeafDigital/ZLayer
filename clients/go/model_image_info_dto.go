@@ -19,7 +19,7 @@ import (
 // checks if the ImageInfoDto type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &ImageInfoDto{}
 
-// ImageInfoDto Serializable wrapper for [`ImageInfo`] so we can attach `ToSchema` here (the underlying type in `zlayer-agent` can't depend on `utoipa`).
+// ImageInfoDto Serializable wrapper for `zlayer_agent::runtime::ImageInfo` so we can attach `ToSchema` here (the underlying type in `zlayer-agent` can't depend on `utoipa`).
 type ImageInfoDto struct {
 	// Content-addressed digest (`sha256:...`) if known.
 	Digest NullableString `json:"digest,omitempty"`

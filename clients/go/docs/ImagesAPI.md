@@ -29,7 +29,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -90,7 +90,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -136,7 +136,7 @@ Other parameters are passed through a pointer to a apiPruneImagesHandlerRequest 
 
 ## PullImageHandler
 
-> PullImageResponse PullImageHandler(ctx).PullImageRequest(pullImageRequest).Execute()
+> PullImageResponse PullImageHandler(ctx).PullImageRequest(pullImageRequest).Stream(stream).Execute()
 
 Pull an OCI image into the runtime's local cache.
 
@@ -151,15 +151,16 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
 	pullImageRequest := *openapiclient.NewPullImageRequest("Reference_example") // PullImageRequest | 
+	stream := true // bool | When `true`, stream NDJSON `PullProgressDto` events instead of a single JSON response. Defaults to `false` (snapshot pull). (optional)
 
 	configuration := openapiclient.NewConfiguration()
 	apiClient := openapiclient.NewAPIClient(configuration)
-	resp, r, err := apiClient.ImagesAPI.PullImageHandler(context.Background()).PullImageRequest(pullImageRequest).Execute()
+	resp, r, err := apiClient.ImagesAPI.PullImageHandler(context.Background()).PullImageRequest(pullImageRequest).Stream(stream).Execute()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error when calling `ImagesAPI.PullImageHandler``: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
@@ -181,6 +182,7 @@ Other parameters are passed through a pointer to a apiPullImageHandlerRequest st
 Name | Type | Description  | Notes
 ------------- | ------------- | ------------- | -------------
  **pullImageRequest** | [**PullImageRequest**](PullImageRequest.md) |  | 
+ **stream** | **bool** | When &#x60;true&#x60;, stream NDJSON &#x60;PullProgressDto&#x60; events instead of a single JSON response. Defaults to &#x60;false&#x60; (snapshot pull). | 
 
 ### Return type
 
@@ -217,7 +219,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -287,7 +289,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {

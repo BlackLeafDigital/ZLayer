@@ -44,8 +44,9 @@ pub use metrics::{
     ServiceMetrics,
 };
 pub use placement::{
-    can_place_on_node, place_service_replicas, validate_placement_feasibility, ContainerId,
-    NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
+    can_place_on_node, place_service_replicas, place_single_container,
+    validate_placement_feasibility, ContainerId, NodeResources, NodeState, PlacementDecision,
+    PlacementReason, PlacementState,
 };
 pub use raft::{
     force_leader_marker_path, load_and_clear_force_leader_state, save_force_leader_state,
@@ -1151,7 +1152,7 @@ pub(crate) fn cluster_nodes_to_node_states(
             placement::NodeState {
                 id: n.node_id,
                 address: n.advertise_addr.clone(),
-                labels: std::collections::HashMap::new(),
+                labels: n.labels.clone(),
                 resources,
                 healthy: true,
                 os: n.os,
@@ -1299,6 +1300,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: std::collections::HashMap::new(),
         }
     }
 
@@ -1327,6 +1329,32 @@ mod tests {
         assert_eq!(
             states[0].id, 1,
             "expected node 1 (ready) to be the only included node"
+        );
+    }
+
+    /// Node labels recorded at registration must survive the conversion into
+    /// the placement `NodeState` so `NodeSelector` matching actually works.
+    /// Guards against the prior bug where the conversion hardcoded an empty
+    /// label map, making label-based placement a silent no-op cluster-wide.
+    #[tokio::test]
+    async fn build_node_states_carries_labels() {
+        let mut info = make_node(1, "ready");
+        info.labels
+            .insert("zone".to_string(), "us-east".to_string());
+        info.labels.insert("tier".to_string(), "edge".to_string());
+        let mut nodes: HashMap<NodeId, NodeInfo> = HashMap::new();
+        nodes.insert(1, info);
+
+        let states = cluster_nodes_to_node_states(&nodes);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].labels.get("zone").map(String::as_str),
+            Some("us-east")
+        );
+        assert_eq!(
+            states[0].labels.get("tier").map(String::as_str),
+            Some("edge")
         );
     }
 }

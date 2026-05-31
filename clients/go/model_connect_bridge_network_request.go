@@ -25,7 +25,7 @@ type ConnectBridgeNetworkRequest struct {
 	Aliases []string `json:"aliases,omitempty"`
 	// Container id to attach.
 	ContainerId string `json:"container_id"`
-	// Optional static IPv4 to pin this container to. Validated as [`Ipv4Addr`].
+	// Optional static IPv4 to pin this container to. Validated as [`std::net::Ipv4Addr`].
 	Ipv4Address NullableString `json:"ipv4_address,omitempty"`
 }
 

@@ -568,6 +568,7 @@ pub async fn cluster_join(
             os: req.os,
             arch: req.arch,
             slice_cidr: slice_cidr.clone(),
+            labels: req.labels.clone(),
         })
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;
@@ -1944,6 +1945,53 @@ pub async fn cluster_set_node_mode(
     Ok(Json(NodeLifecycleResponse {
         node_id,
         status: req.mode,
+    }))
+}
+
+/// Set or remove labels on a node, persisted in raft cluster state so the
+/// scheduler's `NodeSelector` placement honors them. `labels` entries are
+/// inserted/overwritten; `remove` keys are deleted.
+///
+/// # Errors
+/// Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+/// or `Internal` on propose failure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/nodes/{id}/labels",
+    params(("id" = u64, Path, description = "Raft node id")),
+    request_body = crate::handlers::nodes::UpdateLabelsRequest,
+    responses(
+        (status = 200, description = "Labels updated", body = crate::handlers::nodes::UpdateLabelsResponse),
+        (status = 503, description = "Raft coordinator not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
+pub async fn cluster_set_node_labels(
+    State(state): State<ClusterApiState>,
+    axum::extract::Path(node_id): axum::extract::Path<u64>,
+    Json(req): Json<crate::handlers::nodes::UpdateLabelsRequest>,
+) -> Result<Json<crate::handlers::nodes::UpdateLabelsResponse>> {
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+    raft.propose(zlayer_scheduler::raft::Request::SetNodeLabels {
+        node_id,
+        set: req.labels.clone(),
+        remove: req.remove.clone(),
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("propose SetNodeLabels: {e}")))?;
+    let labels = raft
+        .read_state()
+        .await
+        .nodes
+        .get(&node_id)
+        .map(|n| n.labels.clone())
+        .unwrap_or_default();
+    Ok(Json(crate::handlers::nodes::UpdateLabelsResponse {
+        labels,
     }))
 }
 
@@ -3403,6 +3451,7 @@ mod tests {
             gpus: vec![],
             os: None,
             arch: None,
+            labels: std::collections::HashMap::new(),
             secrets_pubkey: None,
         };
         let result = cluster_join(State(state), Json(req)).await;

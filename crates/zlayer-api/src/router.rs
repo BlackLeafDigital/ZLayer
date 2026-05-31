@@ -42,6 +42,7 @@ use crate::handlers::containers::ContainerApiState;
 use crate::handlers::credentials::CredentialState;
 use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
+use crate::handlers::edge_cache::EdgeCacheApiState;
 use crate::handlers::environments::{EnvironmentsRouterState, EnvironmentsState};
 use crate::handlers::groups::GroupsState;
 use crate::handlers::internal::InternalState;
@@ -1173,9 +1174,35 @@ pub fn build_node_routes(node_state: NodeApiState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::nodes::list_nodes))
         .route("/{id}", get(handlers::nodes::get_node))
-        .route("/{id}/labels", post(handlers::nodes::update_node_labels))
         .route("/join-token", post(handlers::nodes::generate_join_token))
         .with_state(node_state)
+}
+
+/// Build routes for the edge-cache eligibility API.
+///
+/// The three endpoints expose the surface upstream callers (notably
+/// Zatabase's `zql_cluster::ClusterManager`) need to mark `ZLayer` nodes
+/// eligible for edge caching:
+///
+/// - `POST   /api/v1/nodes/{node_id}/edge-cache`
+/// - `DELETE /api/v1/nodes/{node_id}/edge-cache`
+/// - `GET    /api/v1/nodes/{node_id}/edge-cache/stats`
+///
+/// Both mutation endpoints require authentication. Stats is a documented
+/// placeholder today (always returns zeroes) — see
+/// [`crate::handlers::edge_cache`] for details.
+pub fn build_edge_cache_routes(state: EdgeCacheApiState) -> Router<()> {
+    Router::new()
+        .route(
+            "/api/v1/nodes/{node_id}/edge-cache",
+            post(handlers::edge_cache::enable_edge_cache)
+                .delete(handlers::edge_cache::disable_edge_cache),
+        )
+        .route(
+            "/api/v1/nodes/{node_id}/edge-cache/stats",
+            get(handlers::edge_cache::edge_cache_stats),
+        )
+        .with_state(state)
 }
 
 /// Build routes for overlay network status
@@ -1397,6 +1424,10 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
             put(handlers::cluster::cluster_set_node_mode),
         )
         .route(
+            "/nodes/{id}/labels",
+            post(handlers::cluster::cluster_set_node_labels),
+        )
+        .route(
             "/nodes/{id}/drain",
             put(handlers::cluster::cluster_drain_node),
         )
@@ -1457,6 +1488,13 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
     Router::new()
         .route("/", post(handlers::containers::create_container))
         .route("/", get(handlers::containers::list_containers))
+        // Internal, token-authenticated cross-node dispatch target. Mounted
+        // under the container routes (shares `ContainerApiState`); a static
+        // segment so it never shadows the `/{id}` param routes.
+        .route(
+            "/_dispatch",
+            post(handlers::containers::create_container_internal),
+        )
         .route("/{id}", get(handlers::containers::get_container))
         .route("/{id}", delete(handlers::containers::delete_container))
         .route("/{id}/logs", get(handlers::containers::get_container_logs))

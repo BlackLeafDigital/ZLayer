@@ -129,7 +129,7 @@ pub async fn unpack_windows_image(
             // the final layer dir and finalizes via `ProcessBaseLayer` — no
             // `HcsImportLayer` involved (that's only for `legacyLayerWriter`
             // staging dirs, i.e. diff layers).
-            extract_tar_to_backup_stream(&raw, &layer_path, true)?;
+            extract_tar_as_base_layer(&raw, &layer_path)?;
             wclayer::process_base_layer(&layer_path).map_err(|e| {
                 io::Error::other(format!(
                     "ProcessBaseLayer(layer={layer_idx} digest={} dest={}): {e}",
@@ -158,10 +158,22 @@ pub async fn unpack_windows_image(
             // Diff layer: materialize the legacy framed staging format, then
             // hand it to `HcsImportLayer` (source must differ from dest — see
             // `wclayer.rs:91-94`).
+            //
+            // Hardlink targets that point at files living in PARENT layers
+            // (every catroot `.cat`, every DriverStore `.inf`/`.sys`/`.dll`,
+            // including `\windows\system32\nanocontainersbridge.dll` —
+            // the in-guest GCS bridge DLL) are resolved here against the
+            // parents in reverse (newest-first) order. The actual link
+            // creation is deferred until after `HcsImportLayer` returns and
+            // the merged view exists at `layer_path` — see the post-import
+            // replay block below. Mirrors hcsshim's
+            // `legacyLayerWriter.AddLink` (target-resolution) +
+            // `legacyLayerWriterWrapper.Close` (post-import replay) split.
             let staging_path = dest_root.join(format!("{layer_id}.staging"));
             std::fs::create_dir_all(&staging_path)?;
-            extract_tar_to_backup_stream(&raw, &staging_path, false)?;
             let parent_chain = build_parent_chain(&chain_so_far);
+            let pending_links =
+                extract_tar_as_diff_layer(&raw, &staging_path, parent_chain.0.as_slice())?;
             wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
                 io::Error::other(format!(
                     "HcsImportLayer(layer={layer_idx} digest={} dest={}): {e}",
@@ -169,6 +181,26 @@ pub async fn unpack_windows_image(
                     layer_path.display()
                 ))
             })?;
+            // Post-import hardlink replay. The link target must exist in the
+            // merged destination dir (HcsImportLayer materialises the parent
+            // chain's files into `layer_path` before returning). We log + fail
+            // on missing targets rather than silently degrade, since the
+            // alternative (no link in the destination layer) is precisely the
+            // bug this fix addresses — silent file loss.
+            for link in &pending_links {
+                let dest_link = layer_path.join(&link.link_rel);
+                let dest_target = layer_path.join(&link.target_rel);
+                if let Err(e) = wclayer::link_relative(&layer_path, &dest_target, &dest_link) {
+                    return Err(io::Error::other(format!(
+                        "post-import hard_link({} -> {}) in layer {}: {e} \
+                         (target resolved from {} during tar walk)",
+                        dest_link.display(),
+                        dest_target.display(),
+                        layer_path.display(),
+                        link.target_origin,
+                    )));
+                }
+            }
             let _ = std::fs::remove_dir_all(&staging_path);
         }
 
@@ -266,15 +298,52 @@ fn verify_digest(bytes: &[u8], expected: &str) -> io::Result<()> {
 /// byte copy via the long-path-aware helper — hcsshim's `BackupFileWriter`
 /// interprets framing on the fly, so the staging-dir layout on disk is
 /// unframed.
-fn extract_tar_to_backup_stream(
-    tar_bytes: &[u8],
-    layer_path: &Path,
-    is_base_layer: bool,
-) -> io::Result<()> {
-    if is_base_layer {
-        extract_tar_as_base_layer(tar_bytes, layer_path)
-    } else {
-        extract_tar_as_diff_layer(tar_bytes, layer_path)
+/// A hardlink that could not be materialised during the tar walk because the
+/// link must be created in the IMPORTED layer dir (post-`HcsImportLayer`),
+/// not in the staging dir. Carries the resolved target so the post-import
+/// replay can fail loudly if the merged destination view is missing the file.
+///
+/// Mirrors hcsshim's `pendingLink { Path, Target, TargetRoot }` (see
+/// `internal/wclayer/legacy.go:740-784`). Our `target_origin` is the
+/// human-readable equivalent of hcsshim's `TargetRoot *os.File` handle —
+/// either "current staging dir" (the link target was added in this same
+/// layer) or the parent layer path it was resolved against.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingLink {
+    /// Forward-slash, archive-relative path of the link to create
+    /// (e.g. `Files/Windows/System32/foo.dll`).
+    pub link_rel: PathBuf,
+    /// Forward-slash, archive-relative path of the link target (e.g.
+    /// `Files/Windows/WinSxS/.../foo.dll`). Resolved in the destination
+    /// layer dir (post-import) against `layer_path / target_rel`.
+    pub target_rel: PathBuf,
+    /// Where the target was found during the tar walk. Used in error
+    /// messages to identify the layer the missing file was expected to
+    /// come from.
+    pub target_origin: TargetOrigin,
+}
+
+/// Provenance of a resolved hardlink target.
+#[derive(Debug, Clone)]
+pub(crate) enum TargetOrigin {
+    /// Target was added in the same layer's staging dir before the link
+    /// entry appeared. Post-import the file lives at `layer_path / rel`.
+    CurrentLayer,
+    /// Target was found in a parent layer's `Files/` tree. Post-import the
+    /// file lives at `layer_path / rel` because `HcsImportLayer` merges the
+    /// parent chain into the destination. The inner `PathBuf` records which
+    /// parent layer satisfied the lookup, surfaced verbatim in error
+    /// messages so a missing post-import target can be traced back to the
+    /// parent layer the file was expected to come from.
+    ParentLayer(PathBuf),
+}
+
+impl std::fmt::Display for TargetOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CurrentLayer => f.write_str("current layer's staging dir"),
+            Self::ParentLayer(p) => write!(f, "parent layer {}", p.display()),
+        }
     }
 }
 
@@ -282,12 +351,36 @@ fn extract_tar_to_backup_stream(
 /// `legacyLayerWriter` on-disk staging format: `.$wcidirs$` markers,
 /// 4-byte LE `FileAttributes` headers, verbatim `WIN32_STREAM_ID` records,
 /// raw `Hives/*` byte copies, and a `tombstones.txt` whiteout manifest.
-fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+///
+/// Returns a vector of pending hardlinks the caller MUST replay against the
+/// imported layer dir (NOT the staging dir) after `wclayer::import_layer`
+/// returns Ok. Hardlinks whose target lives in a parent layer cannot be
+/// created during extraction (the target file doesn't exist on disk yet —
+/// it only materialises into the destination after `HcsImportLayer` merges
+/// the parent chain). Mirrors hcsshim's `legacyLayerWriter.AddLink` +
+/// `legacyLayerWriterWrapper.Close` split (`internal/wclayer/legacy.go:733`
+/// + `internal/wclayer/importlayer.go:69-122`).
+///
+/// `parents` is the same child-to-parent ordered slice you'd hand to
+/// `wclayer::import_layer`; target resolution walks it in reverse (newest
+/// parent first) when the link's target was not added in this layer.
+#[allow(clippy::too_many_lines)]
+fn extract_tar_as_diff_layer(
+    tar_bytes: &[u8],
+    layer_path: &Path,
+    parents: &[Layer],
+) -> io::Result<Vec<PendingLink>> {
     use std::collections::HashSet;
 
     let mut archive = tar::Archive::new(tar_bytes);
-    // Hardlink replay queue: (link_path, target_path), both relative.
-    let mut pending_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Hardlink replay queue. Each entry carries (a) the link's archive-relative
+    // path and (b) the resolved target — either in this same layer's staging
+    // dir or in a parent layer's `Files/` tree.
+    let mut pending_links: Vec<PendingLink> = Vec::new();
+    // Track every regular-file (and hardlink) `Files/` entry materialised in
+    // this layer's staging dir. Mirrors hcsshim's `addedFiles map[string]bool`.
+    // Link targets check this set first before falling back to parent layers.
+    let mut added_files: HashSet<String> = HashSet::new();
     // Whiteout collector: relative target paths (forward-slash, no `.wh.`).
     let mut pending_tombstones: Vec<String> = Vec::new();
     // Track raw `tombstones.txt` presence so we APPEND rather than overwrite.
@@ -336,7 +429,12 @@ fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<
             create_long_path_dir_all(parent)?;
         }
 
-        // (2) Hardlink entries: defer until all targets are materialised.
+        // (2) Hardlink entries: NEVER materialise in the staging dir. They
+        // must be created in the IMPORTED layer dir after `HcsImportLayer`
+        // returns. Here we just resolve the target's provenance — current
+        // layer's staging dir vs a parent layer's `Files/` tree — and queue
+        // it for the post-import replay. Mirrors hcsshim's
+        // `legacyLayerWriter.AddLink` (`internal/wclayer/legacy.go:733-784`).
         if entry_type == tar::EntryType::Link {
             let link_target = entry.link_name()?.ok_or_else(|| {
                 io::Error::other(format!(
@@ -344,7 +442,60 @@ fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<
                     rel_path.display()
                 ))
             })?;
-            pending_links.push((rel_path.clone(), link_target.into_owned()));
+            let target_rel = link_target.into_owned();
+
+            // Normalise the target for `added_files` lookup. OCI tar uses
+            // forward slashes; `added_files` keys are stored the same way.
+            let target_key = path_to_forward_slash(&target_rel);
+            let link_key = path_to_forward_slash(&rel_path);
+
+            let origin = if added_files.contains(&target_key) {
+                TargetOrigin::CurrentLayer
+            } else {
+                // Walk parents in reverse (newest parent first → base layer
+                // last) mirroring how `legacyLayerWriter.AddLink` iterates
+                // its `parentRoots` slice. The chain is already
+                // child-to-parent ordered (first elem = immediate parent),
+                // so a forward iteration is "newest-first".
+                let mut found: Option<PathBuf> = None;
+                for parent in parents {
+                    let parent_root = PathBuf::from(&parent.path);
+                    let candidate = parent_root.join(&target_rel);
+                    if candidate.exists() {
+                        found = Some(parent_root);
+                        break;
+                    }
+                }
+                match found {
+                    Some(root) => TargetOrigin::ParentLayer(root),
+                    None => {
+                        // Match hcsshim's `AddLink`: a link with an
+                        // unresolvable target is a hard error, not a
+                        // silently-dropped entry. This is the exact bug we
+                        // are fixing — degrading here would mean shipping
+                        // an incomplete layer.
+                        return Err(io::Error::other(format!(
+                            "hardlink {} -> {}: target not found in this \
+                             layer's staging dir nor in any of the {} parent \
+                             layer(s)",
+                            link_key,
+                            target_key,
+                            parents.len(),
+                        )));
+                    }
+                }
+            };
+
+            // Record the link itself as "added" so a subsequent link whose
+            // target is THIS link's path still resolves locally. Matches
+            // hcsshim's `w.addedFiles[name] = true` at the end of
+            // `AddLink`.
+            added_files.insert(link_key.clone());
+            pending_links.push(PendingLink {
+                link_rel: rel_path.clone(),
+                target_rel: target_rel.clone(),
+                target_origin: origin,
+            });
             continue;
         }
 
@@ -358,6 +509,7 @@ fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<
         let is_files_payload = rel_str.starts_with("Files/") || rel_str.starts_with("Files\\");
         if is_files_payload {
             backuptar::write_oci_entry_to_backup_stream(&mut entry, &dest)?;
+            added_files.insert(path_to_forward_slash(&rel_path));
         } else {
             // Non-`Files/` payloads (`tombstones.txt`, `Hives/*`, `UtilityVM/`)
             // are raw byte copies. `std::fs::File::create` here would hit
@@ -369,26 +521,12 @@ fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<
             if rel_str == "tombstones.txt" || rel_str == "tombstones" {
                 raw_tombstones_written = true;
             }
-        }
-    }
-
-    // Replay pending hardlinks. The target must exist on disk by now (the
-    // main walk is complete) — if it doesn't we surface the error rather
-    // than silently degrade, since downstream HCS will fail anyway.
-    for (link_rel, target_rel) in pending_links {
-        let link_abs = layer_path.join(&link_rel);
-        // Resolve target relative to the staging root. OCI hardlinks use
-        // archive-relative target paths.
-        let target_abs = layer_path.join(&target_rel);
-        if let Some(parent) = link_abs.parent() {
-            create_long_path_dir_all(parent)?;
-        }
-        if let Err(e) = std::fs::hard_link(&target_abs, &link_abs) {
-            return Err(io::Error::other(format!(
-                "hard_link({} -> {}): {e}",
-                link_abs.display(),
-                target_abs.display()
-            )));
+            // UtilityVM files can also be hardlink targets (the in-guest GCS
+            // bridge DLL itself lives under `Files/Windows/System32/`, but
+            // some auxiliary entries live under `UtilityVM/Files/`).
+            // Tracking them in `added_files` keeps the resolution table
+            // complete.
+            added_files.insert(path_to_forward_slash(&rel_path));
         }
     }
 
@@ -421,7 +559,18 @@ fn extract_tar_as_diff_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<
         std::io::Write::write_all(&mut f, body.as_bytes())?;
     }
 
-    Ok(())
+    Ok(pending_links)
+}
+
+/// Convert an archive-relative `Path` into the forward-slash, no-leading-slash
+/// string form used as the `added_files` lookup key and as the canonical OCI
+/// tar path representation. Matches Go's `filepath.Clean` + `filepath.ToSlash`
+/// pipeline that hcsshim runs over `hdr.Name` / `hdr.Linkname`.
+fn path_to_forward_slash(p: &Path) -> String {
+    p.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// Base-layer (parent-chain empty) tar walk — emits the hcsshim

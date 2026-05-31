@@ -23,7 +23,7 @@ var _ MappedNullable = &VolumeInfo{}
 type VolumeInfo struct {
 	// RFC 3339 creation timestamp. For volumes without a sidecar this is the directory's mtime (best-effort).
 	CreatedAt string `json:"created_at"`
-	// Container IDs currently mounting this volume. Empty when no [`VolumeUsageSource`] is wired.
+	// Container IDs currently mounting this volume. Empty when no `VolumeUsageSource` is wired.
 	InUseBy []string `json:"in_use_by,omitempty"`
 	// Labels from the sidecar. Empty when no sidecar is present.
 	Labels map[string]string `json:"labels,omitempty"`

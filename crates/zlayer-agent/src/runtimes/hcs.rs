@@ -92,11 +92,12 @@ use zlayer_hcs::enumerate;
 use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
     Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
-    ContainerProcessor, Devices, GpuAssignment, GpuAssignmentMode, GpuAssignmentRequest,
-    GuestOs as HcsGuestOs, HvSocket2, HvSocketSystemConfig, ProcessParameters, SchemaVersion,
-    ScsiAttachment, ScsiController, Statistics, Storage as HcsStorage, Topology, TopologyMemory,
-    TopologyProcessor, Uefi, UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare,
-    VirtualSmbShareOptions,
+    ContainerProcessor, DebugOptions, Devices, GpuAssignment, GpuAssignmentMode,
+    GpuAssignmentRequest, GuestCrashReporting, GuestOs as HcsGuestOs, HvSocket2,
+    HvSocketServiceConfig, HvSocketSystemConfig, ProcessParameters, RegistryChanges, RegistryHive,
+    RegistryKey, RegistryValue, RegistryValueType, SchemaVersion, ScsiAttachment, ScsiController,
+    Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi,
+    UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare, VirtualSmbShareOptions,
 };
 use zlayer_hcs::system::ComputeSystem;
 
@@ -1471,11 +1472,29 @@ impl HcsRuntime {
     ) -> Result<(ComputeSystem, HyperVGcsState)> {
         use uuid::Uuid;
         use zlayer_gcs::bridge::GcsBridge;
+        use zlayer_gcs::diagnostics::ts_us;
         use zlayer_gcs::frame::RpcMessageType;
         use zlayer_gcs::protocol::{
             CreateRequest, CreateResponse, ModifySettingsRequest, ModifySettingsResponse,
             RequestBase, StartRequest, StartResponse,
         };
+
+        // Mirror every Hyper-V step transition to stderr alongside
+        // `gcs-bridge-send` / `gcs-bridge-reader` so the test stdout has a
+        // single monotonically-timestamped timeline of host-side activity
+        // (the cargo test harness doesn't init a tracing subscriber, so
+        // `tracing::info!` alone is invisible). Sharing
+        // [`zlayer_gcs::diagnostics::ts_us`]'s epoch keeps these aligned
+        // with the bridge log microsecond-for-microsecond.
+        macro_rules! step_log {
+            ($($arg:tt)*) => {{
+                eprintln!(
+                    "[t=+{}us] hcs_id={hcs_id} Hyper-V step: {}",
+                    ts_us(),
+                    format_args!($($arg)*),
+                );
+            }};
+        }
 
         // GPU adapter probe — Hyper-V isolation supports GPU-PV when the
         // workload requests it. Mirrors the gating in
@@ -1539,6 +1558,10 @@ impl HcsRuntime {
             parents = parent_layers.len(),
             "Hyper-V step 1b: HcsGrantVmAccess on parent layer dirs",
         );
+        step_log!(
+            "1b: HcsGrantVmAccess on parent layer dirs ({} parents)",
+            parent_layers.len()
+        );
         for layer in parent_layers {
             crate::windows::wclayer::grant_vm_access(
                 uvm.runtime_id(),
@@ -1573,6 +1596,7 @@ impl HcsRuntime {
             uvm_system_id = %uvm_system_id,
             "Hyper-V step 2: HcsCreateComputeSystem (UVM)"
         );
+        step_log!("2: HcsCreateComputeSystem (UVM) uvm_system_id={uvm_system_id}");
         let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
@@ -1592,6 +1616,15 @@ impl HcsRuntime {
             runtime_id = %format_guid_bare(uvm.runtime_id()),
             "Hyper-V step 3a: GcsBridge::listen (bind host hvsock listener)"
         );
+        step_log!(
+            "3a: GcsBridge::listen (bind host hvsock listener) runtime_id={}",
+            format_guid_bare(uvm.runtime_id())
+        );
+        // Bind on (uvm.runtime_id, GCS service GUID) — matches hcsshim
+        // create_wcow.go:126-142 (`winio.ListenHvsock{VMID: uvm.runtimeID,
+        // ServiceID: gcsServiceID}`). A wildcard-VMID variant was tested and
+        // produced the same timeout, ruling out a runtime_id≠partition-GUID
+        // routing mismatch — the in-guest GCS service is not dialing at all.
         let pending_bridge =
             GcsBridge::listen(uvm.runtime_id())
                 .await
@@ -1604,6 +1637,7 @@ impl HcsRuntime {
         // Step 3: HcsStartComputeSystem — power the UVM on.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 3: HcsStartComputeSystem (UVM)");
+        step_log!("3: HcsStartComputeSystem (UVM)");
         uvm_system
             .start("")
             .await
@@ -1612,24 +1646,101 @@ impl HcsRuntime {
                 reason: format!("Hyper-V step 3: HcsStartComputeSystem (UVM): {e}"),
             })?;
 
+        // Diagnostic: the CreateFailed reason string is the only channel the
+        // e2e test surfaces, so query the HCS-assigned base properties (carries
+        // "RuntimeId") and the GuestConnection property (populated iff HCS is
+        // managing an INTERNAL GCS connection) once at start. Folded into the
+        // step-4 error below if accept times out. This localizes whether our
+        // external listener is bound on the wrong VMID or whether HCS grabbed
+        // the GCS internally (the latter would mean GuestConnection is set).
+        let diag_base_props = uvm_system
+            .properties("{}")
+            .await
+            .unwrap_or_else(|e| format!("<base-props query failed: {e}>"));
+        let diag_guest_conn = uvm_system
+            .properties(r#"{"PropertyTypes":["GuestConnection"]}"#)
+            .await
+            .unwrap_or_else(|e| format!("<guest-conn query failed: {e}>"));
+
         // ----------------------------------------------------------------
         // Step 4: accept the in-guest GCS's inbound hvsock connection (it
         // dials out after boot) and negotiate the protocol. 120s mirrors
         // hcsshim's GCSConnectionTimeout — the guest GCS can take a while to
         // come up on a cold UVM.
+        //
+        // While we wait, poll the UVM's HCS state every 5s and log it. If the
+        // guest bugchecks / fails to boot, the VM leaves "Running" (e.g. to
+        // "Stopped" / "SystemCrashed") — a decisive signal that the GCS never
+        // dialed because the guest never came up, vs. a guest that is up but
+        // not dialing. The poll borrows `&uvm_system` concurrently with the
+        // accept future via `select!`.
         // ----------------------------------------------------------------
         tracing::info!(
             hcs_id = %hcs_id,
             runtime_id = %format_guid_bare(uvm.runtime_id()),
             "Hyper-V step 4: PendingGcsBridge::accept (await guest GCS dial-out)"
         );
-        let bridge = pending_bridge
-            .accept(std::time::Duration::from_secs(120))
-            .await
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!("Hyper-V step 4: GcsBridge accept: {e}"),
-            })?;
+        step_log!("4: PendingGcsBridge::accept (await guest GCS dial-out, 120s timeout)");
+        let accept_fut = pending_bridge.accept(std::time::Duration::from_secs(120));
+        tokio::pin!(accept_fut);
+        let mut state_poll = tokio::time::interval(std::time::Duration::from_secs(5));
+        let bridge = loop {
+            tokio::select! {
+                res = &mut accept_fut => {
+                    match res {
+                        Ok(bridge) => break bridge,
+                        Err(e) => {
+                            // Read back any files the in-guest `zlayer-dump`
+                            // diagnostic service wrote into the writable
+                            // VSMB exfil share. Folded into the error so
+                            // the e2e test (which only surfaces the
+                            // CreateFailed.reason string) carries the
+                            // actual root-cause signal.
+                            let dump = read_uvm_debug_dump(uvm.debug_dir());
+                            // ZLAYER_KEEP_UVM_ON_FAILURE=1 → block here
+                            // (don't return) so the UVM stays alive AND
+                            // the writable share dir stays intact, giving
+                            // an operator time to inspect both from the
+                            // host before teardown.
+                            if std::env::var("ZLAYER_KEEP_UVM_ON_FAILURE").as_deref()
+                                == Ok("1")
+                            {
+                                tracing::warn!(
+                                    hcs_id = %hcs_id,
+                                    runtime_id = %format_guid_bare(uvm.runtime_id()),
+                                    debug_dir = %uvm.debug_dir().display(),
+                                    sandbox_vhdx = %uvm.scratch_vhdx().display(),
+                                    "ZLAYER_KEEP_UVM_ON_FAILURE=1 — UVM left running for 30 min for offline inspection (debug dir + sandbox VHDX kept)",
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                            }
+                            return Err(AgentError::CreateFailed {
+                                id: hcs_id.to_string(),
+                                reason: format!(
+                                    "Hyper-V step 4: GcsBridge accept: {e} || create_id={uvm_system_id} \
+                                     || base_props={diag_base_props} || guest_conn={diag_guest_conn} \
+                                     || guest_debug_dump={dump}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                _ = state_poll.tick() => {
+                    match uvm_system.properties("{}").await {
+                        Ok(props) => tracing::info!(
+                            hcs_id = %hcs_id,
+                            uvm_props = %props,
+                            "Hyper-V step 4: UVM state poll (awaiting guest GCS dial-out)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            hcs_id = %hcs_id,
+                            error = %e,
+                            "Hyper-V step 4: UVM state poll failed"
+                        ),
+                    }
+                }
+            }
+        };
 
         // ----------------------------------------------------------------
         // Step 4b: external-GCS HvSocket setup (hcsshim's
@@ -1643,6 +1754,7 @@ impl HcsRuntime {
         // ParentAddress: WindowsGcsHvHostID}.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 4b: configureHvSocketForGCS");
+        step_log!("4b: configureHvSocketForGCS");
         let hvsocket_setup_req = ModifySettingsRequest {
             base: RequestBase {
                 activity_id: Uuid::new_v4(),
@@ -1690,6 +1802,10 @@ impl HcsRuntime {
             layer_count = parent_layers.len(),
             "Hyper-V step 5: hot-attach per-layer VSMB shares"
         );
+        step_log!(
+            "5: hot-attach per-layer VSMB shares ({} layers)",
+            parent_layers.len()
+        );
         for (idx, layer) in parent_layers.iter().enumerate() {
             let share = VirtualSmbShare {
                 name: layer.id.clone(),
@@ -1720,6 +1836,7 @@ impl HcsRuntime {
             hcs_id = %hcs_id,
             "Hyper-V step 6: hot-attach scratch VHDX on SCSI LUN 1"
         );
+        step_log!("6: hot-attach scratch VHDX on SCSI LUN 1");
         let scratch_vhd = scratch_layer.vhd_mount_path().to_string();
         let scratch_attachment = ScsiAttachment {
             path: scratch_vhd.clone(),
@@ -1779,6 +1896,7 @@ impl HcsRuntime {
             guest_root = %guest_root_path,
             "Hyper-V step 7: CombineLayersWCOW via GCS"
         );
+        step_log!("7: CombineLayersWCOW via GCS guest_root={guest_root_path}");
         let combine_req = ModifySettingsRequest {
             base: RequestBase {
                 activity_id: Uuid::new_v4(),
@@ -1832,6 +1950,11 @@ impl HcsRuntime {
             endpoint_id = %format_guid_bare(network_attachment.endpoint_id()),
             namespace_id = %format_guid_bare(network_attachment.namespace_id()),
             "Hyper-V step 7.5: wiring HCN endpoint into UVM network compartment"
+        );
+        step_log!(
+            "7.5: wiring HCN endpoint into UVM network compartment endpoint_id={} namespace_id={}",
+            format_guid_bare(network_attachment.endpoint_id()),
+            format_guid_bare(network_attachment.namespace_id()),
         );
         let add_endpoint_req = ModifySettingsRequest {
             base: RequestBase {
@@ -1889,6 +2012,7 @@ impl HcsRuntime {
         // Step 9: RpcCreate the hosted container over the bridge.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 9: GCS RpcCreate (hosted container)");
+        step_log!("9: GCS RpcCreate (hosted container)");
         let create_settings =
             serde_json::to_value(&hosted_doc).map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
@@ -1913,6 +2037,7 @@ impl HcsRuntime {
         // Step 10: RpcStart the hosted container.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 10: GCS RpcStart (hosted container)");
+        step_log!("10: GCS RpcStart (hosted container)");
         let start_req = StartRequest {
             base: RequestBase {
                 activity_id: Uuid::new_v4(),
@@ -1954,6 +2079,10 @@ impl HcsRuntime {
 /// without pulling in the `zlayer-gcs` dependency.
 #[cfg(all(target_os = "windows", not(feature = "hcs-runtime")))]
 impl HcsRuntime {
+    // Signature mirrors the real `hcs-runtime` implementation so callers
+    // compile identically with or without the feature; the stub body neither
+    // awaits nor uses its args.
+    #[allow(clippy::too_many_arguments, clippy::unused_async)]
     async fn hyperv_create_via_gcs(
         &self,
         hcs_id: &str,
@@ -2017,6 +2146,16 @@ const UVM_DEFAULT_MEMORY_MB: u64 = 1024;
 /// `VmbFs`.
 const PRIMARY_SCSI_CTRL_GUID: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
 
+/// `prot.WindowsLoggingHvsockServiceID` from hcsshim
+/// (`internal/gcs/prot/protocol.go`). Re-added after ground-truth ETW capture of
+/// containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes
+/// confirmed runhcs.exe DOES emit this entry (with `AllowWildcardBinds=true` +
+/// BA/SY bind+connect SDs). Prior revert was based on misreading
+/// `create_wcow.go` (the doc entry is guarded by `LogForwardingEnabled` BUT
+/// the resulting wire bytes still include it — runhcs runs with log
+/// forwarding on by default).
+const WINDOWS_LOGGING_HVSOCK_SERVICE_ID: &str = "172dad59-976d-45f2-8b6c-6d1b13f2ac4d";
+
 /// Build a [`VirtualMachine`] document populated from a freshly-provisioned
 /// [`Uvm`] plus the parent read-only layer chain.
 ///
@@ -2049,10 +2188,200 @@ const PRIMARY_SCSI_CTRL_GUID: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
 /// populated `spec.resources.gpu` produces a [`GpuAssignmentMode::Default`]
 /// block (let HCS pick); a non-empty slice produces a
 /// [`GpuAssignmentMode::List`] block.
+/// Encode a `REG_MULTI_SZ` payload (UTF-16LE, null-terminated strings, final
+/// extra null terminator) as base64 — the wire format HCS expects in a
+/// `RegistryValue.BinaryValue` field when `Type=MultiString`. Used to
+/// override `gcs.DependOnService` so SCM does not block waiting for network
+/// services that never come up in a NIC-less UVM.
+///
+/// Currently unused — B-2 dropped the only caller (the
+/// `gcs.DependOnService` override). Kept under `#[allow(dead_code)]`
+/// because the bisect may need to put it back if removing the override
+/// turns out to be wrong; the encoding logic is correct and worth
+/// preserving until the dust settles.
+#[allow(dead_code)]
+fn encode_multi_sz_utf16le(strs: &[&str]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::<u8>::new();
+    for s in strs {
+        for c in s.encode_utf16() {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        // Null-terminate this string.
+        bytes.extend_from_slice(&[0, 0]);
+    }
+    // Final extra null terminator marks end-of-list.
+    bytes.extend_from_slice(&[0, 0]);
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
+}
+
+/// Read the writable `zlayer-debug` VSMB share's host-side backing directory
+/// after a step-4 accept timeout and produce a compact one-line summary of
+/// what the in-guest `zlayer-dump` diagnostic service wrote there.
+///
+/// Each file is truncated to the first ~2KB so the resulting string stays
+/// embeddable in `AgentError::CreateFailed { reason }` (which is what the
+/// integration test surfaces — there is no separate log channel from the
+/// runtime to the test harness). UTF-8 invalid bytes are replaced (the
+/// guest writes ASCII output from `sc.exe` / `wevtutil` / `dir` / `tasklist`,
+/// but defensive against encoding surprises).
+///
+/// Returns `(empty)` when the dir is absent (UVM never started) or empty
+/// (guest never reached the SCM auto-start phase). Returns `(no-files)`
+/// when the dir exists but contains zero files — also a signal: SCM didn't
+/// kick off our injected service even though the guest reached user-mode.
+#[cfg(feature = "hcs-runtime")]
+fn read_uvm_debug_dump(debug_dir: &std::path::Path) -> String {
+    /// Per-file truncation cap, in bytes. 2KB × ~7 expected files = ~14KB
+    /// total dump fold-in, well below any reasonable error-message ceiling.
+    const PER_FILE_CAP: usize = 2 * 1024;
+
+    let Ok(entries) = std::fs::read_dir(debug_dir) else {
+        return "(empty)".to_string();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    if files.is_empty() {
+        return "(no-files)".to_string();
+    }
+    files.sort(); // deterministic order across runs
+
+    let mut out = String::new();
+    for path in &files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".to_string());
+        // Crash artifacts (saved-state / kernel dump) are large binaries — do
+        // NOT slurp them into the error. Note their size; they're fetched
+        // separately and analyzed with cdb on the host.
+        let is_binary_artifact = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("vmrs") || e.eq_ignore_ascii_case("dmp"));
+        let body = if is_binary_artifact {
+            match std::fs::metadata(path) {
+                Ok(m) => format!("<binary crash artifact, {} bytes>", m.len()),
+                Err(e) => format!("<binary crash artifact, stat error: {e}>"),
+            }
+        } else {
+            // Bounded read — never pull more than PER_FILE_CAP+1 bytes into
+            // memory regardless of on-disk size.
+            match read_prefix(path, PER_FILE_CAP + 1) {
+                Ok(bytes) => {
+                    let truncated = bytes.len() > PER_FILE_CAP;
+                    let cap = bytes.len().min(PER_FILE_CAP);
+                    let body = String::from_utf8_lossy(&bytes[..cap])
+                        .replace(['\n', '\r'], " ")
+                        .trim()
+                        .to_string();
+                    if truncated {
+                        format!("{body}…<truncated>")
+                    } else {
+                        body
+                    }
+                }
+                Err(e) => format!("<read error: {e}>"),
+            }
+        };
+        if !out.is_empty() {
+            out.push_str(" || ");
+        }
+        out.push_str(&name);
+        out.push('=');
+        out.push_str(&body);
+    }
+    out
+}
+
+/// Read at most `max` bytes from the start of `path` without loading the whole
+/// file. Used by [`read_uvm_debug_dump`] so a multi-gigabyte crash artifact
+/// that happens to land in the debug dir can never OOM the read-back path.
+#[cfg(feature = "hcs-runtime")]
+fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max];
+    let mut filled = 0usize;
+    while filled < max {
+        let n = f.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Guest-side mount prefix that the VSMB miniport driver registers at boot
+/// for shares declared in the UVM creation document. Sourced verbatim from
+/// hcsshim `internal/uvm/vsmb.go:27`. Combined with a share name, the in-
+/// guest absolute path to that share is `\\?\VMSMB\VSMB-{dcc079ae-…}\<name>`.
+///
+/// Currently unused — B-4 dropped the only callers (the writable
+/// `zlayer-debug` share + zlayer-dump SCM service + WER `LocalDumps` target).
+/// Kept under `#[allow(dead_code)]` because the host-side hot-add path for
+/// per-hosted-container VSMB shares in `hyperv_create_via_gcs` Step 5 still
+/// uses this same prefix indirectly via `add_vsmb`'s controller GUID
+/// derivation.
+#[allow(dead_code)]
+const VSMB_GUEST_PREFIX: &str = r"\\?\VMSMB\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}";
+
+/// Build the offline `RegistryChanges` HCS applies to the guest hives before
+/// first boot.
+///
+/// Two purposes:
+///
+/// 1. **hcsshim parity** — the `gns` `EnableCompartmentNamespace=1` networking
+///    workaround hcsshim sets on every WCOW UVM (`prepareCommonConfigDoc` in
+///    `create_wcow.go`).
+///
+/// 2. **gcs `DependOnService` override** — strip `mpssvc`/`netsetupsvc` from
+///    `gcs`'s SCM dependency chain so the GCS service starts in a UVM that
+///    has no virtual NIC. See the comment block on that entry for rationale.
+///
+/// (B-4 dropped the prior `zlayer-dump` SCM service and WER `LocalDumps`
+/// registry entries because both wrote to the now-removed writable
+/// `zlayer-debug` VSMB share. The host-side HCS ETW capture from
+/// `scripts/windows/launch_e2e.ps1` is the replacement diagnostic channel
+/// while we bisect the 0xEF cause.)
+fn build_uvm_registry_changes() -> Vec<RegistryValue> {
+    vec![
+        // hcsshim parity: gns EnableCompartmentNamespace=1.
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\gns".to_string(),
+            }),
+            name: "EnableCompartmentNamespace".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            d_word_value: Some(1),
+            ..Default::default()
+        },
+        // (B-2: dropped the prior `gcs.DependOnService` override —
+        //  we used to rewrite it to `[condrv, hvsocketcontrol]`, but
+        //  the stock nanoserver:ltsc2022 dep list
+        //  `[condrv, hvsocketcontrol, mpssvc, netsetupsvc]` is what
+        //  the in-guest gcs.exe's RpcCreate handler actually needs at
+        //  runtime — the firewall + netsetup RPC endpoints. With the
+        //  override removed, SCM blocks `gcs` until `mpssvc` and
+        //  `netsetupsvc` are Running, so gcs.exe sees those services up
+        //  when it starts handling Create. Hcsshim doesn't override the
+        //  dep list, and they ship nanoserver UVMs in production daily.)
+    ]
+}
+
 #[allow(clippy::too_many_lines)] // construction is sequential by HCS field; splitting hurts readability
 fn build_virtual_machine_doc(
     uvm: &Uvm,
-    parent_layers: &[zlayer_hcs::schema::Layer],
+    // Retained in the signature so callers + tests stay stable, but no
+    // longer materialised into the UVM-create-time `VirtualSmb.Shares`
+    // array — see the share-construction comment below.
+    _parent_layers: &[zlayer_hcs::schema::Layer],
     spec: &ServiceSpec,
     gpu_adapters: &[HostGpuAdapter],
 ) -> VirtualMachine {
@@ -2076,17 +2405,30 @@ fn build_virtual_machine_doc(
         },
     );
 
-    // VirtualSMB shares: first the `"os"` share that exposes the image's
-    // `UtilityVM\Files` directory as the UVM's boot volume (UEFI boots from
-    // `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`), then one read-only share per
-    // parent layer keyed by the layer's HCS id (already a stable GUID) so
-    // multiple containers attached to the same layer dir on the same UVM never
-    // collide. The `"os"` options match hcsshim's `DefaultVSMBOptions(true)`
-    // from `internal/uvm/vsmb.go` — read-only, share-read, cache-io,
+    // VirtualSMB shares at UVM-create time: ONLY the `"os"` share that
+    // exposes the image's `UtilityVM\Files` directory as the UVM's boot
+    // volume (UEFI boots from `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`),
+    // plus the writable `"zlayer-debug"` diagnostic exfil share appended
+    // at the end.
+    //
+    // We deliberately do NOT include parent-layer shares here. Hcsshim's
+    // `internal/uvm/create_wcow.go` only writes the `os` share at
+    // create-time; parent-layer shares are hot-attached AFTER the UVM
+    // boots, per hosted container, via `uvm.Add` (`internal/uvm/vsmb.go`).
+    // Our `hyperv_create_via_gcs` already does the hot-attach at Step 5
+    // (`hcs.rs::1809`); injecting them here too poisons gcs.exe's
+    // host-compartment init during cold-start `RpcCreate` and is the
+    // working hypothesis for the observed 0xEF `CRITICAL_PROCESS_DIED`
+    // bugcheck ~0.8 s after Negotiate. See:
+    //
+    //   `.claude/plans/okay-todo-delme-md-this-is-abstract-kernighan.md`
+    //   `BlackLeafDocs/zlayer/windowshcs/gcs-bridge-and-0xEF.md`
+    //
+    // The `os` options match hcsshim's `DefaultVSMBOptions(true)` from
+    // `internal/uvm/vsmb.go` — read-only, share-read, cache-io,
     // pseudo-oplocks, take-backup-privilege.
-    let mut shares: Vec<VirtualSmbShare> = Vec::with_capacity(parent_layers.len() + 1);
     // `"os"` share goes FIRST per hcsshim convention (it is the OS root).
-    shares.push(VirtualSmbShare {
+    let shares: Vec<VirtualSmbShare> = vec![VirtualSmbShare {
         name: "os".to_string(),
         path: uvm.os_files_dir().to_string_lossy().into_owned(),
         options: Some(VirtualSmbShareOptions {
@@ -2098,25 +2440,39 @@ fn build_virtual_machine_doc(
             ..Default::default()
         }),
         ..Default::default()
-    });
-    for layer in parent_layers {
-        shares.push(VirtualSmbShare {
-            name: layer.id.clone(),
-            path: layer.path.clone(),
-            options: Some(VirtualSmbShareOptions {
-                read_only: true,
-                share_read: true,
-                cache_io: true,
-                pseudo_oplocks: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    }
+    }];
+    // B-4: writable `zlayer-debug` VSMB share REMOVED from the
+    // create-time doc to test whether it is what kills the in-guest GCS
+    // during cold-start RpcCreate. Hcsshim's create-time doc has ONLY the
+    // `os` (read-only) share; every parent layer + every additional share
+    // is hot-attached AFTER the UVM boots. Our prior `zlayer-debug` share
+    // was a session-evidence-only diagnostic — losing it costs us in-guest
+    // observability (start.txt, env.txt, dir.txt, sc-*.txt, sys.txt,
+    // app.txt) but the host-side HCS ETW + Hyper-V-Worker channels + the
+    // bridge wire trace are still live.
+    //
+    // Original comment for reference (kept while the bisect is in flight):
+    //   Mounted in the guest at `\\?\VMSMB\VSMB-{dcc079ae-…}\zlayer-debug`
+    //   per hcsshim's `internal/uvm/vsmb.go`. No `options` because
+    //   `share_read`/`cache_io`/`take_backup_privilege` on a writable
+    //   share triggers HCS `PowerOnCold` HRESULT 0x80070057.
     let virtual_smb = Some(VirtualSmb {
         shares,
-        direct_file_mapping_in_mb: None,
+        // hcsshim sets DirectFileMappingInMB=1024 on every WCOW UVM VSMB block
+        // (`create_wcow.go` prepareCommonConfigDoc). A "sensible default" per
+        // their comment; we mirror it for parity.
+        direct_file_mapping_in_mb: Some(1024),
     });
+
+    // DebugOptions + GuestCrashReporting removed (2026-05-30 round 2 — second
+    // attempt at this revert). Ground-truth ETW capture of
+    // containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes
+    // shows runhcs emits NEITHER block. Our first attempt to drop them (B-5)
+    // produced a never-dial regression, but that test was confounded by
+    // COM-pipe additions also being active; the present state has those
+    // reverted via Phase H, so re-testing.
+    let debug_options: Option<DebugOptions> = None;
+    let guest_crash_reporting: Option<GuestCrashReporting> = None;
 
     // Populate the GPU-PV block when the workload requested a GPU. With no
     // candidate adapters we emit `Default` so HCS picks the host default
@@ -2148,6 +2504,20 @@ fn build_virtual_machine_doc(
     });
 
     VirtualMachine {
+        // hcsshim sets StopOnReset=true on every utility VM so a guest-side
+        // reset/bugcheck during boot surfaces as a clean Stop (observable in
+        // HCS state) instead of an endless reboot loop.
+        stop_on_reset: true,
+        // Mirror hcsshim's WCOW `prepareCommonConfigDoc` registry edits. The
+        // `gns` `EnableCompartmentNamespace` key is the networking workaround
+        // hcsshim applies by default (`!opts.DisableCompartmentNamespace`); it
+        // gates a GNS.dll change for SMB-share access inside the UVM. We skip
+        // the WER/dump keys (hcsshim only sets those when a dump location is
+        // configured, which we don't).
+        registry_changes: Some(RegistryChanges {
+            add_values: build_uvm_registry_changes(),
+        }),
+        debug_options,
         chipset: Some(Chipset {
             uefi: Some(Uefi {
                 boot_this: Some(UefiBootEntry {
@@ -2155,17 +2525,53 @@ fn build_virtual_machine_doc(
                     device_path: r"\EFI\Microsoft\Boot\bootmgfw.efi".to_string(),
                     disk_number: None,
                 }),
+                // NOTE: hcsshim's `internal/uvm/create_wcow.go:313-319` populates
+                // `Devices.ComPorts["0"].NamedPipe` for the host-side debug
+                // serial console but does NOT set `Uefi.Console = "ComPort1"`.
+                // Setting that redirect breaks the WCOW UVM boot in our
+                // testing — the UVM enters Running state without ever
+                // executing UEFI/bootmgr. Leave Console unset (Default).
+                ..Default::default()
             }),
         }),
         compute_topology: Some(Topology {
             memory: Some(TopologyMemory {
                 size_in_mb: UVM_DEFAULT_MEMORY_MB,
+                // Mirror hcsshim `prepareCommonConfigDoc`: both fields enabled by
+                // default on every WCOW UVM. Phase F diff confirmed gcs.exe's
+                // reference doc has them; ZLayer was omitting both.
+                allow_overcommit: Some(true),
+                enable_hot_hint: Some(true),
             }),
             processor: Some(TopologyProcessor {
                 count: UVM_DEFAULT_VCPUS,
             }),
         }),
         devices: Some(Devices {
+            // COM1 → host named pipe so we can capture UEFI / bootmgr /
+            // winload / SMSS / wininit early-boot output that has no other
+            // channel before the in-guest GCS comes up and starts logging
+            // over hvsock. Mirrors hcsshim `internal/uvm/create_wcow.go`
+            // (`doc.VirtualMachine.Devices.ComPorts["0"].NamedPipe`).
+            // Pipe name is keyed off the UVM's RuntimeId GUID so concurrent
+            // UVMs do not collide on a single pipe. The host-side reader is
+            // spawned by `scripts/windows/launch_e2e.ps1` which watches for
+            // `\\.\pipe\zlayer-uvm-*-com1` and tees each pipe into
+            // `$RunDir\com-zlayer-uvm-<id>-com1.log`.
+            com_ports: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "0".to_string(),
+                    zlayer_hcs::schema::ComPort {
+                        named_pipe: format!(
+                            r"\\.\pipe\zlayer-uvm-{}-com1",
+                            format_guid_bare(uvm.runtime_id())
+                        ),
+                        optimize_for_debugger: false,
+                    },
+                );
+                m
+            },
             scsi,
             virtual_smb,
             gpu,
@@ -2176,9 +2582,24 @@ fn build_virtual_machine_doc(
             hv_socket: Some(HvSocket2 {
                 hv_socket_config: Some(HvSocketSystemConfig {
                     default_bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                    service_table: {
+                        let mut table = BTreeMap::new();
+                        table.insert(
+                            WINDOWS_LOGGING_HVSOCK_SERVICE_ID.to_string(),
+                            HvSocketServiceConfig {
+                                bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                                connect_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                                    .to_string(),
+                                allow_wildcard_binds: true,
+                                ..Default::default()
+                            },
+                        );
+                        table
+                    },
                     ..Default::default()
                 }),
             }),
+            guest_crash_reporting,
         }),
         // VmbFs boot path means HCS persists VM state via the SCSI scratch
         // alone; no host-side `.vmgs` guest-state file is needed (or wanted —
@@ -3008,7 +3429,7 @@ impl Runtime for HcsRuntime {
         // Process branch always produces an empty state, so dropping it
         // here is safe.
         #[cfg(not(feature = "hcs-runtime"))]
-        drop(hyperv_state);
+        let _ = hyperv_state;
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
     }
@@ -3836,7 +4257,7 @@ services:
     /// GUID), the `"os"` VSMB share that exposes `UtilityVM\Files` as the
     /// boot volume, one read-only `VirtualSMB` share per parent layer, the
     /// default 2 vCPU / 1024 MiB topology, and the UEFI `VmbFs` boot entry.
-    /// `guest_state` is omitted entirely — VmbFs boot does not use a
+    /// `guest_state` is omitted entirely — `VmbFs` boot does not use a
     /// host-side `.vmgs`.
     ///
     /// Uses [`Uvm::for_test`] so the test does not touch HCS, the VHD APIs,
@@ -3889,10 +4310,18 @@ services:
             .virtual_smb
             .as_ref()
             .expect("VirtualSmb block populated");
+        // hcsshim parity: the UVM-create-time doc carries ONLY the `os`
+        // boot-files share. Parent-layer shares are hot-attached AFTER
+        // the UVM boots via `hyperv_create_via_gcs` Step 5
+        // (`uvm_system.add_vsmb`) — they do NOT appear in the create-time
+        // `VirtualSmb.Shares` array. The `zlayer-debug` writable exfil
+        // share was also dropped (B-4) — it was triggering the in-guest
+        // GCS to critical-process-die during cold-start RpcCreate (the
+        // 0xEF bugcheck symptom).
         assert_eq!(
             vsmb.shares.len(),
-            3,
-            "expected `os` share + one VirtualSMB share per parent layer",
+            1,
+            "create-time shares: `os` only; parent layers hot-attached at Step 5; zlayer-debug dropped per B-4",
         );
         assert_eq!(
             vsmb.shares[0].name, "os",
@@ -3917,24 +4346,16 @@ services:
             "named options replace the legacy raw flags bitmask",
         );
 
-        let share = vsmb
-            .shares
-            .iter()
-            .find(|s| s.name == "11111111-1111-1111-1111-111111111111")
-            .expect("smb share for base layer");
-        assert_eq!(share.path, r"C:\zlayer\images\base");
+        // No parent-layer share and no zlayer-debug share should appear in
+        // the create-time doc.
         assert!(
-            share.flags.is_none(),
-            "parent-layer shares use named options, not legacy flags",
+            vsmb.shares.iter().all(|s| s.name == "os"),
+            "create-time VSMB.Shares must be `os` only; got {:?}",
+            vsmb.shares
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
         );
-        let layer_opts = share
-            .options
-            .as_ref()
-            .expect("parent-layer share carries named options");
-        assert!(layer_opts.read_only);
-        assert!(layer_opts.share_read);
-        assert!(layer_opts.cache_io);
-        assert!(layer_opts.pseudo_oplocks);
 
         // Compute topology: defaults to 2 vCPU / 1024 MiB.
         let topology = vm.compute_topology.expect("compute_topology");
@@ -3948,11 +4369,55 @@ services:
         );
     }
 
+    /// Pins the hcsshim `prepareCommonConfigDoc` parity fields the UVM doc must
+    /// carry: `StopOnReset`, the `gns` `EnableCompartmentNamespace` registry
+    /// edit, and `VirtualSmb.DirectFileMappingInMB`.
+    #[test]
+    fn build_virtual_machine_doc_sets_hcsshim_parity_fields() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "parity-container",
+            PathBuf::from(r"C:\zlayer\uvms\parity\scratch.vhdx"),
+            PathBuf::from(r"C:\zlayer\images\app\UtilityVM\Files"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+
+        assert!(vm.stop_on_reset, "UVM must set StopOnReset like hcsshim");
+
+        let vsmb = vm
+            .devices
+            .as_ref()
+            .and_then(|d| d.virtual_smb.as_ref())
+            .expect("VirtualSmb block populated");
+        assert_eq!(
+            vsmb.direct_file_mapping_in_mb,
+            Some(1024),
+            "VSMB DirectFileMappingInMB must mirror hcsshim's WCOW default",
+        );
+
+        let reg = vm
+            .registry_changes
+            .as_ref()
+            .expect("UVM must carry RegistryChanges for hcsshim parity");
+        let gns = reg
+            .add_values
+            .iter()
+            .find(|v| v.name == "EnableCompartmentNamespace")
+            .expect("gns EnableCompartmentNamespace key present");
+        assert_eq!(gns.d_word_value, Some(1));
+        assert_eq!(gns.r#type, Some(RegistryValueType::DWord));
+        let key = gns.key.as_ref().expect("registry value carries a key");
+        assert_eq!(key.hive, Some(RegistryHive::System));
+        assert_eq!(key.name, r"CurrentControlSet\Services\gns");
+    }
+
     /// `build_virtual_machine_doc` against an empty parent chain still
     /// produces a valid SCSI + chipset + topology block; the `virtual_smb`
-    /// map carries only the mandatory `"os"` boot-files share. This pins the
-    /// contract that a zero-layer image (theoretical edge case) does not
-    /// panic and still boots.
+    /// map carries the `"os"` boot-files share + the writable `"zlayer-debug"`
+    /// exfil share. This pins the contract that a zero-layer image
+    /// (theoretical edge case) does not panic and still boots.
     #[test]
     fn build_virtual_machine_doc_handles_empty_parent_chain() {
         use std::path::PathBuf;
@@ -3970,6 +4435,9 @@ services:
             .virtual_smb
             .as_ref()
             .expect("VirtualSmb block populated");
+        // `os` only (parent layers are hot-attached at Step 5, not at
+        // create time; zlayer-debug dropped per B-4). See
+        // `build_virtual_machine_doc` comment for rationale.
         assert_eq!(vsmb.shares.len(), 1);
         assert_eq!(vsmb.shares[0].name, "os");
         assert_eq!(devices.scsi.len(), 1);

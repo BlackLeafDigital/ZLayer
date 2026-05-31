@@ -2969,6 +2969,11 @@ pub(crate) enum NodeCommands {
         #[arg(long, default_value_t = zlayer_core::DEFAULT_WG_PORT)]
         overlay_port: u16,
 
+        /// Free-form node labels as `k=v,k=v` (e.g. `region=us-east,tier=edge`).
+        /// Advertised at join and used for `NodeSelector` placement matching.
+        #[arg(long, default_value = "")]
+        labels: String,
+
         /// WSL2 auto-install consent (Windows only).
         #[command(flatten)]
         install_wsl: InstallWslArgs,

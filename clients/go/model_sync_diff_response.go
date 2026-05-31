@@ -19,7 +19,7 @@ import (
 // checks if the SyncDiffResponse type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &SyncDiffResponse{}
 
-// SyncDiffResponse JSON-friendly wrapper around [`SyncDiff`].
+// SyncDiffResponse JSON-friendly wrapper around the sync diff output.
 type SyncDiffResponse struct {
 	// Resources to create.
 	ToCreate []SyncResourceResponse `json:"to_create"`

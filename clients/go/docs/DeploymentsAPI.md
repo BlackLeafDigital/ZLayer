@@ -7,6 +7,7 @@ Method | HTTP request | Description
 [**CreateDeployment**](DeploymentsAPI.md#CreateDeployment) | **Post** /api/v1/deployments | Create a new deployment.
 [**DeleteDeployment**](DeploymentsAPI.md#DeleteDeployment) | **Delete** /api/v1/deployments/{name} | Delete a deployment.
 [**GetDeployment**](DeploymentsAPI.md#GetDeployment) | **Get** /api/v1/deployments/{name} | Get deployment details (with live per-service health when available).
+[**GetDeploymentSpec**](DeploymentsAPI.md#GetDeploymentSpec) | **Get** /api/v1/deployments/{name}/spec | Get the raw stored deployment, including the full &#x60;DeploymentSpec&#x60;.
 [**ListDeployments**](DeploymentsAPI.md#ListDeployments) | **Get** /api/v1/deployments | List all deployments.
 
 
@@ -28,7 +29,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -94,7 +95,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -162,7 +163,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -215,6 +216,76 @@ Name | Type | Description  | Notes
 [[Back to README]](../README.md)
 
 
+## GetDeploymentSpec
+
+> StoredDeployment GetDeploymentSpec(ctx, name).Execute()
+
+Get the raw stored deployment, including the full `DeploymentSpec`.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
+)
+
+func main() {
+	name := "name_example" // string | Deployment name
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.DeploymentsAPI.GetDeploymentSpec(context.Background(), name).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `DeploymentsAPI.GetDeploymentSpec``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `GetDeploymentSpec`: StoredDeployment
+	fmt.Fprintf(os.Stdout, "Response from `DeploymentsAPI.GetDeploymentSpec`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+
+Name | Type | Description  | Notes
+------------- | ------------- | ------------- | -------------
+**ctx** | **context.Context** | context for authentication, logging, cancellation, deadlines, tracing, etc.
+**name** | **string** | Deployment name | 
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiGetDeploymentSpecRequest struct via the builder pattern
+
+
+Name | Type | Description  | Notes
+------------- | ------------- | ------------- | -------------
+
+
+### Return type
+
+[**StoredDeployment**](StoredDeployment.md)
+
+### Authorization
+
+[bearer_auth](../README.md#bearer_auth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
+
+
 ## ListDeployments
 
 > []DeploymentSummary ListDeployments(ctx).Execute()
@@ -232,7 +303,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {

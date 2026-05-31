@@ -50,6 +50,10 @@ pub struct ClusterJoinRequest {
     /// CPU architecture of the joining agent. Same legacy semantics as `os`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<ArchKind>,
+    /// Free-form labels advertised by the joining agent, used for
+    /// `NodeSelector` placement matching. Empty on legacy clients.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
     /// Joiner's 32-byte X25519 pubkey for sealed-box DEK wrapping.
     /// Present on Phase-1+ joiners; absent on legacy clients (in which
     /// case the leader treats the node as not eligible to host

@@ -633,6 +633,10 @@ fn build_create_request(
         oom_kill_disable: res.oom_kill_disable,
         blkio_weight: res.blkio_weight,
         lifecycle,
+        // Docker compat surface has no placement controls; let the daemon
+        // create locally.
+        node_selector: None,
+        platform: None,
     })
 }
 

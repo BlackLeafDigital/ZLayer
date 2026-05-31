@@ -5374,6 +5374,56 @@ impl DaemonClient {
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
+
+    // ------------------------------------------------------------------
+    // Edge-cache eligibility (Track A — upstream control-plane API)
+    // ------------------------------------------------------------------
+
+    /// Mark `node_id` as eligible for edge caching with the supplied
+    /// capacity declaration.
+    ///
+    /// `POST /api/v1/nodes/{node_id}/edge-cache` — returns 204 No Content
+    /// on success.
+    pub async fn enable_edge_cache(
+        &self,
+        node_id: u64,
+        capacity: zlayer_types::api::edge_cache::NodeCapacityDto,
+    ) -> Result<()> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache");
+        let body = serde_json::to_string(&zlayer_types::api::edge_cache::EnableEdgeCacheRequest {
+            capacity,
+        })
+        .context("encode EnableEdgeCacheRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Remove `node_id` from the edge-cache eligibility registry.
+    ///
+    /// `DELETE /api/v1/nodes/{node_id}/edge-cache` — returns 204 No
+    /// Content on success, 404 if the node was not registered.
+    pub async fn disable_edge_cache(&self, node_id: u64) -> Result<()> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache");
+        let (status, resp) = self.delete(&path).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Fetch placeholder edge-cache hit/miss counters for `node_id`.
+    ///
+    /// `GET /api/v1/nodes/{node_id}/edge-cache/stats` — today always
+    /// returns `{hits: 0, misses: 0}` per the documented spec; real
+    /// counters land with the follow-on cache subsystem.
+    pub async fn edge_cache_stats(
+        &self,
+        node_id: u64,
+    ) -> Result<zlayer_types::api::edge_cache::EdgeCacheStatsResponse> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache/stats");
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
 }
 
 /// Concrete platform-specific stream type used as the WebSocket transport

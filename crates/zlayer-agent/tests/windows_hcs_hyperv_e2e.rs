@@ -47,7 +47,17 @@ use zlayer_spec::{DeploymentSpec, ServiceSpec};
 /// it is small (~120 MB compressed) and exits-on-empty-entrypoint friendly.
 /// The same tag also boots fine inside the Hyper-V UVM that the Windows
 /// Containers feature ships, so we use it for both isolation modes.
-const TEST_IMAGE: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";
+///
+/// Operators can override at runtime with `ZLAYER_HCS_TEST_IMAGE` — most
+/// commonly to swap to `mcr.microsoft.com/windows/servercore:ltsc2022` for
+/// A/B testing whether a Hyper-V dial-out failure is image-specific (the
+/// stripped nanoserver UVM may be missing a DLL that `vmcomputeagent.exe`
+/// depends on) versus host-side.
+const TEST_IMAGE_DEFAULT: &str = "mcr.microsoft.com/windows/nanoserver:ltsc2022";
+
+fn test_image() -> String {
+    std::env::var("ZLAYER_HCS_TEST_IMAGE").unwrap_or_else(|_| TEST_IMAGE_DEFAULT.to_string())
+}
 
 /// Generate a unique short suffix so parallel CI shards do not collide on
 /// the per-test storage root or HCS system id.
@@ -121,6 +131,7 @@ fn spec_from_yaml(yaml: &str, service: &str) -> ServiceSpec {
 /// Hyper-V isolation. `isolation: hyperv` is `serde(rename_all = "kebab-case")`
 /// for [`zlayer_spec::IsolationMode::Hyperv`].
 fn echo_spec_hyperv() -> ServiceSpec {
+    let image = test_image();
     let yaml = format!(
         r#"
 version: v1
@@ -130,7 +141,7 @@ services:
     rtype: service
     isolation: hyperv
     image:
-      name: {TEST_IMAGE}
+      name: {image}
     command:
       entrypoint: ["cmd", "/c", "echo", "hello from hyperv"]
     endpoints:
@@ -149,6 +160,7 @@ services:
 /// to Hyper-V. `ping -n 60` keeps the container alive ~60 seconds — plenty
 /// for `cmd /c hostname` to round-trip through the UVM.
 fn long_lived_spec_hyperv() -> ServiceSpec {
+    let image = test_image();
     let yaml = format!(
         r#"
 version: v1
@@ -158,7 +170,7 @@ services:
     rtype: service
     isolation: hyperv
     image:
-      name: {TEST_IMAGE}
+      name: {image}
     command:
       entrypoint: ["cmd", "/c", "ping", "-n", "60", "127.0.0.1"]
     endpoints:
@@ -235,7 +247,7 @@ async fn windows_hcs_hyperv_smoke_create_start_stop_remove() {
         let (runtime, storage_root) = make_runtime("smoke").await;
 
         runtime
-            .pull_image(TEST_IMAGE)
+            .pull_image(&test_image())
             .await
             .expect("pull_image must succeed before create_container");
 
@@ -301,7 +313,7 @@ async fn windows_hcs_hyperv_exec_inside_container() {
         let (runtime, storage_root) = make_runtime("exec").await;
 
         runtime
-            .pull_image(TEST_IMAGE)
+            .pull_image(&test_image())
             .await
             .expect("pull_image must succeed before create_container");
 
@@ -377,7 +389,7 @@ async fn windows_hcs_hyperv_concurrent_pair() {
         let (runtime, storage_root) = make_runtime("pair").await;
 
         runtime
-            .pull_image(TEST_IMAGE)
+            .pull_image(&test_image())
             .await
             .expect("pull_image must succeed before create_container");
 

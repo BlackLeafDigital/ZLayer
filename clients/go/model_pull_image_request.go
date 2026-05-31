@@ -19,7 +19,7 @@ import (
 // checks if the PullImageRequest type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &PullImageRequest{}
 
-// PullImageRequest Request body for [`pull_image_handler`]. Blocking pull of an OCI image.
+// PullImageRequest Request body for the pull-image handler. Blocking pull of an OCI image.
 type PullImageRequest struct {
 	// Pull policy override. Accepts `\"always\"`, `\"if_not_present\"`, or `\"never\"`. Defaults to `\"always\"` when omitted.
 	PullPolicy NullableString `json:"pull_policy,omitempty"`

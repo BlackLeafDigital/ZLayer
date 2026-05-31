@@ -294,6 +294,13 @@ pub struct BuildOptions {
     pub runtime: Option<Runtime>,
     /// Build arguments (ARG values)
     pub build_args: HashMap<String, String>,
+    /// Pipeline variables (`${VAR}`) expanded into the `ZImagefile` body
+    /// (`base:`, `run:`, ...) before parsing. Used by the pipeline executor to
+    /// parametrize a single `ZImagefile` set across e.g. Windows LTSC lines
+    /// (`--set LTSC=ltsc2025`). Empty for direct (non-pipeline) builds.
+    /// Only applied to `ZImagefile` bodies, never to Dockerfiles (whose
+    /// `${ARG}` syntax is parsed natively).
+    pub pipeline_vars: HashMap<String, String>,
     /// Target stage for multi-stage builds
     pub target: Option<String>,
     /// Image tags to apply
@@ -401,6 +408,15 @@ pub struct BuildOptions {
     /// Mirrors `cargo update` semantics. On non-macOS backends this flag is
     /// ignored.
     pub update_bottles: bool,
+    /// Windows LTSC line to target for FROM image rewrites
+    /// (e.g. `"ltsc2022"`, `"ltsc2025"`).
+    ///
+    /// Only consumed by the Windows (HCS / WCOW) backend. When set, the
+    /// builder rewrites generic Docker Hub references (`ubuntu:24.04`,
+    /// `golang:1.24`, etc.) to the equivalent prebuilt Windows image via
+    /// `windows_image_resolver::rewrite_image_for_windows`. `None` means
+    /// the backend uses its built-in default (`ltsc2022`).
+    pub windows_ltsc: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -410,6 +426,7 @@ impl Default for BuildOptions {
             zimagefile: None,
             runtime: None,
             build_args: HashMap::new(),
+            pipeline_vars: HashMap::new(),
             target: None,
             tags: Vec::new(),
             no_cache: false,
@@ -430,8 +447,26 @@ impl Default for BuildOptions {
             source_hash: None,
             pull: PullBaseMode::default(),
             update_bottles: false,
+            windows_ltsc: None,
         }
     }
+}
+
+/// Expand `${VAR}` references in a `ZImagefile` body using pipeline variables.
+///
+/// Mirrors `pipeline::executor::expand_tag_with_vars`: each `${key}` is replaced
+/// with its value; unknown references are left intact. Returns `content`
+/// unchanged when `vars` is empty (the common direct-build case), so this is a
+/// no-op for every non-pipeline caller.
+fn expand_zimage_vars(content: &str, vars: &std::collections::HashMap<String, String>) -> String {
+    if vars.is_empty() {
+        return content.to_string();
+    }
+    let mut result = content.to_string();
+    for (key, value) in vars {
+        result = result.replace(&format!("${{{key}}}"), value);
+    }
+    result
 }
 
 /// Image builder - orchestrates the full build process
@@ -789,6 +824,33 @@ impl ImageBuilder {
     #[must_use]
     pub fn build_args(mut self, args: HashMap<String, String>) -> Self {
         self.options.build_args.extend(args);
+        self
+    }
+
+    /// Set pipeline variables expanded into the `ZImagefile` body before parse.
+    ///
+    /// `${VAR}` / `$VAR` references in a `ZImagefile`'s `base:`/`run:`/etc. are
+    /// replaced with the matching value; unknown references are left untouched.
+    /// Only `ZImagefile` bodies are expanded — Dockerfiles keep their native
+    /// `${ARG}` semantics. Used by the pipeline executor to drive one
+    /// `ZImagefile` set across variants (e.g. Windows `--set LTSC=ltsc2025`).
+    #[must_use]
+    pub fn pipeline_vars(mut self, vars: HashMap<String, String>) -> Self {
+        self.options.pipeline_vars.extend(vars);
+        self
+    }
+
+    /// Set the Windows LTSC line to target for FROM image rewrites
+    /// (e.g. `"ltsc2022"`, `"ltsc2025"`).
+    ///
+    /// Only consumed by the Windows (HCS / WCOW) backend. The pipeline
+    /// executor wires this from the `LTSC` pipeline variable, so a
+    /// `zlayer pipeline --set LTSC=ltsc2025` invocation flows down to the
+    /// FROM rewriter in `windows_builder::start_build`. Has no effect on
+    /// Linux / macOS backends.
+    #[must_use]
+    pub fn windows_ltsc(mut self, ltsc: impl Into<String>) -> Self {
+        self.options.windows_ltsc = Some(ltsc.into());
         self
     }
 
@@ -1624,6 +1686,7 @@ impl ImageBuilder {
         let Ok(content) = fs::read_to_string(&path).await else {
             return Ok(());
         };
+        let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
         let Ok(zimage) = crate::zimage::parse_zimagefile(&content) else {
             return Ok(());
         };
@@ -1672,6 +1735,7 @@ impl ImageBuilder {
                         path: zimage_path.clone(),
                         source: e,
                     })?;
+            let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
             let zimage = crate::zimage::parse_zimagefile(&content)?;
             return self.handle_zimage(&zimage).await;
         }
@@ -1689,6 +1753,7 @@ impl ImageBuilder {
                     source: e,
                 }
             })?;
+            let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
             let zimage = crate::zimage::parse_zimagefile(&content)?;
             return self.handle_zimage(&zimage).await;
         }
@@ -2288,6 +2353,29 @@ async fn write_wasm_oci_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_zimage_vars_substitutes_known_and_keeps_unknown() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("LTSC".to_string(), "ltsc2025".to_string());
+        vars.insert(
+            "REGISTRY".to_string(),
+            "ghcr.io/blackleafdigital/zlayer".to_string(),
+        );
+        let content = "base: ${REGISTRY}/base:windows-${LTSC}\nrun: echo ${UNKNOWN}\n";
+        let out = expand_zimage_vars(content, &vars);
+        assert_eq!(
+            out,
+            "base: ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2025\nrun: echo ${UNKNOWN}\n"
+        );
+    }
+
+    #[test]
+    fn expand_zimage_vars_empty_is_noop() {
+        let vars = std::collections::HashMap::new();
+        let content = "base: mcr.microsoft.com/windows/servercore:${LTSC}\n";
+        assert_eq!(expand_zimage_vars(content, &vars), content);
+    }
 
     #[test]
     fn test_registry_auth_new() {

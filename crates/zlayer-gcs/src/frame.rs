@@ -14,43 +14,67 @@ pub const HEADER_LEN: usize = 16;
 /// from a malicious or buggy guest. 4 MiB is far above any real GCS message.
 pub const MAX_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 
-/// Bit flag in `MessageType.high` marking a response (bit 28).
-pub const RESPONSE_TYPE_OFFSET: u32 = 0x1000_0000;
+/// Top 4 bits of `MessageType` distinguish request / response / notify.
+/// Mirrors hcsshim `internal/gcs/prot/protocol.go::MsgType{Request,Response,Notify,Mask}`.
+pub const MSG_TYPE_REQUEST: u32 = 0x1000_0000;
+pub const MSG_TYPE_RESPONSE: u32 = 0x2000_0000;
+pub const MSG_TYPE_NOTIFY: u32 = 0x3000_0000;
+pub const MSG_TYPE_MASK: u32 = 0xF000_0000;
 
-/// Category for compute-system / container RPCs (high 8 bits = `0x00100000`).
+/// Category for compute-system / container RPCs. Mirrors hcsshim
+/// `ComputeSystem = 0x00100000`.
 pub const CATEGORY_COMPUTE_SYSTEM: u32 = 0x0010_0000;
 
-/// Category for stream-level events (notifications, stdout/stderr).
-pub const CATEGORY_STREAM: u32 = 0x0040_0000;
+/// Category for compute-service RPCs (e.g. log forwarding). Mirrors hcsshim
+/// `ComputeService = 0x00200000`.
+pub const CATEGORY_COMPUTE_SERVICE: u32 = 0x0020_0000;
 
-/// RPC type codes (low 24 bits). High bits are OR'd from the category.
-/// See hcsshim `internal/gcs/prot/protocol.go::MsgType` constants.
+/// RPC type codes for the `ComputeSystem` category.
+///
+/// Each value already encodes `(iota+1)<<8 | 1` per hcsshim's
+/// `RPCProc = Category | (iota+1)<<8 | 1` formula in
+/// `internal/gcs/prot/protocol.go`, so a `NegotiateProtocol` REQUEST frame's
+/// wire `type` is exactly `MSG_TYPE_REQUEST | CATEGORY_COMPUTE_SYSTEM |
+/// (rpc as u32)` = `0x10100B01`. An earlier iteration of this enum used
+/// `0x0001..=0x000A` and was missing both the per-RPC `(iota+1)<<8` byte
+/// AND the `MSG_TYPE_REQUEST` marker, causing the in-guest GCS to close
+/// the bridge the moment it saw a frame with an unrecognized type
+/// (verified via `gcs-bridge-reader: header read failed after 0 frame(s):
+/// bridge closed` against `nanoserver:ltsc2022` with the dep-override
+/// applied).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RpcMessageType {
-    NegotiateProtocol = 0x0001,
-    Create = 0x0002,
-    Start = 0x0003,
-    Shutdown = 0x0004,
-    ExecuteProcess = 0x0005,
-    WaitForProcess = 0x0006,
-    SignalProcess = 0x0007,
-    GetProperties = 0x0008,
-    ModifySettings = 0x0009,
-    NegotiateProtocolV2 = 0x000A,
+    Create = 0x0101,
+    Start = 0x0201,
+    ShutdownGraceful = 0x0301,
+    ShutdownForced = 0x0401,
+    ExecuteProcess = 0x0501,
+    WaitForProcess = 0x0601,
+    SignalProcess = 0x0701,
+    ResizeConsole = 0x0801,
+    GetProperties = 0x0901,
+    ModifySettings = 0x0A01,
+    NegotiateProtocol = 0x0B01,
+    DumpStacks = 0x0C01,
+    DeleteContainerState = 0x0D01,
+    UpdateContainer = 0x0E01,
+    LifecycleNotification = 0x0F01,
 }
 
 impl RpcMessageType {
-    /// Encode as the on-wire u32 (compute-system category | low type code).
+    /// Encode as the on-wire request `type` u32:
+    /// `MSG_TYPE_REQUEST | CATEGORY_COMPUTE_SYSTEM | rpc`.
     #[must_use]
     pub const fn as_request_type(self) -> u32 {
-        CATEGORY_COMPUTE_SYSTEM | (self as u32)
+        MSG_TYPE_REQUEST | CATEGORY_COMPUTE_SYSTEM | (self as u32)
     }
 
-    /// Encode as the expected on-wire response type (same as request | response bit).
+    /// Encode as the expected on-wire response `type` u32:
+    /// `MSG_TYPE_RESPONSE | CATEGORY_COMPUTE_SYSTEM | rpc`.
     #[must_use]
     pub const fn as_response_type(self) -> u32 {
-        self.as_request_type() | RESPONSE_TYPE_OFFSET
+        MSG_TYPE_RESPONSE | CATEGORY_COMPUTE_SYSTEM | (self as u32)
     }
 }
 
@@ -173,7 +197,27 @@ mod tests {
     fn request_vs_response_type_bit() {
         let req = RpcMessageType::Create.as_request_type();
         let resp = RpcMessageType::Create.as_response_type();
-        assert_eq!(resp, req | RESPONSE_TYPE_OFFSET);
+        // Request: 0x10100101, Response: 0x20100101 — differ only in the
+        // top 4 bits per hcsshim's `MsgTypeMask`.
+        assert_eq!(req & MSG_TYPE_MASK, MSG_TYPE_REQUEST);
+        assert_eq!(resp & MSG_TYPE_MASK, MSG_TYPE_RESPONSE);
+        assert_eq!(req & !MSG_TYPE_MASK, resp & !MSG_TYPE_MASK);
         assert_eq!(req & CATEGORY_COMPUTE_SYSTEM, CATEGORY_COMPUTE_SYSTEM);
+    }
+
+    /// Pin the on-wire `NegotiateProtocol` REQUEST type to the exact
+    /// 32-bit value hcsshim's in-guest GCS expects (`0x10100B01`). If
+    /// this number changes, every WCOW UVM under `nanoserver:ltsc2022`
+    /// will reject the connection at the first frame.
+    #[test]
+    fn negotiate_protocol_wire_type_pinned() {
+        assert_eq!(
+            RpcMessageType::NegotiateProtocol.as_request_type(),
+            0x1010_0B01
+        );
+        assert_eq!(
+            RpcMessageType::NegotiateProtocol.as_response_type(),
+            0x2010_0B01
+        );
     }
 }

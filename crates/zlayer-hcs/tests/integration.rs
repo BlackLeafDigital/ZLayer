@@ -108,6 +108,8 @@ fn empty_vm_document(owner: &str) -> CsDoc {
         hosting_system_id: String::new(),
         container: None,
         virtual_machine: Some(VirtualMachine {
+            stop_on_reset: false,
+            registry_changes: None,
             chipset: Some(Chipset {
                 uefi: Some(Uefi {
                     boot_this: Some(UefiBootEntry {
@@ -122,6 +124,7 @@ fn empty_vm_document(owner: &str) -> CsDoc {
                 processor: Some(TopologyProcessor { count: 1 }),
             }),
             devices: None,
+            debug_options: None,
             guest_state: None,
             runtime_state_file_path: None,
         }),

@@ -346,6 +346,117 @@ func (a *DeploymentsAPIService) GetDeploymentExecute(r ApiGetDeploymentRequest) 
 	return localVarReturnValue, localVarHTTPResponse, nil
 }
 
+type ApiGetDeploymentSpecRequest struct {
+	ctx context.Context
+	ApiService *DeploymentsAPIService
+	name string
+}
+
+func (r ApiGetDeploymentSpecRequest) Execute() (*StoredDeployment, *http.Response, error) {
+	return r.ApiService.GetDeploymentSpecExecute(r)
+}
+
+/*
+GetDeploymentSpec Get the raw stored deployment, including the full `DeploymentSpec`.
+
+Unlike [`get_deployment`], which projects to the public `DeploymentDetails`
+shape, this endpoint returns the full [`StoredDeployment`] so callers that
+need the underlying spec (image, command, env, scale) — for example the
+Docker Engine API compatibility shim translating `/services` requests —
+can reconstruct the original input.
+
+# Errors
+
+Returns an error if the deployment is not found or storage access fails.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param name Deployment name
+ @return ApiGetDeploymentSpecRequest
+*/
+func (a *DeploymentsAPIService) GetDeploymentSpec(ctx context.Context, name string) ApiGetDeploymentSpecRequest {
+	return ApiGetDeploymentSpecRequest{
+		ApiService: a,
+		ctx: ctx,
+		name: name,
+	}
+}
+
+// Execute executes the request
+//  @return StoredDeployment
+func (a *DeploymentsAPIService) GetDeploymentSpecExecute(r ApiGetDeploymentSpecRequest) (*StoredDeployment, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *StoredDeployment
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "DeploymentsAPIService.GetDeploymentSpec")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/deployments/{name}/spec"
+	localVarPath = strings.Replace(localVarPath, "{"+"name"+"}", url.PathEscape(parameterValueToString(r.name, "name")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiListDeploymentsRequest struct {
 	ctx context.Context
 	ApiService *DeploymentsAPIService

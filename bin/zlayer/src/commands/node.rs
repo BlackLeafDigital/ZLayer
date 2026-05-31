@@ -98,12 +98,33 @@ struct NodeJoinRequest {
     /// CPU architecture of the joining agent (detected via `std::env::consts::ARCH`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     arch: Option<zlayer_spec::ArchKind>,
+    /// Free-form labels advertised by the joining agent for `NodeSelector`
+    /// placement matching. Empty when `--labels` was not supplied.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    labels: std::collections::HashMap<String, String>,
     /// Joiner's 32-byte X25519 pubkey for sealed-box DEK wrapping (Phase 1+).
     /// `None` only when the local keypair could not be created (extremely
     /// unusual — the leader will then treat this node as not eligible to
     /// host replicated-secret ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secrets_pubkey: Option<[u8; 32]>,
+}
+
+/// Parse a `k=v,k=v` node-labels string (the `node join --labels` flag) into a
+/// map. Blank entries and entries without `=` (or with an empty key) are
+/// skipped; keys/values are trimmed.
+fn parse_node_labels(s: &str) -> std::collections::HashMap<String, String> {
+    s.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.trim().split_once('=')?;
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
 }
 
 /// Join response from the leader
@@ -665,6 +686,7 @@ pub(crate) async fn handle_node(
             api_port,
             raft_port,
             overlay_port,
+            labels,
             install_wsl,
         } => {
             #[cfg(not(unix))]
@@ -681,6 +703,7 @@ pub(crate) async fn handle_node(
                 *raft_port,
                 *overlay_port,
                 cli_data_dir.to_path_buf(),
+                parse_node_labels(labels),
                 #[cfg(not(unix))]
                 consent,
             )
@@ -1099,6 +1122,9 @@ pub(crate) async fn handle_node_init(
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
         slice_cidr: leader_slice_cidr,
+        // Leader bootstrap carries no user labels; differentiated nodes
+        // declare labels when they `node join`.
+        labels: std::collections::HashMap::new(),
     })
     .await
     .context("Failed to register leader in Raft state")?;
@@ -1321,6 +1347,9 @@ pub(crate) async fn handle_node_init(
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
         slice_cidr: leader_slice_cidr,
+        // Leader bootstrap carries no user labels; differentiated nodes
+        // declare labels when they `node join`.
+        labels: std::collections::HashMap::new(),
     })
     .await
     .context("Failed to register leader in Raft state")?;
@@ -1395,6 +1424,7 @@ pub(crate) async fn handle_node_join(
     raft_port: u16,
     overlay_port: u16,
     data_dir_override: PathBuf,
+    node_labels: std::collections::HashMap<String, String>,
     install_wsl: ConsentMode,
 ) -> Result<()> {
     use std::time::Duration;
@@ -1543,6 +1573,7 @@ pub(crate) async fn handle_node_join(
         services: services.clone(),
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+        labels: node_labels.clone(),
         secrets_pubkey,
     };
 
@@ -1879,6 +1910,7 @@ pub(crate) async fn handle_node_join(
     _raft_port: u16,
     _overlay_port: u16,
     _data_dir_override: PathBuf,
+    _node_labels: std::collections::HashMap<String, String>,
     _install_wsl: ConsentMode,
 ) -> Result<()> {
     anyhow::bail!(
@@ -1901,6 +1933,7 @@ pub(crate) async fn handle_node_join(
     raft_port: u16,
     overlay_port: u16,
     data_dir_override: PathBuf,
+    node_labels: std::collections::HashMap<String, String>,
 ) -> Result<()> {
     use std::time::Duration;
     use zlayer_overlay::OverlayTransport;
@@ -1977,6 +2010,7 @@ pub(crate) async fn handle_node_join(
         services: services.clone(),
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+        labels: node_labels.clone(),
         secrets_pubkey,
     };
 
@@ -3007,17 +3041,10 @@ pub(crate) async fn handle_node_label(
         .build()
         .context("Failed to create HTTP client")?;
 
-    #[allow(clippy::items_after_statements)]
-    #[derive(Serialize)]
-    struct AddLabelRequest {
-        key: String,
-        value: String,
-    }
-
-    let request = AddLabelRequest {
-        key: key.to_string(),
-        value: value.to_string(),
-    };
+    let request = serde_json::json!({
+        "labels": { key: value },
+        "remove": [],
+    });
 
     let response = client
         .post(format!(
@@ -4202,6 +4229,7 @@ mod tests {
             9000,
             zlayer_core::DEFAULT_WG_PORT,
             tmp.path().to_path_buf(),
+            std::collections::HashMap::new(),
             crate::ui::consent::ConsentMode::No,
         )
         .await

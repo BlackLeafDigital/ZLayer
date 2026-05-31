@@ -130,6 +130,337 @@ func (a *InternalAPIService) GetReplicasInternalExecute(r ApiGetReplicasInternal
 	return localVarReturnValue, localVarHTTPResponse, nil
 }
 
+type ApiInternalRaftTriggerElectRequest struct {
+	ctx context.Context
+	ApiService *InternalAPIService
+}
+
+func (r ApiInternalRaftTriggerElectRequest) Execute() (*http.Response, error) {
+	return r.ApiService.InternalRaftTriggerElectExecute(r)
+}
+
+/*
+InternalRaftTriggerElect Trigger an immediate Raft election on this node.
+
+`POST /api/v1/internal/raft/trigger-elect`
+
+Called by the cluster leader's pre-self-upgrade flow on a healthy
+follower: that follower campaigns immediately instead of waiting for
+heartbeat-loss timeout after the leader exits. Raft safety still
+holds — only an up-to-date candidate can win — so a stale callee
+just loses the term and a more-up-to-date follower wins the next.
+
+# Errors
+
+- `Unauthorized` if the internal token is missing or wrong.
+- `ServiceUnavailable` on non-clustered daemons (no Raft coordinator).
+- `Internal` if the underlying `Raft::trigger().elect()` returns
+  `Fatal` (coordinator shutdown / storage failure).
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiInternalRaftTriggerElectRequest
+*/
+func (a *InternalAPIService) InternalRaftTriggerElect(ctx context.Context) ApiInternalRaftTriggerElectRequest {
+	return ApiInternalRaftTriggerElectRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+func (a *InternalAPIService) InternalRaftTriggerElectExecute(r ApiInternalRaftTriggerElectRequest) (*http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "InternalAPIService.InternalRaftTriggerElect")
+	if err != nil {
+		return nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/internal/raft/trigger-elect"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarHTTPResponse, newErr
+	}
+
+	return localVarHTTPResponse, nil
+}
+
+type ApiInternalUpgradeStartRequest struct {
+	ctx context.Context
+	ApiService *InternalAPIService
+	upgradeStartRequest *UpgradeStartRequest
+}
+
+func (r ApiInternalUpgradeStartRequest) UpgradeStartRequest(upgradeStartRequest UpgradeStartRequest) ApiInternalUpgradeStartRequest {
+	r.upgradeStartRequest = &upgradeStartRequest
+	return r
+}
+
+func (r ApiInternalUpgradeStartRequest) Execute() (*UpgradeStartResponse, *http.Response, error) {
+	return r.ApiService.InternalUpgradeStartExecute(r)
+}
+
+/*
+InternalUpgradeStart Schedule a daemon-binary upgrade on this node.
+
+`POST /api/v1/internal/upgrade/start`
+
+Registers an upgrade job, spawns a worker task that runs the
+`zlayer self-update` subcommand against `current_exe()`, and returns
+`202 Accepted` with an `upgrade_id` the caller can poll via
+`internal_upgrade_status`. On success the daemon exits with code 75 so
+the supervisor (or `--restart-on-exit`) respawns it.
+
+# Errors
+
+Returns `Unauthorized` if the internal token is missing or wrong.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiInternalUpgradeStartRequest
+*/
+func (a *InternalAPIService) InternalUpgradeStart(ctx context.Context) ApiInternalUpgradeStartRequest {
+	return ApiInternalUpgradeStartRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return UpgradeStartResponse
+func (a *InternalAPIService) InternalUpgradeStartExecute(r ApiInternalUpgradeStartRequest) (*UpgradeStartResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *UpgradeStartResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "InternalAPIService.InternalUpgradeStart")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/internal/upgrade/start"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.upgradeStartRequest == nil {
+		return localVarReturnValue, nil, reportError("upgradeStartRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.upgradeStartRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiInternalUpgradeStatusRequest struct {
+	ctx context.Context
+	ApiService *InternalAPIService
+	upgradeId string
+}
+
+func (r ApiInternalUpgradeStatusRequest) Execute() (*UpgradeJobState, *http.Response, error) {
+	return r.ApiService.InternalUpgradeStatusExecute(r)
+}
+
+/*
+InternalUpgradeStatus Fetch the status of a previously-scheduled daemon-binary upgrade.
+
+`GET /api/v1/internal/upgrade/{upgrade_id}`
+
+# Errors
+
+Returns `Unauthorized` if the internal token is missing or wrong, or
+`NotFound` if `upgrade_id` is not in the in-memory job map (which is
+expected after a daemon restart — callers should treat that as
+"upgrade likely complete; daemon respawned").
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param upgradeId Upgrade job id returned by internal_upgrade_start
+ @return ApiInternalUpgradeStatusRequest
+*/
+func (a *InternalAPIService) InternalUpgradeStatus(ctx context.Context, upgradeId string) ApiInternalUpgradeStatusRequest {
+	return ApiInternalUpgradeStatusRequest{
+		ApiService: a,
+		ctx: ctx,
+		upgradeId: upgradeId,
+	}
+}
+
+// Execute executes the request
+//  @return UpgradeJobState
+func (a *InternalAPIService) InternalUpgradeStatusExecute(r ApiInternalUpgradeStatusRequest) (*UpgradeJobState, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *UpgradeJobState
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "InternalAPIService.InternalUpgradeStatus")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/internal/upgrade/{upgrade_id}"
+	localVarPath = strings.Replace(localVarPath, "{"+"upgrade_id"+"}", url.PathEscape(parameterValueToString(r.upgradeId, "upgradeId")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiScaleServiceInternalRequest struct {
 	ctx context.Context
 	ApiService *InternalAPIService

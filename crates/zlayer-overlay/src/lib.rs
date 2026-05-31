@@ -104,6 +104,7 @@ pub mod allocator;
 pub mod bootstrap;
 pub mod config;
 pub mod dns;
+pub mod edge_cache;
 pub mod error;
 pub mod firewall;
 pub mod gossip;

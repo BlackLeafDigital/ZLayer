@@ -513,6 +513,56 @@ pub fn create_sandbox_layer(layer_path: &Path, parent_chain: &LayerChain) -> io:
     Ok(())
 }
 
+/// Create a hardlink at `link_abs` pointing at `target_abs`, ensuring the
+/// link's parent directory exists first. Mirrors the shape of hcsshim's
+/// `safefile.LinkRelative(target, targetRoot, name, root)` — both endpoints
+/// must already be absolute paths under `dest_root` (i.e. the imported layer
+/// directory) so they remain inside the layer boundary.
+///
+/// `dest_root` is the imported layer's root; passed in only so the function
+/// can record a verification that both endpoints are descendants of it, which
+/// would catch a path-resolution bug in the caller before the syscall fires.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] when either endpoint is outside `dest_root`,
+/// when the link's parent directory cannot be materialised, or when
+/// `std::fs::hard_link` itself fails (most commonly because the target does
+/// not exist on disk — which is the precise signal that
+/// `wclayer::import_layer` did not produce the expected merged view).
+pub fn link_relative(dest_root: &Path, target_abs: &Path, link_abs: &Path) -> io::Result<()> {
+    if !target_abs.starts_with(dest_root) {
+        return Err(io::Error::other(format!(
+            "link target {} is outside layer root {}",
+            target_abs.display(),
+            dest_root.display(),
+        )));
+    }
+    if !link_abs.starts_with(dest_root) {
+        return Err(io::Error::other(format!(
+            "link path {} is outside layer root {}",
+            link_abs.display(),
+            dest_root.display(),
+        )));
+    }
+    if let Some(parent) = link_abs.parent() {
+        // Some link paths (Catroot, WinSxS, etc.) blow past MAX_PATH; fall
+        // back to the `\\?\`-prefixed dir helper if std fails. Matches the
+        // strategy used by `unpacker::create_long_path_dir_all`.
+        if std::fs::create_dir_all(parent).is_err() {
+            let mut to_create: Vec<&Path> = parent.ancestors().collect();
+            to_create.reverse();
+            for component in to_create {
+                if component.as_os_str().is_empty() || component.is_dir() {
+                    continue;
+                }
+                crate::windows::layer::create_long_path_dir(component)?;
+            }
+        }
+    }
+    std::fs::hard_link(target_abs, link_abs)
+}
+
 /// Parse a canonical-format GUID string (lowercase 8-4-4-4-12) into a
 /// `windows::core::GUID`. Returns an error if `s` is not exactly 36 chars in
 /// the expected layout. The `layer_id_for_path` helper produces this format.

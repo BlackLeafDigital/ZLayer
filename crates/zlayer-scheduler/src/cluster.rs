@@ -62,6 +62,22 @@ pub struct NodeRecord {
     pub last_seen: SystemTime,
 }
 
+/// Outcome of placing a single one-off container, returned by
+/// [`Cluster::place_container`]. Carries enough for the caller (the
+/// container-create handler in `zlayer-api`) to either create locally or
+/// forward the request — without the scheduler crate needing to know the
+/// `zlayer-api` request types.
+#[derive(Debug, Clone)]
+pub struct ContainerPlacement {
+    /// The node chosen to host the container.
+    pub node_id: NodeId,
+    /// Base URL of the chosen node's API, e.g. `http://10.0.0.2:3669`.
+    /// The caller appends the internal container-create path.
+    pub api_base_url: String,
+    /// True when the chosen node is the local node (create here, no forward).
+    pub is_self: bool,
+}
+
 // Wire-level scale request types live in `zlayer-types::cluster` so they can
 // be shared between the HTTP fan-out path (here) and the `/internal/scale`
 // handler in `zlayer-api`. Re-exported under the original path so existing
@@ -149,6 +165,40 @@ pub trait Cluster: Send + Sync {
     /// Called when a follower receives a deploy. Returns `NoLeader` if no
     /// leader is currently known.
     async fn forward_scale(&self, req: InternalScaleRequest) -> Result<(), ClusterError>;
+
+    /// Place a single one-off container described by `spec`, honoring its
+    /// `platform`, `node_selector`, and resource requests against the Ready
+    /// node set. Returns the chosen node (with its API base URL) or `None`
+    /// when no Ready node satisfies the constraints.
+    ///
+    /// Only meaningful on the leader / dispatch-authoritative node — callers
+    /// should forward to the leader first when `is_leader()` is false.
+    async fn place_container(
+        &self,
+        spec: &zlayer_spec::ServiceSpec,
+    ) -> Result<Option<ContainerPlacement>, ClusterError>;
+}
+
+/// Build a single-node [`placement::NodeState`] from an OS string (the only
+/// platform signal the `SingleNodeCluster` / `StaticCluster` carry). Arch and
+/// resources are left unknown (wildcard) so a node with a recognized OS still
+/// matches platform constraints on the OS axis without spurious arch/capacity
+/// rejections.
+fn node_state_from_os(
+    id: NodeId,
+    addr: SocketAddr,
+    os: &str,
+    labels: HashMap<String, String>,
+) -> crate::placement::NodeState {
+    crate::placement::NodeState {
+        id,
+        address: addr.to_string(),
+        labels,
+        resources: crate::placement::NodeResources::default(),
+        healthy: true,
+        os: zlayer_spec::OsKind::from_rust_os(os).or_else(|| zlayer_spec::OsKind::from_oci_str(os)),
+        arch: None,
+    }
 }
 
 // ============================================================================
@@ -232,6 +282,22 @@ impl Cluster for SingleNodeCluster {
     async fn forward_scale(&self, req: InternalScaleRequest) -> Result<(), ClusterError> {
         // Single-node mode: we ARE the leader.
         (self.local_dispatch)(req).await
+    }
+
+    async fn place_container(
+        &self,
+        spec: &zlayer_spec::ServiceSpec,
+    ) -> Result<Option<ContainerPlacement>, ClusterError> {
+        let node = node_state_from_os(self.node_id, self.api_addr, &self.os, HashMap::new());
+        Ok(
+            crate::placement::place_single_container(spec, std::slice::from_ref(&node)).map(
+                |node_id| ContainerPlacement {
+                    node_id,
+                    api_base_url: format!("http://{}", self.api_addr),
+                    is_self: true,
+                },
+            ),
+        )
     }
 }
 
@@ -416,6 +482,40 @@ impl Cluster for RaftCluster {
         }
         let url = self.resolve_url(leader_id).await?;
         self.http_dispatch(url, &req).await
+    }
+
+    async fn place_container(
+        &self,
+        spec: &zlayer_spec::ServiceSpec,
+    ) -> Result<Option<ContainerPlacement>, ClusterError> {
+        let state = self.raft.read_state().await;
+        let nodes = crate::cluster_nodes_to_node_states(&state.nodes);
+        let Some(target) = crate::placement::place_single_container(spec, &nodes) else {
+            return Ok(None);
+        };
+        let info = state
+            .nodes
+            .get(&target)
+            .ok_or(ClusterError::UnknownNode(target))?;
+        let host = if info.advertise_addr.is_empty() {
+            info.address
+                .split(':')
+                .next()
+                .unwrap_or("127.0.0.1")
+                .to_string()
+        } else {
+            info.advertise_addr.clone()
+        };
+        let port = if info.api_port > 0 {
+            info.api_port
+        } else {
+            3669
+        };
+        Ok(Some(ContainerPlacement {
+            node_id: target,
+            api_base_url: format!("http://{host}:{port}"),
+            is_self: target == self.node_id,
+        }))
     }
 }
 
@@ -693,6 +793,30 @@ impl Cluster for StaticCluster {
         let leader_addr = self.leader_addr().await.ok_or(ClusterError::NoLeader)?;
         self.http_dispatch(leader_addr, &req).await
     }
+
+    async fn place_container(
+        &self,
+        spec: &zlayer_spec::ServiceSpec,
+    ) -> Result<Option<ContainerPlacement>, ClusterError> {
+        let peers = self.peers.read().await;
+        let nodes: Vec<crate::placement::NodeState> = peers
+            .iter()
+            .filter(|(_, p)| self.state_of(p) == NodeState::Ready)
+            .map(|(id, p)| node_state_from_os(*id, p.api_addr, &p.os, p.labels.clone()))
+            .collect();
+        let Some(target) = crate::placement::place_single_container(spec, &nodes) else {
+            return Ok(None);
+        };
+        let api_addr = peers
+            .get(&target)
+            .map(|p| p.api_addr)
+            .ok_or(ClusterError::UnknownNode(target))?;
+        Ok(Some(ContainerPlacement {
+            node_id: target,
+            api_base_url: format!("http://{api_addr}"),
+            is_self: target == self.node_id,
+        }))
+    }
 }
 
 // ============================================================================
@@ -962,6 +1086,18 @@ impl Cluster for WorkerTierCluster {
                     client.current_leader_addr().await.map(|_| 0u64),
                 ))
             }
+        }
+    }
+
+    async fn place_container(
+        &self,
+        spec: &zlayer_spec::ServiceSpec,
+    ) -> Result<Option<ContainerPlacement>, ClusterError> {
+        match &self.mode {
+            WorkerTierMode::Server { inner, .. } => inner.place_container(spec).await,
+            // Worker-side nodes don't make placement decisions; the control
+            // plane does. Surface "no placement" so the caller forwards.
+            WorkerTierMode::Worker { .. } => Ok(None),
         }
     }
 }

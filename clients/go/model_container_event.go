@@ -22,7 +22,7 @@ var _ MappedNullable = &ContainerEvent{}
 
 // ContainerEvent A container lifecycle event published on the bus.
 type ContainerEvent struct {
-	// Wall-clock time the event was emitted.  Serialized as an RFC 3339 string on the wire. Typed as [`chrono::DateTime<Utc>`] in-process for ergonomic manipulation; the `#[schema(value_type = String, format = DateTime)]` attribute teaches `utoipa` to render a proper string schema in the `OpenAPI` output.
+	// Wall-clock time the event was emitted.  Serialized as an RFC 3339 string on the wire.
 	At time.Time `json:"at"`
 	// Exit code, when known. Populated for `Die` events where a wait has already resolved; otherwise `None`.
 	ExitCode NullableInt32 `json:"exit_code,omitempty"`

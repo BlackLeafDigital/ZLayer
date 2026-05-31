@@ -19,7 +19,7 @@ import (
 // checks if the PullImageResponse type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &PullImageResponse{}
 
-// PullImageResponse Response body for [`pull_image_handler`]. Reports the pulled reference and, when the backend exposes it via `list_images`, the resolved digest and on-disk size.
+// PullImageResponse Response body for the pull-image handler. Reports the pulled reference and, when the backend exposes it via `list_images`, the resolved digest and on-disk size.
 type PullImageResponse struct {
 	// Content-addressed digest (`sha256:...`) if the runtime reports one.
 	Digest NullableString `json:"digest,omitempty"`

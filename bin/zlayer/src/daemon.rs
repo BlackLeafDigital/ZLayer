@@ -1253,6 +1253,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
                             arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
                             slice_cidr: leader_slice_cidr,
+                            labels: std::collections::HashMap::new(),
                         })
                         .await
                     {

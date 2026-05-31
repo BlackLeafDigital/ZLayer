@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -236,12 +237,53 @@ def phase_check_hcn(host: str, repo_remote: str, label: str) -> list[str]:
     return lines
 
 
-def phase_launch(host: str, repo_remote: str, test: str) -> LaunchInfo:
+def phase_event_logs(
+    host: str,
+    repo_remote: str,
+    run_local: Path,
+    since_minutes: int,
+) -> list[str]:
+    """Capture Hyper-V host event logs for the run window into eventlogs.txt.
+
+    Diagnoses UVM-boot / GCS-dial failures that never reach the test stdout:
+    a guest bugcheck or missing-boot-device shows up in the Hyper-V Worker /
+    Compute / VMMS channels instead.
+    """
+    section("6b. Capture Hyper-V event logs")
+    # check=False per the Cygwin-OpenSSH late-disconnect pattern used elsewhere;
+    # judge success by the script's own EVENTS_DONE marker.
+    rc, lines = run_remote_ps(
+        host,
+        f"{repo_remote}/scripts/windows/capture_hyperv_events.ps1",
+        ["-SinceMinutes", str(since_minutes)],
+        prefix="[events]",
+        check=False,
+    )
+    out = run_local / "eventlogs.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if any(ln.strip() == "EVENTS_DONE" for ln in lines):
+        console.print(f"[green]event logs captured[/] -> {out} (ssh rc={rc})")
+    else:
+        console.print(
+            f"[yellow]event-log capture incomplete (no EVENTS_DONE, rc={rc}); "
+            f"wrote partial output to {out}[/]"
+        )
+    return lines
+
+
+def phase_launch(
+    host: str, repo_remote: str, test: str, keep: bool = False, image: str | None = None
+) -> LaunchInfo:
     section("4. Launch")
+    launch_args = ["-Test", test]
+    if keep:
+        launch_args.append("-Keep")
+    if image:
+        launch_args.extend(["-Image", image])
     rc, lines = run_remote_ps(
         host,
         f"{repo_remote}/scripts/windows/launch_e2e.ps1",
-        ["-Test", test],
+        launch_args,
         prefix="[launch]",
         check=False,
     )
@@ -452,6 +494,7 @@ def write_report(
     pre_state: list[str],
     post_state: list[str],
     final_status: dict[str, str],
+    event_log_lines: list[str] | None = None,
 ) -> Path:
     log_path = run_local / "stdout.log"
     log = _read_text_safe(log_path)
@@ -562,6 +605,16 @@ def write_report(
     out.append("```")
     out.append("")
 
+    out.append("## Hyper-V event logs (run window)")
+    out.append("")
+    if not event_log_lines:
+        out.append("(none captured)")
+    else:
+        out.append("```")
+        out.append("\n".join(event_log_lines))
+        out.append("```")
+    out.append("")
+
     out.append("## stdout.log — last 60 lines")
     out.append("")
     tail = _tail(log.splitlines(), 60)
@@ -589,6 +642,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-rsync", action="store_true")
     ap.add_argument("--no-cleanup", action="store_true")
     ap.add_argument(
+        "--keep",
+        action="store_true",
+        help="Forward -Keep to launch_e2e.ps1: cargo runs with "
+        "ZLAYER_KEEP_UVM_ON_FAILURE=1 so a Hyper-V step-4 timeout leaves the "
+        "UVM running and the writable debug share intact for offline inspection.",
+    )
+    ap.add_argument(
+        "--image",
+        default=None,
+        help="Override the Hyper-V e2e test's base image via "
+        "ZLAYER_HCS_TEST_IMAGE — e.g. mcr.microsoft.com/windows/servercore:ltsc2022 "
+        "for the servercore A/B against the default nanoserver:ltsc2022.",
+    )
+    ap.add_argument(
         "--clean-deep",
         action="store_true",
         help="Before the run, also nuke stale test scratch dirs + HCS systems "
@@ -598,9 +665,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--repo-remote", default="C:/src/ZLayer")
     ap.add_argument("--poll-interval", type=int, default=30)
     ap.add_argument("--timeout-min", type=int, default=30)
+    # NEVER /tmp — that's tmpfs (RAM) on Linux, and these run dirs are
+    # state we want surviving reboots + not consuming memory. Default to
+    # the XDG cache dir.
+    _default_report_dir = os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+        "zlayer-debug",
+    )
     ap.add_argument(
         "--report-dir",
-        default=os.environ.get("ZLAYER_DEBUG_REPORT_DIR", "/tmp/zlayer-debug"),
+        default=os.environ.get("ZLAYER_DEBUG_REPORT_DIR", _default_report_dir),
     )
     ap.add_argument(
         "--local-repo",
@@ -643,9 +717,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4. Launch
     started = time.monotonic()
-    launch = phase_launch(args.host, args.repo_remote, args.test)
+    launch = phase_launch(
+        args.host, args.repo_remote, args.test, keep=args.keep, image=args.image
+    )
+    extras: list[str] = []
+    if args.keep:
+        extras.append("KEEP=1")
+    if args.image:
+        extras.append(f"IMAGE={args.image}")
+    suffix = (" [yellow]" + " ".join(extras) + "[/]") if extras else ""
     console.print(
-        f"[green]launched[/] PID={launch.pid} RUNDIR={launch.rundir_remote}"
+        f"[green]launched[/] PID={launch.pid} RUNDIR={launch.rundir_remote}{suffix}"
     )
 
     # 5. Poll
@@ -665,6 +747,12 @@ def main(argv: list[str] | None = None) -> int:
     # Capture post-state AFTER fetch so test had time to flush
     post_state = phase_check_hcn(args.host, args.repo_remote, "post")
 
+    # 6b. Hyper-V event logs for the run window (+1 min buffer).
+    since_minutes = max(2, math.ceil(duration_s / 60) + 1)
+    event_log_lines = phase_event_logs(
+        args.host, args.repo_remote, run_local, since_minutes
+    )
+
     # 7. Report
     section("7. Generate report.md")
     report_path = write_report(
@@ -675,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
         pre_state=pre_state,
         post_state=post_state,
         final_status=final_status,
+        event_log_lines=event_log_lines,
     )
     console.print(f"[green]wrote[/] {report_path}")
 

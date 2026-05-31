@@ -1,0 +1,9 @@
+base: ${REGISTRY}/base:windows-${LTSC}
+os: windows
+
+steps:
+  - run: apt-get install -y nodejs
+
+labels:
+  org.opencontainers.image.title: "ZLayer Windows Node.js"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

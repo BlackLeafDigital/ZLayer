@@ -850,6 +850,19 @@ async fn build_single_image(
     // Determine if this is a ZImagefile or Dockerfile based on extension/name
     builder = apply_build_file(builder, &file_path);
 
+    // Expand pipeline `${VAR}` references in the ZImagefile body (base:/run:),
+    // so a single ZImagefile set parametrizes across variants (e.g. the Windows
+    // `--set LTSC=...` lines). No-op for Dockerfiles and for empty vars.
+    builder = builder.pipeline_vars(pipeline.vars.clone());
+
+    // Forward the `LTSC` pipeline var to the Windows backend so FROM-image
+    // rewrites pick the correct prebuilt (`ltsc2022` vs `ltsc2025`). We only
+    // set it when the pipeline actually declares LTSC so non-Windows builds
+    // don't carry a meaningless field.
+    if let Some(ltsc) = pipeline.vars.get("LTSC") {
+        builder = builder.windows_ltsc(ltsc.clone());
+    }
+
     // Pass the source hash so the sandbox builder stores it for future cache checks
     if let Some(hash) = file_hash {
         builder = builder.source_hash(hash);
@@ -942,6 +955,16 @@ async fn build_multiplatform_image(
 
         // Determine file type (same detection as build_single_image)
         builder = apply_build_file(builder, &file_path);
+
+        // Expand pipeline `${VAR}` refs in the ZImagefile body (see build_single_image).
+        builder = builder.pipeline_vars(pipeline.vars.clone());
+
+        // Forward the `LTSC` pipeline var to the Windows backend (see
+        // build_single_image for the rationale). Only set when actually
+        // declared so non-Windows multi-platform builds aren't polluted.
+        if let Some(ltsc) = pipeline.vars.get("LTSC") {
+            builder = builder.windows_ltsc(ltsc.clone());
+        }
 
         // Set platform
         builder = builder.platform(platform);

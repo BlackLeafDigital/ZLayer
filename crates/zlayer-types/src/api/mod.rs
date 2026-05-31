@@ -9,6 +9,7 @@ pub mod containers;
 pub mod credentials;
 pub mod cron;
 pub mod deployments;
+pub mod edge_cache;
 pub mod environments;
 pub mod events;
 pub mod groups;

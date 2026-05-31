@@ -4,14 +4,15 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**Replicas** | **int32** | Target replica count | 
-**Service** | **string** | Service name to scale | 
+**Assignments** | Pointer to [**[]ScaleAssignment**](ScaleAssignment.md) | Per-role-group container index lists. Empty in Phase 1; populated by Phase 2 once &#x60;replica_groups&#x60; + cross-node identity ship. | [optional] 
+**Replicas** | Pointer to **int32** | Total target replica count for this node, when caller didn&#39;t supply explicit per-role assignments (legacy / Phase 1 shape). When &#x60;assignments&#x60; is non-empty, this field is informational. | [optional] 
+**Service** | **string** | Service name. | 
 
 ## Methods
 
 ### NewInternalScaleRequest
 
-`func NewInternalScaleRequest(replicas int32, service string, ) *InternalScaleRequest`
+`func NewInternalScaleRequest(service string, ) *InternalScaleRequest`
 
 NewInternalScaleRequest instantiates a new InternalScaleRequest object
 This constructor will assign default values to properties that have it defined,
@@ -25,6 +26,31 @@ will change when the set of required properties is changed
 NewInternalScaleRequestWithDefaults instantiates a new InternalScaleRequest object
 This constructor will only assign default values to properties that have it defined,
 but it doesn't guarantee that properties required by API are set
+
+### GetAssignments
+
+`func (o *InternalScaleRequest) GetAssignments() []ScaleAssignment`
+
+GetAssignments returns the Assignments field if non-nil, zero value otherwise.
+
+### GetAssignmentsOk
+
+`func (o *InternalScaleRequest) GetAssignmentsOk() (*[]ScaleAssignment, bool)`
+
+GetAssignmentsOk returns a tuple with the Assignments field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetAssignments
+
+`func (o *InternalScaleRequest) SetAssignments(v []ScaleAssignment)`
+
+SetAssignments sets Assignments field to given value.
+
+### HasAssignments
+
+`func (o *InternalScaleRequest) HasAssignments() bool`
+
+HasAssignments returns a boolean if a field has been set.
 
 ### GetReplicas
 
@@ -45,6 +71,11 @@ and a boolean to check if the value has been set.
 
 SetReplicas sets Replicas field to given value.
 
+### HasReplicas
+
+`func (o *InternalScaleRequest) HasReplicas() bool`
+
+HasReplicas returns a boolean if a field has been set.
 
 ### GetService
 

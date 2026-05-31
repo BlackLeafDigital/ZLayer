@@ -504,6 +504,41 @@ impl PlacementState {
     }
 }
 
+/// Whether `node` has enough remaining CPU/memory headroom for `spec`'s
+/// requests. A node reporting zero total CPU/memory is a legacy agent that
+/// never advertised its specs -- treated as a wildcard (always fits) so a
+/// rolling upgrade doesn't strand it (mirrors the os/arch legacy handling).
+#[must_use]
+fn node_has_capacity(node: &NodeState, spec: &ServiceSpec) -> bool {
+    let req_cpu = spec.resources.cpu.unwrap_or(0.0);
+    if req_cpu > 0.0 && node.resources.cpu_total > 0.0 && node.resources.cpu_available() < req_cpu {
+        debug!(
+            node = %node.id,
+            req_cpu,
+            cpu_available = node.resources.cpu_available(),
+            "Node rejected: insufficient CPU"
+        );
+        return false;
+    }
+    let req_mem = spec
+        .resources
+        .memory
+        .as_deref()
+        .and_then(zlayer_spec::validate::memory_string_to_bytes)
+        .unwrap_or(0);
+    if req_mem > 0 && node.resources.memory_total > 0 && node.resources.memory_available() < req_mem
+    {
+        debug!(
+            node = %node.id,
+            req_mem,
+            memory_available = node.resources.memory_available(),
+            "Node rejected: insufficient memory"
+        );
+        return false;
+    }
+    true
+}
+
 /// Check if a node can accept a service based on `node_mode`, constraints, and resource availability
 ///
 /// # Arguments
@@ -620,9 +655,9 @@ pub fn can_place_on_node(
     // Check based on node mode
     match node_mode {
         NodeMode::Shared => {
-            // In shared mode, check if node has capacity
-            // For now, just check if node is healthy (resource checking can be added)
-            true
+            // In shared mode the node may co-host workloads, so honor the
+            // request's CPU/memory against this node's remaining capacity.
+            service_spec.is_none_or(|spec| node_has_capacity(node, spec))
         }
         NodeMode::Dedicated => {
             // In dedicated mode, check if node has no containers from THIS service
@@ -658,9 +693,73 @@ fn no_suitable_node_reason(
             return format!("no agent matches required platform {target}");
         }
     }
+    // Capacity diagnosis: if a CPU/memory request is set and no node that
+    // reports its specs has enough remaining headroom, say so explicitly.
+    let req_cpu = service_spec.resources.cpu.unwrap_or(0.0);
+    let req_mem = service_spec
+        .resources
+        .memory
+        .as_deref()
+        .and_then(zlayer_spec::validate::memory_string_to_bytes)
+        .unwrap_or(0);
+    if req_cpu > 0.0 || req_mem > 0 {
+        let any_capacity = nodes.iter().any(|n| {
+            let cpu_ok = req_cpu <= 0.0
+                || n.resources.cpu_total <= 0.0
+                || n.resources.cpu_available() >= req_cpu;
+            let mem_ok = req_mem == 0
+                || n.resources.memory_total == 0
+                || n.resources.memory_available() >= req_mem;
+            cpu_ok && mem_ok
+        });
+        if !any_capacity {
+            return format!(
+                "no agent has sufficient capacity (requested cpu {req_cpu}, memory {req_mem} bytes)"
+            );
+        }
+    }
     format!(
         "No node available for service '{}' with mode {:?}",
         service_name, service_spec.node_mode
+    )
+}
+
+/// Pick a node for a single one-off container described by `spec`.
+///
+/// Reuses [`can_place_on_node`] (platform + `node_selector` labels + Shared-mode
+/// CPU/memory capacity) to filter candidates, then [`select_for_bin_packing`]
+/// to rank survivors (preferred-label affinity, then least-utilized). Returns
+/// the chosen [`NodeId`], or `None` when no Ready node satisfies the
+/// constraints. `nodes` is the Ready node set (e.g. from the leader's cluster
+/// state); placement is stateless because a one-off container carries no
+/// prior placement history.
+#[must_use]
+pub fn place_single_container(spec: &ServiceSpec, nodes: &[NodeState]) -> Option<NodeId> {
+    let placements = PlacementState::new();
+    let candidates: Vec<&NodeState> = nodes
+        .iter()
+        .filter(|n| {
+            can_place_on_node(
+                n,
+                "",
+                spec.node_mode,
+                spec.node_selector.as_ref(),
+                &placements,
+                Some(spec),
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(
+        select_for_bin_packing(
+            &candidates,
+            &placements,
+            spec.node_selector.as_ref(),
+            Some(spec),
+        )
+        .id,
     )
 }
 
@@ -2048,5 +2147,130 @@ mod tests {
 
         // Should prefer node2 (less GPU availability) to spread the workload
         assert_eq!(decisions[0].node_id, Some(2));
+    }
+
+    // -- System-spec-aware (CPU/memory) placement -----------------------------
+
+    fn node_with_capacity(id: NodeId, cpu_total: f64, cpu_used: f64, mem_total: u64) -> NodeState {
+        let mut res = NodeResources::new(cpu_total, mem_total);
+        res.cpu_used = cpu_used;
+        NodeState::new(id, format!("10.0.0.{id}:3669")).with_resources(res)
+    }
+
+    #[test]
+    fn shared_mode_rejects_node_without_cpu_headroom() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(1.0);
+        // 2 total, 2 used -> 0 available.
+        let node = node_with_capacity(1, 2.0, 2.0, 8 * 1024 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(!can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_rejects_node_without_memory_headroom() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.memory = Some("512Mi".to_string());
+        // 256Mi total -> request of 512Mi cannot fit.
+        let node = node_with_capacity(1, 8.0, 0.0, 256 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(!can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_accepts_when_capacity_fits() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(1.0);
+        spec.resources.memory = Some("512Mi".to_string());
+        let node = node_with_capacity(1, 4.0, 1.0, 8 * 1024 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_zero_total_capacity_is_wildcard() {
+        // Legacy node that never reported specs (cpu_total/mem_total == 0) must
+        // not be rejected on capacity grounds.
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(64.0);
+        spec.resources.memory = Some("1Ti".to_string());
+        let node = make_node(1, "10.0.0.1:3669"); // default resources == 0
+        let placements = PlacementState::new();
+        assert!(can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    // -- Single-container placement -------------------------------------------
+
+    #[test]
+    fn place_single_container_picks_matching_platform() {
+        let nodes = vec![
+            make_node_with_platform(1, zlayer_spec::OsKind::Linux, zlayer_spec::ArchKind::Amd64),
+            make_node_with_platform(2, zlayer_spec::OsKind::Macos, zlayer_spec::ArchKind::Arm64),
+        ];
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Macos,
+            zlayer_spec::ArchKind::Arm64,
+        ));
+        assert_eq!(place_single_container(&spec, &nodes), Some(2));
+    }
+
+    #[test]
+    fn place_single_container_none_when_no_node_matches() {
+        let nodes = vec![make_node_with_platform(
+            1,
+            zlayer_spec::OsKind::Linux,
+            zlayer_spec::ArchKind::Amd64,
+        )];
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Macos,
+            zlayer_spec::ArchKind::Arm64,
+        ));
+        assert_eq!(place_single_container(&spec, &nodes), None);
+    }
+
+    #[test]
+    fn place_single_container_honors_node_selector_labels() {
+        let nodes = vec![
+            make_node(1, "10.0.0.1:3669").with_label("zone", "a"),
+            make_node(2, "10.0.0.2:3669").with_label("zone", "b"),
+        ];
+        let selector = NodeSelector {
+            labels: [("zone".to_string(), "b".to_string())]
+                .into_iter()
+                .collect(),
+            prefer_labels: HashMap::new(),
+        };
+        let spec = make_service_spec(NodeMode::Shared, Some(selector));
+        assert_eq!(place_single_container(&spec, &nodes), Some(2));
     }
 }

@@ -25,6 +25,8 @@ type ClusterNodeSummary struct {
 	Address string `json:"address"`
 	// Advertise address (public IP)
 	AdvertiseAddr string `json:"advertise_addr"`
+	// API endpoint as `advertise_addr:api_port` (e.g., \"127.0.0.1:19110\"). Distinct from `address` which holds the Raft RPC endpoint.
+	ApiEndpoint *string `json:"api_endpoint,omitempty"`
 	// Total CPU cores on this node
 	CpuTotal float64 `json:"cpu_total"`
 	// Current CPU usage (cores)
@@ -130,6 +132,38 @@ func (o *ClusterNodeSummary) GetAdvertiseAddrOk() (*string, bool) {
 // SetAdvertiseAddr sets field value
 func (o *ClusterNodeSummary) SetAdvertiseAddr(v string) {
 	o.AdvertiseAddr = v
+}
+
+// GetApiEndpoint returns the ApiEndpoint field value if set, zero value otherwise.
+func (o *ClusterNodeSummary) GetApiEndpoint() string {
+	if o == nil || IsNil(o.ApiEndpoint) {
+		var ret string
+		return ret
+	}
+	return *o.ApiEndpoint
+}
+
+// GetApiEndpointOk returns a tuple with the ApiEndpoint field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ClusterNodeSummary) GetApiEndpointOk() (*string, bool) {
+	if o == nil || IsNil(o.ApiEndpoint) {
+		return nil, false
+	}
+	return o.ApiEndpoint, true
+}
+
+// HasApiEndpoint returns a boolean if a field has been set.
+func (o *ClusterNodeSummary) HasApiEndpoint() bool {
+	if o != nil && !IsNil(o.ApiEndpoint) {
+		return true
+	}
+
+	return false
+}
+
+// SetApiEndpoint gets a reference to the given string and assigns it to the ApiEndpoint field.
+func (o *ClusterNodeSummary) SetApiEndpoint(v string) {
+	o.ApiEndpoint = &v
 }
 
 // GetCpuTotal returns the CpuTotal field value
@@ -432,6 +466,9 @@ func (o ClusterNodeSummary) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	toSerialize["address"] = o.Address
 	toSerialize["advertise_addr"] = o.AdvertiseAddr
+	if !IsNil(o.ApiEndpoint) {
+		toSerialize["api_endpoint"] = o.ApiEndpoint
+	}
 	toSerialize["cpu_total"] = o.CpuTotal
 	toSerialize["cpu_used"] = o.CpuUsed
 	toSerialize["id"] = o.Id

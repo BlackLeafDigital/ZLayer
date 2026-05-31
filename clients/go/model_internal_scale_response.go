@@ -25,6 +25,8 @@ type InternalScaleResponse struct {
 	Message NullableString `json:"message,omitempty"`
 	// New replica count
 	Replicas int32 `json:"replicas"`
+	// When set, this agent refused the scale because it cannot run the workload's OS (H-7 `RouteToPeer` policy). The value is the OCI-canonical OS string the workload requires (`linux` / `windows` / `darwin`). The scheduler catches this and re-dispatches to a cluster peer whose `NodeState.os` matches.
+	RerouteToOs NullableString `json:"reroute_to_os,omitempty"`
 	// Service name that was scaled
 	Service string `json:"service"`
 	// Whether the operation succeeded
@@ -119,6 +121,48 @@ func (o *InternalScaleResponse) SetReplicas(v int32) {
 	o.Replicas = v
 }
 
+// GetRerouteToOs returns the RerouteToOs field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *InternalScaleResponse) GetRerouteToOs() string {
+	if o == nil || IsNil(o.RerouteToOs.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.RerouteToOs.Get()
+}
+
+// GetRerouteToOsOk returns a tuple with the RerouteToOs field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *InternalScaleResponse) GetRerouteToOsOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RerouteToOs.Get(), o.RerouteToOs.IsSet()
+}
+
+// HasRerouteToOs returns a boolean if a field has been set.
+func (o *InternalScaleResponse) HasRerouteToOs() bool {
+	if o != nil && o.RerouteToOs.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRerouteToOs gets a reference to the given NullableString and assigns it to the RerouteToOs field.
+func (o *InternalScaleResponse) SetRerouteToOs(v string) {
+	o.RerouteToOs.Set(&v)
+}
+// SetRerouteToOsNil sets the value for RerouteToOs to be an explicit nil
+func (o *InternalScaleResponse) SetRerouteToOsNil() {
+	o.RerouteToOs.Set(nil)
+}
+
+// UnsetRerouteToOs ensures that no value is present for RerouteToOs, not even an explicit nil
+func (o *InternalScaleResponse) UnsetRerouteToOs() {
+	o.RerouteToOs.Unset()
+}
+
 // GetService returns the Service field value
 func (o *InternalScaleResponse) GetService() string {
 	if o == nil {
@@ -181,6 +225,9 @@ func (o InternalScaleResponse) ToMap() (map[string]interface{}, error) {
 		toSerialize["message"] = o.Message.Get()
 	}
 	toSerialize["replicas"] = o.Replicas
+	if o.RerouteToOs.IsSet() {
+		toSerialize["reroute_to_os"] = o.RerouteToOs.Get()
+	}
 	toSerialize["service"] = o.Service
 	toSerialize["success"] = o.Success
 	return toSerialize, nil

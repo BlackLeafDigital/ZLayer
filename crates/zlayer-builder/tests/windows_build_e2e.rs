@@ -442,6 +442,7 @@ async fn windows_build_e2e_full_round_trip() {
             dockerfile_path: PathBuf::from("Dockerfile"),
             build_args: HashMap::new(),
             tag: tag.clone(),
+            ltsc: None,
         };
 
         // --- 2. Build + push the image ------------------------------
@@ -561,6 +562,7 @@ async fn windows_build_e2e_foreign_layer_round_trips() {
             dockerfile_path: PathBuf::from("Dockerfile"),
             build_args: HashMap::new(),
             tag: tag.clone(),
+            ltsc: None,
         };
         builder
             .build_and_push(&ctx)

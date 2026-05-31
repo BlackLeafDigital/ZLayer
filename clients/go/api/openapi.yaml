@@ -79,6 +79,8 @@ tags:
   name: Cron
 - description: "Job execution triggering, status, and cancellation"
   name: Jobs
+- description: Daemon-level introspection (capability survey)
+  name: Daemon
 paths:
   /api/v1/audit:
     get:
@@ -381,6 +383,33 @@ paths:
       summary: Force this node to become the cluster leader (disaster recovery).
       tags:
       - Cluster
+  /api/v1/cluster/gossip/peers:
+    get:
+      description: |-
+        Returns an empty list when the daemon has no gossip pool configured
+        (single-node, raft-only, static, or worker-tier without gossip enabled).
+
+        # Errors
+
+        Currently infallible — `GossipPool::peers()` can't fail today. The
+        return type stays `Result<_>` so a future fallible implementation
+        doesn't need a signature change.
+      operationId: cluster_list_gossip_peers
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/GossipPeerSummary"
+                type: array
+          description: List of gossip pool peers
+      security:
+      - bearer_auth: []
+      summary: '`GET /api/v1/cluster/gossip/peers` — list peers known via the gossip
+        pool.'
+      tags:
+      - Cluster
   /api/v1/cluster/heartbeat:
     post:
       description: |-
@@ -465,6 +494,170 @@ paths:
       security:
       - bearer_auth: []
       summary: List all nodes visible in the Raft cluster state.
+      tags:
+      - Cluster
+  /api/v1/cluster/nodes/{id}/labels:
+    post:
+      description: |-
+        # Errors
+        Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+        or `Internal` on propose failure.
+      operationId: cluster_set_node_labels
+      parameters:
+      - description: Raft node id
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateLabelsRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateLabelsResponse"
+          description: Labels updated
+        "503":
+          description: Raft coordinator not available
+      security:
+      - bearer_auth: []
+      summary: |-
+        Set or remove labels on a node, persisted in raft cluster state so the
+        scheduler's `NodeSelector` placement honors them. `labels` entries are
+        inserted/overwritten; `remove` keys are deleted.
+      tags:
+      - Cluster
+  /api/v1/cluster/upgrade:
+    post:
+      description: |-
+        `POST /api/v1/cluster/upgrade`
+
+        Returns `421 Misdirected Request` (with an `X-Leader-Addr` header) when
+        called on a follower; the CLI should redirect to the leader. The leader
+        upgrades followers in ascending `node_id` order; it does NOT upgrade
+        itself in this handler — the caller is expected to invoke
+        `/api/v1/internal/upgrade/start` against the leader after followers are
+        done (or step down first), so the leader process can restart cleanly.
+
+        # Errors
+
+        Returns `ServiceUnavailable` if no Raft coordinator is wired,
+        `NotLeader` if this node is not the leader, or `Internal` if cluster
+        state cannot be read.
+      operationId: cluster_upgrade
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClusterUpgradeRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClusterUpgradeResult"
+          description: Rolling upgrade completed
+        "421":
+          description: Not the leader; clients should redirect via the X-Leader-Addr
+            header
+        "500":
+          description: Internal error driving the rollout
+        "503":
+          description: Raft coordinator not available
+      security:
+      - bearer_auth: []
+      summary: Drive a rolling daemon-binary upgrade across every follower.
+      tags:
+      - Cluster
+  /api/v1/cluster/upgrade-self:
+    post:
+      description: |-
+        `POST /api/v1/cluster/upgrade-self`
+
+        Two-step orchestration:
+
+        1. **Leader handoff via `trigger_elect`**: pick a healthy follower
+           (status == `"ready"`, fresh heartbeat) and POST to its
+           `/api/v1/internal/raft/trigger-elect`. That follower campaigns
+           immediately — Raft safety guarantees only an up-to-date candidate
+           wins, so a stale callee just loses the term and a better-up-to-date
+           follower wins the next. We then poll our own `raft.metrics()`
+           until `current_leader != local_node_id` (timeout 5s). If the
+           handoff fails or times out, we still proceed; the worst case is
+           the cluster waits one heartbeat-loss window for a new leader.
+
+        2. **Local self-upgrade**: re-enter `POST /api/v1/internal/upgrade/start`
+           against `127.0.0.1` so the (now-former) leader's daemon downloads
+           the target release, writes the restart sentinel, and exits with
+           code 75 — the OS supervisor (launchd / systemd / SCM) respawns it
+           on the new binary and it rejoins as a voter.
+
+        # Errors
+
+        Returns `ServiceUnavailable` if Raft or the internal token are
+        unconfigured, `Internal` if the leader's own `advertise_addr` /
+        `api_port` cannot be resolved from cluster state, or `Internal` if
+        the localhost upgrade-start call fails.
+      operationId: cluster_upgrade_self
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClusterUpgradeSelfRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeStartResponse"
+          description: Self-upgrade scheduled
+        "500":
+          description: Internal error scheduling self-upgrade
+        "503":
+          description: Raft coordinator or internal token not configured
+      security:
+      - bearer_auth: []
+      summary: Trigger a daemon-binary self-upgrade on the local (leader) node.
+      tags:
+      - Cluster
+  /api/v1/cluster/workers:
+    get:
+      description: |-
+        Returns an empty list when this node is not running a worker-tier
+        dispatcher (e.g., single-node, raft-only, static, or a worker-tier
+        worker-role daemon).
+
+        # Errors
+
+        Never errors today — `known_workers()` is infallible. The result type
+        stays `Result<_>` so a future fallible implementation doesn't need a
+        signature change.
+      operationId: cluster_list_workers
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/WorkerSummary"
+                type: array
+          description: List of worker-tier workers
+      security:
+      - bearer_auth: []
+      summary: '`GET /api/v1/cluster/workers` — list currently-leased worker-tier
+        workers.'
       tags:
       - Cluster
   /api/v1/container-networks:
@@ -727,13 +920,14 @@ paths:
       - Containers
     post:
       description: |-
-        Pulls the image if needed, creates the container, and starts it.
-        Returns the container info including its assigned ID.
+        When the daemon has a cluster handle and the request carries
+        `node_selector` / `platform`, the request is placed across the cluster
+        (see [`place_or_create`]); otherwise the container is created locally.
 
         # Errors
 
-        Returns an error if image pull fails, container creation fails, or the
-        user lacks the operator role.
+        Returns an error if image pull fails, container creation fails, no node
+        satisfies the placement constraints, or the user lacks the operator role.
       operationId: create_container
       requestBody:
         content:
@@ -754,11 +948,43 @@ paths:
           description: Unauthorized
         "403":
           description: Forbidden - operator role required
+        "409":
+          description: No node satisfies the placement constraints
         "500":
           description: Internal error
       security:
       - bearer_auth: []
-      summary: Create and start a container.
+      summary: "Create and start a container (public, JWT-authenticated entry point)."
+      tags:
+      - Containers
+  /api/v1/containers/prune:
+    post:
+      description: |-
+        Mirrors Docker-compat `POST /containers/prune`. Returns the IDs of
+        containers that were removed plus the bytes reclaimed.
+
+        # Errors
+
+        Returns 501 when the runtime doesn't support a global prune sweep.
+      operationId: prune_containers
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerPruneResponse"
+          description: Prune result
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support container prune
+      security:
+      - bearer_auth: []
+      summary: Prune stopped containers from the runtime.
       tags:
       - Containers
   /api/v1/containers/{id}:
@@ -823,6 +1049,208 @@ paths:
       security:
       - bearer_auth: []
       summary: Get details for a specific container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/archive:
+    get:
+      description: |-
+        Returns `application/x-tar` bytes. The `X-Docker-Container-Path-Stat`
+        header is also emitted (matching Docker's behaviour) so callers can
+        inspect the path's metadata without a separate HEAD round-trip.
+
+        # Errors
+
+        * `400 Bad Request` when the `path` query parameter is missing.
+        * `404 Not Found` when the container or path does not exist.
+        * `501 Not Implemented` when the runtime cannot produce a TAR archive.
+      operationId: archive_get
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Container-side path to archive
+        explode: true
+        in: query
+        name: path
+        required: true
+        schema:
+          type: string
+        style: form
+      responses:
+        "200":
+          description: TAR archive (application/x-tar)
+        "400":
+          description: Missing path query parameter
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container or path not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support archive download
+      security:
+      - bearer_auth: []
+      summary: |-
+        `GET /api/v1/containers/{id}/archive?path=<...>` — stream a TAR archive
+        of the requested file or directory inside the container.
+      tags:
+      - Containers
+    head:
+      description: |-
+        # Errors
+
+        * `400 Bad Request` when the `path` query parameter is missing.
+        * `404 Not Found` when the container or path does not exist.
+        * `501 Not Implemented` when the runtime cannot stat container paths.
+      operationId: archive_head
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Container-side path to stat
+        explode: true
+        in: query
+        name: path
+        required: true
+        schema:
+          type: string
+        style: form
+      responses:
+        "200":
+          description: Path stat header set
+        "400":
+          description: Missing path query parameter
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container or path not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support archive head
+      security:
+      - bearer_auth: []
+      summary: |-
+        `HEAD /api/v1/containers/{id}/archive?path=<...>` — return path-stat
+        metadata in the `X-Docker-Container-Path-Stat` header without
+        materializing the TAR archive.
+      tags:
+      - Containers
+    put:
+      description: |-
+        Accepts an `application/x-tar` body. Honours Docker's
+        `noOverwriteDirNonDir` and `copyUIDGID` query parameters.
+
+        # Errors
+
+        * `400 Bad Request` when the `path` query parameter is missing or the
+          archive payload is malformed.
+        * `404 Not Found` when the container or destination path does not exist.
+        * `501 Not Implemented` when the runtime cannot extract archives.
+      operationId: archive_put
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Container-side path to extract into
+        explode: true
+        in: query
+        name: path
+        required: true
+        schema:
+          type: string
+        style: form
+      requestBody:
+        content:
+          application/x-tar:
+            schema:
+              items:
+                format: int32
+                minimum: 0
+                type: integer
+              type: array
+        description: Uncompressed TAR archive to extract into the container
+        required: true
+      responses:
+        "200":
+          description: Archive extracted
+        "400":
+          description: Missing path or invalid archive
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container or destination not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support archive upload
+      security:
+      - bearer_auth: []
+      summary: |-
+        `PUT /api/v1/containers/{id}/archive?path=<...>` — extract a TAR
+        archive into the container at the given path.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/changes:
+    get:
+      description: |-
+        Mirrors Docker-compat `GET /containers/{id}/changes`. Returns one
+        `ContainerChangeEntry` per added / modified / deleted path in the
+        container's writable layer. Runtimes without a layered filesystem
+        (e.g. youki) return 501.
+
+        # Errors
+
+        Returns 404 when the container can't be resolved, 501 when the runtime
+        doesn't compute layer diffs.
+      operationId: changes_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/ContainerChangeEntry"
+                type: array
+          description: Filesystem changes
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support filesystem diffs
+      security:
+      - bearer_auth: []
+      summary: Report changes to the container's filesystem.
       tags:
       - Containers
   /api/v1/containers/{id}/exec:
@@ -936,12 +1364,26 @@ paths:
   /api/v1/containers/{id}/logs:
     get:
       description: |-
-        Returns the last N lines of container logs as plain text, or streams
-        logs as Server-Sent Events when `follow=true`.
+        Backed by [`Runtime::logs_stream`]. Two wire formats are supported:
+
+        * `format=json` (the default) — emit one NDJSON `LogChunk` per line:
+          `{"stream":"stdout|stderr","timestamp":"...","data":"<utf8>"}` (or
+          `data_b64` when the bytes aren't valid UTF-8). `Content-Type:
+          application/json`.
+
+        * `format=raw` — emit Docker's multiplexed stdcopy framing
+          (`application/vnd.docker.raw-stream`). Consumed by the Docker compat
+          shim in `zlayer-docker`.
+
+        `follow=true` keeps the stream open until the runtime reports EOF or the
+        client disconnects. Stream errors mid-flight are emitted as a final
+        `{"error": "..."}` line (json mode) or simply terminate the body (raw
+        mode) — Docker's raw framing has no in-band error escape.
 
         # Errors
 
-        Returns an error if the container is not found or log retrieval fails.
+        Returns `404` when the container can't be resolved, `500` on a runtime
+        failure to open the stream.
       operationId: get_container_logs
       parameters:
       - description: Container identifier
@@ -952,7 +1394,10 @@ paths:
         schema:
           type: string
         style: simple
-      - description: Number of tail lines to return
+      - description: |-
+          Number of tail lines to return. `0` and "all" map to "everything
+          available"; otherwise the runtime ships the last `tail` lines before
+          the live stream begins.
         explode: true
         in: query
         name: tail
@@ -961,7 +1406,7 @@ paths:
           minimum: 0
           type: integer
         style: form
-      - description: Follow logs (SSE stream)
+      - description: Follow logs after the current end-of-buffer marker.
         explode: true
         in: query
         name: follow
@@ -969,20 +1414,223 @@ paths:
         schema:
           type: boolean
         style: form
+      - description: |-
+          Earliest log timestamp to include (Unix seconds). `None` means no
+          lower bound.
+        explode: true
+        in: query
+        name: since
+        required: false
+        schema:
+          format: int64
+          nullable: true
+          type: integer
+        style: form
+      - description: |-
+          Latest log timestamp to include (Unix seconds). `None` means no upper
+          bound.
+        explode: true
+        in: query
+        name: until
+        required: false
+        schema:
+          format: int64
+          nullable: true
+          type: integer
+        style: form
+      - description: |-
+          When `true`, the runtime is asked to populate per-chunk timestamps so
+          the wire-format includes them.
+        explode: true
+        in: query
+        name: timestamps
+        required: false
+        schema:
+          type: boolean
+        style: form
+      - description: |-
+          Include stdout chunks. When neither `stdout` nor `stderr` is set, the
+          handler defaults both to `true` (Docker parity).
+        explode: true
+        in: query
+        name: stdout
+        required: false
+        schema:
+          nullable: true
+          type: boolean
+        style: form
+      - description: |-
+          Include stderr chunks. See [`ContainerLogQuery::stdout`] for the
+          "neither set" default behavior.
+        explode: true
+        in: query
+        name: stderr
+        required: false
+        schema:
+          nullable: true
+          type: boolean
+        style: form
+      - description: |-
+          Wire format for the streamed body. `"json"` (the default) emits one
+          NDJSON `LogChunk` per line; `"raw"` emits Docker's multiplexed stdcopy
+          frames (`application/vnd.docker.raw-stream`).
+        explode: true
+        in: query
+        name: format
+        required: false
+        schema:
+          allOf:
+          - $ref: "#/components/schemas/ContainerLogFormat"
+          nullable: true
+        style: form
       responses:
         "200":
           content:
             text/plain:
               schema:
                 type: string
-          description: Container logs (plain text or SSE stream)
+          description: "Container logs (NDJSON when format=json, Docker stdcopy frames\
+            \ when format=raw)"
         "401":
           description: Unauthorized
         "404":
           description: Container not found
       security:
       - bearer_auth: []
-      summary: Get container logs.
+      summary: Stream container logs.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/pause:
+    post:
+      description: |-
+        Mirrors Docker-compat `POST /containers/{id}/pause`. Returns 204 on
+        success, 404 if the container isn't found, 501 if the runtime cannot
+        pause containers, and 500 for other runtime errors.
+
+        # Errors
+
+        Returns an error if authentication fails, the container is missing, the
+        runtime doesn't support pause, or the underlying call fails.
+      operationId: pause_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Container paused
+        "400":
+          description: Container not in a pausable state
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support pause
+      security:
+      - bearer_auth: []
+      summary: Pause a running container by freezing its cgroup.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/port:
+    get:
+      description: |-
+        Mirrors Docker-compat `GET /containers/{id}/port`. Groups the runtime's
+        port-binding entries by `<container_port>/<protocol>` so the wire shape
+        matches Docker's `{"Ports": {"80/tcp": [...]}}` body.
+
+        # Errors
+
+        Returns 404 when the container can't be resolved, 501 when the runtime
+        doesn't expose port bindings.
+      operationId: port_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerPortResponse"
+          description: Port mappings
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support port-mapping inspection
+      security:
+      - bearer_auth: []
+      summary: Report the published port mappings for a container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/rename:
+    post:
+      description: |-
+        Mirrors Docker Engine's `POST /containers/{id}/rename?name=<new>`
+        endpoint: the container's stored display name is updated to `name`,
+        and the underlying runtime is asked to apply the rename so external
+        tooling (e.g. `docker ps`) sees the new name.
+
+        # Errors
+
+        * `400` if the `name` query parameter is missing or empty.
+        * `404` if the container cannot be resolved.
+        * `409` if the runtime rejects the rename (e.g. name already in use).
+        * `500` for other runtime failures.
+      operationId: rename_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: New human-readable name to assign to the container. Required.
+        explode: true
+        in: query
+        name: name
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "204":
+          description: Container renamed
+        "400":
+          description: Missing or empty `name` query parameter
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+      security:
+      - bearer_auth: []
+      summary: Rename a standalone container.
       tags:
       - Containers
   /api/v1/containers/{id}/restart:
@@ -1067,17 +1715,24 @@ paths:
   /api/v1/containers/{id}/stats:
     get:
       description: |-
-        Returns CPU and memory usage statistics for the specified container.
-        By default this is a one-shot JSON response. When the query string
-        contains `stream=true`, the handler switches to Server-Sent Events and
-        emits one `ContainerStatsResponse` sample every `interval` seconds
-        (default 2, clamped to `[1, 60]`). The stream ends with a final
-        `event: close` when the container exits or the runtime reports an
-        unrecoverable error.
+        Backed by [`Runtime::stats_stream`]. The handler always advertises
+        `Content-Type: application/json` and ships one [`StatsSample`] per NDJSON
+        line.
+
+        * `stream=false` (the default — Docker parity) — await the first
+          `StatsSample` and close the body. Returns `200` with a single line.
+        * `stream=true` — keep the body open, forwarding samples as they arrive
+          until the runtime reports EOF or the client disconnects.
+
+        Mid-stream errors are emitted as a final `{"error":"..."}` line and end
+        the body. The legacy `interval` query parameter is accepted for
+        backwards-compatibility but ignored: pacing is now driven by the
+        runtime's own sampling cadence.
 
         # Errors
 
-        Returns an error if the container is not found or stats retrieval fails.
+        `404` when the container can't be resolved, `500` if the runtime fails
+        to open the stream.
       operationId: get_container_stats
       parameters:
       - description: Container identifier
@@ -1117,14 +1772,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ContainerStatsResponse"
-          description: Container statistics (JSON one-shot or SSE stream)
+          description: "Container statistics (NDJSON; one sample when stream=false,\
+            \ continuous when stream=true)"
         "401":
           description: Unauthorized
         "404":
           description: Container not found
       security:
       - bearer_auth: []
-      summary: Get container resource statistics.
+      summary: Stream container resource statistics.
       tags:
       - Containers
   /api/v1/containers/{id}/stop:
@@ -1171,6 +1827,153 @@ paths:
       summary: Stop a running container.
       tags:
       - Containers
+  /api/v1/containers/{id}/top:
+    get:
+      description: |-
+        Mirrors Docker-compat `GET /containers/{id}/top?ps_args=`. Returns the
+        runtime's process listing as `Titles` + `Processes` matrix.
+
+        # Errors
+
+        Returns 404 when the container can't be resolved, 501 when the runtime
+        doesn't expose process listings, and 500 for other failures.
+      operationId: top_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: |-
+          `ps`-style argument string, e.g. `"aux"` or `"-eo pid,user,cmd"`.
+          Empty / omitted means "use the runtime's defaults".
+        explode: true
+        in: query
+        name: ps_args
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerTopResponse"
+          description: Process listing
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support top
+      security:
+      - bearer_auth: []
+      summary: List the processes running inside a container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/unpause:
+    post:
+      description: |-
+        Mirrors Docker-compat `POST /containers/{id}/unpause`. Returns 204 on
+        success.
+
+        # Errors
+
+        Returns the same error envelope as [`pause_container`].
+      operationId: unpause_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Container unpaused
+        "400":
+          description: Container not in a resumable state
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support unpause
+      security:
+      - bearer_auth: []
+      summary: Resume a previously-paused container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/update:
+    post:
+      description: |-
+        Mirrors Docker Engine's `POST /containers/{id}/update`. The request body
+        matches Docker's wire shape (`CpuShares`, `Memory`, `RestartPolicy`,
+        ...) so the `zlayer-docker` compatibility shim can pass it through
+        unchanged. Returns Docker's `{"Warnings": [...]}` response on success;
+        the warnings vector is always present (possibly empty) so clients that
+        match on field presence don't break.
+
+        # Errors
+
+        * `404` if the container cannot be resolved.
+        * `400` if the runtime rejects a field as invalid.
+        * `501` if the runtime does not support resource updates (the trait
+          default returns `Unsupported`).
+        * `500` for other runtime failures.
+      operationId: update_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContainerUpdateRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerUpdateResponse"
+          description: Update applied
+        "400":
+          description: Invalid update field
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+        "501":
+          description: Runtime does not support update
+      security:
+      - bearer_auth: []
+      summary: Update a standalone container's resource limits and/or restart policy.
+      tags:
+      - Containers
   /api/v1/containers/{id}/wait:
     get:
       description: |-
@@ -1204,6 +2007,66 @@ paths:
       security:
       - bearer_auth: []
       summary: Wait for a container to exit and return its exit code.
+      tags:
+      - Containers
+    post:
+      description: |-
+        Mirrors Docker Engine's `POST /containers/{id}/wait?condition=` 1:1.
+        Used by the `zlayer-docker` compatibility shim and any SDK callers
+        that consume the Docker shape directly. The legacy
+        `GET /api/v1/containers/{id}/wait` returns a richer
+        [`ContainerWaitResponse`] for clients that need extended classification
+        fields (`reason`, `signal`, `finished_at`).
+
+        `condition` is one of:
+        * `"not-running"` (default) — block until the container is no longer running.
+        * `"next-exit"` — wait for the next observed exit.
+        * `"removed"` — wait until the container is removed.
+
+        # Errors
+
+        Returns `400` for an unknown condition, `404` when the container can't
+        be resolved, and `500` if the runtime fails the wait.
+      operationId: wait_container_post
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: |-
+          One of `"not-running"` (default), `"next-exit"`, or `"removed"`.
+          Matches Docker's `/containers/{id}/wait` semantics. Omitted
+          values default to `"not-running"`.
+        explode: true
+        in: query
+        name: condition
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerWaitDockerResponse"
+          description: Container reached the requested condition
+        "400":
+          description: Invalid condition
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+        "500":
+          description: Internal error
+      security:
+      - bearer_auth: []
+      summary: Wait for a container to exit and return Docker-shaped JSON.
       tags:
       - Containers
   /api/v1/credentials/git:
@@ -1534,6 +2397,28 @@ paths:
       summary: "POST /api/v1/cron/{name}/trigger - Manually trigger a cron job"
       tags:
       - Cron
+  /api/v1/daemon/capabilities:
+    get:
+      description: |-
+        Returns the process-wide memoised [`DaemonCapabilities`] snapshot. The
+        handler is intentionally state-free — `DaemonCapabilities::get()` is a
+        process-wide accessor backed by a `OnceLock`, so it does not need to
+        pull from `AppState` and tests don't have to construct one to exercise
+        the endpoint.
+
+        If the survey has not been seeded yet (i.e. the daemon's startup task
+        hasn't run), the first call here triggers the probe lazily.
+      operationId: get_daemon_capabilities
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DaemonCapabilitiesResponse"
+          description: Daemon capability survey
+      summary: Get the daemon's runtime capability survey.
+      tags:
+      - Daemon
   /api/v1/deployments:
     get:
       description: |-
@@ -1852,6 +2737,44 @@ paths:
       summary: Get deployment details (with live per-service health when available).
       tags:
       - Deployments
+  /api/v1/deployments/{name}/spec:
+    get:
+      description: |-
+        Unlike [`get_deployment`], which projects to the public `DeploymentDetails`
+        shape, this endpoint returns the full [`StoredDeployment`] so callers that
+        need the underlying spec (image, command, env, scale) — for example the
+        Docker Engine API compatibility shim translating `/services` requests —
+        can reconstruct the original input.
+
+        # Errors
+
+        Returns an error if the deployment is not found or storage access fails.
+      operationId: get_deployment_spec
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredDeployment"
+          description: Stored deployment with full spec
+        "401":
+          description: Unauthorized
+        "404":
+          description: Deployment not found
+      security:
+      - bearer_auth: []
+      summary: "Get the raw stored deployment, including the full `DeploymentSpec`."
+      tags:
+      - Deployments
   /api/v1/environments:
     get:
       description: |-
@@ -2039,6 +2962,10 @@ paths:
   /api/v1/events:
     get:
       description: |-
+        Each event is one JSON object on its own line, terminated with `\n`. The
+        response advertises `Content-Type: application/json` (matching Docker's
+        `/events` endpoint contract).
+
         # Errors
 
         Returns `400` if a `label` query parameter is malformed, `401` if the
@@ -2069,14 +2996,14 @@ paths:
         style: form
       responses:
         "200":
-          description: SSE stream of container lifecycle events
+          description: NDJSON stream of daemon lifecycle events
         "400":
           description: Invalid label filter
         "401":
           description: Unauthorized
       security:
       - bearer_auth: []
-      summary: Stream container lifecycle events as Server-Sent Events.
+      summary: Stream daemon lifecycle events as NDJSON.
       tags:
       - Events
   /api/v1/groups:
@@ -2322,17 +3249,36 @@ paths:
   /api/v1/images/pull:
     post:
       description: |-
-        This is a blocking pull: the handler returns only after the image is
-        resolved and stored locally (or the pull fails). When `pull_policy` is
-        omitted the default is `"always"`, matching Docker-compat semantics for
-        `POST /images/create`. On success, the response echoes the reference and
-        best-effort `digest`/`size_bytes` resolved via `list_images()`.
+        Two behaviours, selected by the `stream` query parameter:
+
+        - `stream=false` (default): blocking pull. The handler returns only
+          after the image is resolved and stored locally (or the pull fails).
+          Response is `{"reference":"...","digest":"...","size_bytes":...}`
+          ([`PullImageResponse`]).
+        - `stream=true`: NDJSON stream of [`PullProgressDto`] events. Each
+          `Status { ... }` becomes one JSON line; the final `Done { ... }`
+          becomes one line and the stream closes. Errors mid-pull surface as
+          a single `{"error":"..."}` line and terminate the stream.
+
+        When `pull_policy` is omitted the default is `"always"`, matching
+        Docker-compat semantics for `POST /images/create`.
 
         # Errors
 
         Returns an error if authentication fails, the reference is empty, the
         image cannot be pulled, or the user lacks the operator role.
       operationId: pull_image_handler
+      parameters:
+      - description: |-
+          When `true`, stream NDJSON `PullProgressDto` events instead of a
+          single JSON response. Defaults to `false` (snapshot pull).
+        explode: true
+        in: query
+        name: stream
+        required: false
+        schema:
+          type: boolean
+        style: form
       requestBody:
         content:
           application/json:
@@ -2345,7 +3291,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PullImageResponse"
-          description: Image pulled
+          description: Image pulled (snapshot) or NDJSON stream of PullProgressDto
+            when stream=true
         "400":
           description: Invalid request
         "401":
@@ -2439,6 +3386,36 @@ paths:
       summary: Remove an image from the runtime's cache.
       tags:
       - Images
+  /api/v1/internal/raft/trigger-elect:
+    post:
+      description: |-
+        `POST /api/v1/internal/raft/trigger-elect`
+
+        Called by the cluster leader's pre-self-upgrade flow on a healthy
+        follower: that follower campaigns immediately instead of waiting for
+        heartbeat-loss timeout after the leader exits. Raft safety still
+        holds — only an up-to-date candidate can win — so a stale callee
+        just loses the term and a more-up-to-date follower wins the next.
+
+        # Errors
+
+        - `Unauthorized` if the internal token is missing or wrong.
+        - `ServiceUnavailable` on non-clustered daemons (no Raft coordinator).
+        - `Internal` if the underlying `Raft::trigger().elect()` returns
+          `Fatal` (coordinator shutdown / storage failure).
+      operationId: internal_raft_trigger_elect
+      responses:
+        "202":
+          description: Election triggered
+        "401":
+          description: Unauthorized — invalid or missing internal token
+        "500":
+          description: Raft trigger_elect failed
+        "503":
+          description: Raft coordinator not configured on this daemon
+      summary: Trigger an immediate Raft election on this node.
+      tags:
+      - Internal
   /api/v1/internal/replicas/{service}:
     get:
       description: |-
@@ -2502,6 +3479,74 @@ paths:
         "500":
           description: Internal error
       summary: Scale a service via internal scheduler request.
+      tags:
+      - Internal
+  /api/v1/internal/upgrade/start:
+    post:
+      description: |-
+        `POST /api/v1/internal/upgrade/start`
+
+        Registers an upgrade job, spawns a worker task that runs the
+        `zlayer self-update` subcommand against `current_exe()`, and returns
+        `202 Accepted` with an `upgrade_id` the caller can poll via
+        `internal_upgrade_status`. On success the daemon exits with code 75 so
+        the supervisor (or `--restart-on-exit`) respawns it.
+
+        # Errors
+
+        Returns `Unauthorized` if the internal token is missing or wrong.
+      operationId: internal_upgrade_start
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpgradeStartRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeStartResponse"
+          description: Upgrade scheduled
+        "401":
+          description: Unauthorized — invalid or missing internal token
+      summary: Schedule a daemon-binary upgrade on this node.
+      tags:
+      - Internal
+  /api/v1/internal/upgrade/{upgrade_id}:
+    get:
+      description: |-
+        `GET /api/v1/internal/upgrade/{upgrade_id}`
+
+        # Errors
+
+        Returns `Unauthorized` if the internal token is missing or wrong, or
+        `NotFound` if `upgrade_id` is not in the in-memory job map (which is
+        expected after a daemon restart — callers should treat that as
+        "upgrade likely complete; daemon respawned").
+      operationId: internal_upgrade_status
+      parameters:
+      - description: Upgrade job id returned by internal_upgrade_start
+        explode: false
+        in: path
+        name: upgrade_id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeJobState"
+          description: Current upgrade state
+        "401":
+          description: Unauthorized — invalid or missing internal token
+        "404":
+          description: Upgrade id not found (may have been lost across a daemon restart)
+      summary: Fetch the status of a previously-scheduled daemon-binary upgrade.
       tags:
       - Internal
   /api/v1/jobs/{execution_id}/cancel:
@@ -2907,48 +3952,6 @@ paths:
       summary: Get detailed information about a specific node.
       tags:
       - Nodes
-  /api/v1/nodes/{id}/labels:
-    post:
-      description: |-
-        # Errors
-
-        Returns an error if the node is not found or the user lacks permission.
-      operationId: update_node_labels
-      parameters:
-      - description: Node identifier
-        explode: false
-        in: path
-        name: id
-        required: true
-        schema:
-          format: int64
-          minimum: 0
-          type: integer
-        style: simple
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/UpdateLabelsRequest"
-        required: true
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/UpdateLabelsResponse"
-          description: Labels updated
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden - admin role required
-        "404":
-          description: Node not found
-      security:
-      - bearer_auth: []
-      summary: Update labels on a node.
-      tags:
-      - Nodes
   /api/v1/notifiers:
     get:
       description: |-
@@ -3186,6 +4189,30 @@ paths:
       summary: Get IP allocation status.
       tags:
       - Overlay
+  /api/v1/overlay/nat/status:
+    get:
+      description: |-
+        Returns the daemon's current NAT traversal configuration plus the live
+        runtime state from the overlay manager: configured STUN/TURN servers,
+        the bound relay-server address (if running), the locally gathered ICE
+        candidates, per-peer connection types, and the timestamp of the last
+        successful STUN refresh.
+
+        When the overlay manager is not initialised (host-networking mode) the
+        response reports `enabled: false` with empty server / candidate lists
+        rather than 503 — the Manager UI uses this endpoint to surface "NAT
+        disabled" badges and shouldn't have to special-case missing overlays.
+      operationId: get_nat_status
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NatStatusResponse"
+          description: NAT traversal status
+      summary: Get NAT traversal status.
+      tags:
+      - Overlay
   /api/v1/overlay/peers:
     get:
       description: |-
@@ -3206,6 +4233,89 @@ paths:
         "503":
           description: Overlay not initialized
       summary: Get list of overlay peers.
+      tags:
+      - Overlay
+  /api/v1/overlay/services/{name}:
+    get:
+      description: |-
+        Returns the resolved overlay mode (after `resolve_v0_51`) and the
+        per-node bridge map describing where on each node the service's
+        overlay terminates.
+
+        In v0.51 this endpoint is a stub: the bridge map is always empty and
+        the mode is always `Shared` (the only implemented mode). Real wiring
+        lands in P9a once `OverlayManager` exposes a per-service bridge view.
+
+        # Errors
+
+        Returns 503 if the overlay manager is not initialised (host
+        networking mode). The 404 case (service unknown to this node) is
+        reserved for the post-P9a implementation; today the stub always
+        responds with an empty bridge map for any name.
+      operationId: get_service_overlay_status
+      parameters:
+      - description: Service name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceOverlayStatus"
+          description: Service overlay status
+        "503":
+          description: Overlay not initialized
+      summary: Get the overlay status for a single service.
+      tags:
+      - Overlay
+  /api/v1/overlay/services/{name}/bridges/{node_id}:
+    get:
+      description: |-
+        In v0.51 this endpoint is a stub: the bridge map is not yet populated
+        by the overlay manager, so every call returns 404. The endpoint
+        contract is defined now so adapter crates (zlayer-docker, manager UI,
+        Python SDK) can consume it day-one once P9a wires the real bridges.
+
+        # Errors
+
+        Returns 503 if the overlay manager is not initialised, and 404 in all
+        other cases until P9a lands.
+      operationId: get_service_bridge
+      parameters:
+      - description: Service name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Node ID
+        explode: false
+        in: path
+        name: node_id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeInfo"
+          description: Bridge info for this service on this node
+        "404":
+          description: No bridge found for this service on this node
+        "503":
+          description: Overlay not initialized
+      summary: Get the bridge attachment for a service on a specific node.
       tags:
       - Overlay
   /api/v1/overlay/status:
@@ -4685,6 +5795,44 @@ paths:
       summary: Create a new tunnel token.
       tags:
       - Tunnels
+  /api/v1/tunnels/access/sessions:
+    post:
+      description: |-
+        Binds a local TCP listener on the daemon that proxies connections to the
+        requested endpoint. Returns the local address so the caller can either
+        connect directly (when sharing the daemon's host) or open a forwarder
+        from a different host. The session is automatically torn down when its
+        TTL expires.
+
+        # Errors
+
+        Returns an error if the tunnel server (and therefore the access manager)
+        is disabled, or if binding the local listener fails.
+      operationId: create_access_session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccessSessionRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateAccessSessionResponse"
+          description: Access session created
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "503":
+          description: Tunnel server disabled
+      security:
+      - bearer_auth: []
+      summary: Create a temporary access session for an existing tunneled service.
+      tags:
+      - Tunnels
   /api/v1/tunnels/node:
     post:
       description: |-
@@ -4873,8 +6021,7 @@ paths:
         # Errors
 
         Returns [`ApiError::Forbidden`] when the caller is not an admin,
-        [`ApiError::BadRequest`] when an admin tries to delete themselves,
-        [`ApiError::NotFound`] when the user does not exist, or
+        [`ApiError::BadRequest`] when an admin tries to delete themselves, or
         [`ApiError::Internal`] if a backing store fails.
       operationId: delete_user
       parameters:
@@ -4888,12 +6035,14 @@ paths:
         style: simple
       responses:
         "204":
-          description: Deleted
+          description: Deleted (or already absent)
+        "400":
+          description: Cannot delete your own account
         "403":
           description: Admin role required
-        "404":
-          description: Not found
-      summary: Delete a user. Admin only. Callers cannot delete their own account.
+      summary: |-
+        Delete a user. Admin only. Callers cannot delete their own account.
+        Idempotent — returns 204 whether the user existed or not.
       tags:
       - Users
     get:
@@ -5808,6 +6957,13 @@ components:
           type: string
       required:
       - user_id
+    ArchKind:
+      description: CPU architecture a service needs. Mirrors the arch half of an OCI
+        platform.
+      enum:
+      - amd64
+      - arm64
+      type: string
     AuditEntry:
       description: |-
         A recorded audit log entry capturing who did what, when, and to which
@@ -5997,6 +7153,37 @@ components:
       required:
       - email
       - password
+    BridgeInfo:
+      description: Where on a specific node a service's overlay terminates.
+      example:
+        subnet: 10.201.0.0/24
+        name: name
+        gateway: 10.201.0.1
+        node_id: node_id
+      properties:
+        gateway:
+          description: |-
+            Gateway IP within the subnet (first usable address); the bridge's
+            own L3 address. Containers' default route points here.
+          example: 10.201.0.1
+          type: string
+        name:
+          description: "Linux bridge name (`br-svc-<hash>`), max 15 chars per IFNAMSIZ."
+          type: string
+        node_id:
+          description: |-
+            Node identifier (stringified to avoid leaking `NodeId` type details
+            across crate boundaries).
+          type: string
+        subnet:
+          description: CIDR of the service subnet assigned to this node.
+          example: 10.201.0.0/24
+          type: string
+      required:
+      - gateway
+      - name
+      - node_id
+      - subnet
     BridgeNetwork:
       description: A user-defined bridge or overlay network that containers can attach
         to.
@@ -6292,7 +7479,20 @@ components:
     ClusterJoinRequest:
       description: Request body for `POST /api/v1/cluster/join`.
       example:
+        os: ""
+        cpu_total: 6.027456183070403
+        raft_port: 0
+        services:
+        - services
+        - services
+        api_port: 0
+        labels:
+          key: labels
+        token: token
         mode: mode
+        secrets_pubkey:
+        - 0
+        - 0
         wg_public_key: wg_public_key
         disk_total: 0
         gpus:
@@ -6303,15 +7503,9 @@ components:
           memory_mb: 0
           model: model
         overlay_port: 0
-        cpu_total: 6.027456183070403
-        raft_port: 0
-        services:
-        - services
-        - services
+        arch: ""
         advertise_addr: advertise_addr
         memory_total: 0
-        api_port: 0
-        token: token
       properties:
         advertise_addr:
           description: Joining node's advertise address (IP)
@@ -6321,6 +7515,12 @@ components:
           format: int32
           minimum: 0
           type: integer
+        arch:
+          allOf:
+          - $ref: "#/components/schemas/ArchKind"
+          description: CPU architecture of the joining agent. Same legacy semantics
+            as `os`.
+          nullable: true
         cpu_total:
           description: Total CPU cores on the joining node
           format: double
@@ -6335,6 +7535,12 @@ components:
           items:
             $ref: "#/components/schemas/GpuInfoSummary"
           type: array
+        labels:
+          additionalProperties:
+            type: string
+          description: |-
+            Free-form labels advertised by the joining agent, used for
+            `NodeSelector` placement matching. Empty on legacy clients.
         memory_total:
           description: Total memory in bytes
           format: int64
@@ -6343,6 +7549,13 @@ components:
         mode:
           description: "Node mode: \"full\" or \"replicate\""
           type: string
+        os:
+          allOf:
+          - $ref: "#/components/schemas/OsKind"
+          description: |-
+            Operating system of the joining agent. `None` = legacy client that did
+            not report platform info.
+          nullable: true
         overlay_port:
           description: Joining node's overlay port (`WireGuard`)
           format: int32
@@ -6353,6 +7566,18 @@ components:
           format: int32
           minimum: 0
           type: integer
+        secrets_pubkey:
+          description: |-
+            Joiner's 32-byte X25519 pubkey for sealed-box DEK wrapping.
+            Present on Phase-1+ joiners; absent on legacy clients (in which
+            case the leader treats the node as not eligible to host
+            replicated-secret ciphertext until it re-joins with a pubkey).
+          items:
+            format: int32
+            minimum: 0
+            type: integer
+          nullable: true
+          type: array
         services:
           description: Services to replicate (only if mode == "replicate")
           items:
@@ -6374,8 +7599,16 @@ components:
     ClusterJoinResponse:
       description: Response body for `POST /api/v1/cluster/join`.
       example:
+        slice_cidr: slice_cidr
         role: role
+        dek_generation: 0
         raft_node_id: 0
+        wrapped_dek:
+        - 0
+        - 0
+        warnings:
+        - warnings
+        - warnings
         peers:
         - wg_public_key: wg_public_key
           raft_node_id: 0
@@ -6391,11 +7624,36 @@ components:
           advertise_addr: advertise_addr
           overlay_ip: overlay_ip
           node_id: node_id
+        join_secret: join_secret
         overlay_ip: overlay_ip
         node_id: node_id
+        node_jwt: node_jwt
       properties:
+        dek_generation:
+          description: |-
+            Cluster DEK generation that `wrapped_dek` was sealed under. Lets
+            the joiner detect rotation drift if it re-joins after a revocation
+            rotated the cluster DEK. `None` when `wrapped_dek` is `None`.
+          format: int64
+          minimum: 0
+          nullable: true
+          type: integer
+        join_secret:
+          description: |-
+            Cluster-wide HMAC join secret. Returned to authenticated joiners
+            so they can derive the same internal RPC bearer as the leader.
+            `None` on legacy responses from older leaders.
+          nullable: true
+          type: string
         node_id:
           description: Assigned node UUID
+          type: string
+        node_jwt:
+          description: |-
+            Node JWT minted by the leader for this joiner — `roles: ["node"]`,
+            `node_id` set. Used to authenticate inter-node calls separately
+            from any user identity. `None` on legacy responses.
+          nullable: true
           type: string
         overlay_ip:
           description: Assigned overlay IP for the new node
@@ -6413,6 +7671,35 @@ components:
         role:
           description: "Role assigned to this node: \"voter\" or \"learner\""
           type: string
+        slice_cidr:
+          description: |-
+            Per-node slice CIDR assigned by the leader (e.g. "10.200.42.0/28").
+            Empty string if the leader is not slice-aware yet.
+          type: string
+        warnings:
+          description: |-
+            Server-side advisory warnings to surface to the operator/CLI.
+
+            Examples: "your token format is deprecated and will be removed in
+            release X.Y", "consider rotating the signing key, last rotated N
+            days ago". Present-but-empty means "no warnings"; serialized as
+            `null` (skip-if-none) when there are none.
+          items:
+            type: string
+          nullable: true
+          type: array
+        wrapped_dek:
+          description: |-
+            Sealed-box-wrapped copy of the cluster DEK addressed to the
+            joiner's `secrets_pubkey`. The joiner unwraps with its node X25519
+            private key and holds the DEK in zeroized memory. `None` on legacy
+            responses or when the joiner did not provide a `secrets_pubkey`.
+          items:
+            format: int32
+            minimum: 0
+            type: integer
+          nullable: true
+          type: array
       required:
       - node_id
       - overlay_ip
@@ -6432,6 +7719,7 @@ components:
         is_leader: true
         mode: mode
         cpu_used: 6.027456183070403
+        api_endpoint: api_endpoint
         id: id
         advertise_addr: advertise_addr
         memory_total: 0
@@ -6442,6 +7730,11 @@ components:
           type: string
         advertise_addr:
           description: Advertise address (public IP)
+          type: string
+        api_endpoint:
+          description: |-
+            API endpoint as `advertise_addr:api_port` (e.g., "127.0.0.1:19110").
+            Distinct from `address` which holds the Raft RPC endpoint.
           type: string
         cpu_total:
           description: Total CPU cores on this node
@@ -6550,6 +7843,88 @@ components:
       - raft_node_id
       - raft_port
       - wg_public_key
+    ClusterUpgradeRequest:
+      description: |-
+        Request body for `POST /api/v1/cluster/upgrade`.
+
+        Drives a leader-coordinated rolling daemon-binary upgrade across the
+        cluster. The leader walks every follower in ascending `node_id` order
+        (and finally upgrades itself), instructing each to download the target
+        `zlayer` release and restart. Followers come back on the same advertise
+        address and re-join Raft; the leader waits for each one to be healthy
+        again before moving on.
+      example:
+        cooldown_secs: 0
+        strict: true
+        version: version
+      properties:
+        cooldown_secs:
+          description: Seconds to pause between node upgrades after each follower
+            comes back healthy.
+          format: int64
+          minimum: 0
+          type: integer
+        strict:
+          description: Abort the rollout if any follower fails to come back healthy.
+          type: boolean
+        version:
+          description: Target zlayer version (e.g. "v0.12.0"). Defaults to latest
+            GitHub release if absent.
+          nullable: true
+          type: string
+    ClusterUpgradeResult:
+      description: Final result of a rolling upgrade attempt.
+      example:
+        upgraded:
+        - null
+        - null
+        errors:
+        - message: message
+          node_id: 0
+        - message: message
+          node_id: 0
+        skipped:
+        - null
+        - null
+      properties:
+        errors:
+          description: Nodes that failed mid-upgrade (one entry per failure).
+          items:
+            $ref: "#/components/schemas/UpgradeError"
+          type: array
+        skipped:
+          description: "Nodes intentionally skipped (e.g. unreachable, missing api\
+            \ endpoint)."
+          items:
+            $ref: "#/components/schemas/u64"
+          type: array
+        upgraded:
+          description: Nodes that successfully restarted on the new binary.
+          items:
+            $ref: "#/components/schemas/u64"
+          type: array
+      required:
+      - errors
+      - skipped
+      - upgraded
+    ClusterUpgradeSelfRequest:
+      description: |-
+        Request body for `POST /api/v1/cluster/upgrade-self`.
+
+        Triggers a daemon-binary self-upgrade on this node. Used by the CLI
+        after `cluster_upgrade` finishes the follower walk, so the leader can
+        upgrade itself last. The handler re-enters
+        `internal_upgrade_start` over localhost using the configured internal
+        token, so all the existing self-update / sentinel / exit-75 plumbing
+        is reused.
+      example:
+        version: version
+      properties:
+        version:
+          description: Target version (e.g. `"v0.12.0"`). Defaults to latest GitHub
+            release.
+          nullable: true
+          type: string
     ConnectBridgeNetworkRequest:
       description: "Body for `POST /api/v1/container-networks/{id_or_name}/connect`."
       example:
@@ -6570,11 +7945,33 @@ components:
         ipv4_address:
           description: |-
             Optional static IPv4 to pin this container to. Validated as
-            [`Ipv4Addr`].
+            [`std::net::Ipv4Addr`].
           nullable: true
           type: string
       required:
       - container_id
+    ContainerChangeEntry:
+      description: |-
+        One row of `GET /api/v1/containers/{id}/changes` (Docker compat shape).
+
+        Mirrors Docker's `{"Path": "/foo", "Kind": 0}` body:
+        `Kind` is a numeric enum where `0 = Modified`, `1 = Added`, `2 = Deleted`.
+      example:
+        Path: Path
+        Kind: 0
+      properties:
+        Kind:
+          description: "`0` = Modified, `1` = Added, `2` = Deleted (Docker's wire\
+            \ integer)."
+          format: int32
+          minimum: 0
+          type: integer
+        Path:
+          description: "Path inside the container that changed (absolute, e.g. `/etc/hosts`)."
+          type: string
+      required:
+      - Kind
+      - Path
     ContainerEvent:
       description: A container lifecycle event published on the bus.
       properties:
@@ -6582,11 +7979,7 @@ components:
           description: |-
             Wall-clock time the event was emitted.
 
-            Serialized as an RFC 3339 string on the wire. Typed as
-            [`chrono::DateTime<Utc>`] in-process for ergonomic manipulation;
-            the `#[schema(value_type = String, format = DateTime)]` attribute
-            teaches `utoipa` to render a proper string schema in the `OpenAPI`
-            output.
+            Serialized as an RFC 3339 string on the wire.
           format: date-time
           type: string
         exit_code:
@@ -6802,6 +8195,77 @@ components:
       - image
       - labels
       - state
+    ContainerLogFormat:
+      description: "Wire format for [`ContainerLogQuery::format`]."
+      enum:
+      - json
+      - raw
+      type: string
+    ContainerPortBinding:
+      description: "One host binding inside a [`ContainerPortResponse`] entry."
+      example:
+        HostIp: HostIp
+        HostPort: HostPort
+      properties:
+        HostIp:
+          description: |-
+            Host IP that maps to the container port. Empty / `"0.0.0.0"` means
+            "any IPv4 address".
+          nullable: true
+          type: string
+        HostPort:
+          description: Host port (always serialised as a string in Docker's wire format).
+          nullable: true
+          type: string
+    ContainerPortResponse:
+      description: |-
+        Response body for `GET /api/v1/containers/{id}/port` (Docker compat shape).
+
+        Mirrors Docker's `{"Ports": {"80/tcp": [{"HostIp":"...","HostPort":"..."}]}}`
+        body. Each key is `<container_port>/<protocol>` and the value is the list
+        of host bindings for that port (or `null` when the port is exposed but not
+        published).
+      example:
+        Ports:
+          key:
+          - HostIp: HostIp
+            HostPort: HostPort
+          - HostIp: HostIp
+            HostPort: HostPort
+      properties:
+        Ports:
+          additionalProperties:
+            items:
+              $ref: "#/components/schemas/ContainerPortBinding"
+            nullable: true
+          description: Map of `"<port>/<protocol>"` to host bindings.
+      required:
+      - Ports
+    ContainerPruneResponse:
+      description: |-
+        Response body for `POST /api/v1/containers/prune` (Docker compat shape).
+
+        Docker uses `ContainersDeleted` / `SpaceReclaimed` `PascalCase` fields, so
+        SDK consumers (and the docker shim) can read the body verbatim.
+      example:
+        SpaceReclaimed: 0
+        ContainersDeleted:
+        - ContainersDeleted
+        - ContainersDeleted
+      properties:
+        ContainersDeleted:
+          description: Container IDs that were removed.
+          items:
+            type: string
+          type: array
+        SpaceReclaimed:
+          description: Bytes reclaimed from the runtime's container storage.
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+      - ContainersDeleted
+      - SpaceReclaimed
     ContainerResourceLimits:
       description: Resource limits for a container
       properties:
@@ -6890,6 +8354,238 @@ components:
       - memory_bytes
       - memory_limit
       - memory_percent
+    ContainerTopResponse:
+      description: |-
+        Response body for `GET /api/v1/containers/{id}/top` (Docker compat shape).
+
+        Wire field names use Docker's `Titles` / `Processes` casing so the
+        shim can pass the body through untouched.
+      example:
+        Processes:
+        - - Processes
+          - Processes
+        - - Processes
+          - Processes
+        Titles:
+        - Titles
+        - Titles
+      properties:
+        Processes:
+          description: |-
+            One row per process inside the container. Each row has the same
+            length as `titles`.
+          items:
+            items:
+              type: string
+            type: array
+          type: array
+        Titles:
+          description: |-
+            `ps` column titles — e.g. `["UID", "PID", "PPID", "C", "STIME",
+            "TTY", "TIME", "CMD"]`.
+          items:
+            type: string
+          type: array
+      required:
+      - Processes
+      - Titles
+    ContainerUpdateRequest:
+      description: |-
+        Request body for `POST /api/v1/containers/{id}/update`.
+
+        Mirrors Docker Engine's `POST /containers/{id}/update` body 1:1 so the
+        `zlayer-docker` compatibility shim can pass the wire payload straight
+        through. Every field is optional — only the fields present on the wire
+        are applied; unset fields are left untouched on the running container.
+
+        Field naming uses Docker's `PascalCase` on the wire (`CpuShares`,
+        `Memory`, ...) and `snake_case` on the Rust side. Subset of the full
+        Docker schema: `ZLayer` supports the resource knobs (cpu, memory, pids,
+        blkio) plus `RestartPolicy`. Windows-only fields (`CpuCount`,
+        `IOMaximumIOps`) and ulimits/devices are accepted on the wire but
+        silently ignored by the Linux runtimes.
+      example:
+        MemoryReservation: 3
+        Memory: 9
+        CpuPeriod: 6
+        CpusetMems: CpusetMems
+        RestartPolicy: ""
+        CpuQuota: 1
+        CpuRealtimeRuntime: 5
+        BlkioWeight: 0
+        CpuShares: 2
+        MemorySwap: 2
+        PidsLimit: 4
+        CpusetCpus: CpusetCpus
+        CpuRealtimePeriod: 5
+        KernelMemory: 7
+      properties:
+        BlkioWeight:
+          description: "Block IO weight (relative weight, range 10-1000)."
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
+        CpuPeriod:
+          description: CPU CFS period in microseconds.
+          format: int64
+          nullable: true
+          type: integer
+        CpuQuota:
+          description: |-
+            CPU CFS quota in microseconds. Together with `cpu_period` defines
+            the fraction of a CPU the container may use.
+          format: int64
+          nullable: true
+          type: integer
+        CpuRealtimePeriod:
+          description: CPU real-time period in microseconds.
+          format: int64
+          nullable: true
+          type: integer
+        CpuRealtimeRuntime:
+          description: CPU real-time runtime in microseconds.
+          format: int64
+          nullable: true
+          type: integer
+        CpuShares:
+          description: |-
+            Relative CPU weight (cgroup `cpu.weight` or `cpu.shares`). Range
+            2-262144 on cgroup v2; 2-262144 mapped from 1-10000 on v1.
+          format: int64
+          nullable: true
+          type: integer
+        CpusetCpus:
+          description: "CPUs allowed for execution (e.g. `\"0-3\"`, `\"0,1\"`)."
+          nullable: true
+          type: string
+        CpusetMems:
+          description: Memory nodes (NUMA) allowed for execution (e.g. `"0-3"`).
+          nullable: true
+          type: string
+        KernelMemory:
+          description: |-
+            Kernel memory limit in bytes (deprecated upstream; accepted for
+            wire compatibility).
+          format: int64
+          nullable: true
+          type: integer
+        Memory:
+          description: Memory limit in bytes. Set `0` to remove the limit.
+          format: int64
+          nullable: true
+          type: integer
+        MemoryReservation:
+          description: |-
+            Soft memory limit in bytes. The kernel reclaims pages above this
+            reservation when the host comes under memory pressure.
+          format: int64
+          nullable: true
+          type: integer
+        MemorySwap:
+          description: |-
+            Total memory limit (memory + swap) in bytes. `-1` removes the swap
+            limit, matching Docker semantics.
+          format: int64
+          nullable: true
+          type: integer
+        PidsLimit:
+          description: PIDs limit. Set `0` or `-1` for unlimited.
+          format: int64
+          nullable: true
+          type: integer
+        RestartPolicy:
+          allOf:
+          - $ref: "#/components/schemas/ContainerUpdateRestartPolicy"
+          description: |-
+            New restart policy. When present, replaces the container's stored
+            restart policy. Docker applies this asynchronously: the next time
+            the supervisor decides whether to restart, it consults the new
+            policy.
+          nullable: true
+    ContainerUpdateResponse:
+      description: |-
+        Response body for `POST /api/v1/containers/{id}/update`.
+
+        Mirrors Docker's `{"Warnings": [...]}` shape so the compat layer
+        passes the body through verbatim. `Warnings` is always present (even
+        if empty) for wire compatibility with clients that match the field
+        presence, not just its contents.
+      example:
+        Warnings:
+        - Warnings
+        - Warnings
+      properties:
+        Warnings:
+          description: |-
+            Human-readable warnings emitted by the runtime while applying the
+            update — e.g. `"kernel memory limit is deprecated"`.
+          items:
+            type: string
+          type: array
+    ContainerUpdateRestartPolicy:
+      description: |-
+        Restart policy entry for [`ContainerUpdateRequest`].
+
+        Mirrors Docker's `HostConfig.RestartPolicy` shape so the Docker compat
+        layer can pass the wire payload through unchanged. `name` accepts the
+        same set of strings as `docker run --restart`: `""`, `"no"`, `"always"`,
+        `"unless-stopped"`, or `"on-failure"`. `maximum_retry_count` is only
+        honoured when `name == "on-failure"`.
+      properties:
+        MaximumRetryCount:
+          description: |-
+            Maximum number of retries before giving up (only used with
+            `on-failure`). When `0` or omitted, retries are unbounded.
+          format: int64
+          nullable: true
+          type: integer
+        Name:
+          description: "`\"no\"`, `\"always\"`, `\"unless-stopped\"`, or `\"on-failure\"\
+            `."
+          nullable: true
+          type: string
+    ContainerWaitDockerError:
+      description: "Error envelope nested inside [`ContainerWaitDockerResponse`]."
+      properties:
+        Message:
+          description: Human-readable description of why the wait failed.
+          type: string
+      required:
+      - Message
+    ContainerWaitDockerResponse:
+      description: |-
+        Docker-shaped wait response returned by
+        `POST /api/v1/containers/{id}/wait`.
+
+        Mirrors Docker Engine's `/containers/{id}/wait` body 1:1: a
+        `StatusCode` field plus an optional `Error` envelope. Used by the
+        `zlayer-docker` compatibility shim and any SDK callers that consume
+        the Docker shape directly. The richer
+        [`ContainerWaitResponse`] (returned by the legacy `GET` endpoint) is
+        preserved for clients that need the `reason` / `signal` / `finished_at`
+        classification fields.
+      example:
+        Error: ""
+        StatusCode: 0
+      properties:
+        Error:
+          allOf:
+          - $ref: "#/components/schemas/ContainerWaitDockerError"
+          description: |-
+            Optional error envelope surfaced when the wait itself failed
+            (e.g. the container was removed before reaching `not-running`
+            when `condition=not-running` was requested). Absent on a normal
+            exit.
+          nullable: true
+        StatusCode:
+          description: |-
+            Container exit code (0 = success). When killed by signal `N`,
+            this is typically `128 + N`, matching Docker's convention.
+          format: int64
+          type: integer
+      required:
+      - StatusCode
     ContainerWaitResponse:
       description: |-
         Wait response with container exit code plus optional classification
@@ -6936,6 +8632,69 @@ components:
       required:
       - exit_code
       - id
+    CreateAccessSessionRequest:
+      description: |-
+        Request to create a temporary access session for an existing tunneled service.
+
+        Used by `zlayer tunnel access <endpoint>` to ask the daemon to bind a local
+        TCP listener that proxies to a remote service. The daemon returns the local
+        address so the CLI can either connect directly (when the daemon and CLI
+        share a host) or open a second hop forwarder.
+      example:
+        endpoint: endpoint
+        ttl_secs: 0
+        local_port: 0
+      properties:
+        endpoint:
+          description: |-
+            Service endpoint to access (e.g. "postgres.service.zlayer" or
+            "host:port"). The daemon resolves this through the overlay network
+            when configured.
+          type: string
+        local_port:
+          description: |-
+            Optional local port for the daemon to bind. `None` (or `0`) lets the
+            daemon auto-assign an ephemeral port.
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
+        ttl_secs:
+          description: |-
+            Time-to-live in seconds for the session. After this expires the
+            listener is torn down.
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+      - endpoint
+    CreateAccessSessionResponse:
+      description: Response after creating a temporary access session.
+      example:
+        endpoint: endpoint
+        expires_at: 0
+        local_addr: local_addr
+        session_id: session_id
+      properties:
+        endpoint:
+          description: Original endpoint requested.
+          type: string
+        expires_at:
+          description: Unix timestamp at which the session expires.
+          format: int64
+          minimum: 0
+          type: integer
+        local_addr:
+          description: "Local address the daemon bound for this session, e.g. `127.0.0.1:30042`."
+          type: string
+        session_id:
+          description: Unique session identifier (UUID).
+          type: string
+      required:
+      - endpoint
+      - expires_at
+      - local_addr
+      - session_id
     CreateBridgeNetworkRequest:
       description: Body for `POST /api/v1/container-networks`.
       example:
@@ -6972,27 +8731,13 @@ components:
     CreateContainerRequest:
       description: Request to create and start a container
       example:
-        image: image
+        memory_swap: memory_swap
+        security_opt:
+        - security_opt
+        - security_opt
+        network_mode: ""
         work_dir: work_dir
-        dns:
-        - dns
-        - dns
-        registry_auth: ""
-        volumes:
-        - readonly: true
-          source: source
-          type: ""
-          target: target
-        - readonly: true
-          source: source
-          type: ""
-          target: target
-        resources: ""
-        extra_hosts:
-        - extra_hosts
-        - extra_hosts
-        env:
-          key: env
+        read_only_root_fs: true
         health_check: ""
         networks:
         - aliases:
@@ -7014,22 +8759,120 @@ components:
           host_ip: host_ip
           protocol: ""
           host_port: 0
+        platform: ""
+        lifecycle: ""
+        pids_limit: 5
+        cap_add:
+        - cap_add
+        - cap_add
+        hostname: hostname
+        pid_mode: pid_mode
+        blkio_weight: 0
+        ipc_mode: ipc_mode
+        init_container: true
+        registry_credential_id: registry_credential_id
+        memory_reservation: memory_reservation
+        stop_signal: stop_signal
+        image: image
+        cap_drop:
+        - cap_drop
+        - cap_drop
+        devices:
+        - path: path
+          read: true
+          mknod: true
+          write: true
+        - path: path
+          read: true
+          mknod: true
+          write: true
+        dns:
+        - dns
+        - dns
+        registry_auth: ""
+        volumes:
+        - readonly: true
+          source: source
+          type: ""
+          target: target
+        - readonly: true
+          source: source
+          type: ""
+          target: target
+        extra_groups:
+        - extra_groups
+        - extra_groups
+        oom_score_adj: 5
+        resources: ""
+        cpuset: cpuset
+        extra_hosts:
+        - extra_hosts
+        - extra_hosts
+        env:
+          key: env
         command:
         - command
         - command
         labels:
           key: labels
-        hostname: hostname
+        sysctls:
+          key: sysctls
+        privileged: true
+        node_selector: ""
+        ulimits:
+          key:
+            hard: 2
+            soft: 7
         restart_policy: ""
         pull_policy: pull_policy
         name: name
-        registry_credential_id: registry_credential_id
+        memory_swappiness: 0
+        stop_grace_period: 30s
+        user: user
+        cpu_shares: 0
+        oom_kill_disable: true
       properties:
+        blkio_weight:
+          description: "Block IO weight, 10-1000 (Docker `--blkio-weight`)."
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
+        cap_add:
+          description: |-
+            Linux capabilities to add (Docker `--cap-add`). Maps to
+            `ServiceSpec::capabilities`.
+          items:
+            type: string
+          type: array
+        cap_drop:
+          description: Linux capabilities to drop (Docker `--cap-drop`).
+          items:
+            type: string
+          type: array
         command:
           description: Command to run (overrides image entrypoint)
           items:
             type: string
           nullable: true
+          type: array
+        cpu_shares:
+          description: Relative CPU shares (Docker `--cpu-shares`). Default weight
+            is 1024.
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
+        cpuset:
+          description: |-
+            CPUs that the container is allowed to execute on
+            (Docker `--cpuset-cpus`).
+          nullable: true
+          type: string
+        devices:
+          description: Host devices to expose to the container (Docker `--device`).
+          items:
+            $ref: "#/components/schemas/DeviceSpec"
           type: array
         dns:
           description: |-
@@ -7042,6 +8885,13 @@ components:
           additionalProperties:
             type: string
           description: Environment variables
+        extra_groups:
+          description: |-
+            Additional groups to add to the container process
+            (Docker `--group-add`).
+          items:
+            type: string
+          type: array
         extra_hosts:
           description: |-
             Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's
@@ -7066,14 +8916,57 @@ components:
           description: "OCI image reference (e.g., \"nginx:latest\", \"ubuntu:22.04\"\
             )"
           type: string
+        init_container:
+          description: |-
+            Run a Docker-supplied init process (PID 1) inside the container
+            (Docker `--init`). Distinct from `ZLayer`'s pre-start init actions.
+          nullable: true
+          type: boolean
+        ipc_mode:
+          description: |-
+            IPC namespace mode (Docker `--ipc`). Accepts e.g. `"host"`,
+            `"shareable"`, `"private"`, or `"container:<id>"`.
+          nullable: true
+          type: string
         labels:
           additionalProperties:
             type: string
           description: Labels for filtering and grouping
+        lifecycle:
+          allOf:
+          - $ref: "#/components/schemas/LifecycleSpec"
+          description: |-
+            Container lifecycle policy. Carries the `delete_on_exit` knob (Docker
+            `--rm` / `HostConfig.AutoRemove`) so the daemon can remove terminated
+            container records and bundles once they exit. Defaults to
+            [`crate::spec::LifecycleSpec::default()`] (i.e. retain on exit), which
+            matches the historical behavior for callers that omit the field.
+        memory_reservation:
+          description: Soft memory limit (Docker `--memory-reservation`).
+          nullable: true
+          type: string
+        memory_swap:
+          description: Total memory limit including swap (Docker `--memory-swap`).
+          nullable: true
+          type: string
+        memory_swappiness:
+          description: "Container memory swappiness, 0-100 (Docker `--memory-swappiness`)."
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
         name:
           description: Optional human-readable name
           nullable: true
           type: string
+        network_mode:
+          allOf:
+          - $ref: "#/components/schemas/NetworkMode"
+          description: |-
+            Network mode (Docker `--network`). Accepts `"default"`, `"host"`,
+            `"none"`, `"bridge"`, `"bridge:<name>"`, or `"container:<id>"`. When
+            omitted, defaults to [`crate::spec::NetworkMode::Default`].
+          nullable: true
         networks:
           description: |-
             User-defined bridge/overlay networks to attach the newly-created
@@ -7084,6 +8977,46 @@ components:
           items:
             $ref: "#/components/schemas/NetworkAttachmentRequest"
           type: array
+        node_selector:
+          allOf:
+          - $ref: "#/components/schemas/NodeSelector"
+          description: |-
+            Node selection constraints (required / preferred labels). When set on a
+            daemon that has a cluster handle, the leader places the container on a
+            node whose labels satisfy the required set; otherwise the field is
+            ignored and the container is created locally.
+          nullable: true
+        oom_kill_disable:
+          description: Disable the OOM killer for the container (Docker `--oom-kill-disable`).
+          nullable: true
+          type: boolean
+        oom_score_adj:
+          description: OOM-killer score adjustment (Docker `--oom-score-adj`).
+          format: int32
+          nullable: true
+          type: integer
+        pid_mode:
+          description: |-
+            PID namespace mode (Docker `--pid`). Accepts e.g. `"host"` or
+            `"container:<id>"`.
+          nullable: true
+          type: string
+        pids_limit:
+          description: |-
+            Maximum number of processes the container may spawn
+            (Docker `--pids-limit`).
+          format: int64
+          nullable: true
+          type: integer
+        platform:
+          allOf:
+          - $ref: "#/components/schemas/TargetPlatform"
+          description: |-
+            Target platform (OS + arch) the container must run on, e.g.
+            `darwin/arm64`. When set on a clustered daemon, the leader places the
+            container on a node whose reported platform matches; when no node
+            matches, the request is rejected. Ignored on single-node daemons.
+          nullable: true
         ports:
           description: |-
             Published ports (Docker's `-p host:container/proto`). When omitted,
@@ -7091,11 +9024,20 @@ components:
           items:
             $ref: "#/components/schemas/PortMapping"
           type: array
+        privileged:
+          description: |-
+            Run the container in privileged mode (Docker `--privileged`). When
+            omitted, defaults to `false`.
+          nullable: true
+          type: boolean
         pull_policy:
           description: "Image pull policy: \"always\", \"`if_not_present`\", or \"\
             never\""
           nullable: true
           type: string
+        read_only_root_fs:
+          description: Mount the container's root filesystem read-only (Docker `--read-only`).
+          type: boolean
         registry_auth:
           allOf:
           - $ref: "#/components/schemas/RegistryAuth"
@@ -7126,6 +9068,41 @@ components:
             Container restart policy (Docker-style). When omitted, the runtime
             applies no explicit restart policy (Docker default: `"no"`).
           nullable: true
+        security_opt:
+          description: |-
+            Security options such as `apparmor=...`, `seccomp=...`,
+            `no-new-privileges:true` (Docker `--security-opt`).
+          items:
+            type: string
+          type: array
+        stop_grace_period:
+          description: |-
+            Grace period to wait between the stop signal and a forced kill
+            (Docker `--stop-timeout`). Wire format is a humantime string
+            (e.g. `"30s"`, `"500ms"`, `"1m"`).
+          example: 30s
+          nullable: true
+          type: string
+        stop_signal:
+          description: |-
+            Signal sent to the container's main process to request a graceful
+            shutdown (Docker `--stop-signal`). Accepts e.g. `"SIGTERM"` or `"15"`.
+          nullable: true
+          type: string
+        sysctls:
+          additionalProperties:
+            type: string
+          description: Kernel sysctl overrides (Docker `--sysctl`).
+        ulimits:
+          additionalProperties:
+            $ref: "#/components/schemas/UlimitSpec"
+          description: Per-process ulimits (Docker `--ulimit`).
+        user:
+          description: |-
+            User and group override for the container's main process
+            (Docker `--user uid:gid`).
+          nullable: true
+          type: string
         volumes:
           description: Volume mounts
           items:
@@ -7413,11 +9390,21 @@ components:
       example:
         scope: scope
         name: name
+        node_affinity: ""
         value: value
       properties:
         name:
           description: The name of the secret.
           type: string
+        node_affinity:
+          allOf:
+          - $ref: "#/components/schemas/NodeAffinity"
+          description: |-
+            Optional per-secret node affinity. `None` (default) = any node may
+            host the decryptable form. When set, only matching nodes receive a
+            wrap of the DEK material for this row, and the API gate filters
+            reads accordingly. Ignored on standalone (non-clustered) daemons.
+          nullable: true
         scope:
           description: |-
             Optional explicit scope (legacy form). Mutually exclusive with the
@@ -7714,6 +9701,85 @@ components:
           type: string
       required:
       - csrf_token
+    DaemonCapabilitiesResponse:
+      description: |-
+        Response body for `GET /api/v1/daemon/capabilities`.
+
+        Snapshot of the daemon's runtime environment: privilege level, cgroup
+        scoping, network-related kernel capabilities. The fields mirror
+        [`DaemonCapabilities`] field-for-field; values are memoised at process
+        start and do not change at runtime.
+      example:
+        mode: ""
+        tun_device_available: true
+        cgroup_parent: cgroup_parent
+        has_cap_net_admin: true
+        can_write_cgroup_root: true
+        is_root: true
+        is_nested: true
+      properties:
+        can_write_cgroup_root:
+          description: |-
+            `true` if the cgroup root's `cgroup.subtree_control` has the owner-
+            write bit set.
+          type: boolean
+        cgroup_parent:
+          description: "The cgroup v2 path of the current process, if any."
+          nullable: true
+          type: string
+        has_cap_net_admin:
+          description: '`true` if `CAP_NET_ADMIN` is present in the process''s bounding
+            set.'
+          type: boolean
+        is_nested:
+          description: |-
+            `true` if the process appears to be inside a container (non-root
+            cgroup v2 path).
+          type: boolean
+        is_root:
+          description: '`true` if the process is running as uid 0.'
+          type: boolean
+        mode:
+          allOf:
+          - $ref: "#/components/schemas/DaemonModeDto"
+          description: Coarse classification derived from the boolean fields below.
+        tun_device_available:
+          description: |-
+            `true` if `/dev/net/tun` can be opened r/w without
+            EACCES/EPERM/ENOENT/ENXIO.
+          type: boolean
+      required:
+      - can_write_cgroup_root
+      - has_cap_net_admin
+      - is_nested
+      - is_root
+      - mode
+      - tun_device_available
+    DaemonEvent:
+      description: |-
+        A daemon lifecycle event. One of container, image, network, or volume.
+
+        Events are tagged on the wire with `"resource"` (`container` | `image` |
+        `network` | `volume`) so consumers can route on resource type without
+        matching the variant shape.
+      oneOf:
+      - $ref: "#/components/schemas/DaemonEvent_oneOf"
+      - $ref: "#/components/schemas/DaemonEvent_oneOf_1"
+      - $ref: "#/components/schemas/DaemonEvent_oneOf_2"
+      - $ref: "#/components/schemas/DaemonEvent_oneOf_3"
+    DaemonModeDto:
+      description: |-
+        Coarse classification of the daemon's effective execution environment.
+
+        Mirror of [`zlayer_agent::capability::DaemonMode`]. The agent's enum lives
+        in a crate that doesn't depend on `utoipa`, so we duplicate the variants
+        here (kept in sync via the [`From`] impl below) and tag this one with
+        [`ToSchema`] for `OpenAPI` generation.
+      enum:
+      - full
+      - nested_adaptive
+      - degraded
+      type: string
     DeploymentDetails:
       description: Deployment details (enhanced with per-service health and endpoints)
       example:
@@ -7769,6 +9835,14 @@ components:
       - services
       - status
       - updated_at
+    DeploymentStatus:
+      description: Deployment lifecycle status.
+      oneOf:
+      - $ref: "#/components/schemas/DeploymentStatus_oneOf"
+      - $ref: "#/components/schemas/DeploymentStatus_oneOf_1"
+      - $ref: "#/components/schemas/DeploymentStatus_oneOf_2"
+      - $ref: "#/components/schemas/DeploymentStatus_oneOf_3"
+      - $ref: "#/components/schemas/DeploymentStatus_oneOf_4"
     DeploymentSummary:
       description: Deployment summary
       example:
@@ -7795,6 +9869,29 @@ components:
       - name
       - service_count
       - status
+    DeviceSpec:
+      additionalProperties: false
+      description: Device passthrough specification
+      example:
+        path: path
+        read: true
+        mknod: true
+        write: true
+      properties:
+        mknod:
+          description: Allow mknod (create device nodes)
+          type: boolean
+        path:
+          description: "Host device path (e.g., /dev/kvm, /dev/net/tun)"
+          type: string
+        read:
+          description: Allow read access
+          type: boolean
+        write:
+          description: Allow write access
+          type: boolean
+      required:
+      - path
     DisconnectBridgeNetworkRequest:
       description: "Body for `POST /api/v1/container-networks/{id_or_name}/disconnect`."
       example:
@@ -7914,8 +10011,50 @@ components:
       - id
       - kind
       - name
+    GossipPeerSummary:
+      description: |-
+        Snapshot of one gossip-pool peer, returned by
+        `GET /api/v1/cluster/gossip/peers`.
+      example:
+        wg_endpoint: wg_endpoint
+        wg_pubkey: wg_pubkey
+        overlay_ip: overlay_ip
+        labels:
+          key: labels
+        node_id: 0
+      properties:
+        labels:
+          additionalProperties:
+            type: string
+          description: Free-form labels advertised by the peer.
+        node_id:
+          description: Worker (or peer) node id.
+          format: int64
+          minimum: 0
+          type: integer
+        overlay_ip:
+          description: "Overlay IP assigned to this peer, if known."
+          nullable: true
+          type: string
+        wg_endpoint:
+          description: "`WireGuard` UDP endpoint (host:port), if known."
+          nullable: true
+          type: string
+        wg_pubkey:
+          description: "`WireGuard` public key (base64-url-no-pad), if known."
+          nullable: true
+          type: string
+      required:
+      - node_id
     GpuInfoSummary:
-      description: "Summary of a GPU on a node, stored in Raft cluster state"
+      description: |-
+        Summary of a GPU on a node, stored in Raft cluster state and reported
+        via cluster join requests.
+
+        Lifted from `zlayer-scheduler::raft` so that wire-types consumers
+        (zlayer-api DTOs, the CLI, the manager UI) can describe GPU inventory
+        without depending on the heavier scheduler crate. `zlayer-scheduler`
+        re-exports this type for source compatibility.
       example:
         vendor: vendor
         memory_mb: 0
@@ -8168,10 +10307,43 @@ components:
       - disk_used
       - memory_used
       - node_id
+    ImageEvent:
+      description: An image lifecycle event.
+      properties:
+        at:
+          description: Wall-clock time.
+          format: date-time
+          type: string
+        digest:
+          description: Optional content digest (`sha256:...`) when known.
+          nullable: true
+          type: string
+        kind:
+          $ref: "#/components/schemas/ImageEventKind"
+        reference:
+          description: Image reference (e.g. `nginx:latest` or `registry/foo/bar@sha256:...`).
+          type: string
+        source:
+          description: Source reference for `Tag` events (the image being aliased).
+          nullable: true
+          type: string
+      required:
+      - at
+      - kind
+      - reference
+    ImageEventKind:
+      description: Kind of image lifecycle event.
+      enum:
+      - pull
+      - push
+      - delete
+      - tag
+      type: string
     ImageInfoDto:
       description: |-
-        Serializable wrapper for [`ImageInfo`] so we can attach `ToSchema` here
-        (the underlying type in `zlayer-agent` can't depend on `utoipa`).
+        Serializable wrapper for `zlayer_agent::runtime::ImageInfo` so we can
+        attach `ToSchema` here (the underlying type in `zlayer-agent` can't
+        depend on `utoipa`).
       example:
         reference: reference
         size_bytes: 0
@@ -8193,21 +10365,48 @@ components:
       required:
       - reference
     InternalScaleRequest:
-      description: Request to scale a service
+      description: |-
+        Wire-format scale request fanned out by the cluster's leader to each node
+        that gets assigned at least one replica of a service.
+
+        The leader's placement engine produces a `HashMap<NodeId, Vec<(role, index)>>`
+        of assignments; each entry becomes one `InternalScaleRequest` HTTP POST.
+
+        Backward-compatible: a peer may send `{service, replicas}` without
+        `assignments`. Receiving nodes treat that as a single implicit
+        `{role: "default", indices: 0..replicas}` group.
       example:
+        assignments:
+        - indices:
+          - 0
+          - 0
+          role: role
+        - indices:
+          - 0
+          - 0
+          role: role
         replicas: 0
         service: service
       properties:
+        assignments:
+          description: |-
+            Per-role-group container index lists. Empty in Phase 1; populated by
+            Phase 2 once `replica_groups` + cross-node identity ship.
+          items:
+            $ref: "#/components/schemas/ScaleAssignment"
+          type: array
         replicas:
-          description: Target replica count
+          description: |-
+            Total target replica count for this node, when caller didn't supply
+            explicit per-role assignments (legacy / Phase 1 shape). When
+            `assignments` is non-empty, this field is informational.
           format: int32
           minimum: 0
           type: integer
         service:
-          description: Service name to scale
+          description: Service name.
           type: string
       required:
-      - replicas
       - service
     InternalScaleResponse:
       description: Response from internal scale operation
@@ -8215,6 +10414,7 @@ components:
         replicas: 0
         service: service
         success: true
+        reroute_to_os: reroute_to_os
         message: message
       properties:
         message:
@@ -8226,6 +10426,15 @@ components:
           format: int32
           minimum: 0
           type: integer
+        reroute_to_os:
+          description: |-
+            When set, this agent refused the scale because it cannot run the
+            workload's OS (H-7 `RouteToPeer` policy). The value is the OCI-canonical
+            OS string the workload requires (`linux` / `windows` / `darwin`). The
+            scheduler catches this and re-dispatches to a cluster peer whose
+            `NodeState.os` matches.
+          nullable: true
+          type: string
         service:
           description: Service name that was scaled
           type: string
@@ -8390,6 +10599,22 @@ components:
             `SIG`-prefixed and bare forms. When omitted, defaults to `SIGKILL`.
           nullable: true
           type: string
+    LifecycleSpec:
+      additionalProperties: false
+      description: |-
+        Lifecycle policy for service / job / cron containers.
+
+        Currently exposes a single `delete_on_exit` knob that, when `true`,
+        instructs higher layers to remove the container record (and its bundle)
+        once it has terminated. Other layers consume this field; this type is
+        purely descriptive.
+      properties:
+        delete_on_exit:
+          description: |-
+            When true, terminated containers (and their bundles) are removed
+            automatically rather than retained for inspection. Defaults to
+            `false`, preserving the historical retain-on-exit behavior.
+          type: boolean
     LinkDeploymentRequest:
       description: "Body for `POST /api/v1/projects/{id}/deployments`."
       example:
@@ -8431,6 +10656,121 @@ components:
       required:
       - csrf_token
       - user
+    NatCandidateDto:
+      description: Locally gathered NAT candidate (`Host` / `ServerReflexive` / `Relay`).
+      example:
+        address: address
+        kind: kind
+        transport: transport
+        priority: 0
+      properties:
+        address:
+          description: Address (host:port)
+          type: string
+        kind:
+          description: '`Host` / `ServerReflexive` / `Relay`'
+          type: string
+        priority:
+          description: Priority (higher = preferred)
+          format: int32
+          minimum: 0
+          type: integer
+        transport:
+          description: Transport (e.g. "udp")
+          type: string
+      required:
+      - address
+      - kind
+      - priority
+      - transport
+    NatPeerDto:
+      description: Per-peer NAT connectivity entry.
+      example:
+        remote_endpoint: remote_endpoint
+        connection_type: connection_type
+        node_id: node_id
+      properties:
+        connection_type:
+          description: Direct / `HolePunched` / Relayed / Unreachable
+          type: string
+        node_id:
+          description: Peer node ID
+          type: string
+        remote_endpoint:
+          description: "Selected remote endpoint, if any"
+          nullable: true
+          type: string
+      required:
+      - connection_type
+      - node_id
+    NatStatusResponse:
+      description: NAT traversal status response
+      example:
+        candidates:
+        - address: address
+          kind: kind
+          transport: transport
+          priority: 0
+        - address: address
+          kind: kind
+          transport: transport
+          priority: 0
+        stun_servers:
+        - stun_servers
+        - stun_servers
+        peers:
+        - remote_endpoint: remote_endpoint
+          connection_type: connection_type
+          node_id: node_id
+        - remote_endpoint: remote_endpoint
+          connection_type: connection_type
+          node_id: node_id
+        last_refresh: 0
+        turn_servers:
+        - turn_servers
+        - turn_servers
+        relay_server_bind: relay_server_bind
+        enabled: true
+      properties:
+        candidates:
+          description: Locally gathered ICE candidates
+          items:
+            $ref: "#/components/schemas/NatCandidateDto"
+          type: array
+        enabled:
+          description: Whether NAT traversal is enabled in the daemon's config
+          type: boolean
+        last_refresh:
+          description: Unix epoch seconds of the last successful STUN refresh
+          format: int64
+          minimum: 0
+          type: integer
+        peers:
+          description: Per-peer NAT connectivity state
+          items:
+            $ref: "#/components/schemas/NatPeerDto"
+          type: array
+        relay_server_bind:
+          description: "Address of the locally-bound built-in relay server, if running"
+          nullable: true
+          type: string
+        stun_servers:
+          description: Configured STUN servers (host:port)
+          items:
+            type: string
+          type: array
+        turn_servers:
+          description: Configured TURN/relay servers (host:port)
+          items:
+            type: string
+          type: array
+      required:
+      - candidates
+      - enabled
+      - last_refresh
+      - peers
+      - stun_servers
+      - turn_servers
     NetworkAttachmentInfo:
       description: |-
         Per-network attachment entry on [`ContainerInfo::networks`].
@@ -8493,6 +10833,63 @@ components:
           type: string
       required:
       - network
+    NetworkEvent:
+      description: A network lifecycle event.
+      properties:
+        at:
+          description: Wall-clock time.
+          format: date-time
+          type: string
+        container_id:
+          description: "Container id, populated for `Connect`/`Disconnect`."
+          nullable: true
+          type: string
+        driver:
+          description: "Network driver (e.g. `bridge`, `overlay`)."
+          type: string
+        id:
+          description: Network identifier (registry id).
+          type: string
+        kind:
+          $ref: "#/components/schemas/NetworkEventKind"
+        name:
+          description: Human-readable network name.
+          type: string
+      required:
+      - at
+      - id
+      - kind
+      - name
+    NetworkEventKind:
+      description: Kind of network lifecycle event.
+      enum:
+      - create
+      - delete
+      - connect
+      - disconnect
+      type: string
+    NetworkMode:
+      description: |-
+        Network mode for a service container.
+
+        Mirrors Docker's `HostConfig.NetworkMode` semantics. Accepts both an
+        enum-tagged form (e.g. `network_mode: { bridge: { name: my-net } }`) and a
+        string form (e.g. `"host"`, `"bridge:my-net"`, `"container:abc123"`).
+      oneOf:
+      - description: Default networking (overlay / bridge as configured by the platform).
+        enum:
+        - default
+        type: string
+      - description: Share the host network namespace (Docker `--network host`).
+        enum:
+        - host
+        type: string
+      - description: Disable networking entirely (Docker `--network none`).
+        enum:
+        - none
+        type: string
+      - $ref: "#/components/schemas/NetworkMode_oneOf"
+      - $ref: "#/components/schemas/NetworkMode_oneOf_1"
     NetworkSummary:
       description: Summary returned when listing networks.
       example:
@@ -8521,6 +10918,16 @@ components:
       - member_count
       - name
       - rule_count
+    NodeAffinity:
+      description: |-
+        Constrains which nodes are allowed to host a given secret's
+        decryptable form. Used as the value of `ReplicatedSecret.node_affinity`.
+        `None` on a secret = unconstrained (any node may host); `Some(...)`
+        = only matching nodes receive a wrap of this row's DEK material,
+        and the API gate filters reads accordingly.
+      oneOf:
+      - $ref: "#/components/schemas/NodeAffinity_oneOf"
+      - $ref: "#/components/schemas/NodeAffinity_oneOf_1"
     NodeDetails:
       description: Detailed node information
       example:
@@ -8627,6 +11034,18 @@ components:
       - memory_percent
       - memory_total
       - memory_used
+    NodeSelector:
+      additionalProperties: false
+      description: Node selection constraints for service placement
+      properties:
+        labels:
+          additionalProperties:
+            type: string
+          description: Required labels that nodes must have (all must match)
+        prefer_labels:
+          additionalProperties:
+            type: string
+          description: "Preferred labels (soft constraint, nodes with these are preferred)"
     NodeSummary:
       description: Node summary for list operations
       example:
@@ -8725,6 +11144,27 @@ components:
       required:
       - display_name
       - name
+    OsKind:
+      description: |-
+        Operating system a service needs to run on.
+
+        Mirrors the OS half of an OCI platform descriptor. Canonical wire strings
+        match Go's `GOOS` values (e.g. `"linux"`, `"windows"`, `"darwin"`).
+      enum:
+      - linux
+      - windows
+      - macos
+      type: string
+    OverlayMode:
+      description: |-
+        How the daemon places a service's overlay attachment.
+
+        See module docs for the v0.51 implementation status of each variant.
+      enum:
+      - auto
+      - shared
+      - dedicated
+      type: string
     OverlayStatusResponse:
       description: Overlay network status response
       example:
@@ -8948,7 +11388,7 @@ components:
       - project_id
       - sha
     PruneResultDto:
-      description: "Serializable wrapper for [`PruneResult`]."
+      description: Serializable wrapper for `zlayer_agent::runtime::PruneResult`.
       example:
         deleted:
         - deleted
@@ -8969,8 +11409,8 @@ components:
       - deleted
       - space_reclaimed
     PullImageRequest:
-      description: "Request body for [`pull_image_handler`]. Blocking pull of an OCI\
-        \ image."
+      description: Request body for the pull-image handler. Blocking pull of an OCI
+        image.
       example:
         reference: reference
         pull_policy: pull_policy
@@ -9006,7 +11446,7 @@ components:
       - reference
     PullImageResponse:
       description: |-
-        Response body for [`pull_image_handler`]. Reports the pulled reference
+        Response body for the pull-image handler. Reports the pulled reference
         and, when the backend exposes it via `list_images`, the resolved digest
         and on-disk size.
       example:
@@ -9191,8 +11631,17 @@ components:
     RotateSecretRequest:
       description: Request body for secret rotation.
       example:
+        node_affinity: ""
         value: value
       properties:
+        node_affinity:
+          allOf:
+          - $ref: "#/components/schemas/NodeAffinity"
+          description: |-
+            Optional per-secret node affinity update. `None` here means "leave
+            existing affinity unchanged"; to clear affinity explicitly, pass an
+            empty selector via a separate update endpoint (Phase 2).
+          nullable: true
         value:
           description: The new secret value (will be encrypted at rest).
           type: string
@@ -9321,6 +11770,31 @@ components:
       required:
       - routes
       - total
+    ScaleAssignment:
+      description: |-
+        One role-group entry within an [`InternalScaleRequest`]. Phase 2 ships
+        this; Phase 1 uses the legacy `replicas` field only.
+      example:
+        indices:
+        - 0
+        - 0
+        role: role
+      properties:
+        indices:
+          description: |-
+            Replica indices within this role that the receiving node should ensure
+            exist locally. Each becomes a container `{service}-{role}-{index}`.
+          items:
+            format: int32
+            minimum: 0
+            type: integer
+          type: array
+        role:
+          description: "Role name (e.g. `\"default\"`, `\"primary\"`, `\"read\"`)."
+          type: string
+      required:
+      - indices
+      - role
     ScaleRequest:
       description: Scale request
       example:
@@ -9509,6 +11983,34 @@ components:
       required:
       - cpu_percent
       - memory_percent
+    ServiceOverlayStatus:
+      description: Status of a service's overlay across the cluster.
+      example:
+        mode: ""
+        service: service
+        bridges_by_node:
+          key:
+            subnet: 10.201.0.0/24
+            name: name
+            gateway: 10.201.0.1
+            node_id: node_id
+      properties:
+        bridges_by_node:
+          additionalProperties:
+            $ref: "#/components/schemas/BridgeInfo"
+          description: |-
+            One entry per node where this service has at least one container
+            attached. Keys are node IDs as stringified.
+        mode:
+          allOf:
+          - $ref: "#/components/schemas/OverlayMode"
+          description: Mode the daemon resolved for this service (after `resolve_v0_51`).
+        service:
+          type: string
+      required:
+      - bridges_by_node
+      - mode
+      - service
     ServiceSummary:
       description: Service summary
       example:
@@ -9621,6 +12123,40 @@ components:
           description: Replication status details
       required:
       - replication
+    StoredDeployment:
+      description: A stored deployment with metadata.
+      example:
+        updated_at: 2025-01-27T12:00:00Z
+        name: name
+        created_at: 2025-01-27T12:00:00Z
+        spec: "{}"
+        status: ""
+      properties:
+        created_at:
+          description: When the deployment was created
+          example: 2025-01-27T12:00:00Z
+          type: string
+        name:
+          description: Deployment name (unique identifier)
+          type: string
+        spec:
+          description: "The deployment specification (complex nested structure, see\
+            \ spec docs)"
+          type: object
+        status:
+          allOf:
+          - $ref: "#/components/schemas/DeploymentStatus"
+          description: Current deployment status
+        updated_at:
+          description: When the deployment was last updated
+          example: 2025-01-27T12:00:00Z
+          type: string
+      required:
+      - created_at
+      - name
+      - spec
+      - status
+      - updated_at
     StoredEnvironment:
       description: |-
         A deployment/runtime environment (e.g. "dev", "staging", "prod").
@@ -9714,6 +12250,13 @@ components:
       description: |-
         A stored permission grant binding a subject (user or group) to a resource
         with a specific access level.
+
+        Canonical `resource_kind` strings (kept here for grep-ability):
+        - `"environment"` — a `StoredEnvironment` row.
+        - `"deployment"` — a `StoredDeployment` row.
+        - `"project"` — a `StoredProject` row.
+        - `"secret"` — a row in the secrets store (`{scope}:{name}` keyed).
+        - `"node"` — a cluster member identified by `NodeIdentity::node_id`.
       example:
         subject_id: subject_id
         subject_kind: ""
@@ -10238,7 +12781,7 @@ components:
       - results
       - summary
     SyncDiffResponse:
-      description: "JSON-friendly wrapper around [`SyncDiff`]."
+      description: JSON-friendly wrapper around the sync diff output.
       example:
         to_delete:
         - to_delete
@@ -10333,7 +12876,7 @@ components:
       - status
     TagImageRequest:
       description: |-
-        Request body for [`tag_image_handler`]. Matches Docker-compat
+        Request body for the tag-image handler. Matches Docker-compat
         `docker tag` semantics: create a new reference (`target`) pointing at an
         already-cached image (`source`).
       example:
@@ -10349,6 +12892,29 @@ components:
       required:
       - source
       - target
+    TargetPlatform:
+      description: |-
+        Platform a service targets. `None` on `ServiceSpec.platform` means
+        "any agent is acceptable" (preserves backward compatibility).
+      properties:
+        arch:
+          $ref: "#/components/schemas/ArchKind"
+        os:
+          $ref: "#/components/schemas/OsKind"
+        osVersion:
+          description: |-
+            Optional OS version constraint — primarily for Windows multi-platform
+            images, where `platform.os.version` in the OCI index distinguishes build
+            families (e.g. `10.0.26100.*` for Server 2025 / Win11 24H2,
+            `10.0.20348.*` for Server 2022). When set on a Windows target the
+            registry platform resolver prefers manifest entries whose `os.version`
+            matches this value exactly or shares a `major.minor.build` prefix.
+            Unused on Linux/macOS platforms.
+          nullable: true
+          type: string
+      required:
+      - arch
+      - os
     TaskKind:
       description: Script type for a task.
       enum:
@@ -10687,6 +13253,21 @@ components:
       - name
       - services
       - status
+    UlimitSpec:
+      additionalProperties: false
+      description: Per-process resource limit (Docker `--ulimit` style).
+      example:
+        hard: 2
+        soft: 7
+      properties:
+        hard:
+          description: Hard limit.
+          format: int64
+          type: integer
+        soft:
+          description: Soft limit.
+          format: int64
+          type: integer
     UpdateEnvironmentRequest:
       description: "Body for `PATCH /api/v1/environments/{id}`. All fields are optional."
       example:
@@ -10871,6 +13452,97 @@ components:
           description: New value.
           nullable: true
           type: string
+    UpgradeError:
+      description: Per-node error captured during a rolling upgrade.
+      example:
+        message: message
+        node_id: 0
+      properties:
+        message:
+          type: string
+        node_id:
+          format: int64
+          minimum: 0
+          type: integer
+      required:
+      - message
+      - node_id
+    UpgradeJobState:
+      description: |-
+        State of a single daemon-binary upgrade attempt. Stored in
+        [`InternalState::upgrade_jobs`] and returned by `GET
+        /api/v1/internal/upgrade/{id}`.
+      example:
+        finished_at: 2000-01-23T04:56:07.000+00:00
+        started_at: 2000-01-23T04:56:07.000+00:00
+        upgrade_id: upgrade_id
+        error: error
+        version: version
+        status: ""
+      properties:
+        error:
+          description: Human-readable failure reason (set only when `status == Failed`).
+          nullable: true
+          type: string
+        finished_at:
+          description: When the job entered its terminal state (`Restarting` or `Failed`).
+          format: date-time
+          nullable: true
+          type: string
+        started_at:
+          description: When the job was registered.
+          format: date-time
+          type: string
+        status:
+          allOf:
+          - $ref: "#/components/schemas/UpgradeStatus"
+          description: Current lifecycle state.
+        upgrade_id:
+          description: Server-generated upgrade id (UUID v4).
+          type: string
+        version:
+          description: Target version (e.g. `"v0.12.0"`); `None` means "latest release".
+          nullable: true
+          type: string
+      required:
+      - started_at
+      - status
+      - upgrade_id
+    UpgradeStartRequest:
+      description: Request body for `POST /api/v1/internal/upgrade/start`.
+      example:
+        version: version
+      properties:
+        version:
+          description: |-
+            Target version. `None` (or `"latest"`) defers to `self-update`'s
+            "latest GitHub release" resolver.
+          nullable: true
+          type: string
+    UpgradeStartResponse:
+      description: Response body for `POST /api/v1/internal/upgrade/start`.
+      example:
+        upgrade_id: upgrade_id
+        message: message
+      properties:
+        message:
+          type: string
+        upgrade_id:
+          type: string
+      required:
+      - message
+      - upgrade_id
+    UpgradeStatus:
+      description: |-
+        Lifecycle of a daemon-binary upgrade job, tracked in-memory on the node
+        being upgraded.
+      enum:
+      - pending
+      - downloading
+      - applying
+      - restarting
+      - failed
+      type: string
     UserRole:
       description: |-
         User role. Admins can do everything; regular users are constrained by
@@ -10909,6 +13581,37 @@ components:
       - id
       - is_active
       - role
+    VolumeEvent:
+      description: A volume lifecycle event.
+      properties:
+        at:
+          description: Wall-clock time.
+          format: date-time
+          type: string
+        container_id:
+          description: "Container id, populated for `Mount`/`Unmount`."
+          nullable: true
+          type: string
+        driver:
+          description: Volume driver (e.g. `local`).
+          type: string
+        kind:
+          $ref: "#/components/schemas/VolumeEventKind"
+        name:
+          description: Volume name.
+          type: string
+      required:
+      - at
+      - kind
+      - name
+    VolumeEventKind:
+      description: Kind of volume lifecycle event.
+      enum:
+      - create
+      - delete
+      - mount
+      - unmount
+      type: string
     VolumeInfo:
       description: |-
         Full volume response shape used by the list, inspect, and create
@@ -10932,7 +13635,7 @@ components:
         in_use_by:
           description: |-
             Container IDs currently mounting this volume. Empty when no
-            [`VolumeUsageSource`] is wired.
+            `VolumeUsageSource` is wired.
           items:
             type: string
           type: array
@@ -11056,6 +13759,45 @@ components:
       required:
       - sha
       - status
+    WorkerSummary:
+      description: "Summary of a worker-tier worker node, returned by `GET /api/v1/cluster/workers`."
+      example:
+        os: os
+        api_addr: api_addr
+        last_seen_unix_secs: 6
+        id: 0
+        state: state
+        labels:
+          key: labels
+      properties:
+        api_addr:
+          description: Worker's API/health address (host:port).
+          type: string
+        id:
+          description: Worker's assigned node id.
+          format: int64
+          minimum: 0
+          type: integer
+        labels:
+          additionalProperties:
+            type: string
+          description: Labels declared during Register.
+        last_seen_unix_secs:
+          description: Last time the leader observed the worker.
+          format: int64
+          type: integer
+        os:
+          description: Worker's reported OS.
+          type: string
+        state:
+          description: Liveness state (`ready` | `unreachable` | `draining`).
+          type: string
+      required:
+      - api_addr
+      - id
+      - last_seen_unix_secs
+      - os
+      - state
     WorkflowAction:
       description: The action a workflow step performs.
       oneOf:
@@ -11138,6 +13880,165 @@ components:
       required:
       - action
       - name
+    u64:
+      format: int64
+      minimum: 0
+      type: integer
+    DaemonEvent_oneOf:
+      allOf:
+      - $ref: "#/components/schemas/ContainerEvent"
+      - properties:
+          resource:
+            enum:
+            - container
+            type: string
+        required:
+        - resource
+    DaemonEvent_oneOf_1:
+      allOf:
+      - $ref: "#/components/schemas/ImageEvent"
+      - properties:
+          resource:
+            enum:
+            - image
+            type: string
+        required:
+        - resource
+    DaemonEvent_oneOf_2:
+      allOf:
+      - $ref: "#/components/schemas/NetworkEvent"
+      - properties:
+          resource:
+            enum:
+            - network
+            type: string
+        required:
+        - resource
+    DaemonEvent_oneOf_3:
+      allOf:
+      - $ref: "#/components/schemas/VolumeEvent"
+      - properties:
+          resource:
+            enum:
+            - volume
+            type: string
+        required:
+        - resource
+    DeploymentStatus_oneOf:
+      description: Deployment created but not yet started
+      properties:
+        state:
+          enum:
+          - pending
+          type: string
+      required:
+      - state
+    DeploymentStatus_oneOf_1:
+      description: Deployment is being rolled out
+      properties:
+        state:
+          enum:
+          - deploying
+          type: string
+      required:
+      - state
+    DeploymentStatus_oneOf_2:
+      description: All services are running
+      properties:
+        state:
+          enum:
+          - running
+          type: string
+      required:
+      - state
+    DeploymentStatus_oneOf_3:
+      description: Deployment failed with an error message
+      properties:
+        message:
+          description: Error message describing the failure
+          type: string
+        state:
+          enum:
+          - failed
+          type: string
+      required:
+      - message
+      - state
+    DeploymentStatus_oneOf_4:
+      description: Deployment has been stopped
+      properties:
+        state:
+          enum:
+          - stopped
+          type: string
+      required:
+      - state
+    NetworkMode_oneOf_bridge:
+      description: |-
+        Attach to a Docker bridge network. When `name` is `None`, uses the
+        default `bridge` network.
+      properties:
+        name:
+          nullable: true
+          type: string
+    NetworkMode_oneOf:
+      description: |-
+        Attach to a Docker bridge network. When `name` is `None`, uses the
+        default `bridge` network.
+      properties:
+        bridge:
+          $ref: "#/components/schemas/NetworkMode_oneOf_bridge"
+      required:
+      - bridge
+    NetworkMode_oneOf_1_container:
+      description: |-
+        Attach to another container's network namespace
+        (Docker `--network container:<id>`).
+      properties:
+        id:
+          type: string
+      required:
+      - id
+    NetworkMode_oneOf_1:
+      description: |-
+        Attach to another container's network namespace
+        (Docker `--network container:<id>`).
+      properties:
+        container:
+          $ref: "#/components/schemas/NetworkMode_oneOf_1_container"
+      required:
+      - container
+    NodeAffinity_oneOf:
+      description: Explicit allow-list of `node_id`s.
+      properties:
+        kind:
+          enum:
+          - nodes
+          type: string
+        node_ids:
+          description: The set of `node_id`s entitled to host this secret.
+          items:
+            type: string
+          type: array
+      required:
+      - kind
+      - node_ids
+    NodeAffinity_oneOf_1:
+      description: |-
+        Match by node labels — every entry in the map must be present on
+        the node. Empty map matches every node.
+      properties:
+        kind:
+          enum:
+          - labels
+          type: string
+        labels:
+          additionalProperties:
+            type: string
+          description: Required label key/value pairs.
+      required:
+      - kind
+      - labels
     NotifierConfig_oneOf:
       description: Slack incoming webhook configuration.
       properties:

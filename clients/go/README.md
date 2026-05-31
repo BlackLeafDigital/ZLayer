@@ -16,7 +16,7 @@ For more information, please visit [https://zlayer.dev](https://zlayer.dev)
 Import the package in a go file in your project and run `go mod tidy`:
 
 ```go
-import zlayer "github.com/BlackLeafDigital/ZLayer/clients/go"
+import zlayer "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 ```
 
 To use a proxy, set the environment variable `HTTP_PROXY`:
@@ -92,25 +92,42 @@ Class | Method | HTTP request | Description
 *ClusterAPI* | [**ClusterForceLeader**](docs/ClusterAPI.md#clusterforceleader) | **Post** /api/v1/cluster/force-leader | Force this node to become the cluster leader (disaster recovery).
 *ClusterAPI* | [**ClusterHeartbeat**](docs/ClusterAPI.md#clusterheartbeat) | **Post** /api/v1/cluster/heartbeat | Handle node heartbeat.
 *ClusterAPI* | [**ClusterJoin**](docs/ClusterAPI.md#clusterjoin) | **Post** /api/v1/cluster/join | Handle a cluster join request.
+*ClusterAPI* | [**ClusterListGossipPeers**](docs/ClusterAPI.md#clusterlistgossippeers) | **Get** /api/v1/cluster/gossip/peers | &#x60;GET /api/v1/cluster/gossip/peers&#x60; — list peers known via the gossip pool.
 *ClusterAPI* | [**ClusterListNodes**](docs/ClusterAPI.md#clusterlistnodes) | **Get** /api/v1/cluster/nodes | List all nodes visible in the Raft cluster state.
+*ClusterAPI* | [**ClusterListWorkers**](docs/ClusterAPI.md#clusterlistworkers) | **Get** /api/v1/cluster/workers | &#x60;GET /api/v1/cluster/workers&#x60; — list currently-leased worker-tier workers.
+*ClusterAPI* | [**ClusterSetNodeLabels**](docs/ClusterAPI.md#clustersetnodelabels) | **Post** /api/v1/cluster/nodes/{id}/labels | Set or remove labels on a node, persisted in raft cluster state so the scheduler&#39;s &#x60;NodeSelector&#x60; placement honors them. &#x60;labels&#x60; entries are inserted/overwritten; &#x60;remove&#x60; keys are deleted.
+*ClusterAPI* | [**ClusterUpgrade**](docs/ClusterAPI.md#clusterupgrade) | **Post** /api/v1/cluster/upgrade | Drive a rolling daemon-binary upgrade across every follower.
+*ClusterAPI* | [**ClusterUpgradeSelf**](docs/ClusterAPI.md#clusterupgradeself) | **Post** /api/v1/cluster/upgrade-self | Trigger a daemon-binary self-upgrade on the local (leader) node.
 *ContainerNetworksAPI* | [**ConnectContainerNetwork**](docs/ContainerNetworksAPI.md#connectcontainernetwork) | **Post** /api/v1/container-networks/{id_or_name}/connect | Attach a container to a network.
 *ContainerNetworksAPI* | [**CreateContainerNetwork**](docs/ContainerNetworksAPI.md#createcontainernetwork) | **Post** /api/v1/container-networks | Create a new bridge or overlay network.
 *ContainerNetworksAPI* | [**DeleteContainerNetwork**](docs/ContainerNetworksAPI.md#deletecontainernetwork) | **Delete** /api/v1/container-networks/{id_or_name} | Delete a bridge network. Refuses if the network still has attachments unless &#x60;?force&#x3D;true&#x60; is set.
 *ContainerNetworksAPI* | [**DisconnectContainerNetwork**](docs/ContainerNetworksAPI.md#disconnectcontainernetwork) | **Post** /api/v1/container-networks/{id_or_name}/disconnect | Detach a container from a network.
 *ContainerNetworksAPI* | [**GetContainerNetwork**](docs/ContainerNetworksAPI.md#getcontainernetwork) | **Get** /api/v1/container-networks/{id_or_name} | Inspect a single bridge network by id or by name.
 *ContainerNetworksAPI* | [**ListContainerNetworks**](docs/ContainerNetworksAPI.md#listcontainernetworks) | **Get** /api/v1/container-networks | List all bridge networks, optionally filtered by label.
-*ContainersAPI* | [**CreateContainer**](docs/ContainersAPI.md#createcontainer) | **Post** /api/v1/containers | Create and start a container.
+*ContainersAPI* | [**ArchiveGet**](docs/ContainersAPI.md#archiveget) | **Get** /api/v1/containers/{id}/archive | &#x60;GET /api/v1/containers/{id}/archive?path&#x3D;&lt;...&gt;&#x60; — stream a TAR archive of the requested file or directory inside the container.
+*ContainersAPI* | [**ArchiveHead**](docs/ContainersAPI.md#archivehead) | **Head** /api/v1/containers/{id}/archive | &#x60;HEAD /api/v1/containers/{id}/archive?path&#x3D;&lt;...&gt;&#x60; — return path-stat metadata in the &#x60;X-Docker-Container-Path-Stat&#x60; header without materializing the TAR archive.
+*ContainersAPI* | [**ArchivePut**](docs/ContainersAPI.md#archiveput) | **Put** /api/v1/containers/{id}/archive | &#x60;PUT /api/v1/containers/{id}/archive?path&#x3D;&lt;...&gt;&#x60; — extract a TAR archive into the container at the given path.
+*ContainersAPI* | [**ChangesContainer**](docs/ContainersAPI.md#changescontainer) | **Get** /api/v1/containers/{id}/changes | Report changes to the container&#39;s filesystem.
+*ContainersAPI* | [**CreateContainer**](docs/ContainersAPI.md#createcontainer) | **Post** /api/v1/containers | Create and start a container (public, JWT-authenticated entry point).
 *ContainersAPI* | [**DeleteContainer**](docs/ContainersAPI.md#deletecontainer) | **Delete** /api/v1/containers/{id} | Stop and remove a container.
 *ContainersAPI* | [**ExecInContainer**](docs/ContainersAPI.md#execincontainer) | **Post** /api/v1/containers/{id}/exec | Execute a command in a running container.
 *ContainersAPI* | [**GetContainer**](docs/ContainersAPI.md#getcontainer) | **Get** /api/v1/containers/{id} | Get details for a specific container.
-*ContainersAPI* | [**GetContainerLogs**](docs/ContainersAPI.md#getcontainerlogs) | **Get** /api/v1/containers/{id}/logs | Get container logs.
-*ContainersAPI* | [**GetContainerStats**](docs/ContainersAPI.md#getcontainerstats) | **Get** /api/v1/containers/{id}/stats | Get container resource statistics.
+*ContainersAPI* | [**GetContainerLogs**](docs/ContainersAPI.md#getcontainerlogs) | **Get** /api/v1/containers/{id}/logs | Stream container logs.
+*ContainersAPI* | [**GetContainerStats**](docs/ContainersAPI.md#getcontainerstats) | **Get** /api/v1/containers/{id}/stats | Stream container resource statistics.
 *ContainersAPI* | [**KillContainer**](docs/ContainersAPI.md#killcontainer) | **Post** /api/v1/containers/{id}/kill | Send a signal to a running container.
 *ContainersAPI* | [**ListContainers**](docs/ContainersAPI.md#listcontainers) | **Get** /api/v1/containers | List standalone containers.
+*ContainersAPI* | [**PauseContainer**](docs/ContainersAPI.md#pausecontainer) | **Post** /api/v1/containers/{id}/pause | Pause a running container by freezing its cgroup.
+*ContainersAPI* | [**PortContainer**](docs/ContainersAPI.md#portcontainer) | **Get** /api/v1/containers/{id}/port | Report the published port mappings for a container.
+*ContainersAPI* | [**PruneContainers**](docs/ContainersAPI.md#prunecontainers) | **Post** /api/v1/containers/prune | Prune stopped containers from the runtime.
+*ContainersAPI* | [**RenameContainer**](docs/ContainersAPI.md#renamecontainer) | **Post** /api/v1/containers/{id}/rename | Rename a standalone container.
 *ContainersAPI* | [**RestartContainer**](docs/ContainersAPI.md#restartcontainer) | **Post** /api/v1/containers/{id}/restart | Restart a container: stop then start.
 *ContainersAPI* | [**StartContainer**](docs/ContainersAPI.md#startcontainer) | **Post** /api/v1/containers/{id}/start | Start a previously-created container.
 *ContainersAPI* | [**StopContainer**](docs/ContainersAPI.md#stopcontainer) | **Post** /api/v1/containers/{id}/stop | Stop a running container.
+*ContainersAPI* | [**TopContainer**](docs/ContainersAPI.md#topcontainer) | **Get** /api/v1/containers/{id}/top | List the processes running inside a container.
+*ContainersAPI* | [**UnpauseContainer**](docs/ContainersAPI.md#unpausecontainer) | **Post** /api/v1/containers/{id}/unpause | Resume a previously-paused container.
+*ContainersAPI* | [**UpdateContainer**](docs/ContainersAPI.md#updatecontainer) | **Post** /api/v1/containers/{id}/update | Update a standalone container&#39;s resource limits and/or restart policy.
 *ContainersAPI* | [**WaitContainer**](docs/ContainersAPI.md#waitcontainer) | **Get** /api/v1/containers/{id}/wait | Wait for a container to exit and return its exit code.
+*ContainersAPI* | [**WaitContainerPost**](docs/ContainersAPI.md#waitcontainerpost) | **Post** /api/v1/containers/{id}/wait | Wait for a container to exit and return Docker-shaped JSON.
 *CredentialsAPI* | [**CreateGitCredential**](docs/CredentialsAPI.md#creategitcredential) | **Post** /api/v1/credentials/git | Create a new git credential. Admin only.
 *CredentialsAPI* | [**CreateRegistryCredential**](docs/CredentialsAPI.md#createregistrycredential) | **Post** /api/v1/credentials/registry | Create a new registry credential. Admin only.
 *CredentialsAPI* | [**DeleteGitCredential**](docs/CredentialsAPI.md#deletegitcredential) | **Delete** /api/v1/credentials/git/{id} | Delete a git credential. Admin only.
@@ -122,16 +139,18 @@ Class | Method | HTTP request | Description
 *CronAPI* | [**GetCronJob**](docs/CronAPI.md#getcronjob) | **Get** /api/v1/cron/{name} | GET /api/v1/cron/{name} - Get cron job details
 *CronAPI* | [**ListCronJobs**](docs/CronAPI.md#listcronjobs) | **Get** /api/v1/cron | GET /api/v1/cron - List all cron jobs
 *CronAPI* | [**TriggerCronJob**](docs/CronAPI.md#triggercronjob) | **Post** /api/v1/cron/{name}/trigger | POST /api/v1/cron/{name}/trigger - Manually trigger a cron job
+*DaemonAPI* | [**GetDaemonCapabilities**](docs/DaemonAPI.md#getdaemoncapabilities) | **Get** /api/v1/daemon/capabilities | Get the daemon&#39;s runtime capability survey.
 *DeploymentsAPI* | [**CreateDeployment**](docs/DeploymentsAPI.md#createdeployment) | **Post** /api/v1/deployments | Create a new deployment.
 *DeploymentsAPI* | [**DeleteDeployment**](docs/DeploymentsAPI.md#deletedeployment) | **Delete** /api/v1/deployments/{name} | Delete a deployment.
 *DeploymentsAPI* | [**GetDeployment**](docs/DeploymentsAPI.md#getdeployment) | **Get** /api/v1/deployments/{name} | Get deployment details (with live per-service health when available).
+*DeploymentsAPI* | [**GetDeploymentSpec**](docs/DeploymentsAPI.md#getdeploymentspec) | **Get** /api/v1/deployments/{name}/spec | Get the raw stored deployment, including the full &#x60;DeploymentSpec&#x60;.
 *DeploymentsAPI* | [**ListDeployments**](docs/DeploymentsAPI.md#listdeployments) | **Get** /api/v1/deployments | List all deployments.
 *EnvironmentsAPI* | [**CreateEnvironment**](docs/EnvironmentsAPI.md#createenvironment) | **Post** /api/v1/environments | Create a new environment. Admin only.
 *EnvironmentsAPI* | [**DeleteEnvironment**](docs/EnvironmentsAPI.md#deleteenvironment) | **Delete** /api/v1/environments/{id} | Delete an environment. Admin only.
 *EnvironmentsAPI* | [**GetEnvironment**](docs/EnvironmentsAPI.md#getenvironment) | **Get** /api/v1/environments/{id} | Fetch a single environment by id.
 *EnvironmentsAPI* | [**ListEnvironments**](docs/EnvironmentsAPI.md#listenvironments) | **Get** /api/v1/environments | List environments.
 *EnvironmentsAPI* | [**UpdateEnvironment**](docs/EnvironmentsAPI.md#updateenvironment) | **Patch** /api/v1/environments/{id} | Rename / re-describe an environment. Admin only.
-*EventsAPI* | [**StreamEvents**](docs/EventsAPI.md#streamevents) | **Get** /api/v1/events | Stream container lifecycle events as Server-Sent Events.
+*EventsAPI* | [**StreamEvents**](docs/EventsAPI.md#streamevents) | **Get** /api/v1/events | Stream daemon lifecycle events as NDJSON.
 *GroupsAPI* | [**AddMember**](docs/GroupsAPI.md#addmember) | **Post** /api/v1/groups/{id}/members | Add a member to a group. Admin only.
 *GroupsAPI* | [**CreateGroup**](docs/GroupsAPI.md#creategroup) | **Post** /api/v1/groups | Create a new group. Admin only.
 *GroupsAPI* | [**DeleteGroup**](docs/GroupsAPI.md#deletegroup) | **Delete** /api/v1/groups/{id} | Delete a group. Admin only.
@@ -147,6 +166,9 @@ Class | Method | HTTP request | Description
 *ImagesAPI* | [**RemoveImageHandler**](docs/ImagesAPI.md#removeimagehandler) | **Delete** /api/v1/images/{image} | Remove an image from the runtime&#39;s cache.
 *ImagesAPI* | [**TagImageHandler**](docs/ImagesAPI.md#tagimagehandler) | **Post** /api/v1/images/tag | Create a new tag pointing at an existing image.
 *InternalAPI* | [**GetReplicasInternal**](docs/InternalAPI.md#getreplicasinternal) | **Get** /api/v1/internal/replicas/{service} | Get the current replica count for a service.
+*InternalAPI* | [**InternalRaftTriggerElect**](docs/InternalAPI.md#internalrafttriggerelect) | **Post** /api/v1/internal/raft/trigger-elect | Trigger an immediate Raft election on this node.
+*InternalAPI* | [**InternalUpgradeStart**](docs/InternalAPI.md#internalupgradestart) | **Post** /api/v1/internal/upgrade/start | Schedule a daemon-binary upgrade on this node.
+*InternalAPI* | [**InternalUpgradeStatus**](docs/InternalAPI.md#internalupgradestatus) | **Get** /api/v1/internal/upgrade/{upgrade_id} | Fetch the status of a previously-scheduled daemon-binary upgrade.
 *InternalAPI* | [**ScaleServiceInternal**](docs/InternalAPI.md#scaleserviceinternal) | **Post** /api/v1/internal/scale | Scale a service via internal scheduler request.
 *JobsAPI* | [**CancelExecution**](docs/JobsAPI.md#cancelexecution) | **Post** /api/v1/jobs/{execution_id}/cancel | POST /&#x60;api/v1/jobs/{execution_id}/cancel&#x60; - Cancel a running execution
 *JobsAPI* | [**GetExecutionStatus**](docs/JobsAPI.md#getexecutionstatus) | **Get** /api/v1/jobs/{execution_id}/status | GET /&#x60;api/v1/jobs/{execution_id}/status&#x60; - Get execution status
@@ -160,7 +182,6 @@ Class | Method | HTTP request | Description
 *NodesAPI* | [**GenerateJoinToken**](docs/NodesAPI.md#generatejointoken) | **Post** /api/v1/nodes/join-token | Generate a join token for new nodes to join the cluster.
 *NodesAPI* | [**GetNode**](docs/NodesAPI.md#getnode) | **Get** /api/v1/nodes/{id} | Get detailed information about a specific node.
 *NodesAPI* | [**ListNodes**](docs/NodesAPI.md#listnodes) | **Get** /api/v1/nodes | List all nodes in the cluster.
-*NodesAPI* | [**UpdateNodeLabels**](docs/NodesAPI.md#updatenodelabels) | **Post** /api/v1/nodes/{id}/labels | Update labels on a node.
 *NotifiersAPI* | [**CreateNotifier**](docs/NotifiersAPI.md#createnotifier) | **Post** /api/v1/notifiers | Create a new notifier. Admin only.
 *NotifiersAPI* | [**DeleteNotifier**](docs/NotifiersAPI.md#deletenotifier) | **Delete** /api/v1/notifiers/{id} | Delete a notifier. Admin only.
 *NotifiersAPI* | [**GetNotifier**](docs/NotifiersAPI.md#getnotifier) | **Get** /api/v1/notifiers/{id} | Fetch a single notifier by id.
@@ -169,8 +190,11 @@ Class | Method | HTTP request | Description
 *NotifiersAPI* | [**UpdateNotifier**](docs/NotifiersAPI.md#updatenotifier) | **Patch** /api/v1/notifiers/{id} | Update a notifier. Admin only.
 *OverlayAPI* | [**GetDnsStatus**](docs/OverlayAPI.md#getdnsstatus) | **Get** /api/v1/overlay/dns | Get DNS service status.
 *OverlayAPI* | [**GetIpAllocation**](docs/OverlayAPI.md#getipallocation) | **Get** /api/v1/overlay/ip-alloc | Get IP allocation status.
+*OverlayAPI* | [**GetNatStatus**](docs/OverlayAPI.md#getnatstatus) | **Get** /api/v1/overlay/nat/status | Get NAT traversal status.
 *OverlayAPI* | [**GetOverlayPeers**](docs/OverlayAPI.md#getoverlaypeers) | **Get** /api/v1/overlay/peers | Get list of overlay peers.
 *OverlayAPI* | [**GetOverlayStatus**](docs/OverlayAPI.md#getoverlaystatus) | **Get** /api/v1/overlay/status | Get overlay network status.
+*OverlayAPI* | [**GetServiceBridge**](docs/OverlayAPI.md#getservicebridge) | **Get** /api/v1/overlay/services/{name}/bridges/{node_id} | Get the bridge attachment for a service on a specific node.
+*OverlayAPI* | [**GetServiceOverlayStatus**](docs/OverlayAPI.md#getserviceoverlaystatus) | **Get** /api/v1/overlay/services/{name} | Get the overlay status for a single service.
 *PermissionsAPI* | [**GrantPermission**](docs/PermissionsAPI.md#grantpermission) | **Post** /api/v1/permissions | Grant a permission. Admin only.
 *PermissionsAPI* | [**ListPermissions**](docs/PermissionsAPI.md#listpermissions) | **Get** /api/v1/permissions | List permissions for a subject (user or group).
 *PermissionsAPI* | [**ListPermissionsByResource**](docs/PermissionsAPI.md#listpermissionsbyresource) | **Get** /api/v1/permissions/by-resource | List permissions granted on a specific resource.
@@ -211,6 +235,7 @@ Class | Method | HTTP request | Description
 *TasksAPI* | [**ListTaskRuns**](docs/TasksAPI.md#listtaskruns) | **Get** /api/v1/tasks/{id}/runs | List past runs for a task, most recent first.
 *TasksAPI* | [**ListTasks**](docs/TasksAPI.md#listtasks) | **Get** /api/v1/tasks | List tasks.
 *TasksAPI* | [**RunTask**](docs/TasksAPI.md#runtask) | **Post** /api/v1/tasks/{id}/run | Execute a task synchronously. Admin only.
+*TunnelsAPI* | [**CreateAccessSession**](docs/TunnelsAPI.md#createaccesssession) | **Post** /api/v1/tunnels/access/sessions | Create a temporary access session for an existing tunneled service.
 *TunnelsAPI* | [**CreateNodeTunnel**](docs/TunnelsAPI.md#createnodetunnel) | **Post** /api/v1/tunnels/node | Create a node-to-node tunnel.
 *TunnelsAPI* | [**CreateTunnel**](docs/TunnelsAPI.md#createtunnel) | **Post** /api/v1/tunnels | Create a new tunnel token.
 *TunnelsAPI* | [**GetTunnelStatus**](docs/TunnelsAPI.md#gettunnelstatus) | **Get** /api/v1/tunnels/{id}/status | Get tunnel status.
@@ -218,7 +243,7 @@ Class | Method | HTTP request | Description
 *TunnelsAPI* | [**RemoveNodeTunnel**](docs/TunnelsAPI.md#removenodetunnel) | **Delete** /api/v1/tunnels/node/{name} | Remove a node-to-node tunnel.
 *TunnelsAPI* | [**RevokeTunnel**](docs/TunnelsAPI.md#revoketunnel) | **Delete** /api/v1/tunnels/{id} | Revoke (delete) a tunnel.
 *UsersAPI* | [**CreateUser**](docs/UsersAPI.md#createuser) | **Post** /api/v1/users | Create a new user. Admin only.
-*UsersAPI* | [**DeleteUser**](docs/UsersAPI.md#deleteuser) | **Delete** /api/v1/users/{id} | Delete a user. Admin only. Callers cannot delete their own account.
+*UsersAPI* | [**DeleteUser**](docs/UsersAPI.md#deleteuser) | **Delete** /api/v1/users/{id} | Delete a user. Admin only. Callers cannot delete their own account. Idempotent — returns 204 whether the user existed or not.
 *UsersAPI* | [**GetUser**](docs/UsersAPI.md#getuser) | **Get** /api/v1/users/{id} | Fetch a single user. Admins can read any record; regular users can read only their own.
 *UsersAPI* | [**ListUsers**](docs/UsersAPI.md#listusers) | **Get** /api/v1/users | List all users. Admin only.
 *UsersAPI* | [**SetPassword**](docs/UsersAPI.md#setpassword) | **Post** /api/v1/users/{id}/password | Set a user&#39;s password. Admins may change any user&#39;s password; regular users may only change their own, and must supply &#x60;current_password&#x60;.
@@ -246,11 +271,13 @@ Class | Method | HTTP request | Description
 ## Documentation For Models
 
  - [AddMemberRequest](docs/AddMemberRequest.md)
+ - [ArchKind](docs/ArchKind.md)
  - [AuditEntry](docs/AuditEntry.md)
  - [BackendGroupInfo](docs/BackendGroupInfo.md)
  - [BackendInfo](docs/BackendInfo.md)
  - [BackendsResponse](docs/BackendsResponse.md)
  - [BootstrapRequest](docs/BootstrapRequest.md)
+ - [BridgeInfo](docs/BridgeInfo.md)
  - [BridgeNetwork](docs/BridgeNetwork.md)
  - [BridgeNetworkAttachment](docs/BridgeNetworkAttachment.md)
  - [BridgeNetworkDetails](docs/BridgeNetworkDetails.md)
@@ -266,18 +293,34 @@ Class | Method | HTTP request | Description
  - [ClusterJoinResponse](docs/ClusterJoinResponse.md)
  - [ClusterNodeSummary](docs/ClusterNodeSummary.md)
  - [ClusterPeer](docs/ClusterPeer.md)
+ - [ClusterUpgradeRequest](docs/ClusterUpgradeRequest.md)
+ - [ClusterUpgradeResult](docs/ClusterUpgradeResult.md)
+ - [ClusterUpgradeSelfRequest](docs/ClusterUpgradeSelfRequest.md)
  - [ConnectBridgeNetworkRequest](docs/ConnectBridgeNetworkRequest.md)
+ - [ContainerChangeEntry](docs/ContainerChangeEntry.md)
  - [ContainerEvent](docs/ContainerEvent.md)
  - [ContainerEventKind](docs/ContainerEventKind.md)
  - [ContainerExecRequest](docs/ContainerExecRequest.md)
  - [ContainerExecResponse](docs/ContainerExecResponse.md)
  - [ContainerHealthInfo](docs/ContainerHealthInfo.md)
  - [ContainerInfo](docs/ContainerInfo.md)
+ - [ContainerLogFormat](docs/ContainerLogFormat.md)
+ - [ContainerPortBinding](docs/ContainerPortBinding.md)
+ - [ContainerPortResponse](docs/ContainerPortResponse.md)
+ - [ContainerPruneResponse](docs/ContainerPruneResponse.md)
  - [ContainerResourceLimits](docs/ContainerResourceLimits.md)
  - [ContainerRestartKind](docs/ContainerRestartKind.md)
  - [ContainerRestartPolicy](docs/ContainerRestartPolicy.md)
  - [ContainerStatsResponse](docs/ContainerStatsResponse.md)
+ - [ContainerTopResponse](docs/ContainerTopResponse.md)
+ - [ContainerUpdateRequest](docs/ContainerUpdateRequest.md)
+ - [ContainerUpdateResponse](docs/ContainerUpdateResponse.md)
+ - [ContainerUpdateRestartPolicy](docs/ContainerUpdateRestartPolicy.md)
+ - [ContainerWaitDockerError](docs/ContainerWaitDockerError.md)
+ - [ContainerWaitDockerResponse](docs/ContainerWaitDockerResponse.md)
  - [ContainerWaitResponse](docs/ContainerWaitResponse.md)
+ - [CreateAccessSessionRequest](docs/CreateAccessSessionRequest.md)
+ - [CreateAccessSessionResponse](docs/CreateAccessSessionResponse.md)
  - [CreateBridgeNetworkRequest](docs/CreateBridgeNetworkRequest.md)
  - [CreateContainerRequest](docs/CreateContainerRequest.md)
  - [CreateDeploymentRequest](docs/CreateDeploymentRequest.md)
@@ -301,14 +344,29 @@ Class | Method | HTTP request | Description
  - [CronJobResponse](docs/CronJobResponse.md)
  - [CronStatusResponse](docs/CronStatusResponse.md)
  - [CsrfResponse](docs/CsrfResponse.md)
+ - [DaemonCapabilitiesResponse](docs/DaemonCapabilitiesResponse.md)
+ - [DaemonEvent](docs/DaemonEvent.md)
+ - [DaemonEventOneOf](docs/DaemonEventOneOf.md)
+ - [DaemonEventOneOf1](docs/DaemonEventOneOf1.md)
+ - [DaemonEventOneOf2](docs/DaemonEventOneOf2.md)
+ - [DaemonEventOneOf3](docs/DaemonEventOneOf3.md)
+ - [DaemonModeDto](docs/DaemonModeDto.md)
  - [DeploymentDetails](docs/DeploymentDetails.md)
+ - [DeploymentStatus](docs/DeploymentStatus.md)
+ - [DeploymentStatusOneOf](docs/DeploymentStatusOneOf.md)
+ - [DeploymentStatusOneOf1](docs/DeploymentStatusOneOf1.md)
+ - [DeploymentStatusOneOf2](docs/DeploymentStatusOneOf2.md)
+ - [DeploymentStatusOneOf3](docs/DeploymentStatusOneOf3.md)
+ - [DeploymentStatusOneOf4](docs/DeploymentStatusOneOf4.md)
  - [DeploymentSummary](docs/DeploymentSummary.md)
+ - [DeviceSpec](docs/DeviceSpec.md)
  - [DisconnectBridgeNetworkRequest](docs/DisconnectBridgeNetworkRequest.md)
  - [DnsStatusResponse](docs/DnsStatusResponse.md)
  - [ForceLeaderRequest](docs/ForceLeaderRequest.md)
  - [ForceLeaderResponse](docs/ForceLeaderResponse.md)
  - [GitCredentialKindSchema](docs/GitCredentialKindSchema.md)
  - [GitCredentialResponse](docs/GitCredentialResponse.md)
+ - [GossipPeerSummary](docs/GossipPeerSummary.md)
  - [GpuInfoSummary](docs/GpuInfoSummary.md)
  - [GpuUtilizationReport](docs/GpuUtilizationReport.md)
  - [GrantPermissionRequest](docs/GrantPermissionRequest.md)
@@ -316,6 +374,8 @@ Class | Method | HTTP request | Description
  - [HealthCheckRequest](docs/HealthCheckRequest.md)
  - [HealthResponse](docs/HealthResponse.md)
  - [HeartbeatRequest](docs/HeartbeatRequest.md)
+ - [ImageEvent](docs/ImageEvent.md)
+ - [ImageEventKind](docs/ImageEventKind.md)
  - [ImageInfoDto](docs/ImageInfoDto.md)
  - [InternalScaleRequest](docs/InternalScaleRequest.md)
  - [InternalScaleResponse](docs/InternalScaleResponse.md)
@@ -323,14 +383,29 @@ Class | Method | HTTP request | Description
  - [JobExecutionResponse](docs/JobExecutionResponse.md)
  - [JoinTokenResponse](docs/JoinTokenResponse.md)
  - [KillContainerRequest](docs/KillContainerRequest.md)
+ - [LifecycleSpec](docs/LifecycleSpec.md)
  - [LinkDeploymentRequest](docs/LinkDeploymentRequest.md)
  - [LoginRequest](docs/LoginRequest.md)
  - [LoginResponse](docs/LoginResponse.md)
+ - [NatCandidateDto](docs/NatCandidateDto.md)
+ - [NatPeerDto](docs/NatPeerDto.md)
+ - [NatStatusResponse](docs/NatStatusResponse.md)
  - [NetworkAttachmentInfo](docs/NetworkAttachmentInfo.md)
  - [NetworkAttachmentRequest](docs/NetworkAttachmentRequest.md)
+ - [NetworkEvent](docs/NetworkEvent.md)
+ - [NetworkEventKind](docs/NetworkEventKind.md)
+ - [NetworkMode](docs/NetworkMode.md)
+ - [NetworkModeOneOf](docs/NetworkModeOneOf.md)
+ - [NetworkModeOneOf1](docs/NetworkModeOneOf1.md)
+ - [NetworkModeOneOf1Container](docs/NetworkModeOneOf1Container.md)
+ - [NetworkModeOneOfBridge](docs/NetworkModeOneOfBridge.md)
  - [NetworkSummary](docs/NetworkSummary.md)
+ - [NodeAffinity](docs/NodeAffinity.md)
+ - [NodeAffinityOneOf](docs/NodeAffinityOneOf.md)
+ - [NodeAffinityOneOf1](docs/NodeAffinityOneOf1.md)
  - [NodeDetails](docs/NodeDetails.md)
  - [NodeResourceInfo](docs/NodeResourceInfo.md)
+ - [NodeSelector](docs/NodeSelector.md)
  - [NodeSummary](docs/NodeSummary.md)
  - [NotifierConfig](docs/NotifierConfig.md)
  - [NotifierConfigOneOf](docs/NotifierConfigOneOf.md)
@@ -340,6 +415,8 @@ Class | Method | HTTP request | Description
  - [NotifierKind](docs/NotifierKind.md)
  - [OidcCallbackResponse](docs/OidcCallbackResponse.md)
  - [OidcProviderPublic](docs/OidcProviderPublic.md)
+ - [OsKind](docs/OsKind.md)
+ - [OverlayMode](docs/OverlayMode.md)
  - [OverlayStatusResponse](docs/OverlayStatusResponse.md)
  - [PeerInfo](docs/PeerInfo.md)
  - [PeerListResponse](docs/PeerListResponse.md)
@@ -362,17 +439,20 @@ Class | Method | HTTP request | Description
  - [RotateSecretResponse](docs/RotateSecretResponse.md)
  - [RouteInfo](docs/RouteInfo.md)
  - [RoutesResponse](docs/RoutesResponse.md)
+ - [ScaleAssignment](docs/ScaleAssignment.md)
  - [ScaleRequest](docs/ScaleRequest.md)
  - [SecretMetadataResponse](docs/SecretMetadataResponse.md)
  - [ServiceDetails](docs/ServiceDetails.md)
  - [ServiceEndpoint](docs/ServiceEndpoint.md)
  - [ServiceHealthInfo](docs/ServiceHealthInfo.md)
  - [ServiceMetrics](docs/ServiceMetrics.md)
+ - [ServiceOverlayStatus](docs/ServiceOverlayStatus.md)
  - [ServiceSummary](docs/ServiceSummary.md)
  - [SetPasswordRequest](docs/SetPasswordRequest.md)
  - [StepResult](docs/StepResult.md)
  - [StopContainerRequest](docs/StopContainerRequest.md)
  - [StorageStatusResponse](docs/StorageStatusResponse.md)
+ - [StoredDeployment](docs/StoredDeployment.md)
  - [StoredEnvironment](docs/StoredEnvironment.md)
  - [StoredNotifier](docs/StoredNotifier.md)
  - [StoredPermission](docs/StoredPermission.md)
@@ -392,6 +472,7 @@ Class | Method | HTTP request | Description
  - [SyncResourceResponse](docs/SyncResourceResponse.md)
  - [SyncResourceResult](docs/SyncResourceResult.md)
  - [TagImageRequest](docs/TagImageRequest.md)
+ - [TargetPlatform](docs/TargetPlatform.md)
  - [TaskKind](docs/TaskKind.md)
  - [TaskRun](docs/TaskRun.md)
  - [TemplateInfo](docs/TemplateInfo.md)
@@ -404,6 +485,7 @@ Class | Method | HTTP request | Description
  - [TriggerJobResponse](docs/TriggerJobResponse.md)
  - [TunnelStatus](docs/TunnelStatus.md)
  - [TunnelSummary](docs/TunnelSummary.md)
+ - [UlimitSpec](docs/UlimitSpec.md)
  - [UpdateEnvironmentRequest](docs/UpdateEnvironmentRequest.md)
  - [UpdateGroupRequest](docs/UpdateGroupRequest.md)
  - [UpdateLabelsRequest](docs/UpdateLabelsRequest.md)
@@ -412,14 +494,22 @@ Class | Method | HTTP request | Description
  - [UpdateProjectRequest](docs/UpdateProjectRequest.md)
  - [UpdateUserRequest](docs/UpdateUserRequest.md)
  - [UpdateVariableRequest](docs/UpdateVariableRequest.md)
+ - [UpgradeError](docs/UpgradeError.md)
+ - [UpgradeJobState](docs/UpgradeJobState.md)
+ - [UpgradeStartRequest](docs/UpgradeStartRequest.md)
+ - [UpgradeStartResponse](docs/UpgradeStartResponse.md)
+ - [UpgradeStatus](docs/UpgradeStatus.md)
  - [UserRole](docs/UserRole.md)
  - [UserView](docs/UserView.md)
+ - [VolumeEvent](docs/VolumeEvent.md)
+ - [VolumeEventKind](docs/VolumeEventKind.md)
  - [VolumeInfo](docs/VolumeInfo.md)
  - [VolumeMount](docs/VolumeMount.md)
  - [VolumeMountType](docs/VolumeMountType.md)
  - [VolumeSummary](docs/VolumeSummary.md)
  - [WebhookInfoResponse](docs/WebhookInfoResponse.md)
  - [WebhookResponse](docs/WebhookResponse.md)
+ - [WorkerSummary](docs/WorkerSummary.md)
  - [WorkflowAction](docs/WorkflowAction.md)
  - [WorkflowActionOneOf](docs/WorkflowActionOneOf.md)
  - [WorkflowActionOneOf1](docs/WorkflowActionOneOf1.md)

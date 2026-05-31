@@ -1,0 +1,14 @@
+base: mcr.microsoft.com/windows/servercore:${LTSC}
+os: windows
+workdir: C:\app
+
+steps:
+  # Common dev tools. `apt-get install` is the portable interface the Windows
+  # builder lowers to `choco install` (via the RepoSources Chocolatey maps).
+  # Server Core is used (not Nano Server) so Chocolatey + MSI installers work.
+  - run: apt-get install -y git curl jq
+
+labels:
+  org.opencontainers.image.title: "ZLayer Windows Base"
+  org.opencontainers.image.description: "Windows Server Core base image with common development tools"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

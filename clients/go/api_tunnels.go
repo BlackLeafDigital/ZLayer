@@ -23,6 +23,125 @@ import (
 // TunnelsAPIService TunnelsAPI service
 type TunnelsAPIService service
 
+type ApiCreateAccessSessionRequest struct {
+	ctx context.Context
+	ApiService *TunnelsAPIService
+	createAccessSessionRequest *CreateAccessSessionRequest
+}
+
+func (r ApiCreateAccessSessionRequest) CreateAccessSessionRequest(createAccessSessionRequest CreateAccessSessionRequest) ApiCreateAccessSessionRequest {
+	r.createAccessSessionRequest = &createAccessSessionRequest
+	return r
+}
+
+func (r ApiCreateAccessSessionRequest) Execute() (*CreateAccessSessionResponse, *http.Response, error) {
+	return r.ApiService.CreateAccessSessionExecute(r)
+}
+
+/*
+CreateAccessSession Create a temporary access session for an existing tunneled service.
+
+Binds a local TCP listener on the daemon that proxies connections to the
+requested endpoint. Returns the local address so the caller can either
+connect directly (when sharing the daemon's host) or open a forwarder
+from a different host. The session is automatically torn down when its
+TTL expires.
+
+# Errors
+
+Returns an error if the tunnel server (and therefore the access manager)
+is disabled, or if binding the local listener fails.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiCreateAccessSessionRequest
+*/
+func (a *TunnelsAPIService) CreateAccessSession(ctx context.Context) ApiCreateAccessSessionRequest {
+	return ApiCreateAccessSessionRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return CreateAccessSessionResponse
+func (a *TunnelsAPIService) CreateAccessSessionExecute(r ApiCreateAccessSessionRequest) (*CreateAccessSessionResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *CreateAccessSessionResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "TunnelsAPIService.CreateAccessSession")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/tunnels/access/sessions"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.createAccessSessionRequest == nil {
+		return localVarReturnValue, nil, reportError("createAccessSessionRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.createAccessSessionRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiCreateNodeTunnelRequest struct {
 	ctx context.Context
 	ApiService *TunnelsAPIService

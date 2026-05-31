@@ -14,8 +14,9 @@ use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::handlers::{reconcile_standalone_containers, start_auto_remove_subscriber};
 use zlayer_api::router::{
     build_cluster_routes, build_container_network_routes, build_container_routes,
-    build_cron_routes, build_event_routes, build_job_routes, build_network_routes,
-    build_node_routes, build_overlay_routes, build_tunnel_routes, build_volume_routes,
+    build_cron_routes, build_edge_cache_routes, build_event_routes, build_job_routes,
+    build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
+    build_volume_routes,
 };
 use zlayer_api::{
     ApiConfig, BridgeNetworkApiState, BuildState, ContainerApiState, CronState, JobState,
@@ -2450,6 +2451,15 @@ pub(crate) async fn serve_with_external_shutdown(
     let tunnel_routes = build_tunnel_routes(tunnel_api_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
 
+    // Merge edge-cache eligibility routes (Track A — upstream control
+    // plane registers ZLayer nodes as eligible via these three endpoints).
+    // The registry is fresh / standalone — gossip-label broadcast is wired
+    // in a follow-on patch once we thread a GossipPool handle through to
+    // this scope; eligibility tracking already works without gossip.
+    let edge_cache_state = zlayer_api::handlers::EdgeCacheApiState::new();
+    let edge_cache_routes = build_edge_cache_routes(edge_cache_state);
+    router = router.merge(edge_cache_routes);
+
     // Merge proxy status routes
     let proxy_state = zlayer_api::ProxyApiState {
         registry: Some(proxy.registry()),
@@ -2606,7 +2616,7 @@ pub(crate) async fn serve_with_external_shutdown(
         Some(ip_allocator_path),
         slice_allocator,
         Some(slice_allocator_path),
-        internal_token,
+        internal_token.clone(),
         Some(config.data_dir.clone()),
         Some(cluster_signer.clone()),
     );
@@ -2651,7 +2661,9 @@ pub(crate) async fn serve_with_external_shutdown(
         .with_shared_event_bus(event_bus.clone())
         .with_bridge_networks(bridge_network_state)
         .with_standalone_storage(bundle.standalone_containers.clone())
-        .with_compose_storage(bundle.compose_projects.clone());
+        .with_compose_storage(bundle.compose_projects.clone())
+        .with_cluster(cluster_handle.clone())
+        .with_internal_token(internal_token.clone());
 
     // Repopulate the in-memory standalone-container cache from disk so
     // create / list / inspect / delete handlers see records that survived a

@@ -19,11 +19,13 @@ import (
 // checks if the InternalScaleRequest type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &InternalScaleRequest{}
 
-// InternalScaleRequest Request to scale a service
+// InternalScaleRequest Wire-format scale request fanned out by the cluster's leader to each node that gets assigned at least one replica of a service.  The leader's placement engine produces a `HashMap<NodeId, Vec<(role, index)>>` of assignments; each entry becomes one `InternalScaleRequest` HTTP POST.  Backward-compatible: a peer may send `{service, replicas}` without `assignments`. Receiving nodes treat that as a single implicit `{role: \"default\", indices: 0..replicas}` group.
 type InternalScaleRequest struct {
-	// Target replica count
-	Replicas int32 `json:"replicas"`
-	// Service name to scale
+	// Per-role-group container index lists. Empty in Phase 1; populated by Phase 2 once `replica_groups` + cross-node identity ship.
+	Assignments []ScaleAssignment `json:"assignments,omitempty"`
+	// Total target replica count for this node, when caller didn't supply explicit per-role assignments (legacy / Phase 1 shape). When `assignments` is non-empty, this field is informational.
+	Replicas *int32 `json:"replicas,omitempty"`
+	// Service name.
 	Service string `json:"service"`
 }
 
@@ -33,9 +35,8 @@ type _InternalScaleRequest InternalScaleRequest
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewInternalScaleRequest(replicas int32, service string) *InternalScaleRequest {
+func NewInternalScaleRequest(service string) *InternalScaleRequest {
 	this := InternalScaleRequest{}
-	this.Replicas = replicas
 	this.Service = service
 	return &this
 }
@@ -48,28 +49,68 @@ func NewInternalScaleRequestWithDefaults() *InternalScaleRequest {
 	return &this
 }
 
-// GetReplicas returns the Replicas field value
+// GetAssignments returns the Assignments field value if set, zero value otherwise.
+func (o *InternalScaleRequest) GetAssignments() []ScaleAssignment {
+	if o == nil || IsNil(o.Assignments) {
+		var ret []ScaleAssignment
+		return ret
+	}
+	return o.Assignments
+}
+
+// GetAssignmentsOk returns a tuple with the Assignments field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *InternalScaleRequest) GetAssignmentsOk() ([]ScaleAssignment, bool) {
+	if o == nil || IsNil(o.Assignments) {
+		return nil, false
+	}
+	return o.Assignments, true
+}
+
+// HasAssignments returns a boolean if a field has been set.
+func (o *InternalScaleRequest) HasAssignments() bool {
+	if o != nil && !IsNil(o.Assignments) {
+		return true
+	}
+
+	return false
+}
+
+// SetAssignments gets a reference to the given []ScaleAssignment and assigns it to the Assignments field.
+func (o *InternalScaleRequest) SetAssignments(v []ScaleAssignment) {
+	o.Assignments = v
+}
+
+// GetReplicas returns the Replicas field value if set, zero value otherwise.
 func (o *InternalScaleRequest) GetReplicas() int32 {
-	if o == nil {
+	if o == nil || IsNil(o.Replicas) {
 		var ret int32
 		return ret
 	}
-
-	return o.Replicas
+	return *o.Replicas
 }
 
-// GetReplicasOk returns a tuple with the Replicas field value
+// GetReplicasOk returns a tuple with the Replicas field value if set, nil otherwise
 // and a boolean to check if the value has been set.
 func (o *InternalScaleRequest) GetReplicasOk() (*int32, bool) {
-	if o == nil {
+	if o == nil || IsNil(o.Replicas) {
 		return nil, false
 	}
-	return &o.Replicas, true
+	return o.Replicas, true
 }
 
-// SetReplicas sets field value
+// HasReplicas returns a boolean if a field has been set.
+func (o *InternalScaleRequest) HasReplicas() bool {
+	if o != nil && !IsNil(o.Replicas) {
+		return true
+	}
+
+	return false
+}
+
+// SetReplicas gets a reference to the given int32 and assigns it to the Replicas field.
 func (o *InternalScaleRequest) SetReplicas(v int32) {
-	o.Replicas = v
+	o.Replicas = &v
 }
 
 // GetService returns the Service field value
@@ -106,7 +147,12 @@ func (o InternalScaleRequest) MarshalJSON() ([]byte, error) {
 
 func (o InternalScaleRequest) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
-	toSerialize["replicas"] = o.Replicas
+	if !IsNil(o.Assignments) {
+		toSerialize["assignments"] = o.Assignments
+	}
+	if !IsNil(o.Replicas) {
+		toSerialize["replicas"] = o.Replicas
+	}
 	toSerialize["service"] = o.Service
 	return toSerialize, nil
 }
@@ -116,7 +162,6 @@ func (o *InternalScaleRequest) UnmarshalJSON(data []byte) (err error) {
 	// by unmarshalling the object into a generic map with string keys and checking
 	// that every required field exists as a key in the generic map.
 	requiredProperties := []string{
-		"replicas",
 		"service",
 	}
 

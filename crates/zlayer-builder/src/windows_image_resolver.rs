@@ -15,11 +15,149 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use zlayer_types::ImageReference;
 
 use crate::error::{BuildError, Result};
+
+/// Registry namespace for prebuilt `ZLayer` Windows base + toolchain images.
+///
+/// Mirrors `ZLAYER_REGISTRY` in `macos_image_resolver.rs`. Used by
+/// [`rewrite_image_for_windows`] to redirect generic Docker Hub references
+/// (e.g. `golang:1.24`, `ubuntu:24.04`) to the equivalent Windows-native
+/// prebuilts under this namespace.
+const ZLAYER_REGISTRY: &str = "ghcr.io/blackleafdigital/zlayer";
+
+/// Rewrite a generic image reference to the equivalent prebuilt `ZLayer`
+/// Windows image under [`ZLAYER_REGISTRY`], parameterized by an LTSC line.
+///
+/// Counterpart to `macos_image_resolver::rewrite_image_for_macos`. Linux
+/// container images cannot run on Windows containers directly, so the
+/// builder rewrites known toolchain / base-distro references to prebuilt
+/// `nanoserver`-based images tagged with the requested LTSC line
+/// (`ltsc2022` or `ltsc2025`).
+///
+/// Returns `None` if:
+/// * The reference is already inside [`ZLAYER_REGISTRY`] (already rewritten).
+/// * The repository name doesn't map to a known base distro or toolchain.
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(
+///     rewrite_image_for_windows("ubuntu:24.04", "ltsc2022"),
+///     Some("ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2022".to_string()),
+/// );
+/// assert_eq!(
+///     rewrite_image_for_windows("golang:1.24", "ltsc2025"),
+///     Some("ghcr.io/blackleafdigital/zlayer/golang:1.24-windows-ltsc2025".to_string()),
+/// );
+/// ```
+#[must_use]
+pub fn rewrite_image_for_windows(image_ref: &str, ltsc: &str) -> Option<String> {
+    // Don't double-rewrite images already in our registry.
+    if image_ref.starts_with(ZLAYER_REGISTRY) {
+        return None;
+    }
+
+    // Strip the registry prefix (docker.io/library/, etc.).
+    let stripped = strip_registry_prefix_for_windows(image_ref);
+
+    // Split into name and tag using the canonical OCI parser (handles
+    // host:port, digests, and missing tags correctly).
+    let (name, tag) = match ImageReference::from_str(&stripped) {
+        Ok(r) => (
+            r.repository().to_string(),
+            r.tag().unwrap_or("latest").to_string(),
+        ),
+        Err(_) => (stripped.clone(), "latest".to_string()),
+    };
+    let base_name = name.rsplit('/').next().unwrap_or(&name);
+
+    // Base distro images → base:windows-<ltsc>
+    if is_base_distro_for_windows(base_name) {
+        return Some(format!("{ZLAYER_REGISTRY}/base:windows-{ltsc}"));
+    }
+
+    // Toolchain images → {zlayer_registry}/{canonical}:{version}-windows-<ltsc>
+    let canonical = match base_name {
+        "golang" | "go" => "golang",
+        "node" => "node",
+        "rust" => "rust",
+        "python" | "python3" => "python",
+        "deno" => "deno",
+        "bun" => "bun",
+        _ => return None,
+    };
+
+    let version = extract_version_from_tag_for_windows(&tag);
+    Some(format!(
+        "{ZLAYER_REGISTRY}/{canonical}:{version}-windows-{ltsc}"
+    ))
+}
+
+/// Check whether the given base image name is a Linux distribution / base image
+/// that has a prebuilt Windows counterpart at
+/// `{ZLAYER_REGISTRY}/base:windows-<ltsc>`.
+fn is_base_distro_for_windows(name: &str) -> bool {
+    matches!(
+        name,
+        "ubuntu"
+            | "debian"
+            | "alpine"
+            | "centos"
+            | "fedora"
+            | "rockylinux"
+            | "almalinux"
+            | "archlinux"
+            | "amazonlinux"
+            | "busybox"
+    )
+}
+
+/// Strip common registry prefixes from an image reference.
+///
+/// Local copy of the macOS resolver's helper so this resolver compiles on
+/// all platforms (the macOS one is `#[cfg(target_os = "macos")]`).
+fn strip_registry_prefix_for_windows(image_ref: &str) -> String {
+    let prefixes = [
+        "docker.io/library/",
+        "docker.io/",
+        "index.docker.io/library/",
+        "index.docker.io/",
+    ];
+    for prefix in &prefixes {
+        if let Some(rest) = image_ref.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    image_ref.to_string()
+}
+
+/// Extract a version-like prefix from an image tag (e.g. `"20-slim"` → `"20"`).
+///
+/// Local copy of `macos_toolchain::extract_version_from_tag` so this
+/// resolver compiles on all platforms.
+fn extract_version_from_tag_for_windows(tag: &str) -> String {
+    if tag == "latest" {
+        return "latest".to_string();
+    }
+
+    // Try to extract a version-like prefix (digits and dots).
+    let version_part: String = tag
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+
+    if version_part.is_empty() {
+        "latest".to_string()
+    } else {
+        version_part.trim_end_matches('.').to_string()
+    }
+}
 
 /// Base URL for Chocolatey package maps on the `RepoSources` `GitHub Pages` site.
 const REPO_SOURCES_CHOCO_BASE: &str = "https://zachhandley.github.io/RepoSources/maps/choco";
@@ -525,6 +663,86 @@ mod tests {
             "expected backdated mtime to exceed TTL ({} >= {})",
             age.as_secs(),
             PACKAGE_MAP_CACHE_TTL_SECS
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_skips_already_rewritten() {
+        assert_eq!(
+            rewrite_image_for_windows(
+                "ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2022",
+                "ltsc2022",
+            ),
+            None,
+        );
+        assert_eq!(
+            rewrite_image_for_windows(
+                "ghcr.io/blackleafdigital/zlayer/golang:1.24-windows-ltsc2025",
+                "ltsc2025",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_ubuntu_ltsc2022() {
+        assert_eq!(
+            rewrite_image_for_windows("ubuntu:24.04", "ltsc2022"),
+            Some("ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2022".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_ubuntu_ltsc2025() {
+        assert_eq!(
+            rewrite_image_for_windows("ubuntu:24.04", "ltsc2025"),
+            Some("ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2025".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_golang_ltsc2022() {
+        assert_eq!(
+            rewrite_image_for_windows("golang:1.24", "ltsc2022"),
+            Some("ghcr.io/blackleafdigital/zlayer/golang:1.24-windows-ltsc2022".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_node_ltsc2025() {
+        assert_eq!(
+            rewrite_image_for_windows("node:22", "ltsc2025"),
+            Some("ghcr.io/blackleafdigital/zlayer/node:22-windows-ltsc2025".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_unknown_returns_none() {
+        assert_eq!(rewrite_image_for_windows("nginx:1.25", "ltsc2022"), None);
+        assert_eq!(rewrite_image_for_windows("redis:7", "ltsc2025"), None);
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_strips_docker_io_prefix() {
+        assert_eq!(
+            rewrite_image_for_windows("docker.io/library/ubuntu:22.04", "ltsc2022"),
+            Some("ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2022".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_python_alias() {
+        assert_eq!(
+            rewrite_image_for_windows("python3:3.12", "ltsc2022"),
+            Some("ghcr.io/blackleafdigital/zlayer/python:3.12-windows-ltsc2022".to_string()),
+        );
+    }
+
+    #[test]
+    fn rewrite_image_for_windows_no_tag_defaults_to_latest() {
+        assert_eq!(
+            rewrite_image_for_windows("bun", "ltsc2025"),
+            Some("ghcr.io/blackleafdigital/zlayer/bun:latest-windows-ltsc2025".to_string()),
         );
     }
 

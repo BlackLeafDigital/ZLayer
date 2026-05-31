@@ -205,6 +205,10 @@ pub mod wasm_builder;
 pub mod windows;
 pub mod windows_builder;
 pub mod windows_image_resolver;
+// Inner `#![cfg(target_os = "windows")]` in the module gates the body; declare
+// it unconditionally here (like `windows_builder`) so a redundant cfg isn't
+// applied twice.
+pub mod windows_toolchain;
 pub mod zimage;
 
 // Re-export main types at crate root

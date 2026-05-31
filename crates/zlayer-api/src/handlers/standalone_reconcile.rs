@@ -363,6 +363,9 @@ mod tests {
             compose_storage: Arc::new(crate::storage::InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(crate::handlers::exec_instances::ExecInstances::new()),
             container_pty_resizers: Arc::new(dashmap::DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
         }
     }
 
