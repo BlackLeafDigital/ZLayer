@@ -1,0 +1,5 @@
+# Built daemon binary — produced by `go build` / Makefile, never committed.
+/zlayer-buildd
+
+# Release artifacts from `make release` — never committed.
+/release/
