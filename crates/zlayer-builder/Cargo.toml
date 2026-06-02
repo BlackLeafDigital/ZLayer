@@ -79,6 +79,10 @@ zlayer-spec.workspace = true
 zlayer-types.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 tempfile = "3"
+tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
+prost = "0.14.3"
+prost-types = "0.14.3"
+tonic-prost = "0.14.5"
 
 # Windows-only dependencies for the HCS (Host Compute Service) build backend.
 # The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer
@@ -115,3 +119,7 @@ local-registry = ["cache", "zlayer-registry/local"]
 
 [lints]
 workspace = true
+
+[build-dependencies]
+tonic-build = "0.14.5"
+tonic-prost-build = "0.14.5"

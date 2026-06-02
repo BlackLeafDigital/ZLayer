@@ -232,6 +232,7 @@ impl<'de> serde::Deserialize<'de> for ImageRef {
 /// import via `pub use zlayer_types::<area>::...`.
 pub mod api;
 pub mod auth;
+pub mod builder;
 pub mod client;
 pub mod cluster;
 pub mod jwt;

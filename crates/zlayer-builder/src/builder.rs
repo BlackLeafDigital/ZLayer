@@ -429,6 +429,13 @@ pub struct BuildOptions {
     /// Default: `false`. Wired up from the top-level `zlayer
     /// --host-network` CLI flag (see `bin/zlayer/src/cli.rs`).
     pub host_network: bool,
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` means "use `detect_backend()`'s default for the host × target
+    /// combination" (current behavior). `Some(kind)` forces that backend; if it's
+    /// unavailable for this host × target combination, the build fails with
+    /// `BuildError::NotSupported { operation: ... }`.
+    pub backend_override: Option<zlayer_types::builder::BuilderBackendKind>,
 }
 
 impl Default for BuildOptions {
@@ -461,6 +468,7 @@ impl Default for BuildOptions {
             update_bottles: false,
             windows_ltsc: None,
             host_network: false,
+            backend_override: None,
         }
     }
 }
@@ -973,6 +981,22 @@ impl ImageBuilder {
     #[must_use]
     pub fn with_host_network(mut self, on: bool) -> Self {
         self.options.host_network = on;
+        self
+    }
+
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` (the default) leaves backend selection to `detect_backend()`.
+    /// `Some(kind)` forces that backend; if it is unavailable for the host ×
+    /// target combination, the eventual build will fail with
+    /// `BuildError::NotSupported`. Wired from the `zlayer build --backend`
+    /// CLI flag.
+    #[must_use]
+    pub fn with_backend_override(
+        mut self,
+        backend: Option<zlayer_types::builder::BuilderBackendKind>,
+    ) -> Self {
+        self.options.backend_override = backend;
         self
     }
 

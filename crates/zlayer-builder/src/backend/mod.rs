@@ -22,12 +22,14 @@
 //! follow-up).
 
 mod buildah;
+pub mod buildah_sidecar;
 #[cfg(target_os = "windows")]
 pub mod hcs;
 #[cfg(target_os = "macos")]
 mod sandbox;
 
 pub use buildah::BuildahBackend;
+pub use buildah_sidecar::BuildahSidecarBackend;
 #[cfg(target_os = "windows")]
 pub use hcs::HcsBackend;
 #[cfg(target_os = "macos")]

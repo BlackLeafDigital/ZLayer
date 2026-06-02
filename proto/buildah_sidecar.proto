@@ -1,0 +1,189 @@
+// Buildah sidecar gRPC schema.
+//
+// Wire protocol between the Rust `BuildahSidecarBackend` (tonic client) and
+// the Go `zlayer-buildd` binary (gRPC server wrapping
+// `imagebuildah.BuildDockerfiles`). All RPCs run over TCP with mTLS;
+// authentication is by client certificate.
+
+syntax = "proto3";
+
+package zlayer.buildah_sidecar.v1;
+
+// BuildService is the single RPC surface of `zlayer-buildd`. The build itself
+// is server-streaming: the client opens a Build, receives BuildEvents until
+// either Finished or Error, then closes the stream.
+service BuildService {
+    rpc Build(BuildRequest) returns (stream BuildEvent);
+    rpc Cancel(CancelRequest) returns (CancelResponse);
+    rpc Inspect(InspectRequest) returns (InspectResponse);
+    rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// One Build request maps to one `imagebuildah.BuildDockerfiles` invocation
+// on the server. Fields mirror the subset of `define.BuildOptions` ZLayer
+// uses, plus enough additional knobs to cover the existing CLI surface.
+message BuildRequest {
+    // Optional client-supplied request ID. Sidecar echoes back via events
+    // for correlation; if empty, sidecar mints a UUID and reports via the
+    // first event.
+    string request_id = 1;
+
+    // Absolute path to the build context directory (sidecar-visible). When
+    // the sidecar and client are on the same host this is the directory
+    // path; for remote sidecars, the client uploads via a future
+    // ContextStream RPC (not in this version of the schema).
+    string context_dir = 2;
+
+    // One or more Dockerfile paths (relative to context_dir or absolute).
+    repeated string dockerfile_paths = 3;
+
+    // Image tags to apply. First tag is `Output`; the rest are
+    // `AdditionalTags`.
+    repeated string tags = 4;
+
+    // Target platforms (e.g. "linux/amd64", "linux/arm64").
+    repeated string platforms = 5;
+
+    // ARG values.
+    map<string, string> build_args = 6;
+
+    // Secret specs in buildah --secret form: "id=mysecret,src=/path"
+    // or "id=mysecret,env=MY_VAR".
+    repeated string secrets = 7;
+
+    // SSH specs in buildah --ssh form: "default" or "<id>=<sock-path>".
+    repeated string ssh = 8;
+
+    // Multi-stage target. Empty string means "build all stages."
+    string target_stage = 9;
+
+    // Use host networking. Maps to buildah --network=host.
+    bool host_network = 10;
+
+    // Cache import / export references.
+    string cache_from = 11;
+    string cache_to = 12;
+
+    // Buildah behavior toggles.
+    bool no_cache = 13;
+    bool squash = 14;
+    bool layers = 15;
+
+    // Output format. Empty => buildah default. Allowed: "oci", "docker".
+    string format = 16;
+
+    // Pull policy. Empty => buildah default. Allowed: "always", "missing",
+    // "never", "ifnewer".
+    string pull_policy = 17;
+
+    // Additional labels in "key=value" form (mirrors --label).
+    repeated string labels = 18;
+
+    // Additional annotations in "key=value" form.
+    repeated string annotations = 19;
+
+    // Hosts to add to /etc/hosts in "name:ip" form.
+    repeated string add_hosts = 20;
+
+    // Per-build env overrides (--env).
+    repeated string envs = 21;
+
+    // Shared memory size, e.g. "64m". Empty => buildah default.
+    string shm_size = 22;
+
+    // ulimits, e.g. "nofile=1024:2048".
+    repeated string ulimits = 23;
+
+    // Bind mounts (--volume) in "src:dst[:opts]" form.
+    repeated string volumes = 24;
+
+    // Reproducibility knobs.
+    int64 source_date_epoch = 25; // seconds; 0 means unset
+    bool rewrite_timestamp = 26;
+}
+
+// Server-streamed event during a build.
+message BuildEvent {
+    oneof event {
+        StageStarted stage_started = 1;
+        StageFinished stage_finished = 2;
+        InstructionStarted instruction_started = 3;
+        InstructionFinished instruction_finished = 4;
+        LogLine log = 5;
+        Warning warning = 6;
+        BuildFinished finished = 7;
+        BuildError error = 8;
+    }
+}
+
+message StageStarted {
+    uint32 index = 1;
+    string name = 2;
+    string base_image = 3;
+}
+
+message StageFinished {
+    uint32 index = 1;
+}
+
+message InstructionStarted {
+    uint32 stage = 1;
+    uint32 index = 2;
+    string instruction = 3;
+}
+
+message InstructionFinished {
+    uint32 stage = 1;
+    uint32 index = 2;
+    bool cached = 3;
+}
+
+message LogLine {
+    string line = 1;
+    bool is_stderr = 2;
+}
+
+message Warning {
+    string message = 1;
+}
+
+message BuildFinished {
+    string image_id = 1;
+    string manifest_ref = 2; // canonical name@sha256:..., may be empty
+}
+
+message BuildError {
+    string message = 1;
+    string kind = 2; // e.g. "parse", "exec", "push"; free-form taxonomy
+}
+
+message CancelRequest {
+    string request_id = 1;
+}
+
+message CancelResponse {
+    bool cancelled = 1;
+}
+
+message InspectRequest {}
+
+message InspectResponse {
+    string sidecar_version = 1;
+    string buildah_version = 2;
+    repeated string supported_platforms = 3;
+    string storage_driver = 4;
+    string storage_root = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+    Status status = 1;
+    string detail = 2;
+
+    enum Status {
+        UNKNOWN = 0;
+        SERVING = 1;
+        NOT_SERVING = 2;
+    }
+}

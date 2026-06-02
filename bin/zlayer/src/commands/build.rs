@@ -29,11 +29,28 @@ pub(crate) async fn handle_build(
     verbose_build: bool,
     platform: Option<String>,
     update_bottles: bool,
+    backend: Option<String>,
     host_network: bool,
 ) -> Result<()> {
     use std::str::FromStr;
     use zlayer_builder::{
         detect_runtime, BuildEvent, ImageBuilder, ImageOs, PlainLogger, PullBaseMode, Runtime,
+    };
+    use zlayer_types::builder::BuilderBackendKind;
+
+    // Parse the optional --backend override into a typed discriminator. We
+    // keep clap's value as `Option<String>` for clean error formatting and
+    // do the typed parse here so callers get an `anyhow` error with the same
+    // remediation hint regardless of which front-end fed the build (CLI vs
+    // pipeline vs daemon RPC).
+    let backend_override: Option<BuilderBackendKind> = match backend.as_deref() {
+        Some(b) => Some(BuilderBackendKind::from_str(b).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid --backend value '{b}': {e} (expected one of: \
+                 buildah-cli, buildah-sidecar, sandbox, hcs)"
+            )
+        })?),
+        None => None,
     };
 
     // L-2: Parse the CLI `--platform` flag into an `ImageOs` pin. When set,
@@ -210,6 +227,12 @@ pub(crate) async fn handle_build(
     // `--net=host`. This matches Docker's `--network host` build mode and
     // bypasses buildah's CNI / netavark plumbing entirely.
     builder = builder.with_host_network(host_network);
+
+    // Forward --backend (if supplied). `None` keeps the auto-detected
+    // default; `Some(kind)` will force that backend at dispatch time. The
+    // value is plumbed onto `BuildOptions::backend_override`; the
+    // `detect_backend()` path will honour it in a follow-up (task 4.1).
+    builder = builder.with_backend_override(backend_override);
 
     // Apply push
     if push {

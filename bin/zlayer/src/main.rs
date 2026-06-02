@@ -630,6 +630,7 @@ async fn run(
             verbose_build,
             platform,
             update_bottles,
+            backend,
         } => {
             commands::build::handle_build(
                 context.clone(),
@@ -648,6 +649,7 @@ async fn run(
                 *verbose_build,
                 platform.clone(),
                 *update_bottles,
+                backend.clone(),
                 cli.host_network,
             )
             .await

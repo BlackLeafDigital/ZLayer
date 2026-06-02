@@ -523,6 +523,15 @@ pub(crate) enum Commands {
         /// On non-macOS platforms this flag is accepted but has no effect.
         #[arg(long)]
         update_bottles: bool,
+
+        /// Build backend to use. Auto-detected if omitted.
+        ///
+        /// One of: `buildah-cli`, `buildah-sidecar`, `sandbox`, `hcs`.
+        /// Stage 4 of the buildah-sidecar plan flips the Linux default from
+        /// `buildah-cli` to `buildah-sidecar`; until then, omitting this flag keeps
+        /// the legacy CLI shellout behavior.
+        #[arg(long, value_name = "BACKEND")]
+        backend: Option<String>,
     },
 
     /// Build multiple images from a pipeline manifest
