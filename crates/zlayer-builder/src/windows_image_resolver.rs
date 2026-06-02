@@ -387,7 +387,19 @@ fn resolve_in_shard(linux_pkg: &str, shard: &ChocoMapShard) -> ShardLookup {
 }
 
 /// Returns the platform cache directory used for storing Chocolatey shards.
+///
+/// `ZLAYER_PACKAGE_MAP_CACHE_DIR`, when set to a non-empty path, overrides the
+/// platform default on **every** OS. This is both an operator knob (relocate
+/// the package-map cache) and what the test suite uses for a hermetic cache —
+/// `dirs::cache_dir()` ignores `XDG_CACHE_HOME` on macOS and Windows, so an
+/// env override is the only portable way to redirect it.
 fn resolve_cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZLAYER_PACKAGE_MAP_CACHE_DIR") {
+        let p = PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return Ok(p);
+        }
+    }
     dirs::cache_dir().ok_or_else(|| {
         BuildError::cache_error("could not determine platform cache directory (dirs::cache_dir)")
     })

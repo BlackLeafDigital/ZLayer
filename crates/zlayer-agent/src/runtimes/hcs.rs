@@ -118,7 +118,7 @@ pub fn owner_tag(daemon_name: &str) -> String {
     }
 }
 
-/// Name of the per-daemon HCN Transparent overlay network on the host. Every
+/// Name of the per-daemon HCN overlay network on the host. Every
 /// `ZLayer` container on this node attaches an endpoint into this network;
 /// the network's IPAM subnet is the node's per-node `/28` slice of the
 /// cluster CIDR (see [`HcsConfig::slice_cidr`]).
@@ -335,7 +335,7 @@ pub struct HcsConfig {
     /// Daemon instance name (resolved from the top-level `--daemon-name`
     /// flag, with a `current_exe()` fallback). Drives the HCS owner tag
     /// stamped onto every compute system this runtime owns and the name
-    /// of the per-daemon HCN Transparent overlay network so two daemons
+    /// of the per-daemon HCN overlay network so two daemons
     /// running side-by-side on one host never collide. Defaults to
     /// `"zlayer"` for backward compatibility with single-instance installs.
     pub daemon_name: String,
@@ -426,7 +426,7 @@ struct ContainerEntry {
     gcs: Option<zlayer_gcs::bridge::GcsBridge>,
 }
 
-/// Per-daemon HCN Transparent overlay network created lazily on first
+/// Per-daemon HCN overlay network created lazily on first
 /// [`HcsRuntime::create_container`] call. We never tear this down during the
 /// daemon's lifetime — containers share it by attaching HCN endpoints to
 /// fresh per-container namespaces.
@@ -459,7 +459,7 @@ pub struct HcsRuntime {
     /// Auth resolver used to pick up persisted credentials when no inline
     /// auth is supplied on the pull.
     auth_resolver: zlayer_core::AuthResolver,
-    /// Lazily-created HCN Transparent overlay network all containers attach
+    /// Lazily-created HCN overlay network all containers attach
     /// to. Guarded by a `tokio::sync::Mutex` so the first `create_container`
     /// call wins the race and every subsequent call returns the cached GUID
     /// without a double-create.
@@ -482,7 +482,7 @@ pub struct HcsRuntime {
     /// Per-node IP allocator seeded from [`HcsConfig::slice_cidr`]. `Some` once
     /// this node has an assigned slice. The slice gateway (`network + 1`) is
     /// reserved at construction via `allocate_first` so the first container gets
-    /// `.2` and never collides with the Transparent network's gateway. `Mutex`
+    /// `.2` and never collides with the overlay network's gateway. `Mutex`
     /// because allocate/release take `&mut self`; never held across an `.await`.
     ip_allocator: Mutex<Option<zlayer_overlay::IpAllocator>>,
 }
@@ -561,7 +561,7 @@ impl HcsRuntime {
         })?;
         // Seed the per-node IP allocator from the assigned slice (if any),
         // reserving the slice gateway (`network + 1`) so container IPs start at
-        // `.2` and never collide with the Transparent network's default-route
+        // `.2` and never collide with the overlay network's default-route
         // gateway. A parse failure is unreachable (the source is a validated
         // `IpNet`); degrade to `None` (no-network) rather than failing.
         let ip_allocator = config.slice_cidr.and_then(|slice| {
@@ -615,7 +615,7 @@ impl HcsRuntime {
         self.config.storage_root.join("scratch").join(hcs_id)
     }
 
-    /// Lazy-create the per-daemon HCN Transparent overlay network on first
+    /// Lazy-create the per-daemon HCN overlay network on first
     /// use and cache its GUID.
     ///
     /// The network's IPAM subnet is this node's per-node `/28` slice of the
@@ -679,7 +679,7 @@ impl HcsRuntime {
             tracing::info!(
                 network_id = %format!("{existing_id:?}"),
                 name = %net_name,
-                "reusing existing HCN Transparent overlay network"
+                "reusing existing HCN overlay network"
             );
             return Ok(existing_id);
         }
@@ -687,33 +687,71 @@ impl HcsRuntime {
         let net_id = GUID::new().map_err(|e| {
             AgentError::Internal(format!("GUID::new for overlay network failed: {e}"))
         })?;
-        let uplink = zlayer_hns::adapter::find_primary_adapter()
-            .map_err(|e| AgentError::Internal(format!("find_primary_adapter: {e}")))?;
         let subnet_str = slice_cidr.to_string();
         let subnet_for_create = subnet_str.clone();
-        let uplink_for_create = uplink.clone();
         let net_name_for_create = net_name.clone();
 
-        let network = tokio::task::spawn_blocking(move || {
-            zlayer_hns::network::Network::create_transparent(
-                net_id,
-                &net_name_for_create,
-                &subnet_for_create,
-                &uplink_for_create,
-            )
-        })
-        .await
-        .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
-        .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork({net_name}): {e}")))?;
+        // Default: an HCN **Internal** network — an internal vSwitch with NO
+        // physical-NIC binding — so container traffic never touches the
+        // operator's gateway adapter. Containers get real overlay IPs and
+        // reach other nodes by routing through the host vNIC to the ZLayer
+        // WireGuard overlay adapter.
+        //
+        // Setting `ZLAYER_HCN_UPLINK_ADAPTER` opts into the legacy
+        // **Transparent** model bound to that named uplink. That binds a
+        // physical NIC (creates an external vSwitch over it) and on a
+        // remotely-administered host can sever the operator's own
+        // connectivity — hence advanced/opt-in only.
+        let use_transparent = std::env::var(zlayer_hns::adapter::ZLAYER_UPLINK_ENV)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
 
-        // HCN's Transparent IPAM needs ~1-2s after network create to settle its
-        // address pool. Without this wait the FIRST `HcnCreateEndpoint` against
-        // a freshly-created network frequently fails with
-        // `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)` for what should be a
-        // valid host address (verified May 2026: first endpoint at the first
-        // usable IP fails, second endpoint same IP succeeds). hcsshim avoids
-        // this race because containerd's snapshotter creates the network once
-        // at daemon startup, far before any endpoint attaches.
+        let network = if use_transparent {
+            let uplink = zlayer_hns::adapter::find_primary_adapter()
+                .map_err(|e| AgentError::Internal(format!("find_primary_adapter: {e}")))?;
+            tracing::warn!(
+                uplink = %uplink,
+                "ZLAYER_HCN_UPLINK_ADAPTER set: creating HCN *Transparent* overlay bound to a \
+                 physical NIC — this creates an external vSwitch over that adapter and can \
+                 disrupt host connectivity"
+            );
+            tokio::task::spawn_blocking(move || {
+                zlayer_hns::network::Network::create_transparent(
+                    net_id,
+                    &net_name_for_create,
+                    &subnet_for_create,
+                    &uplink,
+                )
+            })
+            .await
+            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
+            .map_err(|e| {
+                AgentError::Internal(format!("HcnCreateNetwork transparent ({net_name}): {e}"))
+            })?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                zlayer_hns::network::Network::create_internal(
+                    net_id,
+                    &net_name_for_create,
+                    &subnet_for_create,
+                )
+            })
+            .await
+            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
+            .map_err(|e| {
+                AgentError::Internal(format!("HcnCreateNetwork internal ({net_name}): {e}"))
+            })?
+        };
+
+        // HCN's Static IPAM needs ~1-2s after network create to settle its
+        // address pool (observed for Transparent; kept for Internal as the
+        // same Static-IPAM settling applies). Without this wait the FIRST
+        // `HcnCreateEndpoint` against a freshly-created network frequently
+        // fails with `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)` for what
+        // should be a valid host address (verified May 2026: first endpoint at
+        // the first usable IP fails, second endpoint same IP succeeds). hcsshim
+        // avoids this race because containerd's snapshotter creates the network
+        // once at daemon startup, far before any endpoint attaches.
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
         *guard = Some(OverlayNetwork {
@@ -724,8 +762,8 @@ impl HcsRuntime {
         tracing::info!(
             network_id = %format!("{net_id:?}"),
             subnet = %subnet_str,
-            uplink = %uplink,
-            "created HCN Transparent overlay network"
+            mode = if use_transparent { "Transparent" } else { "Internal" },
+            "created HCN overlay network"
         );
         Ok(net_id)
     }
@@ -3229,7 +3267,7 @@ impl Runtime for HcsRuntime {
                 Err(e) => {
                     return Err(AgentError::CreateFailed {
                         id: hcs_id.clone(),
-                        reason: format!("HCN Transparent overlay network unavailable: {e}"),
+                        reason: format!("HCN overlay network unavailable: {e}"),
                     });
                 }
             },

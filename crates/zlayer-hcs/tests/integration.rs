@@ -117,10 +117,14 @@ fn empty_vm_document(owner: &str) -> CsDoc {
                         device_path: String::new(),
                         disk_number: None,
                     }),
+                    ..Default::default()
                 }),
             }),
             compute_topology: Some(Topology {
-                memory: Some(TopologyMemory { size_in_mb: 256 }),
+                memory: Some(TopologyMemory {
+                    size_in_mb: 256,
+                    ..Default::default()
+                }),
                 processor: Some(TopologyProcessor { count: 1 }),
             }),
             devices: None,

@@ -3784,6 +3784,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "exercises the off-Windows COPY materialization path (commit is a no-op \
+                  off-Windows). On Windows execute_instruction commits via real HcsImportLayer, \
+                  which needs a base layer present; that path is covered by the layer e2e."
+    )]
     async fn apply_copy_simple_file_writes_to_scratch() {
         let builder = WindowsBuilder::new(dummy_config());
         let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
@@ -3821,6 +3827,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "exercises the off-Windows COPY materialization path (commit is a no-op \
+                  off-Windows). On Windows execute_instruction commits via real HcsImportLayer, \
+                  which needs a base layer present; that path is covered by the layer e2e."
+    )]
     async fn apply_copy_directory_recursive() {
         let builder = WindowsBuilder::new(dummy_config());
         let (ctx, mut skel, _guard) = ctx_and_skeleton_in_tempdir();
@@ -3843,6 +3855,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "exercises the off-Windows ADD tarball-extract materialization path (commit is \
+                  a no-op off-Windows). On Windows execute_instruction commits via real \
+                  HcsImportLayer, which needs a base layer present; covered by the layer e2e."
+    )]
     async fn apply_add_tarball_extracts() {
         use flate2::write::GzEncoder;
         use flate2::Compression;

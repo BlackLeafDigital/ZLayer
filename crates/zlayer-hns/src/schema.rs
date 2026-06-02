@@ -157,8 +157,15 @@ pub struct Route {
 // ---------------------------------------------------------------------------
 
 /// Top-level HCN endpoint object.
+///
+/// `#[serde(default)]` on the container makes deserialization tolerant of HCN
+/// *query* responses that omit fields the create-time doc always carries
+/// (`Name`, `HostComputeNetwork`, `SchemaVersion` are all absent from some
+/// query-backs — e.g. an endpoint attached to a namespace on an Internal
+/// network). This affects the **deserialize** side only; the create/serialize
+/// path still emits every populated field. Mirrors [`HostComputeNetwork`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct HostComputeEndpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

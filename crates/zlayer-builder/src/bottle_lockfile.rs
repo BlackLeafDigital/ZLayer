@@ -274,8 +274,12 @@ mod tests {
 
     #[test]
     fn lockfile_path_for_directory() {
-        // Real path; relies on /tmp existing.
-        let p = lockfile_path_for(Path::new("/tmp"));
-        assert_eq!(p, PathBuf::from("/var/lib/zlayer-bottles.lock"));
+        // When the spec path is an existing directory, the lockfile lives
+        // directly inside it. Use the OS temp dir so the directory genuinely
+        // exists on every platform (so `is_dir()` is true on Windows too,
+        // where `/tmp` does not exist).
+        let dir = std::env::temp_dir();
+        let p = lockfile_path_for(&dir);
+        assert_eq!(p, dir.join(LOCKFILE_NAME));
     }
 }

@@ -46,7 +46,8 @@ use zlayer_hns::attach::EndpointAttachment;
 use zlayer_hns::endpoint::Endpoint;
 use zlayer_hns::network::Network;
 use zlayer_hns::schema::{
-    AclAction, AclDirection, AclPolicySetting, OutBoundNatPolicySetting, SdnRoutePolicySetting,
+    AclAction, AclDirection, AclPolicySetting, NetworkType, OutBoundNatPolicySetting,
+    SdnRoutePolicySetting,
 };
 
 /// Test-only CIDR chosen to avoid colliding with a live ZLayer cluster on
@@ -78,6 +79,111 @@ async fn test_find_primary_adapter_nonempty() {
         "adapter friendly name must not be empty; got {name:?}",
     );
     eprintln!("primary adapter: {name}");
+}
+
+/// **Adapter-safety proof for the Transparent→Internal change.**
+///
+/// Creates the default HCN **Internal** overlay network (what
+/// `HcsRuntime::ensure_overlay_network` now builds by default) plus an
+/// endpoint on it, then reads the network back and asserts:
+///   * `Type == Internal` (an internal vSwitch — not Transparent/L2Bridge), and
+///   * it carries **no `NetAdapterName` policy** — i.e. nothing was bound to a
+///     physical host NIC, so no external vSwitch was created over the
+///     operator's gateway adapter.
+///
+/// The endpoint check also confirms a container would get a real overlay IP
+/// on the Internal segment. Pair this with a host-side `Get-NetAdapter`
+/// snapshot before/after to confirm Ethernet/Wi-Fi stay untouched.
+///
+/// Uses a dedicated CIDR distinct from the Transparent test's so a leftover
+/// orphan from either cannot cross-contaminate. Teardown always runs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates a real HCN Internal network + endpoint; requires admin on Windows"]
+async fn test_create_internal_network_no_physical_binding() {
+    const INTERNAL_CIDR: &str = "10.221.50.0/28";
+    const INTERNAL_IP: &str = "10.221.50.2";
+
+    let net_id = new_guid();
+
+    // --- Create the Internal network, query it straight back -------------
+    let net_props = tokio::task::spawn_blocking(move || {
+        let net = Network::create_internal(net_id, "zlayer-e2e-internal", INTERNAL_CIDR)?;
+        // The owning handle drops at the end of this closure but the network
+        // persists in HCN until `Network::delete`.
+        net.query("{}")
+    })
+    .await
+    .expect("join error")
+    .expect("Network::create_internal / query must succeed (admin + Hyper-V required)");
+
+    // HCN Static IPAM needs a moment to settle before the first endpoint.
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+    // --- Attach an endpoint: proves a container gets a real overlay IP ----
+    let ip: IpAddr = INTERNAL_IP
+        .parse()
+        .expect("INTERNAL_IP is a valid IPv4 literal");
+    let attach_result = tokio::task::spawn_blocking(move || {
+        EndpointAttachment::create_overlay(
+            net_id,
+            "zlayer-test",
+            "test-internal-1",
+            ip,
+            TEST_PREFIX_LEN,
+            INTERNAL_CIDR,
+            None,
+            None,
+        )
+    })
+    .await
+    .expect("join error");
+
+    let attachment = match attach_result {
+        Ok(a) => a,
+        Err(e) => {
+            // Clean up the network before failing so a rerun is not blocked.
+            let _ = tokio::task::spawn_blocking(move || Network::delete(net_id)).await;
+            panic!("EndpointAttachment::create_overlay on Internal network: {e}");
+        }
+    };
+
+    // The endpoint attached successfully above (`create_overlay` returned Ok) —
+    // that is the proof a container gets a real overlay IP on the Internal
+    // segment: HCN validates and assigns the address at `HcnCreateEndpoint`
+    // time and rejects an unroutable one. HCN's query-back for a
+    // namespace-attached endpoint returns a minimal object (no
+    // `IPConfigurations`), so re-reading the IP here is not reliable.
+    eprintln!(
+        "Internal-network endpoint attached: {:?}",
+        attachment.endpoint_id()
+    );
+
+    // --- Assertions (wrapped so teardown still runs on failure) ----------
+    let assertion_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Safety-critical: Internal type, no physical-NIC binding policy.
+        assert!(
+            matches!(net_props.ty, NetworkType::Internal),
+            "network must be Internal (got {:?}) — Transparent/L2Bridge would bind a physical NIC",
+            net_props.ty
+        );
+        for p in &net_props.policies {
+            assert_ne!(
+                p.get("Type").and_then(|v| v.as_str()),
+                Some("NetAdapterName"),
+                "Internal network must NOT carry a NetAdapterName policy (that binds a physical \
+                 host NIC / creates an external vSwitch); got policies {:?}",
+                net_props.policies
+            );
+        }
+    }));
+
+    // --- Teardown (always runs) ------------------------------------------
+    let _ = tokio::task::spawn_blocking(move || attachment.teardown()).await;
+    let _ = tokio::task::spawn_blocking(move || Network::delete(net_id)).await;
+
+    if let Err(p) = assertion_outcome {
+        std::panic::resume_unwind(p);
+    }
 }
 
 /// The highest-value end-to-end test. Creates a Transparent HCN network

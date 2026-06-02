@@ -158,6 +158,12 @@ impl EndpointAttachment {
             // Note: `out_bound_nat` and `acl_in_allow` builders are still
             // available in `EndpointPolicy` for callers that need them on
             // NAT/Overlay endpoints in the future.
+            //
+            // The same empty-policy doc is correct for the default **Internal**
+            // network (internal vSwitch, no physical-NIC binding): containers
+            // keep real overlay IPs and reach other nodes by routing through
+            // the host vNIC to the WireGuard overlay, so no SNAT/ACL is wanted
+            // here either.
             policies: Vec::new(),
             routes: vec![Route {
                 next_hop: gateway.clone(),

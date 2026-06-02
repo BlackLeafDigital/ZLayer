@@ -478,9 +478,9 @@ mod tests {
             0xdead_beef_0000_4000_8000_0000_0000_0001_u128 ^ u128::from(std::process::id()),
         );
 
-        let listener = match super::HvSockListener::bind(HV_GUID_WILDCARD, svc).await {
-            Ok(l) => l,
-            Err(_) => return, // No Hyper-V on this host — fix is unverifiable here.
+        let Ok(listener) = super::HvSockListener::bind(HV_GUID_WILDCARD, svc).await else {
+            // No Hyper-V on this host — fix is unverifiable here.
+            return;
         };
 
         let started = Instant::now();

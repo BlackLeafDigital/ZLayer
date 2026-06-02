@@ -2121,6 +2121,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let cache_root = tmp.path().to_path_buf();
+        // `dirs::cache_dir()` ignores `XDG_CACHE_HOME` on macOS/Windows, so set
+        // the explicit override the resolver honors on every platform. The
+        // XDG/LOCALAPPDATA sets are kept for any other code paths that read the
+        // platform cache dir directly.
+        std::env::set_var("ZLAYER_PACKAGE_MAP_CACHE_DIR", &cache_root);
         std::env::set_var("XDG_CACHE_HOME", &cache_root);
         std::env::set_var("LOCALAPPDATA", &cache_root);
         (guard, tmp, cache_root)
