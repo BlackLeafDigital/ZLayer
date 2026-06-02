@@ -8,7 +8,6 @@ rust-version.workspace = true
 description = "Standalone ZLayer overlay daemon: owns the WireGuard/Wintun adapter, HCN/bridge mechanics, IP allocation, DNS and NAT; driven by the main daemon over IPC"
 
 [lib]
-name = "zlayer_overlayd"
 path = "src/lib.rs"
 
 [[bin]]
