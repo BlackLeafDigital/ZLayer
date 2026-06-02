@@ -16,6 +16,13 @@ All notable changes to this project will be documented in this file.
 - `HcsRuntime` (Windows) delegates HCN networking to overlayd. The runtime gained an `overlayd: Option<Arc<Mutex<OverlaydClient>>>` field (connected from `HcsConfig.data_dir`'s overlayd socket in `HcsRuntime::new`); `create_container` now calls `AttachContainer{WindowsContainer{container_id, ip}}` to create the HCN endpoint + per-container namespace and embeds the returned `AttachResult.namespace_guid` in the compute-system document, and `remove_container` sends `DetachContainer`. The agent-side `ensure_overlay_network`, `OverlayNetwork`, `purge_managed_networks`, the `agent_network.json` marker logic, and the in-process endpoint-reaping `reconcile_orphans` body were removed — overlayd owns that lifecycle. The Hyper-V GCS compartment-attach (step 7.5) resolves the endpoint id from the overlayd-created namespace via `zlayer_hns::namespace::Namespace::list_endpoints`. `OverlayManager::attach_container_hcn` now takes the container id (not a namespace GUID) and returns `(IpAddr, Option<String>)` (IP + namespace GUID).
 - `bin/zlayer daemon uninstall --purge` (Windows) now drives `zlayer_overlayd::server::purge_managed_networks` instead of the removed `zlayer_agent::runtimes::hcs::purge_managed_networks`.
 
+### Tested
+- `crates/zlayer-overlayd/tests/ipc_roundtrip.rs` — cross-platform end-to-end IPC test: a real `OverlaydServer` served over a Unix socket and driven by `OverlaydClient` (`Status` / `SetLocal*` round-trips), proving the length-prefixed-JSON framing + client id-matching + server dispatch work over a live socket.
+- `crates/zlayer-overlayd/tests/windows_hcn_e2e.rs` (Windows, `#[ignore]`) carries the HCN adapter-safety proofs forward into overlayd: `create_internal` yields an `Internal` network with no `NetAdapterName` binding, and `purge_managed_networks` deletes the network + clears the marker. Verified on a live Windows Server 2025 host — both gateway NICs stayed Up with zero external vSwitches.
+
+### Fixed
+- Windows-only clippy/test hygiene that surfaced when the overlayd code first compiled on Windows: missing `;` in `tracing!` match arms, `must_use` / `unused_async` / doc-backtick / item-ordering lints, and a parallel-test race on the process-global `ZLAYER_HCN_UPLINK_ADAPTER` env var in `zlayer-hns` (now serialized with a shared mutex). The live-network `zlayer-builder` `sandbox_build_e2e` alpine-pull tests are now `#[ignore]` so `cargo test --workspace` is green offline.
+
 ## 0.52.0 - 2026-06-01
 
 ### Added
