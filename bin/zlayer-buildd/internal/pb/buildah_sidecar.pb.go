@@ -138,8 +138,17 @@ type BuildRequest struct {
 	// Reproducibility knobs.
 	SourceDateEpoch  int64 `protobuf:"varint,25,opt,name=source_date_epoch,json=sourceDateEpoch,proto3" json:"source_date_epoch,omitempty"` // seconds; 0 means unset
 	RewriteTimestamp bool  `protobuf:"varint,26,opt,name=rewrite_timestamp,json=rewriteTimestamp,proto3" json:"rewrite_timestamp,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Buildah isolation backend. One of:
+	//
+	//	""        — sidecar picks the safe default (chroot when rootless,
+	//	             oci when uid 0).
+	//	"default" — buildah's default for the host (= oci on Linux).
+	//	"oci"     — runc/crun.
+	//	"rootless" — runc-rootless.
+	//	"chroot"  — simple chroot, no container runtime needed.
+	Isolation     string `protobuf:"bytes,27,opt,name=isolation,proto3" json:"isolation,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BuildRequest) Reset() {
@@ -352,6 +361,13 @@ func (x *BuildRequest) GetRewriteTimestamp() bool {
 		return x.RewriteTimestamp
 	}
 	return false
+}
+
+func (x *BuildRequest) GetIsolation() string {
+	if x != nil {
+		return x.Isolation
+	}
+	return ""
 }
 
 // Server-streamed event during a build.
@@ -1829,7 +1845,7 @@ var File_buildah_sidecar_proto protoreflect.FileDescriptor
 
 const file_buildah_sidecar_proto_rawDesc = "" +
 	"\n" +
-	"\x15buildah_sidecar.proto\x12\x19zlayer.buildah_sidecar.v1\"\x83\a\n" +
+	"\x15buildah_sidecar.proto\x12\x19zlayer.buildah_sidecar.v1\"\xa1\a\n" +
 	"\fBuildRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1f\n" +
@@ -1862,7 +1878,8 @@ const file_buildah_sidecar_proto_rawDesc = "" +
 	"\aulimits\x18\x17 \x03(\tR\aulimits\x12\x18\n" +
 	"\avolumes\x18\x18 \x03(\tR\avolumes\x12*\n" +
 	"\x11source_date_epoch\x18\x19 \x01(\x03R\x0fsourceDateEpoch\x12+\n" +
-	"\x11rewrite_timestamp\x18\x1a \x01(\bR\x10rewriteTimestamp\x1a<\n" +
+	"\x11rewrite_timestamp\x18\x1a \x01(\bR\x10rewriteTimestamp\x12\x1c\n" +
+	"\tisolation\x18\x1b \x01(\tR\tisolation\x1a<\n" +
 	"\x0eBuildArgsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfe\x04\n" +

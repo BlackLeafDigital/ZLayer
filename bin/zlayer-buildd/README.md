@@ -86,9 +86,9 @@ release/zlayer-buildd-linux-amd64`.
 | `--tls-key`         | (required)     | PEM server private key.                                                 |
 | `--idle-secs`       | `30`           | Shut down after this many seconds of RPC inactivity. `0` disables idle shutdown. |
 | `--max-concurrent`  | `1`            | Cap on concurrent Build RPCs.                                           |
-| `--storage-driver`  | (empty)        | Override containers/storage driver (`overlay`, `vfs`, `btrfs`, ...).    |
-| `--storage-root`    | (empty)        | Override containers/storage `GraphRoot`. Setting any `--storage-*` flag triggers eager store init. |
-| `--storage-runroot` | (empty)        | Override containers/storage `RunRoot`.                                  |
+| `--storage-driver`  | (empty)        | Override containers/storage driver (`overlay`, `vfs`, `btrfs`, ...). Empty → driver chosen by `storage.DefaultStoreOptions()` (typically `overlay` on Linux). |
+| `--storage-root`    | (empty)        | Override containers/storage `GraphRoot`. Empty → rootless/system default from `storage.DefaultStoreOptions()`. |
+| `--storage-runroot` | (empty)        | Override containers/storage `RunRoot`. Empty → rootless/system default from `storage.DefaultStoreOptions()`. |
 | `--log-level`       | `info`         | `error`, `warn`, `info`, `debug`. Plumbed to a stderr JSON `slog.Logger`. |
 | `--version`         | (off)          | Print a single-line JSON with `sidecar_version`, `buildah_version`, `go_version`. Exits 0. |
 
@@ -125,25 +125,41 @@ openssl x509 -req -in zb-server.csr -CA zb-ca.crt -CAkey zb-ca.key \
 
 These certs are **smoke-test only** — never deploy them.
 
-## Lazy storage initialisation
+## Storage initialisation
 
-`containers/storage` ordinarily wants `containers.conf` plus a writable
-`GraphRoot` and `RunRoot` reachable on disk. Smoke tests, CI hosts, and
-unprivileged dev boxes frequently lack one or more of those. To keep the
-boot path resilient, the daemon defers `storage.GetStore` until the first
-Build RPC unless the operator supplies `--storage-root`, `--storage-runroot`,
-or `--storage-driver`. Passing any of those three signals "I have prepared a
-self-contained store" and the daemon initialises it eagerly during boot,
-failing fast if the configuration is broken.
+The daemon ALWAYS initialises a `containers/storage` `Store` at boot. The
+`Build` RPC needs a live store to push layers and the final image manifest
+into, so deferring it would just push every failure into the first build.
 
-When run without any `--storage-*` flag the boot log records:
+The boot sequence:
 
+1. `storage.DefaultStoreOptions()` loads `/etc/containers/storage.conf`
+   (and any user override under `$XDG_CONFIG_HOME/containers/storage.conf`)
+   and picks rootless or root defaults based on the current uid.
+2. Any of `--storage-driver`, `--storage-root`, `--storage-runroot` that
+   were supplied override the corresponding field.
+3. `storage.GetStore` opens the store. Failure is fatal — the daemon logs
+   the resolved `graph_root`, `run_root`, and `driver`, then exits with
+   code 1.
+4. A successful init logs the same fields at INFO level
+   (`containers/storage store initialised`), and the daemon registers a
+   `Shutdown(false)` deferred call so layers are flushed on graceful exit.
+
+For self-contained smoke tests on hosts where the default paths are not
+writable (e.g. unprivileged CI runners), point the daemon at a writable
+tree:
+
+```bash
+./zlayer-buildd \
+  --bind 127.0.0.1:0 \
+  --tls-ca ... --tls-cert ... --tls-key ... \
+  --storage-driver vfs \
+  --storage-root /tmp/zb-graph \
+  --storage-runroot /tmp/zb-run
 ```
-deferring storage.GetStore until first Build RPC; pass --storage-root to initialise eagerly
-```
 
-This is intentional, not a warning of misconfiguration. The first Build
-handler is responsible for materialising the store on demand.
+`vfs` is the lowest-common-denominator driver and requires no kernel
+support beyond `mkdir`.
 
 ## Health
 

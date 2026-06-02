@@ -27,7 +27,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 use crate::backend::buildah_sidecar::discover::{self, Discovery};
 use crate::backend::buildah_sidecar::proto::build_service_client::BuildServiceClient;
-use crate::backend::buildah_sidecar::tls::{ensure_tls_material, TlsMaterial};
+use crate::backend::buildah_sidecar::tls::{ensure_tls_material, set_dir_mode_0700, TlsMaterial};
 use crate::error::{BuildError, Result};
 
 /// Prefix the sidecar prints to stdout exactly once on startup.
@@ -200,6 +200,8 @@ impl SidecarLifecycle {
 
         let tls = ensure_tls_material(&tls_dir)?;
 
+        let storage = prepare_storage_spec(&self.config)?;
+
         // Remote-sidecar branch: caller pre-configured a reachable
         // address, so we never spawn.
         if let Some(addr) = self.config.addr.clone() {
@@ -224,6 +226,9 @@ impl SidecarLifecycle {
         cmd.arg("--tls-key").arg(&tls.key_pem);
         cmd.arg("--idle-secs")
             .arg(self.config.idle_secs.to_string());
+        cmd.arg("--storage-root").arg(&storage.graph_root);
+        cmd.arg("--storage-runroot").arg(&storage.run_root);
+        cmd.arg("--storage-driver").arg(&storage.driver);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -314,8 +319,63 @@ impl SidecarLifecycle {
     }
 }
 
-fn default_tls_dir() -> PathBuf {
+/// Shared resolution for the sidecar's per-user data root.
+///
+/// Both the TLS material directory and the containers/storage tree hang
+/// off this path, so they share a single source of truth via
+/// `ZLayerDirs::buildd()` (which honors `ZLAYER_DATA_DIR` overrides).
+fn default_buildd_dir() -> PathBuf {
     zlayer_paths::ZLayerDirs::system_default().buildd()
+}
+
+fn default_tls_dir() -> PathBuf {
+    default_buildd_dir()
+}
+
+/// Per-user containers/storage paths handed to `zlayer-buildd`.
+///
+/// Storing graph + run under `${ZLAYER_DATA_DIR}/buildd/storage/` keeps
+/// the layout rootless-safe: nothing in `/var/lib/containers` or
+/// `/run/containers` is touched, so non-root users on a host with a
+/// root-only `/etc/containers/storage.conf` still build cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageSpec {
+    graph_root: PathBuf,
+    run_root: PathBuf,
+    driver: String,
+}
+
+/// Resolve `StorageSpec`, pre-create graph + run dirs, and tighten perms.
+///
+/// containers/storage only creates the leaf directory itself, not parent
+/// paths, so we own the parent-dir contract. 0700 keeps any other local
+/// user from peering into the per-user image store.
+fn prepare_storage_spec(config: &zlayer_types::builder::SidecarConfig) -> Result<StorageSpec> {
+    let spec = resolve_storage_spec(config);
+    std::fs::create_dir_all(&spec.graph_root).map_err(BuildError::from)?;
+    std::fs::create_dir_all(&spec.run_root).map_err(BuildError::from)?;
+    set_dir_mode_0700(&spec.graph_root)?;
+    set_dir_mode_0700(&spec.run_root)?;
+    Ok(spec)
+}
+
+fn resolve_storage_spec(config: &zlayer_types::builder::SidecarConfig) -> StorageSpec {
+    let storage_base = default_buildd_dir().join("storage");
+
+    StorageSpec {
+        graph_root: config
+            .storage_graph_root
+            .clone()
+            .unwrap_or_else(|| storage_base.join("graph")),
+        run_root: config
+            .storage_run_root
+            .clone()
+            .unwrap_or_else(|| storage_base.join("run")),
+        driver: config
+            .storage_driver
+            .clone()
+            .unwrap_or_else(|| "vfs".to_string()),
+    }
 }
 
 async fn dial_mtls(addr: &str, tls: &TlsMaterial) -> Result<Channel> {
@@ -391,6 +451,7 @@ mod tests {
             addr: None,
             tls_dir: Some(tmp.path().to_path_buf()),
             idle_secs: 30,
+            ..Default::default()
         });
         let lifecycle = SidecarLifecycle::new(cfg);
         let result = lifecycle.ensure().await;
@@ -430,10 +491,15 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
+        // Scope storage to the tempdir too so the smoke test doesn't
+        // pollute the real per-user `${data_dir}/buildd/storage` tree.
         let cfg = Arc::new(zlayer_types::builder::SidecarConfig {
             addr: None,
             tls_dir: Some(tmp.path().to_path_buf()),
             idle_secs: 30,
+            storage_graph_root: Some(tmp.path().join("storage").join("graph")),
+            storage_run_root: Some(tmp.path().join("storage").join("run")),
+            storage_driver: Some("vfs".into()),
         });
         let lifecycle = SidecarLifecycle::new(cfg);
         let live = lifecycle
@@ -449,5 +515,46 @@ mod tests {
         // server-side handlers may not exist yet — the dial alone
         // proves we got past the handshake and TLS negotiation.
         let _client = live.client();
+    }
+
+    #[test]
+    fn storage_spec_defaults_to_buildd_storage() {
+        let cfg = zlayer_types::builder::SidecarConfig::default();
+        let spec = resolve_storage_spec(&cfg);
+        assert_eq!(spec.driver, "vfs");
+        assert!(
+            spec.graph_root.ends_with("graph"),
+            "expected graph leaf, got {:?}",
+            spec.graph_root
+        );
+        assert!(
+            spec.run_root.ends_with("run"),
+            "expected run leaf, got {:?}",
+            spec.run_root
+        );
+        assert!(
+            spec.graph_root.parent().unwrap().ends_with("storage"),
+            "expected storage parent, got {:?}",
+            spec.graph_root.parent()
+        );
+        assert!(
+            spec.run_root.parent().unwrap().ends_with("storage"),
+            "expected storage parent, got {:?}",
+            spec.run_root.parent()
+        );
+    }
+
+    #[test]
+    fn storage_spec_honors_override() {
+        let cfg = zlayer_types::builder::SidecarConfig {
+            storage_graph_root: Some(PathBuf::from("/tmp/test-graph")),
+            storage_run_root: Some(PathBuf::from("/tmp/test-run")),
+            storage_driver: Some("overlay".into()),
+            ..Default::default()
+        };
+        let spec = resolve_storage_spec(&cfg);
+        assert_eq!(spec.graph_root, PathBuf::from("/tmp/test-graph"));
+        assert_eq!(spec.run_root, PathBuf::from("/tmp/test-run"));
+        assert_eq!(spec.driver, "overlay");
     }
 }

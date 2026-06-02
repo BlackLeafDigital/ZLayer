@@ -143,6 +143,7 @@ mod tests {
             addr: Some("127.0.0.1:1234".into()),
             tls_dir: None,
             idle_secs: 99,
+            ..Default::default()
         };
         let backend = BuildahSidecarBackend::new(cfg.clone());
         assert_eq!(backend.config(), &cfg);
@@ -181,6 +182,7 @@ mod tests {
             // pointing at the same tempdir.
             tls_dir: Some(tmp.path().to_path_buf()),
             idle_secs: 30,
+            ..Default::default()
         };
         let backend = BuildahSidecarBackend::new(cfg);
         let available = backend.is_available().await;

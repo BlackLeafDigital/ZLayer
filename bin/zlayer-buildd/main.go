@@ -30,6 +30,7 @@ import (
 
 	"go.podman.io/buildah"
 	"go.podman.io/storage"
+	"go.podman.io/storage/pkg/unshare"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -61,6 +62,16 @@ func main() {
 	if buildah.InitReexec() {
 		return
 	}
+
+	// Rootless support: when running as a non-root uid, re-exec ourselves
+	// inside a new user namespace where the calling uid maps to root.
+	// Without this, buildah's `BuildDockerfiles` always fails when it
+	// tries to chown the build-context overlay scaffolding to uid 0
+	// under /var/tmp/buildah-context-* (EPERM). This is a no-op when
+	// the process is already running as real root (euid 0 with rootless
+	// UID > 0 means we already re-execed; bare euid 0 means we don't need
+	// to). Mirrors what the upstream `buildah` CLI does in its `main()`.
+	unshare.MaybeReexecUsingUserNamespace(false)
 
 	bind := flag.String("bind", "127.0.0.1:0", "host:port to bind (':0' for OS-allocated port)")
 	tlsCA := flag.String("tls-ca", "", "PEM CA cert used to verify client certs (required)")
@@ -105,43 +116,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Storage is lazy: GetStore needs containers.conf + storage.conf
-	// alongside root or rootless mounts that may not be available at boot
-	// (e.g. in CI smoke tests). We only attempt eager init when the user
-	// supplies --storage-root, which signals an explicit, self-contained
-	// location. Otherwise the server boots with a nil store and the first
-	// Build RPC will populate it via store-on-demand inside the server.
-	var (
-		store     storage.Store
-		storeOpts storage.StoreOptions
-	)
-	if *storageRoot != "" || *storageRunroot != "" || *storageDriver != "" {
-		opts, derr := storage.DefaultStoreOptions()
-		if derr != nil {
-			logger.Warn("could not load default storage options; using zero value", "error", derr)
-			opts = storage.StoreOptions{}
-		}
-		if *storageRoot != "" {
-			opts.GraphRoot = *storageRoot
-		}
-		if *storageRunroot != "" {
-			opts.RunRoot = *storageRunroot
-		}
-		if *storageDriver != "" {
-			opts.GraphDriverName = *storageDriver
-		}
-		storeOpts = opts
-		s, gerr := storage.GetStore(opts)
-		if gerr != nil {
-			logger.Error("failed to open containers/storage store", "error", gerr,
-				"graph_root", opts.GraphRoot, "run_root", opts.RunRoot,
-				"driver", opts.GraphDriverName)
-			os.Exit(1)
-		}
-		store = s
-	} else {
-		logger.Info("deferring storage.GetStore until first Build RPC; pass --storage-root to initialise eagerly")
+	// Storage options — always initialize. The Build RPC requires a live
+	// containers/storage Store on the server, so we cannot defer this. Flags
+	// override the rootless/root defaults that go.podman.io/storage picks
+	// based on uid + /etc/containers/storage.conf.
+	storeOpts, derr := storage.DefaultStoreOptions()
+	if derr != nil {
+		logger.Warn("could not load default storage options; falling back to zero value", "error", derr)
+		storeOpts = storage.StoreOptions{}
 	}
+	if *storageRoot != "" {
+		storeOpts.GraphRoot = *storageRoot
+	}
+	if *storageRunroot != "" {
+		storeOpts.RunRoot = *storageRunroot
+	}
+	if *storageDriver != "" {
+		storeOpts.GraphDriverName = *storageDriver
+	}
+	store, err := storage.GetStore(storeOpts)
+	if err != nil {
+		logger.Error("failed to open containers/storage store", "error", err,
+			"graph_root", storeOpts.GraphRoot, "run_root", storeOpts.RunRoot,
+			"driver", storeOpts.GraphDriverName)
+		os.Exit(1)
+	}
+	logger.Info("containers/storage store initialised",
+		"graph_root", storeOpts.GraphRoot,
+		"run_root", storeOpts.RunRoot,
+		"driver", storeOpts.GraphDriverName,
+	)
+	// Flush layers to disk on graceful exit. Shutdown(false) refuses if any
+	// containers are still mounted, which is the safe default — a true value
+	// would unmount them out from under any in-flight build.
+	defer func() {
+		if _, sErr := store.Shutdown(false); sErr != nil {
+			logger.Warn("store.Shutdown returned error", "error", sErr)
+		}
+	}()
 
 	lis, err := net.Listen("tcp", *bind)
 	if err != nil {
@@ -188,7 +200,6 @@ func main() {
 		"bind", fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port),
 		"idle_secs", *idleSecs,
 		"max_concurrent", *maxConcurrent,
-		"store_eager", store != nil,
 		"graph_root", storeOpts.GraphRoot,
 		"run_root", storeOpts.RunRoot,
 		"driver", storeOpts.GraphDriverName,
@@ -266,13 +277,26 @@ func runIdleLoop(
 				continue
 			}
 			gap := time.Since(time.Unix(0, lastNs))
-			if gap >= idle {
-				logger.Info("idle shutdown",
-					"idle_seconds", idle.Seconds(),
-					"observed_gap_seconds", gap.Seconds())
-				stopCh <- stopReason{why: fmt.Sprintf("idle:%.0fs", idle.Seconds())}
-				return
+			if gap < idle {
+				continue
 			}
+			// A long pull or compile can stall activity touches well past
+			// the idle window without the build being abandoned. Defer
+			// shutdown while any Build RPC is still in flight; the
+			// build's own defer-touchActivity at completion will then
+			// restart the idle clock from a fresh baseline.
+			if n := srv.InflightCount(); n > 0 {
+				logger.Debug("idle gap exceeded but build in flight; deferring shutdown",
+					"idle_seconds", idle.Seconds(),
+					"observed_gap_seconds", gap.Seconds(),
+					"inflight", n)
+				continue
+			}
+			logger.Info("idle shutdown",
+				"idle_seconds", idle.Seconds(),
+				"observed_gap_seconds", gap.Seconds())
+			stopCh <- stopReason{why: fmt.Sprintf("idle:%.0fs", idle.Seconds())}
+			return
 		}
 	}
 }

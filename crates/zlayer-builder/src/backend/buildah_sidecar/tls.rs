@@ -148,7 +148,7 @@ fn set_file_mode_0600(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_dir_mode_0700(path: &Path) -> Result<()> {
+pub(super) fn set_dir_mode_0700(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(0o700);
@@ -157,7 +157,7 @@ fn set_dir_mode_0700(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_dir_mode_0700(_path: &Path) -> Result<()> {
+pub(super) fn set_dir_mode_0700(_path: &Path) -> Result<()> {
     Ok(())
 }
 

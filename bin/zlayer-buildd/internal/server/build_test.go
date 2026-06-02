@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -366,6 +367,40 @@ func TestServerInflightRegistry(t *testing.T) {
 	srv.unregisterInflight("rid")
 	if srv.cancelInflight("rid") {
 		t.Fatal("expected cancelInflight to miss after unregister")
+	}
+}
+
+func TestParseIsolation(t *testing.T) {
+	tests := []struct {
+		in   string
+		want define.Isolation
+	}{
+		{"chroot", define.IsolationChroot},
+		{"oci", define.IsolationOCI},
+		{"rootless", define.IsolationOCIRootless},
+		{"default", define.IsolationDefault},
+	}
+	for _, tc := range tests {
+		got, err := parseIsolation(tc.in)
+		if err != nil {
+			t.Fatalf("parseIsolation(%q) returned error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseIsolation(%q): got %v, want %v", tc.in, got, tc.want)
+		}
+	}
+	// Empty string should pick rootless-safe default when euid != 0.
+	if os.Geteuid() != 0 {
+		got, err := parseIsolation("")
+		if err != nil {
+			t.Fatalf("parseIsolation(\"\") returned error: %v", err)
+		}
+		if got != define.IsolationChroot {
+			t.Fatalf("expected IsolationChroot for empty when rootless; got %v", got)
+		}
+	}
+	if _, err := parseIsolation("garbage"); err == nil {
+		t.Fatalf("expected error for unknown isolation")
 	}
 }
 

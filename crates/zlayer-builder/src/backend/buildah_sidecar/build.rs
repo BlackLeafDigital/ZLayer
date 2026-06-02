@@ -115,6 +115,7 @@ fn build_request_from(
         volumes: Vec::new(),
         source_date_epoch: 0,
         rewrite_timestamp: false,
+        isolation: String::new(), // sidecar picks rootless-safe default
     }
 }
 

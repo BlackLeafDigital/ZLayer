@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -193,6 +194,13 @@ func buildOptionsFromRequest(
 		return define.BuildOptions{}, nil, err
 	}
 
+	// Isolation backend. Empty string ⇒ sidecar picks the safe default
+	// (chroot when running rootless, buildah default when uid 0).
+	isolation, err := parseIsolation(req.GetIsolation())
+	if err != nil {
+		return define.BuildOptions{}, nil, err
+	}
+
 	// Cache references.
 	cacheFrom, err := parseCacheRefs("cache_from", req.GetCacheFrom())
 	if err != nil {
@@ -281,6 +289,7 @@ func buildOptionsFromRequest(
 		CacheTo:          cacheTo,
 		ConfigureNetwork: configureNetwork,
 		NamespaceOptions: namespaceOptions,
+		Isolation:        isolation,
 	}
 
 	// Surface fields that have no buildah analog. Today every schema
@@ -322,6 +331,32 @@ func parsePullPolicy(s string) (define.PullPolicy, error) {
 		return define.PullIfNewer, nil
 	default:
 		return 0, fmt.Errorf("unsupported pull_policy %q (allowed: always, missing, never, ifnewer)", s)
+	}
+}
+
+// parseIsolation maps the proto "isolation" string to buildah's enum.
+// Empty string picks the rootless-safe default: when the sidecar runs
+// unprivileged (euid != 0), buildah's default "oci" backend tries to
+// chown the build-context overlay to root and fails with EPERM, so we
+// fall back to "chroot" which stays in the calling user's namespace. As
+// root we keep the buildah default (= oci on Linux).
+func parseIsolation(s string) (define.Isolation, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		if os.Geteuid() == 0 {
+			return define.IsolationDefault, nil
+		}
+		return define.IsolationChroot, nil
+	case "default":
+		return define.IsolationDefault, nil
+	case "oci":
+		return define.IsolationOCI, nil
+	case "rootless":
+		return define.IsolationOCIRootless, nil
+	case "chroot":
+		return define.IsolationChroot, nil
+	default:
+		return 0, fmt.Errorf("unknown isolation %q (allowed: default, oci, rootless, chroot)", s)
 	}
 }
 

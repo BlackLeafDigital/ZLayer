@@ -84,6 +84,20 @@ pub struct SidecarConfig {
     /// remote operator's responsibility).
     #[serde(default = "SidecarConfig::default_idle_secs")]
     pub idle_secs: u64,
+
+    /// Storage `GraphRoot` to pass to the sidecar. `None` → derive
+    /// `${ZLAYER_DATA_DIR}/buildd/storage/graph`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_graph_root: Option<std::path::PathBuf>,
+
+    /// Storage `RunRoot`. `None` → `${ZLAYER_DATA_DIR}/buildd/storage/run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_run_root: Option<std::path::PathBuf>,
+
+    /// Storage driver name. `None` → `vfs` for rootless safety. Operators
+    /// running as root may switch to `overlay` for performance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_driver: Option<String>,
 }
 
 impl SidecarConfig {
@@ -101,6 +115,9 @@ impl Default for SidecarConfig {
             addr: None,
             tls_dir: None,
             idle_secs: Self::DEFAULT_IDLE_SECS,
+            storage_graph_root: None,
+            storage_run_root: None,
+            storage_driver: None,
         }
     }
 }
@@ -210,5 +227,8 @@ mod tests {
         assert_eq!(cfg.idle_secs, 30);
         assert!(cfg.addr.is_none());
         assert!(cfg.tls_dir.is_none());
+        assert!(cfg.storage_graph_root.is_none());
+        assert!(cfg.storage_run_root.is_none());
+        assert!(cfg.storage_driver.is_none());
     }
 }

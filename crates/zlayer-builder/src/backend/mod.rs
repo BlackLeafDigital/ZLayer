@@ -127,50 +127,80 @@ pub trait BuildBackend: Send + Sync {
 
 /// Auto-detect the best available build backend for the given target OS.
 ///
-/// Selection matrix (host × target):
+/// Thin wrapper around [`detect_backend_with_options`] that passes
+/// `options = None`. Use this from call sites that have no access to a
+/// [`BuildOptions`] (early-construction probes, pipeline scaffolding) and
+/// therefore can only consult `ZLAYER_BACKEND` + the auto-detect matrix.
 ///
-/// | Host / Target | Linux image                               | Windows image                             |
-/// |---------------|-------------------------------------------|-------------------------------------------|
-/// | Linux         | buildah                                   | Err — requires Windows host               |
-/// | macOS         | buildah (if available) else macos-sandbox | Err — requires Windows host               |
-/// | Windows       | Err — Linux peer required (WSL2 follow-up)| HCS-backed native Windows builder (L-4)   |
+/// Selection matrix (host × target), when no override is set:
 ///
-/// If the `ZLAYER_BACKEND` env var is set to `"buildah"` or (on macOS)
-/// `"sandbox"`, that backend is forced regardless of target OS.
+/// | Host / Target | Linux image                                            | Windows image                             |
+/// |---------------|--------------------------------------------------------|-------------------------------------------|
+/// | Linux         | buildah-sidecar if available, else buildah-cli         | Err — requires Windows host               |
+/// | macOS         | buildah-cli (if available) else macos-sandbox          | Err — requires Windows host               |
+/// | Windows       | Err — Linux peer required (WSL2 follow-up)             | HCS-backed native Windows builder (L-4)   |
 ///
 /// # Errors
 ///
 /// Returns an error if the host cannot build images for the requested
 /// `target_os`, or if the selected backend's tooling is missing.
 pub async fn detect_backend(target_os: ImageOs) -> Result<Arc<dyn BuildBackend>> {
-    // Check for explicit override first — respected regardless of target_os so
-    // devs can force a backend during debugging.
-    if let Ok(forced) = std::env::var("ZLAYER_BACKEND") {
-        match forced.to_lowercase().as_str() {
-            "buildah" => {
-                let backend = BuildahBackend::new().await?;
-                return Ok(Arc::new(backend));
-            }
-            #[cfg(target_os = "macos")]
-            "sandbox" => {
-                let backend = SandboxBackend::default();
-                return Ok(Arc::new(backend));
-            }
-            other => {
-                return Err(BuildError::BuildahNotFound {
-                    message: format!("Unknown ZLAYER_BACKEND value: {other}"),
-                });
-            }
+    detect_backend_with_options(target_os, None).await
+}
+
+/// Auto-detect the best available build backend, honoring an optional
+/// per-build override on [`BuildOptions::backend_override`].
+///
+/// Selection precedence:
+///
+/// 1. `BuildOptions::backend_override` (when `options` is `Some`).
+/// 2. `ZLAYER_BACKEND` environment variable.
+/// 3. The host × target auto-detect matrix documented on [`detect_backend`].
+///
+/// When the precedence falls on step 1 or 2 (an explicit operator choice),
+/// the requested backend is **constructed unconditionally** — we do not
+/// silently fall back to a different kind. If the requested backend is
+/// later found to be unavailable, the actual build call will surface the
+/// failure rather than letting auto-fallback mask the operator's intent.
+///
+/// # Errors
+///
+/// Returns [`BuildError::NotSupported`] when the requested (or auto-selected)
+/// backend kind cannot be paired with `target_os` on this host, and bubbles
+/// any constructor error from the chosen backend.
+pub async fn detect_backend_with_options(
+    target_os: ImageOs,
+    options: Option<&BuildOptions>,
+) -> Result<Arc<dyn BuildBackend>> {
+    use zlayer_types::builder::BuilderBackendKind;
+
+    // 1) Explicit override on BuildOptions.
+    if let Some(opts) = options {
+        if let Some(kind) = opts.backend_override {
+            return construct_backend(kind, target_os).await;
         }
     }
 
-    // Host × target routing.
+    // 2) ZLAYER_BACKEND env var. Accepted values match
+    //    `BuilderBackendKind::from_str` (buildah / buildah-cli /
+    //    buildah-sidecar / sidecar / sandbox / hcs / etc.).
+    if let Ok(env_val) = std::env::var("ZLAYER_BACKEND") {
+        let parsed: BuilderBackendKind =
+            env_val
+                .parse()
+                .map_err(|e: String| BuildError::NotSupported {
+                    operation: format!("ZLAYER_BACKEND={env_val}: {e}"),
+                })?;
+        return construct_backend(parsed, target_os).await;
+    }
+
+    // 3) Auto-detect per host × target.
     #[cfg(target_os = "windows")]
     {
         match target_os {
-            ImageOs::Linux => Err(BuildError::BuildahNotFound {
-                message: "Linux image building on Windows hosts requires a Linux peer \
-                          (Phase L follow-up will add WSL2-buildah routing)"
+            ImageOs::Linux => Err(BuildError::NotSupported {
+                operation: "Linux image building on Windows hosts requires a Linux peer \
+                            (Phase L follow-up will add WSL2-buildah routing)"
                     .to_string(),
             }),
             ImageOs::Windows => {
@@ -193,9 +223,9 @@ pub async fn detect_backend(target_os: ImageOs) -> Result<Arc<dyn BuildBackend>>
                     Ok(Arc::new(SandboxBackend::default()))
                 }
             }
-            ImageOs::Windows => Err(BuildError::BuildahNotFound {
-                message: "building Windows images requires a Windows host — run this build \
-                          on a Windows node of the ZLayer cluster"
+            ImageOs::Windows => Err(BuildError::NotSupported {
+                operation: "building Windows images requires a Windows host — run this build \
+                            on a Windows node of the ZLayer cluster"
                     .to_string(),
             }),
         }
@@ -205,14 +235,134 @@ pub async fn detect_backend(target_os: ImageOs) -> Result<Arc<dyn BuildBackend>>
     {
         match target_os {
             ImageOs::Linux => {
+                // Prefer the sidecar backend (Stage 3 default) when it can
+                // actually spawn / dial `zlayer-buildd` and complete a TLS
+                // handshake; otherwise fall back to the CLI shellout. The
+                // sidecar probe is cheap when the binary is missing
+                // (filesystem misses + ZLAYER_BUILDD_BIN check), so this
+                // is fine to run on the hot path.
+                let sidecar = BuildahSidecarBackend::default();
+                if sidecar.is_available().await {
+                    Ok(Arc::new(sidecar))
+                } else {
+                    tracing::debug!(
+                        "buildah-sidecar unavailable on Linux host, falling back to buildah-cli"
+                    );
+                    let cli = BuildahBackend::new().await?;
+                    Ok(Arc::new(cli))
+                }
+            }
+            ImageOs::Windows => Err(BuildError::NotSupported {
+                operation: "building Windows images requires a Windows host — run this build \
+                            on a Windows node of the ZLayer cluster"
+                    .to_string(),
+            }),
+        }
+    }
+}
+
+/// Construct the backend implementation for the requested
+/// [`BuilderBackendKind`], validating that the kind is meaningful for the
+/// requested image OS.
+///
+/// Compatibility matrix:
+///
+/// - `BuildahCli`     ↔ Linux target (Linux/macOS host only)
+/// - `BuildahSidecar` ↔ Linux target (Linux host only)
+/// - `Sandbox`        ↔ Linux target (macOS host only — Seatbelt builder)
+/// - `Hcs`            ↔ Windows target (Windows host only)
+///
+/// Anything outside that matrix is rejected with
+/// [`BuildError::NotSupported`] so the operator gets a clear error instead
+/// of a silent fallback.
+async fn construct_backend(
+    kind: zlayer_types::builder::BuilderBackendKind,
+    target_os: ImageOs,
+) -> Result<Arc<dyn BuildBackend>> {
+    use zlayer_types::builder::BuilderBackendKind;
+
+    match kind {
+        BuilderBackendKind::BuildahCli => {
+            if target_os != ImageOs::Linux {
+                return Err(BuildError::NotSupported {
+                    operation: format!(
+                        "buildah-cli backend can only build Linux images, requested target_os={target_os:?}"
+                    ),
+                });
+            }
+            #[cfg(target_os = "windows")]
+            {
+                return Err(BuildError::NotSupported {
+                    operation: "buildah-cli backend is not available on Windows hosts \
+                                (requires a Linux peer)"
+                        .to_string(),
+                });
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
                 let backend = BuildahBackend::new().await?;
                 Ok(Arc::new(backend))
             }
-            ImageOs::Windows => Err(BuildError::BuildahNotFound {
-                message: "building Windows images requires a Windows host — run this build \
-                          on a Windows node of the ZLayer cluster"
-                    .to_string(),
-            }),
+        }
+        BuilderBackendKind::BuildahSidecar => {
+            if target_os != ImageOs::Linux {
+                return Err(BuildError::NotSupported {
+                    operation: format!(
+                        "buildah-sidecar backend can only build Linux images, requested target_os={target_os:?}"
+                    ),
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(BuildError::NotSupported {
+                    operation: "buildah-sidecar backend currently only runs on Linux hosts \
+                                (zlayer-buildd is Linux-only)"
+                        .to_string(),
+                });
+            }
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Arc::new(BuildahSidecarBackend::default()))
+            }
+        }
+        BuilderBackendKind::Sandbox => {
+            if target_os != ImageOs::Linux {
+                return Err(BuildError::NotSupported {
+                    operation: format!(
+                        "macOS sandbox backend can only build Linux images, requested target_os={target_os:?}"
+                    ),
+                });
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Arc::new(SandboxBackend::default()))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(BuildError::NotSupported {
+                    operation: "sandbox backend is only available on macOS hosts".to_string(),
+                })
+            }
+        }
+        BuilderBackendKind::Hcs => {
+            if target_os != ImageOs::Windows {
+                return Err(BuildError::NotSupported {
+                    operation: format!(
+                        "HCS backend can only build Windows images, requested target_os={target_os:?}"
+                    ),
+                });
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let backend = HcsBackend::new().await?;
+                Ok(Arc::new(backend))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(BuildError::NotSupported {
+                    operation: "HCS backend is only available on Windows hosts".to_string(),
+                })
+            }
         }
     }
 }
@@ -220,6 +370,7 @@ pub async fn detect_backend(target_os: ImageOs) -> Result<Arc<dyn BuildBackend>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_types::builder::BuilderBackendKind;
 
     #[test]
     fn image_os_parses_simple_and_slash_form() {
@@ -232,5 +383,116 @@ mod tests {
             ImageOs::Windows
         );
         assert!("darwin".parse::<ImageOs>().is_err());
+    }
+
+    /// `construct_backend` must reject (kind × `target_os`) pairs that cannot
+    /// possibly succeed regardless of host. The full host-platform matrix is
+    /// covered in the cfg-gated branches inside `construct_backend`; this
+    /// test pins the cross-target rejections so a future refactor cannot
+    /// silently let `Hcs` accept a Linux target (or vice versa).
+    #[tokio::test]
+    async fn construct_backend_rejects_mismatched_target_os() {
+        // HCS is Windows-only.
+        fn assert_not_supported(result: Result<Arc<dyn BuildBackend>>, label: &str) {
+            match result {
+                Ok(_) => panic!("{label}: expected NotSupported, got Ok"),
+                Err(BuildError::NotSupported { .. }) => {}
+                Err(other) => panic!("{label}: expected NotSupported, got: {other:?}"),
+            }
+        }
+
+        // HCS is Windows-only.
+        assert_not_supported(
+            construct_backend(BuilderBackendKind::Hcs, ImageOs::Linux).await,
+            "HCS + Linux target",
+        );
+
+        // Buildah CLI is Linux-image only.
+        assert_not_supported(
+            construct_backend(BuilderBackendKind::BuildahCli, ImageOs::Windows).await,
+            "BuildahCli + Windows target",
+        );
+
+        // Buildah sidecar is Linux-image only.
+        assert_not_supported(
+            construct_backend(BuilderBackendKind::BuildahSidecar, ImageOs::Windows).await,
+            "BuildahSidecar + Windows target",
+        );
+
+        // Sandbox is Linux-image only (and macOS-host only).
+        assert_not_supported(
+            construct_backend(BuilderBackendKind::Sandbox, ImageOs::Windows).await,
+            "Sandbox + Windows target",
+        );
+    }
+
+    /// Smoke test for the Linux × Linux precedence: with `zlayer-buildd`
+    /// missing from PATH, `detect_backend(ImageOs::Linux)` must fall back to
+    /// the CLI backend (`BuildahBackend`). Gated behind `#[ignore]` because
+    /// it mutates process-wide environment variables.
+    ///
+    /// Run manually with:
+    ///   `cargo test -p zlayer-builder --lib backend::tests::detect_backend_falls_back_to_cli_when_sidecar_missing -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "mutates PATH / ZLAYER_BUILDD_BIN / ZLAYER_DATA_DIR; serialize manually"]
+    #[allow(unsafe_code, clippy::await_holding_lock)]
+    async fn detect_backend_falls_back_to_cli_when_sidecar_missing() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prev_path = std::env::var_os("PATH");
+        let prev_buildd = std::env::var_os("ZLAYER_BUILDD_BIN");
+        let prev_data = std::env::var_os("ZLAYER_DATA_DIR");
+        let prev_backend = std::env::var_os("ZLAYER_BACKEND");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // SAFETY: env mutation is serialized by `TEST_ENV_LOCK`.
+        unsafe {
+            std::env::remove_var("ZLAYER_BUILDD_BIN");
+            std::env::remove_var("ZLAYER_BACKEND");
+            std::env::set_var("PATH", tmp.path());
+            std::env::set_var("ZLAYER_DATA_DIR", tmp.path());
+        }
+
+        let result = detect_backend(ImageOs::Linux).await;
+
+        // SAFETY: env mutation is serialized by `TEST_ENV_LOCK`.
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_buildd {
+                Some(v) => std::env::set_var("ZLAYER_BUILDD_BIN", v),
+                None => std::env::remove_var("ZLAYER_BUILDD_BIN"),
+            }
+            match prev_data {
+                Some(v) => std::env::set_var("ZLAYER_DATA_DIR", v),
+                None => std::env::remove_var("ZLAYER_DATA_DIR"),
+            }
+            match prev_backend {
+                Some(v) => std::env::set_var("ZLAYER_BACKEND", v),
+                None => std::env::remove_var("ZLAYER_BACKEND"),
+            }
+        }
+
+        // The CLI fallback requires `buildah` on PATH to construct; if the
+        // test box has no buildah at all, both backends are unavailable and
+        // we can only assert the type didn't pick the sidecar.
+        match result {
+            Ok(backend) => assert_eq!(
+                backend.name(),
+                "buildah",
+                "expected CLI fallback ('buildah'), got: {}",
+                backend.name(),
+            ),
+            Err(e) => {
+                // Acceptable: no buildah binary on this box either.
+                eprintln!("detect_backend returned err (no buildah on PATH?): {e}");
+            }
+        }
     }
 }

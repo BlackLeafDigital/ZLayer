@@ -107,6 +107,16 @@ func (s *Server) unregisterInflight(reqID string) {
 	delete(s.inflight, reqID)
 }
 
+// InflightCount returns the number of builds currently executing. main()'s
+// idle-shutdown loop uses this to avoid killing the process during a
+// long-running build that hasn't emitted activity in a while (e.g. waiting
+// on a slow registry pull).
+func (s *Server) InflightCount() int {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	return len(s.inflight)
+}
+
 // cancelInflight signals the registered context-cancel for reqID, if any.
 // Returns whether a build was found.
 func (s *Server) cancelInflight(reqID string) bool {

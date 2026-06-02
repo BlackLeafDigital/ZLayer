@@ -107,6 +107,15 @@ message BuildRequest {
     // Reproducibility knobs.
     int64 source_date_epoch = 25; // seconds; 0 means unset
     bool rewrite_timestamp = 26;
+
+    // Buildah isolation backend. One of:
+    //   ""        — sidecar picks the safe default (chroot when rootless,
+    //                oci when uid 0).
+    //   "default" — buildah's default for the host (= oci on Linux).
+    //   "oci"     — runc/crun.
+    //   "rootless" — runc-rootless.
+    //   "chroot"  — simple chroot, no container runtime needed.
+    string isolation = 27;
 }
 
 // Server-streamed event during a build.

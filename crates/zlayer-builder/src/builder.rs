@@ -673,7 +673,9 @@ impl ImageBuilder {
     /// host/target combination (e.g. Windows image requested on a Linux host).
     pub async fn with_target_os(mut self, target_os: crate::backend::ImageOs) -> Result<Self> {
         self.target_os = Some(target_os);
-        self.backend = Some(crate::backend::detect_backend(target_os).await?);
+        self.backend = Some(
+            crate::backend::detect_backend_with_options(target_os, Some(&self.options)).await?,
+        );
         Ok(self)
     }
 
@@ -1717,8 +1719,17 @@ impl ImageBuilder {
     /// hint, so they fall through to the caller's pin or the default.
     async fn resolve_target_os_and_backend(&mut self) -> Result<()> {
         // Explicit pin always wins: the backend was already detected for
-        // this OS by `new_with_os`/`with_target_os`. Nothing to do.
-        if self.target_os.is_some() {
+        // this OS by `new_with_os`/`with_target_os`. But the caller may
+        // have set `backend_override` AFTER construction (via
+        // `with_backend_override`), in which case the cached backend was
+        // selected without that hint — re-detect so the override is honored.
+        if let Some(target_os) = self.target_os {
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(target_os, Some(&self.options))
+                        .await?,
+                );
+            }
             return Ok(());
         }
 
@@ -1732,7 +1743,18 @@ impl ImageBuilder {
 
         let Some(path) = zimage_path else {
             // No ZImagefile — Dockerfile / runtime template paths have no OS
-            // metadata, so the initial Linux detection stands.
+            // metadata, so the initial Linux detection stands. If the caller
+            // set a backend_override after construction, re-resolve so the
+            // cached default backend is replaced.
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(
+                        crate::backend::ImageOs::Linux,
+                        Some(&self.options),
+                    )
+                    .await?,
+                );
+            }
             return Ok(());
         };
 
@@ -1748,16 +1770,31 @@ impl ImageBuilder {
         if let Some(resolved) = zimage.resolve_target_os() {
             // Re-detect only if the resolved OS differs from the one we
             // probed at construction. `new_with_os(None)` probes Linux, so
-            // the common Linux case short-circuits.
+            // the common Linux case short-circuits — unless the caller
+            // set a backend_override after construction, in which case we
+            // must re-detect even for the initial OS to apply the override.
             let initial = crate::backend::ImageOs::Linux;
-            if resolved != initial {
+            if resolved != initial || self.options.backend_override.is_some() {
                 info!(
                     "Re-detecting build backend for target OS {:?} (inferred from ZImagefile)",
                     resolved
                 );
-                self.backend = Some(crate::backend::detect_backend(resolved).await?);
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(resolved, Some(&self.options))
+                        .await?,
+                );
             }
             self.target_os = Some(resolved);
+        } else if self.options.backend_override.is_some() {
+            // ZImagefile present but resolves to no explicit OS — apply the
+            // override against the Linux default that was cached.
+            self.backend = Some(
+                crate::backend::detect_backend_with_options(
+                    crate::backend::ImageOs::Linux,
+                    Some(&self.options),
+                )
+                .await?,
+            );
         }
 
         Ok(())
