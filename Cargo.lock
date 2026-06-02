@@ -12967,6 +12967,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer-overlayd"
+version = "0.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zlayer-types",
+]
+
+[[package]]
 name = "zlayer-paths"
 version = "0.0.0-dev"
 dependencies = [

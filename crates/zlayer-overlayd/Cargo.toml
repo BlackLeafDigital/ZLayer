@@ -1,0 +1,26 @@
+[package]
+name = "zlayer-overlayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone ZLayer overlay daemon: owns the WireGuard/Wintun adapter, HCN/bridge mechanics, IP allocation, DNS and NAT; driven by the main daemon over IPC"
+
+[lib]
+name = "zlayer_overlayd"
+path = "src/lib.rs"
+
+# NOTE: the `[[bin]]` target + bin-only deps (clap, tracing-subscriber,
+# tracing-appender), the overlay engine deps (zlayer-overlay, zlayer-paths,
+# zlayer-core), and the server-side platform deps (zlayer-hns, windows) are
+# added together with the server engine + `src/main.rs` in the migration wave.
+# Until then this is a lib-only crate: the IPC contract + transport + client.
+
+[dependencies]
+zlayer-types.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

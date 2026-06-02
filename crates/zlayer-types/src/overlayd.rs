@@ -1,0 +1,335 @@
+//! IPC wire protocol between the main `zlayer` daemon and `zlayer-overlayd`.
+//!
+//! `zlayer-overlayd` is a standalone, long-lived daemon that owns every
+//! mechanism touching the overlay/network plane (the `WireGuard` device +
+//! adapter, peers, `AllowedIPs`/service subnets, IP allocation, DNS, NAT,
+//! Linux bridges + veth/netns attach, and the Windows HCN Internal network +
+//! endpoints). The main `zlayer` daemon keeps the cluster brain (Raft, the
+//! scheduler, the service registry, container/HCS process lifecycle) and
+//! drives overlayd over a length-prefixed-JSON IPC channel (a Unix domain
+//! socket on Unix, a named pipe on Windows).
+//!
+//! This module is that channel's **wire contract** — the only thing both
+//! sides must agree on. It lives in `zlayer-types` (a leaf crate) so the
+//! daemon, the overlayd server, and the overlayd client can all depend on it
+//! without a dependency cycle.
+//!
+//! ## Framing
+//!
+//! One connection multiplexes request/response and server→client event push.
+//! Each frame is a [`OverlaydFrame`] serialized as JSON and written with a
+//! `u32` little-endian length prefix (the framing itself lives in
+//! `zlayer-overlayd`'s transport module, not here). The main daemon sends
+//! [`OverlaydFrame::Request`]s each carrying a client-chosen `id`; overlayd
+//! replies with a [`OverlaydFrame::Response`] echoing that `id`, and may at
+//! any time push an unsolicited [`OverlaydFrame::Event`].
+//!
+//! ## Wire-type conventions
+//!
+//! - Windows HCN GUIDs cross the wire as **bare lowercase strings**
+//!   (`aabbccdd-eeff-...`, no braces) — `windows::core::GUID` is not
+//!   `serde`-serializable and `zlayer-types` must not depend on `windows`.
+//! - CIDRs cross as `String` (e.g. `"10.200.0.0/28"`); endpoints as `String`
+//!   (`"host:port"`, kept textual so an unresolved/hostname endpoint survives).
+//! - Addresses use [`std::net::IpAddr`] (serde-serializable via `std`).
+
+use std::net::IpAddr;
+
+use serde::{Deserialize, Serialize};
+
+pub use crate::overlay::{OverlayConfig, OverlayMode};
+
+/// Wire-protocol version. Bump on any breaking change to the frame/request/
+/// response/event shapes so a version-skewed daemon/overlayd pair can detect
+/// the mismatch instead of silently misparsing.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// A multiplexed frame on the overlayd IPC connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum OverlaydFrame {
+    /// Main daemon → overlayd. `id` is echoed back on the matching response.
+    Request { id: u64, request: OverlaydRequest },
+    /// overlayd → main daemon, answering the request with the same `id`.
+    Response { id: u64, response: OverlaydResponse },
+    /// overlayd → main daemon, unsolicited (no `id`).
+    Event(OverlaydEvent),
+}
+
+/// Identifies the container overlayd must wire into the overlay. The agent
+/// owns the container's process/compute-system lifecycle and hands overlayd
+/// just enough to attach it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum AttachHandle {
+    /// Linux: the container's PID. overlayd opens `/proc/<pid>/ns/net` and
+    /// creates the veth pair into that network namespace.
+    LinuxPid { pid: u32 },
+    /// Windows: the HCS container id (+ the IP the agent reserved, if any).
+    /// overlayd creates the HCN endpoint + per-container namespace on its HCN
+    /// Internal network and returns the bare-lowercase namespace GUID
+    /// ([`AttachResult::namespace_guid`]) for the agent to embed in the
+    /// compute-system document's `Container.Networking.Namespace`.
+    WindowsContainer {
+        container_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ip: Option<IpAddr>,
+    },
+}
+
+/// A request from the main daemon to overlayd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OverlaydRequest {
+    /// Push this node's Raft id (cluster-brain context overlayd scopes by).
+    SetLocalNodeId { node_id: u64 },
+    /// Push this node's `WireGuard` public key (base64).
+    SetLocalWgPubkey { pubkey: String },
+
+    /// Bring up (or reuse) this node's base/global overlay. Idempotent: if the
+    /// overlay network already exists (recorded in overlayd's marker), it is
+    /// reused rather than recreated. This is the only place the base overlay
+    /// is created; it is torn down only on a full uninstall.
+    SetupGlobalOverlay {
+        deployment: String,
+        instance_id: String,
+        /// Full cluster CIDR, e.g. `"10.200.0.0/16"`.
+        cluster_cidr: String,
+        /// This node's per-node slice, e.g. `"10.200.0.0/28"`. `None` until the
+        /// leader assigns one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slice_cidr: Option<String>,
+        wg_port: u16,
+        nat_enabled: bool,
+    },
+    /// Tear down the node's base overlay (e.g. on full uninstall).
+    TeardownGlobalOverlay,
+
+    /// Create the per-service overlay segment (Linux bridge / Windows HCN
+    /// Internal network) for `service`. Returns [`OverlaydResponse::BridgeName`].
+    SetupServiceOverlay { service: String, mode: OverlayMode },
+    /// Remove the per-service overlay segment.
+    TeardownServiceOverlay { service: String },
+
+    /// Allocate (or, with `ip` set on a later attach, validate) an overlay IP
+    /// from the node slice for a container on `service`.
+    AllocateIp { service: String, join_global: bool },
+    /// Return an overlay IP to the allocator.
+    ReleaseIp { ip: IpAddr },
+
+    /// Wire a container into the overlay. Returns [`OverlaydResponse::Attached`].
+    AttachContainer {
+        handle: AttachHandle,
+        service: String,
+        join_global: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns_server: Option<IpAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns_domain: Option<String>,
+    },
+    /// Tear down a container's overlay attachment and release its IP.
+    DetachContainer { handle: AttachHandle },
+
+    /// Add a `WireGuard` peer to the base overlay.
+    AddPeer(PeerSpec),
+    /// Remove a peer by its base64 public key.
+    RemovePeer { pubkey: String },
+    /// Plumb a service subnet into a peer's `AllowedIPs`.
+    AddAllowedIp { pubkey: String, cidr: String },
+    /// Remove a service subnet from a peer's `AllowedIPs`.
+    RemoveAllowedIp { pubkey: String, cidr: String },
+
+    /// Register an overlay DNS A/AAAA record.
+    RegisterDns { name: String, ip: IpAddr },
+    /// Remove an overlay DNS record.
+    UnregisterDns { name: String },
+
+    /// Snapshot overlay state for diagnostics. Returns [`OverlaydResponse::Status`].
+    Status,
+    /// Run one NAT-traversal maintenance tick (probe/refresh endpoints).
+    NatTick,
+    /// Ask overlayd to shut down gracefully (drops the adapter).
+    Shutdown,
+}
+
+/// overlayd's answer to an [`OverlaydRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum OverlaydResponse {
+    /// Generic success with no payload.
+    Ok,
+    /// An allocated/validated overlay IP (`AllocateIp`).
+    Ip { ip: IpAddr },
+    /// A completed container attach.
+    Attached(AttachResult),
+    /// The interface/bridge/network name created (`SetupServiceOverlay`,
+    /// `SetupGlobalOverlay`).
+    BridgeName { name: String },
+    /// A diagnostics snapshot (`Status`).
+    Status(StatusSnapshot),
+    /// The request failed; `message` is a human-readable reason.
+    Err { message: String },
+}
+
+/// Result of [`OverlaydRequest::AttachContainer`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachResult {
+    /// The container's overlay IP.
+    pub ip: IpAddr,
+    /// Windows only: the bare-lowercase HCN namespace GUID the agent embeds in
+    /// the compute-system document. `None` on Linux (no HCN namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_guid: Option<String>,
+}
+
+/// A `WireGuard` peer to add to the base overlay. Mirrors
+/// `zlayer_overlay::PeerInfo` but with wire-safe field types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSpec {
+    /// base64 `WireGuard` public key.
+    pub public_key: String,
+    /// `host:port` (textual so an unresolved/hostname endpoint survives).
+    pub endpoint: String,
+    /// Comma-separated CIDR list (e.g. `"10.200.0.5/32,10.200.1.0/24"`).
+    pub allowed_ips: String,
+    /// Persistent-keepalive interval, in seconds (0 = disabled).
+    pub persistent_keepalive_secs: u64,
+}
+
+/// An unsolicited notification pushed from overlayd to the main daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum OverlaydEvent {
+    /// A peer's liveness changed (handshake seen / lost).
+    PeerHealthChanged { pubkey: String, healthy: bool },
+    /// NAT traversal moved a peer to a new endpoint.
+    NatEndpointChanged { pubkey: String, endpoint: String },
+}
+
+/// Diagnostics snapshot returned by [`OverlaydRequest::Status`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    /// Base overlay interface name (e.g. `"zl-overlay0"`), if up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// This node's overlay IP, if assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ip: Option<IpAddr>,
+    /// This node's `WireGuard` public key (base64), if up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Full cluster CIDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_cidr: Option<String>,
+    /// This node's per-node slice CIDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_cidr: Option<String>,
+    /// Number of base-overlay peers.
+    pub peer_count: u32,
+    /// Number of per-service overlays set up on this node.
+    pub service_count: u32,
+    /// Per-peer status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerStatus>,
+}
+
+/// Per-peer status within a [`StatusSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub public_key: String,
+    pub endpoint: String,
+    pub allowed_ips: String,
+    /// Last successful handshake, Unix seconds; `0` if never.
+    pub last_handshake_unix_secs: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame round-trips through JSON unchanged (the core wire guarantee).
+    fn roundtrip(frame: &OverlaydFrame) {
+        let json = serde_json::to_string(frame).expect("serialize");
+        let back: OverlaydFrame = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(frame, &back, "frame must round-trip; json was {json}");
+    }
+
+    #[test]
+    fn request_frames_round_trip() {
+        roundtrip(&OverlaydFrame::Request {
+            id: 1,
+            request: OverlaydRequest::SetupGlobalOverlay {
+                deployment: "prod".into(),
+                instance_id: "42".into(),
+                cluster_cidr: "10.200.0.0/16".into(),
+                slice_cidr: Some("10.200.0.0/28".into()),
+                wg_port: 51820,
+                nat_enabled: true,
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 2,
+            request: OverlaydRequest::AttachContainer {
+                handle: AttachHandle::WindowsContainer {
+                    container_id: "ctr-abc".into(),
+                    ip: Some("10.200.0.5".parse().unwrap()),
+                },
+                service: "web".into(),
+                join_global: false,
+                dns_server: Some("10.200.0.1".parse().unwrap()),
+                dns_domain: Some("overlay".into()),
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 3,
+            request: OverlaydRequest::AttachContainer {
+                handle: AttachHandle::LinuxPid { pid: 4242 },
+                service: "web".into(),
+                join_global: true,
+                dns_server: None,
+                dns_domain: None,
+            },
+        });
+    }
+
+    #[test]
+    fn response_and_event_frames_round_trip() {
+        roundtrip(&OverlaydFrame::Response {
+            id: 2,
+            response: OverlaydResponse::Attached(AttachResult {
+                ip: "10.200.0.5".parse().unwrap(),
+                namespace_guid: Some("aabbccdd-eeff-0011-2233-445566778899".into()),
+            }),
+        });
+        roundtrip(&OverlaydFrame::Response {
+            id: 9,
+            response: OverlaydResponse::Err {
+                message: "no slice assigned".into(),
+            },
+        });
+        roundtrip(&OverlaydFrame::Event(OverlaydEvent::PeerHealthChanged {
+            pubkey: "base64key".into(),
+            healthy: false,
+        }));
+    }
+
+    #[test]
+    fn status_snapshot_round_trips_and_defaults() {
+        roundtrip(&OverlaydFrame::Response {
+            id: 7,
+            response: OverlaydResponse::Status(StatusSnapshot {
+                interface: Some("zl-overlay0".into()),
+                node_ip: Some("10.200.0.1".parse().unwrap()),
+                peer_count: 2,
+                service_count: 1,
+                peers: vec![PeerStatus {
+                    public_key: "k".into(),
+                    endpoint: "1.2.3.4:51820".into(),
+                    allowed_ips: "10.200.0.2/32".into(),
+                    last_handshake_unix_secs: 0,
+                }],
+                ..StatusSnapshot::default()
+            }),
+        });
+    }
+}
