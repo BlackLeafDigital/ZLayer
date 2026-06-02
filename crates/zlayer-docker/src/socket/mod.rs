@@ -45,12 +45,28 @@ pub(crate) struct SocketState {
 /// Dispatches to the Unix-domain-socket transport on Linux/macOS or
 /// the named-pipe transport on Windows.
 ///
+/// `socket_path` is where the Docker shim listens. `daemon_socket` is
+/// the path to THIS process's own zlayer daemon UDS (Unix) — needed
+/// because the docker socket task runs INSIDE the daemon and must talk
+/// back to it without triggering a competing auto-spawn during startup.
+/// On Windows the daemon listens on TCP loopback, so `daemon_socket`
+/// is ignored.
+///
 /// # Errors
 ///
 /// Returns an error if the socket/pipe cannot be bound, the daemon
 /// cannot be contacted, or the server fails.
-pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
-    let client = DaemonClient::connect().await?;
+pub async fn serve(socket_path: &Path, daemon_socket: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let client =
+        DaemonClient::connect_to_no_autospawn(daemon_socket, std::time::Duration::from_secs(30))
+            .await?;
+    #[cfg(windows)]
+    let client = {
+        let _ = daemon_socket;
+        DaemonClient::connect().await?
+    };
+
     let state = SocketState {
         client: Arc::new(client),
     };

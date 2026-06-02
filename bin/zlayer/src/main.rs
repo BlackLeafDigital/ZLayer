@@ -746,22 +746,34 @@ async fn run(
             vacuum_secrets,
             ..
         } => {
+            let socket_path = cli.effective_socket_path();
+            let data_dir = cli.effective_data_dir();
+
             // Spawn Docker API socket server if enabled. On Unix this is a
             // Unix domain socket; on Windows it is a named pipe. The transport
             // is selected inside `zlayer_docker::socket::serve`.
+            //
+            // The task needs THIS daemon's own UDS (`socket_path`) so it can
+            // wait for the API listener to come up and talk to it directly —
+            // calling `DaemonClient::connect()` at task-spawn time loses a
+            // race with the listener bind and auto-spawns a competing daemon
+            // that fails the :3669 port-bind. See
+            // `DaemonClient::connect_to_no_autospawn` in zlayer-client.
             #[cfg(feature = "docker-compat")]
             if *docker_socket {
                 let path = docker_socket_path.clone();
+                let daemon_uds = socket_path.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = zlayer_docker::socket::serve(std::path::Path::new(&path)).await
+                    if let Err(e) = zlayer_docker::socket::serve(
+                        std::path::Path::new(&path),
+                        std::path::Path::new(&daemon_uds),
+                    )
+                    .await
                     {
                         tracing::error!("Docker API socket server failed: {e}");
                     }
                 });
             }
-
-            let socket_path = cli.effective_socket_path();
-            let data_dir = cli.effective_data_dir();
 
             // Stash CLI-level tunnel overrides so the daemon picks them up
             // alongside the `ZLAYER_TUNNEL_*` env vars when it builds its
