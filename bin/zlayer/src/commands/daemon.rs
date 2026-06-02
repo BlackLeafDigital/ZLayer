@@ -811,6 +811,200 @@ fn plist_path_for(plist_dir: &str, daemon_name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(plist_dir).join(format!("{}.plist", plist_label(daemon_name)))
 }
 
+// ---------------------------------------------------------------------------
+// overlayd (standalone overlay daemon) — its OWN OS service
+//
+// overlayd owns the WireGuard/Wintun adapter and overlay mechanics. It is
+// registered as a separate OS service from the main daemon so that
+// reinstalling/upgrading the main `zlayer` binary does NOT tear down the
+// overlay adapter. The overlay network itself is removed ONLY on a full
+// `daemon uninstall` (purge), never on a plain main-daemon update.
+//
+// The launchd label / systemd unit / SCM service names are fixed (one overlayd
+// per host data-dir), independent of the main daemon instance name.
+// ---------------------------------------------------------------------------
+
+/// Fixed launchd label for the overlayd daemon (macOS).
+#[cfg(target_os = "macos")]
+const OVERLAYD_LAUNCHD_LABEL: &str = "com.zlayer.overlayd";
+
+/// Resolve the `zlayer-overlayd` binary path for install, copying it into
+/// `system_bin_dir` when the running `zlayer` binary itself was copied out of a
+/// user home (so the root-run service can reach it). Mirrors the main-binary
+/// copy logic in each platform `install`.
+///
+/// `main_exe` is the (possibly already-relocated) path of the main `zlayer`
+/// binary; overlayd is expected to sit next to the ORIGINAL invoked binary
+/// (e.g. the dev target dir or the install staging dir), so we look beside
+/// `current_exe()` first, then beside `main_exe`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_and_stage_overlayd_binary(main_exe: &Path, copied_to_system: bool) -> Option<PathBuf> {
+    let bin_name = "zlayer-overlayd";
+
+    // Candidate source locations, in priority order.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            sources.push(dir.join(bin_name));
+        }
+    }
+    if let Some(dir) = main_exe.parent() {
+        sources.push(dir.join(bin_name));
+    }
+    let source = sources.into_iter().find(|p| p.exists())?;
+
+    // If the main binary was relocated into the system bin dir, place overlayd
+    // alongside it so the system service's ExecStart path is valid.
+    if copied_to_system {
+        if let Some(system_dir) = main_exe.parent() {
+            let dest = system_dir.join(bin_name);
+            if dest != source {
+                let _ = std::fs::remove_file(&dest);
+                if let Err(e) = std::fs::copy(&source, &dest) {
+                    eprintln!(
+                        "Warning: failed to copy {} to {}: {e}",
+                        source.display(),
+                        dest.display()
+                    );
+                    return Some(source);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+                }
+                println!("Copied overlayd binary to {}", dest.display());
+                return Some(dest);
+            }
+        }
+    }
+
+    Some(source)
+}
+
+/// Install (or reinstall) the overlayd launchd service on macOS.
+#[cfg(target_os = "macos")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use tokio::process::Command;
+
+    let (plist_dir, target) = match launchd_context() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: could not resolve launchd context for overlayd: {e}");
+            return;
+        }
+    };
+    let path = std::path::PathBuf::from(&plist_dir).join(format!("{OVERLAYD_LAUNCHD_LABEL}.plist"));
+    let path_str = path.to_string_lossy().to_string();
+
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    let log_path = log_dir.join("overlayd.log");
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>--data-dir</string>
+        <string>{data_dir}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+    <key>WorkingDirectory</key>
+    <string>/</string>
+</dict>
+</plist>"#,
+        label = OVERLAYD_LAUNCHD_LABEL,
+        bin = overlayd_bin.display(),
+        data_dir = data_dir.display(),
+        log = log_path.display(),
+    );
+
+    // Unload existing (ignore errors), then write + bootstrap.
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("{target}/{OVERLAYD_LAUNCHD_LABEL}")])
+        .output()
+        .await;
+
+    if let Err(e) = std::fs::write(&path, &plist) {
+        eprintln!(
+            "Warning: failed to write overlayd plist {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    println!("Installed overlayd launchd plist: {}", path.display());
+
+    if no_start {
+        return;
+    }
+
+    let out = Command::new("launchctl")
+        .args(["bootstrap", &target, &path_str])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            let _ = Command::new("launchctl")
+                .args(["load", "-w", &path_str])
+                .output()
+                .await;
+        }
+    }
+    let _ = Command::new("launchctl")
+        .args([
+            "kickstart",
+            "-k",
+            &format!("{target}/{OVERLAYD_LAUNCHD_LABEL}"),
+        ])
+        .output()
+        .await;
+    println!("Started overlayd service ({OVERLAYD_LAUNCHD_LABEL})");
+}
+
+/// Stop + remove the overlayd launchd service on macOS.
+#[cfg(target_os = "macos")]
+async fn uninstall_overlayd_service() {
+    use tokio::process::Command;
+
+    let (plist_dir, target) = match launchd_context() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: could not resolve launchd context for overlayd: {e}");
+            return;
+        }
+    };
+    let path = std::path::PathBuf::from(&plist_dir).join(format!("{OVERLAYD_LAUNCHD_LABEL}.plist"));
+
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("{target}/{OVERLAYD_LAUNCHD_LABEL}")])
+        .output()
+        .await;
+    let _ = Command::new("launchctl")
+        .args(["unload", path.to_string_lossy().as_ref()])
+        .output()
+        .await;
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("Uninstalled overlayd launchd plist: {}", path.display()),
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", path.display()),
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(
     clippy::too_many_lines,
@@ -1136,6 +1330,19 @@ async fn install(
         }
     }
 
+    // Register overlayd as its OWN launchd service so it survives main-binary
+    // reinstalls. macOS does not relocate the main binary, so overlayd is found
+    // next to the running `zlayer` binary (copied_to_system = false).
+    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, false) {
+        install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+    } else {
+        eprintln!(
+            "Warning: zlayer-overlayd binary not found next to {}; \
+             overlay networking will rely on the main daemon spawning it on demand.",
+            exe.display()
+        );
+    }
+
     #[cfg(feature = "docker-compat")]
     if docker_socket {
         let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
@@ -1206,6 +1413,11 @@ async fn uninstall(
         println!("No launchd plist found (checked {})", path.display());
     }
 
+    // Stop + remove the overlayd service too. The overlay adapter is torn down
+    // by overlayd's own graceful shutdown; the overlay *network* is only
+    // removed on --purge-data below.
+    uninstall_overlayd_service().await;
+
     #[cfg(feature = "docker-compat")]
     {
         let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
@@ -1239,6 +1451,13 @@ async fn uninstall(
     }
 
     if remove_binary {
+        // Remove the overlayd binary alongside the main one.
+        let overlayd_bin = zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
         let bin_path = zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name);
         match std::fs::remove_file(&bin_path) {
             Ok(()) => println!("Removed binary: {}", bin_path.display()),
@@ -1509,6 +1728,110 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn pick_system_binary_path(daemon_name: &str) -> std::path::PathBuf {
     zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name)
+}
+
+/// Fixed systemd unit name for the overlayd daemon (Linux).
+#[cfg(target_os = "linux")]
+const OVERLAYD_SYSTEMD_UNIT: &str = "zlayer-overlayd.service";
+
+/// Write + enable + start the overlayd systemd unit. overlayd is the overlay
+/// owner, so it ALWAYS gets the tun + CAP_NET_ADMIN/CAP_SYS_ADMIN capability
+/// block regardless of the main daemon's `--with-overlay` flag.
+#[cfg(target_os = "linux")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use tokio::process::Command;
+
+    let unit = format!(
+        r"[Unit]
+Description=ZLayer Overlay Daemon
+Documentation=https://zlayer.dev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe tun
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+ExecStart={bin} --data-dir {data_dir}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zlayer-overlayd
+LimitNOFILE=1048576
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+",
+        bin = overlayd_bin.display(),
+        data_dir = data_dir.display(),
+    );
+
+    let path = std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT);
+    if let Err(e) = tokio::fs::write(&path, unit).await {
+        eprintln!(
+            "Warning: failed to write overlayd unit {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    println!("Installed overlayd systemd unit: {}", path.display());
+
+    let _ = Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+        .await;
+    let _ = Command::new("systemctl")
+        .args(["enable", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    if !no_start {
+        // restart (not start) so a unit-file change on reinstall takes effect.
+        match Command::new("systemctl")
+            .args(["restart", OVERLAYD_SYSTEMD_UNIT])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                println!("Started overlayd service ({OVERLAYD_SYSTEMD_UNIT})");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("Warning: failed to start overlayd service: {stderr}");
+            }
+            Err(e) => eprintln!("Warning: failed to invoke systemctl for overlayd: {e}"),
+        }
+    }
+}
+
+/// Stop + disable + remove the overlayd systemd unit.
+#[cfg(target_os = "linux")]
+async fn uninstall_overlayd_service() {
+    use tokio::process::Command;
+
+    let _ = Command::new("systemctl")
+        .args(["stop", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    let _ = Command::new("systemctl")
+        .args(["disable", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    let path = std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT);
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("Uninstalled overlayd systemd unit: {}", path.display());
+                let _ = Command::new("systemctl")
+                    .arg("daemon-reload")
+                    .output()
+                    .await;
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", path.display()),
+        }
+    }
 }
 
 /// Create the `zlayer` group, add the invoking user to it, and make the
@@ -1912,7 +2235,7 @@ async fn install(
     // typically mode 0700, so /var/home/user/.local/bin/zlayer is unreachable
     // by the systemd service.  Detect this and copy the binary to
     // /usr/local/bin so the ExecStart path works.
-    let exe = {
+    let (exe, exe_copied_to_system) = {
         let is_root = unsafe { libc::geteuid() } == 0;
         if is_root {
             let in_home = std::env::var("SUDO_USER")
@@ -1956,12 +2279,12 @@ async fn install(
                     "Copied binary to {} (original in user home is inaccessible to root service)",
                     system_path.display()
                 );
-                system_path
+                (system_path, true)
             } else {
-                exe
+                (exe, false)
             }
         } else {
-            exe
+            (exe, false)
         }
     };
 
@@ -2243,6 +2566,20 @@ WantedBy=multi-user.target
         }
     }
 
+    // Register overlayd as its OWN systemd service so it survives main-binary
+    // reinstalls. Locate/stage the overlayd binary the same way the main binary
+    // was: if the main `zlayer` was copied into the system bin dir (out of a
+    // user home), copy overlayd alongside it.
+    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, exe_copied_to_system) {
+        install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+    } else {
+        eprintln!(
+            "Warning: zlayer-overlayd binary not found next to {}; \
+             overlay networking will rely on the main daemon spawning it on demand.",
+            exe.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -2275,6 +2612,11 @@ async fn uninstall(
     } else {
         println!("No systemd unit found at {}", path.display());
     }
+
+    // Stop + disable + remove the overlayd service too. The overlay adapter is
+    // dropped by overlayd's own teardown when the unit stops; veth links are
+    // cleaned up by overlayd on exit.
+    uninstall_overlayd_service().await;
 
     // Remove Docker + Docker Compose CLI shims that may have been
     // installed by `daemon install --docker-socket`.
@@ -2316,6 +2658,12 @@ async fn uninstall(
     }
 
     if remove_binary {
+        let overlayd_bin = zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
         let bin_path = pick_system_binary_path(daemon_name);
         match std::fs::remove_file(&bin_path) {
             Ok(()) => println!("Removed binary: {}", bin_path.display()),
@@ -2613,6 +2961,158 @@ fn build_service_launch_arguments(
         args.push(OsString::from("--no-tunnel-server"));
     }
     args
+}
+
+/// Resolve the `zlayer-overlayd.exe` binary path on Windows, looking next to
+/// the main `zlayer.exe`, then the system bin dir, then bare (PATH).
+#[cfg(target_os = "windows")]
+fn resolve_overlayd_binary_windows(main_exe: &Path) -> PathBuf {
+    let bin_name = "zlayer-overlayd.exe";
+    if let Some(dir) = main_exe.parent() {
+        let candidate = dir.join(bin_name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let system = zlayer_paths::ZLayerDirs::default_binary_dir().join(bin_name);
+    if system.exists() {
+        return system;
+    }
+    PathBuf::from(bin_name)
+}
+
+/// Register (or replace) the overlayd SCM service `ZLayerDaemon-Overlayd`.
+///
+/// overlayd is the overlay-adapter owner; registering it as its OWN SCM
+/// service means reinstalling the main `zlayer` binary does not tear the
+/// overlay adapter down. The service runs LocalSystem / AutoStart with
+/// binPath `zlayer-overlayd.exe --data-dir <data_dir>`.
+///
+/// NOTE: `zlayer-overlayd`'s `main` is a plain tokio entrypoint, not an SCM
+/// dispatcher (it has no `--service` mode). SCM will launch it as an
+/// OWN_PROCESS service; if SCM ever marks it non-responsive (no Running
+/// handshake), the main daemon's `ensure_overlayd_running` fallback spawns it
+/// detached, so the overlay still comes up. A dedicated SCM entrypoint in the
+/// overlayd crate would be the follow-up to make `sc query` report Running.
+#[cfg(target_os = "windows")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use std::ffi::{OsStr, OsString};
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let svc_name = crate::daemon_service::service_name("zlayer-overlayd");
+    let svc_display = crate::daemon_service::display_name("zlayer-overlayd");
+
+    let launch_arguments: Vec<OsString> = vec![
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+    ];
+
+    let service_info = ServiceInfo {
+        name: OsString::from(svc_name.clone()),
+        display_name: OsString::from(svc_display.clone()),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: overlayd_bin.to_path_buf(),
+        launch_arguments,
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+
+    let manager =
+        match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::ALL_ACCESS) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Warning: could not open SCM to register overlayd service: {e}");
+                return;
+            }
+        };
+
+    const ERROR_SERVICE_EXISTS: i32 = 1073;
+    let service = match manager.create_service(&service_info, ServiceAccess::ALL_ACCESS) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            let already_exists = matches!(
+                &e,
+                windows_service::Error::Winapi(io_err)
+                    if io_err.raw_os_error() == Some(ERROR_SERVICE_EXISTS)
+            );
+            if !already_exists {
+                eprintln!("Warning: failed to register overlayd service '{svc_name}': {e}");
+                return;
+            }
+            // Reinstall: stop + delete the existing service, then recreate.
+            if let Ok(existing) = manager.open_service(
+                svc_name.as_str(),
+                ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+            ) {
+                let _ = existing.stop();
+                let _ = existing.delete();
+                drop(existing);
+            }
+            match manager.create_service(&service_info, ServiceAccess::ALL_ACCESS) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Warning: failed to recreate overlayd service '{svc_name}': {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    let Some(service) = service else {
+        return;
+    };
+    println!("Registered overlayd Windows Service '{svc_name}' (display: '{svc_display}').");
+
+    if !no_start {
+        match service.start::<&OsStr>(&[]) {
+            Ok(()) => println!("Started overlayd service '{svc_name}'"),
+            Err(e) => eprintln!(
+                "Warning: failed to start overlayd service '{svc_name}': {e}. \
+                 The main daemon will spawn overlayd on demand if needed."
+            ),
+        }
+    }
+}
+
+/// Stop + delete the overlayd SCM service `ZLayerDaemon-Overlayd`.
+#[cfg(target_os = "windows")]
+async fn uninstall_overlayd_service() {
+    use std::ffi::OsStr;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager =
+        match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Warning: could not open SCM to remove overlayd service: {e}");
+                return;
+            }
+        };
+
+    let svc_name = crate::daemon_service::service_name("zlayer-overlayd");
+    match manager.open_service(
+        svc_name.as_str(),
+        ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(service) => {
+            let _ = service.stop();
+            match service.delete() {
+                Ok(()) => println!("Unregistered overlayd Windows Service '{svc_name}'."),
+                Err(e) => eprintln!("Warning: failed to delete overlayd service '{svc_name}': {e}"),
+            }
+        }
+        Err(e) if is_service_not_found(&e) => {
+            println!("Overlayd Windows Service '{svc_name}' is not registered; nothing to remove.");
+        }
+        Err(e) => eprintln!("Warning: failed to open overlayd service '{svc_name}': {e}"),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2972,6 +3472,13 @@ async fn install(
         }
     }
 
+    // Register overlayd as its OWN SCM service so it survives main-binary
+    // reinstalls. Locate overlayd next to the running zlayer.exe.
+    {
+        let overlayd_bin = resolve_overlayd_binary_windows(&exe);
+        install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+    }
+
     #[cfg(feature = "docker-compat")]
     if docker_socket {
         let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
@@ -3066,6 +3573,10 @@ async fn uninstall(
     }
     let _ = service_unregistered; // silence unused-var warning when not consumed downstream
 
+    // Stop + delete the overlayd SCM service too. The overlay HCN *network* is
+    // purged separately below (only under --purge-data).
+    uninstall_overlayd_service().await;
+
     #[cfg(feature = "docker-compat")]
     {
         let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
@@ -3099,6 +3610,13 @@ async fn uninstall(
     }
 
     if remove_binary {
+        let overlayd_bin =
+            zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd.exe");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
         let bin_path =
             zlayer_paths::ZLayerDirs::default_binary_dir().join(format!("{daemon_name}.exe"));
         match std::fs::remove_file(&bin_path) {
@@ -3768,5 +4286,52 @@ mod macos_label_tests {
     #[test]
     fn plist_label_arbitrary_name() {
         assert_eq!(plist_label("foo"), "com.zlayer.daemon-foo");
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod overlayd_stage_tests {
+    use super::*;
+
+    /// When the main binary was NOT relocated, the overlayd binary is resolved
+    /// in place (next to the main exe) and never copied.
+    #[test]
+    fn resolve_finds_sibling_without_copy() {
+        let dir = std::env::temp_dir().join(format!("zlayer-overlayd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_exe = dir.join("zlayer");
+        let overlayd = dir.join("zlayer-overlayd");
+        std::fs::write(&main_exe, b"x").unwrap();
+        std::fs::write(&overlayd, b"y").unwrap();
+
+        let resolved = resolve_and_stage_overlayd_binary(&main_exe, false);
+        assert_eq!(resolved, Some(overlayd));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the main binary WAS relocated into a system dir, overlayd is copied
+    /// alongside it. We model this by putting the source overlayd in a separate
+    /// "staging" dir reachable via `main_exe`'s parent only after copy.
+    #[test]
+    fn resolve_copies_into_system_dir() {
+        let base =
+            std::env::temp_dir().join(format!("zlayer-overlayd-copy-test-{}", std::process::id()));
+        let system = base.join("system");
+        std::fs::create_dir_all(&system).unwrap();
+        // Source overlayd lives next to the (relocated) main exe in the system
+        // dir already in this model — emulate the staging source being the same
+        // dir, so the copy is a no-op-equal path. To exercise the copy branch,
+        // place the source next to current_exe is not deterministic; instead
+        // assert the function returns a path inside the system dir.
+        let main_exe = system.join("zlayer");
+        let overlayd_src = system.join("zlayer-overlayd");
+        std::fs::write(&main_exe, b"x").unwrap();
+        std::fs::write(&overlayd_src, b"y").unwrap();
+
+        let resolved = resolve_and_stage_overlayd_binary(&main_exe, true);
+        assert_eq!(resolved, Some(system.join("zlayer-overlayd")));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

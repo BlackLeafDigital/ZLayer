@@ -1471,6 +1471,24 @@ pub(crate) async fn serve_with_external_shutdown(
         zlayer_api::bind_dual_with_local_auth(bind_addr, socket_path, &jwt_secret_raw).await?;
 
     // -----------------------------------------------------------------------
+    // 1d. Ensure the standalone overlayd daemon (the overlay-adapter owner) is
+    //     running before init_daemon constructs the OverlayManager — which is
+    //     now a thin overlayd client. Skipped entirely in host-network mode
+    //     (no overlay). On an installed host overlayd is its own OS service and
+    //     this just confirms reachability; in dev it spawns the binary detached.
+    // -----------------------------------------------------------------------
+    if !config.host_network {
+        if let Err(e) =
+            crate::commands::overlayd_supervisor::ensure_overlayd_running(&config.data_dir).await
+        {
+            warn!(
+                error = %e,
+                "overlayd not reachable; overlay networking will be degraded until it is up"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 2. Initialise all daemon infrastructure
     // -----------------------------------------------------------------------
     info!("Initialising daemon infrastructure");

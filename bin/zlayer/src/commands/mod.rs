@@ -35,6 +35,7 @@ pub mod join;
 pub mod network;
 pub mod node;
 pub mod notifier;
+pub mod overlayd_supervisor;
 pub mod permission;
 pub mod project;
 pub mod ps;
