@@ -18,8 +18,9 @@
 //!
 //! This module compiles on Windows only; it mirrors the main daemon's
 //! `bin/zlayer/src/daemon_service.rs::imp` implementation.
-
-#![cfg(windows)]
+//!
+//! (Gated at the `mod service;` declaration in `main.rs` with
+//! `#[cfg(windows)]`, so no inner `#![cfg(windows)]` is needed here.)
 
 use std::ffi::OsString;
 use std::path::PathBuf;
