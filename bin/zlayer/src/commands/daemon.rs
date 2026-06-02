@@ -2985,22 +2985,25 @@ fn resolve_overlayd_binary_windows(main_exe: &Path) -> PathBuf {
 ///
 /// overlayd is the overlay-adapter owner; registering it as its OWN SCM
 /// service means reinstalling the main `zlayer` binary does not tear the
-/// overlay adapter down. The service runs LocalSystem / AutoStart with
+/// overlay adapter down. The service runs `LocalSystem` / `AutoStart` with
 /// binPath `zlayer-overlayd.exe --data-dir <data_dir>`.
 ///
 /// NOTE: `zlayer-overlayd`'s `main` is a plain tokio entrypoint, not an SCM
 /// dispatcher (it has no `--service` mode). SCM will launch it as an
-/// OWN_PROCESS service; if SCM ever marks it non-responsive (no Running
+/// `OWN_PROCESS` service; if SCM ever marks it non-responsive (no Running
 /// handshake), the main daemon's `ensure_overlayd_running` fallback spawns it
 /// detached, so the overlay still comes up. A dedicated SCM entrypoint in the
 /// overlayd crate would be the follow-up to make `sc query` report Running.
 #[cfg(target_os = "windows")]
+#[allow(clippy::unused_async)] // async for symmetry with the linux/macos variants
 async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
     use std::ffi::{OsStr, OsString};
     use windows_service::service::{
         ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    const ERROR_SERVICE_EXISTS: i32 = 1073;
 
     let svc_name = crate::daemon_service::service_name("zlayer-overlayd");
     let svc_display = crate::daemon_service::display_name("zlayer-overlayd");
@@ -3032,7 +3035,6 @@ async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start
             }
         };
 
-    const ERROR_SERVICE_EXISTS: i32 = 1073;
     let service = match manager.create_service(&service_info, ServiceAccess::ALL_ACCESS) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -3082,6 +3084,7 @@ async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start
 
 /// Stop + delete the overlayd SCM service `ZLayerDaemon-Overlayd`.
 #[cfg(target_os = "windows")]
+#[allow(clippy::unused_async)] // async for symmetry with the linux/macos variants
 async fn uninstall_overlayd_service() {
     use std::ffi::OsStr;
     use windows_service::service::ServiceAccess;

@@ -62,6 +62,7 @@ impl OverlaydClient {
     }
 
     /// The endpoint this client is connected to.
+    #[must_use]
     pub fn endpoint(&self) -> &Path {
         &self.endpoint
     }

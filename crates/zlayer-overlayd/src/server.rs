@@ -1197,6 +1197,7 @@ impl OverlaydServer {
     /// # Errors
     /// Propagates the underlying `zlayer_hns` error on create failure.
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_lines)]
     async fn ensure_overlay_network(
         &mut self,
         slice_cidr: ipnet::IpNet,
@@ -1738,14 +1739,14 @@ pub fn purge_managed_networks(data_dir: &Path, daemon_name: &str) {
         match GUID::try_from(entry.id.as_str()) {
             Ok(guid) => match zlayer_hns::network::Network::delete(guid) {
                 Ok(()) => {
-                    tracing::info!(name = %entry.name, id = %entry.id, "deleted managed HCN network")
+                    tracing::info!(name = %entry.name, id = %entry.id, "deleted managed HCN network");
                 }
                 Err(e) => {
-                    tracing::warn!(name = %entry.name, id = %entry.id, error = %e, "failed to delete managed HCN network")
+                    tracing::warn!(name = %entry.name, id = %entry.id, error = %e, "failed to delete managed HCN network");
                 }
             },
             Err(e) => {
-                tracing::warn!(id = %entry.id, error = %e, "managed network marker has unparseable GUID")
+                tracing::warn!(id = %entry.id, error = %e, "managed network marker has unparseable GUID");
             }
         }
     }
@@ -1763,10 +1764,10 @@ pub fn purge_managed_networks(data_dir: &Path, daemon_name: &str) {
             if is_ours {
                 match zlayer_hns::network::Network::delete(guid) {
                     Ok(()) => {
-                        tracing::info!(name = %overlay_name, "deleted overlay HCN network (name sweep)")
+                        tracing::info!(name = %overlay_name, "deleted overlay HCN network (name sweep)");
                     }
                     Err(e) => {
-                        tracing::warn!(name = %overlay_name, error = %e, "failed to delete overlay network (name sweep)")
+                        tracing::warn!(name = %overlay_name, error = %e, "failed to delete overlay network (name sweep)");
                     }
                 }
             }

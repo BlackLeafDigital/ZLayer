@@ -183,6 +183,9 @@ pub async fn connect(endpoint: &Path) -> Result<ClientConn> {
 /// # Errors
 /// Propagates the underlying open error.
 #[cfg(windows)]
+// Must stay `async` to match the unix `connect` signature (callers `.await` it);
+// the named-pipe open is synchronous, so there's nothing to await here.
+#[allow(clippy::unused_async)]
 pub async fn connect(endpoint: &Path) -> Result<ClientConn> {
     use tokio::net::windows::named_pipe::ClientOptions;
     let pipe_name = endpoint
