@@ -187,8 +187,17 @@ unsafe fn pwstr_to_string(p: PWSTR) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the env-var tests below. They all mutate the same
+    /// process-global `ZLAYER_HCN_UPLINK_ADAPTER`, so without a shared lock they
+    /// race under the default parallel test runner (one test's `set_var`
+    /// clobbers another's between its own `set_var` and `find_primary_adapter`).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_override_wins_when_set() {
+        let _env = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Use a unique value so we don't collide with any real setting.
         let marker = "zlayer-test-uplink-marker";
         // Restore previous value if any to avoid leaking env state to other tests.
@@ -207,6 +216,9 @@ mod tests {
 
     #[test]
     fn env_override_empty_falls_through() {
+        let _env = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = env::var(ZLAYER_UPLINK_ENV).ok();
         unsafe {
             env::set_var(ZLAYER_UPLINK_ENV, "   ");
@@ -231,6 +243,9 @@ mod tests {
     #[test]
     #[ignore = "requires a real Windows host with a default gateway"]
     fn auto_detect_returns_adapter_name() {
+        let _env = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = env::var(ZLAYER_UPLINK_ENV).ok();
         unsafe {
             env::remove_var(ZLAYER_UPLINK_ENV);
