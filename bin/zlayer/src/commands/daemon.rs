@@ -3125,13 +3125,15 @@ async fn uninstall(
 
         // Tear down the host-level HCN overlay network(s) ZLayer created. They
         // persist across daemon restarts/reinstalls and are deleted ONLY here,
-        // on a full uninstall. Must run before the data dir (which holds the
-        // network marker) is removed. HCN calls are blocking → spawn_blocking.
+        // on a full uninstall. The HCN network/marker lifecycle now lives in
+        // `zlayer-overlayd`, so drive its purge directly. Must run before the
+        // data dir (which holds the network marker) is removed. HCN calls are
+        // blocking → spawn_blocking.
         {
             let dd = data_dir.to_path_buf();
             let dn = daemon_name.to_string();
             let _ = tokio::task::spawn_blocking(move || {
-                zlayer_agent::runtimes::hcs::purge_managed_networks(&dd, &dn);
+                zlayer_overlayd::server::purge_managed_networks(&dd, &dn);
             })
             .await;
         }

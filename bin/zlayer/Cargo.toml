@@ -167,6 +167,7 @@ jsonwebtoken = { workspace = true }
 async-trait.workspace = true
 tonic = "0.14.5"
 openraft = { version = "0.9.24", features = ["serde"] }
+zlayer-overlayd = { version = "0.0.0-dev", path = "../../crates/zlayer-overlayd" }
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

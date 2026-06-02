@@ -390,40 +390,17 @@ impl ServiceInstance {
                     let overlay_guard = overlay.read().await;
                     #[cfg(target_os = "windows")]
                     let attach_result: Option<std::net::IpAddr> = {
-                        let _ = container_pid; // unused on Windows
-                        match self.runtime.get_container_namespace_id(&id).await {
-                            Ok(Some(ns_id)) => {
-                                let ip_override =
-                                    self.runtime.get_container_ip(&id).await.ok().flatten();
-                                let dns_server = overlay_guard.dns_server_addr().map(|sa| sa.ip());
-                                let dns_domain =
-                                    overlay_guard.dns_domain().map(ToString::to_string);
-                                match overlay_guard
-                                    .attach_container_hcn(
-                                        ns_id,
-                                        &self.service_name,
-                                        ip_override,
-                                        true,
-                                        dns_server,
-                                        dns_domain,
-                                    )
-                                    .await
-                                {
-                                    Ok(ip) => Some(ip),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            container = %id,
-                                            error = %e,
-                                            "HCN overlay attach failed"
-                                        );
-                                        None
-                                    }
-                                }
-                            }
+                        // On Windows the overlay attach (HCN endpoint + per-container
+                        // namespace creation, via overlayd) already happened inside
+                        // `HcsRuntime::create_container`. Here we only need the IP it
+                        // assigned so we can register DNS for service discovery.
+                        let _ = (container_pid, &overlay_guard); // unused on Windows
+                        match self.runtime.get_container_ip(&id).await {
+                            Ok(Some(ip)) => Some(ip),
                             Ok(None) => {
                                 tracing::debug!(
                                     container = %id,
-                                    "skipping HCN overlay attach - no namespace id available"
+                                    "no overlay IP recorded for container (overlay attach skipped at create time)"
                                 );
                                 None
                             }
@@ -431,7 +408,7 @@ impl ServiceInstance {
                                 tracing::warn!(
                                     container = %id,
                                     error = %e,
-                                    "failed to fetch HCN namespace id"
+                                    "failed to fetch container overlay IP"
                                 );
                                 None
                             }

@@ -340,8 +340,8 @@ pub(crate) async fn join(
                 info!("Global overlay network created");
                 println!("Global overlay network created");
             }
+            // Per-container orphan veth sweeping now lives in zlayer-overlayd.
             let om = Arc::new(RwLock::new(om));
-            zlayer_agent::OverlayManager::start_periodic_orphan_sweep(om.clone());
             Some(om)
         }
         Err(e) => {
@@ -611,8 +611,8 @@ pub(crate) async fn join(
                 info!("Global overlay network created");
                 println!("Global overlay network created");
             }
+            // Per-container orphan veth sweeping now lives in zlayer-overlayd.
             let om = Arc::new(RwLock::new(om));
-            zlayer_agent::OverlayManager::start_periodic_orphan_sweep(om.clone());
             Some(om)
         }
         Err(e) => {

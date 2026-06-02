@@ -687,7 +687,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 // `/tmp/foo/run/wireguard` so it does not collide with a
                 // system-wide zlayer install owning `/var/run/wireguard`.
                 let uapi_sock_dir = zlayer_paths::ZLayerDirs::new(&config.data_dir).wireguard();
-                let om = om.with_uapi_sock_dir(uapi_sock_dir);
+                let om = om
+                    .with_uapi_sock_dir(uapi_sock_dir)
+                    .with_data_dir(&config.data_dir);
                 #[cfg(feature = "nat")]
                 let mut om = om.with_nat_config(config.nat.clone());
                 #[cfg(not(feature = "nat"))]
@@ -697,8 +699,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 } else {
                     info!("Global overlay network created");
                 }
+                // Per-container orphan veth sweeping now lives in zlayer-overlayd
+                // (it owns the overlay mechanics); no agent-side sweep to start.
                 let om = Arc::new(RwLock::new(om));
-                OverlayManager::start_periodic_orphan_sweep(om.clone());
                 Some(om)
             }
             Err(e) => {
