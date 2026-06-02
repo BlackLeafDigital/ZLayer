@@ -2986,14 +2986,14 @@ fn resolve_overlayd_binary_windows(main_exe: &Path) -> PathBuf {
 /// overlayd is the overlay-adapter owner; registering it as its OWN SCM
 /// service means reinstalling the main `zlayer` binary does not tear the
 /// overlay adapter down. The service runs `LocalSystem` / `AutoStart` with
-/// binPath `zlayer-overlayd.exe --data-dir <data_dir>`.
+/// binPath `zlayer-overlayd.exe --data-dir <data_dir> --service`.
 ///
-/// NOTE: `zlayer-overlayd`'s `main` is a plain tokio entrypoint, not an SCM
-/// dispatcher (it has no `--service` mode). SCM will launch it as an
-/// `OWN_PROCESS` service; if SCM ever marks it non-responsive (no Running
-/// handshake), the main daemon's `ensure_overlayd_running` fallback spawns it
-/// detached, so the overlay still comes up. A dedicated SCM entrypoint in the
-/// overlayd crate would be the follow-up to make `sc query` report Running.
+/// `zlayer-overlayd`'s `main` enters its SCM dispatcher when launched with
+/// `--service` (registers a control handler, reports Running/Stopped, handles
+/// Stop/Shutdown), so `sc query ZLayerDaemon-Overlayd` reports Running and Stop
+/// works cleanly. The main daemon's `ensure_overlayd_running` fallback still
+/// spawns it detached if SCM ever marks it non-responsive, so the overlay comes
+/// up either way.
 #[cfg(target_os = "windows")]
 #[allow(clippy::unused_async)] // async for symmetry with the linux/macos variants
 async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
@@ -3011,6 +3011,10 @@ async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start
     let launch_arguments: Vec<OsString> = vec![
         OsString::from("--data-dir"),
         data_dir.as_os_str().to_os_string(),
+        // SCM launches the binary detached; `--service` makes overlayd's
+        // `main()` hand control to its SCM dispatcher (report Running/Stopped,
+        // handle Stop/Shutdown) instead of running as a bare console process.
+        OsString::from("--service"),
     ];
 
     let service_info = ServiceInfo {
