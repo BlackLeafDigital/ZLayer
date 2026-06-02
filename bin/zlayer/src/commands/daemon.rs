@@ -3122,6 +3122,20 @@ async fn uninstall(
         println!("  This deletes containers, secrets, raft state, everything.");
         println!("  Press Ctrl-C within 3 seconds to abort.");
         sleep(std::time::Duration::from_secs(3)).await;
+
+        // Tear down the host-level HCN overlay network(s) ZLayer created. They
+        // persist across daemon restarts/reinstalls and are deleted ONLY here,
+        // on a full uninstall. Must run before the data dir (which holds the
+        // network marker) is removed. HCN calls are blocking → spawn_blocking.
+        {
+            let dd = data_dir.to_path_buf();
+            let dn = daemon_name.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                zlayer_agent::runtimes::hcs::purge_managed_networks(&dd, &dn);
+            })
+            .await;
+        }
+
         match tokio::fs::remove_dir_all(data_dir).await {
             Ok(()) => println!("Removed data dir: {}", data_dir.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

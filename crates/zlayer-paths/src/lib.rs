@@ -360,6 +360,17 @@ impl ZLayerDirs {
         self.data_dir.join("agent_ipam.json")
     }
 
+    /// Path to the agent's managed-network marker file
+    /// (`{data}/agent_network.json`).
+    ///
+    /// Records the host-level networks ZLayer creates (e.g. the Windows HCN
+    /// overlay network) so they can be reused across daemon restarts/updates
+    /// and torn down **only** on a full uninstall (`daemon uninstall --purge`),
+    /// not on every restart/reinstall.
+    pub fn agent_network_state(&self) -> PathBuf {
+        self.data_dir.join("agent_network.json")
+    }
+
     /// Logs subdirectory under data_dir (`{data}/logs`).
     /// Used on macOS where logs live under the user data dir.
     pub fn logs(&self) -> PathBuf {

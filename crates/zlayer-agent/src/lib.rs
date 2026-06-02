@@ -21,6 +21,7 @@ pub mod init;
 pub mod job;
 pub mod metrics_providers;
 pub mod netlink;
+pub mod network_state;
 pub mod overlay_manager;
 pub mod proxy_manager;
 pub mod runtime;

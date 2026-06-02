@@ -186,6 +186,80 @@ async fn test_create_internal_network_no_physical_binding() {
     }
 }
 
+/// **Persistent-lifecycle proof.** Verifies that `purge_managed_networks`
+/// (the full-uninstall path) deletes the HCN network recorded in the agent
+/// network marker and clears the marker — i.e. the overlay network is removed
+/// only on uninstall, by the marker the create path writes.
+///
+/// Creates a real HCN Internal network under a non-overlay name (so only the
+/// marker pass, not the name-sweep, can delete it), hand-writes a marker
+/// pointing at it under a temp data dir, runs the purge, then asserts the
+/// network is gone and the marker file is removed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates a real HCN network + marker; requires admin on Windows"]
+async fn test_purge_managed_networks_deletes_recorded_network() {
+    use zlayer_agent::network_state::{ManagedNetwork, NetworkState, OWNER_BASE};
+
+    const CIDR: &str = "10.221.51.0/28";
+    let net_name = "zlayer-e2e-purge-marker";
+    let net_id = new_guid();
+
+    // Create the network and drop the handle (the network persists in HCN
+    // until an explicit delete).
+    tokio::task::spawn_blocking(move || {
+        let n = Network::create_internal(net_id, net_name, CIDR)
+            .expect("create_internal must succeed (admin + Hyper-V required)");
+        drop(n);
+    })
+    .await
+    .expect("join error");
+
+    // Hand-write a marker pointing at the network under a temp data dir.
+    let data_dir = std::env::temp_dir().join(format!("zlayer-purge-e2e-{}", std::process::id()));
+    let marker_path = data_dir.join("agent_network.json");
+    let bare_id = format!("{net_id:?}")
+        .trim_matches(|c: char| c == '{' || c == '}')
+        .to_ascii_lowercase();
+    let mut st = NetworkState::default();
+    st.upsert(ManagedNetwork {
+        owner: OWNER_BASE.to_string(),
+        kind: "hcn-internal".to_string(),
+        name: net_name.to_string(),
+        id: bare_id,
+        subnet: CIDR.to_string(),
+    });
+    st.save(&marker_path).expect("save marker");
+
+    // Run the full-uninstall network purge.
+    let dd = data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        zlayer_agent::runtimes::hcs::purge_managed_networks(&dd, "zlayer");
+    })
+    .await
+    .expect("join error");
+
+    // The network must be gone and the marker cleared.
+    let still_exists = tokio::task::spawn_blocking(move || Network::open(net_id).is_ok())
+        .await
+        .expect("join error");
+    let marker_exists = marker_path.exists();
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    // Best-effort cleanup if the purge somehow didn't delete it.
+    if still_exists {
+        let _ = tokio::task::spawn_blocking(move || Network::delete(net_id)).await;
+    }
+
+    assert!(
+        !still_exists,
+        "purge_managed_networks must delete the marker-recorded HCN network"
+    );
+    assert!(
+        !marker_exists,
+        "purge_managed_networks must remove the marker file"
+    );
+}
+
 /// The highest-value end-to-end test. Creates a Transparent HCN network
 /// bound to the primary uplink, creates an overlay endpoint with the
 /// three Transparent-network policies (`OutBoundNAT`, `SDNRoute`, `ACL`),

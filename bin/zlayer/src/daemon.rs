@@ -637,6 +637,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             match config.runtime_config.clone() {
                 RuntimeConfig::Auto => RuntimeConfig::Hcs(zlayer_agent::runtimes::hcs::HcsConfig {
                     daemon_name: config.daemon_name.clone(),
+                    data_dir: config.data_dir.clone(),
                     ..zlayer_agent::runtimes::hcs::HcsConfig::default()
                 }),
                 RuntimeConfig::Hcs(mut hcs_cfg) => {
@@ -647,6 +648,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                     if hcs_cfg.daemon_name == "zlayer" && config.daemon_name != "zlayer" {
                         hcs_cfg.daemon_name.clone_from(&config.daemon_name);
                     }
+                    // The daemon's resolved `--data-dir` is authoritative for
+                    // the managed-network marker location.
+                    hcs_cfg.data_dir.clone_from(&config.data_dir);
                     RuntimeConfig::Hcs(hcs_cfg)
                 }
                 other => other,

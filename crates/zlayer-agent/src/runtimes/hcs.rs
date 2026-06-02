@@ -157,6 +157,73 @@ fn format_guid_bare(id: GUID) -> String {
         .to_ascii_lowercase()
 }
 
+/// Delete every host-level HCN network `ZLayer` created for this node and clear
+/// the persistent marker. Called on a **full uninstall**
+/// (`daemon uninstall --purge`) — never on a routine stop/restart, so the
+/// overlay network survives daemon updates/reinstalls and is removed only when
+/// the operator wipes the node.
+///
+/// Two passes: (1) delete each network recorded in
+/// `{data_dir}/agent_network.json` by GUID, then (2) a name-sweep that removes
+/// any HCN network whose name matches this daemon's overlay name, to catch a
+/// network whose marker entry was lost to a crash. Best-effort throughout:
+/// every failure is logged, none aborts the uninstall. Synchronous (HCN calls
+/// are blocking) — call from a blocking context.
+pub fn purge_managed_networks(data_dir: &std::path::Path, daemon_name: &str) {
+    let marker_path = zlayer_paths::ZLayerDirs::new(data_dir.to_path_buf()).agent_network_state();
+    let state = crate::network_state::NetworkState::load(&marker_path);
+
+    // Pass 1: delete recorded HCN networks by GUID.
+    for entry in &state.networks {
+        if !entry.kind.starts_with("hcn") {
+            continue; // not an HCN-backed network (e.g. a future Linux bridge)
+        }
+        match GUID::try_from(entry.id.as_str()) {
+            Ok(guid) => match zlayer_hns::network::Network::delete(guid) {
+                Ok(()) => {
+                    tracing::info!(name = %entry.name, id = %entry.id, "deleted managed HCN network");
+                }
+                Err(e) => {
+                    tracing::warn!(name = %entry.name, id = %entry.id, error = %e, "failed to delete managed HCN network");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(id = %entry.id, error = %e, "managed network marker has unparseable GUID");
+            }
+        }
+    }
+
+    // Pass 2: name-sweep fallback for an overlay network whose marker entry was
+    // lost (crash between create and marker write).
+    let overlay_name = overlay_network_name(daemon_name);
+    if let Ok(guids) = zlayer_hns::network::list("{}") {
+        for guid in guids {
+            let Ok(network) = zlayer_hns::network::Network::open(guid) else {
+                continue;
+            };
+            let is_ours = matches!(network.query("{}"), Ok(props) if props.name == overlay_name);
+            drop(network); // close the handle before delete
+            if is_ours {
+                match zlayer_hns::network::Network::delete(guid) {
+                    Ok(()) => {
+                        tracing::info!(name = %overlay_name, "deleted overlay HCN network (name sweep)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %overlay_name, error = %e, "failed to delete overlay network (name sweep)");
+                    }
+                }
+            }
+        }
+    }
+
+    // Clear the marker.
+    if marker_path.exists() {
+        if let Err(e) = std::fs::remove_file(&marker_path) {
+            tracing::warn!(error = %e, path = %marker_path.display(), "failed to remove agent network marker");
+        }
+    }
+}
+
 /// Coerce an arbitrary identifier into a `NetBIOS`-shaped hostname suitable for
 /// `Container.GuestOs.HostName`.
 ///
@@ -339,6 +406,10 @@ pub struct HcsConfig {
     /// running side-by-side on one host never collide. Defaults to
     /// `"zlayer"` for backward compatibility with single-instance installs.
     pub daemon_name: String,
+    /// Daemon data directory (`--data-dir`). Used to locate the managed-network
+    /// marker file (`{data_dir}/agent_network.json`) so the HCN overlay network
+    /// is reused across restarts and torn down only on a full uninstall.
+    pub data_dir: PathBuf,
 }
 
 impl Default for HcsConfig {
@@ -356,6 +427,7 @@ impl Default for HcsConfig {
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,
             daemon_name: "zlayer".to_string(),
+            data_dir: dirs.data_dir().to_path_buf(),
         }
     }
 }
@@ -635,6 +707,7 @@ impl HcsRuntime {
     /// refuses the create (e.g. `AccessDenied` when the daemon is not
     /// running as Administrator, or `SubnetConflict` if another network
     /// already owns the slice).
+    #[allow(clippy::too_many_lines)]
     async fn ensure_overlay_network(&self, slice_cidr: ipnet::IpNet) -> Result<GUID> {
         let mut guard = self.overlay_network.lock().await;
         if let Some(net) = guard.as_ref() {
@@ -642,6 +715,37 @@ impl HcsRuntime {
         }
 
         let net_name = overlay_network_name(&self.config.daemon_name);
+
+        // Persistent marker (`{data_dir}/agent_network.json`) records the
+        // overlay network so it is reused across daemon restarts / binary
+        // updates / reinstalls and removed only on a full uninstall. Fast
+        // path: if the marker names a network GUID that still exists on the
+        // host, reopen and reuse it directly.
+        let marker_path =
+            zlayer_paths::ZLayerDirs::new(self.config.data_dir.clone()).agent_network_state();
+        if let Some(recorded_id) = crate::network_state::NetworkState::load(&marker_path)
+            .get(crate::network_state::OWNER_BASE)
+            .and_then(|entry| GUID::try_from(entry.id.as_str()).ok())
+        {
+            let reopened = tokio::task::spawn_blocking(move || {
+                zlayer_hns::network::Network::open(recorded_id).ok()
+            })
+            .await
+            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?;
+            if let Some(network) = reopened {
+                *guard = Some(OverlayNetwork {
+                    id: recorded_id,
+                    subnet: slice_cidr.to_string(),
+                    _network: network,
+                });
+                tracing::info!(
+                    network_id = %format!("{recorded_id:?}"),
+                    name = %net_name,
+                    "reusing HCN overlay network from marker"
+                );
+                return Ok(recorded_id);
+            }
+        }
 
         // Idempotency: a network with this name may already exist on the host
         // from a previous run that crashed, or from a daemon restart where the
@@ -765,6 +869,32 @@ impl HcsRuntime {
             mode = if use_transparent { "Transparent" } else { "Internal" },
             "created HCN overlay network"
         );
+
+        // Persist the marker so subsequent runs reuse this network (by GUID)
+        // and a full uninstall knows to delete it. Best-effort: a marker write
+        // failure must not fail container creation — the name-enumeration path
+        // above still reuses the network on the next run.
+        let mut marker = crate::network_state::NetworkState::load(&marker_path);
+        marker.upsert(crate::network_state::ManagedNetwork {
+            owner: crate::network_state::OWNER_BASE.to_string(),
+            kind: if use_transparent {
+                "hcn-transparent"
+            } else {
+                "hcn-internal"
+            }
+            .to_string(),
+            name: net_name.clone(),
+            id: format_guid_bare(net_id),
+            subnet: subnet_str.clone(),
+        });
+        if let Err(e) = marker.save(&marker_path) {
+            tracing::warn!(
+                error = %e,
+                path = %marker_path.display(),
+                "failed to persist agent network marker (network still reusable by name)"
+            );
+        }
+
         Ok(net_id)
     }
 
