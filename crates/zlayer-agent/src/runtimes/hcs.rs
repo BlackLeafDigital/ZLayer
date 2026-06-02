@@ -1365,7 +1365,7 @@ impl HcsRuntime {
         parent_layers: &[zlayer_hcs::schema::Layer],
         namespace_strs: &[String],
         uvm: &Uvm,
-        network_attachment: &WindowsOverlayAttach,
+        network_attachment: Option<&WindowsOverlayAttach>,
     ) -> Result<(ComputeSystem, HyperVGcsState)> {
         use uuid::Uuid;
         use zlayer_gcs::bridge::GcsBridge;
@@ -1840,93 +1840,106 @@ impl HcsRuntime {
         //           overlayd-created namespace and listing its endpoints
         //           (there is exactly one per overlay attach). The namespace
         //           GUID is the bare-lowercase form overlayd returned.
+        //
+        // Skipped entirely when there is no overlay attachment (degraded
+        // mode — overlayd unreachable, or no slice/IP): the container runs
+        // in the UVM with no overlay NIC. The GCS bridge + RpcCreate
+        // (steps 8/9) still proceed, so the dial path stays exercisable
+        // without a fully-configured overlayd.
         // ----------------------------------------------------------------
-        let namespace_guid = network_attachment.namespace_guid.clone();
-        let ns_id =
-            GUID::try_from(namespace_guid.as_str()).map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!(
-                    "Hyper-V step 7.5: overlayd namespace GUID {namespace_guid} unparseable: {e}"
-                ),
-            })?;
-        let endpoint_guid = {
-            let ns_for_lookup = ns_id;
-            let endpoints = tokio::task::spawn_blocking(move || {
-                zlayer_hns::namespace::Namespace::open(ns_for_lookup)
-                    .and_then(|ns| ns.list_endpoints())
-            })
-            .await
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!("Hyper-V step 7.5: spawn_blocking join failed: {e}"),
-            })?
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!(
-                    "Hyper-V step 7.5: failed to list endpoints for namespace {namespace_guid}: {e}"
-                ),
-            })?;
-            endpoints
-                .into_iter()
-                .next()
-                .ok_or_else(|| AgentError::CreateFailed {
+        if let Some(network_attachment) = network_attachment {
+            let namespace_guid = network_attachment.namespace_guid.clone();
+            let ns_id =
+                GUID::try_from(namespace_guid.as_str()).map_err(|e| AgentError::CreateFailed {
                     id: hcs_id.to_string(),
                     reason: format!(
+                    "Hyper-V step 7.5: overlayd namespace GUID {namespace_guid} unparseable: {e}"
+                ),
+                })?;
+            let endpoint_guid = {
+                let ns_for_lookup = ns_id;
+                let endpoints = tokio::task::spawn_blocking(move || {
+                    zlayer_hns::namespace::Namespace::open(ns_for_lookup)
+                        .and_then(|ns| ns.list_endpoints())
+                })
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 7.5: spawn_blocking join failed: {e}"),
+                })?
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!(
+                    "Hyper-V step 7.5: failed to list endpoints for namespace {namespace_guid}: {e}"
+                ),
+                })?;
+                endpoints
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: hcs_id.to_string(),
+                        reason: format!(
                         "Hyper-V step 7.5: overlayd namespace {namespace_guid} has no endpoints"
                     ),
-                })?
-        };
-        // `list_endpoints` returns brace/case-normalized GUID strings; reduce
-        // to the bare-lowercase form HCS expects in the compartment-attach doc.
-        let endpoint_id_bare = endpoint_guid
-            .trim_matches(|c: char| c == '{' || c == '}')
-            .to_ascii_lowercase();
-        tracing::info!(
-            hcs_id = %hcs_id,
-            endpoint_id = %endpoint_id_bare,
-            namespace_id = %namespace_guid,
-            "Hyper-V step 7.5: wiring HCN endpoint into UVM network compartment"
-        );
-        step_log!(
+                    })?
+            };
+            // `list_endpoints` returns brace/case-normalized GUID strings; reduce
+            // to the bare-lowercase form HCS expects in the compartment-attach doc.
+            let endpoint_id_bare = endpoint_guid
+                .trim_matches(|c: char| c == '{' || c == '}')
+                .to_ascii_lowercase();
+            tracing::info!(
+                hcs_id = %hcs_id,
+                endpoint_id = %endpoint_id_bare,
+                namespace_id = %namespace_guid,
+                "Hyper-V step 7.5: wiring HCN endpoint into UVM network compartment"
+            );
+            step_log!(
             "7.5: wiring HCN endpoint into UVM network compartment endpoint_id={} namespace_id={}",
             endpoint_id_bare,
             namespace_guid,
         );
-        let add_endpoint_req = ModifySettingsRequest {
-            base: RequestBase {
-                activity_id: Uuid::new_v4(),
-                container_id: hcs_id.to_string(),
-            },
-            request: serde_json::json!({
-                "ResourcePath": "Container/Networks",
-                "RequestType": "Add",
-                "Settings": {
-                    "NamespaceId": namespace_guid,
-                    "EndpointId": endpoint_id_bare,
-                    "AllocatedIPAddress": network_attachment.ip.to_string(),
+            let add_endpoint_req = ModifySettingsRequest {
+                base: RequestBase {
+                    activity_id: Uuid::new_v4(),
+                    container_id: hcs_id.to_string(),
                 },
-            }),
-        };
-        let add_endpoint_resp: ModifySettingsResponse = bridge
-            .send_rpc_json(RpcMessageType::ModifySettings, &add_endpoint_req)
-            .await
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!("Hyper-V step 7.5 (network compartment attach): {e}"),
-            })?;
-        if add_endpoint_resp.result != 0 {
-            // Reinterpret the HRESULT bit pattern as u32 for `{:08x}` printing
-            // (HRESULT severity-bit set ⇒ i32 < 0, but the canonical Windows
-            // textual form is the 8-hex-digit unsigned value, e.g. 0x80070057).
-            let hresult_u32 = u32::from_ne_bytes(add_endpoint_resp.result.to_ne_bytes());
-            return Err(AgentError::CreateFailed {
-                id: hcs_id.to_string(),
-                reason: format!(
-                    "Hyper-V step 7.5 (network compartment attach): guest GCS returned \
+                request: serde_json::json!({
+                    "ResourcePath": "Container/Networks",
+                    "RequestType": "Add",
+                    "Settings": {
+                        "NamespaceId": namespace_guid,
+                        "EndpointId": endpoint_id_bare,
+                        "AllocatedIPAddress": network_attachment.ip.to_string(),
+                    },
+                }),
+            };
+            let add_endpoint_resp: ModifySettingsResponse = bridge
+                .send_rpc_json(RpcMessageType::ModifySettings, &add_endpoint_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 7.5 (network compartment attach): {e}"),
+                })?;
+            if add_endpoint_resp.result != 0 {
+                // Reinterpret the HRESULT bit pattern as u32 for `{:08x}` printing
+                // (HRESULT severity-bit set ⇒ i32 < 0, but the canonical Windows
+                // textual form is the 8-hex-digit unsigned value, e.g. 0x80070057).
+                let hresult_u32 = u32::from_ne_bytes(add_endpoint_resp.result.to_ne_bytes());
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!(
+                        "Hyper-V step 7.5 (network compartment attach): guest GCS returned \
                      HRESULT 0x{:08x}: {}",
-                    hresult_u32, add_endpoint_resp.error_message,
-                ),
-            });
+                        hresult_u32, add_endpoint_resp.error_message,
+                    ),
+                });
+            }
+        } else {
+            step_log!(
+                "7.5: skipped network compartment attach — no overlay attachment \
+                 (degraded; container has no overlay NIC)"
+            );
         }
 
         // ----------------------------------------------------------------
@@ -2027,7 +2040,7 @@ impl HcsRuntime {
         _parent_layers: &[zlayer_hcs::schema::Layer],
         _namespace_strs: &[String],
         _uvm: &Uvm,
-        _network_attachment: &WindowsOverlayAttach,
+        _network_attachment: Option<&WindowsOverlayAttach>,
     ) -> Result<(ComputeSystem, HyperVGcsState)> {
         Err(AgentError::Unsupported(format!(
             "Hyper-V isolation requires the `hcs-runtime` cargo feature \
@@ -2298,16 +2311,26 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
             d_word_value: Some(1),
             ..Default::default()
         },
-        // (B-2: dropped the prior `gcs.DependOnService` override —
-        //  we used to rewrite it to `[condrv, hvsocketcontrol]`, but
-        //  the stock nanoserver:ltsc2022 dep list
-        //  `[condrv, hvsocketcontrol, mpssvc, netsetupsvc]` is what
-        //  the in-guest gcs.exe's RpcCreate handler actually needs at
-        //  runtime — the firewall + netsetup RPC endpoints. With the
-        //  override removed, SCM blocks `gcs` until `mpssvc` and
-        //  `netsetupsvc` are Running, so gcs.exe sees those services up
-        //  when it starts handling Create. Hcsshim doesn't override the
-        //  dep list, and they ship nanoserver UVMs in production daily.)
+        // gcs `DependOnService` override (handoff 2026-05-31 §4 cheap test).
+        // Strip `mpssvc`/`netsetupsvc` from gcs's SCM dependency chain so the
+        // GCS service starts in a UVM that has NO virtual NIC. B-2 removed
+        // this on the theory gcs.exe needs the firewall/netsetup RPC
+        // endpoints at runtime — but the latest evidence (UVM boots, 18601
+        // fired, yet gcs never dials the host hvsock) points the other way:
+        // in a NIC-less UVM `mpssvc`/`netsetupsvc` never reach Running, so
+        // SCM blocks `gcs` forever and gcs.exe never starts. Keep only the
+        // non-network deps gcs needs to come up + dial (console driver +
+        // hvsocket control). Encoded as REG_MULTI_SZ (UTF-16LE, base64).
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\gcs".to_string(),
+            }),
+            name: "DependOnService".to_string(),
+            r#type: Some(RegistryValueType::MultiString),
+            binary_value: encode_multi_sz_utf16le(&["condrv", "hvsocketcontrol"]),
+            ..Default::default()
+        },
     ]
 }
 
@@ -3115,14 +3138,24 @@ impl Runtime for HcsRuntime {
         // + per-container namespace, receiving back the namespace GUID to embed
         // in the compute-system document. Each failure mode below maps to a
         // distinct `AgentError::CreateFailed`.
-        let network_attachment: WindowsOverlayAttach = match (slice_cidr, allocated_ip) {
-            (Some(_slice), Some(ip)) => {
+        // Overlay attachment is best-effort, restoring the documented intent in
+        // the step-3 comment above. The HCN endpoint/namespace now lives in
+        // overlayd, so when overlayd is unreachable (standalone runtime, dev
+        // box, e2e harness) — or no slice/IP is available — we log and proceed
+        // with NO overlay networking rather than failing the create. The
+        // container still starts; it simply has no addressable overlay surface
+        // until networking is (re)attached. A genuine attach error while
+        // overlayd IS connected stays fatal (a real fault, not a missing daemon).
+        // This also keeps the Hyper-V GCS-dial path reachable in tests that do
+        // not stand up a full overlayd.
+        let network_attachment: Option<WindowsOverlayAttach> = match (slice_cidr, allocated_ip) {
+            (Some(_slice), Some(ip)) if self.overlayd.is_some() => {
                 let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
                 match self
                     .overlayd_attach_windows(&hcs_id, &id.service, ip, dns_server, dns_domain)
                     .await
                 {
-                    Ok(att) => att,
+                    Ok(att) => Some(att),
                     Err(e) => {
                         return Err(AgentError::CreateFailed {
                             id: hcs_id.clone(),
@@ -3131,18 +3164,26 @@ impl Runtime for HcsRuntime {
                     }
                 }
             }
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "overlayd not connected; starting container without overlay networking"
+                );
+                None
+            }
             (None, _) => {
-                return Err(AgentError::CreateFailed {
-                    id: hcs_id.clone(),
-                    reason: "HcsConfig.slice_cidr is None (node has no assigned slice yet)"
-                        .to_string(),
-                });
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "node has no assigned slice yet; starting container without overlay networking"
+                );
+                None
             }
             (Some(_), None) => {
-                return Err(AgentError::CreateFailed {
-                    id: hcs_id.clone(),
-                    reason: "no overlay IP could be allocated for this container".to_string(),
-                });
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "no overlay IP could be allocated; starting container without overlay networking"
+                );
+                None
             }
         };
 
@@ -3151,7 +3192,10 @@ impl Runtime for HcsRuntime {
         //    created. HCS resolves this GUID against HCN during its `Construct`
         //    step; it must be the **bare, lowercase, un-braced** form
         //    (`aabbccdd-...`), which overlayd already returns.
-        let namespace_strs: Vec<String> = vec![network_attachment.namespace_guid.clone()];
+        let namespace_strs: Vec<String> = network_attachment
+            .as_ref()
+            .map(|a| vec![a.namespace_guid.clone()])
+            .unwrap_or_default();
         // Resolve the spec-side isolation choice (which may be `Auto` or
         // absent) to the concrete runtime-internal isolation mode using the
         // image's builder-asserted `os.version` and the host's Windows
@@ -3264,7 +3308,7 @@ impl Runtime for HcsRuntime {
                     &parent_layers,
                     &namespace_strs,
                     uvm_ref,
-                    &network_attachment,
+                    network_attachment.as_ref(),
                 )
                 .await
             }
@@ -3276,11 +3320,11 @@ impl Runtime for HcsRuntime {
                 // Ask overlayd to tear down the HCN endpoint + namespace it
                 // created so neither the endpoint nor its IP leaks, then release
                 // the IP back to the node allocator.
-                let ip_to_release = network_attachment.ip;
-                self.overlayd_detach_windows(&network_attachment.namespace_guid)
-                    .await;
-                if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
-                    alloc.release(ip_to_release);
+                if let Some(att) = &network_attachment {
+                    self.overlayd_detach_windows(&att.namespace_guid).await;
+                    if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
+                        alloc.release(att.ip);
+                    }
                 }
                 return Err(e);
             }
@@ -3309,7 +3353,7 @@ impl Runtime for HcsRuntime {
             scratch_layer: Some(scratch_layer),
             hcs_id: hcs_id.clone(),
             last_exit_code: sink,
-            overlay_attach: Some(network_attachment),
+            overlay_attach: network_attachment,
             uvm,
             activated_parent_layers,
             // Carry the GCS bridge through to the entry. Hyper-V path
