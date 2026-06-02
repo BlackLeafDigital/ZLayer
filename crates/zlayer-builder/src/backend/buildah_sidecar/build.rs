@@ -115,7 +115,36 @@ fn build_request_from(
         volumes: Vec::new(),
         source_date_epoch: 0,
         rewrite_timestamp: false,
-        isolation: String::new(), // sidecar picks rootless-safe default
+        isolation: detect_default_isolation(),
+    }
+}
+
+/// Pick the safe isolation backend for the *current process*.
+///
+/// On Unix, when the caller is unprivileged (real uid != 0), we send
+/// `"chroot"` so the sidecar uses buildah's chroot isolation. The chroot
+/// path does not need an OCI runtime (runc/crun) and works correctly
+/// inside the user namespace that the sidecar's
+/// `unshare.MaybeReexecUsingUserNamespace` creates.
+///
+/// When running as real root, we send the empty string so the sidecar
+/// picks buildah's default (= OCI on Linux), which is faster but requires
+/// runc/crun on PATH.
+///
+/// Non-Unix targets return the empty string (the sidecar only supports
+/// Unix; this matches the existing behavior).
+fn detect_default_isolation() -> String {
+    #[cfg(unix)]
+    {
+        if nix::unistd::Uid::current().is_root() {
+            String::new()
+        } else {
+            "chroot".to_string()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        String::new()
     }
 }
 
@@ -413,6 +442,28 @@ mod tests {
         assert_eq!(pull_policy_str(PullBaseMode::Never), "never");
         assert_eq!(pull_policy_str(PullBaseMode::Always), "always");
         assert_eq!(pull_policy_str(PullBaseMode::Newer), "ifnewer");
+    }
+
+    #[test]
+    fn detect_default_isolation_picks_chroot_when_unprivileged() {
+        // We run unit tests as the developer's user (uid != 0 on every
+        // contributor's box AND on CI). The function must therefore return
+        // "chroot" in this environment.
+        #[cfg(unix)]
+        {
+            if nix::unistd::Uid::current().is_root() {
+                // When running as actual root the function returns the
+                // empty string so the sidecar inherits buildah's default
+                // (oci on Linux) — verify that root path too.
+                assert_eq!(detect_default_isolation(), "");
+            } else {
+                assert_eq!(detect_default_isolation(), "chroot");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(detect_default_isolation(), "");
+        }
     }
 
     #[test]

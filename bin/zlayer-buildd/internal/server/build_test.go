@@ -404,6 +404,37 @@ func TestParseIsolation(t *testing.T) {
 	}
 }
 
+func TestParseIsolation_RootlessReexecEnvForcesChroot(t *testing.T) {
+	// Simulate the post-MaybeReexecUsingUserNamespace state: euid is 0
+	// (we're in the mapped userns) BUT the env signal tells us we were
+	// originally rootless. parseIsolation MUST return Chroot, not Default.
+	t.Setenv("BUILDAH_ISOLATION", "rootless")
+	got, err := parseIsolation("")
+	if err != nil {
+		t.Fatalf("parseIsolation(\"\") returned error with rootless env set: %v", err)
+	}
+	if got != define.IsolationChroot {
+		t.Fatalf("expected IsolationChroot when BUILDAH_ISOLATION=rootless; got %v", got)
+	}
+}
+
+func TestParseIsolation_EmptyEnvAsRootReturnsDefault(t *testing.T) {
+	// Real-root invocation: no BUILDAH_ISOLATION env, euid == 0, no re-exec.
+	// parseIsolation("") must return IsolationDefault so buildah picks
+	// the host-appropriate runtime (oci on Linux).
+	t.Setenv("BUILDAH_ISOLATION", "")
+	if os.Geteuid() != 0 {
+		t.Skip("requires running as real root for the negative-path assertion; test runner is unprivileged")
+	}
+	got, err := parseIsolation("")
+	if err != nil {
+		t.Fatalf("parseIsolation(\"\") returned error as root: %v", err)
+	}
+	if got != define.IsolationDefault {
+		t.Fatalf("expected IsolationDefault as root with no env signal; got %v", got)
+	}
+}
+
 func TestCancelEmptyRequestID(t *testing.T) {
 	srv := New(Options{MaxConcurrent: 1})
 	resp, err := srv.Cancel(context.Background(), &pb.CancelRequest{})

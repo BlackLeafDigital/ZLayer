@@ -95,6 +95,56 @@ fn write_dockerfile(dir: &Path, contents: &str) -> PathBuf {
     path
 }
 
+/// Configure a rootless-friendly environment for the CLI `BuildahBackend`
+/// half of the parity test:
+///
+/// 1. Write a custom `storage.conf` pointing at a per-test writable
+///    storage tree (vfs driver, paths under the returned tempdir).
+/// 2. Set `BUILDAH_ISOLATION=chroot` so the CLI's `buildah run` uses the
+///    chroot path — same as the sidecar — instead of trying to spawn
+///    `crun` / `runc`, which fails on hosts where `/run/user/<uid>/crun`
+///    or kernel-rootless OCI runtimes are unreliable.
+///
+/// Returns a `TempDir` guard that, when dropped, cleans up the storage
+/// tree. The env vars are intentionally NOT restored on drop — the test
+/// is the only consumer in this process, and resetting after the test
+/// adds complexity with no benefit.
+fn with_rootless_cli_env() -> tempfile::TempDir {
+    let tmp = tempfile::Builder::new()
+        .prefix("zlayer-cli-storage-")
+        .tempdir()
+        .expect("storage tmpdir");
+    let graph_root = tmp.path().join("graph");
+    let run_root = tmp.path().join("run");
+    std::fs::create_dir_all(&graph_root).expect("graph dir");
+    std::fs::create_dir_all(&run_root).expect("run dir");
+
+    let conf_path = tmp.path().join("storage.conf");
+    let conf = format!(
+        r#"[storage]
+driver = "vfs"
+graphroot = {graph:?}
+runroot = {run:?}
+
+[storage.options]
+pull_options = {{ enable_partial_images = "false" }}
+"#,
+        graph = graph_root.to_string_lossy(),
+        run = run_root.to_string_lossy(),
+    );
+    std::fs::write(&conf_path, conf).expect("write storage.conf");
+
+    // SAFETY: this test file runs serially because every test mutates
+    // process-wide env (ZLAYER_BUILDD_BIN, CONTAINERS_STORAGE_CONF,
+    // BUILDAH_ISOLATION). The TempDir guard owns the storage lifetime.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("CONTAINERS_STORAGE_CONF", &conf_path);
+        std::env::set_var("BUILDAH_ISOLATION", "chroot");
+    }
+    tmp
+}
+
 /// Construct a fresh sidecar backend with a dedicated TLS material directory.
 ///
 /// The TLS dir is created via `tempfile` then `keep()`'d so it outlives the
@@ -213,7 +263,11 @@ RUN sh -c 'echo "parity test" > /parity'
     .expect("sidecar build timed out")
     .expect("sidecar build failed");
 
-    // CLI build.
+    // CLI build — point containers/storage at a writable per-test tree
+    // and pin `BUILDAH_ISOLATION=chroot` so the CLI uses the same
+    // isolation backend as the sidecar (the parity test must compare
+    // like-for-like).
+    let _cli_env = with_rootless_cli_env();
     let cli = BuildahBackend::new().await.expect("init BuildahBackend");
     let cli_opts = BuildOptions {
         tags: vec!["zlayer/parity-cli:latest".to_string()],

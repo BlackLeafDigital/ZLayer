@@ -335,18 +335,34 @@ func parsePullPolicy(s string) (define.PullPolicy, error) {
 }
 
 // parseIsolation maps the proto "isolation" string to buildah's enum.
-// Empty string picks the rootless-safe default: when the sidecar runs
-// unprivileged (euid != 0), buildah's default "oci" backend tries to
-// chown the build-context overlay to root and fails with EPERM, so we
-// fall back to "chroot" which stays in the calling user's namespace. As
-// root we keep the buildah default (= oci on Linux).
+// Empty string picks the rootless-safe default by inspecting the
+// BUILDAH_ISOLATION env var set by unshare.MaybeReexecUsingUserNamespace
+// in main(): when that helper re-execs us into a fresh user namespace
+// it maps the calling uid → 0 AND exports BUILDAH_ISOLATION=rootless,
+// so after the re-exec we cannot tell rootless from real-root by uid
+// alone — os.Geteuid() returns 0 in both cases. We therefore prefer
+// the env signal first, and only fall back to euid for the rare path
+// where the re-exec never fired (e.g. invoked directly as real root,
+// or as a non-root uid without user-namespace re-exec). "chroot" stays
+// inside the calling user namespace and avoids the EPERM that "oci"
+// hits when it tries to chown the build-context overlay to root; as
+// real root we keep the buildah default (= oci on Linux).
 func parseIsolation(s string) (define.Isolation, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "":
-		if os.Geteuid() == 0 {
-			return define.IsolationDefault, nil
+		// We may have been re-exec'd into a user namespace by
+		// unshare.MaybeReexecUsingUserNamespace, which maps the calling uid to
+		// 0 AND sets BUILDAH_ISOLATION=rootless in the child env. After that
+		// re-exec, os.Geteuid()/Getuid() both return 0, so we can't tell
+		// rootless from real-root by uid alone. Use the env signal first,
+		// then fall back to euid for the (rare) path where the re-exec never
+		// fired (e.g. invoked directly as real root or as uid 1000 without
+		// user-namespace re-exec — neither happens in normal operation but
+		// both cases are correctly handled).
+		if os.Getenv("BUILDAH_ISOLATION") == "rootless" || os.Geteuid() != 0 {
+			return define.IsolationChroot, nil
 		}
-		return define.IsolationChroot, nil
+		return define.IsolationDefault, nil
 	case "default":
 		return define.IsolationDefault, nil
 	case "oci":
