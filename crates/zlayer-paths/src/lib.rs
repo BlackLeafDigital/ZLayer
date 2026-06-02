@@ -181,6 +181,51 @@ impl ZLayerDirs {
         }
     }
 
+    /// Data-dir-aware default `zlayer-overlayd` IPC socket path.
+    ///
+    /// `zlayer-overlayd` is the standalone overlay daemon; the main daemon
+    /// drives it over this endpoint. Mirrors [`Self::default_socket_path_for`]:
+    ///
+    /// - Windows: always `\\.\pipe\zlayer-overlayd` (named pipe, not a file).
+    /// - Unix, default data dir: `/var/run/zlayer-overlayd.sock`.
+    /// - Unix, overridden data dir: `{data_dir}/run/zlayer-overlayd.sock`
+    ///   (falling back to a length-safe path if that would exceed `SUN_PATH`).
+    pub fn default_overlayd_socket_path_for(data_dir: &Path) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = data_dir;
+            r"\\.\pipe\zlayer-overlayd".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let system_default = platform_default_data_dir();
+            if data_dir == system_default.as_path() {
+                #[cfg(target_os = "macos")]
+                {
+                    return system_default
+                        .join("run")
+                        .join("zlayer-overlayd.sock")
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return "/var/run/zlayer-overlayd.sock".to_string();
+                }
+            }
+            let natural = data_dir
+                .join("run")
+                .join("zlayer-overlayd.sock")
+                .to_string_lossy()
+                .into_owned();
+            if natural.len() <= SUN_PATH_MAX {
+                natural
+            } else {
+                socket_safe_fallback(data_dir, "overlayd")
+            }
+        }
+    }
+
     /// Default Docker-compatible API socket path.
     ///
     /// - Linux (root): `/var/run/zlayer/docker.sock`

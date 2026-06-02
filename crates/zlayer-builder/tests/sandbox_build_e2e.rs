@@ -40,6 +40,7 @@ fn test_data_dir(prefix: &str) -> PathBuf {
 /// This validates the platform resolver, which must select the correct
 /// architecture manifest from the multi-arch index.
 #[tokio::test]
+#[ignore = "live network: pulls alpine:3.20 from Docker Hub (run with --ignored)"]
 async fn test_pull_alpine_manifest() {
     let cache = BlobCache::new().expect("failed to create blob cache");
     let puller = ImagePuller::new(cache);
@@ -71,6 +72,7 @@ async fn test_pull_alpine_manifest() {
 /// Pull the full image (manifest + layers) for `alpine:3.20` and verify the
 /// layer data is non-empty.
 #[tokio::test]
+#[ignore = "live network: pulls alpine:3.20 from Docker Hub (run with --ignored)"]
 async fn test_pull_alpine_layers() {
     let cache = BlobCache::new().expect("failed to create blob cache");
     let puller = ImagePuller::new(cache);

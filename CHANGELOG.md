@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.1 - 2026-06-02
+
+### Added
+- `zlayer-overlayd` is now a complete, compiling overlay daemon (previously lib-only: just the IPC contract + transport + client). New `zlayer_overlayd::server::OverlaydServer` is a 1:1 migration of the *mechanics* half of the agent's `OverlayManager`: it owns the single cluster `WireGuard` `OverlayTransport`, the per-service Linux bridges (Linux) / HCN Internal network + endpoints (Windows), the per-node IP allocator, DNS records, and NAT traversal. `OverlaydServer::handle` dispatches every `OverlaydRequest` variant (`SetLocalNodeId`/`SetLocalWgPubkey`, `SetupGlobalOverlay`/`TeardownGlobalOverlay`, `SetupServiceOverlay`/`TeardownServiceOverlay`, `AllocateIp`/`ReleaseIp`, `AttachContainer`/`DetachContainer` for both `LinuxPid` and `WindowsContainer` handles, `AddPeer`/`RemovePeer`/`AddAllowedIp`/`RemoveAllowedIp`, `RegisterDns`/`UnregisterDns`, `Status`, `NatTick`, `Shutdown`) to the real mechanism. The Windows `AttachContainer{WindowsContainer}` path ensures the HCN Internal overlay network exists (reused via the `agent_network.json` marker), creates the per-container endpoint + namespace via `zlayer_hns::attach::EndpointAttachment::create_overlay`, and returns the bare-lowercase namespace GUID in `AttachResult`.
+- New `src/main.rs` binary target `zlayer-overlayd`: clap `--data-dir` / `--socket` args (socket defaults to the new data-dir-aware `zlayer_paths::ZLayerDirs::default_overlayd_socket_path_for`), tracing-subscriber init, and a `transport::serve` accept loop that runs each connection's request/response loop against an `Arc<Mutex<OverlaydServer>>`, exiting gracefully on a `Shutdown` request.
+- Ported (copied, not moved — the agent originals are untouched) `zlayer_overlayd::network_state` (HCN marker, pure serde/std) and `zlayer_overlayd::netlink` (Linux RTNETLINK helpers for bridges, veth, routes, netns). The libcontainer-backed `move_link_into_netns_fd_and_rename` was rewritten against the `rtnetlink` crate directly (`setns_by_fd` + `name`) since overlayd has no libcontainer dependency. `zlayer_overlayd::server::purge_managed_networks` (Windows) mirrors the agent's full-uninstall HCN network sweep.
+- `zlayer_paths::ZLayerDirs::default_overlayd_socket_path_for` — data-dir-aware overlayd IPC endpoint (`/var/run/zlayer-overlayd.sock` on the Unix system default, `{data_dir}/run/zlayer-overlayd.sock` otherwise, `\\.\pipe\zlayer-overlayd` on Windows).
+
 ## 0.52.0 - 2026-06-01
 
 ### Added

@@ -11,11 +11,9 @@ description = "Standalone ZLayer overlay daemon: owns the WireGuard/Wintun adapt
 name = "zlayer_overlayd"
 path = "src/lib.rs"
 
-# NOTE: the `[[bin]]` target + bin-only deps (clap, tracing-subscriber,
-# tracing-appender), the overlay engine deps (zlayer-overlay, zlayer-paths,
-# zlayer-core), and the server-side platform deps (zlayer-hns, windows) are
-# added together with the server engine + `src/main.rs` in the migration wave.
-# Until then this is a lib-only crate: the IPC contract + transport + client.
+[[bin]]
+name = "zlayer-overlayd"
+path = "src/main.rs"
 
 [dependencies]
 zlayer-types.workspace = true
@@ -24,3 +22,28 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zlayer-overlay = { workspace = true, features = ["nat"] }
+zlayer-paths.workspace = true
+zlayer-core.workspace = true
+ipnet.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+ipnetwork = "0.21"
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util.workspace = true
+libc.workspace = true
+netlink-packet-route = "0.19"
+nix.workspace = true
+rtnetlink = "0.14"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_HostComputeSystem", "Win32_System_HostComputeNetwork", "Win32_System_Threading", "Win32_System_IO", "Win32_Security"] }
+zlayer-hns.workspace = true
+
+[lints]
+workspace = true
