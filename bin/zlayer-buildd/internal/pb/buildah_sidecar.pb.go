@@ -1245,6 +1245,586 @@ func (x *HealthResponse) GetDetail() string {
 	return ""
 }
 
+// Push an existing local image to a registry. The image is looked up in
+// containers/storage by local name or `sha256:<digest>` ID. The destination
+// is a registry reference; the sidecar prefixes `docker://` when no
+// transport scheme is present.
+type PushRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Image            string                 `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`             // local name or sha256:... digest
+	Destination      string                 `protobuf:"bytes,2,opt,name=destination,proto3" json:"destination,omitempty"` // destination ref, e.g. "registry.example.com/foo:tag"
+	Format           string                 `protobuf:"bytes,3,opt,name=format,proto3" json:"format,omitempty"`           // "oci" | "docker" | "" (= sidecar default)
+	RemoveSignatures bool                   `protobuf:"varint,4,opt,name=remove_signatures,json=removeSignatures,proto3" json:"remove_signatures,omitempty"`
+	Auth             *PushAuth              `protobuf:"bytes,5,opt,name=auth,proto3" json:"auth,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *PushRequest) Reset() {
+	*x = PushRequest{}
+	mi := &file_buildah_sidecar_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushRequest) ProtoMessage() {}
+
+func (x *PushRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushRequest.ProtoReflect.Descriptor instead.
+func (*PushRequest) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PushRequest) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *PushRequest) GetDestination() string {
+	if x != nil {
+		return x.Destination
+	}
+	return ""
+}
+
+func (x *PushRequest) GetFormat() string {
+	if x != nil {
+		return x.Format
+	}
+	return ""
+}
+
+func (x *PushRequest) GetRemoveSignatures() bool {
+	if x != nil {
+		return x.RemoveSignatures
+	}
+	return false
+}
+
+func (x *PushRequest) GetAuth() *PushAuth {
+	if x != nil {
+		return x.Auth
+	}
+	return nil
+}
+
+type PushAuth struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Password      string                 `protobuf:"bytes,2,opt,name=password,proto3" json:"password,omitempty"`
+	IdentityToken string                 `protobuf:"bytes,3,opt,name=identity_token,json=identityToken,proto3" json:"identity_token,omitempty"`
+	RegistryToken string                 `protobuf:"bytes,4,opt,name=registry_token,json=registryToken,proto3" json:"registry_token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushAuth) Reset() {
+	*x = PushAuth{}
+	mi := &file_buildah_sidecar_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushAuth) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushAuth) ProtoMessage() {}
+
+func (x *PushAuth) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushAuth.ProtoReflect.Descriptor instead.
+func (*PushAuth) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *PushAuth) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *PushAuth) GetPassword() string {
+	if x != nil {
+		return x.Password
+	}
+	return ""
+}
+
+func (x *PushAuth) GetIdentityToken() string {
+	if x != nil {
+		return x.IdentityToken
+	}
+	return ""
+}
+
+func (x *PushAuth) GetRegistryToken() string {
+	if x != nil {
+		return x.RegistryToken
+	}
+	return ""
+}
+
+type PushResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PushedDigest  string                 `protobuf:"bytes,1,opt,name=pushed_digest,json=pushedDigest,proto3" json:"pushed_digest,omitempty"` // sha256:... after push (manifest digest at destination)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushResponse) Reset() {
+	*x = PushResponse{}
+	mi := &file_buildah_sidecar_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushResponse) ProtoMessage() {}
+
+func (x *PushResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushResponse.ProtoReflect.Descriptor instead.
+func (*PushResponse) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *PushResponse) GetPushedDigest() string {
+	if x != nil {
+		return x.PushedDigest
+	}
+	return ""
+}
+
+// Assign a new name to an existing image already present in local
+// containers/storage. Mirrors `buildah tag <image> <new_tag>`.
+type TagRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Image         string                 `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`                 // local name or sha256:...
+	NewTag        string                 `protobuf:"bytes,2,opt,name=new_tag,json=newTag,proto3" json:"new_tag,omitempty"` // additional name
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TagRequest) Reset() {
+	*x = TagRequest{}
+	mi := &file_buildah_sidecar_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TagRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TagRequest) ProtoMessage() {}
+
+func (x *TagRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TagRequest.ProtoReflect.Descriptor instead.
+func (*TagRequest) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *TagRequest) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *TagRequest) GetNewTag() string {
+	if x != nil {
+		return x.NewTag
+	}
+	return ""
+}
+
+type TagResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TagResponse) Reset() {
+	*x = TagResponse{}
+	mi := &file_buildah_sidecar_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TagResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TagResponse) ProtoMessage() {}
+
+func (x *TagResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TagResponse.ProtoReflect.Descriptor instead.
+func (*TagResponse) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{20}
+}
+
+// Manifest list operations. Together these implement the manifest
+// create/add/push triplet `buildah manifest create / add / push` exposes.
+type ManifestCreateRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // local name of the new manifest list
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestCreateRequest) Reset() {
+	*x = ManifestCreateRequest{}
+	mi := &file_buildah_sidecar_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestCreateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestCreateRequest) ProtoMessage() {}
+
+func (x *ManifestCreateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestCreateRequest.ProtoReflect.Descriptor instead.
+func (*ManifestCreateRequest) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ManifestCreateRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type ManifestCreateResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ListId        string                 `protobuf:"bytes,1,opt,name=list_id,json=listId,proto3" json:"list_id,omitempty"` // image ID assigned to the new (empty) list
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestCreateResponse) Reset() {
+	*x = ManifestCreateResponse{}
+	mi := &file_buildah_sidecar_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestCreateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestCreateResponse) ProtoMessage() {}
+
+func (x *ManifestCreateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestCreateResponse.ProtoReflect.Descriptor instead.
+func (*ManifestCreateResponse) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ManifestCreateResponse) GetListId() string {
+	if x != nil {
+		return x.ListId
+	}
+	return ""
+}
+
+type ManifestAddRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Manifest      string                 `protobuf:"bytes,1,opt,name=manifest,proto3" json:"manifest,omitempty"` // existing manifest list name
+	Image         string                 `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`       // image to attach (local name or registry ref)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestAddRequest) Reset() {
+	*x = ManifestAddRequest{}
+	mi := &file_buildah_sidecar_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestAddRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestAddRequest) ProtoMessage() {}
+
+func (x *ManifestAddRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestAddRequest.ProtoReflect.Descriptor instead.
+func (*ManifestAddRequest) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ManifestAddRequest) GetManifest() string {
+	if x != nil {
+		return x.Manifest
+	}
+	return ""
+}
+
+func (x *ManifestAddRequest) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+type ManifestAddResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ImageDigest   string                 `protobuf:"bytes,1,opt,name=image_digest,json=imageDigest,proto3" json:"image_digest,omitempty"` // sha256:... of the added image
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestAddResponse) Reset() {
+	*x = ManifestAddResponse{}
+	mi := &file_buildah_sidecar_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestAddResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestAddResponse) ProtoMessage() {}
+
+func (x *ManifestAddResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestAddResponse.ProtoReflect.Descriptor instead.
+func (*ManifestAddResponse) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ManifestAddResponse) GetImageDigest() string {
+	if x != nil {
+		return x.ImageDigest
+	}
+	return ""
+}
+
+type ManifestPushRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`               // local manifest list name
+	Destination   string                 `protobuf:"bytes,2,opt,name=destination,proto3" json:"destination,omitempty"` // destination ref
+	All           bool                   `protobuf:"varint,3,opt,name=all,proto3" json:"all,omitempty"`                // push referenced images too
+	Auth          *PushAuth              `protobuf:"bytes,4,opt,name=auth,proto3" json:"auth,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestPushRequest) Reset() {
+	*x = ManifestPushRequest{}
+	mi := &file_buildah_sidecar_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestPushRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestPushRequest) ProtoMessage() {}
+
+func (x *ManifestPushRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestPushRequest.ProtoReflect.Descriptor instead.
+func (*ManifestPushRequest) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *ManifestPushRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ManifestPushRequest) GetDestination() string {
+	if x != nil {
+		return x.Destination
+	}
+	return ""
+}
+
+func (x *ManifestPushRequest) GetAll() bool {
+	if x != nil {
+		return x.All
+	}
+	return false
+}
+
+func (x *ManifestPushRequest) GetAuth() *PushAuth {
+	if x != nil {
+		return x.Auth
+	}
+	return nil
+}
+
+type ManifestPushResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PushedDigest  string                 `protobuf:"bytes,1,opt,name=pushed_digest,json=pushedDigest,proto3" json:"pushed_digest,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ManifestPushResponse) Reset() {
+	*x = ManifestPushResponse{}
+	mi := &file_buildah_sidecar_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ManifestPushResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ManifestPushResponse) ProtoMessage() {}
+
+func (x *ManifestPushResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_buildah_sidecar_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ManifestPushResponse.ProtoReflect.Descriptor instead.
+func (*ManifestPushResponse) Descriptor() ([]byte, []int) {
+	return file_buildah_sidecar_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *ManifestPushResponse) GetPushedDigest() string {
+	if x != nil {
+		return x.PushedDigest
+	}
+	return ""
+}
+
 var File_buildah_sidecar_proto protoreflect.FileDescriptor
 
 const file_buildah_sidecar_proto_rawDesc = "" +
@@ -1343,12 +1923,51 @@ const file_buildah_sidecar_proto_rawDesc = "" +
 	"\x06Status\x12\v\n" +
 	"\aUNKNOWN\x10\x00\x12\v\n" +
 	"\aSERVING\x10\x01\x12\x0f\n" +
-	"\vNOT_SERVING\x10\x022\x89\x03\n" +
+	"\vNOT_SERVING\x10\x02\"\xc3\x01\n" +
+	"\vPushRequest\x12\x14\n" +
+	"\x05image\x18\x01 \x01(\tR\x05image\x12 \n" +
+	"\vdestination\x18\x02 \x01(\tR\vdestination\x12\x16\n" +
+	"\x06format\x18\x03 \x01(\tR\x06format\x12+\n" +
+	"\x11remove_signatures\x18\x04 \x01(\bR\x10removeSignatures\x127\n" +
+	"\x04auth\x18\x05 \x01(\v2#.zlayer.buildah_sidecar.v1.PushAuthR\x04auth\"\x90\x01\n" +
+	"\bPushAuth\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x1a\n" +
+	"\bpassword\x18\x02 \x01(\tR\bpassword\x12%\n" +
+	"\x0eidentity_token\x18\x03 \x01(\tR\ridentityToken\x12%\n" +
+	"\x0eregistry_token\x18\x04 \x01(\tR\rregistryToken\"3\n" +
+	"\fPushResponse\x12#\n" +
+	"\rpushed_digest\x18\x01 \x01(\tR\fpushedDigest\";\n" +
+	"\n" +
+	"TagRequest\x12\x14\n" +
+	"\x05image\x18\x01 \x01(\tR\x05image\x12\x17\n" +
+	"\anew_tag\x18\x02 \x01(\tR\x06newTag\"\r\n" +
+	"\vTagResponse\"+\n" +
+	"\x15ManifestCreateRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"1\n" +
+	"\x16ManifestCreateResponse\x12\x17\n" +
+	"\alist_id\x18\x01 \x01(\tR\x06listId\"F\n" +
+	"\x12ManifestAddRequest\x12\x1a\n" +
+	"\bmanifest\x18\x01 \x01(\tR\bmanifest\x12\x14\n" +
+	"\x05image\x18\x02 \x01(\tR\x05image\"8\n" +
+	"\x13ManifestAddResponse\x12!\n" +
+	"\fimage_digest\x18\x01 \x01(\tR\vimageDigest\"\x96\x01\n" +
+	"\x13ManifestPushRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
+	"\vdestination\x18\x02 \x01(\tR\vdestination\x12\x10\n" +
+	"\x03all\x18\x03 \x01(\bR\x03all\x127\n" +
+	"\x04auth\x18\x04 \x01(\v2#.zlayer.buildah_sidecar.v1.PushAuthR\x04auth\";\n" +
+	"\x14ManifestPushResponse\x12#\n" +
+	"\rpushed_digest\x18\x01 \x01(\tR\fpushedDigest2\x8e\a\n" +
 	"\fBuildService\x12Y\n" +
 	"\x05Build\x12'.zlayer.buildah_sidecar.v1.BuildRequest\x1a%.zlayer.buildah_sidecar.v1.BuildEvent0\x01\x12]\n" +
 	"\x06Cancel\x12(.zlayer.buildah_sidecar.v1.CancelRequest\x1a).zlayer.buildah_sidecar.v1.CancelResponse\x12`\n" +
 	"\aInspect\x12).zlayer.buildah_sidecar.v1.InspectRequest\x1a*.zlayer.buildah_sidecar.v1.InspectResponse\x12]\n" +
-	"\x06Health\x12(.zlayer.buildah_sidecar.v1.HealthRequest\x1a).zlayer.buildah_sidecar.v1.HealthResponseb\x06proto3"
+	"\x06Health\x12(.zlayer.buildah_sidecar.v1.HealthRequest\x1a).zlayer.buildah_sidecar.v1.HealthResponse\x12W\n" +
+	"\x04Push\x12&.zlayer.buildah_sidecar.v1.PushRequest\x1a'.zlayer.buildah_sidecar.v1.PushResponse\x12T\n" +
+	"\x03Tag\x12%.zlayer.buildah_sidecar.v1.TagRequest\x1a&.zlayer.buildah_sidecar.v1.TagResponse\x12u\n" +
+	"\x0eManifestCreate\x120.zlayer.buildah_sidecar.v1.ManifestCreateRequest\x1a1.zlayer.buildah_sidecar.v1.ManifestCreateResponse\x12l\n" +
+	"\vManifestAdd\x12-.zlayer.buildah_sidecar.v1.ManifestAddRequest\x1a..zlayer.buildah_sidecar.v1.ManifestAddResponse\x12o\n" +
+	"\fManifestPush\x12..zlayer.buildah_sidecar.v1.ManifestPushRequest\x1a/.zlayer.buildah_sidecar.v1.ManifestPushResponseb\x06proto3"
 
 var (
 	file_buildah_sidecar_proto_rawDescOnce sync.Once
@@ -1363,29 +1982,40 @@ func file_buildah_sidecar_proto_rawDescGZIP() []byte {
 }
 
 var file_buildah_sidecar_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_buildah_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_buildah_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_buildah_sidecar_proto_goTypes = []any{
-	(HealthResponse_Status)(0),  // 0: zlayer.buildah_sidecar.v1.HealthResponse.Status
-	(*BuildRequest)(nil),        // 1: zlayer.buildah_sidecar.v1.BuildRequest
-	(*BuildEvent)(nil),          // 2: zlayer.buildah_sidecar.v1.BuildEvent
-	(*StageStarted)(nil),        // 3: zlayer.buildah_sidecar.v1.StageStarted
-	(*StageFinished)(nil),       // 4: zlayer.buildah_sidecar.v1.StageFinished
-	(*InstructionStarted)(nil),  // 5: zlayer.buildah_sidecar.v1.InstructionStarted
-	(*InstructionFinished)(nil), // 6: zlayer.buildah_sidecar.v1.InstructionFinished
-	(*LogLine)(nil),             // 7: zlayer.buildah_sidecar.v1.LogLine
-	(*Warning)(nil),             // 8: zlayer.buildah_sidecar.v1.Warning
-	(*BuildFinished)(nil),       // 9: zlayer.buildah_sidecar.v1.BuildFinished
-	(*BuildError)(nil),          // 10: zlayer.buildah_sidecar.v1.BuildError
-	(*CancelRequest)(nil),       // 11: zlayer.buildah_sidecar.v1.CancelRequest
-	(*CancelResponse)(nil),      // 12: zlayer.buildah_sidecar.v1.CancelResponse
-	(*InspectRequest)(nil),      // 13: zlayer.buildah_sidecar.v1.InspectRequest
-	(*InspectResponse)(nil),     // 14: zlayer.buildah_sidecar.v1.InspectResponse
-	(*HealthRequest)(nil),       // 15: zlayer.buildah_sidecar.v1.HealthRequest
-	(*HealthResponse)(nil),      // 16: zlayer.buildah_sidecar.v1.HealthResponse
-	nil,                         // 17: zlayer.buildah_sidecar.v1.BuildRequest.BuildArgsEntry
+	(HealthResponse_Status)(0),     // 0: zlayer.buildah_sidecar.v1.HealthResponse.Status
+	(*BuildRequest)(nil),           // 1: zlayer.buildah_sidecar.v1.BuildRequest
+	(*BuildEvent)(nil),             // 2: zlayer.buildah_sidecar.v1.BuildEvent
+	(*StageStarted)(nil),           // 3: zlayer.buildah_sidecar.v1.StageStarted
+	(*StageFinished)(nil),          // 4: zlayer.buildah_sidecar.v1.StageFinished
+	(*InstructionStarted)(nil),     // 5: zlayer.buildah_sidecar.v1.InstructionStarted
+	(*InstructionFinished)(nil),    // 6: zlayer.buildah_sidecar.v1.InstructionFinished
+	(*LogLine)(nil),                // 7: zlayer.buildah_sidecar.v1.LogLine
+	(*Warning)(nil),                // 8: zlayer.buildah_sidecar.v1.Warning
+	(*BuildFinished)(nil),          // 9: zlayer.buildah_sidecar.v1.BuildFinished
+	(*BuildError)(nil),             // 10: zlayer.buildah_sidecar.v1.BuildError
+	(*CancelRequest)(nil),          // 11: zlayer.buildah_sidecar.v1.CancelRequest
+	(*CancelResponse)(nil),         // 12: zlayer.buildah_sidecar.v1.CancelResponse
+	(*InspectRequest)(nil),         // 13: zlayer.buildah_sidecar.v1.InspectRequest
+	(*InspectResponse)(nil),        // 14: zlayer.buildah_sidecar.v1.InspectResponse
+	(*HealthRequest)(nil),          // 15: zlayer.buildah_sidecar.v1.HealthRequest
+	(*HealthResponse)(nil),         // 16: zlayer.buildah_sidecar.v1.HealthResponse
+	(*PushRequest)(nil),            // 17: zlayer.buildah_sidecar.v1.PushRequest
+	(*PushAuth)(nil),               // 18: zlayer.buildah_sidecar.v1.PushAuth
+	(*PushResponse)(nil),           // 19: zlayer.buildah_sidecar.v1.PushResponse
+	(*TagRequest)(nil),             // 20: zlayer.buildah_sidecar.v1.TagRequest
+	(*TagResponse)(nil),            // 21: zlayer.buildah_sidecar.v1.TagResponse
+	(*ManifestCreateRequest)(nil),  // 22: zlayer.buildah_sidecar.v1.ManifestCreateRequest
+	(*ManifestCreateResponse)(nil), // 23: zlayer.buildah_sidecar.v1.ManifestCreateResponse
+	(*ManifestAddRequest)(nil),     // 24: zlayer.buildah_sidecar.v1.ManifestAddRequest
+	(*ManifestAddResponse)(nil),    // 25: zlayer.buildah_sidecar.v1.ManifestAddResponse
+	(*ManifestPushRequest)(nil),    // 26: zlayer.buildah_sidecar.v1.ManifestPushRequest
+	(*ManifestPushResponse)(nil),   // 27: zlayer.buildah_sidecar.v1.ManifestPushResponse
+	nil,                            // 28: zlayer.buildah_sidecar.v1.BuildRequest.BuildArgsEntry
 }
 var file_buildah_sidecar_proto_depIdxs = []int32{
-	17, // 0: zlayer.buildah_sidecar.v1.BuildRequest.build_args:type_name -> zlayer.buildah_sidecar.v1.BuildRequest.BuildArgsEntry
+	28, // 0: zlayer.buildah_sidecar.v1.BuildRequest.build_args:type_name -> zlayer.buildah_sidecar.v1.BuildRequest.BuildArgsEntry
 	3,  // 1: zlayer.buildah_sidecar.v1.BuildEvent.stage_started:type_name -> zlayer.buildah_sidecar.v1.StageStarted
 	4,  // 2: zlayer.buildah_sidecar.v1.BuildEvent.stage_finished:type_name -> zlayer.buildah_sidecar.v1.StageFinished
 	5,  // 3: zlayer.buildah_sidecar.v1.BuildEvent.instruction_started:type_name -> zlayer.buildah_sidecar.v1.InstructionStarted
@@ -1395,19 +2025,31 @@ var file_buildah_sidecar_proto_depIdxs = []int32{
 	9,  // 7: zlayer.buildah_sidecar.v1.BuildEvent.finished:type_name -> zlayer.buildah_sidecar.v1.BuildFinished
 	10, // 8: zlayer.buildah_sidecar.v1.BuildEvent.error:type_name -> zlayer.buildah_sidecar.v1.BuildError
 	0,  // 9: zlayer.buildah_sidecar.v1.HealthResponse.status:type_name -> zlayer.buildah_sidecar.v1.HealthResponse.Status
-	1,  // 10: zlayer.buildah_sidecar.v1.BuildService.Build:input_type -> zlayer.buildah_sidecar.v1.BuildRequest
-	11, // 11: zlayer.buildah_sidecar.v1.BuildService.Cancel:input_type -> zlayer.buildah_sidecar.v1.CancelRequest
-	13, // 12: zlayer.buildah_sidecar.v1.BuildService.Inspect:input_type -> zlayer.buildah_sidecar.v1.InspectRequest
-	15, // 13: zlayer.buildah_sidecar.v1.BuildService.Health:input_type -> zlayer.buildah_sidecar.v1.HealthRequest
-	2,  // 14: zlayer.buildah_sidecar.v1.BuildService.Build:output_type -> zlayer.buildah_sidecar.v1.BuildEvent
-	12, // 15: zlayer.buildah_sidecar.v1.BuildService.Cancel:output_type -> zlayer.buildah_sidecar.v1.CancelResponse
-	14, // 16: zlayer.buildah_sidecar.v1.BuildService.Inspect:output_type -> zlayer.buildah_sidecar.v1.InspectResponse
-	16, // 17: zlayer.buildah_sidecar.v1.BuildService.Health:output_type -> zlayer.buildah_sidecar.v1.HealthResponse
-	14, // [14:18] is the sub-list for method output_type
-	10, // [10:14] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	18, // 10: zlayer.buildah_sidecar.v1.PushRequest.auth:type_name -> zlayer.buildah_sidecar.v1.PushAuth
+	18, // 11: zlayer.buildah_sidecar.v1.ManifestPushRequest.auth:type_name -> zlayer.buildah_sidecar.v1.PushAuth
+	1,  // 12: zlayer.buildah_sidecar.v1.BuildService.Build:input_type -> zlayer.buildah_sidecar.v1.BuildRequest
+	11, // 13: zlayer.buildah_sidecar.v1.BuildService.Cancel:input_type -> zlayer.buildah_sidecar.v1.CancelRequest
+	13, // 14: zlayer.buildah_sidecar.v1.BuildService.Inspect:input_type -> zlayer.buildah_sidecar.v1.InspectRequest
+	15, // 15: zlayer.buildah_sidecar.v1.BuildService.Health:input_type -> zlayer.buildah_sidecar.v1.HealthRequest
+	17, // 16: zlayer.buildah_sidecar.v1.BuildService.Push:input_type -> zlayer.buildah_sidecar.v1.PushRequest
+	20, // 17: zlayer.buildah_sidecar.v1.BuildService.Tag:input_type -> zlayer.buildah_sidecar.v1.TagRequest
+	22, // 18: zlayer.buildah_sidecar.v1.BuildService.ManifestCreate:input_type -> zlayer.buildah_sidecar.v1.ManifestCreateRequest
+	24, // 19: zlayer.buildah_sidecar.v1.BuildService.ManifestAdd:input_type -> zlayer.buildah_sidecar.v1.ManifestAddRequest
+	26, // 20: zlayer.buildah_sidecar.v1.BuildService.ManifestPush:input_type -> zlayer.buildah_sidecar.v1.ManifestPushRequest
+	2,  // 21: zlayer.buildah_sidecar.v1.BuildService.Build:output_type -> zlayer.buildah_sidecar.v1.BuildEvent
+	12, // 22: zlayer.buildah_sidecar.v1.BuildService.Cancel:output_type -> zlayer.buildah_sidecar.v1.CancelResponse
+	14, // 23: zlayer.buildah_sidecar.v1.BuildService.Inspect:output_type -> zlayer.buildah_sidecar.v1.InspectResponse
+	16, // 24: zlayer.buildah_sidecar.v1.BuildService.Health:output_type -> zlayer.buildah_sidecar.v1.HealthResponse
+	19, // 25: zlayer.buildah_sidecar.v1.BuildService.Push:output_type -> zlayer.buildah_sidecar.v1.PushResponse
+	21, // 26: zlayer.buildah_sidecar.v1.BuildService.Tag:output_type -> zlayer.buildah_sidecar.v1.TagResponse
+	23, // 27: zlayer.buildah_sidecar.v1.BuildService.ManifestCreate:output_type -> zlayer.buildah_sidecar.v1.ManifestCreateResponse
+	25, // 28: zlayer.buildah_sidecar.v1.BuildService.ManifestAdd:output_type -> zlayer.buildah_sidecar.v1.ManifestAddResponse
+	27, // 29: zlayer.buildah_sidecar.v1.BuildService.ManifestPush:output_type -> zlayer.buildah_sidecar.v1.ManifestPushResponse
+	21, // [21:30] is the sub-list for method output_type
+	12, // [12:21] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_buildah_sidecar_proto_init() }
@@ -1431,7 +2073,7 @@ func file_buildah_sidecar_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_buildah_sidecar_proto_rawDesc), len(file_buildah_sidecar_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   17,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

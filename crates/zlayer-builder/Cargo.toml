@@ -83,6 +83,8 @@ tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
 prost = "0.14.3"
 prost-types = "0.14.3"
 tonic-prost = "0.14.5"
+tokio-stream.workspace = true
+rcgen.workspace = true
 
 # Windows-only dependencies for the HCS (Host Compute Service) build backend.
 # The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer

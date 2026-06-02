@@ -17,6 +17,13 @@ service BuildService {
     rpc Cancel(CancelRequest) returns (CancelResponse);
     rpc Inspect(InspectRequest) returns (InspectResponse);
     rpc Health(HealthRequest) returns (HealthResponse);
+
+    // Post-build operations on already-built images.
+    rpc Push(PushRequest) returns (PushResponse);
+    rpc Tag(TagRequest) returns (TagResponse);
+    rpc ManifestCreate(ManifestCreateRequest) returns (ManifestCreateResponse);
+    rpc ManifestAdd(ManifestAddRequest) returns (ManifestAddResponse);
+    rpc ManifestPush(ManifestPushRequest) returns (ManifestPushResponse);
 }
 
 // One Build request maps to one `imagebuildah.BuildDockerfiles` invocation
@@ -186,4 +193,66 @@ message HealthResponse {
         SERVING = 1;
         NOT_SERVING = 2;
     }
+}
+
+// Push an existing local image to a registry. The image is looked up in
+// containers/storage by local name or `sha256:<digest>` ID. The destination
+// is a registry reference; the sidecar prefixes `docker://` when no
+// transport scheme is present.
+message PushRequest {
+    string image = 1;         // local name or sha256:... digest
+    string destination = 2;   // destination ref, e.g. "registry.example.com/foo:tag"
+    string format = 3;        // "oci" | "docker" | "" (= sidecar default)
+    bool remove_signatures = 4;
+    PushAuth auth = 5;
+}
+
+message PushAuth {
+    string username = 1;
+    string password = 2;
+    string identity_token = 3;
+    string registry_token = 4;
+}
+
+message PushResponse {
+    string pushed_digest = 1; // sha256:... after push (manifest digest at destination)
+}
+
+// Assign a new name to an existing image already present in local
+// containers/storage. Mirrors `buildah tag <image> <new_tag>`.
+message TagRequest {
+    string image = 1;      // local name or sha256:...
+    string new_tag = 2;    // additional name
+}
+
+message TagResponse {}
+
+// Manifest list operations. Together these implement the manifest
+// create/add/push triplet `buildah manifest create / add / push` exposes.
+message ManifestCreateRequest {
+    string name = 1;       // local name of the new manifest list
+}
+
+message ManifestCreateResponse {
+    string list_id = 1;    // image ID assigned to the new (empty) list
+}
+
+message ManifestAddRequest {
+    string manifest = 1;   // existing manifest list name
+    string image = 2;      // image to attach (local name or registry ref)
+}
+
+message ManifestAddResponse {
+    string image_digest = 1; // sha256:... of the added image
+}
+
+message ManifestPushRequest {
+    string name = 1;          // local manifest list name
+    string destination = 2;   // destination ref
+    bool all = 3;             // push referenced images too
+    PushAuth auth = 4;
+}
+
+message ManifestPushResponse {
+    string pushed_digest = 1;
 }

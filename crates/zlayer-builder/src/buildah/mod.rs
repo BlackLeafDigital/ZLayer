@@ -26,6 +26,10 @@ mod executor;
 mod install;
 
 pub use executor::*;
+#[cfg(unix)]
+pub use install::buildd as buildd_install;
+#[cfg(unix)]
+pub use install::buildd::{ensure_buildd_sidecar, InstallOutcome as SidecarInstallOutcome};
 pub use install::{
     current_platform, install_instructions, is_platform_supported, BuildahInstallation,
     BuildahInstaller, InstallError,

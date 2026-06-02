@@ -26,10 +26,15 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	BuildService_Build_FullMethodName   = "/zlayer.buildah_sidecar.v1.BuildService/Build"
-	BuildService_Cancel_FullMethodName  = "/zlayer.buildah_sidecar.v1.BuildService/Cancel"
-	BuildService_Inspect_FullMethodName = "/zlayer.buildah_sidecar.v1.BuildService/Inspect"
-	BuildService_Health_FullMethodName  = "/zlayer.buildah_sidecar.v1.BuildService/Health"
+	BuildService_Build_FullMethodName          = "/zlayer.buildah_sidecar.v1.BuildService/Build"
+	BuildService_Cancel_FullMethodName         = "/zlayer.buildah_sidecar.v1.BuildService/Cancel"
+	BuildService_Inspect_FullMethodName        = "/zlayer.buildah_sidecar.v1.BuildService/Inspect"
+	BuildService_Health_FullMethodName         = "/zlayer.buildah_sidecar.v1.BuildService/Health"
+	BuildService_Push_FullMethodName           = "/zlayer.buildah_sidecar.v1.BuildService/Push"
+	BuildService_Tag_FullMethodName            = "/zlayer.buildah_sidecar.v1.BuildService/Tag"
+	BuildService_ManifestCreate_FullMethodName = "/zlayer.buildah_sidecar.v1.BuildService/ManifestCreate"
+	BuildService_ManifestAdd_FullMethodName    = "/zlayer.buildah_sidecar.v1.BuildService/ManifestAdd"
+	BuildService_ManifestPush_FullMethodName   = "/zlayer.buildah_sidecar.v1.BuildService/ManifestPush"
 )
 
 // BuildServiceClient is the client API for BuildService service.
@@ -44,6 +49,12 @@ type BuildServiceClient interface {
 	Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*CancelResponse, error)
 	Inspect(ctx context.Context, in *InspectRequest, opts ...grpc.CallOption) (*InspectResponse, error)
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	// Post-build operations on already-built images.
+	Push(ctx context.Context, in *PushRequest, opts ...grpc.CallOption) (*PushResponse, error)
+	Tag(ctx context.Context, in *TagRequest, opts ...grpc.CallOption) (*TagResponse, error)
+	ManifestCreate(ctx context.Context, in *ManifestCreateRequest, opts ...grpc.CallOption) (*ManifestCreateResponse, error)
+	ManifestAdd(ctx context.Context, in *ManifestAddRequest, opts ...grpc.CallOption) (*ManifestAddResponse, error)
+	ManifestPush(ctx context.Context, in *ManifestPushRequest, opts ...grpc.CallOption) (*ManifestPushResponse, error)
 }
 
 type buildServiceClient struct {
@@ -103,6 +114,56 @@ func (c *buildServiceClient) Health(ctx context.Context, in *HealthRequest, opts
 	return out, nil
 }
 
+func (c *buildServiceClient) Push(ctx context.Context, in *PushRequest, opts ...grpc.CallOption) (*PushResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PushResponse)
+	err := c.cc.Invoke(ctx, BuildService_Push_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) Tag(ctx context.Context, in *TagRequest, opts ...grpc.CallOption) (*TagResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TagResponse)
+	err := c.cc.Invoke(ctx, BuildService_Tag_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) ManifestCreate(ctx context.Context, in *ManifestCreateRequest, opts ...grpc.CallOption) (*ManifestCreateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManifestCreateResponse)
+	err := c.cc.Invoke(ctx, BuildService_ManifestCreate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) ManifestAdd(ctx context.Context, in *ManifestAddRequest, opts ...grpc.CallOption) (*ManifestAddResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManifestAddResponse)
+	err := c.cc.Invoke(ctx, BuildService_ManifestAdd_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *buildServiceClient) ManifestPush(ctx context.Context, in *ManifestPushRequest, opts ...grpc.CallOption) (*ManifestPushResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ManifestPushResponse)
+	err := c.cc.Invoke(ctx, BuildService_ManifestPush_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // BuildServiceServer is the server API for BuildService service.
 // All implementations must embed UnimplementedBuildServiceServer
 // for forward compatibility.
@@ -115,6 +176,12 @@ type BuildServiceServer interface {
 	Cancel(context.Context, *CancelRequest) (*CancelResponse, error)
 	Inspect(context.Context, *InspectRequest) (*InspectResponse, error)
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	// Post-build operations on already-built images.
+	Push(context.Context, *PushRequest) (*PushResponse, error)
+	Tag(context.Context, *TagRequest) (*TagResponse, error)
+	ManifestCreate(context.Context, *ManifestCreateRequest) (*ManifestCreateResponse, error)
+	ManifestAdd(context.Context, *ManifestAddRequest) (*ManifestAddResponse, error)
+	ManifestPush(context.Context, *ManifestPushRequest) (*ManifestPushResponse, error)
 	mustEmbedUnimplementedBuildServiceServer()
 }
 
@@ -136,6 +203,21 @@ func (UnimplementedBuildServiceServer) Inspect(context.Context, *InspectRequest)
 }
 func (UnimplementedBuildServiceServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
+}
+func (UnimplementedBuildServiceServer) Push(context.Context, *PushRequest) (*PushResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Push not implemented")
+}
+func (UnimplementedBuildServiceServer) Tag(context.Context, *TagRequest) (*TagResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Tag not implemented")
+}
+func (UnimplementedBuildServiceServer) ManifestCreate(context.Context, *ManifestCreateRequest) (*ManifestCreateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ManifestCreate not implemented")
+}
+func (UnimplementedBuildServiceServer) ManifestAdd(context.Context, *ManifestAddRequest) (*ManifestAddResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ManifestAdd not implemented")
+}
+func (UnimplementedBuildServiceServer) ManifestPush(context.Context, *ManifestPushRequest) (*ManifestPushResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ManifestPush not implemented")
 }
 func (UnimplementedBuildServiceServer) mustEmbedUnimplementedBuildServiceServer() {}
 func (UnimplementedBuildServiceServer) testEmbeddedByValue()                      {}
@@ -223,6 +305,96 @@ func _BuildService_Health_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BuildService_Push_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PushRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).Push(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_Push_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).Push(ctx, req.(*PushRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_Tag_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TagRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).Tag(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_Tag_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).Tag(ctx, req.(*TagRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_ManifestCreate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManifestCreateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).ManifestCreate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_ManifestCreate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).ManifestCreate(ctx, req.(*ManifestCreateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_ManifestAdd_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManifestAddRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).ManifestAdd(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_ManifestAdd_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).ManifestAdd(ctx, req.(*ManifestAddRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BuildService_ManifestPush_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ManifestPushRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BuildServiceServer).ManifestPush(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BuildService_ManifestPush_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BuildServiceServer).ManifestPush(ctx, req.(*ManifestPushRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // BuildService_ServiceDesc is the grpc.ServiceDesc for BuildService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -241,6 +413,26 @@ var BuildService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Health",
 			Handler:    _BuildService_Health_Handler,
+		},
+		{
+			MethodName: "Push",
+			Handler:    _BuildService_Push_Handler,
+		},
+		{
+			MethodName: "Tag",
+			Handler:    _BuildService_Tag_Handler,
+		},
+		{
+			MethodName: "ManifestCreate",
+			Handler:    _BuildService_ManifestCreate_Handler,
+		},
+		{
+			MethodName: "ManifestAdd",
+			Handler:    _BuildService_ManifestAdd_Handler,
+		},
+		{
+			MethodName: "ManifestPush",
+			Handler:    _BuildService_ManifestPush_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

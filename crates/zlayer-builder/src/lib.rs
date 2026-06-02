@@ -272,6 +272,14 @@ pub use pipeline::{
 pub use backend::SandboxBackend;
 pub use backend::{detect_backend, BuildBackend, BuildahBackend, ImageOs, ImageOsParseError};
 
+/// Process-wide lock shared by every test in this crate that mutates
+/// environment variables (`PATH`, `ZLAYER_BUILDD_BIN`, etc.). Cargo runs
+/// tests from a single crate in the same process by default, so any two
+/// env-mutating tests that don't share a lock will race. New env-mutating
+/// tests in this crate MUST acquire this mutex before touching env state.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
