@@ -34,7 +34,7 @@ pub use install::{
 use crate::backend::ImageOs;
 use crate::dockerfile::{
     AddInstruction, CopyInstruction, EnvInstruction, ExposeInstruction, HealthcheckInstruction,
-    Instruction, RunInstruction, ShellOrExec,
+    Instruction, RunInstruction, RunNetwork, ShellOrExec,
 };
 
 use std::collections::HashMap;
@@ -373,6 +373,37 @@ impl BuildahCommand {
         // Add --mount arguments BEFORE the container ID
         for mount in &run.mounts {
             cmd = cmd.arg(format!("--mount={}", mount.to_buildah_arg()));
+        }
+
+        // Add transient --env=K=V flags BEFORE the container ID. Sort by key
+        // for deterministic ordering (HashMap iteration is non-deterministic).
+        // These are scoped to this single `buildah run` invocation and are
+        // intentionally NOT persisted into the image config.
+        let mut env_keys: Vec<&String> = run.env.keys().collect();
+        env_keys.sort();
+        for key in env_keys {
+            if let Some(value) = run.env.get(key) {
+                cmd = cmd.arg(format!("--env={key}={value}"));
+            }
+        }
+
+        // Add --net=<value> BEFORE the container ID when a network mode is set.
+        // `RunNetwork::Default` is omitted (buildah's default is `private`),
+        // matching Docker's BuildKit semantics where `--network` is only
+        // emitted when the user opts out of the default. `--net` is the
+        // canonical buildah spelling per the man page (both `--net` and
+        // `--network` work, but `--net` is shorter and matches buildah's
+        // own help output).
+        if let Some(net) = run.network {
+            match net {
+                RunNetwork::Host => {
+                    cmd = cmd.arg("--net=host");
+                }
+                RunNetwork::None => {
+                    cmd = cmd.arg("--net=none");
+                }
+                RunNetwork::Default => {}
+            }
         }
 
         // Now add container and the command
@@ -826,6 +857,12 @@ pub struct DockerfileTranslator {
     /// Most recent `SHELL` instruction override, if any. When `None` the
     /// translator falls back to [`default_shell_for`] for the target OS.
     shell_override: Option<Vec<String>>,
+    /// When `true`, every emitted `buildah run` for a `RUN` instruction will
+    /// carry `--net=host` regardless of any per-instruction `network` value.
+    /// Mirrors Docker's `docker build --network=host` flag and bypasses
+    /// buildah's CNI/netavark plumbing entirely (the container shares the
+    /// host's network namespace).
+    host_network: bool,
 }
 
 impl DockerfileTranslator {
@@ -835,7 +872,22 @@ impl DockerfileTranslator {
         Self {
             target_os,
             shell_override: None,
+            host_network: false,
         }
+    }
+
+    /// Force every translated `RUN` instruction to use host networking.
+    ///
+    /// When `on` is `true`, the translator overrides any per-instruction
+    /// `network` value (including `None`) with [`RunNetwork::Host`] before
+    /// emitting the buildah command. This mirrors the effect of Docker's
+    /// `docker build --network=host` flag and bypasses buildah's CNI /
+    /// netavark plumbing entirely. When `on` is `false` (the default),
+    /// per-instruction `network` values are passed through unchanged.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.host_network = on;
+        self
     }
 
     /// Return the target OS this translator emits commands for.
@@ -873,17 +925,38 @@ impl DockerfileTranslator {
         match instruction {
             Instruction::Run(run) => {
                 let shell = self.active_shell();
-                if run.mounts.is_empty() {
-                    match &run.command {
+                // Apply the translator-level host_network override: when set,
+                // every emitted RUN gets `--net=host` regardless of any
+                // per-instruction network value. We clone only when we
+                // actually need to mutate so the no-override path stays
+                // allocation-free.
+                let effective_run: std::borrow::Cow<'_, RunInstruction> = if self.host_network {
+                    let mut owned = run.clone();
+                    owned.network = Some(RunNetwork::Host);
+                    std::borrow::Cow::Owned(owned)
+                } else {
+                    std::borrow::Cow::Borrowed(run)
+                };
+                let run_ref: &RunInstruction = &effective_run;
+
+                // Route through run_with_mounts_shell whenever mounts, env,
+                // or a network mode are present, since the simple factories
+                // don't emit those pre-container flags.
+                let needs_pre_container_flags = !run_ref.mounts.is_empty()
+                    || !run_ref.env.is_empty()
+                    || run_ref.network.is_some();
+
+                if needs_pre_container_flags {
+                    vec![BuildahCommand::run_with_mounts_shell(
+                        container, run_ref, &shell,
+                    )]
+                } else {
+                    match &run_ref.command {
                         ShellOrExec::Shell(s) => {
                             vec![BuildahCommand::run_shell_custom(container, &shell, s)]
                         }
                         ShellOrExec::Exec(args) => vec![BuildahCommand::run_exec(container, args)],
                     }
-                } else {
-                    vec![BuildahCommand::run_with_mounts_shell(
-                        container, run, &shell,
-                    )]
                 }
             }
 
@@ -1547,6 +1620,7 @@ mod tests {
             mounts: vec![],
             network: None,
             security: None,
+            env: HashMap::new(),
         });
 
         let cmds = BuildahCommand::from_instruction("container-1", &instruction);
@@ -1616,6 +1690,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1666,6 +1741,7 @@ mod tests {
             ],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1709,6 +1785,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         });
 
         let cmds = BuildahCommand::from_instruction("container-1", &instruction);
@@ -1740,6 +1817,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1748,6 +1826,376 @@ mod tests {
         assert!(cmd.args.contains(&"--".to_string()));
         assert!(cmd.args.contains(&"pip".to_string()));
         assert!(cmd.args.contains(&"install".to_string()));
+    }
+
+    #[test]
+    fn test_run_with_mounts_emits_env_flags_sorted() {
+        // RunInstruction with `env` must produce `--env=K=V` args BEFORE the
+        // container ID, sorted by key for determinism. Env is intentionally
+        // scoped to this single buildah-run invocation (not baked into the
+        // image config via `buildah config --env`).
+        let mut env = HashMap::new();
+        env.insert("B".to_string(), "2".to_string());
+        env.insert("A".to_string(), "1".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("env".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        // Confirm both --env flags appear, in sorted (A then B) order.
+        let env_positions: Vec<(usize, &String)> = cmd
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.starts_with("--env="))
+            .collect();
+        assert_eq!(
+            env_positions.len(),
+            2,
+            "expected 2 --env args, got {env_positions:?}"
+        );
+        assert_eq!(env_positions[0].1, "--env=A=1");
+        assert_eq!(env_positions[1].1, "--env=B=2");
+
+        // Both --env flags must come BEFORE the container ID.
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("container ID present");
+        for (idx, _) in &env_positions {
+            assert!(
+                *idx < container_idx,
+                "--env at {idx} must precede container ID at {container_idx}"
+            );
+        }
+
+        // And BEFORE the `--` separator.
+        let sep_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        for (idx, _) in &env_positions {
+            assert!(
+                *idx < sep_idx,
+                "--env at {idx} must precede `--` at {sep_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_translator_routes_env_only_run_through_mounts_path() {
+        // A RunInstruction with env but no mounts must still flow through
+        // run_with_mounts_shell so the --env= flags get emitted. The plain
+        // run_shell / run_exec factories don't know about env.
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo $FOO".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .translate("container-1", &Instruction::Run(run));
+        assert_eq!(cmds.len(), 1);
+
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--env=FOO=bar"),
+            "expected --env=FOO=bar in args: {:?}",
+            cmd.args
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Host-network plumbing
+    //
+    // These tests pin the `--host-network` CLI flag's end-to-end behavior:
+    // a `RunInstruction` with `network: Some(RunNetwork::Host)` MUST emit
+    // `--net=host` BEFORE the container ID on the buildah command, and the
+    // translator-level `with_host_network(true)` MUST force-set host
+    // networking on every RUN regardless of any per-instruction value.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_run_with_mounts_emits_net_host_before_container() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get update".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::Host),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        let net_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("expected --net=host arg");
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("container id present");
+        let sep_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        assert!(
+            net_idx < container_idx,
+            "--net=host (idx {net_idx}) must precede container ID (idx {container_idx})"
+        );
+        assert!(
+            net_idx < sep_idx,
+            "--net=host (idx {net_idx}) must precede `--` (idx {sep_idx})"
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_emits_net_none() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("hostname".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::None),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=none"),
+            "expected --net=none in args, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_default_network_omits_net_flag() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::Default),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "RunNetwork::Default must NOT emit any --net flag, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_no_network_field_omits_net_flag() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "network=None must NOT emit any --net flag, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_forces_net_host_on_run_with_none_network() {
+        // Load-bearing assertion for the `zlayer --host-network` CLI flag:
+        // host_network=true must emit --net=host even when the Dockerfile
+        // RUN does NOT specify a per-instruction --network.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get update".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1, "expected exactly one buildah command");
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "expected --net=host in args (host_network=true should force it even when run.network is None), got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_overrides_per_instruction_network_none() {
+        // `RUN --network=none` + CLI `--host-network` -> host wins.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get install -y curl".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::None),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "host_network=true must override RunNetwork::None, got: {:?}",
+            cmd.args
+        );
+        assert!(
+            !cmd.args.iter().any(|a| a == "--net=none"),
+            "host_network=true must REPLACE (not append to) RunNetwork::None, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_bare_run_through_mounts_path() {
+        // Bare RUN (no mounts, env, or network) must still flow through
+        // run_with_mounts_shell when host_network=true — the simple
+        // factories don't emit --net=host.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo hi".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "bare RUN with host_network=true must emit --net=host, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_env_only_run_with_net_host() {
+        // env-only RUN + host_network=true must produce BOTH --env=... and
+        // --net=host, both before the container ID.
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo $FOO".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+
+        let env_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--env=FOO=bar")
+            .expect("--env=FOO=bar present");
+        let net_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("--net=host present");
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "c1")
+            .expect("container id present");
+        assert!(env_idx < container_idx);
+        assert!(net_idx < container_idx);
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_mount_only_run_with_net_host() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("npm install".to_string()),
+            mounts: vec![RunMount::Cache {
+                target: "/root/.npm".to_string(),
+                id: Some("npm-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a.starts_with("--mount=")),
+            "--mount must be present"
+        );
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "--net=host must be present alongside --mount when host_network=true"
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_default_off_does_not_emit_net_flag() {
+        // Sanity: default translator (host_network not set) must not emit
+        // --net=... on a vanilla RUN. We're only adding a flag, never
+        // silently changing existing behavior.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds =
+            DockerfileTranslator::new(ImageOs::Linux).translate("c1", &Instruction::Run(run));
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "default translator (host_network=false) must NOT emit --net flag, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
@@ -2036,6 +2484,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmds = t.translate("c1", &Instruction::Run(run));

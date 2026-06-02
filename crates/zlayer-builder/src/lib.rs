@@ -359,6 +359,7 @@ ENTRYPOINT ["/app"]
             mounts: vec![],
             network: None,
             security: None,
+            env: std::collections::HashMap::new(),
         });
         let cmds = BuildahCommand::from_instruction(container, &run);
         assert_eq!(cmds.len(), 1);

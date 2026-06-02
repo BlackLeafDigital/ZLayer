@@ -417,6 +417,18 @@ pub struct BuildOptions {
     /// `windows_image_resolver::rewrite_image_for_windows`. `None` means
     /// the backend uses its built-in default (`ltsc2022`).
     pub windows_ltsc: Option<String>,
+    /// Force `--net=host` on every `buildah run` for this build.
+    ///
+    /// When `true`, the buildah backend asks [`DockerfileTranslator`] to
+    /// emit `--net=host` on every translated `RUN` instruction, overriding
+    /// any per-instruction `network` value. This mirrors Docker's
+    /// `docker build --network=host` flag and bypasses buildah's CNI /
+    /// netavark plumbing entirely — the container shares the host's
+    /// network namespace.
+    ///
+    /// Default: `false`. Wired up from the top-level `zlayer
+    /// --host-network` CLI flag (see `bin/zlayer/src/cli.rs`).
+    pub host_network: bool,
 }
 
 impl Default for BuildOptions {
@@ -448,6 +460,7 @@ impl Default for BuildOptions {
             pull: PullBaseMode::default(),
             update_bottles: false,
             windows_ltsc: None,
+            host_network: false,
         }
     }
 }
@@ -943,6 +956,23 @@ impl ImageBuilder {
     #[must_use]
     pub fn update_bottles(mut self, update_bottles: bool) -> Self {
         self.options.update_bottles = update_bottles;
+        self
+    }
+
+    /// Force `--net=host` on every `buildah run` emitted by this build.
+    ///
+    /// Mirrors Docker's `docker build --network=host` flag. When `on` is
+    /// `true`, every translated `RUN` instruction is annotated with
+    /// `RunNetwork::Host` regardless of any per-instruction `--network`
+    /// directive, and the buildah backend emits `--net=host` on the
+    /// resulting `buildah run` invocation. This bypasses buildah's CNI /
+    /// netavark plumbing entirely (the container shares the host's
+    /// network namespace).
+    ///
+    /// Wired from the top-level `zlayer --host-network` CLI flag.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.options.host_network = on;
         self
     }
 

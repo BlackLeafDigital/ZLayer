@@ -648,6 +648,7 @@ async fn run(
                 *verbose_build,
                 platform.clone(),
                 *update_bottles,
+                cli.host_network,
             )
             .await
         }
@@ -674,6 +675,7 @@ async fn run(
                 *no_tui,
                 only.clone(),
                 platform.clone(),
+                cli.host_network,
             )
             .await
         }

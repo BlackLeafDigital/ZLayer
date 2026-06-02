@@ -304,8 +304,18 @@ pub struct ZStage {
 /// A single build instruction within a stage.
 ///
 /// Exactly one of the action fields (`run`, `copy`, `add`, `env`, `workdir`,
-/// `user`) should be set. The remaining fields are modifiers that apply to
-/// the chosen action.
+/// `user`) should be set, with one exception for `env`:
+///
+/// - `env` alone sets persistent environment variables on the image (Dockerfile
+///   `ENV` semantics).
+/// - `env` alongside `run` is allowed and acts as a transient per-RUN modifier:
+///   the env vars are exported only for that single RUN command and are NOT
+///   baked into the resulting image. This is useful for build-time secrets or
+///   knobs (e.g. `CARGO_NET_OFFLINE=true`) that should not persist at runtime.
+///
+/// `env` combined with any other action field (`copy`, `add`, `workdir`, `user`)
+/// is rejected. The remaining fields (`to`, `from`, `owner`, `chmod`, `cache`)
+/// are modifiers that apply to the chosen action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZStep {

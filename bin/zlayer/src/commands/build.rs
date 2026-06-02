@@ -29,6 +29,7 @@ pub(crate) async fn handle_build(
     verbose_build: bool,
     platform: Option<String>,
     update_bottles: bool,
+    host_network: bool,
 ) -> Result<()> {
     use std::str::FromStr;
     use zlayer_builder::{
@@ -204,6 +205,11 @@ pub(crate) async fn handle_build(
 
     // Forward --update-bottles to the macOS sandbox backend (no-op on Linux/Windows)
     builder = builder.update_bottles(update_bottles);
+
+    // Forward --host-network to the builder so every `buildah run` gets
+    // `--net=host`. This matches Docker's `--network host` build mode and
+    // bypasses buildah's CNI / netavark plumbing entirely.
+    builder = builder.with_host_network(host_network);
 
     // Apply push
     if push {

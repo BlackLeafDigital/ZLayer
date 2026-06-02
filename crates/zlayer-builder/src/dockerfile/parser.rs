@@ -295,6 +295,7 @@ impl Dockerfile {
                     mounts: Vec::new(),
                     network: None,
                     security: None,
+                    env: HashMap::new(),
                 })
             }
 
