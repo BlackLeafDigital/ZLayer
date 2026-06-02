@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 use zlayer_agent::overlay_manager::OverlayManager;
+use zlayer_types::overlay::OverlayMode;
 
 /// Spawn 16 concurrent `setup_service_overlay` calls for the same service
 /// name on a shared `OverlayManager`. Assert that all callers receive the
@@ -49,7 +50,7 @@ async fn concurrent_setup_service_overlay_inserts_once() {
     for _ in 0..16 {
         let om = Arc::clone(&om);
         handles.push(tokio::spawn(async move {
-            om.setup_service_overlay("svc-x").await
+            om.setup_service_overlay("svc-x", OverlayMode::Shared).await
         }));
     }
 
@@ -59,7 +60,7 @@ async fn concurrent_setup_service_overlay_inserts_once() {
             .await
             .expect("task join")
             .expect("setup_service_overlay should succeed under CAP_NET_ADMIN");
-        names.push(result);
+        names.push(result.name);
     }
 
     let first = names[0].clone();
@@ -106,7 +107,7 @@ async fn concurrent_setup_distinct_service_names_each_get_one_entry() {
         for _ in 0..4 {
             let om = Arc::clone(&om);
             handles.push(tokio::spawn(async move {
-                let res = om.setup_service_overlay(svc).await;
+                let res = om.setup_service_overlay(svc, OverlayMode::Shared).await;
                 (svc, res)
             }));
         }
@@ -117,7 +118,7 @@ async fn concurrent_setup_distinct_service_names_each_get_one_entry() {
     for h in handles {
         let (svc, res) = h.await.expect("task join");
         let iface = res.expect("setup_service_overlay should not error");
-        by_service.entry(svc).or_default().push(iface);
+        by_service.entry(svc).or_default().push(iface.name);
     }
 
     // Every service got 4 results, all the same.
@@ -172,13 +173,14 @@ async fn concurrent_setup_with_global_overlay_creates_one_bridge_per_service() {
     for _ in 0..8 {
         let om = Arc::clone(&om);
         handles.push(tokio::spawn(async move {
-            om.setup_service_overlay("svc-real").await
+            om.setup_service_overlay("svc-real", OverlayMode::Shared)
+                .await
         }));
     }
 
     let mut names = Vec::with_capacity(8);
     for h in handles {
-        names.push(h.await.expect("task join").expect("setup"));
+        names.push(h.await.expect("task join").expect("setup").name);
     }
 
     let first = names[0].clone();

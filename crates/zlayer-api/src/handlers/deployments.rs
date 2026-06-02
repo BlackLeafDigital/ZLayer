@@ -61,6 +61,19 @@ pub struct DeploymentState {
     /// A channel is inserted when `create_deployment` spawns orchestration and
     /// removed when the orchestration task finishes (sender is dropped).
     pub event_channels: Arc<DashMap<String, broadcast::Sender<DeploymentEventWrapper>>>,
+    /// Raft coordinator handle, used to publish/remove this node's per-service
+    /// [`zlayer_types::overlay::OverlayMode::Dedicated`] overlay endpoint and to
+    /// read the cluster state for cross-node peer distribution. `None` on
+    /// non-clustered daemons (no Dedicated mesh to drive).
+    pub raft: Option<Arc<zlayer_scheduler::RaftCoordinator>>,
+    /// Internal shared secret used to authenticate the per-service add-peer /
+    /// remove-peer broadcasts to other hosting nodes. `None` disables the
+    /// broadcast leg (the Raft publish + local learn still run).
+    pub internal_token: Option<String>,
+    /// This node's externally-reachable advertise address (no port), used to
+    /// build the `{advertise_addr}:{wg_port}` endpoint published for dedicated
+    /// service overlays. `None` falls back to skipping the publish leg.
+    pub advertise_addr: Option<String>,
 }
 
 impl DeploymentState {
@@ -73,6 +86,9 @@ impl DeploymentState {
             proxy: None,
             dns_handle: None,
             event_channels: Arc::new(DashMap::new()),
+            raft: None,
+            internal_token: None,
+            advertise_addr: None,
         }
     }
 
@@ -91,7 +107,28 @@ impl DeploymentState {
             proxy: Some(proxy),
             dns_handle,
             event_channels: Arc::new(DashMap::new()),
+            raft: None,
+            internal_token: None,
+            advertise_addr: None,
         }
+    }
+
+    /// Wire the cross-node `Dedicated` overlay mesh dependencies (Raft handle,
+    /// internal auth token, advertise address). Without these the deploy path
+    /// still creates dedicated devices locally but never peers them across
+    /// nodes. Builder-style so the daemon bootstrap can layer it on after
+    /// [`Self::with_orchestration`].
+    #[must_use]
+    pub fn with_dedicated_mesh(
+        mut self,
+        raft: Option<Arc<zlayer_scheduler::RaftCoordinator>>,
+        internal_token: Option<String>,
+        advertise_addr: Option<String>,
+    ) -> Self {
+        self.raft = raft;
+        self.internal_token = internal_token;
+        self.advertise_addr = advertise_addr;
+        self
     }
 
     /// Build per-service health info from a stored deployment.
@@ -533,20 +570,40 @@ async fn orchestrate_deployment(
                     service: name.clone(),
                 },
             );
-            let om_guard = om.read().await;
-            match om_guard.setup_service_overlay(name).await {
-                Ok(iface) => {
+            let mode = service_spec
+                .overlay
+                .as_ref()
+                .map(|o| o.mode)
+                .unwrap_or_default();
+            let setup_result = {
+                let om_guard = om.read().await;
+                om_guard.setup_service_overlay(name, mode).await
+            };
+            match setup_result {
+                Ok(info) => {
                     info!(
                         deployment = %deployment_name,
                         service = %name,
-                        interface = %iface,
+                        interface = %info.name,
                         "Service overlay created"
                     );
+                    // Dedicated mode: publish this node's per-service endpoint
+                    // and mesh with the other hosting nodes (best-effort).
+                    if let (Some(raft), Some(token), Some(addr)) = (
+                        state.raft.as_ref(),
+                        state.internal_token.as_deref(),
+                        state.advertise_addr.as_deref(),
+                    ) {
+                        crate::handlers::dedicated_mesh::distribute_dedicated_service(
+                            raft, om, token, addr, name, &info,
+                        )
+                        .await;
+                    }
                     emit_progress(
                         event_tx.as_ref(),
                         DeploymentProgressEvent::OverlayCreated {
                             service: name.clone(),
-                            interface: iface,
+                            interface: info.name,
                         },
                     );
                 }
@@ -922,7 +979,7 @@ pub async fn delete_deployment(
         .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
     if let Some(stored) = &stored {
-        for service_name in stored.spec.services.keys() {
+        for (service_name, service_spec) in &stored.spec.services {
             // 1. Remove proxy routes/ports BEFORE scaling down so in-flight
             //    requests get clean connection-refused instead of routing to
             //    half-dead containers.
@@ -935,7 +992,29 @@ pub async fn delete_deployment(
                 );
             }
 
-            // 2. Tear down the service overlay network interface
+            // 2a. For Dedicated overlays: drop this node's per-service endpoint
+            //     from Raft and tell the other hosting nodes to drop us as a
+            //     peer (best-effort). Do this BEFORE the local teardown so the
+            //     pubkey is still readable from Raft.
+            let mode = service_spec
+                .overlay
+                .as_ref()
+                .map(|o| o.mode)
+                .unwrap_or_default();
+            if mode == zlayer_types::overlay::OverlayMode::Dedicated {
+                if let (Some(raft), Some(token)) =
+                    (state.raft.as_ref(), state.internal_token.as_deref())
+                {
+                    crate::handlers::dedicated_mesh::remove_dedicated_service_endpoint(
+                        raft,
+                        token,
+                        service_name,
+                    )
+                    .await;
+                }
+            }
+
+            // 2b. Tear down the service overlay network interface
             if let Some(ref overlay) = state.overlay {
                 let om = overlay.read().await;
                 om.teardown_service_overlay(service_name).await;

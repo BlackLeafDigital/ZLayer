@@ -91,6 +91,9 @@ pub use handlers::credentials::{
     RegistryCredentialResponse,
 };
 pub use handlers::cron::CronState;
+pub use handlers::dedicated_mesh::{
+    distribute_dedicated_service, remove_dedicated_service_endpoint, InternalRemovePeerRequest,
+};
 pub use handlers::deployments::{DeploymentState, ServiceHealthInfo};
 pub use handlers::environments::{
     CreateEnvironmentRequest, EnvironmentsRouterState, EnvironmentsState, UpdateEnvironmentRequest,

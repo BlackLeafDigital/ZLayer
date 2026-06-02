@@ -131,13 +131,32 @@ pub enum OverlaydRequest {
     DetachContainer { handle: AttachHandle },
 
     /// Add a `WireGuard` peer to the base overlay.
-    AddPeer(PeerSpec),
+    AddPeer {
+        #[serde(flatten)]
+        peer: PeerSpec,
+        #[serde(default)]
+        scope: PeerScope,
+    },
     /// Remove a peer by its base64 public key.
-    RemovePeer { pubkey: String },
+    RemovePeer {
+        pubkey: String,
+        #[serde(default)]
+        scope: PeerScope,
+    },
     /// Plumb a service subnet into a peer's `AllowedIPs`.
-    AddAllowedIp { pubkey: String, cidr: String },
+    AddAllowedIp {
+        pubkey: String,
+        cidr: String,
+        #[serde(default)]
+        scope: PeerScope,
+    },
     /// Remove a service subnet from a peer's `AllowedIPs`.
-    RemoveAllowedIp { pubkey: String, cidr: String },
+    RemoveAllowedIp {
+        pubkey: String,
+        cidr: String,
+        #[serde(default)]
+        scope: PeerScope,
+    },
 
     /// Register an overlay DNS A/AAAA record.
     RegisterDns { name: String, ip: IpAddr },
@@ -167,8 +186,30 @@ pub enum OverlaydResponse {
     BridgeName { name: String },
     /// A diagnostics snapshot (`Status`).
     Status(StatusSnapshot),
+    /// A dedicated per-service overlay device's identity (`SetupServiceOverlay`
+    /// in Dedicated mode). Not yet produced by the server — the server still
+    /// returns [`OverlaydResponse::BridgeName`] for now; this variant is the
+    /// wire contract for a later task that switches Dedicated setup over.
+    ServiceOverlay(ServiceOverlayInfo),
     /// The request failed; `message` is a human-readable reason.
     Err { message: String },
+}
+
+/// Identity of a dedicated per-service overlay device, reported by
+/// `SetupServiceOverlay` once Dedicated mode is wired up. Shared-mode setups
+/// leave the `wg_*`/`overlay_ip`/`subnet` fields `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOverlayInfo {
+    pub name: String,
+    pub mode: crate::overlay::OverlayMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ip: Option<std::net::IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
 }
 
 /// Result of [`OverlaydRequest::AttachContainer`].
@@ -180,6 +221,19 @@ pub struct AttachResult {
     /// the compute-system document. `None` on Linux (no HCN namespace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_guid: Option<String>,
+}
+
+/// Which overlay device a peer / `AllowedIP` op targets. `Global` (default, and
+/// the only value pre-Dedicated senders emit) = the single cluster transport.
+/// `Service` = that service's dedicated per-service transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum PeerScope {
+    #[default]
+    Global,
+    Service {
+        service: String,
+    },
 }
 
 /// A `WireGuard` peer to add to the base overlay. Mirrors
@@ -231,6 +285,23 @@ pub struct StatusSnapshot {
     /// Per-peer status.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerStatus>,
+    /// Per dedicated per-service overlay device status. Empty unless one or
+    /// more services run in `OverlayMode::Dedicated` on this node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dedicated_services: Vec<DedicatedServiceStatus>,
+}
+
+/// Status of a single dedicated per-service overlay device within a
+/// [`StatusSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedicatedServiceStatus {
+    pub service: String,
+    pub interface: String,
+    pub public_key: String,
+    pub listen_port: u16,
+    pub overlay_ip: std::net::IpAddr,
+    pub subnet: String,
+    pub peer_count: u32,
 }
 
 /// Per-peer status within a [`StatusSnapshot`].
@@ -327,6 +398,171 @@ mod tests {
                     endpoint: "1.2.3.4:51820".into(),
                     allowed_ips: "10.200.0.2/32".into(),
                     last_handshake_unix_secs: 0,
+                }],
+                ..StatusSnapshot::default()
+            }),
+        });
+    }
+
+    fn sample_peer() -> PeerSpec {
+        PeerSpec {
+            public_key: "base64key".into(),
+            endpoint: "1.2.3.4:51820".into(),
+            allowed_ips: "10.200.0.2/32".into(),
+            persistent_keepalive_secs: 25,
+        }
+    }
+
+    #[test]
+    fn peer_ops_round_trip_both_scopes() {
+        // AddPeer, global (default) + service scope.
+        roundtrip(&OverlaydFrame::Request {
+            id: 1,
+            request: OverlaydRequest::AddPeer {
+                peer: sample_peer(),
+                scope: PeerScope::Global,
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 2,
+            request: OverlaydRequest::AddPeer {
+                peer: sample_peer(),
+                scope: PeerScope::Service {
+                    service: "web".into(),
+                },
+            },
+        });
+        // RemovePeer.
+        roundtrip(&OverlaydFrame::Request {
+            id: 3,
+            request: OverlaydRequest::RemovePeer {
+                pubkey: "k".into(),
+                scope: PeerScope::Global,
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 4,
+            request: OverlaydRequest::RemovePeer {
+                pubkey: "k".into(),
+                scope: PeerScope::Service {
+                    service: "web".into(),
+                },
+            },
+        });
+        // AddAllowedIp.
+        roundtrip(&OverlaydFrame::Request {
+            id: 5,
+            request: OverlaydRequest::AddAllowedIp {
+                pubkey: "k".into(),
+                cidr: "10.200.1.0/24".into(),
+                scope: PeerScope::Global,
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 6,
+            request: OverlaydRequest::AddAllowedIp {
+                pubkey: "k".into(),
+                cidr: "10.200.1.0/24".into(),
+                scope: PeerScope::Service {
+                    service: "web".into(),
+                },
+            },
+        });
+        // RemoveAllowedIp.
+        roundtrip(&OverlaydFrame::Request {
+            id: 7,
+            request: OverlaydRequest::RemoveAllowedIp {
+                pubkey: "k".into(),
+                cidr: "10.200.1.0/24".into(),
+                scope: PeerScope::Global,
+            },
+        });
+        roundtrip(&OverlaydFrame::Request {
+            id: 8,
+            request: OverlaydRequest::RemoveAllowedIp {
+                pubkey: "k".into(),
+                cidr: "10.200.1.0/24".into(),
+                scope: PeerScope::Service {
+                    service: "web".into(),
+                },
+            },
+        });
+    }
+
+    #[test]
+    fn add_peer_without_scope_defaults_to_global() {
+        // A pre-Dedicated sender emits no `scope` field. The frame is tagged
+        // `frame: "request"`, the request `op: "add_peer"`, and `PeerSpec` is
+        // flattened so its fields sit at the request level.
+        let json = r#"{
+            "frame": "request",
+            "id": 11,
+            "request": {
+                "op": "add_peer",
+                "public_key": "base64key",
+                "endpoint": "1.2.3.4:51820",
+                "allowed_ips": "10.200.0.2/32",
+                "persistent_keepalive_secs": 25
+            }
+        }"#;
+        let frame: OverlaydFrame = serde_json::from_str(json).expect("deserialize");
+        match frame {
+            OverlaydFrame::Request {
+                request: OverlaydRequest::AddPeer { scope, peer },
+                ..
+            } => {
+                assert_eq!(scope, PeerScope::Global);
+                assert_eq!(peer.public_key, "base64key");
+            }
+            other => panic!("expected AddPeer request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_overlay_response_round_trips_both_shapes() {
+        // Shared shape: identity fields are None.
+        roundtrip(&OverlaydFrame::Response {
+            id: 20,
+            response: OverlaydResponse::ServiceOverlay(ServiceOverlayInfo {
+                name: "web".into(),
+                mode: crate::overlay::OverlayMode::Shared,
+                wg_public_key: None,
+                wg_port: None,
+                overlay_ip: None,
+                subnet: None,
+            }),
+        });
+        // Dedicated shape: all identity fields populated.
+        roundtrip(&OverlaydFrame::Response {
+            id: 21,
+            response: OverlaydResponse::ServiceOverlay(ServiceOverlayInfo {
+                name: "web".into(),
+                mode: crate::overlay::OverlayMode::Dedicated,
+                wg_public_key: Some("svc-key".into()),
+                wg_port: Some(51821),
+                overlay_ip: Some("10.201.0.1".parse().unwrap()),
+                subnet: Some("10.201.0.0/24".into()),
+            }),
+        });
+    }
+
+    #[test]
+    fn status_snapshot_with_dedicated_service_round_trips() {
+        roundtrip(&OverlaydFrame::Response {
+            id: 22,
+            response: OverlaydResponse::Status(StatusSnapshot {
+                interface: Some("zl-overlay0".into()),
+                node_ip: Some("10.200.0.1".parse().unwrap()),
+                peer_count: 1,
+                service_count: 1,
+                dedicated_services: vec![DedicatedServiceStatus {
+                    service: "web".into(),
+                    interface: "zl-svc-web0".into(),
+                    public_key: "svc-key".into(),
+                    listen_port: 51821,
+                    overlay_ip: "10.201.0.1".parse().unwrap(),
+                    subnet: "10.201.0.0/24".into(),
+                    peer_count: 3,
                 }],
                 ..StatusSnapshot::default()
             }),

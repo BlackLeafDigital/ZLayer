@@ -77,8 +77,8 @@ pub(crate) struct NodeConfig {
     pub(crate) created_at: String,
     /// Per-node preferred overlay mode. When `None`, the node defers to the
     /// cluster-level default (`AgentConfig::overlay_default_mode`). Per-service
-    /// overrides on the spec take precedence over both. In v0.51 every value
-    /// eventually funnels through [`zlayer_types::overlay::OverlayMode::resolve_v0_51`].
+    /// overrides on the spec take precedence over both. Every value eventually
+    /// funnels through [`zlayer_types::overlay::OverlayMode::resolve`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) overlay_preferred_mode: Option<zlayer_types::overlay::OverlayMode>,
 }
@@ -2383,15 +2383,38 @@ async fn restore_single_deployment(state: &DaemonState, stored: &StoredDeploymen
 
         // 2. Set up service overlay network (non-fatal if overlay is unavailable)
         if let Some(om) = &state.overlay {
-            let om_guard = om.read().await;
-            match om_guard.setup_service_overlay(name).await {
-                Ok(iface) => {
+            let mode = service_spec
+                .overlay
+                .as_ref()
+                .map(|o| o.mode)
+                .unwrap_or_default();
+            let setup_result = {
+                let om_guard = om.read().await;
+                om_guard.setup_service_overlay(name, mode).await
+            };
+            match setup_result {
+                Ok(info) => {
                     info!(
                         deployment = %deployment_name,
                         service = %name,
-                        interface = %iface,
+                        interface = %info.name,
                         "Restored service overlay"
                     );
+                    // Dedicated mode: republish + re-mesh on every restore.
+                    // This restore loop runs on daemon startup, so wiring the
+                    // distribution here doubles as the boot reconcile backstop
+                    // that self-heals dropped per-service peers.
+                    if let Some(raft) = state.raft.as_ref() {
+                        zlayer_api::distribute_dedicated_service(
+                            raft,
+                            om,
+                            &state.internal_token,
+                            &state.node_config.advertise_addr,
+                            name,
+                            &info,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     warn!(

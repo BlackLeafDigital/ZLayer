@@ -174,7 +174,7 @@ pub async fn get_overlay_peers(
 
 /// Get the overlay status for a single service.
 ///
-/// Returns the resolved overlay mode (after `resolve_v0_51`) and the
+/// Returns the resolved overlay mode (after `resolve`) and the
 /// per-node bridge map describing where on each node the service's
 /// overlay terminates.
 ///
@@ -215,7 +215,7 @@ pub async fn get_service_overlay_status(
 
     Ok(Json(ServiceOverlayStatus {
         service: name,
-        mode: OverlayMode::Auto.resolve_v0_51(),
+        mode: OverlayMode::Auto.resolve(),
         bridges_by_node: HashMap::new(),
     }))
 }

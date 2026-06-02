@@ -620,6 +620,8 @@ pub async fn cluster_join(
             wg_public_key: req.wg_public_key.clone(),
             overlay_ip: overlay_ip.clone(),
             endpoint: format!("{}:{}", req.advertise_addr, req.overlay_port),
+            service: None,
+            service_subnet: None,
         };
 
         // Collect the API endpoints of existing nodes (excluding the joining node

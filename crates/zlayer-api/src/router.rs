@@ -646,6 +646,10 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             get(handlers::internal::get_replicas_internal),
         )
         .route("/add-peer", post(handlers::internal::add_peer_internal))
+        .route(
+            "/remove-peer",
+            post(handlers::internal::remove_peer_internal),
+        )
         // `zlayer node upgrade` — the leader hits `upgrade/start` on each
         // follower in turn and polls `upgrade/{id}` for progress.
         .route(

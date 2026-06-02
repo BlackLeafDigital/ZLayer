@@ -13,6 +13,7 @@ pub mod containers;
 pub mod credentials;
 pub mod cron;
 pub mod daemon;
+pub mod dedicated_mesh;
 pub mod deployments;
 pub mod edge_cache;
 pub mod environments;

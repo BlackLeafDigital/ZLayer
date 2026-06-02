@@ -52,6 +52,13 @@ pub struct InternalAddPeerRequest {
     pub overlay_ip: String,
     /// New peer's `WireGuard` endpoint (e.g. "203.0.113.5:51820")
     pub endpoint: String,
+    /// When set, this peer is for the named service's *dedicated* overlay
+    /// rather than the global cluster overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Service subnet to plumb into the dedicated peer's `AllowedIPs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_subnet: Option<String>,
 }
 
 /// Response from internal add-peer operation

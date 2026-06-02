@@ -20,11 +20,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ipnetwork::IpNetwork;
 use zlayer_overlay::{NatConfig, NatTraversal, OverlayConfig, OverlayTransport, PeerInfo};
 use zlayer_types::overlayd::{
-    AttachHandle, AttachResult, OverlaydRequest, OverlaydResponse, PeerSpec, PeerStatus,
-    StatusSnapshot,
+    AttachHandle, AttachResult, DedicatedServiceStatus, OverlayMode, OverlaydRequest,
+    OverlaydResponse, PeerScope, PeerSpec, PeerStatus, ServiceOverlayInfo, StatusSnapshot,
 };
 
 use crate::error::OverlaydError;
+use crate::network_state::{
+    owner_for_service, DedicatedPortAllocator, ManagedNetwork, NetworkState,
+};
 
 /// Maximum length for Linux network interface names (IFNAMSIZ - 1 for null terminator).
 const MAX_IFNAME_LEN: usize = 15;
@@ -79,7 +82,6 @@ pub fn make_interface_name(parts: &[&str], suffix: &str) -> String {
 ///
 /// For IPv4 this is `network() + 1` (skipping the network address). For IPv6
 /// the same rule applies — the network address is conventionally reserved.
-#[cfg(target_os = "linux")]
 fn first_usable_ip(subnet: ipnet::IpNet) -> IpAddr {
     match subnet {
         ipnet::IpNet::V4(v4) => {
@@ -137,6 +139,30 @@ struct ServiceBridge {
     ip_allocator: zlayer_overlay::allocator::IpAllocator,
 }
 
+/// A dedicated per-service `WireGuard` transport (`OverlayMode::Dedicated`).
+///
+/// Unlike Shared mode — where every service subnet is plumbed onto the single
+/// cluster [`OverlayTransport`] via multi-CIDR `AllowedIPs` — a Dedicated
+/// service owns a *second* real `WireGuard` device with its own crypto context,
+/// listen port, overlay IP, and subnet. The device is portable (boringtun
+/// userspace `WireGuard` works on Linux/macOS/Windows), so this struct is
+/// cross-platform; only the bridge/HCN *attachment* of containers onto it is
+/// platform-gated.
+struct ServiceTransport {
+    /// The live dedicated `WireGuard` device. Dropping it tears down the TUN.
+    transport: OverlayTransport,
+    /// Actual interface name (kernel-assigned `utunN` on macOS).
+    interface: String,
+    /// base64 public key of this dedicated device.
+    public_key: String,
+    /// UDP listen port handed out by [`DedicatedPortAllocator`].
+    listen_port: u16,
+    /// This node's overlay IP on the dedicated device.
+    overlay_ip: std::net::IpAddr,
+    /// The service's subnet carried by the dedicated device.
+    subnet: ipnet::IpNet,
+}
+
 /// The overlay daemon engine.
 pub struct OverlaydServer {
     /// Deployment name (used for network naming). Set by `SetupGlobalOverlay`.
@@ -154,11 +180,17 @@ pub struct OverlaydServer {
     global_transport: Option<OverlayTransport>,
     /// Service-name -> per-service Linux bridge / placeholder name.
     service_interfaces: HashMap<String, String>,
+    /// Service-name -> dedicated per-service `WireGuard` transport (Dedicated
+    /// mode). Coexists with `global_transport`. Empty for Shared-only nodes.
+    service_transports: HashMap<String, ServiceTransport>,
+    /// Port allocator for dedicated devices (band above the global WG port).
+    dedicated_ports: DedicatedPortAllocator,
     /// Per-service bridge state (Linux only).
     #[cfg(target_os = "linux")]
     service_bridges: HashMap<String, ServiceBridge>,
-    /// Local fallback `ServiceSubnetRegistry` (Linux only).
-    #[cfg(target_os = "linux")]
+    /// Local fallback `ServiceSubnetRegistry`. Used by the Linux Shared bridge
+    /// path and by the cross-platform Dedicated path (subnets stay globally
+    /// unique regardless of mode/OS).
     service_subnet_registry: Option<zlayer_overlay::allocator::ServiceSubnetRegistry>,
     /// Local raft node id used as the partition key for service-subnet assign.
     local_node_id: u64,
@@ -183,6 +215,12 @@ pub struct OverlaydServer {
     /// Map of HCN namespace GUID -> (`service_name`, `allocated_ip`) for autoclean.
     #[cfg(target_os = "windows")]
     hcn_cleanup: HashMap<windows::core::GUID, (String, std::net::IpAddr)>,
+    /// Per-service container-IP allocators for Windows dedicated services. Each
+    /// is bounded to that service's subnet (not the node slice) so dedicated
+    /// containers draw addresses from their own isolated network. Keyed by
+    /// service name; created lazily on the first dedicated attach.
+    #[cfg(target_os = "windows")]
+    service_ip_allocators: HashMap<String, IpAllocator>,
     /// Per-PID tracking of overlay attachments on Linux.
     #[cfg(target_os = "linux")]
     attached: HashMap<u32, AttachInfo>,
@@ -217,6 +255,19 @@ impl OverlaydServer {
         // Until SetupGlobalOverlay arrives, the allocator is bounded to the
         // default cluster /16. SetupGlobalOverlay re-binds it to the node slice.
         let default_cidr: IpNetwork = "10.200.0.0/16".parse().expect("compile-time constant CIDR");
+        let overlay_port = zlayer_core::DEFAULT_WG_PORT;
+
+        // Rehydrate the dedicated-port allocator from the on-disk marker so a
+        // service that already owns a dedicated overlay re-binds the exact UDP
+        // port it had before this process started.
+        let marker_path = zlayer_paths::ZLayerDirs::new(data_dir.clone()).agent_network_state();
+        let recorded_dedicated_ports: Vec<u16> = NetworkState::load(&marker_path)
+            .networks
+            .iter()
+            .filter(|n| n.owner.starts_with("service:"))
+            .filter_map(|n| n.wg_port)
+            .collect();
+
         Self {
             deployment: String::new(),
             instance_id: String::new(),
@@ -224,20 +275,23 @@ impl OverlaydServer {
             global_interface: None,
             global_transport: None,
             service_interfaces: HashMap::new(),
+            service_transports: HashMap::new(),
+            dedicated_ports: DedicatedPortAllocator::new(overlay_port, recorded_dedicated_ports),
             #[cfg(target_os = "linux")]
             service_bridges: HashMap::new(),
-            #[cfg(target_os = "linux")]
             service_subnet_registry: None,
             local_node_id: 0,
             local_wg_pubkey: None,
             transport_public_key: None,
             ip_allocator: IpAllocator::new(default_cidr),
             node_ip: None,
-            overlay_port: zlayer_core::DEFAULT_WG_PORT,
+            overlay_port,
             cluster_cidr: Some(default_cidr),
             slice_cidr: None,
             #[cfg(target_os = "windows")]
             hcn_cleanup: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            service_ip_allocators: HashMap::new(),
             #[cfg(target_os = "linux")]
             attached: HashMap::new(),
             dns_server_addr: None,
@@ -322,8 +376,8 @@ impl OverlaydServer {
                 Ok(OverlaydResponse::Ok)
             }
             OverlaydRequest::SetupServiceOverlay { service, mode } => {
-                let name = self.setup_service_overlay(&service, mode).await?;
-                Ok(OverlaydResponse::BridgeName { name })
+                let info = self.setup_service_overlay(&service, mode).await?;
+                Ok(OverlaydResponse::ServiceOverlay(info))
             }
             OverlaydRequest::TeardownServiceOverlay { service } => {
                 self.teardown_service_overlay(&service).await;
@@ -356,21 +410,36 @@ impl OverlaydServer {
                 self.detach_container(handle).await?;
                 Ok(OverlaydResponse::Ok)
             }
-            OverlaydRequest::AddPeer(spec) => {
-                let peer = peer_spec_to_info(&spec)?;
-                self.add_global_peer(&peer).await?;
+            // `scope` selects the target device: `Global` (default) = the single
+            // cluster transport; `Service { service }` = that service's
+            // dedicated per-service transport.
+            OverlaydRequest::AddPeer { peer, scope } => {
+                let peer = peer_spec_to_info(&peer)?;
+                let transport = self.transport_for_scope(&scope)?;
+                Self::add_peer_on(transport, &peer).await?;
                 Ok(OverlaydResponse::Ok)
             }
-            OverlaydRequest::RemovePeer { pubkey } => {
-                self.remove_global_peer(&pubkey).await?;
+            OverlaydRequest::RemovePeer { pubkey, scope } => {
+                let transport = self.transport_for_scope(&scope)?;
+                Self::remove_peer_on(transport, &pubkey).await?;
                 Ok(OverlaydResponse::Ok)
             }
-            OverlaydRequest::AddAllowedIp { pubkey, cidr } => {
-                self.add_allowed_ip(&pubkey, &cidr).await?;
+            OverlaydRequest::AddAllowedIp {
+                pubkey,
+                cidr,
+                scope,
+            } => {
+                let transport = self.transport_for_scope(&scope)?;
+                Self::add_allowed_ip_on(transport, &pubkey, &cidr).await?;
                 Ok(OverlaydResponse::Ok)
             }
-            OverlaydRequest::RemoveAllowedIp { pubkey, cidr } => {
-                self.remove_allowed_ip(&pubkey, &cidr).await?;
+            OverlaydRequest::RemoveAllowedIp {
+                pubkey,
+                cidr,
+                scope,
+            } => {
+                let transport = self.transport_for_scope(&scope)?;
+                Self::remove_allowed_ip_on(transport, &pubkey, &cidr).await?;
                 Ok(OverlaydResponse::Ok)
             }
             OverlaydRequest::RegisterDns { name, ip } => {
@@ -497,19 +566,42 @@ impl OverlaydServer {
     /// cannot be created, or if the cluster transport rejects the `AllowedIPs`
     /// update.
     #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_lines)]
     async fn setup_service_overlay(
         &mut self,
         service: &str,
-        _mode: zlayer_types::overlayd::OverlayMode,
-    ) -> Result<String, OverlaydError> {
+        mode: OverlayMode,
+    ) -> Result<ServiceOverlayInfo, OverlaydError> {
+        match mode.resolve() {
+            OverlayMode::Shared => self.setup_service_overlay_shared(service).await,
+            OverlayMode::Dedicated => self.setup_service_overlay_dedicated(service).await,
+            OverlayMode::Auto => unreachable!("OverlayMode::resolve never returns Auto"),
+        }
+    }
+
+    /// Shared-mode per-service overlay (Linux): the per-service bridge backed by
+    /// the single cluster transport. This is the original `setup_service_overlay`
+    /// body verbatim, now returning a [`ServiceOverlayInfo`] with the bridge name
+    /// and all identity fields `None` (Shared mode shares the cluster device).
+    ///
+    /// Returns the bridge name on success.
+    ///
+    /// # Errors
+    /// Returns an error if subnet assignment fails (exhaustion), if the bridge
+    /// cannot be created, or if the cluster transport rejects the `AllowedIPs`
+    /// update.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_lines)]
+    async fn setup_service_overlay_shared(
+        &mut self,
+        service: &str,
+    ) -> Result<ServiceOverlayInfo, OverlaydError> {
         use zlayer_overlay::allocator::IpAllocator as OverlayIpAllocator;
 
         // 1. Idempotency check.
         if let Some(existing) = self.service_bridges.get(service) {
             let name = existing.name.clone();
             tracing::debug!(service = %service, bridge = %name, "Service bridge already active, reusing");
-            return Ok(name);
+            return Ok(shared_overlay_info(name));
         }
 
         // 2. Assign subnet via the (currently local) ServiceSubnetRegistry.
@@ -527,7 +619,53 @@ impl OverlaydServer {
             })?
         };
 
-        // 3. Compute bridge name + create bridge.
+        // 3+4+6. Create the per-service Linux bridge, assign its gateway, bring
+        // it up, build the per-service IpAllocator, and record it.
+        let bridge_name = self.create_service_bridge(service, subnet).await?;
+
+        // 5. Plumb subnet into the cluster transport's local AllowedIPs so the
+        // single cluster device carries this service's cross-node traffic
+        // (Shared mode shares one crypto context for every service).
+        if let Some(ref cluster) = self.global_transport {
+            if let Some(ref pubkey) = self.local_wg_pubkey {
+                if let Err(e) = cluster.add_allowed_ip(pubkey, subnet).await {
+                    tracing::warn!(
+                        service = %service,
+                        subnet = %subnet,
+                        error = %e,
+                        "Failed to add service subnet to cluster transport AllowedIPs (non-fatal)"
+                    );
+                }
+            } else {
+                tracing::debug!(service = %service, "local_wg_pubkey not yet set; skipping cluster AllowedIPs update");
+            }
+        }
+
+        Ok(shared_overlay_info(bridge_name))
+    }
+
+    /// Create the per-service Linux bridge for `service` on `subnet`, assign its
+    /// gateway, bring it up, build the per-service [`IpAllocator`], and record it
+    /// in `service_bridges` + `service_interfaces`. Returns the bridge name.
+    ///
+    /// Shared and Dedicated mode share this bridge mechanic verbatim — the ONLY
+    /// difference between the two modes is which `WireGuard` device the service
+    /// subnet/peers are plumbed onto (the single cluster transport for Shared,
+    /// the dedicated per-service transport for Dedicated). This helper does NOT
+    /// touch any transport's `AllowedIPs`; the caller does that against the
+    /// device it owns.
+    ///
+    /// # Errors
+    /// Returns an error if the bridge cannot be created, addressed, or brought
+    /// up, or if the per-service `IpAllocator` cannot be built.
+    #[cfg(target_os = "linux")]
+    async fn create_service_bridge(
+        &mut self,
+        service: &str,
+        subnet: ipnet::IpNet,
+    ) -> Result<String, OverlaydError> {
+        use zlayer_overlay::allocator::IpAllocator as OverlayIpAllocator;
+
         let bridge_name = make_interface_name(&[&self.deployment, &self.instance_id, service], "b");
 
         if let Err(e) = crate::netlink::create_bridge(&bridge_name).await {
@@ -539,7 +677,7 @@ impl OverlaydServer {
             tracing::warn!(bridge = %bridge_name, error = %e, "set_bridge_stp(off) failed (non-fatal)");
         }
 
-        // 4. Pick gateway = first usable host in the subnet, assign to bridge.
+        // Gateway = first usable host in the subnet, assigned to the bridge.
         let gateway = first_usable_ip(subnet);
         if let Err(e) =
             crate::netlink::add_address_to_link_by_name(&bridge_name, gateway, subnet.prefix_len())
@@ -558,23 +696,7 @@ impl OverlaydServer {
             )));
         }
 
-        // 5. Plumb subnet into the cluster transport's local AllowedIPs.
-        if let Some(ref cluster) = self.global_transport {
-            if let Some(ref pubkey) = self.local_wg_pubkey {
-                if let Err(e) = cluster.add_allowed_ip(pubkey, subnet).await {
-                    tracing::warn!(
-                        service = %service,
-                        subnet = %subnet,
-                        error = %e,
-                        "Failed to add service subnet to cluster transport AllowedIPs (non-fatal)"
-                    );
-                }
-            } else {
-                tracing::debug!(service = %service, "local_wg_pubkey not yet set; skipping cluster AllowedIPs update");
-            }
-        }
-
-        // 6. Build per-service IpAllocator, reserve gateway.
+        // Build per-service IpAllocator, reserve the gateway.
         let mut ip_allocator = OverlayIpAllocator::new(&subnet.to_string()).map_err(|e| {
             OverlaydError::Overlay(format!("IpAllocator::new({subnet}) failed: {e}"))
         })?;
@@ -604,61 +726,402 @@ impl OverlaydServer {
     /// # Errors
     /// Infallible on non-Linux; the `Result` is preserved for ABI parity.
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_async)]
     async fn setup_service_overlay(
         &mut self,
         service: &str,
-        _mode: zlayer_types::overlayd::OverlayMode,
-    ) -> Result<String, OverlaydError> {
+        mode: OverlayMode,
+    ) -> Result<ServiceOverlayInfo, OverlaydError> {
+        match mode.resolve() {
+            OverlayMode::Shared => self.setup_service_overlay_shared(service).await,
+            OverlayMode::Dedicated => self.setup_service_overlay_dedicated(service).await,
+            OverlayMode::Auto => unreachable!("OverlayMode::resolve never returns Auto"),
+        }
+    }
+
+    /// Shared-mode per-service overlay (non-Linux): on Windows the per-service
+    /// segment is the HCN Internal network created lazily at attach time, and on
+    /// macOS containers fall through to host networking. Registers the service
+    /// in `service_interfaces` with a placeholder name so presence checks work.
+    ///
+    /// # Errors
+    /// Infallible on non-Linux; the `Result` is preserved for ABI parity.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_async)]
+    async fn setup_service_overlay_shared(
+        &mut self,
+        service: &str,
+    ) -> Result<ServiceOverlayInfo, OverlaydError> {
         let placeholder = make_interface_name(&[&self.deployment, &self.instance_id, service], "b");
         self.service_interfaces
             .insert(service.to_string(), placeholder.clone());
         tracing::debug!(service = %service, "Service overlay bridge setup is Linux-only; using direct networking placeholder");
-        Ok(placeholder)
+        Ok(shared_overlay_info(placeholder))
+    }
+
+    /// Dedicated-mode per-service overlay: stand up a *second* real `WireGuard`
+    /// device for `service` with its own crypto context, listen port, overlay
+    /// IP, and subnet — distinct from the single cluster transport.
+    ///
+    /// The cross-platform core (identity, subnet assign, transport bring-up,
+    /// marker persist, status) runs on every OS; only the *attachment* of
+    /// containers onto the device is platform-gated:
+    /// - Linux: a per-service bridge (same mechanic as Shared) routed over the
+    ///   dedicated device instead of the cluster device.
+    /// - Windows: a per-service HCN Internal network (a later task; a clearly
+    ///   marked seam returns an error here for now).
+    /// - macOS: nothing further — the utun device is the attachment.
+    ///
+    /// # Errors
+    /// Returns an error if port/key/subnet allocation, transport bring-up,
+    /// marker persistence, or the platform attachment fails.
+    #[allow(clippy::too_many_lines)]
+    async fn setup_service_overlay_dedicated(
+        &mut self,
+        service: &str,
+    ) -> Result<ServiceOverlayInfo, OverlaydError> {
+        // ----- cross-platform core (runs on every OS) -----
+
+        // 1. Idempotency: an existing dedicated transport returns its identity.
+        if let Some(st) = self.service_transports.get(service) {
+            return Ok(dedicated_overlay_info(
+                st.interface.clone(),
+                &st.public_key,
+                st.listen_port,
+                st.overlay_ip,
+                st.subnet,
+            ));
+        }
+
+        // 2. Identity: reuse a stable identity from the marker if one exists
+        //    (so the device re-binds the same key + port across restarts),
+        //    otherwise mint a fresh port + keypair + interface name.
+        let marker_path =
+            zlayer_paths::ZLayerDirs::new(self.data_dir.clone()).agent_network_state();
+        let recorded = NetworkState::load(&marker_path)
+            .get(&owner_for_service(service))
+            .cloned();
+
+        let (private_key, public_key, listen_port, iface_hint) = match recorded.as_ref() {
+            Some(entry)
+                if entry.wg_private_key.is_some()
+                    && entry.wg_public_key.is_some()
+                    && entry.wg_port.is_some()
+                    && entry.interface.is_some() =>
+            {
+                let port = entry.wg_port.expect("checked above");
+                self.dedicated_ports.reserve(port);
+                (
+                    entry.wg_private_key.clone().expect("checked above"),
+                    entry.wg_public_key.clone().expect("checked above"),
+                    port,
+                    entry.interface.clone().expect("checked above"),
+                )
+            }
+            _ => {
+                let port = self.dedicated_ports.allocate()?;
+                let (priv_key, pub_key) = OverlayTransport::generate_keys()
+                    .await
+                    .map_err(|e| OverlaydError::Overlay(format!("Failed to generate keys: {e}")))?;
+                let iface =
+                    make_interface_name(&[&self.deployment, &self.instance_id, service], "d");
+                (priv_key, pub_key, port, iface)
+            }
+        };
+
+        // 3. Subnet: assign from the same registry Shared uses, so per-service
+        //    subnets stay globally unique regardless of mode.
+        self.ensure_service_subnet_registry()?;
+        let subnet: ipnet::IpNet = {
+            let registry = self
+                .service_subnet_registry
+                .as_mut()
+                .expect("ensure_service_subnet_registry leaves Some");
+            let node_key = self.local_node_id.to_string();
+            registry.assign(service, &node_key).map_err(|e| {
+                OverlaydError::Overlay(format!(
+                    "ServiceSubnetRegistry::assign({service}, {node_key}) failed: {e}"
+                ))
+            })?
+        };
+        let overlay_ip = first_usable_ip(subnet);
+
+        // 4. Build + bring up the dedicated transport. The device's overlay CIDR
+        //    is the service subnet (so boringtun routes that subnet over THIS
+        //    device), and its listen port is the dedicated port.
+        let config = self.build_config(
+            private_key.clone(),
+            public_key.clone(),
+            overlay_ip,
+            subnet.prefix_len(),
+            listen_port,
+        );
+        let mut transport = OverlayTransport::new(config, iface_hint);
+        transport.create_interface().await.map_err(|e| {
+            OverlaydError::Overlay(format!(
+                "Failed to create dedicated overlay for {service}: {e}"
+            ))
+        })?;
+        transport.configure(&[]).await.map_err(|e| {
+            OverlaydError::Overlay(format!(
+                "Failed to configure dedicated overlay for {service}: {e}"
+            ))
+        })?;
+        let actual_iface = transport.interface_name().to_string();
+
+        // 5. Persist the marker so the identity survives restarts. Match the
+        //    base/Shared entry shape (owner/kind/name/id/subnet) plus the
+        //    dedicated WG fields.
+        let mut marker = NetworkState::load(&marker_path);
+        marker.upsert(ManagedNetwork {
+            owner: owner_for_service(service),
+            kind: "wg-dedicated".to_string(),
+            name: actual_iface.clone(),
+            id: public_key.clone(),
+            subnet: subnet.to_string(),
+            wg_port: Some(listen_port),
+            wg_private_key: Some(private_key),
+            wg_public_key: Some(public_key.clone()),
+            interface: Some(actual_iface.clone()),
+        });
+        if let Err(e) = marker.save(&marker_path) {
+            tracing::warn!(service = %service, error = %e, path = %marker_path.display(), "failed to persist dedicated-overlay marker (device still live)");
+        }
+
+        // 6. Record the live transport.
+        self.service_transports.insert(
+            service.to_string(),
+            ServiceTransport {
+                transport,
+                interface: actual_iface.clone(),
+                public_key: public_key.clone(),
+                listen_port,
+                overlay_ip,
+                subnet,
+            },
+        );
+
+        tracing::info!(
+            service = %service,
+            interface = %actual_iface,
+            listen_port,
+            subnet = %subnet,
+            overlay_ip = %overlay_ip,
+            "Dedicated per-service overlay device created"
+        );
+
+        // ----- platform-gated attachment -----
+        // `name` in the returned info is the container-attach handle: the bridge
+        // name on Linux, the dedicated interface elsewhere.
+        let name = self
+            .attach_dedicated_service(service, subnet, overlay_ip)
+            .await?;
+
+        Ok(dedicated_overlay_info(
+            name,
+            &public_key,
+            listen_port,
+            overlay_ip,
+            subnet,
+        ))
+    }
+
+    /// Linux attachment for a dedicated per-service overlay: create the same
+    /// per-service bridge Shared uses, but route the service subnet over the
+    /// DEDICATED device rather than the cluster device.
+    ///
+    /// Concretely, the dedicated transport's overlay CIDR already covers
+    /// `subnet` (set at `build_config` time in the core), so boringtun routes
+    /// `subnet` out the dedicated TUN; we additionally plumb `subnet` onto this
+    /// node's own `AllowedIPs` entry on the dedicated device so locally
+    /// originated packets to the subnet are accepted. Returns the bridge name.
+    ///
+    /// # Errors
+    /// Returns an error if the bridge cannot be created.
+    #[cfg(target_os = "linux")]
+    async fn attach_dedicated_service(
+        &mut self,
+        service: &str,
+        subnet: ipnet::IpNet,
+        overlay_ip: IpAddr,
+    ) -> Result<String, OverlaydError> {
+        let _ = overlay_ip;
+        let bridge_name = self.create_service_bridge(service, subnet).await?;
+
+        // Plumb the service subnet onto the DEDICATED device (not the cluster
+        // device). The dedicated transport's overlay CIDR already routes the
+        // subnet out its TUN; adding it to our own pubkey's AllowedIPs keeps the
+        // local-accept side consistent with the Shared path's cluster plumbing.
+        if let Some(st) = self.service_transports.get(service) {
+            if let Some(ref pubkey) = self.local_wg_pubkey {
+                if let Err(e) = st.transport.add_allowed_ip(pubkey, subnet).await {
+                    tracing::warn!(
+                        service = %service,
+                        subnet = %subnet,
+                        error = %e,
+                        "Failed to add service subnet to dedicated transport AllowedIPs (non-fatal)"
+                    );
+                }
+            } else {
+                tracing::debug!(service = %service, "local_wg_pubkey not yet set; skipping dedicated AllowedIPs update");
+            }
+        }
+
+        Ok(bridge_name)
+    }
+
+    /// Windows attachment for a dedicated per-service overlay.
+    ///
+    /// The cross-platform core has already stood up the dedicated Wintun
+    /// transport (the encrypted node-to-node path for the service subnet). This
+    /// adds the *container-facing* side: a per-service HCN **Internal** network
+    /// onto which the agent's containers attach (instead of the node's shared
+    /// base overlay network), so dedicated-service traffic is isolated at the
+    /// vSwitch layer. Returns the per-service network's name, which the caller
+    /// records as the [`ServiceOverlayInfo::name`] attach handle.
+    ///
+    /// # Errors
+    /// Propagates any error from [`Self::ensure_service_network`].
+    #[cfg(target_os = "windows")]
+    async fn attach_dedicated_service(
+        &mut self,
+        service: &str,
+        subnet: ipnet::IpNet,
+        _overlay_ip: IpAddr,
+    ) -> Result<String, OverlaydError> {
+        // Create (or reuse) the per-service Internal HCN network. The returned
+        // GUID is recorded in the marker under `owner_for_service(service)`;
+        // the `AttachContainer` handler reuses it via the same marker lookup.
+        let _net_id = self.ensure_service_network(service, subnet).await?;
+        // The attach handle reported back is the per-service network's name.
+        let daemon_name = self.deployment_or_default();
+        Ok(format!(
+            "{}-svc-{service}",
+            overlay_network_name(&daemon_name)
+        ))
+    }
+
+    /// macOS attachment for a dedicated per-service overlay: the cross-platform
+    /// core already brought up a utun device; there is no bridge, so the
+    /// interface name itself is the attach handle.
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+    #[allow(clippy::unused_async)]
+    async fn attach_dedicated_service(
+        &mut self,
+        service: &str,
+        _subnet: ipnet::IpNet,
+        _overlay_ip: IpAddr,
+    ) -> Result<String, OverlaydError> {
+        let iface = self
+            .service_transports
+            .get(service)
+            .map(|st| st.interface.clone())
+            .unwrap_or_default();
+        Ok(iface)
     }
 
     /// Tear down the per-service segment for `service`. Idempotent.
     // Only the Linux body awaits (netlink + cluster AllowedIPs); other targets
-    // are synchronous but must keep the async signature for the dispatch call.
+    // are synchronous (transport shutdown is sync) but must keep the async
+    // signature for the dispatch call.
     #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     async fn teardown_service_overlay(&mut self, service: &str) {
+        // Shared-mode segment teardown (bridge on Linux, placeholder elsewhere).
         #[cfg(target_os = "linux")]
         {
             let removed = self.service_bridges.remove(service);
             self.service_interfaces.remove(service);
-            let Some(bridge) = removed else {
-                return;
-            };
-
-            if let Some(ref cluster) = self.global_transport {
-                if let Some(ref pubkey) = self.local_wg_pubkey {
-                    if let Err(e) = cluster.remove_allowed_ip(pubkey, bridge.subnet).await {
-                        tracing::warn!(
-                            service = %service,
-                            subnet = %bridge.subnet,
-                            error = %e,
-                            "Failed to remove service subnet from cluster AllowedIPs (non-fatal)"
-                        );
+            if let Some(bridge) = removed {
+                if let Some(ref cluster) = self.global_transport {
+                    if let Some(ref pubkey) = self.local_wg_pubkey {
+                        if let Err(e) = cluster.remove_allowed_ip(pubkey, bridge.subnet).await {
+                            tracing::warn!(
+                                service = %service,
+                                subnet = %bridge.subnet,
+                                error = %e,
+                                "Failed to remove service subnet from cluster AllowedIPs (non-fatal)"
+                            );
+                        }
                     }
                 }
-            }
 
-            if let Err(e) = crate::netlink::delete_bridge(&bridge.name).await {
-                tracing::warn!(service = %service, bridge = %bridge.name, error = %e, "delete_bridge failed (non-fatal)");
-            }
+                if let Err(e) = crate::netlink::delete_bridge(&bridge.name).await {
+                    tracing::warn!(service = %service, bridge = %bridge.name, error = %e, "delete_bridge failed (non-fatal)");
+                }
 
-            if let Some(registry) = self.service_subnet_registry.as_mut() {
-                let node_key = self.local_node_id.to_string();
-                let _ = registry.release(service, &node_key);
-            }
+                if let Some(registry) = self.service_subnet_registry.as_mut() {
+                    let node_key = self.local_node_id.to_string();
+                    let _ = registry.release(service, &node_key);
+                }
 
-            tracing::info!(service = %service, bridge = %bridge.name, "Tore down service bridge");
+                tracing::info!(service = %service, bridge = %bridge.name, "Tore down service bridge");
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
             if let Some(iface) = self.service_interfaces.remove(service) {
                 tracing::info!(service = %service, interface = %iface, "Removed service overlay interface (placeholder, non-Linux)");
             }
+        }
+
+        // Dedicated-mode teardown (cross-platform): tear down the per-service
+        // transport, free its port, and drop its marker entry. No-op when the
+        // service ran in Shared mode (nothing in `service_transports`).
+        if let Some(mut st) = self.service_transports.remove(service) {
+            st.transport.shutdown();
+            self.dedicated_ports.release(st.listen_port);
+
+            // Release the subnet assignment (Shared releases it inside the
+            // Linux block above; the dedicated subnet lives in the same
+            // registry, so release it here for the dedicated case on every OS).
+            if let Some(registry) = self.service_subnet_registry.as_mut() {
+                let node_key = self.local_node_id.to_string();
+                let _ = registry.release(service, &node_key);
+            }
+
+            let marker_path =
+                zlayer_paths::ZLayerDirs::new(self.data_dir.clone()).agent_network_state();
+            let mut marker = NetworkState::load(&marker_path);
+            let removed_entry = marker.remove(&owner_for_service(service));
+            if removed_entry.is_some() {
+                if let Err(e) = marker.save(&marker_path) {
+                    tracing::warn!(service = %service, error = %e, path = %marker_path.display(), "failed to persist dedicated-overlay marker removal");
+                }
+            }
+
+            // Windows: delete the per-service HCN Internal network this service
+            // owned. The marker entry's `id` is the bare HCN GUID (set by
+            // `ensure_service_network`); delete the network so a dedicated
+            // service tears down cleanly without waiting for a full uninstall.
+            // Also drop the per-service container-IP allocator.
+            #[cfg(target_os = "windows")]
+            {
+                self.service_ip_allocators.remove(service);
+                if let Some(entry) = removed_entry.as_ref() {
+                    if entry.kind == "hcn-internal" {
+                        if let Ok(guid) = windows::core::GUID::try_from(entry.id.as_str()) {
+                            match zlayer_hns::network::Network::delete(guid) {
+                                Ok(()) => {
+                                    tracing::info!(service = %service, id = %entry.id, "deleted per-service HCN network");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(service = %service, id = %entry.id, error = %e, "failed to delete per-service HCN network (may leak until uninstall)");
+                                }
+                            }
+                        } else {
+                            tracing::warn!(service = %service, id = %entry.id, "per-service marker has unparseable HCN GUID; skipping network delete");
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            drop(removed_entry);
+
+            tracing::info!(
+                service = %service,
+                interface = %st.interface,
+                listen_port = st.listen_port,
+                "Tore down dedicated per-service overlay device"
+            );
         }
     }
 
@@ -668,7 +1131,6 @@ impl OverlaydServer {
     /// # Errors
     /// Returns an error when no cluster CIDR is configured or the registry
     /// cannot be built.
-    #[cfg(target_os = "linux")]
     fn ensure_service_subnet_registry(&mut self) -> Result<(), OverlaydError> {
         use zlayer_overlay::allocator::ServiceSubnetRegistry;
 
@@ -1080,22 +1542,59 @@ impl OverlaydServer {
         dns_server: Option<IpAddr>,
         dns_domain: Option<String>,
     ) -> Result<AttachResult, OverlaydError> {
-        let slice = self.slice_cidr.ok_or_else(|| {
-            OverlaydError::Other(
-                "no node slice assigned yet (SetupGlobalOverlay with slice_cidr first)".to_string(),
-            )
-        })?;
-        let slice_ipnet: ipnet::IpNet = slice.to_string().parse().map_err(|e| {
-            OverlaydError::Other(format!("failed to parse slice CIDR {slice}: {e}"))
-        })?;
+        // Resolve whether THIS service has a dedicated per-service overlay. It
+        // does iff a live dedicated transport exists OR a `hcn-internal` marker
+        // entry is recorded under `owner_for_service(service)` (the network
+        // survives daemon restarts even if the transport map is empty mid-init).
+        // Dedicated services attach onto their OWN per-service Internal network
+        // and draw IPs from the service subnet; everything else uses the node's
+        // shared base overlay network and the node slice.
+        let dedicated_subnet = self.dedicated_service_subnet(service);
 
-        // 1. Ensure the overlay HCN Internal network exists (reuse via marker).
-        let net_id = self.ensure_overlay_network(slice_ipnet).await?;
+        let (net_id, ip, prefix_length) = if let Some(svc_subnet) = dedicated_subnet {
+            // ----- dedicated per-service network path -----
+            let net_id = self.ensure_service_network(service, svc_subnet).await?;
 
-        // 2. Allocate or validate the IP from the node slice.
-        let ip = match ip_override {
-            Some(ip) => ip,
-            None => self.ip_allocator.allocate()?,
+            // Allocate (or validate) the IP from the SERVICE subnet, not the
+            // node slice. A per-service allocator is created lazily and bounded
+            // to the service subnet so addresses stay inside the dedicated
+            // network. An `ip_override` inside the service subnet is honored;
+            // one outside it is rejected so a slice-allocated IP can't leak onto
+            // the dedicated network.
+            let svc_ipnetwork: IpNetwork = svc_subnet.to_string().parse().map_err(|e| {
+                OverlaydError::Other(format!("failed to parse service subnet {svc_subnet}: {e}"))
+            })?;
+            let allocator = self
+                .service_ip_allocators
+                .entry(service.to_string())
+                .or_insert_with(|| IpAllocator::new(svc_ipnetwork));
+            let ip = match ip_override {
+                Some(ip) if svc_subnet.contains(&ip) => ip,
+                Some(ip) => {
+                    return Err(OverlaydError::Other(format!(
+                        "overridden IP {ip} is not inside dedicated service subnet {svc_subnet} for service {service}"
+                    )));
+                }
+                None => allocator.allocate()?,
+            };
+            (net_id, ip, svc_subnet.prefix_len())
+        } else {
+            // ----- shared base overlay network path (unchanged) -----
+            let slice = self.slice_cidr.ok_or_else(|| {
+                OverlaydError::Other(
+                    "no node slice assigned yet (SetupGlobalOverlay with slice_cidr first)"
+                        .to_string(),
+                )
+            })?;
+            let slice_ipnet: ipnet::IpNet = slice.to_string().parse().map_err(|e| {
+                OverlaydError::Other(format!("failed to parse slice CIDR {slice}: {e}"))
+            })?;
+            let net_id = self.ensure_overlay_network(slice_ipnet).await?;
+            let ip = match ip_override {
+                Some(ip) => ip,
+                None => self.ip_allocator.allocate()?,
+            };
+            (net_id, ip, slice_ipnet.prefix_len())
         };
 
         // 3. Create the endpoint + per-container namespace on the network.
@@ -1103,7 +1602,6 @@ impl OverlaydServer {
         let dns_domain_for_attach = dns_domain.or_else(|| self.dns_domain.clone());
         let cluster_cidr = self.cluster_cidr.map(|c| c.to_string()).unwrap_or_default();
         let owner_tag = owner_tag(&self.deployment_or_default());
-        let prefix_length = slice_ipnet.prefix_len();
         let cid = container_id.to_string();
 
         let attachment = tokio::task::spawn_blocking(move || {
@@ -1318,12 +1816,188 @@ impl OverlaydServer {
             name: net_name.clone(),
             id: format_guid_bare(net_id),
             subnet: subnet_str.clone(),
+            // Base/Shared HCN network: no dedicated WireGuard identity.
+            wg_port: None,
+            wg_private_key: None,
+            wg_public_key: None,
+            interface: None,
         });
         if let Err(e) = marker.save(&marker_path) {
             tracing::warn!(error = %e, path = %marker_path.display(), "failed to persist agent network marker (network still reusable by name)");
         }
 
         Ok(net_id)
+    }
+
+    /// Ensure the per-service HCN **Internal** network for `service` exists on
+    /// the host, reusing one recorded under the `service:<name>` marker owner
+    /// (or discoverable by its derived name) and recording it on create.
+    ///
+    /// This is the Windows analogue of the Linux per-service bridge: a
+    /// dedicated (`OverlayMode::Dedicated`) service gets its OWN isolated HCN
+    /// Internal network — an internal vSwitch with NO physical-NIC binding —
+    /// distinct from the node's shared base overlay network. Containers attach
+    /// to it (rather than the base network) so dedicated-service traffic is
+    /// segregated at the vSwitch layer. Modeled on [`Self::ensure_overlay_network`]
+    /// but keyed on [`owner_for_service`] and forced to the Internal type (never
+    /// Transparent — the on-box test asserts zero external vSwitches for
+    /// dedicated services).
+    ///
+    /// Returns the network GUID.
+    ///
+    /// # Errors
+    /// Propagates the underlying `zlayer_hns` error on create failure.
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_lines)]
+    async fn ensure_service_network(
+        &mut self,
+        service: &str,
+        subnet: ipnet::IpNet,
+    ) -> Result<windows::core::GUID, OverlaydError> {
+        use windows::core::GUID;
+
+        let daemon_name = self.deployment_or_default();
+        // Per-service network name: `<base overlay name>-svc-<service>` so it is
+        // unambiguously distinct from the base network and from other services.
+        let net_name = format!("{}-svc-{service}", overlay_network_name(&daemon_name));
+        let owner = owner_for_service(service);
+        let marker_path =
+            zlayer_paths::ZLayerDirs::new(self.data_dir.clone()).agent_network_state();
+
+        // Fast path: marker names a network GUID that still exists; reopen it.
+        // Only honor the recorded id when it belongs to an HCN-internal entry —
+        // a Dedicated WireGuard marker (`kind == "wg-dedicated"`) stores the
+        // transport public key in `id`, NOT an HCN GUID, so it must be ignored
+        // for HCN reuse.
+        let recorded_hcn_id = crate::network_state::NetworkState::load(&marker_path)
+            .get(&owner)
+            .filter(|entry| entry.kind == "hcn-internal")
+            .and_then(|entry| GUID::try_from(entry.id.as_str()).ok());
+        if let Some(recorded_id) = recorded_hcn_id {
+            let reopened = tokio::task::spawn_blocking(move || {
+                zlayer_hns::network::Network::open(recorded_id).ok()
+            })
+            .await
+            .map_err(|e| OverlaydError::Other(format!("spawn_blocking join failed: {e}")))?;
+            if reopened.is_some() {
+                tracing::info!(name = %net_name, service = %service, "reusing per-service HCN network from marker");
+                return Ok(recorded_id);
+            }
+        }
+
+        // Idempotency: reuse a host network whose queried name matches ours.
+        let target_name = net_name.clone();
+        let existing = tokio::task::spawn_blocking(move || -> Option<GUID> {
+            let guids = zlayer_hns::network::list("{}").ok()?;
+            for guid in guids {
+                let Ok(network) = zlayer_hns::network::Network::open(guid) else {
+                    continue;
+                };
+                if matches!(network.query("{}"), Ok(props) if props.name == target_name) {
+                    return Some(guid);
+                }
+            }
+            None
+        })
+        .await
+        .map_err(|e| OverlaydError::Other(format!("spawn_blocking join failed: {e}")))?;
+
+        if let Some(existing_id) = existing {
+            tracing::info!(name = %net_name, service = %service, "reusing existing per-service HCN network");
+            return Ok(existing_id);
+        }
+
+        let net_id = GUID::new()
+            .map_err(|e| OverlaydError::Other(format!("GUID::new for per-service network: {e}")))?;
+        let subnet_str = subnet.to_string();
+
+        // ALWAYS Internal for a dedicated service — never Transparent. The
+        // dedicated requirement is isolation; an Internal network binds NO
+        // physical NIC (no external vSwitch), which is what the on-box test
+        // asserts.
+        let net_name_for_create = net_name.clone();
+        let subnet_for_create = subnet_str.clone();
+        tokio::task::spawn_blocking(move || {
+            zlayer_hns::network::Network::create_internal(
+                net_id,
+                &net_name_for_create,
+                &subnet_for_create,
+            )
+        })
+        .await
+        .map_err(|e| OverlaydError::Other(format!("spawn_blocking join failed: {e}")))?
+        .map_err(|e| {
+            OverlaydError::Overlay(format!("HcnCreateNetwork internal ({net_name}): {e}"))
+        })?;
+
+        // HCN's Static IPAM needs ~1-2s after network create to settle its
+        // address pool; without this the first endpoint frequently fails with
+        // HCN_E_ADDR_INVALID_OR_RESERVED (same wait as the base network).
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+        tracing::info!(
+            service = %service,
+            subnet = %subnet_str,
+            "created per-service HCN Internal network"
+        );
+
+        // Persist the marker (owner = `service:<name>`, kind = `hcn-internal`)
+        // so subsequent runs reuse this network by GUID and a full uninstall
+        // (`purge_managed_networks`, which sweeps every `kind` starting with
+        // `hcn`) deletes it. Best-effort.
+        //
+        // A dedicated Windows service shares the SAME owner key for two facts:
+        // the dedicated WireGuard identity (written by the cross-platform core
+        // in `setup_service_overlay_dedicated`, kind `wg-dedicated`) and this
+        // HCN network's GUID. The marker is keyed by owner, so carry the WG
+        // identity fields over when we rewrite the entry to `hcn-internal` — the
+        // single entry then holds both the HCN GUID (in `id`) and the WG
+        // identity (in the `wg_*`/`interface` fields), and the WG private key
+        // survives restarts. (The core re-asserts the `wg-dedicated` shape on
+        // the next setup; this path re-asserts `hcn-internal` again right after
+        // — both are self-healing because the network is also reusable by name.)
+        let mut marker = crate::network_state::NetworkState::load(&marker_path);
+        let carried = marker.get(&owner).cloned();
+        marker.upsert(crate::network_state::ManagedNetwork {
+            owner,
+            kind: "hcn-internal".to_string(),
+            name: net_name.clone(),
+            id: format_guid_bare(net_id),
+            subnet: subnet_str.clone(),
+            wg_port: carried.as_ref().and_then(|c| c.wg_port),
+            wg_private_key: carried.as_ref().and_then(|c| c.wg_private_key.clone()),
+            wg_public_key: carried.as_ref().and_then(|c| c.wg_public_key.clone()),
+            interface: carried.as_ref().and_then(|c| c.interface.clone()),
+        });
+        if let Err(e) = marker.save(&marker_path) {
+            tracing::warn!(service = %service, error = %e, path = %marker_path.display(), "failed to persist per-service network marker (network still reusable by name)");
+        }
+
+        Ok(net_id)
+    }
+
+    /// Resolve the dedicated per-service subnet for `service`, if the service
+    /// runs in `OverlayMode::Dedicated` on this node.
+    ///
+    /// Source of truth, in order:
+    /// 1. The live [`ServiceTransport`] in `service_transports` (the normal
+    ///    case once `SetupServiceOverlay` has run this process).
+    /// 2. A persisted `hcn-internal` marker entry under
+    ///    [`owner_for_service`]`(service)` — covers the window where the HCN
+    ///    network exists from a prior run but the transport map is still empty.
+    ///
+    /// Returns `None` for Shared-mode services (attach onto the base network).
+    #[cfg(target_os = "windows")]
+    fn dedicated_service_subnet(&self, service: &str) -> Option<ipnet::IpNet> {
+        if let Some(st) = self.service_transports.get(service) {
+            return Some(st.subnet);
+        }
+        let marker_path =
+            zlayer_paths::ZLayerDirs::new(self.data_dir.clone()).agent_network_state();
+        crate::network_state::NetworkState::load(&marker_path)
+            .get(&owner_for_service(service))
+            .filter(|entry| entry.kind == "hcn-internal")
+            .and_then(|entry| entry.subnet.parse::<ipnet::IpNet>().ok())
     }
 
     /// The daemon name used for HCN network/owner naming, defaulting to
@@ -1339,44 +2013,67 @@ impl OverlaydServer {
 
     // -- peers ---------------------------------------------------------------
 
-    /// Add a peer to the live global overlay transport.
+    /// Resolve a [`PeerScope`] to the live [`OverlayTransport`] its ops target.
+    ///
+    /// `Global` -> the single cluster transport; `Service { service }` -> that
+    /// service's dedicated per-service transport (Dedicated mode only).
     ///
     /// # Errors
-    /// Returns an error when the global overlay has not yet been set up, or
-    /// wraps the underlying transport error.
-    async fn add_global_peer(&self, peer: &PeerInfo) -> Result<(), OverlaydError> {
-        let transport = self.global_transport.as_ref().ok_or_else(|| {
-            OverlaydError::Other("global overlay not set up; cannot add peer".to_string())
-        })?;
+    /// Returns an error if the global overlay is not up (for `Global`) or no
+    /// dedicated overlay exists for the named service (for `Service`).
+    fn transport_for_scope(&self, scope: &PeerScope) -> Result<&OverlayTransport, OverlaydError> {
+        match scope {
+            PeerScope::Global => self
+                .global_transport
+                .as_ref()
+                .ok_or_else(|| OverlaydError::Other("global overlay not set up".into())),
+            PeerScope::Service { service } => self
+                .service_transports
+                .get(service)
+                .map(|s| &s.transport)
+                .ok_or_else(|| {
+                    OverlaydError::Other(format!("no dedicated overlay for service {service}"))
+                }),
+        }
+    }
+
+    /// Add a peer to a resolved transport.
+    ///
+    /// # Errors
+    /// Wraps the underlying transport error.
+    async fn add_peer_on(
+        transport: &OverlayTransport,
+        peer: &PeerInfo,
+    ) -> Result<(), OverlaydError> {
         transport
             .add_peer(peer)
             .await
             .map_err(|e| OverlaydError::Overlay(format!("add_peer failed: {e}")))
     }
 
-    /// Remove a peer by base64 public key.
+    /// Remove a peer (by base64 public key) from a resolved transport.
     ///
     /// # Errors
-    /// Returns an error when the global overlay is not up, or on UAPI failure.
-    async fn remove_global_peer(&self, pubkey: &str) -> Result<(), OverlaydError> {
-        let transport = self.global_transport.as_ref().ok_or_else(|| {
-            OverlaydError::Other("global overlay not set up; cannot remove peer".to_string())
-        })?;
+    /// Wraps the underlying transport error.
+    async fn remove_peer_on(
+        transport: &OverlayTransport,
+        pubkey: &str,
+    ) -> Result<(), OverlaydError> {
         transport
             .remove_peer(pubkey)
             .await
             .map_err(|e| OverlaydError::Overlay(format!("remove_peer failed: {e}")))
     }
 
-    /// Plumb a CIDR into a peer's `AllowedIPs`.
+    /// Plumb a CIDR into a peer's `AllowedIPs` on a resolved transport.
     ///
     /// # Errors
-    /// Returns an error when the overlay is not up, the CIDR is invalid, or the
-    /// UAPI write fails.
-    async fn add_allowed_ip(&self, pubkey: &str, cidr: &str) -> Result<(), OverlaydError> {
-        let transport = self.global_transport.as_ref().ok_or_else(|| {
-            OverlaydError::Other("global overlay not set up; cannot add allowed ip".to_string())
-        })?;
+    /// Returns an error when the CIDR is invalid or the UAPI write fails.
+    async fn add_allowed_ip_on(
+        transport: &OverlayTransport,
+        pubkey: &str,
+        cidr: &str,
+    ) -> Result<(), OverlaydError> {
         let net: ipnet::IpNet = cidr
             .parse()
             .map_err(|e| OverlaydError::Other(format!("invalid CIDR {cidr}: {e}")))?;
@@ -1386,15 +2083,15 @@ impl OverlaydServer {
             .map_err(|e| OverlaydError::Overlay(format!("add_allowed_ip failed: {e}")))
     }
 
-    /// Remove a CIDR from a peer's `AllowedIPs`.
+    /// Remove a CIDR from a peer's `AllowedIPs` on a resolved transport.
     ///
     /// # Errors
-    /// Returns an error when the overlay is not up, the CIDR is invalid, or the
-    /// UAPI write fails.
-    async fn remove_allowed_ip(&self, pubkey: &str, cidr: &str) -> Result<(), OverlaydError> {
-        let transport = self.global_transport.as_ref().ok_or_else(|| {
-            OverlaydError::Other("global overlay not set up; cannot remove allowed ip".to_string())
-        })?;
+    /// Returns an error when the CIDR is invalid or the UAPI write fails.
+    async fn remove_allowed_ip_on(
+        transport: &OverlayTransport,
+        pubkey: &str,
+        cidr: &str,
+    ) -> Result<(), OverlaydError> {
         let net: ipnet::IpNet = cidr
             .parse()
             .map_err(|e| OverlaydError::Other(format!("invalid CIDR {cidr}: {e}")))?;
@@ -1480,6 +2177,25 @@ impl OverlaydServer {
         let service_count = u32::try_from(self.service_count()).unwrap_or(u32::MAX);
         let peer_count = u32::try_from(peers.len()).unwrap_or(u32::MAX);
 
+        // Per dedicated per-service overlay device: count its peers the same
+        // way the global status does (parse the UAPI/status dump).
+        let mut dedicated_services: Vec<DedicatedServiceStatus> = Vec::new();
+        for (svc, st) in &self.service_transports {
+            let peer_count = match st.transport.status().await {
+                Ok(dump) => u32::try_from(parse_peer_status(&dump).len()).unwrap_or(u32::MAX),
+                Err(_) => 0,
+            };
+            dedicated_services.push(DedicatedServiceStatus {
+                service: svc.clone(),
+                interface: st.interface.clone(),
+                public_key: st.public_key.clone(),
+                listen_port: st.listen_port,
+                overlay_ip: st.overlay_ip,
+                subnet: st.subnet.to_string(),
+                peer_count,
+            });
+        }
+
         StatusSnapshot {
             interface: self.global_interface.clone(),
             node_ip: self.node_ip,
@@ -1489,12 +2205,19 @@ impl OverlaydServer {
             peer_count,
             service_count,
             peers,
+            dedicated_services,
         }
     }
 
-    /// Number of per-service overlays set up on this node.
+    /// Number of per-service overlays set up on this node (Shared bridges /
+    /// placeholders plus any Dedicated transports not already counted there).
     fn service_count(&self) -> usize {
-        self.service_interfaces.len()
+        let extra_dedicated = self
+            .service_transports
+            .keys()
+            .filter(|svc| !self.service_interfaces.contains_key(*svc))
+            .count();
+        self.service_interfaces.len() + extra_dedicated
     }
 
     // -- config helper -------------------------------------------------------
@@ -1525,6 +2248,40 @@ impl OverlaydServer {
             config.uapi_sock_dir = dir;
         }
         config
+    }
+}
+
+/// Build a Shared-mode [`ServiceOverlayInfo`]: the bridge/placeholder name with
+/// every dedicated-device identity field left `None` (Shared mode shares the
+/// single cluster device).
+fn shared_overlay_info(name: String) -> ServiceOverlayInfo {
+    ServiceOverlayInfo {
+        name,
+        mode: OverlayMode::Shared,
+        wg_public_key: None,
+        wg_port: None,
+        overlay_ip: None,
+        subnet: None,
+    }
+}
+
+/// Build a Dedicated-mode [`ServiceOverlayInfo`] from a dedicated device's
+/// identity. `name` is the container-attach handle (bridge name on Linux, the
+/// dedicated interface elsewhere).
+fn dedicated_overlay_info(
+    name: String,
+    public_key: &str,
+    listen_port: u16,
+    overlay_ip: IpAddr,
+    subnet: ipnet::IpNet,
+) -> ServiceOverlayInfo {
+    ServiceOverlayInfo {
+        name,
+        mode: OverlayMode::Dedicated,
+        wg_public_key: Some(public_key.to_string()),
+        wg_port: Some(listen_port),
+        overlay_ip: Some(overlay_ip),
+        subnet: Some(subnet.to_string()),
     }
 }
 
@@ -1887,5 +2644,147 @@ latest_handshake=0
         // Released IP is handed back before the monotonic counter advances.
         let c = server.allocate_ip("svc", false).expect("alloc c");
         assert_eq!(c, a);
+    }
+
+    /// Build a throwaway server bound to a unique temp data dir so the marker
+    /// file (rehydrated in `new`) never collides between tests.
+    fn test_server() -> OverlaydServer {
+        let dir = std::env::temp_dir().join(format!(
+            "zlayer-overlayd-scope-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        OverlaydServer::new(dir)
+    }
+
+    #[tokio::test]
+    async fn transport_for_scope_global_requires_setup() {
+        let server = test_server();
+        // No global overlay set up yet -> Global scope errors. (Can't use
+        // `expect_err` because `&OverlayTransport` is not `Debug`.)
+        match server.transport_for_scope(&PeerScope::Global) {
+            Ok(_) => panic!("global overlay should not be set up"),
+            Err(OverlaydError::Other(m)) => {
+                assert!(m.contains("global overlay not set up"), "got: {m}");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_for_scope_unset_service_errors() {
+        let server = test_server();
+        match server.transport_for_scope(&PeerScope::Service {
+            service: "x".to_string(),
+        }) {
+            Ok(_) => panic!("no dedicated overlay should exist for x"),
+            Err(OverlaydError::Other(m)) => {
+                assert_eq!(m, "no dedicated overlay for service x");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_peer_service_scope_before_setup_errors_via_dispatch() {
+        let mut server = test_server();
+        let resp = server
+            .handle(OverlaydRequest::AddPeer {
+                peer: PeerSpec {
+                    public_key: "k".to_string(),
+                    endpoint: "1.2.3.4:51820".to_string(),
+                    allowed_ips: "10.200.0.2/32".to_string(),
+                    persistent_keepalive_secs: 0,
+                },
+                scope: PeerScope::Service {
+                    service: "x".to_string(),
+                },
+            })
+            .await;
+        match resp {
+            OverlaydResponse::Err { message } => {
+                assert_eq!(message, "no dedicated overlay for service x");
+            }
+            other => panic!("expected Err response, got {other:?}"),
+        }
+    }
+
+    /// End-to-end Dedicated setup. Needs a real TUN device, so it is ignored by
+    /// default and only runs on a privileged Linux host (mirrors the crate's
+    /// other privileged overlay e2e tests).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN; run on a privileged Linux host"]
+    async fn dedicated_setup_creates_distinct_device_and_routes_service_peer() {
+        let mut server = test_server();
+        // Bring up the global overlay first so the cluster CIDR + global device
+        // exist (the dedicated device must get a distinct port and key).
+        let global_name = server
+            .setup_global_overlay(
+                "dep".to_string(),
+                "i0".to_string(),
+                "10.200.0.0/16",
+                Some("10.200.0.0/28"),
+                zlayer_core::DEFAULT_WG_PORT,
+                false,
+            )
+            .await
+            .expect("global overlay up");
+        assert!(!global_name.is_empty());
+
+        // Dedicated service setup.
+        let info = server
+            .setup_service_overlay("web", OverlayMode::Dedicated)
+            .await
+            .expect("dedicated service overlay up");
+        assert_eq!(info.mode, OverlayMode::Dedicated);
+        let port = info.wg_port.expect("dedicated port");
+        assert_ne!(
+            port, server.overlay_port,
+            "dedicated device must not share the global port"
+        );
+
+        let st = server
+            .service_transports
+            .get("web")
+            .expect("service transport recorded");
+        assert_eq!(st.listen_port, port);
+        assert_ne!(
+            st.interface, global_name,
+            "dedicated interface must differ from global"
+        );
+        assert_eq!(
+            Some(st.public_key.clone()),
+            info.wg_public_key,
+            "info pubkey matches recorded transport"
+        );
+        assert_ne!(
+            Some(st.public_key.clone()),
+            server.transport_public_key,
+            "dedicated key must differ from global key"
+        );
+
+        // A Service-scoped AddPeer must land on the dedicated device (succeeds),
+        // proving scope routing targets the per-service transport.
+        let resp = server
+            .handle(OverlaydRequest::AddPeer {
+                peer: PeerSpec {
+                    public_key: {
+                        let (_priv, pubk) = OverlayTransport::generate_keys().await.unwrap();
+                        pubk
+                    },
+                    endpoint: "5.6.7.8:51999".to_string(),
+                    allowed_ips: "10.201.0.2/32".to_string(),
+                    persistent_keepalive_secs: 25,
+                },
+                scope: PeerScope::Service {
+                    service: "web".to_string(),
+                },
+            })
+            .await;
+        assert!(
+            matches!(resp, OverlaydResponse::Ok),
+            "service-scoped add_peer should land on the dedicated device, got {resp:?}"
+        );
     }
 }

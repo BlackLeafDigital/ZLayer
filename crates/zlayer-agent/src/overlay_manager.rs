@@ -87,6 +87,18 @@ fn map_overlayd_err(e: &zlayer_overlayd::OverlaydError) -> AgentError {
     AgentError::Network(format!("overlayd: {e}"))
 }
 
+/// Convert a live [`zlayer_overlay::PeerInfo`] into the wire-safe [`PeerSpec`]
+/// the overlayd IPC contract expects. Shared by every `add_*_peer` shim so the
+/// global and per-service paths build identical specs.
+fn peer_spec_from(peer: &zlayer_overlay::PeerInfo) -> PeerSpec {
+    PeerSpec {
+        public_key: peer.public_key.clone(),
+        endpoint: peer.endpoint.to_string(),
+        allowed_ips: peer.allowed_ips.clone(),
+        persistent_keepalive_secs: peer.persistent_keepalive_interval.as_secs(),
+    }
+}
+
 /// Manages overlay networks for a deployment by delegating all mechanics to the
 /// `zlayer-overlayd` daemon.
 ///
@@ -433,19 +445,50 @@ impl OverlayManager {
     }
 
     /// Set up the per-service overlay segment by delegating to overlayd.
-    /// Returns the bridge/network name.
+    ///
+    /// Returns a [`ServiceOverlayInfo`] describing the segment. The
+    /// container-attach handle (bridge name on Linux, interface elsewhere) is
+    /// `info.name`. In `Dedicated` mode the `wg_public_key`/`wg_port`/
+    /// `overlay_ip`/`subnet` fields carry the per-service `WireGuard`
+    /// transport's identity so the deploy path can publish it to Raft and mesh
+    /// with the other hosting nodes; in `Shared` mode those fields are `None`.
+    ///
+    /// `mode` is the service's resolved [`OverlayMode`], read from its spec at
+    /// the deploy call site. In `Shared` mode overlayd attaches the service to
+    /// the cluster transport via a per-node bridge; in `Dedicated` mode it
+    /// stands up a per-service `WireGuard` transport with its own crypto
+    /// context and reports its identity via
+    /// [`OverlaydResponse::ServiceOverlay`].
     ///
     /// # Errors
     /// Returns an error if overlayd fails to create the segment.
-    pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
+    pub async fn setup_service_overlay(
+        &self,
+        service_name: &str,
+        mode: zlayer_types::overlay::OverlayMode,
+    ) -> Result<zlayer_types::overlayd::ServiceOverlayInfo, AgentError> {
         let resp = self
             .call(OverlaydRequest::SetupServiceOverlay {
                 service: service_name.to_string(),
-                mode: zlayer_types::overlayd::OverlayMode::default(),
+                mode,
             })
             .await?;
         match resp {
-            OverlaydResponse::BridgeName { name } => Ok(name),
+            // Shared mode (and any server still on the legacy response shape)
+            // reports only the container-attach handle; synthesize a
+            // `ServiceOverlayInfo` whose Dedicated-only fields are `None`.
+            OverlaydResponse::BridgeName { name } => {
+                Ok(zlayer_types::overlayd::ServiceOverlayInfo {
+                    name,
+                    mode,
+                    wg_public_key: None,
+                    wg_port: None,
+                    overlay_ip: None,
+                    subnet: None,
+                })
+            }
+            // Dedicated mode reports the full device identity.
+            OverlaydResponse::ServiceOverlay(info) => Ok(info),
             other => Err(AgentError::Network(format!(
                 "overlayd SetupServiceOverlay returned unexpected response: {other:?}"
             ))),
@@ -615,13 +658,61 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if overlayd rejects the peer (e.g. overlay not yet up).
     pub async fn add_global_peer(&self, peer: &zlayer_overlay::PeerInfo) -> Result<(), AgentError> {
-        let spec = PeerSpec {
-            public_key: peer.public_key.clone(),
-            endpoint: peer.endpoint.to_string(),
-            allowed_ips: peer.allowed_ips.clone(),
-            persistent_keepalive_secs: peer.persistent_keepalive_interval.as_secs(),
-        };
-        self.call(OverlaydRequest::AddPeer(spec)).await?;
+        self.call(OverlaydRequest::AddPeer {
+            peer: peer_spec_from(peer),
+            scope: zlayer_types::overlayd::PeerScope::Global,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Add a peer to a service's dedicated per-service overlay transport.
+    ///
+    /// Analogous to [`OverlayManager::add_global_peer`] but scoped to
+    /// `service`'s [`OverlayMode::Dedicated`] device: first the peer itself
+    /// (`AddPeer` with `scope: Service`), then the service `subnet` plumbed
+    /// into that peer's `AllowedIPs` (`AddAllowedIp` with the same scope).
+    ///
+    /// # Errors
+    /// Returns an error if overlayd rejects the peer or the allowed-IP add
+    /// (e.g. the service's dedicated transport is not yet up).
+    pub async fn add_service_peer(
+        &self,
+        service: &str,
+        peer: &zlayer_overlay::PeerInfo,
+        subnet: &str,
+    ) -> Result<(), AgentError> {
+        self.call(OverlaydRequest::AddPeer {
+            peer: peer_spec_from(peer),
+            scope: zlayer_types::overlayd::PeerScope::Service {
+                service: service.to_string(),
+            },
+        })
+        .await?;
+        self.call(OverlaydRequest::AddAllowedIp {
+            pubkey: peer.public_key.clone(),
+            cidr: subnet.to_string(),
+            scope: zlayer_types::overlayd::PeerScope::Service {
+                service: service.to_string(),
+            },
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a peer (by base64 public key) from a service's dedicated
+    /// per-service overlay transport.
+    ///
+    /// # Errors
+    /// Returns an error if overlayd reports the removal failed.
+    pub async fn remove_service_peer(&self, service: &str, pubkey: &str) -> Result<(), AgentError> {
+        self.call(OverlaydRequest::RemovePeer {
+            pubkey: pubkey.to_string(),
+            scope: zlayer_types::overlayd::PeerScope::Service {
+                service: service.to_string(),
+            },
+        })
+        .await?;
         Ok(())
     }
 
@@ -795,5 +886,109 @@ mod tests {
         om.set_dns_config(None, None);
         assert!(om.dns_server_addr().is_none());
         assert!(om.dns_domain().is_none());
+    }
+
+    /// `peer_spec_from` must copy every `PeerInfo` field into the wire-safe
+    /// `PeerSpec` exactly as the live overlayd transport expects (endpoint
+    /// stringified, keepalive in whole seconds).
+    #[test]
+    fn peer_spec_from_copies_all_fields() {
+        let peer = zlayer_overlay::PeerInfo {
+            public_key: "base64key".to_string(),
+            endpoint: "1.2.3.4:51820".parse().unwrap(),
+            allowed_ips: "10.200.0.2/32".to_string(),
+            persistent_keepalive_interval: std::time::Duration::from_secs(25),
+        };
+        let spec = peer_spec_from(&peer);
+        assert_eq!(spec.public_key, "base64key");
+        assert_eq!(spec.endpoint, "1.2.3.4:51820");
+        assert_eq!(spec.allowed_ips, "10.200.0.2/32");
+        assert_eq!(spec.persistent_keepalive_secs, 25);
+    }
+
+    /// `setup_service_overlay` must forward the caller-supplied mode verbatim
+    /// (no more hardcoded `OverlayMode::default()`). Asserts the request the
+    /// shim builds carries `Dedicated` when asked for `Dedicated`.
+    #[test]
+    fn setup_service_overlay_request_carries_dedicated_mode() {
+        let req = OverlaydRequest::SetupServiceOverlay {
+            service: "web".to_string(),
+            mode: zlayer_types::overlay::OverlayMode::Dedicated,
+        };
+        match req {
+            OverlaydRequest::SetupServiceOverlay { service, mode } => {
+                assert_eq!(service, "web");
+                assert_eq!(mode, zlayer_types::overlay::OverlayMode::Dedicated);
+                assert_ne!(mode, zlayer_types::overlay::OverlayMode::default());
+            }
+            other => panic!("expected SetupServiceOverlay, got {other:?}"),
+        }
+    }
+
+    /// The service-scoped peer ops must target `PeerScope::Service { service }`,
+    /// not `Global`, so dedicated transports stay isolated from the cluster
+    /// transport.
+    #[test]
+    fn service_peer_ops_use_service_scope() {
+        let peer = zlayer_overlay::PeerInfo {
+            public_key: "k".to_string(),
+            endpoint: "1.2.3.4:51820".parse().unwrap(),
+            allowed_ips: "10.201.0.2/32".to_string(),
+            persistent_keepalive_interval: std::time::Duration::from_secs(0),
+        };
+        let svc_scope = zlayer_types::overlayd::PeerScope::Service {
+            service: "web".to_string(),
+        };
+
+        let add = OverlaydRequest::AddPeer {
+            peer: peer_spec_from(&peer),
+            scope: svc_scope.clone(),
+        };
+        let allow = OverlaydRequest::AddAllowedIp {
+            pubkey: peer.public_key.clone(),
+            cidr: "10.201.0.0/24".to_string(),
+            scope: svc_scope.clone(),
+        };
+        let remove = OverlaydRequest::RemovePeer {
+            pubkey: peer.public_key.clone(),
+            scope: svc_scope,
+        };
+
+        match add {
+            OverlaydRequest::AddPeer { scope, peer } => {
+                assert_eq!(
+                    scope,
+                    zlayer_types::overlayd::PeerScope::Service {
+                        service: "web".to_string()
+                    }
+                );
+                assert_eq!(peer.public_key, "k");
+            }
+            other => panic!("expected AddPeer, got {other:?}"),
+        }
+        match allow {
+            OverlaydRequest::AddAllowedIp { scope, cidr, .. } => {
+                assert_eq!(cidr, "10.201.0.0/24");
+                assert_eq!(
+                    scope,
+                    zlayer_types::overlayd::PeerScope::Service {
+                        service: "web".to_string()
+                    }
+                );
+            }
+            other => panic!("expected AddAllowedIp, got {other:?}"),
+        }
+        match remove {
+            OverlaydRequest::RemovePeer { scope, pubkey } => {
+                assert_eq!(pubkey, "k");
+                assert_eq!(
+                    scope,
+                    zlayer_types::overlayd::PeerScope::Service {
+                        service: "web".to_string()
+                    }
+                );
+            }
+            other => panic!("expected RemovePeer, got {other:?}"),
+        }
     }
 }

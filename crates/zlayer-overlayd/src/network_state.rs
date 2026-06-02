@@ -48,6 +48,20 @@ pub struct ManagedNetwork {
     pub id: String,
     /// CIDR the network was created with (informational / diagnostics).
     pub subnet: String,
+    /// Dedicated-overlay `WireGuard` listen port (per-service transports only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_port: Option<u16>,
+    /// Dedicated-overlay `WireGuard` private key, base64 (per-service only).
+    /// Persisted so the device identity survives overlayd restarts (no
+    /// per-service republish loop exists, so a stable key avoids a re-peer storm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_private_key: Option<String>,
+    /// Dedicated-overlay public key, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_public_key: Option<String>,
+    /// Dedicated-overlay interface name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 /// The full marker file: every host-level network this node manages.
@@ -128,6 +142,93 @@ impl NetworkState {
     }
 }
 
+/// Width of the dedicated-overlay listen-port band scanned by
+/// [`DedicatedPortAllocator`]. Ports are handed out from `base+1 ..= base+MAX`,
+/// so a default base of `51820` yields the range `51821..=52076` — 256 distinct
+/// per-service `WireGuard` transports, comfortably more than any single node is
+/// expected to host while staying well clear of the ephemeral range.
+pub const DEDICATED_PORT_BAND: u16 = 256;
+
+/// Deterministic allocator for dedicated-overlay `WireGuard` listen ports.
+///
+/// Each per-service [`OverlayMode::Dedicated`] overlay needs its own UDP listen
+/// port distinct from the node's shared base-overlay port. This allocator hands
+/// out the lowest free port in the band `base+1 ..= base+`[`DEDICATED_PORT_BAND`]
+/// by scanning ascending — no RNG, fully reproducible across restarts.
+///
+/// On startup, callers rehydrate the in-use set from the marker (the persisted
+/// [`ManagedNetwork::wg_port`] of each dedicated service) via [`Self::reserve`]
+/// so a service re-binds the exact port it had before.
+///
+/// [`OverlayMode::Dedicated`]: # "consumed by a later task"
+#[derive(Debug, Clone)]
+pub struct DedicatedPortAllocator {
+    base: u16,
+    used: std::collections::BTreeSet<u16>,
+}
+
+impl DedicatedPortAllocator {
+    /// Build an allocator over `base+1 ..= base+`[`DEDICATED_PORT_BAND`], seeding
+    /// the in-use set from `in_use` (e.g. ports already recorded in the marker).
+    ///
+    /// Ports in `in_use` that fall outside the band are kept in the used set —
+    /// they never collide with [`allocate`](Self::allocate) results and reserving
+    /// an out-of-band port is harmless — but they can never be re-allocated.
+    pub fn new(base: u16, in_use: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            base,
+            used: in_use.into_iter().collect(),
+        }
+    }
+
+    /// Lowest port in the band, i.e. `base + 1` (saturating).
+    fn band_start(&self) -> u16 {
+        self.base.saturating_add(1)
+    }
+
+    /// Highest port in the band, i.e. `base + `[`DEDICATED_PORT_BAND`] (saturating).
+    fn band_end(&self) -> u16 {
+        self.base.saturating_add(DEDICATED_PORT_BAND)
+    }
+
+    /// Allocate the lowest free port in the band, recording it as used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OverlaydError::Other`] if every port in the band is taken.
+    pub fn allocate(&mut self) -> crate::error::Result<u16> {
+        for port in self.band_start()..=self.band_end() {
+            if !self.used.contains(&port) {
+                self.used.insert(port);
+                return Ok(port);
+            }
+        }
+        Err(crate::error::OverlaydError::Other(format!(
+            "dedicated-overlay port band exhausted ({}..={}, {} ports)",
+            self.band_start(),
+            self.band_end(),
+            DEDICATED_PORT_BAND
+        )))
+    }
+
+    /// Free a previously allocated port so it can be handed out again.
+    pub fn release(&mut self, port: u16) {
+        self.used.remove(&port);
+    }
+
+    /// Mark a specific port used without scanning — used to rehydrate the
+    /// allocator from persisted marker state so a service re-binds its port.
+    pub fn reserve(&mut self, port: u16) {
+        self.used.insert(port);
+    }
+
+    /// Whether `port` is currently recorded as in use.
+    #[must_use]
+    pub fn is_used(&self, port: u16) -> bool {
+        self.used.contains(&port)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +240,10 @@ mod tests {
             name: "zlayer-overlay".to_string(),
             id: id.to_string(),
             subnet: "10.200.0.0/28".to_string(),
+            wg_port: None,
+            wg_private_key: None,
+            wg_public_key: None,
+            interface: None,
         }
     }
 
@@ -190,5 +295,120 @@ mod tests {
         let st = NetworkState::load(&path);
         assert_eq!(st.version, CURRENT_VERSION);
         assert!(st.networks.is_empty());
+    }
+
+    #[test]
+    fn dedicated_fields_survive_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zlayer-netstate-ded-{}", std::process::id()));
+        let path = dir.join("agent_network.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut net = sample(&owner_for_service("web"), "ded-guid");
+        net.wg_port = Some(51823);
+        net.wg_private_key = Some("cHJpdmF0ZS1rZXktYjY0".to_string());
+        net.wg_public_key = Some("cHVibGljLWtleS1iNjQ=".to_string());
+        net.interface = Some("zl-web0".to_string());
+
+        let mut st = NetworkState::default();
+        st.upsert(net.clone());
+        st.save(&path).expect("save must succeed");
+
+        let loaded = NetworkState::load(&path);
+        let got = loaded
+            .get(&owner_for_service("web"))
+            .expect("service entry present");
+        assert_eq!(got.wg_port, Some(51823));
+        assert_eq!(got.wg_private_key.as_deref(), Some("cHJpdmF0ZS1rZXktYjY0"));
+        assert_eq!(got.wg_public_key.as_deref(), Some("cHVibGljLWtleS1iNjQ="));
+        assert_eq!(got.interface.as_deref(), Some("zl-web0"));
+        assert_eq!(got, &net);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_marker_without_dedicated_fields_still_loads() {
+        // Hand-written marker JSON from before the dedicated-overlay fields
+        // existed: it must deserialize with the new fields defaulting to None.
+        let dir = std::env::temp_dir().join(format!("zlayer-netstate-bc-{}", std::process::id()));
+        let path = dir.join("agent_network.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let legacy = r#"{
+            "version": 1,
+            "networks": [
+                {
+                    "owner": "base",
+                    "kind": "hcn-internal",
+                    "name": "zlayer-overlay",
+                    "id": "legacy-guid",
+                    "subnet": "10.200.0.0/28"
+                }
+            ]
+        }"#;
+        std::fs::write(&path, legacy).expect("write legacy marker");
+
+        let loaded = NetworkState::load(&path);
+        let got = loaded.get(OWNER_BASE).expect("base entry present");
+        assert_eq!(got.id, "legacy-guid");
+        assert_eq!(got.wg_port, None);
+        assert_eq!(got.wg_private_key, None);
+        assert_eq!(got.wg_public_key, None);
+        assert_eq!(got.interface, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allocate_returns_distinct_ascending_ports() {
+        let mut alloc = DedicatedPortAllocator::new(51820, std::iter::empty());
+        let a = alloc.allocate().expect("port a");
+        let b = alloc.allocate().expect("port b");
+        let c = alloc.allocate().expect("port c");
+        assert_eq!(a, 51821);
+        assert_eq!(b, 51822);
+        assert_eq!(c, 51823);
+    }
+
+    #[test]
+    fn release_then_allocate_reuses_freed_port() {
+        let mut alloc = DedicatedPortAllocator::new(51820, std::iter::empty());
+        let a = alloc.allocate().expect("port a");
+        let b = alloc.allocate().expect("port b");
+        assert_eq!(a, 51821);
+        assert_eq!(b, 51822);
+
+        alloc.release(a);
+        // Lowest free is now the released port again.
+        let reused = alloc.allocate().expect("reused port");
+        assert_eq!(reused, 51821);
+    }
+
+    #[test]
+    fn reserved_port_is_skipped_by_allocate() {
+        // Rehydrate as if 51821 was persisted in the marker for another service.
+        let mut alloc = DedicatedPortAllocator::new(51820, [51821]);
+        assert!(alloc.is_used(51821));
+        let first = alloc.allocate().expect("first allocation");
+        assert_eq!(first, 51822);
+
+        // Explicit reserve mid-flight is also honored.
+        alloc.reserve(51823);
+        let next = alloc.allocate().expect("next allocation");
+        assert_eq!(next, 51824);
+    }
+
+    #[test]
+    fn band_exhaustion_errors() {
+        // Pre-reserve every port in the band so allocate has nothing left.
+        let base = 51820u16;
+        let full: Vec<u16> = (base + 1..=base + DEDICATED_PORT_BAND).collect();
+        let mut alloc = DedicatedPortAllocator::new(base, full);
+        let err = alloc.allocate().expect_err("band must be exhausted");
+        assert!(
+            matches!(err, crate::error::OverlaydError::Other(ref m) if m.contains("exhausted")),
+            "unexpected error: {err:?}"
+        );
     }
 }

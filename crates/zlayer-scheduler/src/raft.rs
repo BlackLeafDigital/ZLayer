@@ -213,6 +213,19 @@ pub enum Request {
         set: HashMap<String, String>,
         remove: Vec<String>,
     },
+    /// Publish (insert/overwrite) one node's dedicated-overlay endpoint for one
+    /// service. Each node hosting an [`OverlayMode::Dedicated`] service proposes
+    /// this so the other hosting nodes can peer with its per-service WG
+    /// transport. Keyed by `(node_id, service)`; re-publish overwrites.
+    ///
+    /// Appended at the end of the enum for postcard2 discriminant stability
+    /// (see [`Request::AssignServiceSubnet`]).
+    SetServiceOverlayEndpoint { endpoint: ServiceOverlayEndpoint },
+    /// Counterpart to [`Request::SetServiceOverlayEndpoint`]: removes the
+    /// endpoint published for `(node_id, service)`. Idempotent — no-op if no
+    /// endpoint was published. Appended at the end of the enum for postcard2
+    /// discriminant stability (see [`Request::AssignServiceSubnet`]).
+    RemoveServiceOverlayEndpoint { node_id: NodeId, service: String },
 }
 
 /// Raft response types
@@ -308,6 +321,37 @@ impl WorkerLeaseRecord {
     }
 }
 
+/// One node's dedicated-overlay endpoint for one service (Dedicated mode).
+///
+/// Published per (node, service) when a node hosts a service whose overlay is
+/// configured as [`OverlayMode::Dedicated`]: every hosting node advertises its
+/// per-service `WireGuard` transport (pubkey + endpoint + overlay IP/subnet) so
+/// the other hosting nodes can peer with it directly. Driven through Raft via
+/// [`Request::SetServiceOverlayEndpoint`] / [`Request::RemoveServiceOverlayEndpoint`]
+/// so every replica observes the same (node, service) -> endpoint mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceOverlayEndpoint {
+    pub node_id: NodeId,
+    pub service: String,
+    /// base64 `WireGuard` public key of this node's per-service transport.
+    pub wg_public_key: String,
+    /// host:port, textual (matches `PeerSpec.endpoint` convention).
+    pub endpoint: String,
+    pub overlay_ip: String,
+    pub subnet: String,
+}
+
+impl ServiceOverlayEndpoint {
+    /// Composite map key `"{node_id}/{service}"` used by
+    /// [`ClusterState::service_overlay_endpoints`]. A `String` key keeps the
+    /// map JSON-serializable with no custom serde (JSON object keys must be
+    /// strings), unlike a tuple key.
+    #[must_use]
+    pub fn map_key(node_id: NodeId, service: &str) -> String {
+        format!("{node_id}/{service}")
+    }
+}
+
 /// Cluster state (the Raft state machine application state).
 ///
 /// This is the `S` generic parameter to the storage state machine types.
@@ -351,6 +395,19 @@ pub struct ClusterState {
         default = "default_service_subnet_registry"
     )]
     pub service_subnets: ServiceSubnetRegistry,
+    /// Per-`(node, service)` dedicated-overlay endpoints. Driven by the
+    /// `SetServiceOverlayEndpoint` / `RemoveServiceOverlayEndpoint` raft
+    /// commands so every node observes the same set of per-service WG
+    /// peers for [`OverlayMode::Dedicated`] services.
+    ///
+    /// Keyed by the composite string [`ServiceOverlayEndpoint::map_key`]
+    /// (`"{node_id}/{service}"`) so the map stays JSON-serializable with no
+    /// custom serde — JSON object keys must be strings, which a tuple key is
+    /// not. `#[serde(default)]` keeps snapshots/log entries written before
+    /// this field existed loading cleanly with an empty map (no version bump,
+    /// no migration).
+    #[serde(default)]
+    pub service_overlay_endpoints: HashMap<String, ServiceOverlayEndpoint>,
 }
 
 impl Default for ClusterState {
@@ -362,6 +419,7 @@ impl Default for ClusterState {
             secrets: SecretsState::default(),
             worker_leases: HashMap::new(),
             service_subnets: default_service_subnet_registry(),
+            service_overlay_endpoints: HashMap::new(),
         }
     }
 }
@@ -775,6 +833,16 @@ impl ClusterState {
                 self.service_subnets.release(service_name, &node_key);
                 Response::Success { data: None }
             }
+            Request::SetServiceOverlayEndpoint { endpoint } => {
+                let key = ServiceOverlayEndpoint::map_key(endpoint.node_id, &endpoint.service);
+                self.service_overlay_endpoints.insert(key, endpoint.clone());
+                Response::Success { data: None }
+            }
+            Request::RemoveServiceOverlayEndpoint { node_id, service } => {
+                let key = ServiceOverlayEndpoint::map_key(*node_id, service);
+                self.service_overlay_endpoints.remove(&key);
+                Response::Success { data: None }
+            }
         }
     }
 
@@ -923,6 +991,28 @@ impl ClusterState {
     pub fn get_scale_events(&self, limit: usize) -> &[ScaleEvent] {
         let start = self.scale_events.len().saturating_sub(limit);
         &self.scale_events[start..]
+    }
+
+    /// Node IDs currently hosting `service`, read from
+    /// [`ServiceState::assigned_nodes`]. Returns an empty `Vec` if the service
+    /// is unknown. Used to determine which nodes should peer with each other
+    /// for a [`OverlayMode::Dedicated`] overlay.
+    #[must_use]
+    pub fn nodes_hosting(&self, service: &str) -> Vec<NodeId> {
+        self.services
+            .get(service)
+            .map(|svc| svc.assigned_nodes.clone())
+            .unwrap_or_default()
+    }
+
+    /// All published dedicated-overlay endpoints for `service`, across every
+    /// hosting node. Order is unspecified (backed by a `HashMap`).
+    #[must_use]
+    pub fn service_overlay_endpoints_for(&self, service: &str) -> Vec<&ServiceOverlayEndpoint> {
+        self.service_overlay_endpoints
+            .values()
+            .filter(|ep| ep.service == service)
+            .collect()
     }
 }
 
@@ -2901,5 +2991,123 @@ mod tests {
             s.service_subnets.slice_prefix(),
             DEFAULT_SERVICE_SUBNET_SLICE_PREFIX
         );
+    }
+
+    // -- ServiceOverlayEndpoint (Dedicated mode) dispatch ------------------
+
+    fn sample_endpoint(node_id: NodeId, service: &str) -> ServiceOverlayEndpoint {
+        ServiceOverlayEndpoint {
+            node_id,
+            service: service.to_string(),
+            wg_public_key: format!("pubkey-{node_id}-{service}"),
+            endpoint: format!("10.0.0.{node_id}:51820"),
+            overlay_ip: format!("10.200.1.{node_id}"),
+            subnet: "10.200.1.0/28".to_string(),
+        }
+    }
+
+    #[test]
+    fn set_and_remove_service_overlay_endpoint_roundtrip() {
+        let mut state = ClusterState::new();
+        let ep = sample_endpoint(7, "api");
+
+        let resp = state.apply(&Request::SetServiceOverlayEndpoint {
+            endpoint: ep.clone(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+
+        let key = ServiceOverlayEndpoint::map_key(7, "api");
+        assert_eq!(state.service_overlay_endpoints.get(&key), Some(&ep));
+        assert_eq!(state.service_overlay_endpoints.len(), 1);
+
+        // Re-publish overwrites in place (same key), not append.
+        let mut ep2 = ep.clone();
+        ep2.endpoint = "10.0.0.7:52000".to_string();
+        let resp = state.apply(&Request::SetServiceOverlayEndpoint {
+            endpoint: ep2.clone(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert_eq!(state.service_overlay_endpoints.len(), 1);
+        assert_eq!(state.service_overlay_endpoints.get(&key), Some(&ep2));
+
+        // Remove drops the entry; a second remove is a no-op.
+        let resp = state.apply(&Request::RemoveServiceOverlayEndpoint {
+            node_id: 7,
+            service: "api".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert!(!state.service_overlay_endpoints.contains_key(&key));
+
+        let resp = state.apply(&Request::RemoveServiceOverlayEndpoint {
+            node_id: 7,
+            service: "api".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert_eq!(state.service_overlay_endpoints.len(), 0);
+    }
+
+    #[test]
+    fn service_overlay_endpoints_serde_roundtrip() {
+        let mut state = ClusterState::new();
+        for (nid, svc) in [(1u64, "api"), (2, "api"), (3, "worker")] {
+            state.apply(&Request::SetServiceOverlayEndpoint {
+                endpoint: sample_endpoint(nid, svc),
+            });
+        }
+        assert_eq!(state.service_overlay_endpoints.len(), 3);
+
+        let bytes = serde_json::to_vec(&state).expect("serialize ClusterState");
+        let restored: ClusterState = serde_json::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(
+            restored.service_overlay_endpoints,
+            state.service_overlay_endpoints
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_service_overlay_endpoints_field_deserializes() {
+        // Snapshots written before `service_overlay_endpoints` existed must
+        // still deserialize cleanly — the field is `#[serde(default)]` so it
+        // restores to an empty map with no version bump / migration.
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // service_overlay_endpoints (and friends) intentionally absent.
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(s.service_overlay_endpoints.is_empty());
+    }
+
+    #[test]
+    fn nodes_hosting_reads_assigned_nodes() {
+        let mut state = ClusterState::new();
+
+        // Unknown service -> empty.
+        assert!(state.nodes_hosting("missing").is_empty());
+
+        state.apply(&Request::UpdateServiceState {
+            service_name: "api".to_string(),
+            state: ServiceState {
+                assigned_nodes: vec![3, 1, 4],
+                ..Default::default()
+            },
+        });
+        assert_eq!(state.nodes_hosting("api"), vec![3, 1, 4]);
+
+        // service_overlay_endpoints_for filters by service.
+        for (nid, svc) in [(3u64, "api"), (1, "api"), (4, "worker")] {
+            state.apply(&Request::SetServiceOverlayEndpoint {
+                endpoint: sample_endpoint(nid, svc),
+            });
+        }
+        let mut api_nodes: Vec<NodeId> = state
+            .service_overlay_endpoints_for("api")
+            .into_iter()
+            .map(|ep| ep.node_id)
+            .collect();
+        api_nodes.sort_unstable();
+        assert_eq!(api_nodes, vec![1, 3]);
     }
 }

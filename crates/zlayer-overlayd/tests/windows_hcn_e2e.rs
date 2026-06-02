@@ -152,6 +152,77 @@ async fn test_create_internal_network_no_physical_binding() {
     }
 }
 
+/// **Dedicated-overlay coexistence proof.** A `OverlayMode::Dedicated` service
+/// gets its OWN per-service HCN network (named `<base>-svc-<service>`) created
+/// via the same `Network::create_internal` the base overlay uses. This test
+/// stands up the base Internal network AND a per-service-named Internal network
+/// *simultaneously* and asserts BOTH are `Internal` with NO `NetAdapterName`
+/// policy — i.e. a dedicated service network coexists with the base network and
+/// neither binds a physical host NIC / creates an external vSwitch. Pair with a
+/// host-side `Get-NetAdapter` / `Get-VMSwitch` snapshot to confirm zero external
+/// vSwitches on the gateway NICs while both networks are live.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates two real HCN Internal networks; requires admin on Windows"]
+async fn test_dedicated_service_network_coexists_internal_only() {
+    const BASE_CIDR: &str = "10.221.52.0/28";
+    const SVC_CIDR: &str = "10.221.53.0/28";
+
+    let base_id = new_guid();
+    let svc_id = new_guid();
+
+    // Bring both networks up at once: the base overlay network and a
+    // per-service dedicated network using overlayd's `<base>-svc-<service>`
+    // naming convention. Both go through `Network::create_internal`.
+    let both = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let base = Network::create_internal(base_id, "zlayer-e2e-base", BASE_CIDR)
+            .map_err(|e| format!("base create_internal: {e}"))?;
+        let svc = Network::create_internal(svc_id, "zlayer-e2e-base-svc-web", SVC_CIDR)
+            .map_err(|e| format!("per-service create_internal: {e}"))?;
+        let base_props = base.query("{}").map_err(|e| format!("base query: {e}"))?;
+        let svc_props = svc.query("{}").map_err(|e| format!("svc query: {e}"))?;
+        Ok((base_props, svc_props))
+    })
+    .await
+    .expect("join error");
+
+    let (base_props, svc_props) = match both {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort cleanup of whatever did get created.
+            let _ = tokio::task::spawn_blocking(move || Network::delete(base_id)).await;
+            let _ = tokio::task::spawn_blocking(move || Network::delete(svc_id)).await;
+            panic!("coexisting Internal networks: {e}");
+        }
+    };
+
+    let assertion_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (label, props) in [("base", &base_props), ("service", &svc_props)] {
+            assert!(
+                matches!(props.ty, NetworkType::Internal),
+                "{label} network must be Internal (got {:?}) — Transparent/L2Bridge binds a NIC",
+                props.ty
+            );
+            for p in &props.policies {
+                assert_ne!(
+                    p.get("Type").and_then(|v| v.as_str()),
+                    Some("NetAdapterName"),
+                    "{label} network must NOT carry a NetAdapterName policy (no physical-NIC \
+                     binding / external vSwitch); got policies {:?}",
+                    props.policies
+                );
+            }
+        }
+    }));
+
+    // Teardown both, always.
+    let _ = tokio::task::spawn_blocking(move || Network::delete(base_id)).await;
+    let _ = tokio::task::spawn_blocking(move || Network::delete(svc_id)).await;
+
+    if let Err(p) = assertion_outcome {
+        std::panic::resume_unwind(p);
+    }
+}
+
 /// **Persistent-lifecycle proof.** Verifies that
 /// [`zlayer_overlayd::server::purge_managed_networks`] (the full-uninstall path)
 /// deletes the HCN network recorded in the agent network marker and clears the
@@ -194,6 +265,10 @@ async fn test_purge_managed_networks_deletes_recorded_network() {
         name: net_name.to_string(),
         id: bare_id,
         subnet: CIDR.to_string(),
+        wg_port: None,
+        wg_private_key: None,
+        wg_public_key: None,
+        interface: None,
     });
     st.save(&marker_path).expect("save marker");
 

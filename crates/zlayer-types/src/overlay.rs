@@ -1,30 +1,29 @@
 //! Overlay-network configuration types shared across `ZLayer` crates.
 //!
-//! Status as of v0.51:
+//! Mode status:
 //! - [`OverlayMode::Shared`] is fully implemented (single cluster `WireGuard`
 //!   interface carrying multiple service subnets via multi-CIDR `AllowedIPs`,
 //!   per-node Linux bridges per service).
-//! - [`OverlayMode::Auto`] is the default. In v0.51 it always resolves to
-//!   `Shared` because we have no telemetry inputs (bandwidth budgets, NIC
-//!   capabilities, per-node interface caps) to choose otherwise. Future
-//!   rounds will wire a real heuristic.
-//! - [`OverlayMode::Dedicated`] is reserved for a future round that restores
-//!   per-service `WireGuard` TUNs as a bandwidth opt-out. Currently warns and
-//!   falls back to `Shared`.
+//! - [`OverlayMode::Dedicated`] is implemented: each service gets its own
+//!   per-service `WireGuard` transport with an isolated crypto context.
+//! - [`OverlayMode::Auto`] is the default. It resolves to `Shared` — there is
+//!   no telemetry heuristic yet (bandwidth budgets, NIC capabilities, per-node
+//!   interface caps) to pick `Dedicated` automatically. A future round will
+//!   wire a real heuristic.
 //!
-//! Every consumer of `OverlayMode` MUST go through [`OverlayMode::resolve_v0_51`]
-//! before acting on the value, so the warn-and-fallback surface is uniform.
+//! Every consumer of `OverlayMode` MUST go through [`OverlayMode::resolve`]
+//! before acting on the value, so the resolution surface is uniform.
 
 use serde::{Deserialize, Serialize};
 
 /// How the daemon places a service's overlay attachment.
 ///
-/// See module docs for the v0.51 implementation status of each variant.
+/// See module docs for the implementation status of each variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OverlayMode {
-    /// Daemon picks. In v0.51 always resolves to [`OverlayMode::Shared`]
-    /// (no telemetry inputs yet to choose otherwise).
+    /// Daemon picks. Resolves to [`OverlayMode::Shared`] — there is no
+    /// telemetry heuristic yet to pick [`OverlayMode::Dedicated`] on its own.
     #[default]
     Auto,
     /// Single cluster `WireGuard` interface carries every service subnet via
@@ -32,29 +31,22 @@ pub enum OverlayMode {
     /// for container attachment. Lowest interface count; one shared crypto
     /// context (bandwidth ceiling shared across all service traffic).
     Shared,
-    /// Per-service `WireGuard` TUN with its own crypto context. Reserved for
-    /// a future bandwidth opt-out — **NOT implemented in v0.51**, currently
-    /// warns and falls back to `Shared`.
+    /// Per-service `WireGuard` transport with its own isolated crypto context,
+    /// for services that need their own bandwidth ceiling. Implemented.
     Dedicated,
 }
 
 impl OverlayMode {
-    /// Resolve to the actually-implemented mode for v0.51, logging a warning
-    /// if the requested mode is not yet wired up. Every code path that
-    /// consumes an `OverlayMode` value MUST go through this funnel so we
-    /// get a uniform warning surface for future-reserved variants.
+    /// Resolve to the actually-implemented mode. `Auto` resolves to `Shared`
+    /// (no telemetry heuristic yet to choose `Dedicated` automatically);
+    /// `Shared` and `Dedicated` resolve to themselves. Every code path that
+    /// consumes an `OverlayMode` value MUST go through this funnel so the
+    /// resolution surface is uniform.
     #[must_use]
-    pub fn resolve_v0_51(self) -> OverlayMode {
+    pub fn resolve(self) -> OverlayMode {
         match self {
             OverlayMode::Auto | OverlayMode::Shared => OverlayMode::Shared,
-            OverlayMode::Dedicated => {
-                tracing::warn!(
-                    "OverlayMode::Dedicated is reserved for a future round; \
-                     falling back to OverlayMode::Shared. Per-service `WireGuard` \
-                     TUNs will be restored when bandwidth telemetry lands.",
-                );
-                OverlayMode::Shared
-            }
+            OverlayMode::Dedicated => OverlayMode::Dedicated,
         }
     }
 }
@@ -104,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn overlay_mode_resolve_v0_51_collapses_to_shared() {
-        assert_eq!(OverlayMode::Auto.resolve_v0_51(), OverlayMode::Shared);
-        assert_eq!(OverlayMode::Shared.resolve_v0_51(), OverlayMode::Shared);
-        assert_eq!(OverlayMode::Dedicated.resolve_v0_51(), OverlayMode::Shared);
+    fn overlay_mode_resolve() {
+        assert_eq!(OverlayMode::Auto.resolve(), OverlayMode::Shared);
+        assert_eq!(OverlayMode::Shared.resolve(), OverlayMode::Shared);
+        assert_eq!(OverlayMode::Dedicated.resolve(), OverlayMode::Dedicated);
     }
 
     #[test]

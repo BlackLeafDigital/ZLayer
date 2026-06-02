@@ -35,7 +35,7 @@ pub struct BridgeInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ServiceOverlayStatus {
     pub service: String,
-    /// Mode the daemon resolved for this service (after `resolve_v0_51`).
+    /// Mode the daemon resolved for this service (after `resolve`).
     pub mode: OverlayMode,
     /// One entry per node where this service has at least one container
     /// attached. Keys are node IDs as stringified.

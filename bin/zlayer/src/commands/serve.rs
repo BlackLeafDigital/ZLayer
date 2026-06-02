@@ -2276,17 +2276,25 @@ pub(crate) async fn serve_with_external_shutdown(
     // actually registers services, sets up overlays, and scales containers.
     // Clone dns_handle so the deployment state keeps one for API handlers while
     // we retain the original for explicit shutdown cleanup.
+    // Use the internal token generated during daemon init so the scheduler
+    // (which already has a copy) and the API InternalState share the same secret.
+    let internal_token = daemon_internal_token;
+
     let deployment_state = zlayer_api::DeploymentState::with_orchestration(
         storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
         Arc::clone(&service_manager),
         overlay.clone(),
         Arc::clone(&proxy),
         dns_handle.clone(),
+    )
+    // Wire the cross-node Dedicated-overlay mesh: the Raft handle drives the
+    // per-service endpoint publish/learn, the internal token authenticates the
+    // peer broadcasts, and advertise_addr builds the published WG endpoint.
+    .with_dedicated_mesh(
+        _raft.clone(),
+        Some(internal_token.clone()),
+        Some(node_config.advertise_addr.clone()),
     );
-
-    // Use the internal token generated during daemon init so the scheduler
-    // (which already has a copy) and the API InternalState share the same secret.
-    let internal_token = daemon_internal_token;
 
     // Build the core router using the orchestration-wired deployment state.
     // This ensures create_deployment actually orchestrates containers.

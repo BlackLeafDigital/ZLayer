@@ -701,7 +701,49 @@ pub async fn add_peer_internal(
         ))
     })?;
 
-    // Build a PeerInfo for the WireGuard UAPI call
+    // Service-scoped path: when `request.service` is set, this peer belongs to
+    // a `Dedicated` per-service overlay rather than the global cluster overlay.
+    // Route it through `OverlayManager::add_service_peer` so it lands on the
+    // service's isolated WireGuard transport. AllowedIPs is the service subnet
+    // when supplied, else the single peer overlay IP.
+    if let Some(service) = request.service.as_deref() {
+        let allowed_ips = request
+            .service_subnet
+            .clone()
+            .unwrap_or_else(|| format!("{}/32", request.overlay_ip));
+        let peer_info = zlayer_overlay::PeerInfo::new(
+            request.wg_public_key.clone(),
+            endpoint,
+            &allowed_ips,
+            std::time::Duration::from_secs(25),
+        );
+        let Some(om) = state.overlay_manager.as_ref() else {
+            return Err(ApiError::ServiceUnavailable(
+                "service-scoped add-peer requires a live OverlayManager; none is wired in on this \
+                 node"
+                    .into(),
+            ));
+        };
+        let guard = om.read().await;
+        guard
+            .add_service_peer(service, &peer_info, &allowed_ips)
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!("Failed to add service-scoped WireGuard peer: {e}"))
+            })?;
+        info!(
+            wg_public_key = %request.wg_public_key,
+            overlay_ip = %request.overlay_ip,
+            service = %service,
+            "Successfully added service-scoped WireGuard peer via internal endpoint"
+        );
+        return Ok(Json(InternalAddPeerResponse {
+            success: true,
+            message: None,
+        }));
+    }
+
+    // Build a PeerInfo for the WireGuard UAPI call (global cluster overlay).
     let peer_info = zlayer_overlay::PeerInfo::new(
         request.wg_public_key.clone(),
         endpoint,
@@ -766,6 +808,68 @@ pub async fn add_peer_internal(
     }))
 }
 
+/// Remove a service-scoped `WireGuard` peer from a `Dedicated` service overlay.
+///
+/// `POST /api/v1/internal/remove-peer`
+///
+/// The scoped-removal analog of [`add_peer_internal`]. Called by a node that is
+/// scaling down / undeploying a `Dedicated` service so the other hosting nodes
+/// drop it as a peer immediately (see
+/// [`crate::handlers::dedicated_mesh::remove_dedicated_service_endpoint`]).
+/// Best-effort on the caller side; idempotent on this side.
+///
+/// # Errors
+///
+/// - `Unauthorized` if the internal token is missing or wrong.
+/// - `ServiceUnavailable` if no live `OverlayManager` is wired in.
+/// - `Internal` if overlayd rejects the removal.
+#[utoipa::path(
+    post,
+    path = "/api/v1/internal/remove-peer",
+    request_body = crate::handlers::dedicated_mesh::InternalRemovePeerRequest,
+    responses(
+        (status = 200, description = "Peer removed successfully", body = InternalAddPeerResponse),
+        (status = 401, description = "Unauthorized - invalid or missing internal token"),
+        (status = 503, description = "Overlay networking not configured on this node"),
+        (status = 500, description = "Internal error"),
+    ),
+    tag = "Internal"
+)]
+pub async fn remove_peer_internal(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+    Json(request): Json<crate::handlers::dedicated_mesh::InternalRemovePeerRequest>,
+) -> Result<Json<InternalAddPeerResponse>> {
+    let Some(om) = state.overlay_manager.as_ref() else {
+        return Err(ApiError::ServiceUnavailable(
+            "service-scoped remove-peer requires a live OverlayManager; none is wired in on this \
+             node"
+                .into(),
+        ));
+    };
+
+    info!(
+        wg_public_key = %request.wg_public_key,
+        service = %request.service,
+        "Internal remove-peer request received"
+    );
+
+    let guard = om.read().await;
+    guard
+        .remove_service_peer(&request.service, &request.wg_public_key)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "Failed to remove service-scoped WireGuard peer: {e}"
+            ))
+        })?;
+
+    Ok(Json(InternalAddPeerResponse {
+        success: true,
+        message: None,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +922,39 @@ mod tests {
         assert_eq!(request.wg_public_key, "abc123base64key==");
         assert_eq!(request.overlay_ip, "10.200.0.5");
         assert_eq!(request.endpoint, "203.0.113.5:51820");
+        // Pre-Dedicated senders omit the service fields; they default to None.
+        assert_eq!(request.service, None);
+        assert_eq!(request.service_subnet, None);
+    }
+
+    #[test]
+    fn test_add_peer_request_with_service_fields_round_trips() {
+        let request = InternalAddPeerRequest {
+            wg_public_key: "k".into(),
+            overlay_ip: "10.201.0.5".into(),
+            endpoint: "203.0.113.5:51821".into(),
+            service: Some("web".into()),
+            service_subnet: Some("10.201.0.0/24".into()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: InternalAddPeerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.service.as_deref(), Some("web"));
+        assert_eq!(back.service_subnet.as_deref(), Some("10.201.0.0/24"));
+
+        // Without the service fields they are omitted from the wire and
+        // deserialize back to None.
+        let global = InternalAddPeerRequest {
+            wg_public_key: "k".into(),
+            overlay_ip: "10.200.0.5".into(),
+            endpoint: "203.0.113.5:51820".into(),
+            service: None,
+            service_subnet: None,
+        };
+        let json = serde_json::to_string(&global).unwrap();
+        assert!(!json.contains("service"));
+        let back: InternalAddPeerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.service, None);
+        assert_eq!(back.service_subnet, None);
     }
 
     #[test]
@@ -842,5 +979,72 @@ mod tests {
             Some("zl-overlay0".to_string()),
         );
         assert_eq!(state.overlay_interface.as_deref(), Some("zl-overlay0"));
+    }
+
+    fn test_state_with_interface_only() -> InternalState {
+        // Wire only the legacy `overlay_interface` (no live OverlayManager).
+        // This lets us distinguish the global path (which falls back to the
+        // ad-hoc interface transport) from the service-scoped path (which
+        // hard-requires a live OverlayManager).
+        let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> =
+            Arc::new(zlayer_agent::MockRuntime::new());
+        let service_manager = Arc::new(RwLock::new(ServiceManager::builder(runtime).build()));
+        InternalState::with_overlay(
+            service_manager,
+            "token".to_string(),
+            Some("zl-overlay0".to_string()),
+        )
+    }
+
+    /// `add_peer_internal` with `service: Some(..)` must route through the
+    /// service-scoped branch. With no live `OverlayManager` wired in (only the
+    /// legacy `overlay_interface`), that branch returns `ServiceUnavailable` —
+    /// distinct from the global branch, which would instead attempt the ad-hoc
+    /// interface transport. Reaching the 503 proves we took the service path.
+    #[tokio::test]
+    async fn add_peer_internal_routes_service_scope_to_service_path() {
+        let state = test_state_with_interface_only();
+        let request = InternalAddPeerRequest {
+            wg_public_key: "svc-key".into(),
+            overlay_ip: "10.201.0.5".into(),
+            endpoint: "203.0.113.9:51821".into(),
+            service: Some("web".into()),
+            service_subnet: Some("10.201.0.0/24".into()),
+        };
+        let err = add_peer_internal(InternalAuth, State(state), Json(request))
+            .await
+            .expect_err("service-scoped add-peer must require a live OverlayManager");
+        assert!(
+            matches!(err, ApiError::ServiceUnavailable(_)),
+            "expected ServiceUnavailable from the service-scoped path, got {err:?}"
+        );
+    }
+
+    /// The global path (`service: None`) must NOT hit the service-scoped
+    /// `ServiceUnavailable` guard. With only `overlay_interface` wired it falls
+    /// through to the legacy ad-hoc transport, which fails with `Internal`
+    /// (no real `WireGuard` socket in the test env) rather than the
+    /// service-path 503 — confirming the two branches are distinct.
+    #[tokio::test]
+    async fn add_peer_internal_global_scope_does_not_take_service_path() {
+        let state = test_state_with_interface_only();
+        let request = InternalAddPeerRequest {
+            wg_public_key: "global-key".into(),
+            overlay_ip: "10.200.0.5".into(),
+            endpoint: "203.0.113.9:51820".into(),
+            service: None,
+            service_subnet: None,
+        };
+        let err = add_peer_internal(InternalAuth, State(state), Json(request))
+            .await
+            .expect_err("global add-peer hits the ad-hoc transport and fails in tests");
+        // Key contract: the global path must NOT hit the service-scoped guard.
+        // It falls through to the legacy ad-hoc transport, which fails for a
+        // different reason in the test env (no real WireGuard socket).
+        assert!(
+            !matches!(err, ApiError::ServiceUnavailable(_)),
+            "global path must not take the service-scoped ServiceUnavailable \
+             branch; got {err:?}"
+        );
     }
 }

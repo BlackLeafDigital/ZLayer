@@ -680,6 +680,7 @@ impl HcsRuntime {
     async fn overlayd_attach_windows(
         &self,
         container_id: &str,
+        service: &str,
         ip: IpAddr,
         dns_server: Option<IpAddr>,
         dns_domain: Option<String>,
@@ -694,7 +695,12 @@ impl HcsRuntime {
                     container_id: container_id.to_string(),
                     ip: Some(ip),
                 },
-                service: String::new(),
+                // The real service name (the identity the deploy/scheduler path
+                // uses), threaded from `ContainerId::service` at the call site.
+                // Required for overlayd to (a) place a Dedicated service's
+                // container on its own per-service HCN network, and (b) tag the
+                // attachment correctly even in Shared mode.
+                service: service.to_string(),
                 join_global: false,
                 dns_server,
                 dns_domain,
@@ -3113,7 +3119,7 @@ impl Runtime for HcsRuntime {
             (Some(_slice), Some(ip)) => {
                 let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
                 match self
-                    .overlayd_attach_windows(&hcs_id, ip, dns_server, dns_domain)
+                    .overlayd_attach_windows(&hcs_id, &id.service, ip, dns_server, dns_domain)
                     .await
                 {
                     Ok(att) => att,
