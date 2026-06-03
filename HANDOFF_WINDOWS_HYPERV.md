@@ -1,8 +1,53 @@
 # ZLayer Windows Hyper-V (Part B) — Mac handoff
 
-**Last updated:** 2026-06-02 (Mac→box SSH debug)
-**Audience:** future-you, iterating on the Windows box (rsync copy at `C:\src\ZLayer`, Mac drives via SSH)
-**Status one-liner:** Guest now DIALS + negotiates (the never-dial bug is fixed). New frontier: the guest inbox GCS flakily CLOSES the bridge (EOF, no HRESULT, VM stays Running) on the cold-start `RpcCreate`/HvSocket. Our bytes match hcsshim `main` exactly; this is a guest-side `vmcomputeagent.exe` fault. All host-side hypotheses exhausted — next step needs in-guest crash capture (heavy).
+**Last updated:** 2026-06-03 (Mac→box SSH debug; `C:\src\ZLayer` is now a REAL git checkout on the box, Forgejo-credentialed — commit + push from the box directly)
+**Audience:** whoever runs the box next (on-box Claude or SSH). Root cause is narrowed to one open fact; the NEXT ACTION below names it without windbg.
+**Status one-liner:** never-dial root-caused: inbox `gcs` is SCM-gated on `mpssvc`/`netsetupsvc`, which DON'T reach Running in our stripped nanoserver UVM (drivers all load, configs healthy, service DLLs present — so a RUNTIME service-start failure of unknown cause). hcsshim uses the same stock deps + UVM + external bridge and works. The `DependOnService` strip is the wrong workaround (trades never-dial for a cold-start Create fault). **The one open fact: WHY `mpssvc`/`netsetupsvc` fail at runtime.** Detailed trail: UPDATEs 2–5 below.
+
+---
+
+## ⟢ NEXT ACTION — name *why* the services fail, via a guest `sc queryex` dump (NO windbg)
+
+Working hypothesis: the stripped UtilityVM is **missing something those services need at runtime**
+(a transitive dependency DLL, a dependency service, or a config) — the service *entries* and their
+top-level DLLs (`mpssvc.dll`, `NetSetupSvc.dll`, `FirewallAPI.dll`, `fwpuclnt.dll`, `rpcss.dll`)
+are all present, so it's deeper. The deterministic, no-windbg way to confirm + name it is each
+service's own exit code via `sc queryex` (`WIN32_EXIT_CODE` / `SERVICE_EXIT_CODE`): e.g. `126
+ERROR_MOD_NOT_FOUND` (missing DLL), `1068`/`1075` (dependency fail), `1058` (disabled), `1053`
+(timeout). KD-over-COM is unstable non-interactively (UPDATE 5), so this is the path.
+
+**Implementation** (all in `crates/zlayer-agent/src/runtimes/hcs.rs`, `#[cfg(feature="windows-debug")]`
++ env toggle `ZLAYER_GCS_SVCDUMP=1`, default off → no effect on normal runs):
+1. **Inject `sc.exe`** — the stripped UtilityVM has `cmd.exe`/`services.exe` but **NO `sc.exe`**. In
+   the create path, just before `ComputeSystem::create` (~hcs.rs:1497, the same spot as the existing
+   `ZLAYER_GCS_BOOTLOG`/`ZLAYER_GCS_KD` offline-BCD block), `std::fs::copy` the host
+   `%SystemRoot%\System32\sc.exe` → `uvm.os_files_dir()\Windows\System32\sc.exe` (os-files dir is
+   host-writable before HcsCreate; `sc.exe`'s deps — advapi32 etc. — are present in the UVM).
+2. **Register a boot dump service** in `build_uvm_registry_changes()` (~hcs.rs:2470, gated on
+   `ZLAYER_GCS_SVCDUMP`; reuse the `RegistryValue`/`encode_multi_sz_utf16le` pattern already there):
+   auto-start (`Start`=2, `Type`=0x10, `ErrorControl`=0, **no `DependOnService`** so SCM starts it
+   regardless) `CurrentControlSet\Services\zlayer-svcdump` whose `ImagePath` (REG_EXPAND_SZ) runs
+   `%comspec% /c` a short loop that, every ~5s for ~60s, appends to `C:\zlayer-dbg\svcdump.txt`:
+   `sc queryex mpssvc`, `sc queryex netsetupsvc`, `sc queryex BFE`, `sc queryex RpcSs`,
+   `sc queryex nsi`, `sc queryex gcs`, `sc qc mpssvc`, `sc qc netsetupsvc`, `sc query` (all).
+   `C:\zlayer-dbg` is the scratch-local path WER already uses (offline-mountable; recipe in UPDATE 4).
+3. **Run on the box:** `ZLAYER_GCS_STOCK_DEPS=1` (real never-dial boot, stock deps) +
+   `ZLAYER_GCS_SVCDUMP=1` + `ZLAYER_KEEP_UVM_ON_FAILURE=1` (terminate + copy scratch →
+   `C:\zlayer-uvm-debug`), windows-debug build. Then mount the copied scratch offline (reconnect to
+   `C:\zlayer-uvm-reference\UtilityVM\SystemTemplateBase.vhdx` → `Mount-DiskImage -ReadOnly` →
+   `Add-PartitionAccessPath -AssignDriveLetter`) and read `C:\zlayer-dbg\svcdump.txt`.
+
+**Verification / fix:** `svcdump.txt` shows which of `mpssvc`/`netsetupsvc` is `STOPPED`/`START_PENDING`
++ its exit code → names the missing piece. Apply the concrete fix (inject the missing dependency
+DLL / add the missing service-or-config to the UVM), then **restore the stock `gcs` `DependOnService`**
+(drop the strip), rebuild, run the e2e smoke test with stock deps → `gcs` should dial AND the full
+create/start/stop/remove should pass (`test result: ok`), 0 external vSwitches / NICs Up. Keep Mac
+workspace green; windows-only code compiles on the box. Fallback: interactive `windbg` (Debugging
+Tools installed; `ZLAYER_GCS_KD` toggle wired) only if the exit code is ambiguous.
+
+**Box workflow:** edit on the box, `cargo build/test --features hcs-runtime,wsl,windows-debug`,
+commit, `git push` (origin is Forgejo, credentialed). Push to `dev` with `[np] [fast]` for minimum
+CI (no `[skip ci]` — it does nothing). Mirror shared-crate changes into `zlayer-zql` per the standing rule.
 
 ---
 
