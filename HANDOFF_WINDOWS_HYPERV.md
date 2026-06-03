@@ -115,6 +115,63 @@ fault is the guest Create handler, most likely network-setup in a NIC-less UVM. 
 DESIGN UVM Internal networking (option 1), ideally after a KD confirm (option 2) — not more
 byte edits.
 
+### UPDATE 3 (same day) — NIC fix REFUTED; architecture VALIDATED; mechanism PINNED to gcs SCM deps
+
+Did NOT build option 1 (UVM NIC). Confirmed first — and it's **refuted**:
+
+- **hcsshim's WCOW UVM is NIC-less at boot AND at cold-start Create, and that Create succeeds**
+  (`UvmConfig{SystemType:"Container"}` carries zero networking; NICs added per-container LATER,
+  over the bridge). So a UVM NIC is NOT what makes cold-start work. (`internal/uvm/create_wcow.go`
+  `prepareCommonConfigDoc` Devices = only HvSocket+VirtualSmb; `internal/uvm/start.go`.)
+- **Our architecture is CORRECT / matches hcsshim:** WCOW uses an EXTERNAL GCS bridge (host
+  `ListenHvsock` on `acef5661-…`, guest `gcs` dials) + the inbox `gcs` started by the guest SCM as
+  an auto-start service gated by its stock `DependOnService`. hcsshim does NOT launch gcs directly,
+  has ZERO `DependOnService` overrides, and ships the unmodified inbox UVM. (`create_wcow.go::CreateWCOW`
+  `startExternalGcsListener`; `start.go::Start` `gcListener != nil` external branch is unconditional
+  for WCOW; internal-GuestConnection `else` is LCOW-only via `OptionsLCOW.UseGuestConnection`.)
+- **Mechanism PINNED.** Inbox `gcs` service (read offline from the UtilityVM SYSTEM hive):
+  `Start=2`, `DependOnService = condrv, hvsocketcontrol, mpssvc, netsetupsvc`. A/B (env toggle
+  `ZLAYER_GCS_STOCK_DEPS=1`):
+    - **stock deps → never-dial** (120s "waiting for in-guest GCS to connect"): `gcs` SCM service
+      never starts because `mpssvc`(firewall)/`netsetupsvc` don't reach Running in our UVM.
+    - **strip to condrv+hvsocketcontrol → gcs dials, cold-start Create FAULTS** — gcs runs without
+      the firewall/network-setup substrate its Create handler needs. So the strip is the WRONG fix
+      and is what produces the Create fault.
+  hcsshim uses stock deps + nanoserver UtilityVM and works → those services DO reach Running in
+  hcsshim's UVM. **The true root cause is: why don't `mpssvc`/`netsetupsvc` reach Running in OUR UVM.**
+- **Service CONFIGS are stock-healthy** (read offline): `mpssvc`(auto; deps mpsdrv,bfe,nsi),
+  `netsetupsvc`(auto; dep RpcSs), `BFE`/`RpcSs`/`nsi`(auto), `mpsdrv`/`netvsc`(demand drivers) —
+  nothing in the chain disabled/missing (`Dhcp` is Start=4 but not in the chain). So it's a
+  **RUNTIME** service-start failure with healthy configs, not a config/image-customization problem
+  (we don't customize the WIM; UVM boots the stock nanoserver `UtilityVM\`).
+- **servercore-substrate A/B blocked:** running with `servercore:ltsc2022` UtilityVM + stock deps
+  failed at image unpack (`HcsImportLayer 0x80004005` on a servercore layer — a SEPARATE unpacker
+  bug, not the GCS issue). Could not test whether a fuller UtilityVM brings the services up.
+
+THE FIX DIRECTION (per research): restore the stock `gcs` `DependOnService` (drop the strip), keep
+the external bridge + the step-4b HvSocket `configureHvSocketForGCS` (we already send it), and make
+`mpssvc`/`netsetupsvc` reach Running in the UVM. The final unknown is the RUNTIME reason they don't
+start (configs are healthy) — needs in-guest runtime visibility the write-nothing UVM denies:
+
+### REMAINING OPTIONS (ranked, post-UPDATE-3)
+1. **BCD `/bootlog` → `ntbtlog.txt`** (kernel-written to the scratch; now offline-mountable via the
+   reconnect-to-`C:\zlayer-uvm-reference\UtilityVM\SystemTemplateBase.vhdx` + Mount-DiskImage +
+   Add-PartitionAccessPath recipe proven this session). Run with STOCK deps; the boot driver log
+   shows whether `mpsdrv`/`nsiproxy`/`netvsc` (the drivers under `mpssvc`/`nsi`) fail to load,
+   cascading to the service-start failure. Moderate effort, partial signal (drivers, not svchost
+   services).
+2. **Guest kernel debugger (KD)** — definitive: see which service is `START_PENDING` and why.
+   Heaviest; COM/`Uefi.Console` previously broke boot.
+3. **Fix the servercore unpacker bug** (`HcsImportLayer 0x80004005`) to enable the substrate A/B
+   (does a fuller UtilityVM bring `mpssvc`/`netsetupsvc` to Running?).
+4. **Escalate to MS/hcsshim** with the minimal repro: external-GCS WCOW on the Server 2025 inbox
+   nanoserver UtilityVM, `mpssvc`/`netsetupsvc` never reach Running so `gcs` (SCM-gated) never dials.
+
+Committed this session (on `dev`, NOT pushed): `bf5c5b14`..`02c5f664` — dial fix, windows-debug
+instrument, protocol parity, real-host-TZ, error_records=Value, VHDX offline exfil (works but UVM
+writes nothing), `ZLAYER_GCS_STOCK_DEPS` A/B toggle (default = strip on), compose passthrough, +
+handoff. Workspace green; box build RC=0.
+
 ---
 
 ## ⟢ 2026-05-31 PM update — corrections + new iteration model
