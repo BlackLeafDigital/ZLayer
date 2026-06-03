@@ -184,9 +184,32 @@ impl GcsBridge {
     /// host skips these or sends an unrelated RPC first, the GCS closes the
     /// bridge (we observed this verbatim:
     /// `gcs-bridge-reader: header read failed after 1 frame(s): bridge closed`).
-    async fn cold_start_create_start(&self, caps: &ProtocolSupport) -> GcsResult<()> {
+    async fn cold_start_create_start(
+        &self,
+        caps: &ProtocolSupport,
+        host_tz: Option<&serde_json::Value>,
+    ) -> GcsResult<()> {
         if !caps.send_host_create_message {
             return Ok(());
+        }
+        // DIAGNOSTIC (guest-init-race hypothesis): the Server 2025 inbox GCS
+        // accepts NegotiateProtocol immediately on dial but flakily
+        // critical-fails when the very next RPC (cold-start Create) lands
+        // before the guest has finished bringing up the subsystems Create
+        // touches. ~25-30% of UVMs survive Create with byte-identical input,
+        // which is the signature of a readiness race rather than a malformed
+        // message. Give the guest a settle window after negotiate before the
+        // first container RPC. Tunable via ZLAYER_GCS_COLDSTART_DELAY_MS.
+        //
+        // Default OFF (0): this was a diagnostic probe. The env override hook
+        // is kept so the settle window can be turned back on without a rebuild
+        // while iterating on the box, but it is a no-op unless set.
+        let settle_ms = std::env::var("ZLAYER_GCS_COLDSTART_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if settle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
         }
         // `ContainerConfig` is hcsshim's `AnyInString` — a JSON value
         // serialised into a string field. The inner UvmConfig carries
@@ -200,8 +223,18 @@ impl GcsBridge {
         // after 1 frame(s): bridge closed` and Hyper-V-Worker eventid 18590
         // fires with bugcheck 0xEF (`CRITICAL_PROCESS_DIED`).
         //
-        // The exact `TimeZoneInformation` value mirrors hcsshim's
-        // `noInheritHostTimezone` UTC constant `utcTimezone` from
+        // hcsshim's DEFAULT path (no `noInheritHostTimezone`) sends the REAL
+        // host timezone, queried via `GetDynamicTimeZoneInformation` and mapped
+        // to `hcsschema.TimeZoneInformation` (`internal/uvm/timezone.go`). A
+        // real host TZ with DST carries POPULATED `StandardDate`/`DaylightDate`
+        // transition dates; the inbox GCS's timezone handling is a fragile
+        // critical path, and the all-zero transition dates of the UTC constant
+        // are the suspected fragile input. So we prefer the host TZ (passed in
+        // by the agent via the Win32 helper) and only fall back to hcsshim's
+        // `noInheritHostTimezone` UTC constant when it is unavailable
+        // (non-windows build, or the Win32 call reported TIME_ZONE_ID_INVALID).
+        //
+        // Fallback UTC constant — hcsshim's `utcTimezone` from
         // `internal/uvm/timezone.go`:
         //
         //   var utcTimezone = &hcsschema.TimeZoneInformation{
@@ -213,18 +246,19 @@ impl GcsBridge {
         //
         // i.e. the canonical Windows TZ names (NOT the bare `"UTC"` our prior
         // body used, which `TIME_ZONE_INFORMATION` rejects) plus empty
-        // `StandardDate`/`DaylightDate` objects — hcsshim sets them to
-        // `&SystemTime{}`, which serialise as `{}`. Reproducing the exact
-        // hcsshim wire shape removes the malformed-TZ confounder for the
-        // 0xEF cold-start death.
-        let uvm_config_str = serde_json::to_string(&serde_json::json!({
-            "SystemType": "Container",
-            "TimeZoneInformation": {
+        // `StandardDate`/`DaylightDate` objects (`&SystemTime{}` → `{}`).
+        let timezone_information = match host_tz {
+            Some(tz) => tz.clone(),
+            None => serde_json::json!({
                 "StandardName": "Coordinated Universal Time",
                 "DaylightName": "Coordinated Universal Time",
                 "StandardDate": {},
                 "DaylightDate": {},
-            },
+            }),
+        };
+        let uvm_config_str = serde_json::to_string(&serde_json::json!({
+            "SystemType": "Container",
+            "TimeZoneInformation": timezone_information,
         }))?;
         let create_body = serde_json::json!({
             "ActivityId": uuid::Uuid::new_v4().to_string(),
@@ -500,7 +534,18 @@ impl PendingGcsBridge {
     ///
     /// `timeout` bounds how long we wait for the guest GCS to come up and
     /// connect; hcsshim uses a multi-minute `GCSConnectionTimeout`.
-    pub async fn accept(self, timeout: Duration) -> GcsResult<GcsBridge> {
+    ///
+    /// `host_tz` is the real host timezone rendered as hcsschema's
+    /// `TimeZoneInformation` JSON (see the agent's `windows::timezone`
+    /// helper). It is attached to the cold-start `Create`'s `UvmConfig`,
+    /// mirroring hcsshim's default real-host-TZ path. Pass `None` (non-windows
+    /// build, or a failed Win32 query) to fall back to hcsshim's
+    /// `noInheritHostTimezone` UTC constant inside `cold_start_create_start`.
+    pub async fn accept(
+        self,
+        timeout: Duration,
+        host_tz: Option<serde_json::Value>,
+    ) -> GcsResult<GcsBridge> {
         let stream = tokio::time::timeout(timeout, self.listener.accept())
             .await
             .map_err(|_| {
@@ -539,7 +584,9 @@ impl PendingGcsBridge {
         // negotiate, before any other RPC. Skipping this causes the peer to
         // close the bridge ~instantly. See `cold_start_create_start` for
         // the load-bearing detail.
-        bridge.cold_start_create_start(&caps).await?;
+        bridge
+            .cold_start_create_start(&caps, host_tz.as_ref())
+            .await?;
         Ok(bridge)
     }
 }

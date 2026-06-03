@@ -1625,7 +1625,21 @@ impl HcsRuntime {
             "Hyper-V step 4: PendingGcsBridge::accept (await guest GCS dial-out)"
         );
         step_log!("4: PendingGcsBridge::accept (await guest GCS dial-out, 120s timeout)");
-        let accept_fut = pending_bridge.accept(std::time::Duration::from_secs(120));
+        // Query the host's real timezone and render it as hcsschema's
+        // `TimeZoneInformation` JSON to attach to the cold-start Create's
+        // UvmConfig — mirroring hcsshim's default (real-host-TZ) path rather
+        // than the all-zero-transition-date UTC constant the bridge falls back
+        // to. `None` (a failed Win32 query) makes the bridge use that UTC
+        // constant fallback.
+        let host_tz = crate::windows::timezone::host_timezone_information();
+        if host_tz.is_none() {
+            tracing::warn!(
+                hcs_id = %hcs_id,
+                "Hyper-V step 4: host timezone query returned TIME_ZONE_ID_INVALID; \
+                 cold-start Create will fall back to the UTC TimeZoneInformation constant"
+            );
+        }
+        let accept_fut = pending_bridge.accept(std::time::Duration::from_secs(120), host_tz);
         tokio::pin!(accept_fut);
         let mut state_poll = tokio::time::interval(std::time::Duration::from_secs(5));
         let bridge = loop {

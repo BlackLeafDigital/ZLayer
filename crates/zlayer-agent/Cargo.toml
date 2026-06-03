@@ -129,6 +129,7 @@ base64.workspace = true
 ipnet.workspace = true
 zlayer-gcs = { version = "0.0.0-dev", path = "../zlayer-gcs", optional = true }
 zlayer-overlayd = { version = "0.0.0-dev", path = "../zlayer-overlayd" }
+windows = { version = "0.62", features = ["Win32_System_Time"] }
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 # Consuming the patched fork via `zlayer-libcontainer` published from
