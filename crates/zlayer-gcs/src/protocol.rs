@@ -7,8 +7,79 @@
 //! The frame header carries the message id + type code (see [`crate::frame`]);
 //! these types only describe the payload.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize, Serializer};
 use uuid::Uuid;
+
+/// hcsshim's `AnyInString` — a JSON value that is wire-encoded as a JSON
+/// **string** whose content is the escaped JSON of the inner value
+/// (double-encoded).
+///
+/// Mirrors hcsshim's `internal/gcs/prot/protocol.go`:
+/// ```go
+/// type AnyInString struct { Value interface{} }
+/// func (a *AnyInString) MarshalText() ([]byte, error) { return json.Marshal(a.Value) }
+/// ```
+/// Because `AnyInString` implements `MarshalText`, the outer `json.Marshal`
+/// emits the field as a JSON string containing the escaped JSON of the inner
+/// value. The inbox guest GCS uses a STRICT JSON unmarshaller (hcsshim issue
+/// #2714) that rejects unknown/misnamed fields and tears down the VM, so the
+/// double-encoding must match exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnyInString(pub serde_json::Value);
+
+impl AnyInString {
+    /// Wrap a JSON value for double-encoded `AnyInString` serialization.
+    #[must_use]
+    pub const fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the inner JSON value.
+    #[must_use]
+    pub const fn value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    /// Consume and return the inner JSON value.
+    #[must_use]
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+impl From<serde_json::Value> for AnyInString {
+    fn from(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+}
+
+impl Serialize for AnyInString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize the inner value to a JSON string, then serialize THAT
+        // string — yielding a double-encoded `"{...escaped...}"` on the wire,
+        // exactly as hcsshim's `MarshalText` does.
+        let inner =
+            serde_json::to_string(&self.0).map_err(<S::Error as serde::ser::Error>::custom)?;
+        serializer.serialize_str(&inner)
+    }
+}
+
+impl<'de> Deserialize<'de> for AnyInString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Read the outer JSON string, then parse its escaped JSON content
+        // back into a `serde_json::Value`.
+        let s = String::deserialize(deserializer)?;
+        let value = serde_json::from_str(&s).map_err(de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
 
 /// Base fields present on every request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,16 +150,24 @@ pub struct ProtocolSupport {
     pub send_lifecycle_notifications: bool,
 }
 
-/// `RpcCreate` — create the COMPUTE-system root. For a cold-start UVM this
-/// is the null container `00000000-...` with a `Settings` block describing
-/// the UVM container kind (`{"SystemType":"Container"}`).
+/// `RpcCreate` — create the COMPUTE-system root.
+///
+/// For a cold-start UVM this is the null container `00000000-...` with a
+/// `ContainerConfig` block describing the UVM container kind
+/// (`{"SystemType":"Container"}`).
+///
+/// The `ContainerConfig` field is hcsshim's `AnyInString`: it is wire-encoded
+/// as a JSON **string** containing the escaped JSON of the config value
+/// (double-encoded). The field name is literally `ContainerConfig`, NOT
+/// `Settings` — the inbox guest GCS strictly rejects any other shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CreateRequest {
     #[serde(flatten)]
     pub base: RequestBase,
-    /// Container creation settings — JSON value, schema varies by `SystemType`.
-    pub settings: serde_json::Value,
+    /// Container creation config — double-encoded JSON string on the wire.
+    #[serde(rename = "ContainerConfig")]
+    pub container_config: AnyInString,
 }
 
 pub type CreateResponse = ResponseBase;
@@ -232,6 +311,49 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["Result"], json!(0));
+    }
+
+    #[test]
+    fn any_in_string_double_encodes_as_json_string() {
+        let v = AnyInString::new(json!({"SystemType": "Container"}));
+        let s = serde_json::to_string(&v).unwrap();
+        // Top-level serialization is a JSON STRING (starts/ends with a quote),
+        // and the inner braces/quotes are escaped.
+        assert_eq!(s, "\"{\\\"SystemType\\\":\\\"Container\\\"}\"");
+        // Round-trips back to the same value.
+        let back: AnyInString = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn create_request_container_config_is_escaped_string() {
+        let req = CreateRequest {
+            base: RequestBase {
+                activity_id: Uuid::nil(),
+                container_id: "00000000-0000-0000-0000-000000000000".into(),
+            },
+            container_config: AnyInString::new(json!({
+                "SystemType": "Container",
+            })),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        // Field name is literally `ContainerConfig` (NOT `Settings`), and its
+        // value is a STRING containing escaped JSON (double-encoded).
+        assert!(
+            s.contains("\"ContainerConfig\":\"{\\\"SystemType\\\":\\\"Container\\\"}\""),
+            "expected double-encoded ContainerConfig string, got: {s}"
+        );
+        assert!(
+            !s.contains("\"Settings\""),
+            "must not emit a Settings field"
+        );
+        assert!(s.contains("\"ContainerId\":\"00000000-0000-0000-0000-000000000000\""));
+        assert!(s.contains("\"ActivityId\""));
+
+        // Full round-trip back into a CreateRequest.
+        let back: CreateRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.base.container_id, req.base.container_id);
+        assert_eq!(back.container_config, req.container_config);
     }
 
     #[test]

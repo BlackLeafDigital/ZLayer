@@ -11,6 +11,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Gates in-guest Hyper-V debugging instrumentation. OFF by default.
+windows-debug = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -50,6 +50,10 @@ s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3", "dep:zlayer-storage"]
 # opt out with `default-features = false`.
 nat = ["zlayer-overlay/nat"]
 zlayer-gcs = ["dep:zlayer-gcs"]
+# In-guest Hyper-V debugging instrumentation. OFF by default. Implies
+# `hcs-runtime` because the debug code lives in hcs-runtime-gated modules, and
+# forwards to `zlayer-gcs`'s own `windows-debug` feature.
+windows-debug = ["hcs-runtime", "zlayer-gcs/windows-debug"]
 
 [dependencies]
 async-trait.workspace = true

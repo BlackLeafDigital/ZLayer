@@ -17,8 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::diagnostics::ts_us;
-
 use tokio::sync::{oneshot, Mutex};
 
 use crate::error::{GcsError, GcsResult};
@@ -33,9 +31,61 @@ use crate::transport::{HvSockListener, HvSockStream, GCS_SERVICE_GUID};
 /// `internal/gcs/guestconnection.go::nullContainerID`.
 const NULL_CONTAINER_ID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// Emit a verbose in-guest-GCS handshake diagnostic to stderr, but ONLY when
+/// the `windows-debug` feature is enabled. Kept in-tree (not deleted) so the
+/// timeline-aligned send/reader traces can be turned back on while debugging
+/// the GCS protocol on nanoserver; compiled out (and silent) otherwise.
+///
+/// The first argument is the format string (a `[t=+{ts}us] ...` template with
+/// a leading `{ts}` placeholder for the [`crate::diagnostics::ts_us`] anchor);
+/// remaining arguments are the format args. When the feature is off the whole
+/// invocation — including the `ts_us()` call — expands to nothing, so no
+/// computations run and no `unused` warnings fire.
+macro_rules! gcs_debug {
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        #[cfg(feature = "windows-debug")]
+        {
+            eprintln!(
+                concat!("[t=+{}us] ", $fmt),
+                $crate::diagnostics::ts_us(),
+                $($arg),*
+            );
+        }
+    };
+}
+
 /// Default min/max GCS protocol version we negotiate. v4 is the version
 /// hcsshim's `internal/gcs/guestconnection.go` declares as of May 2026.
 pub const GCS_PROTOCOL_VERSION: u32 = 4;
+
+/// Render a non-zero guest [`ResponseBase`] into a diagnostic string that
+/// includes the HRESULT (as `{:#x}`), the guest's `error_message`, AND the
+/// raw `error_records` blob — the latter is where the in-guest GCS stashes the
+/// structured reason a Create/Start was rejected. `stage` labels which step of
+/// the bridge lifecycle produced the failure (e.g. `"cold-start Create"`).
+fn describe_response_error(stage: &str, base: &ResponseBase) -> String {
+    // HRESULT is conventionally rendered as an unsigned 32-bit hex value
+    // (top bit = severity). Reinterpret the i32 bit pattern rather than going
+    // through `as u32`, which clippy flags.
+    let hresult = u32::from_ne_bytes(base.result.to_ne_bytes());
+    let records = if base.error_records.is_empty() {
+        String::new()
+    } else {
+        format!(" error_records={}", base.error_records)
+    };
+    format!(
+        "{stage} returned HRESULT {hresult:#x}: {}{records}",
+        base.error_message
+    )
+}
+
+/// Annotate a transport/dispatch-level [`GcsError`] with the bridge lifecycle
+/// `stage` it occurred in, so a mid-handshake hangup reads as e.g.
+/// `negotiation: cold-start Create: bridge closed` rather than a bare
+/// `bridge closed` that gives no hint which RPC the guest rejected.
+fn stage_err(stage: &str, err: GcsError) -> GcsError {
+    GcsError::Negotiation(format!("{stage}: {err}"))
+}
 
 /// Reader/writer rendezvous state, guarded by a single mutex so that "reader
 /// has exited" and "new waiter inserted" are mutually exclusive.
@@ -109,15 +159,12 @@ impl GcsBridge {
         };
         let resp: NegotiateProtocolResponse = self
             .send_rpc_json(RpcMessageType::NegotiateProtocol, &req)
-            .await?;
+            .await
+            .map_err(|e| stage_err("negotiate", e))?;
         if resp.base.result != 0 {
-            // HRESULT is conventionally rendered as an unsigned 32-bit hex
-            // value (top bit = severity). Reinterpret the i32 bit pattern
-            // rather than going through `as u32`, which clippy flags.
-            let hresult = u32::from_ne_bytes(resp.base.result.to_ne_bytes());
-            return Err(GcsError::Negotiation(format!(
-                "guest returned HRESULT {hresult:#x}: {}",
-                resp.base.error_message
+            return Err(GcsError::Negotiation(describe_response_error(
+                "negotiate",
+                &resp.base,
             )));
         }
         if resp.version != GCS_PROTOCOL_VERSION {
@@ -151,17 +198,32 @@ impl GcsBridge {
         // only body) causes the guest GCS to critical-process-die ~0.87ms
         // after receiving Create — the bridge sees `header read failed
         // after 1 frame(s): bridge closed` and Hyper-V-Worker eventid 18590
-        // fires with bugcheck 0xEF (`CRITICAL_PROCESS_DIED`). UTC is the
-        // safe default: matches hcsshim's `noInheritHostTimezone` branch
-        // and avoids plumbing the host's tz through (which would need a
-        // `windows`-only `GetDynamicTimeZoneInformation` call). All fields
-        // beyond `StandardName`/`DaylightName` are `omitempty` Go-side, so
-        // we send the minimum non-empty object the deserialiser will accept.
+        // fires with bugcheck 0xEF (`CRITICAL_PROCESS_DIED`).
+        //
+        // The exact `TimeZoneInformation` value mirrors hcsshim's
+        // `noInheritHostTimezone` UTC constant `utcTimezone` from
+        // `internal/uvm/timezone.go`:
+        //
+        //   var utcTimezone = &hcsschema.TimeZoneInformation{
+        //       StandardName: "Coordinated Universal Time",
+        //       DaylightName: "Coordinated Universal Time",
+        //       StandardDate: &hcsschema.SystemTime{},
+        //       DaylightDate: &hcsschema.SystemTime{},
+        //   }
+        //
+        // i.e. the canonical Windows TZ names (NOT the bare `"UTC"` our prior
+        // body used, which `TIME_ZONE_INFORMATION` rejects) plus empty
+        // `StandardDate`/`DaylightDate` objects — hcsshim sets them to
+        // `&SystemTime{}`, which serialise as `{}`. Reproducing the exact
+        // hcsshim wire shape removes the malformed-TZ confounder for the
+        // 0xEF cold-start death.
         let uvm_config_str = serde_json::to_string(&serde_json::json!({
             "SystemType": "Container",
             "TimeZoneInformation": {
-                "StandardName": "UTC",
-                "DaylightName": "UTC",
+                "StandardName": "Coordinated Universal Time",
+                "DaylightName": "Coordinated Universal Time",
+                "StandardDate": {},
+                "DaylightDate": {},
             },
         }))?;
         let create_body = serde_json::json!({
@@ -171,12 +233,12 @@ impl GcsBridge {
         });
         let create_resp: ResponseBase = self
             .send_rpc_json(RpcMessageType::Create, &create_body)
-            .await?;
+            .await
+            .map_err(|e| stage_err("cold-start Create", e))?;
         if create_resp.result != 0 {
-            let hresult = u32::from_ne_bytes(create_resp.result.to_ne_bytes());
-            return Err(GcsError::Negotiation(format!(
-                "cold-start Create returned HRESULT {hresult:#x}: {}",
-                create_resp.error_message
+            return Err(GcsError::Negotiation(describe_response_error(
+                "cold-start Create",
+                &create_resp,
             )));
         }
 
@@ -189,12 +251,60 @@ impl GcsBridge {
         });
         let start_resp: ResponseBase = self
             .send_rpc_json(RpcMessageType::Start, &start_body)
-            .await?;
+            .await
+            .map_err(|e| stage_err("cold-start Start", e))?;
         if start_resp.result != 0 {
-            let hresult = u32::from_ne_bytes(start_resp.result.to_ne_bytes());
-            return Err(GcsError::Negotiation(format!(
-                "cold-start Start returned HRESULT {hresult:#x}: {}",
-                start_resp.error_message
+            return Err(GcsError::Negotiation(describe_response_error(
+                "cold-start Start",
+                &start_resp,
+            )));
+        }
+        Ok(())
+    }
+
+    /// (windows-debug only) Issue the GCS `ModifyServiceSettings` RPC that asks
+    /// the in-guest log-forward service to begin streaming the guest GCS's own
+    /// log to the host over the `WindowsLoggingHvsockServiceID` hvsock (which
+    /// the host listens on — see `zlayer_gcs::log_forward::LogForwardListener`).
+    ///
+    /// Wire shape mirrors hcsshim exactly
+    /// (`internal/uvm/log_wcow.go::StartLogForwarding` →
+    /// `internal/gcs/guestconnection.go::ModifyServiceSettings` →
+    /// `internal/gcs/prot/protocol.go::ServiceModificationRequest`): an
+    /// `RPCModifyServiceSettings` (the sole RPC in hcsshim's `ComputeService`
+    /// category) against the null container id, carrying
+    /// `PropertyType: "LogForwardService"` and a
+    /// `guestrequest.LogForwardServiceRPCRequest{RPCType:"StartLogForwarding",
+    /// Settings:""}` body.
+    ///
+    /// Best-effort by design — the caller logs and continues on error, since a
+    /// guest that does not advertise log-forwarding will reject the RPC and we
+    /// must not abort the cold-start over a diagnostic.
+    #[cfg(feature = "windows-debug")]
+    async fn start_log_forwarding(&self) -> GcsResult<()> {
+        let body = serde_json::json!({
+            "ActivityId": uuid::Uuid::new_v4().to_string(),
+            "ContainerId": NULL_CONTAINER_ID,
+            // hcsshim `ServiceModificationRequest.PropertyType`.
+            "PropertyType": "LogForwardService",
+            // hcsshim `guestrequest.LogForwardServiceRPCRequest`.
+            "Settings": {
+                "RPCType": "StartLogForwarding",
+                "Settings": "",
+            },
+        });
+        gcs_debug!(
+            "gcs-logfwd: issuing StartLogForwarding ModifyServiceSettings RPC: {}",
+            body,
+        );
+        let resp: ResponseBase = self
+            .send_rpc_json(RpcMessageType::ModifyServiceSettings, &body)
+            .await
+            .map_err(|e| stage_err("StartLogForwarding", e))?;
+        if resp.result != 0 {
+            return Err(GcsError::Negotiation(describe_response_error(
+                "StartLogForwarding",
+                &resp,
             )));
         }
         Ok(())
@@ -219,9 +329,10 @@ impl GcsBridge {
         let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
         frame::encode_frame(rpc.as_request_type(), message_id, &payload, &mut frame);
 
-        eprintln!(
-            "[t=+{}us] gcs-bridge-send: rpc={rpc:?} msg_id={message_id} frame_size={} payload_size={} payload={}",
-            ts_us(),
+        gcs_debug!(
+            "gcs-bridge-send: rpc={:?} msg_id={} frame_size={} payload_size={} payload={}",
+            rpc,
+            message_id,
             frame.len(),
             payload.len(),
             std::str::from_utf8(&payload).unwrap_or("<non-utf8>"),
@@ -272,30 +383,36 @@ impl GcsBridge {
             // doesn't init a subscriber) so the cause of any "bridge closed"
             // lands in `stdout.log`. Verbose by design while the GCS protocol
             // handshake is still being debugged on nanoserver:ltsc2022.
-            eprintln!("[t=+{}us] gcs-bridge-reader: started", ts_us());
+            gcs_debug!("gcs-bridge-reader: started");
+            // Purely diagnostic frame counter — only read by the gated
+            // `gcs_debug!` traces. Gate it too so the non-debug build has no
+            // unused-variable/assignment warnings.
+            #[cfg(feature = "windows-debug")]
             let mut frames_seen: u32 = 0;
             loop {
                 let mut hdr_buf = [0u8; HEADER_LEN];
                 if let Err(e) = stream.read_exact(&mut hdr_buf).await {
-                    eprintln!(
-                        "[t=+{}us] gcs-bridge-reader: header read failed after {frames_seen} frame(s): {e}",
-                        ts_us(),
+                    gcs_debug!(
+                        "gcs-bridge-reader: header read failed after {} frame(s): {}",
+                        frames_seen,
+                        e,
                     );
                     break;
                 }
                 let hdr = match frame::decode_header(&hdr_buf) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!(
-                            "[t=+{}us] gcs-bridge-reader: header decode failed (bytes={hdr_buf:02x?}): {e}",
-                            ts_us(),
+                        gcs_debug!(
+                            "gcs-bridge-reader: header decode failed (bytes={:02x?}): {}",
+                            hdr_buf,
+                            e,
                         );
                         break;
                     }
                 };
-                eprintln!(
-                    "[t=+{}us] gcs-bridge-reader: frame#{frames_seen} type=0x{:08x} size={} msg_id={}",
-                    ts_us(),
+                gcs_debug!(
+                    "gcs-bridge-reader: frame#{} type=0x{:08x} size={} msg_id={}",
+                    frames_seen,
                     hdr.r#type,
                     hdr.size,
                     hdr.message_id,
@@ -304,22 +421,29 @@ impl GcsBridge {
                 let mut body = vec![0u8; body_len];
                 if body_len > 0 {
                     if let Err(e) = stream.read_exact(&mut body).await {
-                        eprintln!(
-                            "[t=+{}us] gcs-bridge-reader: body read failed (need {body_len} bytes): {e}",
-                            ts_us(),
+                        gcs_debug!(
+                            "gcs-bridge-reader: body read failed (need {} bytes): {}",
+                            body_len,
+                            e,
                         );
                         break;
                     }
                     // Cap dumped payload at 512B so a verbose stream event
                     // doesn't flood stdout.log.
-                    let cap = body.len().min(512);
-                    eprintln!(
-                        "[t=+{}us] gcs-bridge-reader: body[..{cap}]={:?}",
-                        ts_us(),
-                        String::from_utf8_lossy(&body[..cap]),
-                    );
+                    #[cfg(feature = "windows-debug")]
+                    {
+                        let cap = body.len().min(512);
+                        gcs_debug!(
+                            "gcs-bridge-reader: body[..{}]={:?}",
+                            cap,
+                            String::from_utf8_lossy(&body[..cap]),
+                        );
+                    }
                 }
-                frames_seen = frames_seen.saturating_add(1);
+                #[cfg(feature = "windows-debug")]
+                {
+                    frames_seen = frames_seen.saturating_add(1);
+                }
                 // Only RESPONSE frames are routed to an awaiting RPC waiter.
                 // Notification / stream frames have no caller — drop them
                 // here (a future task can plumb them to a notification
@@ -348,9 +472,8 @@ impl GcsBridge {
             // check installs a waiter no reader will ever wake.
             {
                 let mut g = pending.lock().await;
-                eprintln!(
-                    "[t=+{}us] gcs-bridge-reader: exiting; dropping {} pending waiters",
-                    ts_us(),
+                gcs_debug!(
+                    "gcs-bridge-reader: exiting; dropping {} pending waiters",
                     g.waiters.len(),
                 );
                 g.closed = true;
@@ -395,6 +518,23 @@ impl PendingGcsBridge {
         };
         bridge.spawn_reader();
         let caps = bridge.negotiate_protocol().await?;
+        // windows-debug only: ask the in-guest GCS to START FORWARDING its own
+        // log to the host BEFORE we issue the cold-start Create that currently
+        // kills it. In production hcsshim issues this later (post-cold-start, in
+        // `start.go`), but the whole point of the debug build is to capture the
+        // guest GCS's own log lines explaining the cold-start death — so we
+        // turn forwarding on at the earliest possible moment after negotiate.
+        // Best-effort: a forwarding-RPC failure must NOT abort the create (the
+        // guest may not advertise the capability), so we only log it.
+        #[cfg(feature = "windows-debug")]
+        {
+            if let Err(e) = bridge.start_log_forwarding().await {
+                gcs_debug!(
+                    "gcs-logfwd: StartLogForwarding RPC failed (continuing): {}",
+                    e
+                );
+            }
+        }
         // hcsshim sends Create+Start IMMEDIATELY after a successful
         // negotiate, before any other RPC. Skipping this causes the peer to
         // close the bridge ~instantly. See `cold_start_create_start` for

@@ -54,6 +54,21 @@ pub const HV_GUID_WILDCARD: windows::core::GUID =
 pub const WINDOWS_GCS_HV_HOST_ID: windows::core::GUID =
     windows::core::GUID::from_u128(0x894c_c2d6_9d79_424f_93fe_4296_9ae6_d8d1);
 
+/// `WindowsLoggingHvsockServiceID` — the hvsock service ID the in-guest GCS
+/// log-forward service connects to (on the host partition) to stream its log
+/// records out to the host. Matches hcsshim
+/// `internal/gcs/prot/protocol.go::WindowsLoggingHvsockServiceID`
+/// (172dad59-976d-45f2-8b6c-6d1b13f2ac4d).
+///
+/// hcsshim binds a host listener on `(uvm.RuntimeID(), this)` in
+/// `create_wcow.go::makeUtilityVM` (`uvm.outputListener = winio.ListenHvsock`)
+/// and, after the GCS bridge negotiates, drives the guest to start streaming
+/// via the `LogForwardService` GCS RPC (see `log_wcow.go::StartLogForwarding`).
+/// The guest then dials this service and writes newline-delimited JSON logrus
+/// records, which hcsshim's default `ParseGCSLogrus` output handler decodes.
+pub const WINDOWS_LOGGING_HVSOCK_SERVICE_ID: windows::core::GUID =
+    windows::core::GUID::from_u128(0x172d_ad59_976d_45f2_8b6c_6d1b_13f2_ac4d);
+
 /// `AF_HYPERV` socket address family (34 / `0x22`). Held as `u16` because
 /// that is the type of the `family` field in `SOCKADDR_HV`; widened to
 /// `i32` at the `WSASocketW` call site.
@@ -291,6 +306,39 @@ impl HvSockStream {
 
         buf.copy_from_slice(&filled);
         Ok(())
+    }
+
+    /// Read whatever bytes are currently available, up to `max`, returning a
+    /// freshly-allocated `Vec` (empty only on a clean peer close, which is
+    /// surfaced as `Ok(vec![])`). Unlike [`HvSockStream::read_exact`] this does
+    /// NOT wait for a fixed length — it is the primitive for consuming an
+    /// open-ended stream of unknown framing, e.g. the in-guest GCS log-forward
+    /// service writing newline-delimited JSON logrus records over the
+    /// `WindowsLoggingHvsockServiceID` hvsock (see [`LogForwardListener`]).
+    ///
+    /// Returns `Ok(vec![])` when the peer has closed the connection (Winsock
+    /// `recv` returned 0), so callers can treat an empty result as EOF.
+    pub async fn read_some(&self, max: usize) -> GcsResult<Vec<u8>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> GcsResult<Vec<u8>> {
+            let mut out = vec![0u8; max];
+            // SAFETY: `out` is a valid &mut [u8]; `recv` writes at most
+            // `out.len()` bytes; the socket is owned by `inner`.
+            let n = unsafe { recv(inner.socket(), &mut out, SEND_RECV_FLAGS(0)) };
+            if n == SOCKET_ERROR {
+                return Err(wsa_err("recv"));
+            }
+            let got =
+                usize::try_from(n).map_err(|e| GcsError::Hvsock(format!("recv count: {e}")))?;
+            out.truncate(got);
+            Ok(out)
+        })
+        .await
+        .map_err(|e| GcsError::Hvsock(format!("read_some join: {e}")))??;
+        Ok(bytes)
     }
 
     /// Write all `buf` bytes.

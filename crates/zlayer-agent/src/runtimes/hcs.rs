@@ -1531,6 +1531,34 @@ impl HcsRuntime {
                 })?;
 
         // ----------------------------------------------------------------
+        // Step 3a' (windows-debug only): bind the host log-forward hvsock
+        // listener BEFORE starting the UVM. hcsshim's create_wcow.go binds
+        // `uvm.outputListener = winio.ListenHvsock{VMID: uvm.RuntimeID(),
+        // ServiceID: WindowsLoggingHvsockServiceID}` here (between create and
+        // start) so the host is listening when the in-guest GCS log-forward
+        // service dials out. The guest only STARTS forwarding after we issue
+        // the `StartLogForwarding` GCS RPC (done inside the bridge's accept(),
+        // post-negotiate, windows-debug gated), but the listener must already
+        // exist or the guest's connect fails. The receive loop is spawned just
+        // after HcsStart (below); records land in `gcs-forward.log` in the
+        // UVM debug dir, which `read_uvm_debug_dump` collects.
+        #[cfg(feature = "windows-debug")]
+        let log_fwd = {
+            tracing::info!(
+                hcs_id = %hcs_id,
+                runtime_id = %format_guid_bare(uvm.runtime_id()),
+                "Hyper-V step 3a' (windows-debug): bind host log-forward hvsock listener"
+            );
+            step_log!("3a' (windows-debug): bind host log-forward hvsock listener");
+            zlayer_gcs::log_forward::LogForwardListener::bind(uvm.runtime_id(), uvm.debug_dir())
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 3a': LogForwardListener::bind: {e}"),
+                })?
+        };
+
+        // ----------------------------------------------------------------
         // Step 3: HcsStartComputeSystem — power the UVM on.
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 3: HcsStartComputeSystem (UVM)");
@@ -1542,6 +1570,25 @@ impl HcsRuntime {
                 id: hcs_id.to_string(),
                 reason: format!("Hyper-V step 3: HcsStartComputeSystem (UVM): {e}"),
             })?;
+
+        // ----------------------------------------------------------------
+        // Step 3b' (windows-debug only): spawn the host log-forward receive
+        // loop now that the UVM is Running. The guest's GCS log-forward
+        // service may dial as soon as it boots; the listener is already bound
+        // (step 3a'). Records are appended to `gcs-forward.log` in the UVM
+        // debug dir and echoed to stderr.
+        // ----------------------------------------------------------------
+        #[cfg(feature = "windows-debug")]
+        log_fwd.spawn();
+
+        // NOTE: there is intentionally NO writable "zlayer-debug" VSMB share.
+        // A guest-writable VSMB share is rejected by HCS at hot-attach with
+        // PowerOnCold `0x80070057` (E_INVALIDARG) regardless of `options` —
+        // confirmed on the box (a pre-accept `add_vsmb(zlayer-debug)` fails
+        // create outright). Guest-side diagnostics are exfiltrated instead via
+        // GCS log forwarding (steps 3a'/3b'), which streams the guest GCS's own
+        // logrus records to a HOST file over the logging hvsock — no
+        // guest-writable share required.
 
         // Diagnostic: the CreateFailed reason string is the only channel the
         // e2e test surfaces, so query the HCS-assigned base properties (carries
@@ -1690,20 +1737,24 @@ impl HcsRuntime {
 
         // ----------------------------------------------------------------
         // Step 5: hot-attach each parent layer as a read-only VSMB share
-        //         on the UVM. Indices are sequential from 0 (host-side
-        //         resource path keying); guest-side VSMB paths are
-        //         `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`.
+        //         on the UVM. Indices are sequential; guest-side VSMB paths
+        //         are `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`. Parent layers start at
+        //         index 0 (there is no longer a writable debug share occupying
+        //         index 0 — guest diagnostics use GCS log forwarding instead).
         // ----------------------------------------------------------------
+        let vsmb_base_idx = 0usize;
         tracing::info!(
             hcs_id = %hcs_id,
             layer_count = parent_layers.len(),
+            vsmb_base_idx,
             "Hyper-V step 5: hot-attach per-layer VSMB shares"
         );
         step_log!(
-            "5: hot-attach per-layer VSMB shares ({} layers)",
+            "5: hot-attach per-layer VSMB shares ({} layers, base_idx={vsmb_base_idx})",
             parent_layers.len()
         );
-        for (idx, layer) in parent_layers.iter().enumerate() {
+        for (offset, layer) in parent_layers.iter().enumerate() {
+            let idx = vsmb_base_idx + offset;
             let share = VirtualSmbShare {
                 name: layer.id.clone(),
                 path: layer.path.clone(),
@@ -1771,8 +1822,15 @@ impl HcsRuntime {
         // hcsshim's well-known VSMB controller GUID — same across all
         // hcsshim builds; lives in `internal/uvm/vsmb.go`.
         let vsmb_controller_guid = "{dcc079ae-60ba-4d07-847c-3493609c0870}";
+        // Guest-side VSMB path index `sN` is the host-side VSMB share index
+        // used at attach time, so it must include `vsmb_base_idx` (1 under
+        // windows-debug, where index 0 is the writable zlayer-debug share; 0
+        // otherwise) to stay aligned with the Step 5 hot-attach indices.
         let guest_vsmb_paths: Vec<String> = (0..parent_layers.len())
-            .map(|n| format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{n}"))
+            .map(|n| {
+                let idx = vsmb_base_idx + n;
+                format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{idx}")
+            })
             .collect();
         // Placeholder guest scratch mount + WCIFS root — freshly-allocated
         // GUID per create. Real values come from the in-guest mount
@@ -1972,7 +2030,7 @@ impl HcsRuntime {
                 activity_id: Uuid::new_v4(),
                 container_id: hcs_id.to_string(),
             },
-            settings: create_settings,
+            container_config: zlayer_gcs::protocol::AnyInString::new(create_settings),
         };
         let _create_resp: CreateResponse = bridge
             .send_rpc_json(RpcMessageType::Create, &create_req)
@@ -2143,12 +2201,8 @@ const WINDOWS_LOGGING_HVSOCK_SERVICE_ID: &str = "172dad59-976d-45f2-8b6c-6d1b13f
 /// override `gcs.DependOnService` so SCM does not block waiting for network
 /// services that never come up in a NIC-less UVM.
 ///
-/// Currently unused — B-2 dropped the only caller (the
-/// `gcs.DependOnService` override). Kept under `#[allow(dead_code)]`
-/// because the bisect may need to put it back if removing the override
-/// turns out to be wrong; the encoding logic is correct and worth
-/// preserving until the dust settles.
-#[allow(dead_code)]
+/// Used by `build_uvm_registry_changes` for the `gcs.DependOnService`
+/// override, and by the `windows-debug`-gated `zlayer-dbg` SCM service entry.
 fn encode_multi_sz_utf16le(strs: &[&str]) -> String {
     use base64::Engine;
     let mut bytes = Vec::<u8>::new();
@@ -2271,13 +2325,11 @@ fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
 /// hcsshim `internal/uvm/vsmb.go:27`. Combined with a share name, the in-
 /// guest absolute path to that share is `\\?\VMSMB\VSMB-{dcc079ae-…}\<name>`.
 ///
-/// Currently unused — B-4 dropped the only callers (the writable
-/// `zlayer-debug` share + zlayer-dump SCM service + WER `LocalDumps` target).
-/// Kept under `#[allow(dead_code)]` because the host-side hot-add path for
-/// per-hosted-container VSMB shares in `hyperv_create_via_gcs` Step 5 still
-/// uses this same prefix indirectly via `add_vsmb`'s controller GUID
-/// derivation.
-#[allow(dead_code)]
+/// Only referenced by the `windows-debug`-gated diagnostic registry builder
+/// (`build_uvm_debug_registry_changes`), which points WER `LocalDumps` and the
+/// `zlayer-dbg` SCM service at the writable `zlayer-debug` share mounted under
+/// this prefix inside the guest.
+#[cfg(feature = "windows-debug")]
 const VSMB_GUEST_PREFIX: &str = r"\\?\VMSMB\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}";
 
 /// Build the offline `RegistryChanges` HCS applies to the guest hives before
@@ -2299,7 +2351,7 @@ const VSMB_GUEST_PREFIX: &str = r"\\?\VMSMB\VSMB-{dcc079ae-60ba-4d07-847c-349360
 /// `scripts/windows/launch_e2e.ps1` is the replacement diagnostic channel
 /// while we bisect the 0xEF cause.)
 fn build_uvm_registry_changes() -> Vec<RegistryValue> {
-    vec![
+    let mut values = vec![
         // hcsshim parity: gns EnableCompartmentNamespace=1.
         RegistryValue {
             key: Some(RegistryKey {
@@ -2329,6 +2381,159 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
             name: "DependOnService".to_string(),
             r#type: Some(RegistryValueType::MultiString),
             binary_value: encode_multi_sz_utf16le(&["condrv", "hvsocketcontrol"]),
+            ..Default::default()
+        },
+    ];
+
+    // windows-debug: append WER LocalDumps for vmcomputeagent.exe + the
+    // `zlayer-dbg` auto-start diagnostic exfil service. Both target the
+    // writable `zlayer-debug` VSMB share (hot-attached in step 4c). Compiled
+    // out entirely in normal builds.
+    #[cfg(feature = "windows-debug")]
+    values.extend(build_uvm_debug_registry_changes());
+
+    values
+}
+
+/// (`windows-debug` only) Offline registry changes that turn the guest into a
+/// diagnostic exfiltrator for the GCS cold-start failure: when
+/// `vmcomputeagent.exe` (the in-guest GCS host process) crashes or tears down,
+/// the host can read a crash dump and event-log capture from the writable
+/// `zlayer-debug` VSMB share.
+///
+/// Two mechanisms, primary + secondary:
+///
+/// 1. **WER `LocalDumps` for `vmcomputeagent.exe`** (PRIMARY). If gcs.exe
+///    actually crashes during cold-start `Create`, Windows Error Reporting
+///    writes a full (`DumpType=2`) minidump into the configured `DumpFolder`,
+///    which we point at the guest mount of the writable share. The host then
+///    reads it back via [`read_uvm_debug_dump`] (which records `.dmp` size
+///    rather than slurping the binary). Lives in the `Software` hive at
+///    `Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe`.
+///
+/// 2. **`zlayer-dbg` SCM service** (SECONDARY). A DEMAND-start own-process
+///    service whose `ImagePath` is a `cmd.exe /c` one-liner that dumps the
+///    `gcs` service state (`sc query gcs`) and the Hyper-V Compute operational
+///    event channel into the share. It is registered but NOT auto-started:
+///    auto-start (`Start`=2) ran this `cmd.exe`/`wevtutil` payload during the
+///    fragile cold-start boot window and confounded the 0xEF bisection, so it
+///    is now `Start`=3 (SERVICE_DEMAND_START) and only runs on an explicit
+///    `sc start zlayer-dbg` from a host/serial console. Lives in the `System`
+///    hive under `CurrentControlSet\Services\zlayer-dbg`.
+///
+/// The guest mount path for the share is
+/// `\\?\VMSMB\VSMB-{dcc079ae-…}\zlayer-debug` (see [`VSMB_GUEST_PREFIX`]).
+#[cfg(feature = "windows-debug")]
+fn build_uvm_debug_registry_changes() -> Vec<RegistryValue> {
+    // Guest-side absolute path to the writable `zlayer-debug` share.
+    let mount = format!(r"{VSMB_GUEST_PREFIX}\zlayer-debug");
+
+    // ImagePath for the `zlayer-dbg` SCM service. `cmd.exe /c` runs both
+    // captures (each redirected to its own file in the share) at first
+    // auto-start. `sc query gcs` snapshots whether SCM ever started the GCS
+    // service; the `wevtutil` calls dump the Hyper-V Compute operational
+    // channel (the channel that carries GCS create/teardown ETW) AND, as a
+    // fallback if that channel name is wrong on this build, the System log
+    // filtered to Service Control Manager events mentioning gcs. `%comspec%`
+    // is left literal so REG_EXPAND_SZ expansion picks up the real cmd path.
+    let image_path = format!(
+        concat!(
+            r"%comspec% /c ",
+            r"sc query gcs > {mount}\sc-gcs.txt 2>&1 & ",
+            r"sc qc gcs >> {mount}\sc-gcs.txt 2>&1 & ",
+            r"wevtutil qe Microsoft-Windows-Hyper-V-Compute-Operational /c:200 /f:text ",
+            r"> {mount}\gcs-evtlog.txt 2>&1 & ",
+            r#"wevtutil qe System "/q:*[System[Provider[@Name='Service Control Manager']]]" "#,
+            r"/c:200 /rd:true /f:text > {mount}\system-scm.txt 2>&1"
+        ),
+        mount = mount,
+    );
+
+    vec![
+        // --- WER LocalDumps for vmcomputeagent.exe (PRIMARY) ---
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpFolder".to_string(),
+            r#type: Some(RegistryValueType::ExpandedString),
+            string_value: mount.clone(),
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpType".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 2 = full dump.
+            d_word_value: Some(2),
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpCount".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            d_word_value: Some(5),
+            ..Default::default()
+        },
+        // --- zlayer-dbg auto-start exfil service (SECONDARY) ---
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
+            }),
+            name: "ImagePath".to_string(),
+            r#type: Some(RegistryValueType::ExpandedString),
+            string_value: image_path,
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
+            }),
+            name: "Start".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 3 = SERVICE_DEMAND_START. Previously 2 (SERVICE_AUTO_START),
+            // which ran this `cmd.exe`/`wevtutil` one-liner early in guest
+            // boot and is a confounder for the fragile cold-start UVM (it
+            // perturbs the guest before the GCS even dials). Demand-start
+            // leaves the registry entry in-tree (so the service definition is
+            // still present for manual `sc start zlayer-dbg` from a console)
+            // without auto-running it at boot. The passive WER `LocalDumps`
+            // entries above are untouched — they only act on a real crash.
+            d_word_value: Some(3),
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
+            }),
+            name: "Type".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 0x10 = SERVICE_WIN32_OWN_PROCESS.
+            d_word_value: Some(0x10),
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
+            }),
+            name: "ErrorControl".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 0 = SERVICE_ERROR_IGNORE — never block boot on this service.
+            d_word_value: Some(0),
             ..Default::default()
         },
     ]
@@ -2366,19 +2571,19 @@ fn build_virtual_machine_doc(
 
     // VirtualSMB shares at UVM-create time: ONLY the `"os"` share that
     // exposes the image's `UtilityVM\Files` directory as the UVM's boot
-    // volume (UEFI boots from `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`),
-    // plus the writable `"zlayer-debug"` diagnostic exfil share appended
-    // at the end.
+    // volume (UEFI boots from `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`).
     //
-    // We deliberately do NOT include parent-layer shares here. Hcsshim's
+    // We deliberately do NOT include parent-layer shares here, nor the
+    // writable `"zlayer-debug"` diagnostic exfil share. Hcsshim's
     // `internal/uvm/create_wcow.go` only writes the `os` share at
     // create-time; parent-layer shares are hot-attached AFTER the UVM
     // boots, per hosted container, via `uvm.Add` (`internal/uvm/vsmb.go`).
-    // Our `hyperv_create_via_gcs` already does the hot-attach at Step 5
-    // (`hcs.rs::1809`); injecting them here too poisons gcs.exe's
-    // host-compartment init during cold-start `RpcCreate` and is the
-    // working hypothesis for the observed 0xEF `CRITICAL_PROCESS_DIED`
-    // bugcheck ~0.8 s after Negotiate. See:
+    // Our `hyperv_create_via_gcs` does those hot-attaches at Step 5 (parent
+    // layers) and, under `windows-debug`, the writable `zlayer-debug` share
+    // at Step 3c' (post-HcsStart, pre-accept); injecting any of them into the
+    // create-time doc poisons gcs.exe's host-compartment init during
+    // cold-start `RpcCreate` and is the working hypothesis for the observed
+    // 0xEF `CRITICAL_PROCESS_DIED` bugcheck ~0.8 s after Negotiate. See:
     //
     //   `.claude/plans/okay-todo-delme-md-this-is-abstract-kernighan.md`
     //   `BlackLeafDocs/zlayer/windowshcs/gcs-bridge-and-0xEF.md`

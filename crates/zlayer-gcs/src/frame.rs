@@ -60,21 +60,53 @@ pub enum RpcMessageType {
     DeleteContainerState = 0x0D01,
     UpdateContainer = 0x0E01,
     LifecycleNotification = 0x0F01,
+    /// `RPCModifyServiceSettings` — the ONLY RPC in hcsshim's `ComputeService`
+    /// category (`internal/gcs/prot/protocol.go`):
+    /// `RPCModifyServiceSettings RPCProc = ComputeService | (iota+1)<<8 | 1`.
+    /// `iota` RESETS to 0 in that second `const` block, so the per-RPC byte is
+    /// `(0+1)<<8 = 0x100` and the low 16 bits are `0x0101` — identical to
+    /// `Create`'s low bits, but it lives in a DIFFERENT category
+    /// (`ComputeService = 0x0020_0000`, not `ComputeSystem = 0x0010_0000`).
+    /// Used to drive the in-guest GCS log-forward service
+    /// (`internal/uvm/log_wcow.go`). Because the category differs, the
+    /// discriminant alone cannot be OR'd with `CATEGORY_COMPUTE_SYSTEM` —
+    /// [`RpcMessageType::as_request_type`] special-cases it. The discriminant
+    /// is offset into a private range so it does not numerically collide with
+    /// `Create = 0x0101` inside the Rust enum.
+    ModifyServiceSettings = 0x1_0101,
 }
 
 impl RpcMessageType {
-    /// Encode as the on-wire request `type` u32:
-    /// `MSG_TYPE_REQUEST | CATEGORY_COMPUTE_SYSTEM | rpc`.
+    /// hcsshim message category for this RPC. Every container/system RPC is
+    /// `ComputeSystem`; only [`RpcMessageType::ModifyServiceSettings`] is
+    /// `ComputeService`.
+    #[must_use]
+    const fn category(self) -> u32 {
+        match self {
+            Self::ModifyServiceSettings => CATEGORY_COMPUTE_SERVICE,
+            _ => CATEGORY_COMPUTE_SYSTEM,
+        }
+    }
+
+    /// The low-16-bit `(iota+1)<<8 | 1` RPC code, stripped of the synthetic
+    /// enum-disambiguation offset carried by [`RpcMessageType::ModifyServiceSettings`].
+    #[must_use]
+    const fn proc_code(self) -> u32 {
+        (self as u32) & 0xFFFF
+    }
+
+    /// Encode as the on-wire request `type` u32: `MSG_TYPE_REQUEST | category |
+    /// rpc`.
     #[must_use]
     pub const fn as_request_type(self) -> u32 {
-        MSG_TYPE_REQUEST | CATEGORY_COMPUTE_SYSTEM | (self as u32)
+        MSG_TYPE_REQUEST | self.category() | self.proc_code()
     }
 
     /// Encode as the expected on-wire response `type` u32:
-    /// `MSG_TYPE_RESPONSE | CATEGORY_COMPUTE_SYSTEM | rpc`.
+    /// `MSG_TYPE_RESPONSE | category | rpc`.
     #[must_use]
     pub const fn as_response_type(self) -> u32 {
-        MSG_TYPE_RESPONSE | CATEGORY_COMPUTE_SYSTEM | (self as u32)
+        MSG_TYPE_RESPONSE | self.category() | self.proc_code()
     }
 }
 
@@ -219,5 +251,26 @@ mod tests {
             RpcMessageType::NegotiateProtocol.as_response_type(),
             0x2010_0B01
         );
+    }
+
+    /// Pin the on-wire `ModifyServiceSettings` REQUEST/RESPONSE types. This RPC
+    /// lives in hcsshim's `ComputeService` category (not `ComputeSystem`), so
+    /// its wire value is `MSG_TYPE_* | 0x0020_0000 | 0x0101`. The Rust enum
+    /// discriminant carries a synthetic `0x1_0000` offset to avoid colliding
+    /// with `Create = 0x0101`; `proc_code()` must strip it so the wire bytes
+    /// are exactly `0x1020_0101` (request) / `0x2020_0101` (response). If this
+    /// drifts, the in-guest log-forward service will reject the RPC and the
+    /// guest GCS log will never reach the host.
+    #[test]
+    fn modify_service_settings_wire_type_pinned() {
+        let req = RpcMessageType::ModifyServiceSettings.as_request_type();
+        let resp = RpcMessageType::ModifyServiceSettings.as_response_type();
+        assert_eq!(req, 0x1020_0101);
+        assert_eq!(resp, 0x2020_0101);
+        // Category bits must be ComputeService, NOT ComputeSystem.
+        assert_eq!(req & CATEGORY_COMPUTE_SERVICE, CATEGORY_COMPUTE_SERVICE);
+        assert_eq!(req & CATEGORY_COMPUTE_SYSTEM, 0);
+        // No synthetic enum-offset bits leak onto the wire.
+        assert_eq!(req & 0x1_0000, 0);
     }
 }

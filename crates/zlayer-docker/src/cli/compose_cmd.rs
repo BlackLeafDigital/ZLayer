@@ -42,6 +42,15 @@ use zlayer_paths::ZLayerDirs;
 /// Docker Compose commands.
 #[derive(Debug, Parser)]
 pub struct ComposeCommands {
+    /// Project-level compose flags accepted *before* the subcommand, the way
+    /// `docker compose [OPTIONS] SUBCOMMAND` (v2) and `docker-compose` (v1)
+    /// expect them. These mirror the per-subcommand [`ComposeContextArgs`]
+    /// (which remain `global = true` for the post-subcommand form), so
+    /// `zlayer docker compose -f a.yml -p web config` parses identically to
+    /// `zlayer docker compose config -f a.yml -p web`.
+    #[clap(flatten)]
+    pub ctx: ComposeContextArgs,
+
     /// Compose subcommand
     #[clap(subcommand)]
     pub command: ComposeSubcommand,
@@ -153,7 +162,7 @@ pub struct ComposeContextArgs {
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ComposeUpArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to start (default: all)
@@ -188,7 +197,7 @@ pub struct ComposeUpArgs {
 /// Arguments for `docker compose down`.
 #[derive(Debug, Parser)]
 pub struct ComposeDownArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Remove named volumes
@@ -216,7 +225,7 @@ pub struct ComposeLsArgs {
 /// Arguments for `docker compose build`.
 #[derive(Debug, Parser)]
 pub struct ComposeBuildArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to build (default: all)
@@ -234,7 +243,7 @@ pub struct ComposeBuildArgs {
 /// Arguments for `docker compose ps`.
 #[derive(Debug, Parser)]
 pub struct ComposePsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to list (default: all)
@@ -248,7 +257,7 @@ pub struct ComposePsArgs {
 /// Arguments for `docker compose logs`.
 #[derive(Debug, Parser)]
 pub struct ComposeLogsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to show logs for (default: all)
@@ -270,7 +279,7 @@ pub struct ComposeLogsArgs {
 /// Arguments for `docker compose exec`.
 #[derive(Debug, Parser)]
 pub struct ComposeExecArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name
@@ -291,7 +300,7 @@ pub struct ComposeExecArgs {
 /// Arguments for `docker compose pull`.
 #[derive(Debug, Parser)]
 pub struct ComposePullArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to pull (default: all)
@@ -301,7 +310,7 @@ pub struct ComposePullArgs {
 /// Arguments for `docker compose push`.
 #[derive(Debug, Parser)]
 pub struct ComposePushArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to push (default: all)
@@ -311,7 +320,7 @@ pub struct ComposePushArgs {
 /// Arguments for `docker compose restart`.
 #[derive(Debug, Parser)]
 pub struct ComposeRestartArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to restart (default: all)
@@ -325,7 +334,7 @@ pub struct ComposeRestartArgs {
 /// Arguments for `docker compose stop`.
 #[derive(Debug, Parser)]
 pub struct ComposeStopArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to stop (default: all)
@@ -339,7 +348,7 @@ pub struct ComposeStopArgs {
 /// Arguments for `docker compose start`.
 #[derive(Debug, Parser)]
 pub struct ComposeStartArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to start (default: all)
@@ -349,7 +358,7 @@ pub struct ComposeStartArgs {
 /// Arguments for `docker compose kill`.
 #[derive(Debug, Parser)]
 pub struct ComposeKillArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to kill (default: all)
@@ -363,7 +372,7 @@ pub struct ComposeKillArgs {
 /// Arguments for `docker compose rm`.
 #[derive(Debug, Parser)]
 pub struct ComposeRmArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to remove (default: all)
@@ -386,7 +395,7 @@ pub struct ComposeRmArgs {
 /// Arguments for `docker compose pause`.
 #[derive(Debug, Parser)]
 pub struct ComposePauseArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to pause (default: all)
@@ -396,7 +405,7 @@ pub struct ComposePauseArgs {
 /// Arguments for `docker compose unpause`.
 #[derive(Debug, Parser)]
 pub struct ComposeUnpauseArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to unpause (default: all)
@@ -407,7 +416,7 @@ pub struct ComposeUnpauseArgs {
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ComposeRunArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name to run.
@@ -441,7 +450,7 @@ pub struct ComposeRunArgs {
 /// Arguments for `docker compose config`.
 #[derive(Debug, Parser)]
 pub struct ComposeConfigArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Print only the service names.
@@ -462,7 +471,7 @@ pub struct ComposeConfigArgs {
 /// Arguments for `docker compose images`.
 #[derive(Debug, Parser)]
 pub struct ComposeImagesArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to inspect (default: all).
@@ -472,7 +481,7 @@ pub struct ComposeImagesArgs {
 /// Arguments for `docker compose port`.
 #[derive(Debug, Parser)]
 pub struct ComposePortArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name.
@@ -489,7 +498,7 @@ pub struct ComposePortArgs {
 /// Arguments for `docker compose top`.
 #[derive(Debug, Parser)]
 pub struct ComposeTopArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to inspect (default: all).
@@ -499,7 +508,7 @@ pub struct ComposeTopArgs {
 /// Arguments for `docker compose events`.
 #[derive(Debug, Parser)]
 pub struct ComposeEventsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Output events as JSON lines.
@@ -510,7 +519,7 @@ pub struct ComposeEventsArgs {
 /// Arguments for `docker compose cp`.
 #[derive(Debug, Parser)]
 pub struct ComposeCpArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Source path (`<service>:<path>` or local path).
@@ -523,7 +532,7 @@ pub struct ComposeCpArgs {
 /// Arguments for `docker compose wait`.
 #[derive(Debug, Parser)]
 pub struct ComposeWaitArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to wait for (default: all).
@@ -533,14 +542,14 @@ pub struct ComposeWaitArgs {
 /// Arguments for `docker compose watch`.
 #[derive(Debug, Parser)]
 pub struct ComposeWatchArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 }
 
 /// Arguments for `docker compose attach`.
 #[derive(Debug, Parser)]
 pub struct ComposeAttachArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name to attach to.
@@ -558,7 +567,7 @@ pub struct ComposeVersionArgs {
 /// Arguments for `docker compose alpha publish`.
 #[derive(Debug, Parser)]
 pub struct ComposeAlphaPublishArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Repository to publish to.
@@ -844,36 +853,54 @@ async fn connect_daemon() -> anyhow::Result<DaemonClient> {
 /// Returns an error if the compose file cannot be read, parsed, or converted,
 /// or if the daemon request fails.
 pub async fn handle_compose(cmd: ComposeCommands) -> anyhow::Result<()> {
+    // Project-level flags (`-f`, `-p`, `--project-directory`, `--env-file`,
+    // `--profile`) are `global = true` and flattened on the parent
+    // [`ComposeCommands`], so clap collects them whether they appear *before*
+    // or *after* the subcommand (Docker Compose v2 and v1 both allow the
+    // pre-subcommand form). The per-subcommand `ctx` fields are `#[clap(skip)]`
+    // placeholders; we merge the parsed parent `ctx` into each here so the
+    // existing handler bodies (which read `args.ctx`) keep working unchanged.
+    let ctx = cmd.ctx;
+    // Inject the parsed project-level `ctx` into the chosen subcommand's
+    // skipped placeholder, then dispatch. `dispatch!` keeps this terse so the
+    // handler bodies can keep reading `args.ctx` unchanged.
+    macro_rules! dispatch {
+        ($args:ident, $handler:ident) => {{
+            let mut args = $args;
+            args.ctx = ctx;
+            $handler(args).await
+        }};
+    }
     match cmd.command {
-        ComposeSubcommand::Up(args) => handle_up(args).await,
-        ComposeSubcommand::Down(args) => handle_down(args).await,
-        ComposeSubcommand::Ls(args) => handle_ls(args).await,
-        ComposeSubcommand::Build(args) => handle_build(args).await,
-        ComposeSubcommand::Ps(args) => handle_ps(args).await,
-        ComposeSubcommand::Logs(args) => handle_logs(args).await,
-        ComposeSubcommand::Exec(args) => handle_exec(args).await,
-        ComposeSubcommand::Pull(args) => handle_pull(args).await,
-        ComposeSubcommand::Push(args) => handle_push(args).await,
-        ComposeSubcommand::Restart(args) => handle_restart(args).await,
-        ComposeSubcommand::Stop(args) => handle_stop(args).await,
-        ComposeSubcommand::Start(args) => handle_start(args).await,
-        ComposeSubcommand::Kill(args) => handle_kill(args).await,
-        ComposeSubcommand::Rm(args) => handle_rm(args).await,
-        ComposeSubcommand::Pause(args) => handle_pause(args).await,
-        ComposeSubcommand::Unpause(args) => handle_unpause(args).await,
-        ComposeSubcommand::Run(args) => handle_run(args).await,
-        ComposeSubcommand::Config(args) => handle_config(args).await,
-        ComposeSubcommand::Images(args) => handle_images(args).await,
-        ComposeSubcommand::Port(args) => handle_port(args).await,
-        ComposeSubcommand::Top(args) => handle_top(args).await,
-        ComposeSubcommand::Events(args) => handle_events(args).await,
-        ComposeSubcommand::Cp(args) => handle_cp(args).await,
-        ComposeSubcommand::Wait(args) => handle_wait(args).await,
-        ComposeSubcommand::Watch(args) => handle_watch(args).await,
-        ComposeSubcommand::Attach(args) => handle_attach(args).await,
-        ComposeSubcommand::Version(args) => handle_version(args).await,
+        ComposeSubcommand::Up(a) => dispatch!(a, handle_up),
+        ComposeSubcommand::Down(a) => dispatch!(a, handle_down),
+        ComposeSubcommand::Ls(a) => handle_ls(a).await,
+        ComposeSubcommand::Build(a) => dispatch!(a, handle_build),
+        ComposeSubcommand::Ps(a) => dispatch!(a, handle_ps),
+        ComposeSubcommand::Logs(a) => dispatch!(a, handle_logs),
+        ComposeSubcommand::Exec(a) => dispatch!(a, handle_exec),
+        ComposeSubcommand::Pull(a) => dispatch!(a, handle_pull),
+        ComposeSubcommand::Push(a) => dispatch!(a, handle_push),
+        ComposeSubcommand::Restart(a) => dispatch!(a, handle_restart),
+        ComposeSubcommand::Stop(a) => dispatch!(a, handle_stop),
+        ComposeSubcommand::Start(a) => dispatch!(a, handle_start),
+        ComposeSubcommand::Kill(a) => dispatch!(a, handle_kill),
+        ComposeSubcommand::Rm(a) => dispatch!(a, handle_rm),
+        ComposeSubcommand::Pause(a) => dispatch!(a, handle_pause),
+        ComposeSubcommand::Unpause(a) => dispatch!(a, handle_unpause),
+        ComposeSubcommand::Run(a) => dispatch!(a, handle_run),
+        ComposeSubcommand::Config(a) => dispatch!(a, handle_config),
+        ComposeSubcommand::Images(a) => dispatch!(a, handle_images),
+        ComposeSubcommand::Port(a) => dispatch!(a, handle_port),
+        ComposeSubcommand::Top(a) => dispatch!(a, handle_top),
+        ComposeSubcommand::Events(a) => dispatch!(a, handle_events),
+        ComposeSubcommand::Cp(a) => dispatch!(a, handle_cp),
+        ComposeSubcommand::Wait(a) => dispatch!(a, handle_wait),
+        ComposeSubcommand::Watch(a) => dispatch!(a, handle_watch),
+        ComposeSubcommand::Attach(a) => dispatch!(a, handle_attach),
+        ComposeSubcommand::Version(a) => handle_version(a).await,
         ComposeSubcommand::Alpha(sub) => match sub {
-            ComposeAlphaSubcommand::Publish(args) => handle_alpha_publish(args).await,
+            ComposeAlphaSubcommand::Publish(a) => dispatch!(a, handle_alpha_publish),
         },
     }
 }
@@ -3155,9 +3182,11 @@ services:
     #[test]
     fn parses_stop_subcommand() {
         let cmd = parse_compose(["stop", "-p", "myproj", "web", "db"]);
+        // Project-level flags land on the parent `ctx` (they are `global` and
+        // flattened on `ComposeCommands`), not on the subcommand's skipped one.
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
         match cmd.command {
             ComposeSubcommand::Stop(args) => {
-                assert_eq!(args.ctx.project_name.as_deref(), Some("myproj"));
                 assert_eq!(args.services, vec!["web", "db"]);
                 assert_eq!(args.timeout, 10);
             }
@@ -3168,13 +3197,57 @@ services:
     #[test]
     fn parses_start_subcommand() {
         let cmd = parse_compose(["start", "-p", "myproj"]);
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
         match cmd.command {
             ComposeSubcommand::Start(args) => {
-                assert_eq!(args.ctx.project_name.as_deref(), Some("myproj"));
                 assert!(args.services.is_empty());
             }
             other => panic!("unexpected subcommand: {other:?}"),
         }
+    }
+
+    /// Regression: Docker Compose accepts project-level flags *before* the
+    /// subcommand (`docker compose -f X -p Y config`). clap must collect those
+    /// leading flags into the parent `ctx` rather than rejecting them as
+    /// "unexpected argument", and the value must match the post-subcommand form.
+    #[test]
+    fn parses_pre_subcommand_project_flags() {
+        // Leading -f / -p / --project-directory / --env-file / --profile.
+        let cmd = parse_compose([
+            "-f",
+            "foo.yml",
+            "-p",
+            "myproj",
+            "--project-directory",
+            "/srv/app",
+            "--env-file",
+            ".env.prod",
+            "--profile",
+            "debug",
+            "config",
+            "--services",
+        ]);
+        assert_eq!(cmd.ctx.files, vec![PathBuf::from("foo.yml")]);
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
+        assert_eq!(
+            cmd.ctx.project_directory.as_deref(),
+            Some(Path::new("/srv/app"))
+        );
+        assert_eq!(cmd.ctx.env_files, vec![PathBuf::from(".env.prod")]);
+        assert_eq!(cmd.ctx.profiles, vec!["debug".to_string()]);
+        assert!(matches!(cmd.command, ComposeSubcommand::Config(_)));
+    }
+
+    /// The pre-subcommand and post-subcommand forms must parse identically:
+    /// `compose -f X config` == `compose config -f X`. Repeated `-f` flags on
+    /// the *same* side of the subcommand collect in order.
+    #[test]
+    fn pre_and_post_subcommand_flags_are_equivalent() {
+        let pre = parse_compose(["-f", "a.yml", "-f", "b.yml", "config"]);
+        let post = parse_compose(["config", "-f", "a.yml", "-f", "b.yml"]);
+        let expected = vec![PathBuf::from("a.yml"), PathBuf::from("b.yml")];
+        assert_eq!(pre.ctx.files, expected);
+        assert_eq!(post.ctx.files, expected);
     }
 
     #[test]

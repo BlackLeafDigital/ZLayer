@@ -24,6 +24,11 @@ pub mod bridge;
 pub mod diagnostics;
 pub mod error;
 pub mod frame;
+/// Host-side receiver for the in-guest GCS log-forward stream. Only meaningful
+/// (non-empty) on Windows with the `windows-debug` feature; see the module docs
+/// for the hcsshim mechanism it mirrors.
+#[cfg(all(target_os = "windows", feature = "windows-debug"))]
+pub mod log_forward;
 pub mod protocol;
 pub mod transport;
 

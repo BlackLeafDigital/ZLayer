@@ -132,9 +132,15 @@ pub struct Storage {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Layer {
-    /// GUID of the layer.
+    /// GUID of the layer. Serializes as `Id` (NOT `ID`) to byte-match
+    /// hcsshim's `internal/hcs/schema2/layer.go` (`Id string json:"Id,omitempty"`).
+    /// The strict inbox GCS unmarshaller (hcsshim #2714) rejects `ID`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
-    /// Absolute path to the layer's backing storage.
+    /// Absolute path to the layer's backing storage. hcsshim marks this
+    /// `Path,omitempty`; omitted when empty so we never emit a field hcsshim
+    /// would have dropped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 }
 
@@ -146,6 +152,19 @@ pub struct ContainerNetworking {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_unqualified_dns_query: Option<bool>,
     /// DNS search-suffix list.
+    ///
+    /// TYPE MISMATCH (flagged): hcsshim's
+    /// `internal/hcs/schema2/container_networking.go` declares this as a
+    /// **comma-joined `string`** (`DnsSearchList string json:"DnsSearchList,omitempty"`),
+    /// NOT a JSON array. As a `Vec<String>` this serializes to `["a","b"]`,
+    /// which the strict inbox GCS unmarshaller (hcsshim #2714) would reject
+    /// with `HCS_E_INVALID_JSON`. It is kept as a `Vec<String>` only because
+    /// the two `zlayer-agent` call sites construct it with `Vec::new()` and
+    /// changing the type would break a crate this audit must not edit. The
+    /// `skip_serializing_if = "Vec::is_empty"` below guarantees the field is
+    /// OMITTED entirely whenever it is empty (which is always, today), so no
+    /// JSON array is ever emitted on the wire. If a non-empty search list is
+    /// ever needed, this MUST be migrated to a comma-joined `String` first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_search_list: Vec<String>,
     /// HCN namespace id the container is attached to. HCS's
@@ -1024,6 +1043,71 @@ mod tests {
         );
         assert_eq!(container.processor.and_then(|p| p.count), Some(2));
         assert_eq!(container.memory.and_then(|m| m.size_in_mb), Some(1024));
+    }
+
+    #[test]
+    fn empty_container_omits_all_optional_fields() {
+        // A Container whose optionals are all None/empty must serialize with
+        // NO null, empty-string, empty-array, or zero-valued fields — mimicking
+        // hcsshim's `,omitempty`. The strict inbox GCS unmarshaller
+        // (hcsshim #2714) tears down the VM on any unexpected/empty field.
+        let doc = ComputeSystem {
+            owner: "zlayer".to_string(),
+            schema_version: SchemaVersion::default(),
+            hosting_system_id: String::new(),
+            container: Some(Container::default()),
+            virtual_machine: None,
+            should_terminate_on_last_handle_closed: None,
+        };
+        let json = serde_json::to_string(&doc).expect("serialize");
+
+        // The empty Container body must collapse to `{}` — every field omitted.
+        assert!(
+            json.contains("\"Container\":{}"),
+            "empty Container must serialize to {{}}, got: {json}",
+        );
+        // No null, no empty string, no empty array anywhere.
+        assert!(!json.contains("null"), "no null fields: {json}");
+        assert!(!json.contains("[]"), "no empty arrays: {json}");
+        assert!(!json.contains("\"\""), "no empty strings: {json}");
+        // Omitted optionals — none of these keys should appear.
+        for key in [
+            "GuestOs",
+            "Storage",
+            "Networking",
+            "MappedDirectories",
+            "MappedPipes",
+            "Processor",
+            "Memory",
+            "HostingSystemId",
+            "VirtualMachine",
+            "ShouldTerminateOnLastHandleClosed",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "key {key} must be omitted, got: {json}",
+            );
+        }
+    }
+
+    #[test]
+    fn layer_serializes_id_not_uppercase_id() {
+        // CRITICAL: hcsshim's Layer.Id is `json:"Id,omitempty"` (NOT `ID`).
+        let layer = Layer {
+            id: "0f2c0c2a-1111-2222-3333-444455556666".to_string(),
+            path: r"C:\layers\base".to_string(),
+        };
+        let json = serde_json::to_string(&layer).expect("serialize layer");
+        assert!(json.contains("\"Id\":"), "must emit `Id`: {json}");
+        assert!(!json.contains("\"ID\":"), "must NOT emit `ID`: {json}");
+        assert!(json.contains("\"Path\":"), "must emit `Path`: {json}");
+
+        // Empty layer must omit both fields (omitempty parity).
+        let empty = serde_json::to_string(&Layer::default()).expect("serialize");
+        assert_eq!(
+            empty, "{}",
+            "empty Layer must serialize to {{}}, got: {empty}"
+        );
     }
 
     #[test]

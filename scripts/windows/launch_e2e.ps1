@@ -48,7 +48,7 @@
 param(
   [string]$Test     = "composite_dispatch_e2e",
   [string]$Package  = "zlayer-agent",
-  [string]$Features = "hcs-runtime,wsl",
+  [string]$Features = "hcs-runtime,wsl,windows-debug",
   [string]$RunDir   = $null,
   [string]$RepoDir  = "C:\src\ZLayer",
   [switch]$Keep,
