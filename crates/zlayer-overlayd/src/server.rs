@@ -595,8 +595,6 @@ impl OverlaydServer {
         &mut self,
         service: &str,
     ) -> Result<ServiceOverlayInfo, OverlaydError> {
-        use zlayer_overlay::allocator::IpAllocator as OverlayIpAllocator;
-
         // 1. Idempotency check.
         if let Some(existing) = self.service_bridges.get(service) {
             let name = existing.name.clone();
@@ -1193,7 +1191,7 @@ impl OverlaydServer {
         #[cfg(target_os = "linux")]
         {
             for bridge in self.service_bridges.values_mut() {
-                if bridge.subnet.contains(ip) {
+                if bridge.subnet.contains(&ip) {
                     bridge.ip_allocator.release(ip);
                     return;
                 }
