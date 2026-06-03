@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.6 - 2026-06-03
+
+### Fixed
+- **daemon startup deadlock (ship-blocker for both local installs and `raft-e2e`).** `zlayer serve` would never bind its API listener when stderr is not a TTY (i.e. under launchd/systemd/CI, where stderr is redirected to a file) — manifesting locally as "Daemon failed to start within 45s" and in CI as every raft cluster suite failing "node1 never came up on 127.0.0.1:NNNN". Root cause: commit `51383c54` moved the observability **console** tracing layer from stdout to stderr, but `serve` installs `install_stderr_redirect_to_tracing()` which `dup2`'s fd 2 onto a pipe whose reader re-emits each line as a `tracing::error!`. With the console layer also writing to fd 2, every event looped back through that pipe; once the pipe buffer filled, `write_all` blocked while holding the global stderr mutex and the daemon deadlocked mid-`init` (observed via `sample`: main thread parked in `Stderr::lock` from `StorageBundle::open`). Fix: in `zlayer-observability::init_logging`, the **daemon** arms (those with a file writer — only `zlayer serve` configures file logging) route the console layer to **stdout** (fd 1), keeping it disjoint from the fd-2 stderr capture; the **CLI** arms (no file writer) keep console on **stderr** so command stdout such as `ps --format json` stays clean. Restores the pre-`51383c54` daemon behavior while preserving the JSON-clean-stdout fix for CLI commands.
+- **daemon startup stall on unreachable overlayd.** When `zlayer-overlayd` was missing or could not bind (e.g. a dev box without the staged binary, or before it finishes starting), `OverlayManager::setup_global_overlay` paid the full `connect_with_backoff` retry window (~20 attempts) once per IPC call, stacking to ~35s of synchronous startup stall before the (already non-fatal) overlay setup gave up. Added `OverlaydClient::connect_with_attempts(endpoint, max_attempts)` (the existing `connect_with_backoff` now delegates with `20`; it also no longer sleeps after its final attempt), switched the `OverlayManager` lazy connector to a bounded 6-attempt (~2.5s) dial, and made `setup_global_overlay` establish/cache the connection once up front so a dead overlayd costs a single bounded dial instead of 2-3 full windows. The overlayd supervisor keeps the generous budget for waiting on a freshly-spawned overlayd.
+
 ## 0.52.5 - 2026-06-03
 
 ### Added

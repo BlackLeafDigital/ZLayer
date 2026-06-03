@@ -258,7 +258,13 @@ impl OverlayManager {
             return Ok(Arc::clone(c));
         }
         let socket = ZLayerDirs::default_overlayd_socket_path_for(&self.data_dir);
-        let conn = OverlaydClient::connect_with_backoff(std::path::Path::new(&socket))
+        // Bounded dial (~2.5s worst case): overlay operations are non-fatal, so a
+        // dead/unreachable overlayd must degrade fast rather than hold the daemon's
+        // startup hostage. The overlayd supervisor (ensure_overlayd_running) owns
+        // the generous "wait for a freshly-spawned overlayd to bind" budget; once
+        // it has confirmed overlayd up (or fast-failed when the binary is missing),
+        // this lazy connector only needs a short retry window.
+        let conn = OverlaydClient::connect_with_attempts(std::path::Path::new(&socket), 6)
             .await
             .map_err(|e| map_overlayd_err(&e))?;
         let arc = Arc::new(Mutex::new(conn));
@@ -383,6 +389,14 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if overlayd fails to bring up the overlay.
     pub async fn setup_global_overlay(&mut self) -> Result<(), AgentError> {
+        // Fast pre-flight: establish (and cache) the overlayd connection once with a
+        // bounded budget. If overlayd is unreachable this returns after a single
+        // ~2.5s dial instead of letting each of the calls below pay the full retry
+        // window (which previously stacked to ~35s of daemon-startup stall when the
+        // overlayd binary was missing). Overlay setup is non-fatal, so bailing here
+        // simply leaves cross-node networking degraded — handled by the caller.
+        self.client().await?;
+
         // Push cluster-brain context first (best-effort).
         let _ = self
             .call(OverlaydRequest::SetLocalNodeId {
