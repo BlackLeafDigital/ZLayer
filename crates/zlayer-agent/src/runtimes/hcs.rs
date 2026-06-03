@@ -2438,17 +2438,26 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
             d_word_value: Some(1),
             ..Default::default()
         },
-        // gcs `DependOnService` override (handoff 2026-05-31 §4 cheap test).
-        // Strip `mpssvc`/`netsetupsvc` from gcs's SCM dependency chain so the
-        // GCS service starts in a UVM that has NO virtual NIC. B-2 removed
-        // this on the theory gcs.exe needs the firewall/netsetup RPC
-        // endpoints at runtime — but the latest evidence (UVM boots, 18601
-        // fired, yet gcs never dials the host hvsock) points the other way:
-        // in a NIC-less UVM `mpssvc`/`netsetupsvc` never reach Running, so
-        // SCM blocks `gcs` forever and gcs.exe never starts. Keep only the
-        // non-network deps gcs needs to come up + dial (console driver +
-        // hvsocket control). Encoded as REG_MULTI_SZ (UTF-16LE, base64).
-        RegistryValue {
+    ];
+
+    // gcs `DependOnService` override (handoff 2026-05-31 §4). Strip
+    // `mpssvc`/`netsetupsvc` from gcs's SCM dependency chain so the GCS service
+    // starts in a UVM that has NO virtual NIC. This is the ONE thing we do that
+    // hcsshim never does (hcsshim ships the unmodified inbox UVM). It fixed the
+    // never-dial bug but the cold-start `RpcCreate` handler then faults — so the
+    // override may have MASKED the real never-dial cause rather than fixing it.
+    // A/B toggle: set `ZLAYER_GCS_STOCK_DEPS=1` to OMIT the override and use the
+    // inbox gcs's stock dependency chain (hcsshim parity) — used to test whether
+    // the strip itself is the Create-fault culprit. Encoded as REG_MULTI_SZ
+    // (UTF-16LE, base64).
+    let stock_deps = std::env::var("ZLAYER_GCS_STOCK_DEPS").as_deref() == Ok("1");
+    if stock_deps {
+        tracing::warn!(
+            "ZLAYER_GCS_STOCK_DEPS=1 — omitting the gcs DependOnService override; \
+             using the inbox gcs stock dependency chain (hcsshim parity)"
+        );
+    } else {
+        values.push(RegistryValue {
             key: Some(RegistryKey {
                 hive: Some(RegistryHive::System),
                 name: r"CurrentControlSet\Services\gcs".to_string(),
@@ -2457,8 +2466,8 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
             r#type: Some(RegistryValueType::MultiString),
             binary_value: encode_multi_sz_utf16le(&["condrv", "hvsocketcontrol"]),
             ..Default::default()
-        },
-    ];
+        });
+    }
 
     // windows-debug: append WER LocalDumps for vmcomputeagent.exe, pointing
     // its full-crash `DumpFolder` at the guest-local scratch path
