@@ -174,15 +174,40 @@ Serial, debugport 1, baudrate 115200`, and `launch_e2e.ps1` already captures COM
 is mostly pre-wired: set `{default} debug Yes` (same offline-bcdedit path as bootlog) and attach
 `kd`/`windbg` to the host COM1 pipe (or read non-interactive `DbgPrint` from the harness com log).
 
-### REMAINING OPTIONS (ranked, post-UPDATE-4)
-1. **DONE — BCD `/bootlog`**: boot healthy, not a driver problem (see UPDATE 4). The signal it gave:
-   look at user-mode services, not drivers.
-2. **Guest kernel debugger (KD)** — definitive: see which service is `START_PENDING` and why.
-   Heaviest; COM/`Uefi.Console` previously broke boot.
+### UPDATE 5 — KD installed + CONNECTS, but COM-pipe session is unstable → needs INTERACTIVE windbg
+
+Installed **Debugging Tools for Windows** on the box (SDK feature `OptionId.WindowsDesktopDebuggers`
+via winsdksetup.exe; `kd.exe` at `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe`,
+v10.0.26100.8249 — kept installed). Wired `ZLAYER_GCS_KD=1` (windows-debug): offline `bcdedit
+/set {default} debug Yes` + opens the kernel DbgPrint filter (`Session Manager\Debug Print
+Filter\DEFAULT`). The UVM's COM1 is the HCS named pipe `\\.\pipe\zlayer-uvm-<runtimeGUID>-com1`.
+
+`kd` ATTACHES and the transport WORKS — confirmed: `Connected to Windows 10 20348 x64 target …
+Kernel Debugger connection established.` (the no-space `-c g` token avoids a Start-Process
+arg-split `0x80070057`; transport string `com:pipe,port=\\.\pipe\<name>,reconnect`). BUT the
+session is UNSTABLE: it sits in a `KDTARGET: Refreshing KD connection` resync loop at
+`System Uptime 0:00:00`, never reaching a stable prompt, so non-interactive `-c g` yields no
+DbgPrint stream and no command output. (Risk: `debug Yes` + an early-connecting debugger that
+doesn't cleanly resume can itself stall boot — so a `ZLAYER_GCS_KD` never-dial may be debugger-
+induced, not the real bug. Both KD toggles default OFF; normal runs unaffected.)
+
+Non-interactive KD over this COM-pipe is the wall. The realistic final mile is **INTERACTIVE
+windbg** at the keyboard: run the e2e (`ZLAYER_GCS_STOCK_DEPS=1 ZLAYER_GCS_KD=1`, windows-debug),
+attach `windbg -k com:pipe,port=\\.\pipe\zlayer-uvm-<rtid>-com1,reconnect`, stabilize the
+connection, let it `g` through boot, then break in AFTER the ~120s never-dial window and inspect
+the SCM: `!process 0 0 services.exe`, examine `mpssvc`/`netsetupsvc` start state / failure HRESULT
+(needs symbols: `srv*https://msdl.microsoft.com/download/symbols`). That names why those two
+services don't reach Running — the last unknown.
+
+### REMAINING OPTIONS (ranked, post-UPDATE-5)
+1. **Interactive windbg** (tooling is installed + the `ZLAYER_GCS_KD` toggle is wired): attach,
+   stabilize, break in post-window, dump SCM/service state. The definitive final-mile.
+2. **Escalate to MS/hcsshim** with the minimal repro: external-GCS WCOW on the Server 2025 inbox
+   nanoserver UtilityVM, drivers all load but `mpssvc`/`netsetupsvc` never reach Running so the
+   SCM-gated `gcs` never dials (stock deps); stripping the deps trades never-dial for a cold-start
+   Create fault.
 3. **Fix the servercore unpacker bug** (`HcsImportLayer 0x80004005`) to enable the substrate A/B
    (does a fuller UtilityVM bring `mpssvc`/`netsetupsvc` to Running?).
-4. **Escalate to MS/hcsshim** with the minimal repro: external-GCS WCOW on the Server 2025 inbox
-   nanoserver UtilityVM, `mpssvc`/`netsetupsvc` never reach Running so `gcs` (SCM-gated) never dials.
 
 Committed this session (on `dev`, NOT pushed): `bf5c5b14`..`02c5f664` — dial fix, windows-debug
 instrument, protocol parity, real-host-TZ, error_records=Value, VHDX offline exfil (works but UVM
