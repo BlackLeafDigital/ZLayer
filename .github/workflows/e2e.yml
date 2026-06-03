@@ -369,6 +369,37 @@ jobs:
         with:
           enable-cache: true
 
+      # cluster_scaling / cluster_upgrade create real workload containers, which
+      # need a WRITABLE cgroup-v2 subtree. In the runner's job container the
+      # daemon lands at the cgroup-v2 root with /sys/fs/cgroup read-only, so
+      # libcontainer cannot create the per-container cgroup. Make it writable and
+      # delegate a `zlayer-e2e` parent (best-effort; needs a privileged job
+      # container — the diagnostics say so if it isn't).
+      - name: Prepare writable cgroup for nested container creation
+        run: |
+          set +e
+          echo "== cgroup diagnostics (before) =="
+          cat /proc/self/cgroup || true
+          grep -E 'cgroup' /proc/mounts || true
+          ls -ld /sys/fs/cgroup || true
+          mount -o remount,rw /sys/fs/cgroup 2>&1 \
+            && echo "remount rw: OK" \
+            || echo "remount rw: FAILED (job container is not privileged)"
+          if mkdir -p /sys/fs/cgroup/zlayer-e2e 2>/dev/null; then
+            echo "created /sys/fs/cgroup/zlayer-e2e"
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/zlayer-e2e/cgroup.subtree_control 2>/dev/null || true
+            echo "ZLAYER_CGROUP_PARENT=/zlayer-e2e" >> "$GITHUB_ENV"
+            echo "exported ZLAYER_CGROUP_PARENT=/zlayer-e2e"
+          else
+            echo "cgroup root not writable; cluster_scaling/cluster_upgrade cannot create containers"
+            echo "  -> the runner must launch job containers privileged (or delegate a writable cgroup)"
+          fi
+          echo "== cgroup diagnostics (after) =="
+          ls -ld /sys/fs/cgroup /sys/fs/cgroup/zlayer-e2e 2>/dev/null || true
+          cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+          exit 0
+
       - name: Build zlayer
         run: cargo build --release -p zlayer -p zlayer-overlayd
 

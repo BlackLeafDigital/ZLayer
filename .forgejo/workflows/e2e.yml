@@ -630,6 +630,47 @@ jobs:
         with:
           enable-cache: true
 
+      # The cluster_scaling / cluster_upgrade suites create real workload
+      # containers, which need a WRITABLE cgroup-v2 subtree. Inside the runner's
+      # job container the daemon lands at the cgroup-v2 root (`0::/`) with
+      # `/sys/fs/cgroup` mounted read-only, so libcontainer cannot create the
+      # per-container cgroup ("no writable cgroup parent"). Make the hierarchy
+      # writable and delegate a `zlayer-e2e` parent (the v2 ROOT is exempt from
+      # the no-internal-process rule, so we can enable controllers there even
+      # though the daemon runs at root). Best-effort: if the container isn't
+      # privileged the remount fails and the diagnostics below say so — the
+      # pure-raft suites still run regardless.
+      - name: Prepare writable cgroup for nested container creation
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set +e
+          echo "== cgroup diagnostics (before) =="
+          cat /proc/self/cgroup || true
+          grep -E 'cgroup' /proc/mounts || true
+          ls -ld /sys/fs/cgroup || true
+          # Make the cgroup2 filesystem writable (requires a privileged container).
+          mount -o remount,rw /sys/fs/cgroup 2>&1 \
+            && echo "remount rw: OK" \
+            || echo "remount rw: FAILED (job container is not privileged)"
+          if mkdir -p /sys/fs/cgroup/zlayer-e2e 2>/dev/null; then
+            echo "created /sys/fs/cgroup/zlayer-e2e"
+            # Enable controllers at the root subtree (root is exempt from the
+            # cgroup-v2 no-internal-process rule) and delegate them into our
+            # parent so per-container leaves can apply cpu/memory/pids limits.
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/zlayer-e2e/cgroup.subtree_control 2>/dev/null || true
+            echo "ZLAYER_CGROUP_PARENT=/zlayer-e2e" >> "$GITHUB_ENV"
+            echo "exported ZLAYER_CGROUP_PARENT=/zlayer-e2e"
+          else
+            echo "cgroup root not writable; cluster_scaling/cluster_upgrade cannot create containers"
+            echo "  -> the forgejo runner must launch job containers privileged (or delegate a writable cgroup)"
+          fi
+          echo "== cgroup diagnostics (after) =="
+          ls -ld /sys/fs/cgroup /sys/fs/cgroup/zlayer-e2e 2>/dev/null || true
+          cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+          # Never fail the job here — the pure-raft suites do not need cgroups.
+          exit 0
+
       - name: Build zlayer
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release -p zlayer -p zlayer-overlayd
