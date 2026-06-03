@@ -1,8 +1,71 @@
 # ZLayer Windows Hyper-V (Part B) — Mac handoff
 
-**Last updated:** 2026-05-31 (PM session — Mac→box debug, iteration model change)
-**Audience:** future-you, now iterating ON the Windows box via a real git checkout
-**Status one-liner:** Doc is byte-identical to runhcs. Guest never dials the host hvsock listener. Cause is somewhere inside the booted UVM. Three diagnostic channels still open (writable VSMB exfil, BCD `/bootlog`, kernel-debugger ServiceID). Pick one and iterate.
+**Last updated:** 2026-06-02 (Mac→box SSH debug)
+**Audience:** future-you, iterating on the Windows box (rsync copy at `C:\src\ZLayer`, Mac drives via SSH)
+**Status one-liner:** Guest now DIALS + negotiates (the never-dial bug is fixed). New frontier: the guest inbox GCS flakily CLOSES the bridge (EOF, no HRESULT, VM stays Running) on the cold-start `RpcCreate`/HvSocket. Our bytes match hcsshim `main` exactly; this is a guest-side `vmcomputeagent.exe` fault. All host-side hypotheses exhausted — next step needs in-guest crash capture (heavy).
+
+---
+
+## ⟢ 2026-06-02 update — never-dial FIXED; cold-start RpcCreate is the new wall
+
+**The never-dial bug is SOLVED.** The `gcs.DependOnService` override (strip to `condrv` +
+`hvsocketcontrol`, in `build_uvm_registry_changes`, committed `bf5c5b14`) fixed it. The guest
+GCS now dials ~1-2.5s after UVM start and **NegotiateProtocol succeeds** every run:
+`Result:0, Version:4, Capabilities{SendHostCreateMessage, SendHostStartMessage,
+HvSocketConfigOnStartup, SendLifecycleNotifications, SupportedSchemaVersions:[{1,0},{2,1}],
+RuntimeOsType:Windows, GuestDefinedCapabilities{NamespaceAddRequest, SignalProcess,
+PurgeVSmbCachedHandles}}`.
+
+**NEW failure (the current wall):** after negotiate we send (over the same bridge, serially):
+msg2 cold-start `RpcCreate` (null container, `UvmConfig{SystemType:"Container",
+TimeZoneInformation:…}` double-encoded as `ContainerConfig`) → msg3 cold-start `RpcStart` →
+msg4 `RpcModifySettings` HvSocket ("configureHvSocketForGCS"). The guest **closes the bridge
+(reader gets EOF), with NO HRESULT response**, and the **VM stays `State:"Running"`**. It is
+**FLAKY**: ~25-30% of UVMs survive Create+Start and die at msg4; the rest die at msg2. The
+guest is otherwise alive (it once returned an *error response* to a ModifyServiceSettings
+RPC). A hard close with no HRESULT + VM Running = the inbox `vmcomputeagent.exe` **faults
+mid-dispatch** (not a protocol-decode rejection, which returns an HRESULT).
+
+### RULE-OUT MATRIX (do NOT re-investigate these)
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| Our cold-start/Create/Start/HvSocket **bytes** | CORRECT | byte-for-byte match vs hcsshim `main` `internal/gcs/guestconnection.go::connect`, `prot/protocol.go` (UvmConfig, AnyInString double-encode, null GUID, no SchemaVersion on cold-create), `internal/uvm/start.go::configureHvSocketForGCS` (ParentAddress `894cc2d6…`) |
+| **TimeZoneInformation** as the cause | EXONERATED | omit→`0xEF CRITICAL_PROCESS_DIED`; bare `"UTC"`→reject; hcsshim UTC-constant (empty dates)→flaky close; **real host TZ** (Win32 GetDynamicTimeZoneInformation, hcsshim default)→still flaky close |
+| **Memory pressure** | NO | box = 15.7 GB RAM, 12.2 GB free, 0 leftover compute systems |
+| **My windows-debug instrumentation** | NOT a confounder | bare `--features hcs-runtime,wsl` build fails identically |
+| **Guest-init race** (host waits before Create) | NO | `ZLAYER_GCS_COLDSTART_DELAY_MS=1500` made it *worse* (0/3 past Create) |
+| **Image/host version mismatch** | NO | host = Server 2025 build **26100** (24H2); swapping nanoserver `ltsc2022`→**`ltsc2025`** (=26100) still fails identically |
+| **Writable VSMB exfil share** (§6.B) | DEAD END | HCS rejects `add_vsmb(zlayer-debug)` with PowerOnCold `0x80070057` regardless of `options`/timing (pre- or post-accept) |
+| **GCS log forwarding** as a cold-start instrument | DEAD END | guest doesn't advertise log-forwarding support; rejects `StartLogForwarding`; and hcsshim only starts forwarding AFTER cold-start succeeds (catch-22) |
+| **HvSocketConfigOnStartup → skip msg4** | hcsshim does NOT skip it | `start.go::configureHvSocketForGCS` is gated only on `OS()=="windows"`, sent unconditionally. (Untested whether skipping helps THIS guest — but won't fix the msg2 deaths.) |
+| Protocol version | v4 correct | `protocolVersion=4` is current hcsshim `main`; guest agreed (Version:4) |
+| BCD `/bootlog` + ntbtlog | OBSOLETE | targeted the (solved) never-dial/driver-load theory |
+
+### What's committed this session (all green; Mac workspace + box build RC=0)
+- `windows-debug` cargo feature (off by default; zlayer-agent→zlayer-gcs forward) — kept in-tree per standing rule.
+- GCS protocol parity: `AnyInString` double-encoding; `CreateRequest.ContainerConfig` (was `Settings`); zlayer-hcs schema `skip_serializing_if` omitempty + `Layer.Id` casing.
+- cold-start TimeZoneInformation = **real host TZ** via `crate::windows::timezone::host_timezone_information()` (Win32), falling back to hcsshim UTC constant.
+- GCS log-forwarding scaffold (host hvsock listener on `WindowsLoggingHvsockServiceID 172dad59` + `ModifyServiceSettings`/`StartLogForwarding`); WER LocalDumps + demand-start `zlayer-dbg` svc (gated). NOTE: log forwarding is a dead instrument for THIS guest (see matrix).
+- bridge stage-labeled errors (`negotiation: cold-start Create: bridge closed`) + verbose tracing gated behind `windows-debug`.
+- `ZLAYER_GCS_COLDSTART_DELAY_MS` diag knob (default 0).
+- Commits on `dev` (NOT pushed): `bf5c5b14` (dial fix), `da563a6f` (instrument+parity+compose), `6939b676` (host TZ).
+
+### REMAINING OPTIONS (all heavy — need a steer)
+1. **In-guest crash capture via a SCSI-attached writable VHD** (the one exfil channel HCS won't
+   reject like VSMB does). The guest OS onlines SCSI disks at boot independent of GCS; point WER
+   `LocalDumps` (or a guest svc dumping the Application/System event log) at it; read the VHD
+   offline host-side after the run. Captures the `vmcomputeagent` fault reason. Multi-iteration build.
+2. **Guest kernel debugger** (KD over the COM/named-pipe the harness already exposes). Heaviest;
+   the COM/`Uefi.Console` path previously broke UVM boot — needs care.
+3. **Escalate to hcsshim/Microsoft**: an EXTERNAL GCS host driving the Server 2025 inbox
+   `vmcomputeagent.exe` for WCOW may be an under-supported configuration; the flaky cold-start
+   crash could be a guest-side bug. Worth a minimal repro + issue.
+4. **Cheap remaining experiment** (low confidence): skip msg4 when `HvSocketConfigOnStartup:true`
+   (won't fix the msg2 deaths, only the msg4-class ones).
+
+The disciplined read (confirmed by deep hcsshim research): STOP spraying byte-level changes —
+the bytes are correct. The fault is inside the guest; capturing it (option 1) is the only way
+forward without guesswork.
 
 ---
 
