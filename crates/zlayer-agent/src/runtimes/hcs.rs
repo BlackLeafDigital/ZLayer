@@ -1655,22 +1655,95 @@ impl HcsRuntime {
                             // CreateFailed.reason string) carries the
                             // actual root-cause signal.
                             let dump = read_uvm_debug_dump(uvm.debug_dir());
-                            // ZLAYER_KEEP_UVM_ON_FAILURE=1 → block here
-                            // (don't return) so the UVM stays alive AND
-                            // the writable share dir stays intact, giving
-                            // an operator time to inspect both from the
-                            // host before teardown.
+                            // ZLAYER_KEEP_UVM_ON_FAILURE=1 → TERMINATE the
+                            // UVM here (don't leave it running). A running
+                            // UVM holds the scratch VHDX locked, so it can't
+                            // be mounted offline — and since GCS is broken,
+                            // a live UVM is useless. Terminating releases the
+                            // scratch VHDX lock; the `Uvm` Rust wrapper's
+                            // KEEP-aware Drop then PRESERVES the (now-unlocked)
+                            // scratch VHDX + temp dir when this function
+                            // returns Err below. The operator mounts the
+                            // preserved VHDX offline and reads the guest
+                            // event logs + any WER crash dump from it.
                             if std::env::var("ZLAYER_KEEP_UVM_ON_FAILURE").as_deref()
                                 == Ok("1")
                             {
+                                // Best-effort terminate to unlock the scratch
+                                // VHDX. This is the SAME compute system the
+                                // normal-path cleanup would terminate; the
+                                // error return below skips that path, so this
+                                // is the only terminate of `uvm_system` on this
+                                // branch — no double-terminate. The `Uvm`
+                                // wrapper (`uvm`) is NOT consumed here, so its
+                                // Drop still runs at scope exit and performs
+                                // the KEEP-aware preservation.
+                                if let Err(te) = uvm_system.terminate("").await {
+                                    tracing::warn!(
+                                        hcs_id = %hcs_id,
+                                        error = %te,
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — best-effort UVM terminate failed; scratch VHDX may remain locked until the VM is stopped manually",
+                                    );
+                                }
+                                let vhdx = uvm.scratch_vhdx().display().to_string();
                                 tracing::warn!(
                                     hcs_id = %hcs_id,
                                     runtime_id = %format_guid_bare(uvm.runtime_id()),
-                                    debug_dir = %uvm.debug_dir().display(),
-                                    sandbox_vhdx = %uvm.scratch_vhdx().display(),
-                                    "ZLAYER_KEEP_UVM_ON_FAILURE=1 — UVM left running for 30 min for offline inspection (debug dir + sandbox VHDX kept)",
+                                    scratch_vhdx = %vhdx,
+                                    "ZLAYER_KEEP_UVM_ON_FAILURE=1 — UVM TERMINATED and scratch VHDX PRESERVED for offline inspection",
                                 );
-                                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+
+                                // The test harness surfaces ONLY eprintln!/
+                                // step_log! (stdout.log), not `tracing` — and on
+                                // panic it deletes the test's parent temp dir,
+                                // nuking the in-place VHDX (why preserve-in-place
+                                // failed). So ALSO emit via step_log! AND copy the
+                                // scratch VHDX to a stable host dir OUTSIDE the
+                                // temp tree before it is reaped. Best-effort: log
+                                // on failure, never panic. Copy at most ONE VHDX
+                                // per run (skip if the debug dir already has one)
+                                // to bound disk cost when several UVMs fail.
+                                let debug_root =
+                                    std::path::Path::new(r"C:\zlayer-uvm-debug");
+                                let already_have_vhdx = std::fs::read_dir(debug_root)
+                                    .map(|rd| {
+                                        rd.filter_map(Result::ok).any(|e| {
+                                            e.path()
+                                                .extension()
+                                                .is_some_and(|x| x.eq_ignore_ascii_case("vhdx"))
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if already_have_vhdx {
+                                    step_log!(
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — {} already contains a captured *.vhdx; skipping copy of {vhdx}",
+                                        debug_root.display(),
+                                    );
+                                } else if let Err(ce) = std::fs::create_dir_all(debug_root) {
+                                    eprintln!(
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — failed to create {}: {ce}; scratch VHDX NOT copied out (in-place copy at {vhdx} will be reaped on panic)",
+                                        debug_root.display(),
+                                    );
+                                } else {
+                                    let dest = debug_root
+                                        .join(format!("{hcs_id}-scratch.vhdx"));
+                                    let dest_str = dest.display().to_string();
+                                    match std::fs::copy(uvm.scratch_vhdx(), &dest) {
+                                        Ok(_) => step_log!(
+                                            "ZLAYER_KEEP_UVM_ON_FAILURE=1 — scratch VHDX COPIED to {dest_str} (survives temp-dir reap). \
+                                             Read the guest event log + any WER dump OFFLINE from the COPY:\n\
+                                             \x20 Mount-VHD -Path '{dest_str}' -ReadOnly   # note the drive letter, e.g. X:\n\
+                                             \x20 Get-WinEvent -Path 'X:\\Windows\\System32\\winevt\\Logs\\Application.evtx' | Select-Object -First 100 | Format-List\n\
+                                             \x20 Get-WinEvent -Path 'X:\\Windows\\System32\\winevt\\Logs\\System.evtx'      | Select-Object -First 100 | Format-List\n\
+                                             \x20 Get-ChildItem 'X:\\zlayer-dbg\\*.dmp'\n\
+                                             \x20 Dismount-VHD -Path '{dest_str}'",
+                                        ),
+                                        Err(ce) => eprintln!(
+                                            "ZLAYER_KEEP_UVM_ON_FAILURE=1 — failed to copy scratch VHDX {vhdx} -> {dest_str}: {ce}; \
+                                             fall back to the in-place copy at {vhdx} if it survives",
+                                        ),
+                                    }
+                                }
                             }
                             return Err(AgentError::CreateFailed {
                                 id: hcs_id.to_string(),
@@ -2216,7 +2289,7 @@ const WINDOWS_LOGGING_HVSOCK_SERVICE_ID: &str = "172dad59-976d-45f2-8b6c-6d1b13f
 /// services that never come up in a NIC-less UVM.
 ///
 /// Used by `build_uvm_registry_changes` for the `gcs.DependOnService`
-/// override, and by the `windows-debug`-gated `zlayer-dbg` SCM service entry.
+/// override.
 fn encode_multi_sz_utf16le(strs: &[&str]) -> String {
     use base64::Engine;
     let mut bytes = Vec::<u8>::new();
@@ -2334,18 +2407,6 @@ fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Guest-side mount prefix that the VSMB miniport driver registers at boot
-/// for shares declared in the UVM creation document. Sourced verbatim from
-/// hcsshim `internal/uvm/vsmb.go:27`. Combined with a share name, the in-
-/// guest absolute path to that share is `\\?\VMSMB\VSMB-{dcc079ae-…}\<name>`.
-///
-/// Only referenced by the `windows-debug`-gated diagnostic registry builder
-/// (`build_uvm_debug_registry_changes`), which points WER `LocalDumps` and the
-/// `zlayer-dbg` SCM service at the writable `zlayer-debug` share mounted under
-/// this prefix inside the guest.
-#[cfg(feature = "windows-debug")]
-const VSMB_GUEST_PREFIX: &str = r"\\?\VMSMB\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}";
-
 /// Build the offline `RegistryChanges` HCS applies to the guest hives before
 /// first boot.
 ///
@@ -2399,72 +2460,50 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
         },
     ];
 
-    // windows-debug: append WER LocalDumps for vmcomputeagent.exe + the
-    // `zlayer-dbg` auto-start diagnostic exfil service. Both target the
-    // writable `zlayer-debug` VSMB share (hot-attached in step 4c). Compiled
-    // out entirely in normal builds.
+    // windows-debug: append WER LocalDumps for vmcomputeagent.exe, pointing
+    // its full-crash `DumpFolder` at the guest-local scratch path
+    // `C:\zlayer-dbg`. WER auto-creates the folder; the dump persists on the
+    // preserved scratch VHDX for offline inspection. Compiled out entirely in
+    // normal builds.
     #[cfg(feature = "windows-debug")]
     values.extend(build_uvm_debug_registry_changes());
 
     values
 }
 
-/// (`windows-debug` only) Offline registry changes that turn the guest into a
-/// diagnostic exfiltrator for the GCS cold-start failure: when
-/// `vmcomputeagent.exe` (the in-guest GCS host process) crashes or tears down,
-/// the host can read a crash dump and event-log capture from the writable
-/// `zlayer-debug` VSMB share.
+/// (`windows-debug` only) Offline registry changes that arm Windows Error
+/// Reporting so that, if `vmcomputeagent.exe` (the in-guest GCS host process)
+/// fully crashes during the cold-start `RpcCreate`/HvSocket handshake, a full
+/// crash dump lands on the guest's writable scratch volume (`C:\`) where the
+/// operator can read it offline after the failed UVM is terminated and the
+/// scratch VHDX is mounted host-side.
 ///
-/// Two mechanisms, primary + secondary:
+/// **WER `LocalDumps` for `vmcomputeagent.exe`.** If gcs.exe actually crashes
+/// during cold-start `Create`, Windows Error Reporting writes a full
+/// (`DumpType=2`) minidump into the configured `DumpFolder`. WER auto-creates
+/// the folder, so we point it at a guest-local path on the scratch volume
+/// (`C:\zlayer-dbg`) rather than any VSMB share — there is no guest-writable
+/// VSMB share (HCS rejects one at hot-attach), and the scratch VHDX persists
+/// after a failure under `ZLAYER_KEEP_UVM_ON_FAILURE=1`, so the dump survives
+/// for offline inspection. Lives in the `Software` hive at
+/// `Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe`.
 ///
-/// 1. **WER `LocalDumps` for `vmcomputeagent.exe`** (PRIMARY). If gcs.exe
-///    actually crashes during cold-start `Create`, Windows Error Reporting
-///    writes a full (`DumpType=2`) minidump into the configured `DumpFolder`,
-///    which we point at the guest mount of the writable share. The host then
-///    reads it back via [`read_uvm_debug_dump`] (which records `.dmp` size
-///    rather than slurping the binary). Lives in the `Software` hive at
-///    `Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe`.
-///
-/// 2. **`zlayer-dbg` SCM service** (SECONDARY). A DEMAND-start own-process
-///    service whose `ImagePath` is a `cmd.exe /c` one-liner that dumps the
-///    `gcs` service state (`sc query gcs`) and the Hyper-V Compute operational
-///    event channel into the share. It is registered but NOT auto-started:
-///    auto-start (`Start`=2) ran this `cmd.exe`/`wevtutil` payload during the
-///    fragile cold-start boot window and confounded the 0xEF bisection, so it
-///    is now `Start`=3 (SERVICE_DEMAND_START) and only runs on an explicit
-///    `sc start zlayer-dbg` from a host/serial console. Lives in the `System`
-///    hive under `CurrentControlSet\Services\zlayer-dbg`.
-///
-/// The guest mount path for the share is
-/// `\\?\VMSMB\VSMB-{dcc079ae-…}\zlayer-debug` (see [`VSMB_GUEST_PREFIX`]).
+/// (The prior `zlayer-dbg` SCM service was removed: it wrote `sc`/`wevtutil`
+/// output to a now-dead VSMB share. The replacement diagnostic path reads the
+/// guest's raw `.evtx` event logs offline from the preserved scratch VHDX
+/// (`C:\Windows\System32\winevt\Logs\{Application,System}.evtx`), which needs
+/// no in-guest service.)
 #[cfg(feature = "windows-debug")]
 fn build_uvm_debug_registry_changes() -> Vec<RegistryValue> {
-    // Guest-side absolute path to the writable `zlayer-debug` share.
-    let mount = format!(r"{VSMB_GUEST_PREFIX}\zlayer-debug");
-
-    // ImagePath for the `zlayer-dbg` SCM service. `cmd.exe /c` runs both
-    // captures (each redirected to its own file in the share) at first
-    // auto-start. `sc query gcs` snapshots whether SCM ever started the GCS
-    // service; the `wevtutil` calls dump the Hyper-V Compute operational
-    // channel (the channel that carries GCS create/teardown ETW) AND, as a
-    // fallback if that channel name is wrong on this build, the System log
-    // filtered to Service Control Manager events mentioning gcs. `%comspec%`
-    // is left literal so REG_EXPAND_SZ expansion picks up the real cmd path.
-    let image_path = format!(
-        concat!(
-            r"%comspec% /c ",
-            r"sc query gcs > {mount}\sc-gcs.txt 2>&1 & ",
-            r"sc qc gcs >> {mount}\sc-gcs.txt 2>&1 & ",
-            r"wevtutil qe Microsoft-Windows-Hyper-V-Compute-Operational /c:200 /f:text ",
-            r"> {mount}\gcs-evtlog.txt 2>&1 & ",
-            r#"wevtutil qe System "/q:*[System[Provider[@Name='Service Control Manager']]]" "#,
-            r"/c:200 /rd:true /f:text > {mount}\system-scm.txt 2>&1"
-        ),
-        mount = mount,
-    );
+    // Guest-local path on the writable scratch volume (guest `C:\`). WER
+    // auto-creates this folder before writing the dump. The scratch VHDX is
+    // preserved + unlocked after a cold-start failure (KEEP mode terminates
+    // the UVM, releasing the disk lock), so the operator can mount it offline
+    // and read `C:\zlayer-dbg\*.dmp`.
+    let dump_folder = r"C:\zlayer-dbg".to_string();
 
     vec![
-        // --- WER LocalDumps for vmcomputeagent.exe (PRIMARY) ---
+        // --- WER LocalDumps for vmcomputeagent.exe ---
         RegistryValue {
             key: Some(RegistryKey {
                 hive: Some(RegistryHive::Software),
@@ -2473,7 +2512,7 @@ fn build_uvm_debug_registry_changes() -> Vec<RegistryValue> {
             }),
             name: "DumpFolder".to_string(),
             r#type: Some(RegistryValueType::ExpandedString),
-            string_value: mount.clone(),
+            string_value: dump_folder,
             ..Default::default()
         },
         RegistryValue {
@@ -2497,57 +2536,6 @@ fn build_uvm_debug_registry_changes() -> Vec<RegistryValue> {
             name: "DumpCount".to_string(),
             r#type: Some(RegistryValueType::DWord),
             d_word_value: Some(5),
-            ..Default::default()
-        },
-        // --- zlayer-dbg auto-start exfil service (SECONDARY) ---
-        RegistryValue {
-            key: Some(RegistryKey {
-                hive: Some(RegistryHive::System),
-                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
-            }),
-            name: "ImagePath".to_string(),
-            r#type: Some(RegistryValueType::ExpandedString),
-            string_value: image_path,
-            ..Default::default()
-        },
-        RegistryValue {
-            key: Some(RegistryKey {
-                hive: Some(RegistryHive::System),
-                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
-            }),
-            name: "Start".to_string(),
-            r#type: Some(RegistryValueType::DWord),
-            // 3 = SERVICE_DEMAND_START. Previously 2 (SERVICE_AUTO_START),
-            // which ran this `cmd.exe`/`wevtutil` one-liner early in guest
-            // boot and is a confounder for the fragile cold-start UVM (it
-            // perturbs the guest before the GCS even dials). Demand-start
-            // leaves the registry entry in-tree (so the service definition is
-            // still present for manual `sc start zlayer-dbg` from a console)
-            // without auto-running it at boot. The passive WER `LocalDumps`
-            // entries above are untouched — they only act on a real crash.
-            d_word_value: Some(3),
-            ..Default::default()
-        },
-        RegistryValue {
-            key: Some(RegistryKey {
-                hive: Some(RegistryHive::System),
-                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
-            }),
-            name: "Type".to_string(),
-            r#type: Some(RegistryValueType::DWord),
-            // 0x10 = SERVICE_WIN32_OWN_PROCESS.
-            d_word_value: Some(0x10),
-            ..Default::default()
-        },
-        RegistryValue {
-            key: Some(RegistryKey {
-                hive: Some(RegistryHive::System),
-                name: r"CurrentControlSet\Services\zlayer-dbg".to_string(),
-            }),
-            name: "ErrorControl".to_string(),
-            r#type: Some(RegistryValueType::DWord),
-            // 0 = SERVICE_ERROR_IGNORE — never block boot on this service.
-            d_word_value: Some(0),
             ..Default::default()
         },
     ]

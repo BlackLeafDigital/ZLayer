@@ -68,10 +68,15 @@ fn describe_response_error(stage: &str, base: &ResponseBase) -> String {
     // (top bit = severity). Reinterpret the i32 bit pattern rather than going
     // through `as u32`, which clippy flags.
     let hresult = u32::from_ne_bytes(base.result.to_ne_bytes());
-    let records = if base.error_records.is_empty() {
+    // `error_records` is a JSON Value (the guest sends an array). Render it
+    // compactly when present; omit it entirely when null/empty.
+    let records = if base.error_records.is_null() {
         String::new()
     } else {
-        format!(" error_records={}", base.error_records)
+        match serde_json::to_string(&base.error_records) {
+            Ok(s) => format!(" error_records={s}"),
+            Err(_) => String::new(),
+        }
     };
     format!(
         "{stage} returned HRESULT {hresult:#x}: {}{records}",
@@ -573,10 +578,23 @@ impl PendingGcsBridge {
         // guest may not advertise the capability), so we only log it.
         #[cfg(feature = "windows-debug")]
         {
-            if let Err(e) = bridge.start_log_forwarding().await {
+            // hcsshim gates StartLogForwarding on
+            // `GcsCapabilities.ModifyServiceSettingsSupported`. The Server 2025
+            // inbox GCS does NOT advertise this; sending the RPC anyway returns
+            // `Message Type 270532865 unknown` (an ErrorRecords array). Skip the
+            // RPC unless the guest advertised support — the host-side
+            // log-forward listener is left running (harmless) either way.
+            if caps.modify_service_settings_supported {
+                if let Err(e) = bridge.start_log_forwarding().await {
+                    gcs_debug!(
+                        "gcs-logfwd: StartLogForwarding RPC failed (continuing): {}",
+                        e
+                    );
+                }
+            } else {
                 gcs_debug!(
-                    "gcs-logfwd: StartLogForwarding RPC failed (continuing): {}",
-                    e
+                    "gcs-logfwd: guest did not advertise ModifyServiceSettingsSupported; \
+                     skipping StartLogForwarding RPC (unsupported on this guest)",
                 );
             }
         }

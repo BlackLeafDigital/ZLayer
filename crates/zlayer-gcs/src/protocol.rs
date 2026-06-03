@@ -101,11 +101,18 @@ pub struct ResponseBase {
     pub result: i32,
     #[serde(default)]
     pub error_message: String,
-    /// On failure, hcsshim populates this with a JSON-encoded array of
-    /// `ErrorRecord` objects. We expose it as a raw string; callers that
-    /// need parsed records parse on demand.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub error_records: String,
+    /// On failure, the in-guest GCS populates this with a JSON **array** of
+    /// `ErrorRecord` objects (e.g.
+    /// `[{"Result":-1070137077,"Message":"...","ModuleName":"vmcomputeagent.exe",...}]`).
+    /// It is kept as a raw [`serde_json::Value`] so callers can render or parse
+    /// it on demand; a `String` field here fails to deserialize the guest's
+    /// array shape with "invalid type: sequence, expected a string".
+    #[serde(
+        default,
+        rename = "ErrorRecords",
+        skip_serializing_if = "serde_json::Value::is_null"
+    )]
+    pub error_records: serde_json::Value,
 }
 
 /// `RpcNegotiateProtocol` request — proposes a min/max protocol version
@@ -148,6 +155,13 @@ pub struct ProtocolSupport {
     pub hv_socket_config_on_startup: bool,
     #[serde(default)]
     pub send_lifecycle_notifications: bool,
+    /// Whether the guest advertises support for the `ModifyServiceSettings`
+    /// RPC (hcsshim's `GcsCapabilities.ModifyServiceSettingsSupported`). The
+    /// Server 2025 inbox GCS does NOT advertise this, and sending the RPC
+    /// (e.g. `StartLogForwarding`) yields `Message Type 270532865 unknown`.
+    /// hcsshim gates `StartLogForwarding` on this flag; so do we.
+    #[serde(default)]
+    pub modify_service_settings_supported: bool,
 }
 
 /// `RpcCreate` — create the COMPUTE-system root.
@@ -354,6 +368,52 @@ mod tests {
         let back: CreateRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.base.container_id, req.base.container_id);
         assert_eq!(back.container_config, req.container_config);
+    }
+
+    #[test]
+    fn response_base_parses_error_records_array() {
+        // The in-guest GCS sends `ErrorRecords` as a JSON ARRAY. Previously
+        // `error_records: String` failed this with "invalid type: sequence,
+        // expected a string". It must now deserialize into a Value array.
+        let wire = r#"{
+            "Result": -1070137077,
+            "ActivityId": "00000000-0000-0000-0000-000000000000",
+            "ErrorRecords": [
+                {
+                    "Result": -1070137077,
+                    "Message": "Message Type 270532865 unknown (215 byte)",
+                    "ModuleName": "vmcomputeagent.exe"
+                }
+            ]
+        }"#;
+        let base: ResponseBase = serde_json::from_str(wire).unwrap();
+        assert_eq!(base.result, -1_070_137_077);
+        assert!(
+            base.error_records.is_array(),
+            "error_records must be an array"
+        );
+        assert_eq!(
+            base.error_records[0]["Message"],
+            json!("Message Type 270532865 unknown (215 byte)")
+        );
+
+        // A response with no ErrorRecords still parses, leaving a null Value
+        // that is skipped on re-serialization.
+        let empty: ResponseBase = serde_json::from_str(r#"{"Result":0}"#).unwrap();
+        assert!(empty.error_records.is_null());
+        let s = serde_json::to_string(&empty).unwrap();
+        assert!(!s.contains("ErrorRecords"), "null records must be skipped");
+    }
+
+    #[test]
+    fn protocol_support_parses_modify_service_settings_supported() {
+        // Guest that DOES advertise the capability.
+        let with: ProtocolSupport =
+            serde_json::from_str(r#"{"ModifyServiceSettingsSupported": true}"#).unwrap();
+        assert!(with.modify_service_settings_supported);
+        // Guest (Server 2025 inbox) that omits it → defaults to false.
+        let without: ProtocolSupport = serde_json::from_str(r"{}").unwrap();
+        assert!(!without.modify_service_settings_supported);
     }
 
     #[test]
