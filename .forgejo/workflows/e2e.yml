@@ -566,7 +566,13 @@ jobs:
   # ===========================================
   raft-e2e-tests:
     name: E2E Tests (Raft)
-    runs-on: ubuntu-latest
+    # Pin to the NVIDIA/GPU runners (MiniBeast / BeastPC): they reliably honor
+    # `--privileged`, giving the job container a WRITABLE cgroup-v2 subtree so the
+    # cluster_scaling / cluster_upgrade suites can create real workload
+    # containers. The plain `ubuntu-latest` pool also includes GitRunner, which
+    # does NOT reliably grant privilege (job container lands at the cgroup-v2
+    # root with /sys/fs/cgroup read-only) — which is why those two suites flaked.
+    runs-on: nvidia
     container:
       image: node:20-bullseye
       options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun

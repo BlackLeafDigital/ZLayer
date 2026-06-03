@@ -336,7 +336,11 @@ jobs:
   # ===========================================
   raft-e2e-tests:
     name: E2E Tests (Raft)
-    runs-on: ubuntu-latest
+    # Pin to the NVIDIA/GPU runners (privileged → writable cgroups) so the
+    # cluster_scaling / cluster_upgrade suites can create workload containers;
+    # the plain ubuntu-latest pool includes a runner that doesn't reliably grant
+    # privilege.
+    runs-on: nvidia
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
