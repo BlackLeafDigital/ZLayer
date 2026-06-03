@@ -7,7 +7,7 @@ services:
   web:
     rtype: service
     image:
-      name: nginx:1.28-alpine
+      name: docker.io/library/nginx:1.28-alpine
       pull_policy: if_not_present
 
     endpoints:

@@ -583,7 +583,7 @@ jobs:
       - name: Compute step fingerprint
         id: fingerprint
         run: |
-          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc bin/zlayer/src/commands/cluster.rs crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc crates/zlayer-overlayd bin/zlayer/src/commands/cluster.rs crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
             | sha256sum | cut -c1-16)
           echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
 
@@ -632,7 +632,7 @@ jobs:
 
       - name: Build zlayer
         if: steps.check.outputs.completed != 'true'
-        run: cargo build --release -p zlayer
+        run: cargo build --release -p zlayer -p zlayer-overlayd
 
       - name: Run raft cluster suite(s)
         if: steps.check.outputs.completed != 'true'

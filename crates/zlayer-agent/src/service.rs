@@ -701,6 +701,7 @@ impl ServiceInstance {
                         id.clone(),
                         Container {
                             id: id.clone(),
+                            image: self.spec.image.name.to_string(),
                             state: ContainerState::Running,
                             pid: None,
                             task: None,
@@ -869,6 +870,27 @@ impl ServiceInstance {
         self.containers.read().await.keys().cloned().collect()
     }
 
+    /// Get per-container info (id, image, state, pid, overlay IP) for every
+    /// live container in this instance.
+    ///
+    /// Surfaces the REAL image reference each container was created from and its
+    /// REAL lifecycle state (lowercased via [`ContainerState::as_str`]) so the
+    /// API/`ps` no longer reports a hardcoded `"running"` with no image.
+    pub async fn container_infos(&self) -> Vec<ContainerInfo> {
+        self.containers
+            .read()
+            .await
+            .values()
+            .map(|c| ContainerInfo {
+                id: c.id.clone(),
+                image: c.image.clone(),
+                state: c.state.as_str().to_string(),
+                pid: c.pid,
+                overlay_ip: c.overlay_ip.map(|ip| ip.to_string()),
+            })
+            .collect()
+    }
+
     /// Get read access to the containers map
     ///
     /// This allows callers to access container overlay IPs and other metadata
@@ -893,6 +915,25 @@ impl ServiceInstance {
     pub fn has_dns_server(&self) -> bool {
         self.dns_server.is_some()
     }
+}
+
+/// Per-container summary surfaced to callers (API / `ps`).
+///
+/// Carries the REAL image reference and lifecycle state of a single live
+/// container, replacing the previous id-only view that forced the API to
+/// fabricate a hardcoded `"running"` state with no image.
+#[derive(Debug, Clone)]
+pub struct ContainerInfo {
+    /// Container identity.
+    pub id: ContainerId,
+    /// Image reference the container was created from (canonical form).
+    pub image: String,
+    /// Lowercased lifecycle state (e.g. `"running"`, `"exited"`).
+    pub state: String,
+    /// Process ID, when the container is running.
+    pub pid: Option<u32>,
+    /// Overlay IP rendered as a string, when assigned.
+    pub overlay_ip: Option<String>,
 }
 
 /// Service manager for multiple services
@@ -2225,6 +2266,23 @@ impl ServiceManager {
         }
     }
 
+    /// Get per-container info (id, image, real state, pid, overlay IP) for a
+    /// specific service.
+    ///
+    /// Unlike [`get_service_containers`](Self::get_service_containers) (which
+    /// returns ids only), this surfaces the REAL image reference and lifecycle
+    /// state of each live container so the API/`ps` can report them accurately.
+    ///
+    /// Returns an empty vector if the service doesn't exist.
+    pub async fn get_service_container_infos(&self, service_name: &str) -> Vec<ContainerInfo> {
+        let services = self.services.read().await;
+        if let Some(instance) = services.get(service_name) {
+            instance.container_infos().await
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Execute a command inside a running container for a service
     ///
     /// Picks a specific replica if provided, otherwise uses the first available container.
@@ -2498,6 +2556,99 @@ mod tests {
         // Verify service is registered
         let services = manager.list_services().await;
         assert!(services.contains(&"web".to_string()));
+    }
+
+    #[test]
+    fn test_container_state_as_str() {
+        use crate::runtime::ContainerState;
+        assert_eq!(ContainerState::Pending.as_str(), "pending");
+        assert_eq!(ContainerState::Initializing.as_str(), "initializing");
+        assert_eq!(ContainerState::Running.as_str(), "running");
+        assert_eq!(ContainerState::Stopping.as_str(), "stopping");
+        assert_eq!(ContainerState::Exited { code: 0 }.as_str(), "exited");
+        assert_eq!(
+            ContainerState::Failed {
+                reason: "boom".to_string()
+            }
+            .as_str(),
+            "failed"
+        );
+        // Display delegates to as_str.
+        assert_eq!(ContainerState::Running.to_string(), "running");
+    }
+
+    /// A container created from image X must report image X and its real
+    /// lifecycle state through the new `container_infos` accessor, replacing
+    /// the previously hardcoded `"running"` / empty-image behavior.
+    #[tokio::test]
+    async fn test_container_infos_surfaces_image_and_state() {
+        use crate::runtime::{Container, ContainerState};
+
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let manager = ServiceManager::new(runtime);
+
+        let spec = mock_spec(); // image name = "test:latest"
+        let image = spec.image.name.to_string();
+        Box::pin(manager.upsert_service("web".to_string(), spec))
+            .await
+            .unwrap();
+
+        // Inject containers directly with distinct states.
+        {
+            let services = manager.services.read().await;
+            let instance = services.get("web").unwrap();
+            let mut containers = instance.containers().write().await;
+
+            let running_id = ContainerId::new("web", 0);
+            containers.insert(
+                running_id.clone(),
+                Container {
+                    id: running_id,
+                    image: image.clone(),
+                    state: ContainerState::Running,
+                    pid: Some(4242),
+                    task: None,
+                    overlay_ip: None,
+                    health_monitor: None,
+                    port_override: None,
+                },
+            );
+
+            let exited_id = ContainerId::new("web", 1);
+            containers.insert(
+                exited_id.clone(),
+                Container {
+                    id: exited_id,
+                    image: image.clone(),
+                    state: ContainerState::Exited { code: 1 },
+                    pid: None,
+                    task: None,
+                    overlay_ip: None,
+                    health_monitor: None,
+                    port_override: None,
+                },
+            );
+        }
+
+        let mut infos = manager.get_service_container_infos("web").await;
+        infos.sort_by_key(|i| i.id.replica);
+        assert_eq!(infos.len(), 2);
+
+        // Every container reports the real image it was created from.
+        assert!(infos.iter().all(|i| i.image == image));
+        assert!(infos.iter().all(|i| i.image == "test:latest"));
+
+        // Real per-container state is surfaced (not a hardcoded "running").
+        assert_eq!(infos[0].state, "running");
+        assert_eq!(infos[0].pid, Some(4242));
+        assert_eq!(infos[1].state, "exited");
+        assert_eq!(infos[1].pid, None);
+
+        // Unknown service yields an empty list.
+        assert!(manager
+            .get_service_container_infos("missing")
+            .await
+            .is_empty());
     }
 
     fn mock_spec() -> ServiceSpec {
@@ -3410,6 +3561,7 @@ services:
                 cid_primary.clone(),
                 Container {
                     id: cid_primary,
+                    image: spec.image.name.to_string(),
                     state: crate::runtime::ContainerState::Running,
                     pid: None,
                     task: None,
@@ -3422,6 +3574,7 @@ services:
                 cid_first_read.clone(),
                 Container {
                     id: cid_first_read,
+                    image: spec.image.name.to_string(),
                     state: crate::runtime::ContainerState::Running,
                     pid: None,
                     task: None,
@@ -3434,6 +3587,7 @@ services:
                 cid_second_read.clone(),
                 Container {
                     id: cid_second_read,
+                    image: spec.image.name.to_string(),
                     state: crate::runtime::ContainerState::Running,
                     pid: None,
                     task: None,

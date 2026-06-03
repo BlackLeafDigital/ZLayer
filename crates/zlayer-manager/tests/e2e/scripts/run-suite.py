@@ -496,9 +496,13 @@ def resolve_host_socket() -> Optional[Path]:
 def build_phase(*, throwaway: bool, with_manager: bool = True) -> None:
     on_path = shutil.which("zlayer") is not None
     if throwaway or not on_path:
-        log("Building zlayer (release)")
+        log("Building zlayer + zlayer-overlayd (release)")
+        # The daemon self-spawns the sibling `zlayer-overlayd` binary at
+        # `serve` time; without it the overlay dial stalls ~35s and trips
+        # the harness's /health/ready budget. Build both so the sibling
+        # exists alongside the `zlayer` binary in target/release.
         subprocess.run(
-            ["cargo", "build", "--release", "-p", "zlayer"],
+            ["cargo", "build", "--release", "-p", "zlayer", "-p", "zlayer-overlayd"],
             cwd=REPO_ROOT, check=True,
         )
     else:
@@ -891,7 +895,7 @@ def _bootstrap_3node_cluster(
     )
     procs.append(n1)
     if not _wait_http_ok(
-        f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/health/ready", 30,
+        f"http://127.0.0.1:{CLUSTER_NODES[0]['api']}/health/ready", 60,
     ):
         die(f"node1 never came up on 127.0.0.1:{CLUSTER_NODES[0]['api']}")
 
@@ -951,7 +955,7 @@ def _bootstrap_3node_cluster(
         )
         procs.append(p)
         if not _wait_http_ok(
-            f"http://127.0.0.1:{cfg['api']}/health/ready", 30,
+            f"http://127.0.0.1:{cfg['api']}/health/ready", 60,
         ):
             die(f"node{i + 1} never came up on 127.0.0.1:{cfg['api']}")
 
@@ -1787,7 +1791,8 @@ def _container_wait_image_transition(
         ]
         last_state = running
         if len(running) == expected_count and all(
-            _container_image(e) == expected_image for e in running
+            _norm_image(_container_image(e)) == _norm_image(expected_image)
+            for e in running
         ):
             return running
         time.sleep(2)
@@ -2270,7 +2275,7 @@ def run_cluster_upgrade_container(args: argparse.Namespace) -> int:
             ],
             check=True,
         )
-        expected_image = "nginx:1.29-alpine"
+        expected_image = "docker.io/library/nginx:1.29-alpine"
         log(f"cluster_upgrade(container): waiting for 3 containers on {expected_image}")
         _container_wait_image_transition(
             runtime, leader, CLUSTER_APP_DEPLOYMENT,
@@ -3037,6 +3042,24 @@ def _container_image(entry: dict) -> str:
     return ""
 
 
+def _norm_image(ref: str) -> str:
+    """Strip registry/namespace prefixes so short and fully-qualified
+    image refs compare equal (e.g. `nginx:1.29-alpine` ==
+    `docker.io/library/nginx:1.29-alpine`)."""
+    r = ref.strip()
+    for p in (
+        "docker.io/library/",
+        "docker.io/",
+        "registry-1.docker.io/library/",
+        "index.docker.io/library/",
+        "library/",
+    ):
+        if r.startswith(p):
+            r = r[len(p):]
+            break
+    return r
+
+
 def _container_node(entry: dict) -> str:
     for field in _NODE_FIELDS:
         val = entry.get(field)
@@ -3183,7 +3206,8 @@ def _wait_image_transition(
         ]
         last_state = running
         if len(running) == expected_count and all(
-            _container_image(e) == expected_image for e in running
+            _norm_image(_container_image(e)) == _norm_image(expected_image)
+            for e in running
         ):
             return running
         time.sleep(2)
@@ -3407,7 +3431,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
                     sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
                 raise
 
-            expected_image = "nginx:1.29-alpine"
+            expected_image = "docker.io/library/nginx:1.29-alpine"
             log(
                 f"cluster_upgrade: waiting for 3 containers on {expected_image}"
             )

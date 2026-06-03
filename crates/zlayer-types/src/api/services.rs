@@ -97,6 +97,13 @@ pub struct ContainerSummary {
     pub service: String,
     /// Replica number
     pub replica: u32,
+    /// Image reference the container was created from (canonical form, e.g.
+    /// `docker.io/library/nginx:1.29-alpine`).
+    ///
+    /// `#[serde(default)]` keeps older payloads (which lacked this field)
+    /// deserializable.
+    #[serde(default)]
+    pub image: String,
     /// Container state
     pub state: String,
     /// Process ID (if running)

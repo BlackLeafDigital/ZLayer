@@ -370,7 +370,7 @@ jobs:
           enable-cache: true
 
       - name: Build zlayer
-        run: cargo build --release -p zlayer
+        run: cargo build --release -p zlayer -p zlayer-overlayd
 
       - name: Run raft cluster suite(s)
         run: |

@@ -35,6 +35,31 @@ pub enum ContainerState {
     Failed { reason: String },
 }
 
+impl ContainerState {
+    /// Stable lowercase string representation of the state.
+    ///
+    /// Used when surfacing container state through the API / `ps` output.
+    /// `Running` stringifies to `"running"` (matched case-insensitively by the
+    /// raft e2e harness when counting healthy replicas).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Initializing => "initializing",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Exited { .. } => "exited",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ContainerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Container identifier.
 ///
 /// Identifies a container by `(service, replica)` for the legacy single-group
@@ -121,6 +146,9 @@ impl std::fmt::Display for ContainerId {
 /// Container handle
 pub struct Container {
     pub id: ContainerId,
+    /// Image reference this container was created from (canonical form, e.g.
+    /// `docker.io/library/nginx:1.29-alpine`). Surfaced through the API/`ps`.
+    pub image: String,
     pub state: ContainerState,
     pub pid: Option<u32>,
     pub task: Option<JoinHandle<std::io::Result<()>>>,
@@ -1876,12 +1904,13 @@ impl Runtime for MockRuntime {
         Ok(())
     }
 
-    async fn create_container(&self, id: &ContainerId, _spec: &ServiceSpec) -> Result<()> {
+    async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let mut containers = self.containers.write().await;
         containers.insert(
             id.clone(),
             Container {
                 id: id.clone(),
+                image: spec.image.name.to_string(),
                 state: ContainerState::Pending,
                 pid: None,
                 task: None,

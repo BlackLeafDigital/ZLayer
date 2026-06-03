@@ -415,15 +415,16 @@ pub async fn list_containers(
     let mut containers = Vec::new();
     if let Some(ref manager) = state.service_manager {
         let manager = manager.read().await;
-        let container_ids = manager.get_service_containers(&service).await;
-        for cid in container_ids {
+        let infos = manager.get_service_container_infos(&service).await;
+        for info in infos {
             containers.push(ContainerSummary {
-                id: cid.to_string(),
-                service: cid.service.clone(),
-                replica: cid.replica,
-                state: "running".to_string(),
-                pid: None,
-                overlay_ip: None,
+                id: info.id.to_string(),
+                service: info.id.service.clone(),
+                replica: info.id.replica,
+                image: info.image,
+                state: info.state,
+                pid: info.pid,
+                overlay_ip: info.overlay_ip,
                 node_id: state.local_node_id.clone(),
             });
         }
