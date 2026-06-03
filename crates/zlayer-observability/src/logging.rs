@@ -58,7 +58,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
     match (config.format, file_writer) {
         (LogFormat::Pretty, Some(file_writer)) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -82,7 +82,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Pretty, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -96,7 +96,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Json, Some(file_writer)) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -120,7 +120,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Json, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -134,7 +134,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Compact, Some(file_writer)) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -158,7 +158,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Compact, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)

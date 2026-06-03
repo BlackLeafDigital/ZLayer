@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.5 - 2026-06-03
+
+### Added
+- hcs (windows-debug): `ZLAYER_GCS_SVCDUMP=1` diagnostic to name *why* the stripped nanoserver UVM's `mpssvc`/`netsetupsvc` never reach Running (the GCS cold-start wall). When set, the create path injects the host `%SystemRoot%\System32\sc.exe` into the UVM at `<os_files>\Windows\System32\sc.exe` (the stripped UVM ships `cmd.exe`/`services.exe` but no `sc.exe`), and `build_uvm_registry_changes` registers an auto-start (`Start`=2, `Type`=0x10, `ErrorControl`=0, no `DependOnService`) SCM service `CurrentControlSet\Services\zlayer-svcdump` whose REG_EXPAND_SZ `ImagePath` loops ~12×/~5s appending `sc queryex mpssvc|netsetupsvc|BFE|RpcSs|nsi|gcs` + `sc qc mpssvc|netsetupsvc` + `sc query` to `C:\zlayer-dbg\svcdump.txt`. Reuses the existing `RegistryValue`/`RegistryKey`/`RegistryHive` schema.
+- hcs (windows-debug): interactive/on-box svcdump capture. After a cold-start accept timeout under `ZLAYER_GCS_SVCDUMP=1` + `ZLAYER_KEEP_UVM_ON_FAILURE=1`, the preserved scratch VHDX is mounted **on the box** (read-only, via `Mount-DiskImage`), `C:\zlayer-dbg\svcdump.txt` is read, and its contents are both folded into the `CreateFailed` error message and echoed to stderr via `step_log!`, so a foreground `cargo test … --nocapture` run streams the service-state dump live without offline-VHDX mounting.
+- hcs: real `container_logs` / `get_logs` for HCS process-isolation. Added `CapturedProcess::create_capturing_blocking` to `zlayer-hcs::process`, which drives `HcsCreateProcess` via `HcsWaitForOperationResultAndProcessInfo` to recover the `HCS_PROCESS_INFORMATION` stdout/stderr pipe HANDLEs, plus a synchronous `drain_pipe`/`drain_with_process` reader. The agent's `exec` path now creates the process capturing, drains the pipes (so `exec` returns real stdout/stderr instead of empty strings), and appends each line to a new per-container in-memory `log_buffer`; `container_logs` returns those `LogEntry`s with tail support (mirroring the youki/WSL2 file-backed log readers).
+
 ## 0.52.4 - 2026-06-03
 
 ### Fixed

@@ -74,7 +74,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout as tokio_timeout;
 use tracing::instrument;
 use windows::core::GUID;
-use zlayer_observability::logs::LogEntry;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_overlay::ipnet;
 use zlayer_spec::{PullPolicy, RegistryAuth as SpecRegistryAuth, ServiceSpec};
 
@@ -433,6 +433,17 @@ struct ContainerEntry {
     #[cfg(feature = "hcs-runtime")]
     #[allow(dead_code)] // read by B4.3 lifecycle routing
     gcs: Option<zlayer_gcs::bridge::GcsBridge>,
+    /// In-memory ring of captured log lines for this container.
+    ///
+    /// HCS does not host-spawn the container's image entrypoint (it runs
+    /// inside the compute system once started), so there is no host-side pipe
+    /// to that init process. What IS capturable is every `exec`'d process's
+    /// stdout/stderr (the `exec` path creates the HCS stdio pipes and now
+    /// drains them). Those lines are appended here so `container_logs` /
+    /// `get_logs` return real, non-empty output — mirroring the file-backed
+    /// log readers on the youki / WSL2 runtimes, but kept in memory because
+    /// the HCS pipes are streamed, not written to a host log file by HCS.
+    log_buffer: Arc<RwLock<Vec<LogEntry>>>,
 }
 
 /// Overlay attachment identifiers returned by `zlayer-overlayd` for a Windows
@@ -1535,6 +1546,35 @@ impl HcsRuntime {
             if std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1") {
                 set_bcd("debug", "Yes");
             }
+            // ZLAYER_GCS_SVCDUMP=1: inject the host `sc.exe` into the UVM. The
+            // stripped nanoserver UtilityVM ships `cmd.exe`/`services.exe` but
+            // NOT `sc.exe`; its deps (advapi32 etc.) ARE present. The os-files
+            // dir is the read-only "os" VSMB source and is host-writable before
+            // HcsCreate, so we drop the host's `%SystemRoot%\System32\sc.exe`
+            // into `<os_files>\Windows\System32\sc.exe`. The injected
+            // `zlayer-svcdump` SCM service (see `build_uvm_registry_changes`)
+            // then runs `sc queryex`/`sc qc`/`sc query` to capture WHY
+            // `mpssvc`/`netsetupsvc` fail to reach Running. Best-effort: failures
+            // are logged, not fatal.
+            if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref() == Ok("1") {
+                let host_sc = std::path::Path::new(
+                    &std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+                )
+                .join(r"System32\sc.exe");
+                let dst_sc = uvm.os_files_dir().join(r"Windows\System32\sc.exe");
+                match std::fs::copy(&host_sc, &dst_sc) {
+                    Ok(n) => step_log!(
+                        "2-svcdump (windows-debug): injected sc.exe {} -> {} ({n} bytes)",
+                        host_sc.display(),
+                        dst_sc.display(),
+                    ),
+                    Err(e) => step_log!(
+                        "2-svcdump (windows-debug): sc.exe inject {} -> {} FAILED: {e}",
+                        host_sc.display(),
+                        dst_sc.display(),
+                    ),
+                }
+            }
         }
         let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
             .await
@@ -1697,6 +1737,12 @@ impl HcsRuntime {
                             // CreateFailed.reason string) carries the
                             // actual root-cause signal.
                             let dump = read_uvm_debug_dump(uvm.debug_dir());
+                            // ZLAYER_GCS_SVCDUMP=1 capture, populated below
+                            // after the scratch is preserved + mounted on-box.
+                            // Defaults empty so the error string is unaffected
+                            // on a normal run.
+                            #[allow(unused_mut)]
+                            let mut svcdump_capture = String::new();
                             // ZLAYER_KEEP_UVM_ON_FAILURE=1 → TERMINATE the
                             // UVM here (don't leave it running). A running
                             // UVM holds the scratch VHDX locked, so it can't
@@ -1771,7 +1817,8 @@ impl HcsRuntime {
                                         .join(format!("{hcs_id}-scratch.vhdx"));
                                     let dest_str = dest.display().to_string();
                                     match std::fs::copy(uvm.scratch_vhdx(), &dest) {
-                                        Ok(_) => step_log!(
+                                        Ok(_) => {
+                                            step_log!(
                                             "ZLAYER_KEEP_UVM_ON_FAILURE=1 — scratch VHDX COPIED to {dest_str} (survives temp-dir reap). \
                                              Read the guest event log + any WER dump OFFLINE from the COPY:\n\
                                              \x20 Mount-VHD -Path '{dest_str}' -ReadOnly   # note the drive letter, e.g. X:\n\
@@ -1779,7 +1826,32 @@ impl HcsRuntime {
                                              \x20 Get-WinEvent -Path 'X:\\Windows\\System32\\winevt\\Logs\\System.evtx'      | Select-Object -First 100 | Format-List\n\
                                              \x20 Get-ChildItem 'X:\\zlayer-dbg\\*.dmp'\n\
                                              \x20 Dismount-VHD -Path '{dest_str}'",
-                                        ),
+                                            );
+                                            // ZLAYER_GCS_SVCDUMP=1: the dev is
+                                            // AT the box watching a foreground
+                                            // `--nocapture` run, so mount the
+                                            // just-copied scratch ON THIS
+                                            // machine (not offline-detached),
+                                            // read `C:\zlayer-dbg\svcdump.txt`
+                                            // (what the injected `zlayer-svcdump`
+                                            // SCM service wrote), and surface it
+                                            // both into the CreateFailed reason
+                                            // AND live on stderr. This is the
+                                            // whole point of the SVCDUMP run:
+                                            // see WHY mpssvc/netsetupsvc don't
+                                            // reach Running without offline VHDX
+                                            // gymnastics.
+                                            #[cfg(feature = "windows-debug")]
+                                            if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref()
+                                                == Ok("1")
+                                            {
+                                                let cap = mount_and_read_svcdump(&dest);
+                                                step_log!(
+                                                    "ZLAYER_GCS_SVCDUMP=1 — on-box svcdump capture from {dest_str}:\n{cap}",
+                                                );
+                                                svcdump_capture = cap;
+                                            }
+                                        }
                                         Err(ce) => eprintln!(
                                             "ZLAYER_KEEP_UVM_ON_FAILURE=1 — failed to copy scratch VHDX {vhdx} -> {dest_str}: {ce}; \
                                              fall back to the in-place copy at {vhdx} if it survives",
@@ -1787,12 +1859,17 @@ impl HcsRuntime {
                                     }
                                 }
                             }
+                            let svcdump_fold = if svcdump_capture.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" || svcdump={svcdump_capture}")
+                            };
                             return Err(AgentError::CreateFailed {
                                 id: hcs_id.to_string(),
                                 reason: format!(
                                     "Hyper-V step 4: GcsBridge accept: {e} || create_id={uvm_system_id} \
                                      || base_props={diag_base_props} || guest_conn={diag_guest_conn} \
-                                     || guest_debug_dump={dump}"
+                                     || guest_debug_dump={dump}{svcdump_fold}"
                                 ),
                             });
                         }
@@ -2449,6 +2526,77 @@ fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// (`windows-debug` only) Mount a preserved scratch VHDX **on this machine**
+/// (read-only), read the in-guest `C:\zlayer-dbg\svcdump.txt` the injected
+/// `zlayer-svcdump` SCM service wrote, then dismount. Returns the file's
+/// contents (collapsed to one line, capped) or a `(…)` marker string on any
+/// failure. Used by the cold-start failure path under `ZLAYER_GCS_SVCDUMP=1`
+/// so the dev watching a foreground `--nocapture` run sees the service-state
+/// dump live, without the offline-detached `Set-VHD`/`Mount-DiskImage` dance.
+///
+/// This is the on-box ergonomic counterpart to the offline-VHDX recipe: the
+/// scratch is a differencing disk, but it mounts coherently on the SAME box
+/// that wrote it because the parent (the UtilityVM base) is local. We mount
+/// read-only and never alter the disk, so re-running the offline recipe later
+/// still works.
+#[cfg(all(feature = "hcs-runtime", feature = "windows-debug"))]
+fn mount_and_read_svcdump(vhdx: &std::path::Path) -> String {
+    /// Cap the folded-in svcdump so the `CreateFailed` reason stays bounded;
+    /// the full file remains on the preserved VHDX for offline reading.
+    const SVCDUMP_CAP: usize = 16 * 1024;
+
+    let vhdx_str = vhdx.display().to_string();
+    // One PowerShell invocation: mount RO, resolve the assigned letter, read
+    // the svcdump (Raw so newlines survive), dismount in `finally` so a read
+    // error never leaves the disk attached. `Get-Content -Raw` returns $null
+    // for a missing file; we emit a marker so the caller can tell "mounted but
+    // no svcdump" (SCM never ran our service) from a mount failure.
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$p='{vhdx_str}'
+try {{
+  $img = Mount-DiskImage -ImagePath $p -Access ReadOnly -PassThru
+  $disk = $img | Get-DiskImage | Get-Disk
+  $letters = ($disk | Get-Partition | Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ $_.DriveLetter }})
+  $found=$null
+  foreach ($dl in $letters) {{
+    $f = ($dl + ':\zlayer-dbg\svcdump.txt')
+    if (Test-Path $f) {{ $found=$f; break }}
+  }}
+  if ($found) {{ Get-Content -Raw -LiteralPath $found }}
+  else {{ Write-Output '(mounted-no-svcdump)' }}
+}} finally {{
+  try {{ Dismount-DiskImage -ImagePath $p | Out-Null }} catch {{}}
+}}"#,
+    );
+    let out = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("(mount-spawn-failed: {e})"),
+    };
+    if !out.status.success() {
+        return format!(
+            "(mount-failed: status={} err={})",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .replace(['\n', '\r'], " ")
+                .trim(),
+        );
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if trimmed.len() > SVCDUMP_CAP {
+        format!("{}…<truncated>", &trimmed[..SVCDUMP_CAP])
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Build the offline `RegistryChanges` HCS applies to the guest hives before
 /// first boot.
 ///
@@ -2530,6 +2678,95 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
             d_word_value: Some(0x7FFF_FFFF),
             ..Default::default()
         });
+    }
+
+    // windows-debug + ZLAYER_GCS_SVCDUMP=1: register an auto-start SCM service
+    // `zlayer-svcdump` that names WHY `mpssvc`/`netsetupsvc` don't reach Running
+    // (handoff NEXT ACTION). Unlike the dead writable-VSMB exfil path, this
+    // writes to the guest-local scratch volume `C:\zlayer-dbg` (the same path
+    // WER LocalDumps uses), which survives offline on the preserved scratch
+    // VHDX and is also readable on-box (the host writes the scratch).
+    //
+    //   * Start=2 (SERVICE_AUTO_START), Type=0x10 (SERVICE_WIN32_OWN_PROCESS),
+    //     ErrorControl=0 (SERVICE_ERROR_IGNORE) — boot keeps going even if our
+    //     dumper bombs.
+    //   * NO `DependOnService` — SCM starts it regardless of the firewall/
+    //     network services we're trying to diagnose (so it can observe THEM
+    //     stuck in START_PENDING/STOPPED).
+    //   * `ImagePath` is REG_EXPAND_SZ (`%comspec%` expands at service start)
+    //     and loops ~12 times, ~5s apart, appending `sc queryex`/`sc qc`/
+    //     `sc query` snapshots so we capture WIN32_EXIT_CODE/SERVICE_EXIT_CODE
+    //     over the window the services would normally start.
+    //
+    // NOTE: an SCM service `ImagePath` is NOT a normal interactive process — it
+    // must call StartServiceCtrlDispatcher within ~30s or SCM kills it. A raw
+    // `cmd /c` here is reaped quickly by SCM, but the loop body runs at least
+    // once or twice before that, which is enough to capture the post-boot
+    // service state. (services.exe still launches the ImagePath process and the
+    // child `cmd` keeps running detached long enough on a stripped UVM with no
+    // contending workload.) We deliberately keep the loop short so the captured
+    // file is bounded.
+    #[cfg(feature = "windows-debug")]
+    if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref() == Ok("1") {
+        let svc = r"CurrentControlSet\Services\zlayer-svcdump";
+        let svc_key = || {
+            Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: svc.to_string(),
+            })
+        };
+        // %comspec% /c "for /l %i in (1,1,12) do ( <dump one snapshot> & ping -n 6 127.0.0.1 >nul )"
+        // `ping -n 6 127.0.0.1` is the inbox-safe ~5s sleep (no `timeout.exe`
+        // in nanoserver, and `timeout` needs a console anyway). `>>` appends so
+        // every iteration accumulates. `2>&1` folds stderr in so a missing
+        // service name still records its error. `md` (ignored if present)
+        // creates the scratch-local dir first.
+        let image_path = concat!(
+            r#"%comspec% /c "md C:\zlayer-dbg 2>nul & for /l %i in (1,1,12) do ("#,
+            r#"echo ===== iter %i ===== >> C:\zlayer-dbg\svcdump.txt & "#,
+            r#"sc queryex mpssvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex netsetupsvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex BFE >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex RpcSs >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex nsi >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex gcs >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc qc mpssvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc qc netsetupsvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc query >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"ping -n 6 127.0.0.1 >nul )""#,
+        );
+        values.extend([
+            RegistryValue {
+                key: svc_key(),
+                name: "Start".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(2), // SERVICE_AUTO_START
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "Type".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(0x10), // SERVICE_WIN32_OWN_PROCESS
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "ErrorControl".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(0), // SERVICE_ERROR_IGNORE
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "ImagePath".to_string(),
+                // REG_EXPAND_SZ via the `string_value` field (NOT MultiString /
+                // binary) so `%comspec%` expands at service-start time.
+                r#type: Some(RegistryValueType::ExpandedString),
+                string_value: image_path.to_string(),
+                ..Default::default()
+            },
+        ]);
     }
 
     // windows-debug: append WER LocalDumps for vmcomputeagent.exe, pointing
@@ -3641,6 +3878,7 @@ impl Runtime for HcsRuntime {
             // lifecycle-routing migration (B4.3).
             #[cfg(feature = "hcs-runtime")]
             gcs: hyperv_state.bridge,
+            log_buffer: Arc::new(RwLock::new(Vec::new())),
         };
         // Suppress "unused" when the `hcs-runtime` feature is off — the
         // state is only consumed via the gated entry field above. The
@@ -3816,14 +4054,37 @@ impl Runtime for HcsRuntime {
         Ok(ContainerState::Running)
     }
 
-    async fn container_logs(&self, _id: &ContainerId, _tail: usize) -> Result<Vec<LogEntry>> {
-        Err(AgentError::Unsupported(
-            "container_logs is not yet wired for the HCS runtime; use `zlayer exec` to inspect logs inside the container".to_string(),
-        ))
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
+        let hcs_id = Self::hcs_id(id);
+        let buffer = {
+            let containers = self.containers.read().await;
+            let entry = containers
+                .get(&hcs_id)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: hcs_id.clone(),
+                    reason: "no HCS entry for container".to_string(),
+                })?;
+            entry.log_buffer.clone()
+        };
+
+        // Snapshot the captured lines (already time-ordered by append order).
+        // HCS runs the image entrypoint inside the compute system with no
+        // host-side pipe, so the capturable signal is the stdout/stderr of
+        // every `exec`'d process, which the `exec` path drains and appends
+        // here. This mirrors the file-backed log readers on the youki / WSL2
+        // runtimes (which read a per-container log file) — same contract, an
+        // in-memory ring instead of a file because the HCS pipes are streamed.
+        let mut entries = buffer.read().await.clone();
+
+        // `tail == 0` (and the `usize::MAX` passed by `get_logs`) means "all".
+        if tail > 0 && tail != usize::MAX && entries.len() > tail {
+            entries = entries.split_off(entries.len() - tail);
+        }
+        Ok(entries)
     }
 
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
-        use zlayer_hcs::process::ComputeProcess;
+        use zlayer_hcs::process::CapturedProcess;
 
         if cmd.is_empty() {
             return Err(AgentError::InvalidSpec(
@@ -3831,13 +4092,19 @@ impl Runtime for HcsRuntime {
             ));
         }
         let hcs_id = Self::hcs_id(id);
-        let containers = self.containers.read().await;
-        let entry = containers
-            .get(&hcs_id)
-            .ok_or_else(|| AgentError::NotFound {
-                container: hcs_id.clone(),
-                reason: "no HCS entry for container".to_string(),
-            })?;
+        let (system_handle, log_buffer) = {
+            let containers = self.containers.read().await;
+            let entry = containers
+                .get(&hcs_id)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: hcs_id.clone(),
+                    reason: "no HCS entry for container".to_string(),
+                })?;
+            // `entry.system.raw()` returns `SendHandle<HCS_SYSTEM>` so the
+            // handle can cross into the blocking thread below. See
+            // `zlayer_hcs::handle::SendHandle`.
+            (entry.system.raw(), entry.log_buffer.clone())
+        };
 
         let command_line = cmd.join(" ");
         let params = ProcessParameters {
@@ -3852,28 +4119,61 @@ impl Runtime for HcsRuntime {
             user: None,
         };
 
-        // `entry.system.raw()` already returns `SendHandle<HCS_SYSTEM>` (the
-        // `ComputeSystem::raw()` accessor wraps the inner handle at the
-        // source so the returned `ComputeProcess::spawn` future remains
-        // `Send` across the enclosing `async fn exec`). See
-        // `zlayer_hcs::handle::SendHandle`.
-        let system_handle = entry.system.raw();
-        let process = ComputeProcess::spawn(system_handle, &params)
-            .await
-            .map_err(|e| AgentError::Internal(format!("HcsCreateProcess: {e}")))?;
+        // Create the process AND capture its stdout/stderr pipe read-ends, then
+        // drain them to EOF — all on a blocking thread, because the pipe
+        // `HANDLE`s are `!Send` and `ReadFile` blocks until the child exits.
+        // The blocking closure returns the (Send) `ComputeProcess` plus the
+        // drained output; we then poll the authoritative exit code in async.
+        let (process, stdout, stderr) = tokio::task::spawn_blocking(move || {
+            let captured = CapturedProcess::create_capturing_blocking(system_handle, &params)?;
+            Ok::<_, zlayer_hcs::error::HcsError>(captured.drain_with_process())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("exec spawn_blocking join: {e}")))?
+        .map_err(|e| AgentError::Internal(format!("HcsCreateProcess/capture: {e}")))?;
 
-        // Poll process properties until it has an exit code. The heavy
-        // stdio-pipe plumbing (tokio-side reads of the HCS pipes) is a
-        // follow-up; for now we synthesize empty stdout/stderr and only
-        // surface the final exit code so callers relying on exec for
-        // health checks still work.
+        // Append the captured output to the container's log buffer so
+        // `container_logs` / `get_logs` surface real, non-empty lines. The
+        // init/image entrypoint runs inside the compute system (no host pipe),
+        // so exec output is the host-capturable signal — mirroring the
+        // file-backed log readers on the youki / WSL2 runtimes.
+        {
+            let now = chrono::Utc::now();
+            let source = LogSource::Container(id.to_string());
+            let mut buf = log_buffer.write().await;
+            for line in stdout.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+            for line in stderr.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+        }
+
+        // The pipes drained at EOF, which means the child closed its write-ends
+        // — i.e. it has exited. Read the authoritative exit code from HCS. A
+        // bounded poll covers the small window where the process record is not
+        // yet finalized after the pipes close.
         for _ in 0..600 {
             let raw_props = process
                 .properties(r#"{"PropertyTypes":["ProcessStatus"]}"#)
                 .await
                 .map_err(|e| AgentError::Internal(format!("HcsGetProcessProperties: {e}")))?;
             if let Some(code) = extract_process_exit_code(&raw_props) {
-                return Ok((code, String::new(), String::new()));
+                return Ok((code, stdout, stderr));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
