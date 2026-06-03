@@ -2511,6 +2511,27 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
         });
     }
 
+    // windows-debug + ZLAYER_GCS_KD=1: open the kernel DbgPrint filter wide
+    // (`Session Manager\Debug Print Filter\DEFAULT = 0xFFFFFFFF`) so all kernel
+    // `DbgPrintEx` output streams to the attached `kd` over the COM1 transport
+    // (user-mode `OutputDebugString` from svchost/SCM reaches kd regardless).
+    // Lets the KD capture show why `mpssvc`/`netsetupsvc` fail to reach Running.
+    #[cfg(feature = "windows-debug")]
+    if std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1") {
+        values.push(RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Control\Session Manager\Debug Print Filter".to_string(),
+            }),
+            name: "DEFAULT".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 0x7FFFFFFF (max positive i32): verbose DbgPrint across components
+            // without signed-serialization ambiguity of a full 0xFFFFFFFF.
+            d_word_value: Some(0x7FFF_FFFF),
+            ..Default::default()
+        });
+    }
+
     // windows-debug: append WER LocalDumps for vmcomputeagent.exe, pointing
     // its full-crash `DumpFolder` at the guest-local scratch path
     // `C:\zlayer-dbg`. WER auto-creates the folder; the dump persists on the
