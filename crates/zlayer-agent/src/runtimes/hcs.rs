@@ -1494,35 +1494,46 @@ impl HcsRuntime {
             "Hyper-V step 2: HcsCreateComputeSystem (UVM)"
         );
         step_log!("2: HcsCreateComputeSystem (UVM) uvm_system_id={uvm_system_id}");
-        // windows-debug + ZLAYER_GCS_BOOTLOG=1: enable kernel boot logging on the
-        // UVM's boot config so the guest writes `\Windows\ntbtlog.txt` (the
-        // driver-load log) onto the scratch. Read it offline after a never-dial
-        // run (stock deps) to see which boot/system driver fails to load —
-        // cascading to `mpssvc`/`netsetupsvc` and blocking the SCM-gated `gcs`.
-        // The `{default}` Windows Boot Loader lives in the BCD on the read-only
-        // "os" VSMB source dir; it is host-writable before HcsCreate. Best-effort.
+        // windows-debug diagnostics that require offline edits to the UVM's BCD
+        // (the `{default}` Windows Boot Loader). The BCD lives on the read-only
+        // "os" VSMB source dir but is host-writable before HcsCreate.
+        //   * ZLAYER_GCS_BOOTLOG=1 → `bootlog Yes`: kernel writes
+        //     `\Windows\ntbtlog.txt` (driver-load log) onto the scratch; read it
+        //     offline after a never-dial run.
+        //   * ZLAYER_GCS_KD=1 → `debug Yes`: enable the kernel debugger over the
+        //     COM1 transport the BCD `{dbgsettings}` already configures (Serial,
+        //     debugport 1, 115200). A `kd` client then attaches to the UVM's COM1
+        //     named pipe to observe the user-mode service-start failure
+        //     (`mpssvc`/`netsetupsvc`) that bootlog can't see.
+        // Both best-effort; failures are logged, not fatal.
         #[cfg(feature = "windows-debug")]
-        if std::env::var("ZLAYER_GCS_BOOTLOG").as_deref() == Ok("1") {
+        {
             let bcd = uvm.os_files_dir().join(r"EFI\Microsoft\Boot\BCD");
-            match std::process::Command::new("bcdedit")
+            let set_bcd = |opt: &str, val: &str| match std::process::Command::new("bcdedit")
                 .args([
                     "/store",
                     bcd.to_string_lossy().as_ref(),
                     "/set",
                     "{default}",
-                    "bootlog",
-                    "Yes",
+                    opt,
+                    val,
                 ])
                 .output()
             {
                 Ok(o) => step_log!(
-                    "2-bootlog (windows-debug): bcdedit bootlog Yes on {} status={} out={} err={}",
+                    "2-bcd (windows-debug): {opt} {val} on {} status={} out={} err={}",
                     bcd.display(),
                     o.status,
                     String::from_utf8_lossy(&o.stdout).trim(),
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => step_log!("2-bootlog (windows-debug): bcdedit spawn failed: {e}"),
+                Err(e) => step_log!("2-bcd (windows-debug): bcdedit {opt} spawn failed: {e}"),
+            };
+            if std::env::var("ZLAYER_GCS_BOOTLOG").as_deref() == Ok("1") {
+                set_bcd("bootlog", "Yes");
+            }
+            if std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1") {
+                set_bcd("debug", "Yes");
             }
         }
         let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
