@@ -153,13 +153,30 @@ the external bridge + the step-4b HvSocket `configureHvSocketForGCS` (we already
 `mpssvc`/`netsetupsvc` reach Running in the UVM. The final unknown is the RUNTIME reason they don't
 start (configs are healthy) — needs in-guest runtime visibility the write-nothing UVM denies:
 
-### REMAINING OPTIONS (ranked, post-UPDATE-3)
-1. **BCD `/bootlog` → `ntbtlog.txt`** (kernel-written to the scratch; now offline-mountable via the
-   reconnect-to-`C:\zlayer-uvm-reference\UtilityVM\SystemTemplateBase.vhdx` + Mount-DiskImage +
-   Add-PartitionAccessPath recipe proven this session). Run with STOCK deps; the boot driver log
-   shows whether `mpsdrv`/`nsiproxy`/`netvsc` (the drivers under `mpssvc`/`nsi`) fail to load,
-   cascading to the service-start failure. Moderate effort, partial signal (drivers, not svchost
-   services).
+### UPDATE 4 — BCD /bootlog DONE: boot is healthy, NOT a driver problem → user-mode service failure → KD next
+
+Wired BCD `/bootlog` (windows-debug + `ZLAYER_GCS_BOOTLOG=1`: offline `bcdedit /store
+<os_files>\EFI\Microsoft\Boot\BCD /set {default} bootlog Yes` before HcsCreate — committed). Ran
+with STOCK deps (never-dial), copied the scratch out, mounted it offline (reconnect-to-base +
+Mount-DiskImage + AssignDriveLetter), read `\Windows\ntbtlog.txt` (81 lines). RESULT: **the UVM
+boots completely healthy.** Every relevant driver LOADED: ntoskrnl/hal, `vmbus`, `NDIS`, `NETIO`,
+`hvsocket`, `winhv`, `storvsc`, `Ntfs`, `wcifs`/`UnionFS`/`bindflt`, `mrxsmb`/`mrxsmb20` (VSMB),
+`tcpip`, `fwpkclnt`, `wfplwfs`, `afd`, `tdx`, `nsiproxy`, `condrv`, **`mpsdrv`** (firewall driver),
+`HTTP.sys`, **`hvsocketcontrol`**, `tcpipreg`, `mqac`. Only `dxgkrnl.sys` (GPU) "did not load" —
+irrelevant (no GPU). `mpsdrv` loading means `mpssvc` engaged its driver; `condrv`+`hvsocketcontrol`
+(gcs's working deps) load fine. So the never-dial is **NOT a driver-load failure** — it's a
+**user-mode svchost SERVICE failure** (`mpssvc` and/or `netsetupsvc` don't reach Running) that
+bootlog cannot observe. The driver/network substrate those services need is fully present.
+
+The remaining diagnosis needs user-mode service-state visibility, which the write-nothing UVM only
+exposes via a kernel debugger. Conveniently the UVM's BCD already carries `{dbgsettings} debugtype
+Serial, debugport 1, baudrate 115200`, and `launch_e2e.ps1` already captures COM1 — so KD-over-COM
+is mostly pre-wired: set `{default} debug Yes` (same offline-bcdedit path as bootlog) and attach
+`kd`/`windbg` to the host COM1 pipe (or read non-interactive `DbgPrint` from the harness com log).
+
+### REMAINING OPTIONS (ranked, post-UPDATE-4)
+1. **DONE — BCD `/bootlog`**: boot healthy, not a driver problem (see UPDATE 4). The signal it gave:
+   look at user-mode services, not drivers.
 2. **Guest kernel debugger (KD)** — definitive: see which service is `START_PENDING` and why.
    Heaviest; COM/`Uefi.Console` previously broke boot.
 3. **Fix the servercore unpacker bug** (`HcsImportLayer 0x80004005`) to enable the substrate A/B

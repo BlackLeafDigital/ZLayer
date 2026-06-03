@@ -1494,6 +1494,37 @@ impl HcsRuntime {
             "Hyper-V step 2: HcsCreateComputeSystem (UVM)"
         );
         step_log!("2: HcsCreateComputeSystem (UVM) uvm_system_id={uvm_system_id}");
+        // windows-debug + ZLAYER_GCS_BOOTLOG=1: enable kernel boot logging on the
+        // UVM's boot config so the guest writes `\Windows\ntbtlog.txt` (the
+        // driver-load log) onto the scratch. Read it offline after a never-dial
+        // run (stock deps) to see which boot/system driver fails to load —
+        // cascading to `mpssvc`/`netsetupsvc` and blocking the SCM-gated `gcs`.
+        // The `{default}` Windows Boot Loader lives in the BCD on the read-only
+        // "os" VSMB source dir; it is host-writable before HcsCreate. Best-effort.
+        #[cfg(feature = "windows-debug")]
+        if std::env::var("ZLAYER_GCS_BOOTLOG").as_deref() == Ok("1") {
+            let bcd = uvm.os_files_dir().join(r"EFI\Microsoft\Boot\BCD");
+            match std::process::Command::new("bcdedit")
+                .args([
+                    "/store",
+                    bcd.to_string_lossy().as_ref(),
+                    "/set",
+                    "{default}",
+                    "bootlog",
+                    "Yes",
+                ])
+                .output()
+            {
+                Ok(o) => step_log!(
+                    "2-bootlog (windows-debug): bcdedit bootlog Yes on {} status={} out={} err={}",
+                    bcd.display(),
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => step_log!("2-bootlog (windows-debug): bcdedit spawn failed: {e}"),
+            }
+        }
         let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
