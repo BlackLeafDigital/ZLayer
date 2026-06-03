@@ -50,22 +50,70 @@ mid-dispatch** (not a protocol-decode rejection, which returns an HRESULT).
 - `ZLAYER_GCS_COLDSTART_DELAY_MS` diag knob (default 0).
 - Commits on `dev` (NOT pushed): `bf5c5b14` (dial fix), `da563a6f` (instrument+parity+compose), `6939b676` (host TZ).
 
-### REMAINING OPTIONS (all heavy — need a steer)
-1. **In-guest crash capture via a SCSI-attached writable VHD** (the one exfil channel HCS won't
-   reject like VSMB does). The guest OS onlines SCSI disks at boot independent of GCS; point WER
-   `LocalDumps` (or a guest svc dumping the Application/System event log) at it; read the VHD
-   offline host-side after the run. Captures the `vmcomputeagent` fault reason. Multi-iteration build.
-2. **Guest kernel debugger** (KD over the COM/named-pipe the harness already exposes). Heaviest;
-   the COM/`Uefi.Console` path previously broke UVM boot — needs care.
-3. **Escalate to hcsshim/Microsoft**: an EXTERNAL GCS host driving the Server 2025 inbox
-   `vmcomputeagent.exe` for WCOW may be an under-supported configuration; the flaky cold-start
-   crash could be a guest-side bug. Worth a minimal repro + issue.
-4. **Cheap remaining experiment** (low confidence): skip msg4 when `HvSocketConfigOnStartup:true`
-   (won't fix the msg2 deaths, only the msg4-class ones).
+### UPDATE 2 (same day) — guest captured its OWN error; on-disk exfil is a DEAD END; LEADING ROOT CAUSE = NIC-less UVM
 
-The disciplined read (confirmed by deep hcsshim research): STOP spraying byte-level changes —
-the bytes are correct. The fault is inside the guest; capturing it (option 1) is the only way
-forward without guesswork.
+**Captured the guest's structured error via the windows-debug bridge body-dump** (no VHDX
+needed): for our `ModifyServiceSettings`/`StartLogForwarding` RPC (wire type `0x10200101`) the
+inbox GCS returned
+`{"Result":-1070137077,"ErrorRecords":[{"Message":"Message Type 270532865 unknown (215 byte)",
+"ModuleName":"vmcomputeagent.exe","FileName":"onecore\\vm\\compute\\common\\bridge\\bridgeclient.cpp","Line":1170}]}`.
+So (a) this inbox GCS does NOT support log-forwarding (ModifyServiceSettings) — we now gate
+`StartLogForwarding` on a `ModifyServiceSettingsSupported` cap and skip it; (b) the guest
+returns `ErrorRecords` as a JSON **array** (our `ResponseBase.error_records` was `String` — now
+`serde_json::Value`); (c) crucially: the guest **handles unknown messages gracefully (error
+response, bridge survives)** but **closes with NO response on cold-start `Create`** → the Create
+HANDLER faults, not a decode rejection.
+
+**SCSI/VHDX offline exfil: built, works mechanically, but yields NOTHING.** On KEEP-failure we
+now terminate the UVM + copy the scratch `sandbox.vhdx` to `C:\zlayer-uvm-debug\` (+ eprintln a
+mount recipe). The scratch is a DIFFERENCING disk; reconnect its parent to the harness
+snapshotter's `C:\zlayer-uvm-reference\UtilityVM\SystemTemplateBase.vhdx` (`Set-VHD -ParentPath
+... -IgnoreIdMismatch`), `Mount-DiskImage -ReadOnly`, `Add-PartitionAccessPath -AssignDriveLetter`
+→ coherent `Windows\` filesystem mounts. BUT the **stripped UtilityVM writes NO on-disk
+diagnostics**: `Windows\System32\winevt\Logs` does not exist (no Event Log service), no WER
+`LocalDumps` output, no `.dmp`/`.evtx`/`.log`/`.etl` anywhere on the scratch. So the guest fault
+leaves zero forensic trace on disk — the on-disk exfil approach cannot capture it. The only
+guest signal is the GCS bridge `ErrorRecords` (and Create gives none — it just closes).
+
+**Full UVM-doc parity audit vs hcsshim `prepareConfigDoc`/`prepareCommonConfigDoc`: our doc
+MATCHES field-for-field.** Verified identical/benign: SCSI controller GUID
+(`df6d0690-79e5-55b6-a5ec-c1e2f77f580a` = `ScsiControllerGuids[0]`), VSMB "os" options +
+`DirectFileMappingInMB=1024`, Chipset/UEFI VmbFs boot (no UseUtc/Console/SecureBoot — correct),
+ComputeTopology (1024MB/2vCPU, MMIO/DeferredCommit default to 0 in hcsshim too), HvSocket
+(DefaultBind SD + logging ServiceTable `172dad59`, no ConnectSD — correct), schema 2.1,
+StopOnReset, ShouldTerminateOnLastHandleClosed. Correctly OMITTED (hcsshim also omits for
+non-confidential WCOW): GuestState/GuestStateFile, VirtualMachine.Version, RuntimeId. **The fault
+is NOT in the create JSON.** (Stale comment to fix: `windows/uvm.rs:304-318` claims we inject
+`VirtualMachine.RuntimeId`; we don't and shouldn't — no runtime impact.)
+
+**LEADING ROOT-CAUSE HYPOTHESIS (connects all evidence): the NIC-less UVM.** Our dial fix strips
+`mpssvc`/`netsetupsvc` from `gcs.DependOnService` so `gcs` starts + dials in a UVM with **no
+network adapter**. But the cold-start `Create` handler sets up the UVM as a **container host**,
+including network compartments (we set `gns EnableCompartmentNamespace=1`). That setup needs the
+network services running — which can't happen in a NIC-less UVM. So: never-dial (gcs blocked on
+net-svc deps) → strip deps → now dials → but the Create handler's network/compartment setup
+faults because the net stack isn't up. hcsshim's WCOW UVMs get networking; ours is NIC-less (the
+adapter-safety / Internal-network work governs *container* traffic off the physical NIC, but the
+UVM itself has no NIC). The ~25-30% flaky-survival rate fits a readiness/ordering race in that
+net setup.
+
+### REMAINING OPTIONS (ranked, post-investigation)
+1. **Give the UVM networking (Internal/NAT, OFF the physical NIC) — the likely real fix.** Add a
+   synthetic NetworkAdapter / HCN endpoint to the UVM so `mpssvc`/`netsetupsvc` reach Running and
+   the Create handler's compartment setup succeeds — then the `gcs.DependOnService` strip is no
+   longer needed. MUST respect the adapter-safety guarantee (0 external vSwitches, physical NICs
+   Up). This is a real new piece (UVM HCN networking), to be DESIGNED, not blind-edited. Best
+   confirmed first by option 2.
+2. **Guest kernel debugger (KD)** on `vmcomputeagent.exe` — the ONLY way to see the fault in a
+   write-nothing stripped UVM. Confirms whether the Create handler dies in network/compartment
+   setup (would validate option 1). Heaviest; COM/`Uefi.Console` previously broke boot — needs care.
+3. **Escalate to MS/hcsshim**: external host GCS driving the Server 2025 inbox `vmcomputeagent.exe`
+   for WCOW, cold-start Create critical-fails with bytes matching hcsshim. Minimal repro + issue.
+
+The disciplined read: byte-level changes are exhausted (bytes + UVM doc both match hcsshim). The
+fault is the guest Create handler, most likely network-setup in a NIC-less UVM. Next move is to
+DESIGN UVM Internal networking (option 1), ideally after a KD confirm (option 2) — not more
+byte edits.
 
 ---
 
