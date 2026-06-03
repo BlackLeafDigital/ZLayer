@@ -618,78 +618,95 @@ impl ServiceInstance {
                         .with_start_grace(start_grace)
                         .with_check_timeout(check_timeout);
 
-                    // Create health callback to update proxy backend health if proxy is configured
-                    // and we have an overlay IP for this container
-                    if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
-                        let proxy = Arc::clone(proxy);
-                        let service_name = self.service_name.clone();
-                        // Get the container's target port, using the runtime override if present.
-                        // On macOS sandbox, port_override gives each replica a unique port
-                        // so the proxy can distinguish backends sharing 127.0.0.1.
-                        let port = port_override.unwrap_or_else(|| {
-                            self.spec
-                                .endpoints
-                                .iter()
-                                .find(|ep| {
-                                    matches!(
-                                        ep.protocol,
-                                        Protocol::Http | Protocol::Https | Protocol::Websocket
-                                    )
-                                })
-                                .map_or(8080, zlayer_spec::EndpointSpec::target_port)
-                        });
-
-                        let backend_addr = SocketAddr::new(ip, port);
-
-                        // Register backend with load balancer so proxy can route to it.
-                        // This must happen before the health callback is created, because
-                        // update_backend_health only updates *existing* backends.
-                        proxy.add_backend(&self.service_name, backend_addr).await;
-
-                        let health_states_opt = self.health_states.clone();
-                        let svc_name_for_states = self.service_name.clone();
-
-                        let health_callback: HealthCallback =
-                            Arc::new(move |container_id: ContainerId, is_healthy: bool| {
-                                let proxy = Arc::clone(&proxy);
-                                let service_name = service_name.clone();
-                                tracing::info!(
-                                    container = %container_id,
-                                    service = %service_name,
-                                    backend = %backend_addr,
-                                    healthy = is_healthy,
-                                    "health status changed, updating proxy backend"
-                                );
-                                // Spawn a task to update the proxy (callback is sync, proxy update is async)
-                                tokio::spawn(async move {
-                                    proxy
-                                        .update_backend_health(
-                                            &service_name,
-                                            backend_addr,
-                                            is_healthy,
+                    // Build the optional proxy backend handle. This is only present
+                    // when both a proxy manager AND a reachable overlay IP exist; in
+                    // degraded-overlay / no-proxy deployments it stays None and the
+                    // callback below skips all proxy work while STILL bridging health
+                    // state back into ServiceManager.
+                    let proxy_backend: Option<(Arc<ProxyManager>, SocketAddr)> =
+                        if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
+                            let proxy = Arc::clone(proxy);
+                            // Get the container's target port, using the runtime override if
+                            // present. On macOS sandbox, port_override gives each replica a
+                            // unique port so the proxy can distinguish backends sharing
+                            // 127.0.0.1.
+                            let port = port_override.unwrap_or_else(|| {
+                                self.spec
+                                    .endpoints
+                                    .iter()
+                                    .find(|ep| {
+                                        matches!(
+                                            ep.protocol,
+                                            Protocol::Http | Protocol::Https | Protocol::Websocket
                                         )
-                                        .await;
-                                });
-                                // Bridge health state back to ServiceManager's health_states map
-                                if let Some(ref health_states) = health_states_opt {
-                                    let states = Arc::clone(health_states);
-                                    let svc = svc_name_for_states.clone();
-                                    tokio::spawn(async move {
-                                        let state = if is_healthy {
-                                            HealthState::Healthy
-                                        } else {
-                                            HealthState::Unhealthy {
-                                                failures: 0,
-                                                reason: "health check failed".into(),
-                                            }
-                                        };
-                                        states.write().await.insert(svc, state);
-                                    });
-                                }
+                                    })
+                                    .map_or(8080, zlayer_spec::EndpointSpec::target_port)
                             });
 
-                        monitor = monitor.with_callback(health_callback);
-                    }
+                            let backend_addr = SocketAddr::new(ip, port);
+
+                            // Register backend with load balancer so proxy can route to it.
+                            // This must happen before the health callback is created, because
+                            // update_backend_health only updates *existing* backends.
+                            proxy.add_backend(&self.service_name, backend_addr).await;
+
+                            Some((proxy, backend_addr))
+                        } else {
+                            None
+                        };
+
+                    // The health bridge is ALWAYS attached, independent of proxy/IP
+                    // availability. stabilization::wait_for_stabilization only treats a
+                    // service as ready when health_states[name] == Healthy, so this write
+                    // must happen even when the overlay is degraded and no proxy backend
+                    // exists — otherwise the service stays healthy=false forever and
+                    // stabilization times out.
+                    let health_states_opt = self.health_states.clone();
+                    let svc_name_for_states = self.service_name.clone();
+                    let svc_name_for_proxy = self.service_name.clone();
+                    let svc_name_for_log = self.service_name.clone();
+
+                    let health_callback: HealthCallback =
+                        Arc::new(move |container_id: ContainerId, is_healthy: bool| {
+                            tracing::info!(
+                                container = %container_id,
+                                service = %svc_name_for_log,
+                                healthy = is_healthy,
+                                has_proxy_backend = proxy_backend.is_some(),
+                                "health status changed"
+                            );
+
+                            // Always bridge health state back to ServiceManager's
+                            // health_states map (unconditional — no proxy/IP required).
+                            if let Some(ref health_states) = health_states_opt {
+                                let states = Arc::clone(health_states);
+                                let svc = svc_name_for_states.clone();
+                                tokio::spawn(async move {
+                                    let state = if is_healthy {
+                                        HealthState::Healthy
+                                    } else {
+                                        HealthState::Unhealthy {
+                                            failures: 0,
+                                            reason: "health check failed".into(),
+                                        }
+                                    };
+                                    states.write().await.insert(svc, state);
+                                });
+                            }
+
+                            // Update proxy backend health only when a proxy backend was
+                            // registered (proxy manager + reachable overlay IP present).
+                            if let Some((proxy, backend_addr)) = proxy_backend.clone() {
+                                let svc = svc_name_for_proxy.clone();
+                                tokio::spawn(async move {
+                                    proxy
+                                        .update_backend_health(&svc, backend_addr, is_healthy)
+                                        .await;
+                                });
+                            }
+                        });
+
+                    monitor = monitor.with_callback(health_callback);
 
                     monitor.start()
                 };
@@ -2933,6 +2950,71 @@ services:
             states_read.get("cache"),
             Some(HealthState::Unknown)
         ));
+    }
+
+    /// Regression test for the stabilization timeout that blocked the raft-e2e
+    /// `cluster_scaling` / `cluster_upgrade` suites.
+    ///
+    /// Previously the callback that bridges a container's health result into the
+    /// `ServiceManager` `health_states` map was only attached when BOTH a proxy
+    /// manager AND a reachable overlay IP existed. In degraded-overlay / no-proxy
+    /// deployments that `if let` was false, so `health_states` was never written,
+    /// the service stayed `healthy=false` forever, and stabilization timed out
+    /// even though the container was running and its health check passing.
+    ///
+    /// This test drives the real `scale_to` create path with:
+    ///   * NO `proxy_manager` (so `proxy_backend` resolves to None), and
+    ///   * a `Command { command: "true" }` health check (always passes host-side),
+    /// then asserts the shared `health_states` map receives `Healthy` for the
+    /// service — proving the bridge fires unconditionally.
+    #[tokio::test]
+    async fn test_health_states_bridge_fires_without_proxy() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+
+        // Service spec with a host-side command health check that always passes.
+        // Zero start-grace + a short interval keep the test fast.
+        let mut spec = mock_spec();
+        spec.health = zlayer_spec::HealthSpec {
+            start_grace: Some(Duration::from_millis(0)),
+            interval: Some(Duration::from_millis(50)),
+            timeout: Some(Duration::from_secs(5)),
+            retries: 1,
+            check: HealthCheck::Command {
+                command: "true".to_string(),
+            },
+        };
+
+        // Build a ServiceInstance with NO proxy_manager and NO overlay_manager,
+        // then wire in the shared health_states map exactly as ServiceManager does.
+        let mut instance =
+            ServiceInstance::new("web".to_string(), spec, Arc::clone(&runtime), None);
+        let health_states: Arc<RwLock<HashMap<String, HealthState>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        instance.set_health_states(Arc::clone(&health_states));
+
+        // Drive the real create path (no proxy, MockRuntime IP present but proxy
+        // absent => proxy_backend is None, hitting the previously-broken branch).
+        instance.scale_to(1).await.unwrap();
+
+        // Poll for the bridged Healthy state (the monitor checks asynchronously
+        // after its start grace). Bounded so a regression fails fast.
+        let mut bridged = false;
+        for _ in 0..100 {
+            if matches!(
+                health_states.read().await.get("web"),
+                Some(HealthState::Healthy)
+            ) {
+                bridged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            bridged,
+            "health_states must receive Healthy for the service even without a \
+             proxy or overlay IP; the bridge regressed and stabilization would time out"
+        );
     }
 
     // ==================== Job/Cron Integration Tests ====================

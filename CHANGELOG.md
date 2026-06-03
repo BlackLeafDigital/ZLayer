@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.4 - 2026-06-03
+
+### Fixed
+- raft e2e (agent, health bridge): `cluster_scaling` / `cluster_upgrade` still timed out at stabilization (`web: N/N replicas, healthy=false → 0/N ready`) even with the host-side `command: "true"` health check in place, because nothing bridged the check's result into `ServiceManager`. In `zlayer-agent`'s container-create path (`ServiceInstance::scale_to`), the `HealthMonitor` callback that writes the shared `health_states` map (which `stabilization::wait_for_stabilization` reads) was built **only inside** `if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip)`. In CI the container has no reachable `effective_ip` (degraded overlay) and there is no proxy, so the `if let` was false, no callback was attached, `health_states` was never written, and the service stayed `healthy=false` forever. Restructured so the `health_states` bridge callback is **always** attached to the monitor (`monitor.with_callback(...)` before `monitor.start()`), regardless of proxy/IP. The proxy-specific work (`add_backend` / `update_backend_health`) is now captured into an `Option<(Arc<ProxyManager>, SocketAddr)>` that stays `None` when no proxy + IP exist; the single callback always updates `health_states` and only touches the proxy when that Option is `Some`. Added a regression unit test (`test_health_states_bridge_fires_without_proxy`) that drives the real `scale_to` create path with no proxy_manager and a `Command { command: "true" }` health check, asserting `health_states` receives `Healthy`.
+
 ## 0.52.3 - 2026-06-02
 
 ### Added

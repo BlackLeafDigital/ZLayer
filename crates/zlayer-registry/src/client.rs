@@ -856,6 +856,52 @@ impl ImagePuller {
                 }
             }
         }
+
+        // Suffix-match fallback (§4.1): a locally-built/pushed image may be
+        // stored under a FULLER name than any canonical candidate form — e.g.
+        // `zarcrunner-executor:latest` stored as `…/library/zarcrunner-executor:latest`.
+        // For an unqualified input that missed every candidate, scan the local
+        // registry and match by final path segment (optionally under a
+        // `library/` namespace), so the daemon resolves the local image instead
+        // of falling through to a doomed Docker Hub pull.
+        if zlayer_types::image_str_is_unqualified(image) {
+            if let Some((want_name, want_ref)) =
+                local_image_ref_candidates(image).into_iter().next()
+            {
+                let want_leaf = want_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&want_name)
+                    .to_string();
+                if let Ok(stored) = registry.list_images().await {
+                    for s in stored {
+                        let s_leaf = s.rsplit('/').next().unwrap_or(&s);
+                        // Match the requested leaf either exactly, or as the
+                        // leaf of a stored namespaced name (`…/<leaf>` /
+                        // `…/library/<leaf>`). The tag must also resolve below,
+                        // which guards against a same-leaf-different-tag miss.
+                        if s_leaf != want_leaf {
+                            continue;
+                        }
+                        if let Ok(data) = registry.get_manifest(&s, &want_ref).await {
+                            if let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&data)
+                            {
+                                let digest = crate::cache::compute_digest(&data);
+                                tracing::debug!(
+                                    image = %image,
+                                    matched_name = %s,
+                                    reference = %want_ref,
+                                    digest = %digest,
+                                    "manifest found in local registry via unqualified suffix-match",
+                                );
+                                return Some((manifest, digest));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         None
     }
 

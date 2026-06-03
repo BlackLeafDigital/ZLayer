@@ -311,7 +311,16 @@ maybe_sudo "${ZLAYER_DEV_DATA_DIR}" mkdir -p \
     "${ZLAYER_DEV_DATA_DIR}/rootfs" \
     "${ZLAYER_DEV_DATA_DIR}/bundles" \
     "${ZLAYER_DEV_DATA_DIR}/cache" \
+    "${ZLAYER_DEV_DATA_DIR}/tmp" \
     "${ZLAYER_DEV_DATA_DIR}/volumes"
+# The secrets dir (and possibly other subdirs) may be left root-owned by a
+# prior root/system daemon install; `install -d -m 0750` then fails with
+# "Operation not permitted" for this non-root dev install because maybe_sudo
+# does NOT sudo for $HOME paths. Reclaim ownership first when we don't own it.
+if [ -d "${ZLAYER_DEV_DATA_DIR}/secrets" ] && [ ! -O "${ZLAYER_DEV_DATA_DIR}/secrets" ]; then
+    echo "Reclaiming ownership of ${ZLAYER_DEV_DATA_DIR}/secrets (was root-owned)..."
+    sudo chown -R "$(id -un)" "${ZLAYER_DEV_DATA_DIR}/secrets" || true
+fi
 maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0750 "${ZLAYER_DEV_DATA_DIR}/secrets"
 
 # --- Install service unit + daemon (opt-in) ---
@@ -351,8 +360,8 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
             # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
             # shellcheck disable=SC2086
             sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
-                "${GLOBAL_ARGS[@]}" \
-                daemon "${DAEMON_NAME_ARGS[@]}" \
+                ${GLOBAL_ARGS[@]+"${GLOBAL_ARGS[@]}"} \
+                daemon ${DAEMON_NAME_ARGS[@]+"${DAEMON_NAME_ARGS[@]}"} \
                 install ${DAEMON_INSTALL_FLAGS}
             ;;
         darwin)
@@ -361,8 +370,8 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
             # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
             # shellcheck disable=SC2086
             "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
-                "${GLOBAL_ARGS[@]}" \
-                daemon "${DAEMON_NAME_ARGS[@]}" \
+                ${GLOBAL_ARGS[@]+"${GLOBAL_ARGS[@]}"} \
+                daemon ${DAEMON_NAME_ARGS[@]+"${DAEMON_NAME_ARGS[@]}"} \
                 install ${DAEMON_INSTALL_FLAGS}
             ;;
     esac
