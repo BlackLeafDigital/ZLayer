@@ -1987,10 +1987,18 @@ impl ServiceManager {
         let _permit = self.scale_semaphore.acquire().await;
 
         let services = self.services.read().await;
-        let instance = services.get(name).ok_or_else(|| AgentError::NotFound {
-            container: name.to_string(),
-            reason: "service not found".to_string(),
-        })?;
+        let Some(instance) = services.get(name) else {
+            // Draining a service this node never hosted is a no-op (e.g. the
+            // leader fans out `count=0` to a node to drain it during a
+            // scale-down, but that node never ran the service).
+            if replicas == 0 {
+                return Ok(());
+            }
+            return Err(AgentError::NotFound {
+                container: name.to_string(),
+                reason: "service not found".to_string(),
+            });
+        };
 
         // Get current replica count before scaling
         let current_replicas = instance.replica_count().await as u32;

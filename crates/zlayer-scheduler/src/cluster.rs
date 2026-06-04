@@ -629,11 +629,23 @@ impl Cluster for RaftCluster {
             return self.dispatch_scale(self.node_id, req).await;
         }
 
-        // Fan out: one dispatch per node with a non-zero share. Each carries
-        // that node's count plus the spec, so a fresh worker can register the
-        // service before scaling. The leader's own share short-circuits to a
-        // local call inside `dispatch_scale`.
-        for (node_id, count) in per_node {
+        // Fan out to the UNION of (new placement winners) ∪ (nodes currently
+        // running the service) ∪ (self). A scale-DOWN must tell nodes that are
+        // no longer assigned to drain to 0 — dispatching only to the winners
+        // would leave the de-assigned nodes' replicas running. `count = 0` is a
+        // no-op on a node that doesn't host the service. Each request carries
+        // the spec so a fresh worker can register before scaling. The leader's
+        // own share short-circuits to a local call inside `dispatch_scale`.
+        let remote_states = self.fetch_remote_service_states(&req.service).await;
+        let mut targets: std::collections::BTreeSet<NodeId> = per_node.keys().copied().collect();
+        targets.insert(self.node_id);
+        for ns in &remote_states {
+            if ns.running > 0 {
+                targets.insert(ns.node_id);
+            }
+        }
+        for node_id in targets {
+            let count = per_node.get(&node_id).copied().unwrap_or(0);
             let mut node_req = InternalScaleRequest::new(&req.service, count);
             if let Some(spec) = req.spec.as_deref() {
                 node_req = node_req.with_spec(spec.clone());
