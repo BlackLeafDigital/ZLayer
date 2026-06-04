@@ -1219,6 +1219,55 @@ def _container_exec(
     )
 
 
+# Path of the redirected `serve` log inside each cluster-node container. The
+# daemon runs detached (`exec -d`), so its stdout is otherwise discarded; we
+# tee it to this file via a shell wrapper so failures can be diagnosed.
+_CONTAINER_SERVE_LOG = f"{_CONTAINER_DATA_DIR}/serve.log"
+
+
+def _container_serve_argv(api_port: int) -> list[str]:
+    """Argv to launch `zlayer serve` in a container with stdout+stderr
+    redirected to `_CONTAINER_SERVE_LOG` (so the detached daemon's logs are
+    recoverable for postmortem). `exec` replaces the shell so signals/kill
+    still reach the daemon."""
+    inner = (
+        f"exec {_CONTAINER_BIN} --data-dir {_CONTAINER_DATA_DIR} serve "
+        f"--bind 0.0.0.0:{api_port} --deployment-name {CLUSTER_DEPLOYMENT} "
+        f"> {_CONTAINER_SERVE_LOG} 2>&1"
+    )
+    return ["sh", "-c", inner]
+
+
+def _dump_cluster_daemon_logs(
+    runtime: str, names: list[str], *, grep: Optional[str] = None,
+) -> None:
+    """Dump each node's redirected `serve.log` to stderr for postmortem.
+
+    When `grep` is set, only matching lines are shown (plus a short tail);
+    otherwise the tail of each log is printed. Best-effort: never raises.
+    """
+    for idx, name in enumerate(names):
+        log(f"---- daemon log: node{idx + 1} ({name}) ----")
+        try:
+            if grep:
+                inner = (
+                    f"grep -E '{grep}' {_CONTAINER_SERVE_LOG} 2>/dev/null | tail -n 60; "
+                    f"echo '---- tail ----'; tail -n 40 {_CONTAINER_SERVE_LOG} 2>/dev/null"
+                )
+            else:
+                inner = f"tail -n 80 {_CONTAINER_SERVE_LOG} 2>/dev/null"
+            res = subprocess.run(
+                [runtime, "exec", name, "sh", "-c", inner],
+                check=False, capture_output=True, text=True,
+            )
+            sys.stderr.write(res.stdout or "(empty)\n")
+            if res.stderr:
+                sys.stderr.write(res.stderr)
+            sys.stderr.flush()
+        except Exception as exc:  # noqa: BLE001
+            log(f"  (failed to read daemon log for {name}: {exc!r})")
+
+
 def _container_stop(runtime: str, name: str) -> None:
     """Stop a container. Best-effort: log on failure, never raise.
 
@@ -1284,13 +1333,7 @@ def _bootstrap_3node_cluster_container(
     log(f"cluster(container): starting node1 serve on {ips[0]}:{CLUSTER_NODES[0]['api']}")
     _container_exec(
         runtime, names[0],
-        [
-            _CONTAINER_BIN,
-            "--data-dir", _CONTAINER_DATA_DIR,
-            "serve",
-            "--bind", f"0.0.0.0:{CLUSTER_NODES[0]['api']}",
-            "--deployment-name", CLUSTER_DEPLOYMENT,
-        ],
+        _container_serve_argv(CLUSTER_NODES[0]["api"]),
         detach=True,
     )
     if not _wait_http_ok(f"{api_endpoints[0]}/health/ready", 30):
@@ -1348,13 +1391,7 @@ def _bootstrap_3node_cluster_container(
         )
         _container_exec(
             runtime, names[i],
-            [
-                _CONTAINER_BIN,
-                "--data-dir", _CONTAINER_DATA_DIR,
-                "serve",
-                "--bind", f"0.0.0.0:{cfg['api']}",
-                "--deployment-name", CLUSTER_DEPLOYMENT,
-            ],
+            _container_serve_argv(cfg["api"]),
             detach=True,
         )
         if not _wait_http_ok(f"{api_endpoints[i]}/health/ready", 30):
@@ -1594,13 +1631,7 @@ def _bootstrap_3node_worker_tier_container(
         )
         _container_exec(
             runtime, names[i],
-            [
-                _CONTAINER_BIN,
-                "--data-dir", _CONTAINER_DATA_DIR,
-                "serve",
-                "--bind", f"0.0.0.0:{cfg['api']}",
-                "--deployment-name", CLUSTER_DEPLOYMENT,
-            ],
+            _container_serve_argv(cfg["api"]),
             detach=True,
         )
         if not _wait_http_ok(f"{api_endpoints[i]}/health/ready", 30):
@@ -2212,6 +2243,14 @@ def run_cluster_scaling_container(args: argparse.Namespace) -> int:
             f"cluster_scaling(container): FAIL — {e!r}",
             file=sys.stderr, flush=True,
         )
+        # Surface the per-node daemon decision (scale fan-out + placement) so
+        # the concentration bug is diagnosable from CI alone.
+        if names:
+            _dump_cluster_daemon_logs(
+                runtime, names,
+                grep="scale_distribute|scale_service|distributed scale|per_node|"
+                "placeable_nodes|orchestrate_deployment",
+            )
         return 1
     finally:
         _cleanup_cluster_container(runtime, names, network=network)
