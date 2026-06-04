@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.13 - 2026-06-04
+
+### Fixed
+- **macOS rootless daemon install: reinstall-over-running race.** `daemon install` ran
+  `launchctl bootout` then immediately `launchctl bootstrap` of the same label. `bootout` is
+  asynchronous, so bootstrapping before launchd finished tearing the old job down raced the teardown —
+  the job failed to stay loaded, surfacing as `Daemon failed to start within 45s / no job loaded`
+  (hit most often by `install-dev.sh --replace`, which boots out the running production daemon right
+  before reinstalling). Now waits (bounded) for the label to actually disappear before bootstrapping.
+
+### Changed
+- **macOS rootless install now uses the shared `zlayer` group when available.** The per-user
+  `gui/$uid` LaunchAgent previously emitted `GroupName=zlayer` only when installing as root. It now
+  emits it whenever the `zlayer` group exists **and** the installing user is a member (verified via
+  `id -Gn`) — using an existing group needs no admin; only *creating* it (`dseditgroup`) does. A
+  first-ever rootless install on a host that never provisioned the group still omits `GroupName` (so
+  `launchctl bootstrap` can't fail `EX_CONFIG`).
+
 ## 0.52.12 - 2026-06-04
 
 ### Added

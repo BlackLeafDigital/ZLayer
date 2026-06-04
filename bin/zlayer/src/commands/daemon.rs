@@ -1429,6 +1429,53 @@ fn launchd_failure_diagnosis(daemon_name: &str) -> Option<String> {
     }
 }
 
+/// True if the current user is a member of unix group `group` (so a `gui/$uid`
+/// `LaunchAgent` can set `GroupName=<group>` without `launchctl bootstrap`
+/// failing `EX_CONFIG`). Uses `id -Gn` (the effective + supplementary group
+/// names). Best-effort: any failure returns false (skip the group).
+#[cfg(target_os = "macos")]
+fn macos_self_in_group(group: &str) -> bool {
+    std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == group)
+        })
+}
+
+/// Poll until `launchctl print {target}/{label}` reports the job is gone.
+///
+/// `launchctl bootout` is **asynchronous**: it returns before launchd has
+/// finished tearing the job down. Bootstrapping the same label too soon races
+/// that teardown and either fails (`Bootstrap failed: 5: Input/output error`)
+/// or loads a job that immediately vanishes — surfacing as the
+/// "no job loaded after install" symptom (especially on `--replace`, which
+/// boots out a running daemon right before reinstalling). Bounded; returns once
+/// the label is absent or `timeout` elapses.
+#[cfg(target_os = "macos")]
+async fn wait_for_label_unloaded(target: &str, label: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let present = tokio::process::Command::new("launchctl")
+            .args(["print", &format!("{target}/{label}")])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !present {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[allow(
     clippy::too_many_lines,
@@ -1597,12 +1644,17 @@ async fn install(
 
     let label = plist_label(daemon_name);
 
-    // `GroupName` is only valid when the daemon runs in the system domain as
-    // root: it references the shared `zlayer` unix group, which is created by
-    // `dseditgroup` (root-only). A per-user `gui/$uid` Agent has no such shared
-    // group, and emitting `GroupName=zlayer` makes `launchctl bootstrap` fail
-    // EX_CONFIG (78). So include it ONLY when installing as root.
-    let group_name_xml = if is_root {
+    // Emit `GroupName=zlayer` (the shared unix group used for socket
+    // access-control across instances) whenever it is USABLE without elevation:
+    //   - a root/system install (it owns the group), OR
+    //   - a rootless install where the `zlayer` group already exists AND this
+    //     user is a member of it.
+    // Using an existing group you belong to needs no admin; only *creating* the
+    // group does (`dseditgroup`, root-only). Emitting `GroupName` for a group
+    // that doesn't exist, or that the user isn't in, makes `launchctl bootstrap`
+    // fail EX_CONFIG (78) — so we skip it only in that case (a first-ever
+    // rootless install on a host where the group was never provisioned).
+    let group_name_xml = if is_root || macos_self_in_group("zlayer") {
         "    <key>GroupName</key>\n    \
          <!-- Why: unix group is shared across instances (access-control), not the daemon identity. -->\n    \
          <string>zlayer</string>\n"
@@ -1662,6 +1714,13 @@ async fn install(
         .args(["unload", &path_str])
         .output()
         .await;
+
+    // `bootout` above is asynchronous — wait for the old job to actually
+    // disappear from the domain before bootstrapping the same label, otherwise
+    // the bootstrap races the teardown and the job fails to stay loaded (the
+    // "Daemon failed to start within 45s / no job loaded" symptom, hit most
+    // often by `--replace` reinstalling over a running daemon).
+    wait_for_label_unloaded(&target, &label, std::time::Duration::from_secs(8)).await;
 
     // Write plist
     std::fs::write(&path, &plist)
