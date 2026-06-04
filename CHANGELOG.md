@@ -37,8 +37,17 @@ All notable changes to this project will be documented in this file.
   (`place_service_replicas` over live raft node state, honoring `Spread`/`Pack`/`Pin`) and fans out
   one scale per node with its share (each carrying the spec; the leader's own share short-circuits to a
   local call). `SingleNodeCluster`/`StaticCluster`/`WorkerTierCluster` keep their dispatch-to-self
-  behavior via the trait's default. This was the last `raft-e2e` ship-blocker (the companion
-  `cluster_upgrade` spec-propagation fix already passes in CI).
+  behavior via the trait's default. (The companion `cluster_upgrade` spec-propagation fix already
+  passes in CI.)
+- **`affinity: spread` now distributes zero-footprint services across uneven nodes.** The bin-packer
+  (`select_for_bin_packing`) ranked nodes by **utilization first** and used same-service anti-affinity
+  only as a tie-break *when utilizations were exactly equal*. But a spread service typically requests no
+  CPU/mem (e.g. the nginx e2e fixture), so per-replica reservation never moves utilization; and real
+  cluster nodes sit at slightly different utilization, so the tie-break never fired and all replicas
+  piled onto the single lowest-utilization node. For `Spread`, same-service replica count is now the
+  **primary** ranking key (utilization is the secondary tie-break), so replicas fan out across distinct
+  nodes regardless of resource requests or uneven load. `Pack`/`Pin` ordering is unchanged. This was the
+  actual `cluster_scaling` ship-blocker (the fan-out above is necessary but was insufficient alone).
 
 ## 0.52.11 - 2026-06-04
 

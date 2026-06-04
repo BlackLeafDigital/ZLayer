@@ -161,6 +161,42 @@ fn shared_mode_pack_affinity_concentrates() {
     );
 }
 
+/// Regression for the `cluster_scaling` e2e: a Spread service that requests
+/// ZERO cpu/mem (like the nginx fixture), on nodes at DIFFERENT utilization
+/// (like a real cluster). Utilization never moves between replicas (zero
+/// request) and is never tied (uneven), so ranking by utilization-first — with
+/// anti-affinity only as a tie-break — would pile all three replicas onto the
+/// single emptiest node. Spread must still distribute across all nodes.
+#[test]
+fn spread_affinity_distributes_with_zero_request_and_uneven_utilization() {
+    let mut n1 = make_node(1, 8.0, 16 * GIB);
+    let mut n2 = make_node(2, 8.0, 16 * GIB);
+    let mut n3 = make_node(3, 8.0, 16 * GIB);
+    // Distinct utilizations so there is never a utilization tie.
+    n1.resources.cpu_used = 1.0; // 12.5%
+    n2.resources.cpu_used = 2.0; // 25.0%
+    n3.resources.cpu_used = 3.0; // 37.5%
+    let mut nodes = vec![n1, n2, n3];
+    let mut placements = PlacementState::new();
+    // `None` cpu request => zero per-replica footprint, exactly like the
+    // nginx-v1-3r.yaml fixture (no `resources:` block).
+    let spec = make_spec_affinity(None, GroupAffinity::Spread);
+
+    let decisions = place_service_replicas("web", &spec, 3, &mut nodes, &mut placements);
+
+    assert!(
+        decisions.iter().all(PlacementDecision::is_success),
+        "every replica should be placed, got: {decisions:?}"
+    );
+    let distinct: HashSet<u64> = decisions.iter().filter_map(|d| d.node_id).collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "spread must distribute across all 3 nodes despite zero requests and \
+         uneven utilization, got {distinct:?}"
+    );
+}
+
 /// Mirror of the leader fan-out in
 /// `RaftCluster::dispatch_scale_distributed`: place the replicas, then group
 /// the decisions into a `node_id -> count` map (one `dispatch_scale` call per

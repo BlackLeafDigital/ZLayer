@@ -1208,53 +1208,54 @@ fn select_for_bin_packing<'a>(
                             .partial_cmp(&b_combined)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     } else {
-                        // Non-GPU: rank by utilization, direction set by
-                        // affinity. `max_by` selects the "greater" element.
-                        //  - Spread: prefer the EMPTIER node (worst-fit) so
-                        //    replicas fan out — compare `b vs a` so lower
-                        //    utilization wins.
-                        //  - Pack/Pin: prefer the FULLER node that still fits
-                        //    (best-fit) so a node is filled before the next is
-                        //    touched — compare `a vs b` so higher util wins.
-                        // (CPU/memory requests are consumed per placement in
-                        // `place_service_replicas`, so utilization actually
-                        // moves between replicas in a single pass.)
-                        let util_cmp = match affinity {
-                            GroupAffinity::Spread => b.utilization().partial_cmp(&a.utilization()),
-                            GroupAffinity::Pack | GroupAffinity::Pin(_) => {
-                                a.utilization().partial_cmp(&b.utilization())
+                        // Non-GPU ranking. `max_by` selects the "greater" node.
+                        match affinity {
+                            GroupAffinity::Spread => {
+                                // Same-service anti-affinity is the PRIMARY key,
+                                // NOT a tiebreak under utilization. A spread spec
+                                // commonly requests zero CPU/mem, so the
+                                // per-replica reservation in
+                                // `place_service_replicas` never moves
+                                // utilization; and on a real cluster nodes sit at
+                                // slightly different utilization, so utilizations
+                                // are essentially never exactly equal. If we
+                                // ranked by utilization first (tiebreaking on
+                                // replica count), every replica would pile onto
+                                // the single lowest-utilization node and the
+                                // anti-affinity tiebreak would never fire. So
+                                // rank by FEWER replicas of THIS service first,
+                                // breaking ties with the emptier node. (`b vs a`
+                                // everywhere so the lower value wins under
+                                // `max_by`.)
+                                let a_count = placements.service_count_on_node(a.id, service_name);
+                                let b_count = placements.service_count_on_node(b.id, service_name);
+                                match b_count.cmp(&a_count) {
+                                    std::cmp::Ordering::Equal => b
+                                        .utilization()
+                                        .partial_cmp(&a.utilization())
+                                        .unwrap_or(std::cmp::Ordering::Equal),
+                                    other => other,
+                                }
                             }
-                        }
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                        match util_cmp {
-                            std::cmp::Ordering::Equal => {
-                                // Utilization ties (e.g. all nodes at 0% on a
-                                // fresh deploy, or zero-resource specs). Break
-                                // the tie by container counts.
-                                match affinity {
-                                    GroupAffinity::Spread => {
-                                        // Same-service anti-affinity: prefer the
-                                        // node hosting FEWER replicas of THIS
-                                        // service so replicas land on distinct
-                                        // nodes. `b vs a` so the lower count wins.
-                                        let a_count =
-                                            placements.service_count_on_node(a.id, service_name);
-                                        let b_count =
-                                            placements.service_count_on_node(b.id, service_name);
-                                        b_count.cmp(&a_count)
-                                    }
-                                    GroupAffinity::Pack | GroupAffinity::Pin(_) => {
-                                        // Concentrate: prefer the node that
-                                        // already has MORE containers, packing
-                                        // consecutive replicas together (the
-                                        // historical shared-mode default).
+                            GroupAffinity::Pack | GroupAffinity::Pin(_) => {
+                                // Concentrate (best-fit): prefer the FULLER node
+                                // that still fits, so one node is filled before
+                                // the next is touched. Break utilization ties
+                                // (e.g. zero-resource specs) by packing onto the
+                                // node that already holds MORE containers.
+                                let util_cmp = a
+                                    .utilization()
+                                    .partial_cmp(&b.utilization())
+                                    .unwrap_or(std::cmp::Ordering::Equal);
+                                match util_cmp {
+                                    std::cmp::Ordering::Equal => {
                                         let a_count = placements.container_count(a.id);
                                         let b_count = placements.container_count(b.id);
                                         a_count.cmp(&b_count)
                                     }
+                                    other => other,
                                 }
                             }
-                            other => other,
                         }
                     }
                 }
