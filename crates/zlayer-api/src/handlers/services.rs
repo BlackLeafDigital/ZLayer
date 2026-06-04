@@ -411,22 +411,27 @@ pub async fn list_containers(
         )));
     }
 
-    // Get container info from service manager if available
+    // Aggregate containers cluster-wide: a service's replicas may be
+    // distributed across nodes, so the leader fans out to every node holding
+    // the service and tags each container with its real host node_id (not the
+    // responding daemon's local id). Single-node clusters return just the local
+    // view.
     let mut containers = Vec::new();
     if let Some(ref manager) = state.service_manager {
         let manager = manager.read().await;
-        let infos = manager.get_service_container_infos(&service).await;
-        for info in infos {
-            containers.push(ContainerSummary {
-                id: info.id.to_string(),
-                service: info.id.service.clone(),
-                replica: info.id.replica,
-                image: info.image,
-                state: info.state,
-                pid: info.pid,
-                overlay_ip: info.overlay_ip,
-                node_id: state.local_node_id.clone(),
-            });
+        for ns in manager.cluster_service_states(&service).await {
+            for c in ns.containers {
+                containers.push(ContainerSummary {
+                    id: c.id,
+                    service: c.service,
+                    replica: c.replica,
+                    image: c.image,
+                    state: c.state,
+                    pid: c.pid,
+                    overlay_ip: c.overlay_ip,
+                    node_id: Some(c.node_id.to_string()),
+                });
+            }
         }
     }
 

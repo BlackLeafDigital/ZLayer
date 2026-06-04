@@ -202,6 +202,20 @@ pub trait Cluster: Send + Sync {
         let target = self.node_id();
         self.dispatch_scale(target, req).await
     }
+
+    /// Fetch every **other** node's local view of `service` (running count,
+    /// health, containers) so the leader can aggregate cluster-wide state for a
+    /// service whose replicas are distributed across nodes. The local node's own
+    /// view is added by the caller.
+    ///
+    /// Default: no remotes (single-node and non-distributing clusters report
+    /// only their local state).
+    async fn fetch_remote_service_states(
+        &self,
+        _service: &str,
+    ) -> Vec<zlayer_types::cluster::NodeServiceState> {
+        Vec::new()
+    }
 }
 
 /// Build a single-node [`placement::NodeState`] from an OS string (the only
@@ -627,6 +641,67 @@ impl Cluster for RaftCluster {
             self.dispatch_scale(node_id, node_req).await?;
         }
         Ok(())
+    }
+
+    /// GET each other Ready raft node's `/api/v1/internal/services/{svc}/state`
+    /// and collect their local views, so the leader can report replicas placed
+    /// on remote nodes (distributed scaling). Unreachable / non-200 peers are
+    /// logged and skipped — a partial view is better than failing the listing.
+    async fn fetch_remote_service_states(
+        &self,
+        service: &str,
+    ) -> Vec<zlayer_types::cluster::NodeServiceState> {
+        let state = self.raft.read_state().await;
+        let mut out = Vec::new();
+        for (id, info) in &state.nodes {
+            if *id == self.node_id || info.status != "ready" {
+                continue;
+            }
+            let host = if info.advertise_addr.is_empty() {
+                info.address.split(':').next().unwrap_or("127.0.0.1")
+            } else {
+                info.advertise_addr.as_str()
+            };
+            let port = if info.api_port > 0 {
+                info.api_port
+            } else {
+                3669
+            };
+            let url = format!("http://{host}:{port}/api/v1/internal/services/{service}/state");
+            match self
+                .http_client
+                .get(&url)
+                .header("X-ZLayer-Internal-Token", &self.internal_token)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<zlayer_types::cluster::NodeServiceState>().await {
+                        Ok(ns) => out.push(ns),
+                        Err(e) => tracing::warn!(
+                            node_id = *id,
+                            service,
+                            error = %e,
+                            "failed to parse remote service state"
+                        ),
+                    }
+                }
+                Ok(resp) => tracing::warn!(
+                    node_id = *id,
+                    service,
+                    status = %resp.status(),
+                    "remote service-state query returned non-success"
+                ),
+                Err(e) => tracing::warn!(
+                    node_id = *id,
+                    service,
+                    error = %e,
+                    "remote service-state query failed"
+                ),
+            }
+        }
+        out
     }
 }
 
@@ -1209,6 +1284,18 @@ impl Cluster for WorkerTierCluster {
             // Worker-side nodes don't make placement decisions; the control
             // plane does. Surface "no placement" so the caller forwards.
             WorkerTierMode::Worker { .. } => Ok(None),
+        }
+    }
+
+    async fn fetch_remote_service_states(
+        &self,
+        service: &str,
+    ) -> Vec<zlayer_types::cluster::NodeServiceState> {
+        match &self.mode {
+            WorkerTierMode::Server { inner, .. } => {
+                inner.fetch_remote_service_states(service).await
+            }
+            WorkerTierMode::Worker { .. } => Vec::new(),
         }
     }
 }

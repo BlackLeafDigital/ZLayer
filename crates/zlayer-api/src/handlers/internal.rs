@@ -669,6 +669,24 @@ pub async fn get_replicas_internal(
     }))
 }
 
+/// This node's **local** view of `service` (running count, health, containers),
+/// for cluster-wide aggregation. The leader GETs this from every node and rolls
+/// the results up so distributed-service replicas are visible in deployment
+/// status / stabilization and `ps`.
+///
+/// # Errors
+/// Infallible in practice (an unknown service yields an empty/zero state), but
+/// returns [`Result`] to match the handler signature and the internal-auth
+/// extractor's failure path.
+pub async fn service_state_internal(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+    axum::extract::Path(service): axum::extract::Path<String>,
+) -> Result<Json<zlayer_types::cluster::NodeServiceState>> {
+    let manager = state.service_manager.read().await;
+    Ok(Json(manager.local_service_state(&service).await))
+}
+
 /// Add a `WireGuard` peer to the local overlay transport.
 ///
 /// Called by the cluster leader after a new node joins, so existing nodes

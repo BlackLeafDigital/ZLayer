@@ -2361,6 +2361,68 @@ impl ServiceManager {
         }
     }
 
+    /// This node's **local** view of `service` (running replica count, health,
+    /// containers), used for cluster-wide aggregation. Served by the internal
+    /// `/api/v1/internal/services/{svc}/state` endpoint and used as the local
+    /// part of [`Self::cluster_service_states`].
+    pub async fn local_service_state(
+        &self,
+        service: &str,
+    ) -> zlayer_types::cluster::NodeServiceState {
+        use zlayer_types::cluster::{ClusterContainerSummary, NodeServiceState};
+        let node_id = self.cluster.as_ref().map_or(0, |c| c.node_id());
+        let infos = self.get_service_container_infos(service).await;
+        #[allow(clippy::cast_possible_truncation)]
+        let running = infos
+            .iter()
+            .filter(|i| i.state.eq_ignore_ascii_case("running"))
+            .count() as u32;
+        // A node running 0 replicas is trivially healthy (it can't drag the
+        // cluster-wide aggregate). Otherwise require a Healthy health state.
+        let healthy = if running == 0 {
+            true
+        } else {
+            let states = self.health_states();
+            let guard = states.read().await;
+            matches!(guard.get(service), Some(HealthState::Healthy))
+        };
+        let containers = infos
+            .into_iter()
+            .map(|i| ClusterContainerSummary {
+                node_id,
+                id: i.id.to_string(),
+                service: i.id.service.clone(),
+                replica: i.id.replica,
+                image: i.image,
+                state: i.state,
+                pid: i.pid,
+                overlay_ip: i.overlay_ip,
+            })
+            .collect();
+        NodeServiceState {
+            node_id,
+            running,
+            healthy,
+            containers,
+        }
+    }
+
+    /// Cluster-wide per-node states for `service`: this node's local view plus
+    /// every other node's (fetched via the cluster handle's
+    /// `fetch_remote_service_states`). When not clustered, returns just the
+    /// local view. This is the source of truth for distributed-service replica
+    /// counts, health, and the `ps` container listing on the leader.
+    pub async fn cluster_service_states(
+        &self,
+        service: &str,
+    ) -> Vec<zlayer_types::cluster::NodeServiceState> {
+        let mut states = vec![self.local_service_state(service).await];
+        if let Some(cluster) = &self.cluster {
+            states.extend(cluster.fetch_remote_service_states(service).await);
+        }
+        states
+    }
+
     /// Execute a command inside a running container for a service
     ///
     /// Picks a specific replica if provided, otherwise uses the first available container.

@@ -214,6 +214,49 @@ pub struct RaftPeer {
     pub api_addr: SocketAddr,
 }
 
+/// One container's summary for cluster-wide listing/aggregation, tagged with the
+/// node it runs on. Wire type shared by the agent (builds the local view), the
+/// scheduler's `Cluster` fan-out, and the API
+/// (`GET /internal/services/{svc}/state` + `list_containers`), so the leader can
+/// report replicas placed on remote nodes (distributed scaling).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterContainerSummary {
+    /// Raft id of the node this container runs on.
+    pub node_id: u64,
+    /// Full container id (`service-replica`).
+    pub id: String,
+    /// Service name.
+    pub service: String,
+    /// Replica index.
+    pub replica: u32,
+    /// Image reference.
+    pub image: String,
+    /// Lowercased lifecycle state (e.g. `"running"`).
+    pub state: String,
+    /// Process id, when running.
+    pub pid: Option<u32>,
+    /// Overlay IP, when assigned.
+    pub overlay_ip: Option<String>,
+}
+
+/// A single node's view of one service: how many replicas it runs **locally**,
+/// whether they're healthy there, and their containers. The leader aggregates
+/// one of these per node (its own local view + remote views fetched via the
+/// `Cluster` fan-out) to compute cluster-wide replica count, health, and the
+/// `ps` container listing for distributed services.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeServiceState {
+    /// Raft id of the reporting node.
+    pub node_id: u64,
+    /// Replicas of the service running on this node.
+    pub running: u32,
+    /// Whether this node's replicas of the service are healthy (trivially true
+    /// when the node runs none).
+    pub healthy: bool,
+    /// This node's containers for the service.
+    pub containers: Vec<ClusterContainerSummary>,
+}
+
 /// A static-cluster peer's identity, reachability, and labels.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -645,6 +645,13 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             "/replicas/{service}",
             get(handlers::internal::get_replicas_internal),
         )
+        // This node's local view of a service (running count, health,
+        // containers) — the leader fans out to every node and aggregates these
+        // for cluster-wide replica counts, health, and `ps` listing.
+        .route(
+            "/services/{service}/state",
+            get(handlers::internal::service_state_internal),
+        )
         .route("/add-peer", post(handlers::internal::add_peer_internal))
         .route(
             "/remove-peer",

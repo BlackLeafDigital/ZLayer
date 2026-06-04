@@ -148,7 +148,14 @@ impl DeploymentState {
 
             let (running, health) = if let Some(ref mgr_lock) = self.service_manager {
                 let mgr = mgr_lock.read().await;
-                let running = mgr.service_replica_count(name).await.unwrap_or(0) as u32;
+                // Cluster-wide: a service's replicas may be on remote nodes.
+                #[allow(clippy::cast_possible_truncation)]
+                let running: u32 = mgr
+                    .cluster_service_states(name)
+                    .await
+                    .iter()
+                    .map(|s| s.running)
+                    .sum();
 
                 let health_states = mgr.health_states();
                 let states = health_states.read().await;
