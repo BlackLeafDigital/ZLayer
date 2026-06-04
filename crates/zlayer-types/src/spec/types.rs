@@ -1154,6 +1154,20 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
 
+    /// Placement affinity for this service's replicas when the service is NOT
+    /// composed of `replica_groups` (each group carries its own affinity).
+    ///
+    /// `None` (the default) preserves historical shared-mode behavior:
+    /// bin-pack / concentrate consecutive replicas onto the fewest nodes that
+    /// fit. Set to `spread` for same-service anti-affinity (replicas land on
+    /// distinct nodes for higher availability), `pack` to concentrate
+    /// explicitly, or `pin` to bind all replicas to one node.
+    ///
+    /// Note: capacity always wins — a replica that does not fit on a node is
+    /// placed elsewhere regardless of affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<GroupAffinity>,
+
     /// Target platform for this service. When `None` (default), the service is
     /// eligible to run on any agent regardless of OS/architecture. When `Some`,
     /// the scheduler will only place replicas on agents whose platform matches.
@@ -1380,6 +1394,8 @@ struct ServiceSpecCompat {
     #[serde(default)]
     node_selector: Option<NodeSelector>,
     #[serde(default)]
+    affinity: Option<GroupAffinity>,
+    #[serde(default)]
     platform: Option<TargetPlatform>,
     #[serde(default)]
     service_type: ServiceType,
@@ -1476,6 +1492,7 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             privileged: c.privileged,
             node_mode: c.node_mode,
             node_selector: c.node_selector,
+            affinity: c.affinity,
             platform: c.platform,
             service_type: c.service_type,
             wasm: c.wasm,

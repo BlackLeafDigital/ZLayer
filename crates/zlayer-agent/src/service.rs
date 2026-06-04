@@ -1600,9 +1600,19 @@ impl ServiceManager {
                 if let Some(instance) = services.get_mut(&name) {
                     // Update existing service. We need to:
                     //   1. Update the in-memory spec (so future scale-ups use the new image).
-                    //   2. Honour the effective pull policy. For Never/IfNotPresent (after
-                    //      effective resolution) we noop. For Always/Newer we pull, compare
-                    //      digests, and trigger a rolling recreate when drift is observed.
+                    //   2. Recreate the local replicas when the image actually changed —
+                    //      either a different image *reference* (e.g. tag bump
+                    //      1.28 -> 1.29), which is a new image regardless of pull
+                    //      policy, or, under Always/Newer, observed *digest* drift on
+                    //      the same reference.
+                    // The recreate is LOCAL (`scale_service_local`): `upsert_service`
+                    // runs on whichever node owns the replicas (the leader for its
+                    // own share, each worker via the `/internal/scale` handler). Using
+                    // the cluster-routed `scale_service` here would bounce a worker's
+                    // recreate back to the leader and re-enter dispatch. Cluster-wide
+                    // distribution is the caller's job (orchestrate_deployment + the
+                    // scale dispatch that carries this spec to every node).
+                    let image_changed = instance.spec.image.name != spec.image.name;
                     instance.spec = spec.clone();
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
@@ -1614,14 +1624,22 @@ impl ServiceManager {
                         u32::try_from(instance.replica_count().await).unwrap_or(u32::MAX);
                     drop(services); // Release write lock before pull / scale (which take their own locks).
 
+                    // A changed image reference always recreates. Same-reference
+                    // refreshes are governed by pull policy + digest drift.
+                    let mut should_recreate = image_changed;
+                    let mut new_digest = old_digest.clone();
+
                     match effective {
                         PullPolicy::Never | PullPolicy::IfNotPresent => {
-                            // No pull, no recreate. Drift is silently ignored when the
-                            // user has explicitly opted into "do not refresh" semantics.
+                            // No proactive pull. If the reference changed we still
+                            // recreate below; the scale-up path pulls the (absent) new
+                            // image per IfNotPresent. A same-reference redeploy under
+                            // these policies is a genuine no-op.
                             tracing::debug!(
                                 service = %name,
                                 policy = ?effective,
-                                "service unchanged on re-deploy (effective pull policy skips refresh)"
+                                image_changed,
+                                "re-deploy under no-refresh pull policy"
                             );
                         }
                         PullPolicy::Always | PullPolicy::Newer => {
@@ -1629,7 +1647,7 @@ impl ServiceManager {
                             // We need a read guard to keep the instance alive while
                             // calling its &self method.
                             let services_ro = self.services.read().await;
-                            let new_digest = if let Some(inst) = services_ro.get(&name) {
+                            new_digest = if let Some(inst) = services_ro.get(&name) {
                                 inst.pull_and_refresh_digest().await?
                             } else {
                                 // The service vanished between our write-lock release
@@ -1643,45 +1661,47 @@ impl ServiceManager {
                             };
                             drop(services_ro);
 
-                            // Decide whether to recreate. Always forces a recreate.
-                            // Newer recreates only when the digest actually changed.
-                            // When digests are unknown (runtime doesn't expose them),
-                            // we can't observe drift safely under Newer, so no-op.
-                            let should_recreate = match effective {
-                                PullPolicy::Always => true,
-                                PullPolicy::Newer => match (&old_digest, &new_digest) {
-                                    (Some(old), Some(new)) => old != new,
+                            // Always forces a recreate. Newer recreates on digest
+                            // drift. When digests are unknown (runtime doesn't expose
+                            // them), we can't observe drift safely under Newer, so the
+                            // reference check above is the only trigger.
+                            should_recreate = should_recreate
+                                || match effective {
+                                    PullPolicy::Always => true,
+                                    PullPolicy::Newer => match (&old_digest, &new_digest) {
+                                        (Some(old), Some(new)) => old != new,
+                                        _ => false,
+                                    },
                                     _ => false,
-                                },
-                                _ => false,
-                            };
-
-                            if should_recreate && current_replicas > 0 {
-                                tracing::info!(
-                                    service = %name,
-                                    policy = ?effective,
-                                    old_digest = ?old_digest,
-                                    new_digest = ?new_digest,
-                                    replicas = current_replicas,
-                                    "image drift detected; performing rolling recreate"
-                                );
-                                self.scale_service(&name, 0).await?;
-                                self.scale_service(&name, current_replicas).await?;
-                                tracing::info!(
-                                    service = %name,
-                                    new_digest = ?new_digest,
-                                    "service recreated with refreshed image"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    service = %name,
-                                    policy = ?effective,
-                                    old_digest = ?old_digest,
-                                    new_digest = ?new_digest,
-                                    "service up to date; no recreate required"
-                                );
-                            }
+                                };
                         }
+                    }
+
+                    if should_recreate && current_replicas > 0 {
+                        tracing::info!(
+                            service = %name,
+                            policy = ?effective,
+                            image_changed,
+                            old_digest = ?old_digest,
+                            new_digest = ?new_digest,
+                            replicas = current_replicas,
+                            "image changed; performing local rolling recreate"
+                        );
+                        self.scale_service_local(&name, 0).await?;
+                        self.scale_service_local(&name, current_replicas).await?;
+                        tracing::info!(
+                            service = %name,
+                            new_digest = ?new_digest,
+                            "service recreated with refreshed image"
+                        );
+                    } else {
+                        tracing::debug!(
+                            service = %name,
+                            policy = ?effective,
+                            old_digest = ?old_digest,
+                            new_digest = ?new_digest,
+                            "service up to date; no recreate required"
+                        );
                     }
                     return Ok(());
                 }
@@ -1875,11 +1895,30 @@ impl ServiceManager {
     pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
         use zlayer_scheduler::cluster::InternalScaleRequest;
 
+        // Attach the current spec so every receiving node can register/update
+        // the service before scaling. This is what propagates an image change
+        // to worker containers and lets a fresh worker run a replica it has
+        // never seen. `None` if the service isn't registered locally (the
+        // receiver then falls back to its own cached spec).
+        let spec = self
+            .services
+            .read()
+            .await
+            .get(name)
+            .map(|inst| inst.spec.clone());
+        let build_req = |replicas: u32| {
+            let req = InternalScaleRequest::new(name, replicas);
+            match spec.clone() {
+                Some(s) => req.with_spec(s),
+                None => req,
+            }
+        };
+
         if let Some(cluster) = &self.cluster {
             if !cluster.is_leader().await {
                 // Follower: forward to the leader and let it dispatch.
                 return cluster
-                    .forward_scale(InternalScaleRequest::new(name, replicas))
+                    .forward_scale(build_req(replicas))
                     .await
                     .map_err(|e| AgentError::CreateFailed {
                         id: name.to_string(),
@@ -1898,7 +1937,7 @@ impl ServiceManager {
             // local. The full scheduler-driven fan-out wires up once
             // `Scheduler::scale_service_distributed` is exposed.
             return cluster
-                .dispatch_scale(cluster.node_id(), InternalScaleRequest::new(name, replicas))
+                .dispatch_scale(cluster.node_id(), build_req(replicas))
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: name.to_string(),
@@ -2666,6 +2705,56 @@ mod tests {
             .get_service_container_infos("missing")
             .await
             .is_empty());
+    }
+
+    /// Bug 2 (`cluster_upgrade`): a changed image *reference* (tag bump) under
+    /// `if_not_present` must still recreate the local replicas. Previously the
+    /// recreate only fired on digest drift under `Always`/`Newer`, so a tag
+    /// change was silently ignored and containers stayed on the old image.
+    #[tokio::test]
+    async fn upsert_recreates_local_replicas_on_image_reference_change() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let manager = ServiceManager::new(runtime);
+
+        // Deploy v1 with the e2e's pull policy (if_not_present) and scale up.
+        let mut spec = mock_spec();
+        spec.image.name = "docker.io/library/nginx:1.28-alpine".parse().unwrap();
+        spec.image.pull_policy = zlayer_spec::PullPolicy::IfNotPresent;
+        Box::pin(manager.upsert_service("web".to_string(), spec.clone()))
+            .await
+            .unwrap();
+        manager.scale_service_local("web", 2).await.unwrap();
+
+        let v1: Vec<String> = manager
+            .get_service_container_infos("web")
+            .await
+            .into_iter()
+            .map(|i| i.image)
+            .collect();
+        assert_eq!(v1.len(), 2);
+        assert!(
+            v1.iter().all(|img| img.contains("1.28")),
+            "expected v1 images, got {v1:?}"
+        );
+
+        // Upgrade to v2 under the SAME if_not_present policy.
+        let mut spec_v2 = spec;
+        spec_v2.image.name = "docker.io/library/nginx:1.29-alpine".parse().unwrap();
+        Box::pin(manager.upsert_service("web".to_string(), spec_v2))
+            .await
+            .unwrap();
+
+        let v2: Vec<String> = manager
+            .get_service_container_infos("web")
+            .await
+            .into_iter()
+            .map(|i| i.image)
+            .collect();
+        assert_eq!(v2.len(), 2, "replica count preserved across upgrade");
+        assert!(
+            v2.iter().all(|img| img.contains("1.29")),
+            "containers must be recreated on the new image, got {v2:?}"
+        );
     }
 
     fn mock_spec() -> ServiceSpec {

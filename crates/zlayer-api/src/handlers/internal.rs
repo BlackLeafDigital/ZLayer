@@ -539,6 +539,22 @@ pub async fn scale_service_internal(
     // Get the service manager
     let manager = state.service_manager.read().await;
 
+    // If the leader propagated the spec, register/update the service locally
+    // before scaling. This (a) registers a service this node has never seen so
+    // the scale below doesn't 404 (lets spread replicas land on a fresh
+    // worker), and (b) detects an image change and rolls the local replicas
+    // (the cluster_upgrade path). `upsert_service` recreates via
+    // `scale_service_local`, so this stays at the bottom of the dispatch
+    // recursion — no re-entry into the cluster.
+    if let Some(spec) = request.spec {
+        if let Err(e) = Box::pin(manager.upsert_service(request.service.clone(), *spec)).await {
+            return Err(ApiError::Internal(format!(
+                "Failed to register service '{}': {e}",
+                request.service
+            )));
+        }
+    }
+
     // Check if service exists
     if manager
         .service_replica_count(&request.service)

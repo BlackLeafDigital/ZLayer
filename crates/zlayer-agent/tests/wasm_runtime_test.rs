@@ -241,6 +241,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: zlayer_spec::ServiceType::Standard,
         wasm: None,
         logs: None,

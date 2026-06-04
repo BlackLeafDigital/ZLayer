@@ -29,6 +29,11 @@ services:
         type: command
         command: "true"
 
+    # Same-service anti-affinity: distribute replicas across distinct cluster
+    # nodes (matches nginx-v1-3r so the cluster_upgrade rollout keeps the same
+    # spread). Without this the default Pack affinity concentrates replicas.
+    affinity: spread
+
     scale:
       mode: fixed
       replicas: 3

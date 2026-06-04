@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.7 - 2026-06-03
+
+### Added
+- **Opt-in placement affinity** (`ServiceSpec.affinity`: `spread` | `pack` | `pin`). Wires up the
+  previously-dead `GroupAffinity` so a service can control how its replicas spread across cluster
+  nodes. `spread` = same-service anti-affinity (each replica prefers a node hosting fewer of this
+  service's replicas, so they land on distinct nodes for HA); `pack` (the default, preserving
+  historical shared-mode behavior) bin-packs replicas onto the fewest nodes; `pin("id=N")` /
+  `pin("label=value")` binds all replicas to one node. Also honoured per-`ReplicaGroup`
+  (`place_service_with_groups` no longer ignores `group.affinity`).
+
+### Fixed
+- **`cluster_scaling`: replicas no longer pile onto a single node.** The shared-mode scheduler never
+  consumed a replica's CPU/memory during a placement pass, so `node_has_capacity` always saw the
+  original (empty) usage and the tie-break concentrated every replica on one node. Placement now
+  reserves CPU/memory per replica as it goes (`reserve_node_resources`, restored on a gang rollback),
+  so capacity-driven spread works — a replica that doesn't fit on a node is placed elsewhere — and the
+  new `affinity: spread` distributes same-service replicas across distinct nodes even when they would
+  fit together.
+- **`cluster_upgrade`: a rolling image change now reaches worker containers.** Two gaps: (1)
+  `ServiceManager::upsert_service` only recreated containers on *digest* drift under `Always`/`Newer`,
+  so a tag bump (e.g. `nginx:1.28-alpine` → `1.29-alpine`) under `if_not_present` was silently ignored;
+  it now recreates on any change to the image *reference*, doing so locally via `scale_service_local`
+  to avoid bouncing a worker's recreate back through the leader. (2) Leader→worker scale dispatch
+  carried only `{service, replicas}`, so workers scaled from a stale cached spec; `InternalScaleRequest`
+  now carries the full `ServiceSpec` and the `/internal/scale` handler `upsert`s it before scaling —
+  which both propagates image changes and lets a never-seen-before service run on a fresh worker (so
+  spread replicas can actually start on peer nodes).
+
 ## 0.52.6 - 2026-06-03
 
 ### Fixed

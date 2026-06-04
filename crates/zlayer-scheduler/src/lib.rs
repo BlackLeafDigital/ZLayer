@@ -340,13 +340,15 @@ impl Scheduler {
                 "Sending scaling request to agent"
             );
 
+            let mut scale_req = zlayer_types::cluster::InternalScaleRequest::new(service, replicas);
+            if let Some(spec) = self.service_specs.read().await.get(service).cloned() {
+                scale_req = scale_req.with_spec(spec);
+            }
             let response = self
                 .http_client
                 .post(&url)
                 .header("X-ZLayer-Internal-Token", &self.internal_token)
-                .json(&zlayer_types::cluster::InternalScaleRequest::new(
-                    service, replicas,
-                ))
+                .json(&scale_req)
                 .send()
                 .await
                 .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
@@ -475,6 +477,12 @@ impl Scheduler {
         // the placement algorithm will filter by `NodeState.os` automatically.
         let mut rerouted_nodes: Vec<(NodeId, String, String)> = Vec::new();
 
+        // Propagate the current spec to every target node so it can register
+        // (first deploy on a fresh worker) or update (image change → rolling
+        // recreate) the service before scaling. Without this, workers scale
+        // from a stale cached spec and never pick up a new image.
+        let dispatch_spec = self.service_specs.read().await.get(service_name).cloned();
+
         for (node_id, containers) in node_assignments {
             let Some(node_info) = cluster.nodes.get(node_id) else {
                 warn!(
@@ -519,14 +527,16 @@ impl Scheduler {
             // Skip HTTP calls during tests
             #[cfg(not(feature = "test-skip-http"))]
             {
+                let mut scale_req =
+                    zlayer_types::cluster::InternalScaleRequest::new(service_name, replicas);
+                if let Some(spec) = dispatch_spec.clone() {
+                    scale_req = scale_req.with_spec(spec);
+                }
                 match self
                     .http_client
                     .post(&url)
                     .header("X-ZLayer-Internal-Token", &self.internal_token)
-                    .json(&zlayer_types::cluster::InternalScaleRequest::new(
-                        service_name,
-                        replicas,
-                    ))
+                    .json(&scale_req)
                     .timeout(Duration::from_secs(30))
                     .send()
                     .await

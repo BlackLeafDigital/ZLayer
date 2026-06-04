@@ -99,6 +99,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,

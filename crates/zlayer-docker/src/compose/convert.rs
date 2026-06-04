@@ -154,6 +154,7 @@ fn convert_service(
         privileged: svc.privileged,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,

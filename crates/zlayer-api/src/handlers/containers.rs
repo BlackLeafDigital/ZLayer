@@ -826,6 +826,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         privileged: request.privileged.unwrap_or(false),
         node_mode: NodeMode::default(),
         node_selector: request.node_selector.clone(),
+        affinity: None,
         platform: request.platform.clone(),
         service_type: ServiceType::default(),
         wasm: None,

@@ -29,6 +29,11 @@ services:
         type: command
         command: "true"
 
+    # Same-service anti-affinity: distribute replicas across distinct cluster
+    # nodes (the cluster_scaling suite asserts >= 2 distinct node_ids). Without
+    # this the default Pack affinity bin-packs all replicas onto one node.
+    affinity: spread
+
     scale:
       mode: fixed
       replicas: 3

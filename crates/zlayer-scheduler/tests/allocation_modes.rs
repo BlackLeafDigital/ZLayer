@@ -17,7 +17,8 @@ use zlayer_scheduler::{
     place_service_replicas, NodeResources, NodeState, PlacementDecision, PlacementState,
 };
 use zlayer_spec::{
-    HealthCheck, HealthSpec, ImageSpec, NodeMode, PullPolicy, ResourcesSpec, ServiceSpec,
+    GroupAffinity, HealthCheck, HealthSpec, ImageSpec, NodeMode, PullPolicy, ResourcesSpec,
+    ServiceSpec,
 };
 
 /// Build a healthy node with the requested CPU/memory capacity.
@@ -50,6 +51,15 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
         },
         node_mode,
         ..ServiceSpec::default()
+    }
+}
+
+/// Like [`make_spec`] but in `Shared` mode with an explicit placement
+/// `affinity` (the opt-in spread/pack/pin knob).
+fn make_spec_affinity(cpu_per_replica: Option<f64>, affinity: GroupAffinity) -> ServiceSpec {
+    ServiceSpec {
+        affinity: Some(affinity),
+        ..make_spec(NodeMode::Shared, cpu_per_replica)
     }
 }
 
@@ -98,6 +108,115 @@ fn shared_mode_bin_packs_onto_one_node_when_possible() {
          got {} distinct nodes: {:?}",
         distinct_nodes.len(),
         distinct_nodes
+    );
+}
+
+/// Opt-in `affinity: spread` on a `Shared`-mode service must distribute
+/// same-service replicas across distinct nodes even though they would all fit
+/// on one node (the `cluster_scaling` e2e contract). This is same-service
+/// anti-affinity, not a `node_mode` change.
+#[test]
+fn shared_mode_spread_affinity_distributes_across_nodes() {
+    let mut nodes = vec![
+        make_node(1, 10.0, 16 * GIB),
+        make_node(2, 10.0, 16 * GIB),
+        make_node(3, 10.0, 16 * GIB),
+    ];
+    let mut placements = PlacementState::new();
+    let spec = make_spec_affinity(Some(1.0), GroupAffinity::Spread);
+
+    let decisions = place_service_replicas("web", &spec, 3, &mut nodes, &mut placements);
+
+    assert_eq!(decisions.len(), 3);
+    assert!(
+        decisions.iter().all(PlacementDecision::is_success),
+        "every replica should be placed, got: {decisions:?}"
+    );
+    let distinct: HashSet<u64> = decisions.iter().filter_map(|d| d.node_id).collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "spread affinity must put 3 replicas on 3 distinct nodes, got {distinct:?}"
+    );
+}
+
+/// Explicit `affinity: pack` preserves the historical concentrate behavior
+/// (same as the default `None`): replicas collapse onto few nodes.
+#[test]
+fn shared_mode_pack_affinity_concentrates() {
+    let mut nodes = vec![
+        make_node(1, 10.0, 16 * GIB),
+        make_node(2, 10.0, 16 * GIB),
+        make_node(3, 10.0, 16 * GIB),
+    ];
+    let mut placements = PlacementState::new();
+    let spec = make_spec_affinity(Some(1.0), GroupAffinity::Pack);
+
+    let decisions = place_service_replicas("web", &spec, 3, &mut nodes, &mut placements);
+
+    let distinct: HashSet<u64> = decisions.iter().filter_map(|d| d.node_id).collect();
+    assert!(
+        distinct.len() <= 2,
+        "pack affinity should concentrate, got {distinct:?}"
+    );
+}
+
+/// Capacity always wins over affinity: a `pack`/default service whose
+/// per-replica CPU footprint exceeds a single node's headroom is forced to
+/// spread, mirroring the user's "2 CPU replica on a 2-CPU node" example —
+/// the second replica cannot co-locate and must land elsewhere.
+#[test]
+fn capacity_forces_spread_even_when_packing() {
+    // Two nodes, 2 vCPU each. A replica needs 2 vCPU, so only one fits per node.
+    let mut nodes = vec![make_node(1, 2.0, 6 * GIB), make_node(2, 2.0, 6 * GIB)];
+    let mut placements = PlacementState::new();
+    // Default affinity (None => Pack/concentrate). Capacity must still spread.
+    let spec = make_spec(NodeMode::Shared, Some(2.0));
+
+    let decisions = place_service_replicas("heavy", &spec, 2, &mut nodes, &mut placements);
+
+    assert_eq!(decisions.len(), 2);
+    assert!(
+        decisions.iter().all(PlacementDecision::is_success),
+        "both replicas should place across the two nodes, got: {decisions:?}"
+    );
+    let distinct: HashSet<u64> = decisions.iter().filter_map(|d| d.node_id).collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "a 2-vCPU replica cannot share a 2-vCPU node; placement must spread, got {distinct:?}"
+    );
+
+    // A third replica has nowhere to fit — both nodes are full.
+    let third = place_service_replicas("heavy", &spec, 1, &mut nodes, &mut placements);
+    assert!(
+        !third[0].is_success(),
+        "no capacity remains for a third 2-vCPU replica, expected pending: {third:?}"
+    );
+}
+
+/// `affinity: pin("id=2")` binds every replica to the named node.
+#[test]
+fn shared_mode_pin_affinity_binds_to_node() {
+    let mut nodes = vec![
+        make_node(1, 10.0, 16 * GIB),
+        make_node(2, 10.0, 16 * GIB),
+        make_node(3, 10.0, 16 * GIB),
+    ];
+    let mut placements = PlacementState::new();
+    let spec = make_spec_affinity(Some(1.0), GroupAffinity::Pin("id=2".to_string()));
+
+    let decisions = place_service_replicas("pinned", &spec, 3, &mut nodes, &mut placements);
+
+    assert_eq!(decisions.len(), 3);
+    assert!(
+        decisions.iter().all(PlacementDecision::is_success),
+        "every replica should be placed on the pinned node, got: {decisions:?}"
+    );
+    assert!(
+        decisions.iter().all(|d| d.node_id == Some(2)),
+        "pin must bind all replicas to node 2, got {:?}",
+        decisions.iter().map(|d| d.node_id).collect::<Vec<_>>()
     );
 }
 

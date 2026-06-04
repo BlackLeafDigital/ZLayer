@@ -329,6 +329,16 @@ pub struct InternalScaleRequest {
     /// Phase 2 once `replica_groups` + cross-node identity ship.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignments: Vec<ScaleAssignment>,
+    /// The full service spec, propagated so the receiving node can register
+    /// (or update) the service before scaling. This is what lets a fresh
+    /// worker run a replica it has never seen, and what makes an image change
+    /// on the leader reach worker containers: the receiver `upsert`s this spec,
+    /// which detects digest drift and rolls the local replicas. `None` on the
+    /// legacy `{service, replicas}` shape (receiver falls back to its cached
+    /// spec). Boxed because `ServiceSpec` is large.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub spec: Option<Box<crate::spec::types::ServiceSpec>>,
 }
 
 /// One role-group entry within an [`InternalScaleRequest`]. Phase 2 ships
@@ -350,7 +360,17 @@ impl InternalScaleRequest {
             service: service.into(),
             replicas,
             assignments: Vec::new(),
+            spec: None,
         }
+    }
+
+    /// Attach the full service spec so the receiver can register/update the
+    /// service before scaling (image-change propagation + first-deploy on a
+    /// fresh worker). Chainable onto [`Self::new`] / [`Self::with_assignments`].
+    #[must_use]
+    pub fn with_spec(mut self, spec: crate::spec::types::ServiceSpec) -> Self {
+        self.spec = Some(Box::new(spec));
+        self
     }
 
     /// Build a Phase-2 request with explicit per-role assignments.
@@ -368,6 +388,7 @@ impl InternalScaleRequest {
             service: service.into(),
             replicas,
             assignments,
+            spec: None,
         }
     }
 }
@@ -380,6 +401,30 @@ mod tests {
     fn default_is_single_node() {
         let cfg = ClusterMode::default();
         assert_eq!(cfg, ClusterMode::SingleNode);
+    }
+
+    #[test]
+    fn scale_request_legacy_shape_has_no_spec() {
+        // A legacy `{service, replicas}` body (no `spec`) must still
+        // deserialize, with `spec` defaulting to None.
+        let req: InternalScaleRequest =
+            serde_json::from_str(r#"{"service":"web","replicas":3}"#).unwrap();
+        assert_eq!(req.service, "web");
+        assert_eq!(req.replicas, 3);
+        assert!(req.spec.is_none());
+        assert!(req.assignments.is_empty());
+    }
+
+    #[test]
+    fn scale_request_with_spec_roundtrips() {
+        let spec = crate::spec::types::ServiceSpec::default();
+        let req = InternalScaleRequest::new("web", 3).with_spec(spec);
+        assert!(req.spec.is_some());
+        let json = serde_json::to_string(&req).unwrap();
+        let back: InternalScaleRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.service, "web");
+        assert_eq!(back.replicas, 3);
+        assert!(back.spec.is_some(), "spec must survive the round-trip");
     }
 
     #[test]
