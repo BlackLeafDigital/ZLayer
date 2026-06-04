@@ -274,6 +274,54 @@ fn generate_join_token_data(
     ))
 }
 
+/// Persist `ClusterMode::Raft` to `<data_dir>/cluster_mode.yaml`.
+///
+/// Without this, `zlayer serve` reads no `cluster_mode.yaml` and falls back to
+/// `ClusterMode::SingleNode` → a `SingleNodeCluster` scale-dispatch handle whose
+/// `dispatch_scale_distributed` runs every scale **locally** (all replicas pile
+/// onto the leader). A raft-bootstrapped/joined node must record that it is part
+/// of a Raft cluster so `serve` builds a distributing `RaftCluster` handle.
+///
+/// `serve`'s `ClusterMode::Raft` arm rebuilds the live peer set from the raft
+/// coordinator and ignores the persisted `peers`, so a self-only peer list (or
+/// an empty one when the advertise address can't be parsed as `host:port`) is
+/// correct and sufficient.
+async fn persist_cluster_mode_raft(
+    data_dir: impl AsRef<Path>,
+    node_id: u64,
+    advertise_addr: impl AsRef<str>,
+    api_port: u16,
+    raft_port: u16,
+) -> Result<()> {
+    use zlayer_types::cluster::{ClusterMode, RaftPeer};
+
+    let data_dir = data_dir.as_ref();
+    let advertise_addr = advertise_addr.as_ref();
+
+    let peers = match (
+        format!("{advertise_addr}:{raft_port}").parse(),
+        format!("{advertise_addr}:{api_port}").parse(),
+    ) {
+        (Ok(raft_addr), Ok(api_addr)) => vec![RaftPeer {
+            id: node_id,
+            raft_addr,
+            api_addr,
+        }],
+        // advertise_addr isn't a literal IP (e.g. a hostname); serve rebuilds
+        // peers from live raft, so an empty list is harmless.
+        _ => Vec::new(),
+    };
+
+    let mode = ClusterMode::Raft { node_id, peers };
+    let yaml = serde_yaml::to_string(&mode).context("serialize ClusterMode::Raft")?;
+    let path = data_dir.join("cluster_mode.yaml");
+    tokio::fs::write(&path, yaml)
+        .await
+        .with_context(|| format!("write {}", path.display()))?;
+    info!(path = %path.display(), node_id, "persisted ClusterMode::Raft");
+    Ok(())
+}
+
 /// Parse a join token
 ///
 /// Accepts both the Wave-3+ signed envelope (`SignedClusterJoinToken`,
@@ -1101,6 +1149,19 @@ pub(crate) async fn handle_node_init(
         .context("Failed to bootstrap Raft cluster")?;
     info!("Raft cluster bootstrapped");
 
+    // Record that this node runs a Raft cluster so `serve` builds a
+    // distributing `RaftCluster` scale-dispatch handle (not the default
+    // `SingleNodeCluster`, which scales every replica locally on the leader).
+    persist_cluster_mode_raft(
+        &data_dir,
+        raft_node_id,
+        &advertise_addr,
+        api_port,
+        raft_port,
+    )
+    .await
+    .context("Failed to persist ClusterMode::Raft")?;
+
     // Register the leader node in the Raft state machine. See the Unix body for
     // the background on why we register with placeholder overlay metadata that
     // the daemon later overwrites from the persisted bootstrap state.
@@ -1320,6 +1381,19 @@ pub(crate) async fn handle_node_init(
         .await
         .context("Failed to bootstrap Raft cluster")?;
     info!("Raft cluster bootstrapped");
+
+    // Record that this node runs a Raft cluster so `serve` builds a
+    // distributing `RaftCluster` scale-dispatch handle (not the default
+    // `SingleNodeCluster`, which scales every replica locally on the leader).
+    persist_cluster_mode_raft(
+        &data_dir,
+        raft_node_id,
+        &advertise_addr,
+        api_port,
+        raft_port,
+    )
+    .await
+    .context("Failed to persist ClusterMode::Raft")?;
 
     // Register the leader node in the Raft state machine with overlay metadata.
     // `handle_node_init` runs before the overlay bootstrap is persisted — the
@@ -1604,6 +1678,19 @@ pub(crate) async fn handle_node_join(
         overlay_ip = %join_response.overlay_ip,
         "Received join response"
     );
+
+    // Record Raft cluster membership so this joined node's `serve` builds a
+    // distributing `RaftCluster` handle rather than the default
+    // `SingleNodeCluster` (which would scale every replica locally).
+    persist_cluster_mode_raft(
+        &data_dir,
+        join_response.raft_node_id,
+        &advertise_addr,
+        api_port,
+        raft_port,
+    )
+    .await
+    .context("Failed to persist ClusterMode::Raft")?;
 
     // 8a. Persist the secrets join material returned by the leader so the
     //     daemon can pick it up on startup (Task #18). Three pieces are
@@ -2041,6 +2128,19 @@ pub(crate) async fn handle_node_join(
         overlay_ip = %join_response.overlay_ip,
         "Received join response"
     );
+
+    // Record Raft cluster membership so this joined node's `serve` builds a
+    // distributing `RaftCluster` handle rather than the default
+    // `SingleNodeCluster` (which would scale every replica locally).
+    persist_cluster_mode_raft(
+        &data_dir,
+        join_response.raft_node_id,
+        &advertise_addr,
+        api_port,
+        raft_port,
+    )
+    .await
+    .context("Failed to persist ClusterMode::Raft")?;
 
     // 6a. Persist the secrets join material returned by the leader so the
     //     daemon can pick it up on startup (Task #18). Three pieces are
