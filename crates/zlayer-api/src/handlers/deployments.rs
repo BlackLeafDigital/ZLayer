@@ -683,6 +683,13 @@ async fn orchestrate_deployment(
             );
 
             let mgr = mgr_lock.read().await;
+            tracing::info!(
+                target: "zlayer::scale_distribute",
+                deployment = %deployment_name,
+                service = %name,
+                target = target_replicas,
+                "orchestrate_deployment: invoking scale_service"
+            );
             if let Err(e) = mgr.scale_service(name, target_replicas).await {
                 let msg = format!("{name}: failed to scale to {target_replicas}: {e}");
                 warn!(

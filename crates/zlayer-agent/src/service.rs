@@ -1895,6 +1895,14 @@ impl ServiceManager {
     pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
         use zlayer_scheduler::cluster::InternalScaleRequest;
 
+        tracing::info!(
+            target: "zlayer::scale_distribute",
+            service = name,
+            replicas,
+            has_cluster = self.cluster.is_some(),
+            "scale_service ENTER"
+        );
+
         // Attach the current spec so every receiving node can register/update
         // the service before scaling. This is what propagates an image change
         // to worker containers and lets a fresh worker run a replica it has
@@ -1970,6 +1978,12 @@ impl ServiceManager {
     /// Returns an error if the service is not found or scaling fails.
     #[allow(clippy::cast_possible_truncation)]
     pub async fn scale_service_local(&self, name: &str, replicas: u32) -> Result<()> {
+        tracing::info!(
+            target: "zlayer::scale_distribute",
+            service = name,
+            replicas,
+            "scale_service_local ENTER"
+        );
         let _permit = self.scale_semaphore.acquire().await;
 
         let services = self.services.read().await;
