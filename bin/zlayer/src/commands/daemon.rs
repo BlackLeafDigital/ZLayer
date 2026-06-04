@@ -194,18 +194,23 @@ pub(crate) async fn handle_daemon(
 
     // Elevation policy.
     //
-    // macOS: the main daemon installs as a per-user launchd Agent (`gui/$uid`)
-    // that writes only to user-owned `~/.zlayer`, so install / uninstall /
-    // start / stop / restart / reset / migrate all run AS THE USER — no sudo.
-    // The single privileged step — registering the `zlayer-overlayd` *system*
-    // service, which owns a utun adapter — self-elevates surgically inside
+    // macOS + Linux: the main daemon installs as a per-USER service — a launchd
+    // Agent (`gui/$uid`, macOS) or a `systemctl --user` unit
+    // (`~/.config/systemd/user`, Linux) — writing only to user-owned
+    // `~/.zlayer` and running the container runtime rootless (rootless youki +
+    // cgroup-v2 delegation on Linux). So install / uninstall / start / stop /
+    // restart / reset / migrate all run AS THE USER — no sudo. The single
+    // privileged step — registering the `zlayer-overlayd` *system* service,
+    // which owns the tun/utun adapter — self-elevates surgically inside
     // install() (via the hidden `_install-overlayd` re-exec) and ONLY when the
-    // overlay binary/plist actually changed. A daemon-only upgrade prompts for
+    // overlay binary/unit actually changed. A daemon-only upgrade prompts for
     // nothing.
     //
-    // Linux/Windows: the system systemd unit / SCM service still require root
-    // up front (rootless arms tracked separately).
-    #[cfg(not(target_os = "macos"))]
+    // Windows: the SCM registers services in the system database and requires
+    // Administrator, so the daemon-management actions still elevate up front
+    // (Windows per-user services would need a separate API the SCM path here
+    // does not implement; HCS itself is not the blocker).
+    #[cfg(target_os = "windows")]
     match action {
         DaemonAction::Install(_) => {
             crate::privilege::ensure_root_or_reexec("install the system service")?;
@@ -740,19 +745,32 @@ pub fn print_install_summary(
     }
     #[cfg(target_os = "linux")]
     {
-        println!("  Service:    systemctl status zlayer.service");
-        println!("  Logs:       journalctl -fu zlayer.service");
-        if let Some(dir) = log_dir {
-            println!("              {}/daemon.log", dir.display());
+        let unit = unit_name(daemon_name);
+        // System install (root) uses the system manager + the shared `zlayer`
+        // group; a rootless install uses the per-user manager and has no group.
+        if linux_is_root() {
+            println!("  Service:    systemctl status {unit}");
+            println!("  Logs:       journalctl -fu {unit}");
+            if let Some(dir) = log_dir {
+                println!("              {}/daemon.log", dir.display());
+            }
+            // Group-membership hint. `ensure_zlayer_group` is best-effort and
+            // we can't easily distinguish "newly added" from "already a member"
+            // here, so print it unconditionally for a system install — re-running
+            // `newgrp zlayer` in a shell that already has the group is harmless.
+            println!("  Group:      You were added to the 'zlayer' group. New shells get this");
+            println!("              automatically. For the current shell, run:");
+            println!("                newgrp zlayer");
+        } else {
+            println!("  Service:    systemctl --user status {unit}");
+            println!("  Logs:       journalctl --user -fu {unit}");
+            if let Some(dir) = log_dir {
+                println!("              {}/daemon.log", dir.display());
+            }
+            // Rootless user services stop at logout unless lingering is enabled.
+            println!("  Tip:        to keep the daemon running while you're logged out, run:");
+            println!("                sudo loginctl enable-linger $USER");
         }
-        // Group-membership hint. `ensure_zlayer_group` is best-effort and we
-        // can't easily distinguish "newly added" from "already a member"
-        // here, so print the hint unconditionally on Linux — re-running
-        // `newgrp zlayer` in an existing shell that already has the group
-        // is a harmless no-op.
-        println!("  Group:      You were added to the 'zlayer' group. New shells get this");
-        println!("              automatically. For the current shell, run:");
-        println!("                newgrp zlayer");
     }
     #[cfg(target_os = "macos")]
     {
@@ -1031,7 +1049,7 @@ async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start
 }
 
 /// Lowercase-hex SHA-256 of a file's contents, or `None` if it can't be read.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn file_sha256(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).ok()?;
@@ -1048,10 +1066,11 @@ fn overlayd_system_plist_path() -> std::path::PathBuf {
         .join(format!("{OVERLAYD_LAUNCHD_LABEL}.plist"))
 }
 
-/// User-owned fast-path cache recording the `{binary_sha256, plist_sha256}` of
-/// the last overlayd registration. The on-disk plist + binary remain the source
-/// of truth; this just lets a daemon-only upgrade confirm "unchanged" cheaply.
-#[cfg(target_os = "macos")]
+/// User-owned fast-path cache recording the `{binary_sha256, service_sha256}` of
+/// the last overlayd registration. The on-disk service unit/plist + binary
+/// remain the source of truth; this just lets a daemon-only upgrade confirm
+/// "unchanged" cheaply.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn overlayd_service_cache_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("overlayd-service.json")
 }
@@ -1116,20 +1135,21 @@ fn overlayd_service_is_current(data_dir: &Path, staged_overlayd_bin: &Path) -> b
         .is_ok_and(|s| s.success())
 }
 
-/// Persist the user-owned `{binary_sha256, plist_sha256}` cache after a
-/// successful overlayd registration.
-#[cfg(target_os = "macos")]
-fn write_overlayd_service_cache(data_dir: &Path, overlayd_bin: &Path) {
+/// Persist the user-owned `{binary_sha256, service_sha256}` cache after a
+/// successful overlayd registration. `rendered_service` is the exact unit/plist
+/// text that was (or will be) installed, so the hash captures the full config.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_overlayd_service_cache(data_dir: &Path, overlayd_bin: &Path, rendered_service: &str) {
     use sha2::{Digest, Sha256};
     let Some(bin_sha) = file_sha256(overlayd_bin) else {
         return;
     };
     let mut hasher = Sha256::new();
-    hasher.update(render_overlayd_plist(data_dir, overlayd_bin).as_bytes());
-    let plist_sha = hex::encode(hasher.finalize());
+    hasher.update(rendered_service.as_bytes());
+    let service_sha = hex::encode(hasher.finalize());
     let json = serde_json::json!({
         "binary_sha256": bin_sha,
-        "plist_sha256": plist_sha,
+        "service_sha256": service_sha,
     });
     if let Ok(s) = serde_json::to_string_pretty(&json) {
         let _ = std::fs::write(overlayd_service_cache_path(data_dir), s);
@@ -1140,14 +1160,14 @@ fn write_overlayd_service_cache(data_dir: &Path, overlayd_bin: &Path) {
 /// `sudo zlayer daemon _install-overlayd --overlayd-bin <bin> [--no-start]` as a
 /// child (so the parent rootless install continues afterward), inheriting stdio
 /// so the sudo prompt is visible. The hidden subcommand runs as root and writes
-/// the system plist + bootstraps the service.
-#[cfg(target_os = "macos")]
+/// the system unit/plist + bootstraps the service.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn elevate_overlayd_install(overlayd_bin: &Path, no_start: bool) -> Result<()> {
     let exe = std::env::current_exe()
         .context("failed to resolve the current zlayer executable for overlayd elevation")?;
     println!(
-        "Overlay networking needs root to register its system service \
-         ({OVERLAYD_LAUNCHD_LABEL}); you may be prompted for your password."
+        "Overlay networking needs root to register its system service; \
+         you may be prompted for your password."
     );
     let mut cmd = std::process::Command::new("sudo");
     cmd.arg("-E")
@@ -1785,7 +1805,11 @@ async fn install(
             } else {
                 // Persist the user-owned fast-path cache so the next
                 // daemon-only upgrade can confirm "unchanged" without a probe.
-                write_overlayd_service_cache(data_dir, &overlayd_bin);
+                write_overlayd_service_cache(
+                    data_dir,
+                    &overlayd_bin,
+                    &render_overlayd_plist(data_dir, &overlayd_bin),
+                );
             }
         }
     } else {
@@ -2148,14 +2172,49 @@ fn unit_name(daemon_name: &str) -> String {
     format!("{daemon_name}.service")
 }
 
+/// Is the current process root (euid 0)? On Linux this gates the system-vs-user
+/// install: as root we register a system unit under `/etc/systemd/system`; as a
+/// regular user we register a `systemctl --user` unit under
+/// `~/.config/systemd/user` and run rootless (rootless youki + cgroup-v2
+/// delegation). Only the overlay (which owns a tun adapter) needs root.
 #[cfg(target_os = "linux")]
-fn unit_path(daemon_name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from("/etc/systemd/system").join(unit_name(daemon_name))
+#[allow(unsafe_code)]
+fn linux_is_root() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
+/// The user systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, default
+/// `~/.config/systemd/user`).
+#[cfg(target_os = "linux")]
+fn user_systemd_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("systemd/user");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home).join(".config/systemd/user")
 }
 
 #[cfg(target_os = "linux")]
+fn unit_path(daemon_name: &str) -> std::path::PathBuf {
+    if linux_is_root() {
+        std::path::PathBuf::from("/etc/systemd/system").join(unit_name(daemon_name))
+    } else {
+        user_systemd_dir().join(unit_name(daemon_name))
+    }
+}
+
+/// Build `systemctl` args, prepending `--user` for a rootless install so the
+/// call targets the per-user manager instead of the (root-only) system manager.
+#[cfg(target_os = "linux")]
 fn systemctl_args(base_args: &[&str]) -> Vec<String> {
-    base_args.iter().copied().map(ToString::to_string).collect()
+    let mut out: Vec<String> = Vec::with_capacity(base_args.len() + 1);
+    if !linux_is_root() {
+        out.push("--user".to_string());
+    }
+    out.extend(base_args.iter().copied().map(ToString::to_string));
+    out
 }
 
 /// Pick a writable system location for the daemon binary, named after the
@@ -2174,14 +2233,18 @@ fn pick_system_binary_path(daemon_name: &str) -> std::path::PathBuf {
 #[cfg(target_os = "linux")]
 const OVERLAYD_SYSTEMD_UNIT: &str = "zlayer-overlayd.service";
 
-/// Write + enable + start the overlayd systemd unit. overlayd is the overlay
-/// owner, so it ALWAYS gets the tun + CAP_NET_ADMIN/CAP_SYS_ADMIN capability
-/// block regardless of the main daemon's `--with-overlay` flag.
+/// The system-domain unit path for the overlayd service (world-readable, so the
+/// change-gate can inspect it without root).
 #[cfg(target_os = "linux")]
-async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
-    use tokio::process::Command;
+fn overlayd_system_unit_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT)
+}
 
-    let unit = format!(
+/// Render the overlayd systemd unit. Shared by the installer and the change-gate
+/// so byte-for-byte comparison of the on-disk unit is meaningful.
+#[cfg(target_os = "linux")]
+fn render_overlayd_unit(data_dir: &Path, overlayd_bin: &Path) -> String {
+    format!(
         r"[Unit]
 Description=ZLayer Overlay Daemon
 Documentation=https://zlayer.dev
@@ -2207,9 +2270,61 @@ WantedBy=multi-user.target
 ",
         bin = overlayd_bin.display(),
         data_dir = data_dir.display(),
-    );
+    )
+}
 
-    let path = std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT);
+/// Extract the `ExecStart=` binary path from an installed overlayd unit.
+#[cfg(target_os = "linux")]
+fn overlayd_unit_exec_path(unit_text: &str) -> Option<std::path::PathBuf> {
+    let line = unit_text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))?;
+    // `ExecStart=<bin> --data-dir <dir>` — the binary is the first token.
+    let bin = line.split_whitespace().next()?;
+    if bin.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(bin))
+    }
+}
+
+/// The Linux change-gate: is the installed overlayd system service already
+/// exactly what we would register? Mirrors the macOS gate — none of these checks
+/// needs root (the unit + binary are world-readable; `systemctl is-active` works
+/// read-only): installed unit text == rendered unit, AND
+/// `sha256(staged bin) == sha256(installed bin)`, AND the service is active.
+#[cfg(target_os = "linux")]
+fn overlayd_service_is_current(data_dir: &Path, staged_overlayd_bin: &Path) -> bool {
+    let Ok(installed) = std::fs::read_to_string(overlayd_system_unit_path()) else {
+        return false; // not installed
+    };
+    if installed != render_overlayd_unit(data_dir, staged_overlayd_bin) {
+        return false;
+    }
+    let Some(installed_bin) = overlayd_unit_exec_path(&installed) else {
+        return false;
+    };
+    let staged_sha = file_sha256(staged_overlayd_bin);
+    if staged_sha.is_none() || staged_sha != file_sha256(&installed_bin) {
+        return false;
+    }
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", OVERLAYD_SYSTEMD_UNIT])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Write + enable + start the overlayd systemd unit. overlayd is the overlay
+/// owner, so it ALWAYS gets the tun + CAP_NET_ADMIN/CAP_SYS_ADMIN capability
+/// block regardless of the main daemon's `--with-overlay` flag. Always run as
+/// root (directly, or via the `_install-overlayd` sudo re-exec).
+#[cfg(target_os = "linux")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use tokio::process::Command;
+
+    let unit = render_overlayd_unit(data_dir, overlayd_bin);
+
+    let path = overlayd_system_unit_path();
     if let Err(e) = tokio::fs::write(&path, unit).await {
         eprintln!(
             "Warning: failed to write overlayd unit {}: {e}",
@@ -2790,7 +2905,21 @@ async fn install(
     // tells systemd to ignore failures (e.g. `tun` built into the kernel
     // or `/sbin/modprobe` missing), so the daemon still starts on hosts
     // where `modprobe tun` is unnecessary or unavailable.
-    let overlay_block = if with_overlay {
+    // Root vs rootless (`systemctl --user`) unit shape:
+    //  - `Group=zlayer` references the root-created shared group → system only.
+    //  - `WantedBy`: system units hook `multi-user.target`; user units hook
+    //    `default.target` (the user manager has no multi-user.target).
+    //  - The overlay capability block (ambient CAP_NET_ADMIN/CAP_SYS_ADMIN) can
+    //    only be granted to a system unit; a `--user` unit can't hold caps, and
+    //    the overlay runs as its own root `zlayer-overlayd.service` regardless.
+    let is_root = linux_is_root();
+    let group_line = if is_root { "Group=zlayer\n" } else { "" };
+    let wanted_by = if is_root {
+        "multi-user.target"
+    } else {
+        "default.target"
+    };
+    let overlay_block = if with_overlay && is_root {
         "ExecStartPre=-/sbin/modprobe tun\n\
          AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN\n\
          CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\n"
@@ -2807,8 +2936,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-Group=zlayer
-ExecStart={exec_start}
+{group_line}ExecStart={exec_start}
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=60
 Restart=always
@@ -2831,7 +2959,7 @@ Delegate=yes
 KillMode=process
 {overlay_block}{env_line}
 [Install]
-WantedBy=multi-user.target
+WantedBy={wanted_by}
 ",
     );
 
@@ -3007,11 +3135,31 @@ WantedBy=multi-user.target
     }
 
     // Register overlayd as its OWN systemd service so it survives main-binary
-    // reinstalls. Locate/stage the overlayd binary the same way the main binary
-    // was: if the main `zlayer` was copied into the system bin dir (out of a
-    // user home), copy overlayd alongside it.
+    // reinstalls. overlayd owns the tun adapter → it's the ONLY component that
+    // needs root. The change-gate decides whether that root step runs at all:
+    // when the installed unit + binary already match (and the service is active)
+    // we skip it (no sudo); only a genuine overlay change elevates, and only the
+    // overlay step. (When already root, register directly.)
     if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, exe_copied_to_system) {
-        install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+        if is_root {
+            install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+        } else if overlayd_service_is_current(data_dir, &overlayd_bin) {
+            println!(
+                "Overlay networking service is up to date ({OVERLAYD_SYSTEMD_UNIT}); \
+                 skipping (no root needed)."
+            );
+        } else if let Err(e) = elevate_overlayd_install(&overlayd_bin, no_start) {
+            eprintln!(
+                "Warning: could not register the overlay networking system service: {e}. \
+                 The main daemon will spawn overlayd on demand instead."
+            );
+        } else {
+            write_overlayd_service_cache(
+                data_dir,
+                &overlayd_bin,
+                &render_overlayd_unit(data_dir, &overlayd_bin),
+            );
+        }
     } else {
         eprintln!(
             "Warning: zlayer-overlayd binary not found next to {}; \

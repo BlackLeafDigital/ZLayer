@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.9 - 2026-06-03
+
+### Changed
+- **Rootless Linux daemon install** (mirrors the macOS rootless model). When `zlayer daemon install`
+  runs as a regular user it now registers a `systemctl --user` unit under `~/.config/systemd/user`
+  (instead of a system unit in `/etc/systemd/system`) and runs the container runtime **rootless**
+  (rootless youki uid/gid mappings from `/etc/subuid`/`/etc/subgid` + cgroup-v2 delegation via the
+  unit's `Delegate=yes`), writing only to user-owned `~/.zlayer`. The blanket up-front `sudo`
+  re-exec is removed on Linux; `unit_path`/`systemctl_args` switch to the per-user manager when
+  non-root; the user unit omits `Group=zlayer` and the overlay capability block (a user unit can't
+  hold caps) and hooks `default.target` instead of `multi-user.target`. The `zlayer-overlayd` system
+  service (which owns the tun adapter) is the only root step: the same change-gate as macOS
+  (installed unit text + binary SHA-256 + `systemctl is-active`) skips it with no sudo when unchanged,
+  else re-execs `daemon _install-overlayd` under `sudo`. The install summary points at
+  `systemctl --user` and suggests `loginctl enable-linger $USER` to keep the daemon running while
+  logged out. A root/system install (`sudo zlayer daemon install`) is unchanged.
+- **Windows is intentionally NOT rootless**: registering a service goes through the SCM
+  (`ServiceManager::local_computer()`), which requires Administrator for the system service database;
+  Windows per-user services would need a separate API path the current SCM code does not implement
+  (HCS, the container runtime, is not the blocker). Windows daemon-management actions still elevate
+  up front.
+
 ## 0.52.8 - 2026-06-03
 
 ### Changed
