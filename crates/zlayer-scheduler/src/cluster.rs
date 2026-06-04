@@ -574,6 +574,11 @@ impl Cluster for RaftCluster {
         let replicas = req.replicas;
 
         let state = self.raft.read_state().await;
+        let raw_node_summary: Vec<(NodeId, String)> = state
+            .nodes
+            .iter()
+            .map(|(id, n)| (*id, n.status.clone()))
+            .collect();
         let mut nodes = crate::cluster_nodes_to_node_states(&state.nodes);
         let mut placements = crate::placement::PlacementState::new();
         let decisions = crate::placement::place_service_replicas(
@@ -591,6 +596,18 @@ impl Cluster for RaftCluster {
                 *per_node.entry(node_id).or_insert(0) += 1;
             }
         }
+
+        tracing::info!(
+            target: "zlayer::scale_distribute",
+            service = %req.service,
+            replicas,
+            affinity = ?spec.affinity,
+            leader_self = self.node_id,
+            raft_nodes = ?raw_node_summary,
+            placeable_nodes = nodes.len(),
+            per_node = ?per_node,
+            "distributed scale placement computed"
+        );
 
         if per_node.is_empty() {
             // Nothing placed (no Ready node matched). Preserve prior behavior:

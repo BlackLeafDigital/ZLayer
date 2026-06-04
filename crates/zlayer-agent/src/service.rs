@@ -1915,7 +1915,16 @@ impl ServiceManager {
         };
 
         if let Some(cluster) = &self.cluster {
-            if !cluster.is_leader().await {
+            let is_leader = cluster.is_leader().await;
+            tracing::info!(
+                target: "zlayer::scale_distribute",
+                service = name,
+                replicas,
+                is_leader,
+                spec_affinity = ?spec.as_ref().and_then(|s| s.affinity.clone()),
+                "scale_service: cluster path"
+            );
+            if !is_leader {
                 // Follower: forward to the leader and let it dispatch.
                 return cluster
                     .forward_scale(build_req(replicas))
