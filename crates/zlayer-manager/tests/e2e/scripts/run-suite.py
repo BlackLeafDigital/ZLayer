@@ -110,6 +110,39 @@ def _close_proc_logs(proc: subprocess.Popen) -> None:
         proc._zlayer_log_files = ()  # type: ignore[attr-defined]
 
 
+def _dump_host_daemon_logs(root_dir: Path, *, grep: Optional[str] = None) -> None:
+    """Dump the per-node daemon serve logs (`<root>/logs/*.log`) to stderr for
+    postmortem. With `grep` set, show only matching lines (plus a short tail);
+    otherwise the tail of each file. Best-effort: never raises.
+
+    The host-mode cluster daemons (`_spawn_node_serve`) redirect stdout/stderr
+    into `<root>/logs/node*.{out,err}.log`, so this is where the daemon-side
+    `scale_distribute` placement logs live (they are NOT in the CI job stdout).
+    """
+    logs_dir = root_dir / "logs"
+    log(f"---- daemon logs from {logs_dir} ----")
+    if not logs_dir.is_dir():
+        log(f"  (no logs dir at {logs_dir})")
+        return
+    pat = re.compile(grep) if grep else None
+    for p in sorted(logs_dir.glob("*.log")):
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except Exception as exc:  # noqa: BLE001
+            log(f"  (failed to read {p}: {exc!r})")
+            continue
+        if pat is not None:
+            sel = [ln for ln in lines if pat.search(ln)]
+            shown = sel[-80:] if sel else lines[-25:]
+            log(f"---- {p.name}: {len(sel)} match(es), showing {len(shown)} ----")
+        else:
+            shown = lines[-60:]
+            log(f"---- {p.name} (tail {len(shown)}) ----")
+        for ln in shown:
+            sys.stderr.write(ln + "\n")
+        sys.stderr.flush()
+
+
 def _run_capture(cmd: list, output_path: Path) -> None:
     """Run a shell command, write its combined stdout+stderr to output_path.
 
@@ -3382,6 +3415,13 @@ def run_cluster_scaling(args: argparse.Namespace) -> int:
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"cluster_scaling: FAIL — {e!r}", file=sys.stderr, flush=True)
+        # Surface the daemon-side scale decision (fan-out + placement) so the
+        # concentration bug is diagnosable from CI.
+        _dump_host_daemon_logs(
+            root_dir,
+            grep="scale_distribute|scale_service|distributed scale|per_node|"
+            "placeable_nodes|orchestrate_deployment",
+        )
         _suite_exit = 1
         return 1
     finally:
