@@ -29,5 +29,7 @@ pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
         }),
         #[cfg(target_os = "macos")]
         RuntimeType::MacVm => RuntimeConfig::MacVm,
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacVz => RuntimeConfig::MacVz,
     }
 }

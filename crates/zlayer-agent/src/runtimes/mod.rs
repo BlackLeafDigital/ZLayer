@@ -134,6 +134,11 @@ pub mod macos_sandbox;
 #[cfg(target_os = "macos")]
 pub mod macos_vm;
 
+// Apple-Virtualization (VZ) runtime: ephemeral native-macOS guest VMs. Opt-in
+// only (label `com.zlayer.isolation=vz`); coexists with the Seatbelt sandbox.
+#[cfg(target_os = "macos")]
+pub mod macos_vz;
+
 // HCS-backed native Windows container runtime. Compiled only on Windows
 // because it depends on the `zlayer-hcs` crate and the `crate::windows`
 // submodule, both of which are Windows-only.
@@ -158,6 +163,9 @@ pub use macos_sandbox::SandboxRuntime;
 
 #[cfg(target_os = "macos")]
 pub use macos_vm::VmRuntime;
+
+#[cfg(target_os = "macos")]
+pub use macos_vz::VzRuntime;
 
 #[cfg(feature = "docker")]
 pub use docker::DockerRuntime;

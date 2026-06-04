@@ -55,6 +55,9 @@ use crate::runtime::{
 enum DispatchTarget {
     Primary,
     Delegate,
+    /// The opt-in Apple-Virtualization (VZ) delegate, selected per-service via
+    /// the `com.zlayer.isolation=vz` label (macOS only).
+    Vz,
 }
 
 /// Routes each container to either the primary runtime or an optional delegate.
@@ -63,6 +66,9 @@ enum DispatchTarget {
 pub struct CompositeRuntime {
     primary: Arc<dyn Runtime>,
     delegate: Option<Arc<dyn Runtime>>,
+    /// Opt-in Apple-Virtualization delegate (macOS). Selected only when a
+    /// service carries `com.zlayer.isolation=vz`.
+    vz: Option<Arc<dyn Runtime>>,
     /// Per-container dispatch cache. Populated on `create_container`, removed
     /// on `remove_container`.
     dispatch: Arc<RwLock<HashMap<ContainerId, DispatchTarget>>>,
@@ -83,9 +89,18 @@ impl CompositeRuntime {
         Self {
             primary,
             delegate,
+            vz: None,
             dispatch: Arc::new(RwLock::new(HashMap::new())),
             image_os: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Attach an opt-in Apple-Virtualization delegate. Services labelled
+    /// `com.zlayer.isolation=vz` route to it; everything else is unaffected.
+    #[must_use]
+    pub fn with_vz_delegate(mut self, vz: Option<Arc<dyn Runtime>>) -> Self {
+        self.vz = vz;
+        self
     }
 
     /// Access the primary runtime (for introspection / tests).
@@ -165,6 +180,18 @@ impl CompositeRuntime {
     /// specs without a platform — producing cryptic downstream errors when the
     /// image-OS cache said `Linux`. We now return `RouteToPeer` in both cases.
     async fn select_for(&self, service: &str, spec: &ServiceSpec) -> Result<DispatchTarget> {
+        // Opt-in Apple-Virtualization: a service labelled `com.zlayer.isolation=vz`
+        // routes to the VZ delegate (native-macOS guest VMs). Checked first so it
+        // overrides the platform/image-OS dispatch below.
+        if self.vz.is_some()
+            && spec
+                .labels
+                .get("com.zlayer.isolation")
+                .is_some_and(|v| v.eq_ignore_ascii_case("vz"))
+        {
+            return Ok(DispatchTarget::Vz);
+        }
+
         if let Some(platform) = &spec.platform {
             let target = match platform.os {
                 OsKind::Windows | OsKind::Macos => DispatchTarget::Primary,
@@ -246,6 +273,9 @@ impl CompositeRuntime {
                 .delegate
                 .as_ref()
                 .expect("delegate target requires delegate to exist"),
+            // `select_for` only returns `Vz` when a vz delegate is present;
+            // fall back to primary defensively.
+            DispatchTarget::Vz => self.vz.as_ref().unwrap_or(&self.primary),
         }
     }
 }

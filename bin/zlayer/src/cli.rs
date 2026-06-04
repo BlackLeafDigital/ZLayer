@@ -177,9 +177,12 @@ pub(crate) enum RuntimeType {
     /// macOS sandbox runtime (uses Apple sandbox framework)
     #[cfg(target_os = "macos")]
     MacSandbox,
-    /// macOS VM runtime (uses Virtualization.framework)
+    /// macOS libkrun micro-VM runtime (Linux guests via Hypervisor.framework)
     #[cfg(target_os = "macos")]
     MacVm,
+    /// macOS Apple-Virtualization runtime (ephemeral native-macOS guest VMs)
+    #[cfg(target_os = "macos")]
+    MacVz,
 }
 
 /// Shared flag group controlling WSL2 auto-install consent.

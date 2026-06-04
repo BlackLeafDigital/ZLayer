@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.10 - 2026-06-03
+
+### Added
+- **macOS Apple-Virtualization (VZ) runtime** (`crates/zlayer-agent/src/runtimes/macos_vz.rs`):
+  ephemeral native-macOS guest VMs via `Virtualization.framework` (the GitHub-runner / Tart model),
+  coexisting with the Seatbelt sandbox (primary) and the libkrun Linux-guest runtime. **Opt-in only** —
+  never selected by `Auto`: choose it node-wide with `--runtime mac-vz`, or per-service with the label
+  `com.zlayer.isolation: "vz"` (routed by the composite runtime's new VZ delegate). Each container is a
+  macOS guest cloned from a base bundle (`disk.img` + `hardware-model.bin` + `aux.img`) via APFS
+  `clonefile` CoW, with a fresh `VZMacMachineIdentifier`, a per-VM random MAC, and an ephemeral SSH
+  keypair. `start_container` builds the full `VZVirtualMachineConfiguration` (Mac platform + boot loader
+  + clamped CPU/RAM + graphics + virtio block/net+NAT + serial→console.log) and runs the VM on a
+  dedicated serial `DispatchQueue`, bridging the framework's `block2` completion handlers to the async
+  runtime. `exec` runs over SSH (system `ssh`, no extra deps); `get_container_ip` parses
+  `/var/db/dhcpd_leases` by MAC; `pause`/`unpause` use real VZ pause/resume. A process-wide 2-VM gate
+  (RAII guard) enforces Apple's concurrent-macOS-guest limit. Deps: `objc2`, `objc2-foundation`,
+  `objc2-virtualization`, `block2`, `dispatch2`. Pure helpers are unit-tested; the VM-boot integration
+  test is `#[ignore]`d (needs the `com.apple.security.virtualization` entitlement + a base bundle). See
+  `docs/macos-vz-runtime.md`.
+
 ## 0.52.9 - 2026-06-03
 
 ### Changed

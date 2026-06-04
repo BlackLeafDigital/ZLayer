@@ -140,9 +140,13 @@ pub enum RuntimeConfig {
     /// Use macOS sandbox-based container runtime
     #[cfg(target_os = "macos")]
     MacSandbox(MacSandboxConfig),
-    /// Use macOS Virtualization.framework for full VM isolation
+    /// Use macOS libkrun micro-VMs for Linux-guest isolation.
     #[cfg(target_os = "macos")]
     MacVm,
+    /// Use Apple `Virtualization.framework` for ephemeral native-macOS guest
+    /// VMs. Opt-in only (never `Auto`); route via `com.zlayer.isolation=vz`.
+    #[cfg(target_os = "macos")]
+    MacVz,
     /// WSL2 backend (deprecated).
     ///
     /// Preserved for one release for back-compat with existing `runtime: wsl2`
@@ -258,6 +262,7 @@ pub fn is_wasm_available() -> bool {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn create_runtime(
     config: RuntimeConfig,
     auth_ctx: Option<ContainerAuthContext>,
@@ -287,7 +292,7 @@ pub async fn create_runtime(
                 auth_ctx.clone(),
             )?);
             let delegate: Option<Arc<dyn Runtime>> = match runtimes::macos_vm::VmRuntime::new(
-                auth_ctx,
+                auth_ctx.clone(),
             ) {
                 Ok(rt) => {
                     tracing::info!(
@@ -303,12 +308,22 @@ pub async fn create_runtime(
                     None
                 }
             };
-            Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
-                primary, delegate,
-            )))
+            // Opt-in VZ delegate (native-macOS guests via `com.zlayer.isolation=vz`).
+            let vz: Option<Arc<dyn Runtime>> = match runtimes::macos_vz::VzRuntime::new(auth_ctx) {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "macOS VZ delegate unavailable");
+                    None
+                }
+            };
+            Ok(Arc::new(
+                runtimes::composite::CompositeRuntime::new(primary, delegate).with_vz_delegate(vz),
+            ))
         }
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new(auth_ctx)?)),
+        #[cfg(target_os = "macos")]
+        RuntimeConfig::MacVz => Ok(Arc::new(runtimes::macos_vz::VzRuntime::new(auth_ctx)?)),
         #[cfg(target_os = "windows")]
         #[allow(deprecated)]
         RuntimeConfig::Wsl2 => {
@@ -429,11 +444,16 @@ async fn create_auto_runtime(
                 None
             }
         };
+        // Opt-in VZ delegate (native-macOS guests via `com.zlayer.isolation=vz`);
+        // never the default, only used when a service requests it.
+        let vz: Option<Arc<dyn Runtime>> = runtimes::macos_vz::VzRuntime::new(auth_ctx.clone())
+            .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+            .ok();
 
         if let Some(p) = primary {
-            return Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
-                p, delegate,
-            )));
+            return Ok(Arc::new(
+                runtimes::composite::CompositeRuntime::new(p, delegate).with_vz_delegate(vz),
+            ));
         }
         // If sandbox failed but VM succeeded, use the VM runtime on its own —
         // it's still the best available native macOS path before falling back
