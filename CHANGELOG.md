@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.11 - 2026-06-04
+
+### Added
+- **VZ runtime: auto-signing + Apple-Silicon auto-detection.** `make build`/`make release` and
+  `scripts/install-dev.sh` now sign the `zlayer` binary on macOS with the
+  `com.apple.security.virtualization` entitlement (`bin/zlayer/zlayer.entitlements` +
+  `scripts/sign-vz.sh`) so the VZ runtime can create/boot guest VMs out of the box — ad-hoc by default
+  (sufficient for local use on the same Mac), or with a Developer ID via `VZ_SIGN_IDENTITY=…` /
+  `make sign-vz` for a distributable build. `VzRuntime::new` now detects Apple Silicon and
+  `VZVirtualMachine::isSupported()`, logging "ready" when usable or an actionable WARN (pointing at
+  `scripts/sign-vz.sh`) when the framework reports unsupported (typically a missing entitlement);
+  `start_container` surfaces the same signing hint. Verified on an Apple M-series host: a signed binary
+  reports the runtime "ready" with `apple_silicon=true`.
+
 ## 0.52.10 - 2026-06-03
 
 ### Added

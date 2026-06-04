@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required to create/boot guest VMs with the macOS VZ runtime
+         (crates/zlayer-agent/src/runtimes/macos_vz.rs). Works with an ad-hoc
+         signature (`codesign -s -`) for local use on the same Mac; use a real
+         Developer ID identity to distribute a signed build. -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

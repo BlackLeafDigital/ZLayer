@@ -229,16 +229,29 @@ impl VzRuntime {
             })?;
         }
 
-        // `VZVirtualMachine::isSupported()` returns false on unentitled or
-        // unsupported hosts. We don't hard-fail construction (so the daemon can
-        // still start and route non-VZ work elsewhere); start_container surfaces
-        // the precise error if a VM is actually requested.
+        // Auto-detect the host. `VZVirtualMachine::isSupported()` reflects
+        // hardware/OS capability (true on Apple Silicon running a supported
+        // macOS); the `com.apple.security.virtualization` entitlement is
+        // enforced later, at VM *creation*. We never hard-fail construction so
+        // the daemon can still start and route non-VZ work elsewhere.
         let supported = unsafe { VZVirtualMachine::isSupported() };
-        tracing::info!(
-            vz_dir = %vz_dir.display(),
-            virtualization_supported = supported,
-            "macOS Apple-Virtualization (VZ) runtime initialized"
-        );
+        let apple_silicon = cfg!(target_arch = "aarch64");
+        if supported {
+            tracing::info!(
+                vz_dir = %vz_dir.display(),
+                apple_silicon,
+                "macOS Apple-Virtualization (VZ) runtime ready (opt in with --runtime mac-vz \
+                 or the com.zlayer.isolation=vz label)"
+            );
+        } else {
+            tracing::warn!(
+                apple_silicon,
+                "Virtualization.framework reports UNSUPPORTED on this host — VZ-isolated \
+                 services will fail to start. On Apple Silicon this is almost always a \
+                 missing entitlement: sign the `zlayer` binary with `scripts/sign-vz.sh` \
+                 (or build via `make build`, which auto-signs on macOS)."
+            );
+        }
 
         Ok(Self {
             vz_dir,
@@ -882,8 +895,10 @@ impl Runtime for VzRuntime {
         if !unsafe { VZVirtualMachine::isSupported() } {
             return Err(AgentError::StartFailed {
                 id: dir_name,
-                reason: "Virtualization.framework is unavailable (needs the \
-                         com.apple.security.virtualization entitlement + code signing)"
+                reason: "Virtualization.framework is unavailable. On Apple Silicon, grant the \
+                         com.apple.security.virtualization entitlement by signing the binary \
+                         with `scripts/sign-vz.sh` (or build via `make build`, which auto-signs \
+                         on macOS)."
                     .to_string(),
             });
         }

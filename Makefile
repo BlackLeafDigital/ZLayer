@@ -1,4 +1,21 @@
-.PHONY: all check test build release clean fmt lint ci docs install
+.PHONY: all check test build release clean fmt lint ci docs install sign-vz
+
+# On macOS, auto-sign the built `zlayer` binary with the
+# `com.apple.security.virtualization` entitlement so the VZ runtime
+# (crates/zlayer-agent/src/runtimes/macos_vz.rs) can create/boot guest VMs.
+# Ad-hoc by default; override the identity with `VZ_SIGN_IDENTITY=...`.
+# A no-op on non-macOS hosts.
+UNAME_S := $(shell uname -s)
+VZ_SIGN_IDENTITY ?= -
+ifeq ($(UNAME_S),Darwin)
+define sign_zlayer
+	@scripts/sign-vz.sh "$(1)" "$(VZ_SIGN_IDENTITY)"
+endef
+else
+define sign_zlayer
+	@:
+endef
+endif
 
 # Default target
 all: check test build
@@ -11,13 +28,19 @@ check:
 test:
 	cargo test --workspace
 
-# Build debug
+# Build debug (auto-signs the binary on macOS for the VZ runtime)
 build:
 	cargo build --workspace
+	$(call sign_zlayer,target/debug/zlayer)
 
-# Build release
+# Build release (auto-signs the binary on macOS for the VZ runtime)
 release:
 	cargo build --release --package zlayer
+	$(call sign_zlayer,target/release/zlayer)
+
+# (Re)sign an existing binary with the virtualization entitlement (macOS).
+sign-vz:
+	$(call sign_zlayer,)
 
 # Clean build artifacts
 clean:

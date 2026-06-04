@@ -160,6 +160,15 @@ if [ ! -f "$TARGET_BIN" ]; then
     exit 1
 fi
 
+# On macOS, sign the binary with the virtualization entitlement so the VZ
+# runtime can boot guest VMs. Ad-hoc by default (fine for local use); set
+# VZ_SIGN_IDENTITY to a Developer ID for a distributable build. No-op elsewhere.
+if [ "$OS" = "darwin" ] && [ -x "${REPO_ROOT}/scripts/sign-vz.sh" ]; then
+    echo "Signing ${TARGET_BIN} for the macOS VZ runtime..."
+    "${REPO_ROOT}/scripts/sign-vz.sh" "$TARGET_BIN" "${VZ_SIGN_IDENTITY:--}" || \
+        echo "Warning: VZ signing failed; the VZ runtime won't boot VMs until signed." >&2
+fi
+
 # --- Stop the existing daemon ---
 # In --replace mode we fully uninstall the running production zlayer
 # (removes the systemd unit / launchd plist and stops it). In dev mode
