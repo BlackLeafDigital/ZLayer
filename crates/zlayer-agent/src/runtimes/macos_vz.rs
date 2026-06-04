@@ -8,8 +8,11 @@
 //!     primary), and
 //!   - [`crate::runtimes::macos_vm::VmRuntime`] (libkrun, Linux guests).
 //!
-//! VZ is **opt-in only** (never selected by `Auto`): route a service to it by
-//! setting the label `com.zlayer.isolation = "vz"`.
+//! Under the composite runtime the VZ delegate is preferred automatically for
+//! images whose manifest is marked `com.zlayer.runtime=vz` (a VZ base bundle
+//! from `zlayer vz build-base`); it can also be forced per-service with the
+//! label `com.zlayer.isolation = "vz"` (or opted out with `"sandbox"`). Ordinary
+//! Linux/Seatbelt images never route here. See `docs/macos-vz-runtime.md`.
 //!
 //! ## Model
 //!
@@ -103,7 +106,7 @@ const DISPLAY_DPI: isize = 80;
 /// serial dispatch queue. `VZVirtualMachine` and its config objects are not
 /// thread-safe, but we serialize **all** access through one queue, so moving
 /// the handle between the queue's worker threads is sound.
-struct QueuePinned<T>(T);
+pub(crate) struct QueuePinned<T>(pub(crate) T);
 // SAFETY: every access to the wrapped handle is funnelled through a single
 // serial `DispatchQueue`, so there is never concurrent access even though the
 // underlying Obj-C object is not itself `Send`/`Sync`.
@@ -157,7 +160,7 @@ impl Drop for VmSlotGuard {
 // Container record
 // ---------------------------------------------------------------------------
 
-struct VzContainer {
+pub(crate) struct VzContainer {
     /// Current container state.
     state: ContainerState,
     /// Per-container state directory.
@@ -315,7 +318,7 @@ fn safe_vcpu_count(requested: u32) -> u32 {
 /// Clamp a requested memory-in-MiB value to the framework's allowed range,
 /// returning bytes (the unit `VZVirtualMachineConfiguration.setMemorySize`
 /// expects).
-fn clamp_memory_bytes(req_mib: u32) -> u64 {
+pub(crate) fn clamp_memory_bytes(req_mib: u32) -> u64 {
     let min = unsafe { VZVirtualMachineConfiguration::minimumAllowedMemorySize() };
     let max = unsafe { VZVirtualMachineConfiguration::maximumAllowedMemorySize() };
     let requested = u64::from(req_mib) * 1024 * 1024;
@@ -324,7 +327,7 @@ fn clamp_memory_bytes(req_mib: u32) -> u64 {
 
 /// Clamp a requested vCPU count to the framework's allowed CPU range AND the
 /// host core count.
-fn clamp_cpu_count(req: u32) -> usize {
+pub(crate) fn clamp_cpu_count(req: u32) -> usize {
     let min = unsafe { VZVirtualMachineConfiguration::minimumAllowedCPUCount() };
     let max = unsafe { VZVirtualMachineConfiguration::maximumAllowedCPUCount() };
     let host_clamped = safe_vcpu_count(req) as usize;
@@ -420,13 +423,13 @@ fn normalize_mac(mac: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// A file-URL NSURL for a path.
-fn file_url(path: &Path) -> Retained<NSURL> {
+pub(crate) fn file_url(path: &Path) -> Retained<NSURL> {
     let s = NSString::from_str(&path.to_string_lossy());
     NSURL::fileURLWithPath(&s)
 }
 
 /// Human-readable message from an `*mut NSError` (null => generic).
-fn ns_error_message(err: *mut NSError) -> String {
+pub(crate) fn ns_error_message(err: *mut NSError) -> String {
     if err.is_null() {
         return "unknown VZ error".to_string();
     }
@@ -442,21 +445,21 @@ fn ns_error_message(err: *mut NSError) -> String {
 
 /// Plain (`Send`) inputs for building a VM configuration on the queue.
 #[derive(Clone)]
-struct VmBuildInputs {
-    bundle_dir: PathBuf,
-    disk_path: PathBuf,
-    aux_path: PathBuf,
-    machine_id_path: PathBuf,
-    console_log: PathBuf,
-    mac: String,
-    cpu_count: usize,
-    memory_bytes: u64,
+pub(crate) struct VmBuildInputs {
+    pub(crate) bundle_dir: PathBuf,
+    pub(crate) disk_path: PathBuf,
+    pub(crate) aux_path: PathBuf,
+    pub(crate) machine_id_path: PathBuf,
+    pub(crate) console_log: PathBuf,
+    pub(crate) mac: String,
+    pub(crate) cpu_count: usize,
+    pub(crate) memory_bytes: u64,
 }
 
 impl VzContainer {
     /// Build a [`VZVirtualMachineConfiguration`]. MUST be called on the VM's
     /// dispatch queue. Returns an error string on any FFI/validation failure.
-    fn build_configuration(
+    pub(crate) fn build_configuration(
         inputs: &VmBuildInputs,
     ) -> std::result::Result<Retained<VZVirtualMachineConfiguration>, String> {
         unsafe {

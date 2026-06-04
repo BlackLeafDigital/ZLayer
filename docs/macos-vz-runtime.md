@@ -12,12 +12,19 @@ GitHub-runner / Tart model. It coexists with, and does not replace:
 
 ## Selecting it
 
-VZ is **never** chosen by `Auto`. Opt in either way:
+Under the default composite runtime the VZ delegate is **preferred automatically
+for genuine VZ bundles**, and remains explicitly selectable:
 
+- **Auto-detect (default):** when an image's manifest carries the
+  `com.zlayer.runtime=vz` annotation — stamped by `zlayer vz build-base` — the
+  composite's `select_for` routes it to the VZ runtime (the only runtime that
+  can boot such a bundle). This fires *only* for real VZ bundles, so
+  Seatbelt-rootfs images and Linux images are unaffected (Linux still routes to
+  the libkrun delegate or a peer).
+- **Per service (force/opt-out):** label `com.zlayer.isolation: "vz"` to force
+  VZ, or `com.zlayer.isolation: "sandbox"` (alias `seatbelt`) to force the
+  Seatbelt sandbox even for a VZ-annotated image.
 - **Whole node:** `zlayer --runtime mac-vz …` (a standalone `VzRuntime`).
-- **Per service:** under the default composite runtime, label the service
-  `com.zlayer.isolation: "vz"`. The composite's `select_for` routes only those
-  services to the VZ delegate; everything else is unaffected.
 
 ## How it works
 
@@ -29,7 +36,8 @@ Each "container" is a macOS guest VM cloned from a base image bundle:
   - `pull_image` of an OCI artifact whose layers unpack to those three files
     (Tart-style), or
   - pointing the image reference at a local directory containing them, or
-  - restoring from a macOS `.ipsw` (canonical `VZMacOSInstaller` flow).
+  - **building one** from a macOS `.ipsw` with `zlayer vz build-base` (see
+    below).
 - **create_container**: APFS `clonefile` CoW of the base `disk.img`, a fresh
   `VZMacMachineIdentifier`, a per-VM locally-administered MAC
   (`VZMACAddress.randomLocallyAdministeredAddress`), an ephemeral SSH keypair
@@ -46,6 +54,40 @@ Each "container" is a macOS guest VM cloned from a base image bundle:
 - **exec**: SSH into the guest (`admin` by default, override with
   `com.zlayer.vz.user`) using the ephemeral key.
 - **pause/unpause**: real `VZVirtualMachine` pause/resume.
+
+## Building base images (`zlayer vz build-base`)
+
+The producer end of the runtime
+(`crates/zlayer-agent/src/runtimes/macos_vz_build.rs`) mints a base bundle from
+a macOS `.ipsw` restore image:
+
+```bash
+# From a local / remote .ipsw, write the bundle to a directory:
+zlayer vz build-base --ipsw ~/UniversalMac.ipsw --output ./macos-vz-base
+
+# Fetch the latest host-supported restore image and publish to a registry:
+zlayer vz build-base --latest --push ghcr.io/org/zlayer/macos-vz:sequoia
+```
+
+It loads the restore image (`VZMacOSRestoreImage`), reads its most-featureful
+supported configuration (`VZMacHardwareModel` + minimum CPU/RAM), writes
+`hardware-model.bin`, creates a fresh `aux.img`
+(`VZMacAuxiliaryStorage initCreatingStorageAtURL:hardwareModel:options:error:`)
+and a sparse blank `disk.img`, then runs `VZMacOSInstaller` (~20-40 min) to
+install macOS onto the disk. With `--push`, the three files are packed into a
+single `tar+zstd` OCI layer (`zlayer-registry::pack::pack_files_tar_zstd`) and
+pushed via `ImagePuller::push_artifact`; the manifest carries the routing
+annotation `com.zlayer.runtime=vz`.
+
+This requires a **signed** binary (the virtualization entitlement) on
+Apple Silicon — build with `make build` (auto-signs on macOS) or run
+`scripts/sign-vz.sh` afterward. CI: `.forgejo/workflows/macos-vz-images.yml`
+(manual `workflow_dispatch`, since the install is multi-GB and ~30 min). Because
+the install needs the entitlement + an `.ipsw`, the end-to-end builder test is
+`#[ignore]`d (set `ZLAYER_TEST_IPSW` to run it); the full code path compiles and
+the pure helpers are unit-tested. The pushed layer (a compressed multi-GB disk)
+is held in memory during the chunked-over-the-wire blob push, so run the build
+on a host with adequate RAM.
 
 ## Constraints
 

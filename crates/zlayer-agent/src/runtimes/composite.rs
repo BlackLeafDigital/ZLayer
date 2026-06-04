@@ -55,8 +55,9 @@ use crate::runtime::{
 enum DispatchTarget {
     Primary,
     Delegate,
-    /// The opt-in Apple-Virtualization (VZ) delegate, selected per-service via
-    /// the `com.zlayer.isolation=vz` label (macOS only).
+    /// The Apple-Virtualization (VZ) delegate (macOS only). Selected
+    /// automatically for `com.zlayer.runtime=vz` base bundles, or per-service
+    /// via the `com.zlayer.isolation=vz` label.
     Vz,
 }
 
@@ -76,6 +77,12 @@ pub struct CompositeRuntime {
     /// Populated by [`CompositeRuntime::record_image_os`], which is driven
     /// from [`zlayer_registry::fetch_image_os`] during `pull_image*`.
     image_os: Arc<RwLock<HashMap<String, OsKind>>>,
+    /// Image runtime-marker cache (the `com.zlayer.runtime` manifest
+    /// annotation, e.g. `"vz"`). Populated from
+    /// [`zlayer_registry::fetch_image_runtime_marker`] during `pull_image*` so
+    /// `select_for` can auto-detect a VZ base bundle and prefer the VZ runtime
+    /// for it without requiring a per-service label.
+    image_runtime: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl CompositeRuntime {
@@ -92,6 +99,7 @@ impl CompositeRuntime {
             vz: None,
             dispatch: Arc::new(RwLock::new(HashMap::new())),
             image_os: Arc::new(RwLock::new(HashMap::new())),
+            image_runtime: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -122,6 +130,40 @@ impl CompositeRuntime {
     /// without an explicit `platform` still dispatch correctly.
     pub(crate) async fn record_image_os(&self, image: &str, os: OsKind) {
         self.image_os.write().await.insert(image.to_string(), os);
+    }
+
+    /// Record an image's `com.zlayer.runtime` marker (e.g. `"vz"`), used by
+    /// [`CompositeRuntime::select_for`] to auto-detect a runtime-specific bundle.
+    pub(crate) async fn record_image_runtime(&self, image: &str, marker: String) {
+        self.image_runtime
+            .write()
+            .await
+            .insert(image.to_string(), marker);
+    }
+
+    /// Apply a manifest runtime-marker inspection to the cache. Mirrors
+    /// [`CompositeRuntime::apply_image_os_inspection`]'s non-fatal contract:
+    /// only a present marker updates the cache; absence or error leaves it
+    /// untouched (dispatch falls through to the OS/platform rules).
+    async fn apply_image_runtime_inspection(
+        &self,
+        image: &str,
+        result: std::result::Result<Option<String>, zlayer_registry::RegistryError>,
+    ) {
+        match result {
+            Ok(Some(marker)) => {
+                tracing::debug!(image, marker, "cached image runtime marker for dispatch");
+                self.record_image_runtime(image, marker).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::trace!(
+                    image,
+                    error = %e,
+                    "failed to inspect image runtime marker — dispatch unaffected",
+                );
+            }
+        }
     }
 
     /// Apply the result of a manifest OS inspection to the image-OS cache.
@@ -180,14 +222,31 @@ impl CompositeRuntime {
     /// specs without a platform — producing cryptic downstream errors when the
     /// image-OS cache said `Linux`. We now return `RouteToPeer` in both cases.
     async fn select_for(&self, service: &str, spec: &ServiceSpec) -> Result<DispatchTarget> {
-        // Opt-in Apple-Virtualization: a service labelled `com.zlayer.isolation=vz`
-        // routes to the VZ delegate (native-macOS guest VMs). Checked first so it
-        // overrides the platform/image-OS dispatch below.
+        // Explicit per-service isolation label wins over everything below.
+        //   `com.zlayer.isolation=vz`               -> VZ (native-macOS guest VM)
+        //   `com.zlayer.isolation=sandbox|seatbelt` -> Seatbelt sandbox (primary),
+        //                                              opting OUT of VZ auto-detect.
+        if let Some(label) = spec.labels.get("com.zlayer.isolation") {
+            if self.vz.is_some() && label.eq_ignore_ascii_case("vz") {
+                return Ok(DispatchTarget::Vz);
+            }
+            if label.eq_ignore_ascii_case("sandbox") || label.eq_ignore_ascii_case("seatbelt") {
+                return Ok(DispatchTarget::Primary);
+            }
+        }
+
+        // Auto-detect a VZ base bundle: when the image's manifest carries
+        // `com.zlayer.runtime=vz` (stamped by `zlayer vz build-base`), prefer the
+        // VZ runtime — it is the only runtime that can boot such a bundle. This
+        // is the "prefer VZ by default" behaviour: it only fires for genuine VZ
+        // bundles, so Seatbelt-rootfs and Linux images are unaffected.
         if self.vz.is_some()
-            && spec
-                .labels
-                .get("com.zlayer.isolation")
-                .is_some_and(|v| v.eq_ignore_ascii_case("vz"))
+            && self
+                .image_runtime
+                .read()
+                .await
+                .get(&spec.image.name.to_string())
+                .is_some_and(|m| m.eq_ignore_ascii_case(zlayer_registry::ZLAYER_RUNTIME_VZ))
         {
             return Ok(DispatchTarget::Vz);
         }
@@ -319,6 +378,9 @@ impl Runtime for CompositeRuntime {
         // failure here just means dispatch falls through to primary.
         let os_result = zlayer_registry::fetch_image_os(image, None).await;
         self.apply_image_os_inspection(image, os_result).await;
+        let marker_result = zlayer_registry::fetch_image_runtime_marker(image, None).await;
+        self.apply_image_runtime_inspection(image, marker_result)
+            .await;
 
         Ok(())
     }
@@ -357,6 +419,9 @@ impl Runtime for CompositeRuntime {
 
         let os_result = zlayer_registry::fetch_image_os(image, auth).await;
         self.apply_image_os_inspection(image, os_result).await;
+        let marker_result = zlayer_registry::fetch_image_runtime_marker(image, auth).await;
+        self.apply_image_runtime_inspection(image, marker_result)
+            .await;
 
         Ok(())
     }
@@ -582,6 +647,7 @@ mod tests {
     enum Role {
         Primary,
         Delegate,
+        Vz,
     }
 
     /// One recorded invocation: (runtime role, method name, container id).
@@ -624,6 +690,7 @@ mod tests {
                     runtime: match self.role {
                         Role::Primary => "primary-mock".to_string(),
                         Role::Delegate => "delegate-mock".to_string(),
+                        Role::Vz => "vz-mock".to_string(),
                     },
                     expected: expected.to_string(),
                     actual: actual.to_string(),
@@ -956,6 +1023,93 @@ services:
             role_for(&calls, "create_container"),
             Some(Role::Delegate),
             "image-OS cache should route Linux images to the delegate"
+        );
+    }
+
+    /// Composite with primary + delegate + an attached VZ delegate, all sharing
+    /// one call log.
+    fn make_composite_with_vz() -> (CompositeRuntime, CallLog) {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary = Arc::new(MockRuntime::new(Role::Primary, Arc::clone(&calls)));
+        let delegate =
+            Arc::new(MockRuntime::new(Role::Delegate, Arc::clone(&calls))) as Arc<dyn Runtime>;
+        let vz = Arc::new(MockRuntime::new(Role::Vz, Arc::clone(&calls))) as Arc<dyn Runtime>;
+        let rt = CompositeRuntime::new(primary as Arc<dyn Runtime>, Some(delegate))
+            .with_vz_delegate(Some(vz));
+        (rt, calls)
+    }
+
+    #[tokio::test]
+    async fn dispatch_vz_bundle_annotation_auto_routes_to_vz() {
+        let (rt, calls) = make_composite_with_vz();
+        let id = cid("mac-svc", 0);
+        let image = "ghcr.io/org/macos-vz:sequoia";
+        // Simulate the manifest inspection having cached `com.zlayer.runtime=vz`.
+        rt.record_image_runtime(image, "vz".to_string()).await;
+
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Vz),
+            "a com.zlayer.runtime=vz bundle should auto-route to the VZ runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_vz_label_forces_vz() {
+        let (rt, calls) = make_composite_with_vz();
+        let id = cid("mac-svc", 0);
+        let mut spec = make_spec("ghcr.io/org/whatever:1", None);
+        spec.labels
+            .insert("com.zlayer.isolation".to_string(), "vz".to_string());
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Vz),
+            "an explicit com.zlayer.isolation=vz label should force the VZ runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_sandbox_label_overrides_vz_bundle() {
+        let (rt, calls) = make_composite_with_vz();
+        let id = cid("mac-svc", 0);
+        let image = "ghcr.io/org/macos-vz:sequoia";
+        rt.record_image_runtime(image, "vz".to_string()).await;
+
+        let mut spec = make_spec(image, None);
+        spec.labels
+            .insert("com.zlayer.isolation".to_string(), "sandbox".to_string());
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Primary),
+            "com.zlayer.isolation=sandbox should opt out of VZ auto-detect (force the sandbox)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unmarked_image_with_vz_delegate_falls_through_to_primary() {
+        let (rt, calls) = make_composite_with_vz();
+        let id = cid("mac-svc", 0);
+        // No runtime marker, no platform, no image-OS cache: VZ must NOT capture
+        // ordinary images just because the delegate exists.
+        let spec = make_spec("ghcr.io/org/plain:1", None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Primary),
+            "an unmarked image must fall through to primary even when a VZ delegate is attached"
         );
     }
 

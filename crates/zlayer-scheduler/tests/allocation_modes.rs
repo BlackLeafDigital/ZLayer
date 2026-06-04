@@ -161,6 +161,82 @@ fn shared_mode_pack_affinity_concentrates() {
     );
 }
 
+/// Mirror of the leader fan-out in
+/// `RaftCluster::dispatch_scale_distributed`: place the replicas, then group
+/// the decisions into a `node_id -> count` map (one `dispatch_scale` call per
+/// node). This is the exact step the `cluster_scaling` bug skipped — the leader
+/// dispatched every replica to itself instead of grouping per node.
+///
+/// Contract proven here:
+///   1. `affinity: spread` yields >= 2 distinct target nodes.
+///   2. The per-node counts sum to the total replica count (no replica lost or
+///      double-dispatched).
+///   3. `affinity: pack` (and the default `None`) concentrate onto <= 2 nodes.
+fn group_per_node(decisions: &[PlacementDecision]) -> std::collections::HashMap<u64, u32> {
+    let mut per_node: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for d in decisions {
+        if let Some(node_id) = d.node_id {
+            *per_node.entry(node_id).or_insert(0) += 1;
+        }
+    }
+    per_node
+}
+
+#[test]
+fn distributed_dispatch_spread_splits_across_at_least_two_nodes() {
+    let mut nodes = vec![
+        make_node(1, 10.0, 16 * GIB),
+        make_node(2, 10.0, 16 * GIB),
+        make_node(3, 10.0, 16 * GIB),
+    ];
+    let mut placements = PlacementState::new();
+    let spec = make_spec_affinity(Some(1.0), GroupAffinity::Spread);
+
+    let decisions = place_service_replicas("web", &spec, 3, &mut nodes, &mut placements);
+    let per_node = group_per_node(&decisions);
+
+    // (1) spread => at least two distinct nodes get a share. This is the exact
+    // assertion the e2e `cluster_scaling` suite makes
+    // (`distinct={'1'}` failure before the fix).
+    assert!(
+        per_node.len() >= 2,
+        "spread must fan out across >= 2 nodes; got per-node {per_node:?}"
+    );
+    // (2) the dispatched counts sum to the requested replica total.
+    let total: u32 = per_node.values().sum();
+    assert_eq!(
+        total, 3,
+        "sum of per-node dispatch counts must equal total replicas; got {per_node:?}"
+    );
+}
+
+#[test]
+fn distributed_dispatch_pack_concentrates_but_preserves_total() {
+    let mut nodes = vec![
+        make_node(1, 10.0, 16 * GIB),
+        make_node(2, 10.0, 16 * GIB),
+        make_node(3, 10.0, 16 * GIB),
+    ];
+    let mut placements = PlacementState::new();
+    // Default affinity is Pack (None). Use an explicit Pack to be unambiguous.
+    let spec = make_spec_affinity(Some(1.0), GroupAffinity::Pack);
+
+    let decisions = place_service_replicas("web", &spec, 3, &mut nodes, &mut placements);
+    let per_node = group_per_node(&decisions);
+
+    // (3) pack concentrates onto few nodes...
+    assert!(
+        per_node.len() <= 2,
+        "pack must concentrate onto <= 2 nodes; got per-node {per_node:?}"
+    );
+    // ...without ever dropping a replica from the fan-out.
+    let total: u32 = per_node.values().sum();
+    assert_eq!(
+        total, 3,
+        "sum of per-node dispatch counts must equal total replicas; got {per_node:?}"
+    );
+}
+
 /// Capacity always wins over affinity: a `pack`/default service whose
 /// per-replica CPU footprint exceeds a single node's headroom is forced to
 /// spread, mirroring the user's "2 CPU replica on a 2-CPU node" example —

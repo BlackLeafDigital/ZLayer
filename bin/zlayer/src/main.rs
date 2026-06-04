@@ -970,6 +970,8 @@ async fn run(
         }
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         Commands::Windows(cmd) => commands::windows::handle(cmd).await,
+        #[cfg(target_os = "macos")]
+        Commands::Vz(cmd) => commands::vz::handle_vz(&cli, cmd).await,
         #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
         Commands::Runtime { global, command } => commands::runtime::handle(global, command).await,
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,

@@ -42,7 +42,13 @@
 set -uo pipefail
 
 # Auto-detect the MiniWindows host if not overridden.
+# The box's interactive SSH user is `Admin` (the `MiniWindows@` aliases below
+# are kept only as fallbacks for older provisioning). Probed 2026-06-04:
+# only Admin@miniwindows.net.home answered, so it leads the list.
 DEFAULT_WIN_HOSTS=(
+  "Admin@miniwindows.net.home"
+  "Admin@192.168.68.92"
+  "Admin@100.96.69.45"
   "MiniWindows@192.168.68.92"
   "MiniWindows@100.96.69.45"
   "MiniWindows@miniwindows.net.home"

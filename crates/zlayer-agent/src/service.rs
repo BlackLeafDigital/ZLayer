@@ -1885,9 +1885,9 @@ impl ServiceManager {
     }
 
     /// Scale a service. Cluster-aware: if this node has a `Cluster` handle
-    /// and we're not the leader, forward to the leader; if leader, dispatch
-    /// via the cluster's placement layer (Phase 1 sends to every peer that
-    /// gets a share); else (single-node) just scale locally.
+    /// and we're not the leader, forward to the leader; if leader, compute
+    /// affinity-aware placement and dispatch each node its share via
+    /// `dispatch_scale_distributed`; else (single-node) just scale locally.
     ///
     /// # Errors
     /// Returns an error if scaling fails on any participating node.
@@ -1926,18 +1926,17 @@ impl ServiceManager {
                     });
             }
 
-            // Leader path. For Phase 1 we keep the placement logic in the
-            // scheduler layer (called externally); here we just send the
-            // legacy `{service, replicas}` shape to every node and let the
-            // scheduler fan it out. The scheduler-side wrapper handles the
-            // actual per-node split — that lands in a follow-up.
-            //
-            // In Phase 1 single-cluster setups, leader dispatch reduces to
-            // `dispatch_scale(self_node_id, req)` which short-circuits to
-            // local. The full scheduler-driven fan-out wires up once
-            // `Scheduler::scale_service_distributed` is exposed.
+            // Leader path. Compute affinity-aware placement across the Ready
+            // node set and dispatch each node its share. `dispatch_scale_distributed`
+            // reuses the same placement machinery as one-off container placement
+            // (`cluster_nodes_to_node_states` + `place_service_replicas`), honoring
+            // `ServiceSpec.affinity` (`spread`/`pack`/`pin`). The leader's own
+            // share short-circuits to a local call (no localhost HTTP round-trip),
+            // and the attached spec lets fresh workers register the service before
+            // scaling. Single-node clusters fall through the default impl, which
+            // dispatches everything to this node (unchanged behavior).
             return cluster
-                .dispatch_scale(cluster.node_id(), build_req(replicas))
+                .dispatch_scale_distributed(build_req(replicas))
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: name.to_string(),

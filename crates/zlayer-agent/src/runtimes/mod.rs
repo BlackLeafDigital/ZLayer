@@ -139,6 +139,13 @@ pub mod macos_vm;
 #[cfg(target_os = "macos")]
 pub mod macos_vz;
 
+// Producer for VZ base-image bundles: drives a macOS `.ipsw` restore through
+// `VZMacOSInstaller` to mint a Tart-style bundle (`disk.img`,
+// `hardware-model.bin`, `aux.img`) that `macos_vz` can pull. Used by
+// `zlayer vz build-base`.
+#[cfg(target_os = "macos")]
+pub mod macos_vz_build;
+
 // HCS-backed native Windows container runtime. Compiled only on Windows
 // because it depends on the `zlayer-hcs` crate and the `crate::windows`
 // submodule, both of which are Windows-only.

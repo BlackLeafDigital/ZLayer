@@ -177,6 +177,31 @@ pub trait Cluster: Send + Sync {
         &self,
         spec: &zlayer_spec::ServiceSpec,
     ) -> Result<Option<ContainerPlacement>, ClusterError>;
+
+    /// Dispatch a service scale across the cluster, computing affinity-aware
+    /// per-node placement and fanning out one [`dispatch_scale`] call per node
+    /// with a non-zero share.
+    ///
+    /// `req` carries the desired total `replicas` (and an optional spec used to
+    /// register/update the service on each receiving node). The leader's own
+    /// share short-circuits to a local call (no localhost HTTP round-trip),
+    /// because per-node dispatch goes through [`dispatch_scale`], which already
+    /// routes `self.node_id()` through the local-dispatch closure.
+    ///
+    /// The default implementation preserves the legacy single-target behavior:
+    /// dispatch the whole request to this node. Multi-node clusters
+    /// ([`RaftCluster`]) override this to distribute across Ready peers.
+    ///
+    /// [`dispatch_scale`]: Cluster::dispatch_scale
+    async fn dispatch_scale_distributed(
+        &self,
+        req: InternalScaleRequest,
+    ) -> Result<(), ClusterError> {
+        // Default: no distribution — everything runs on this node. Single-node,
+        // static, and worker-tier clusters keep their existing semantics.
+        let target = self.node_id();
+        self.dispatch_scale(target, req).await
+    }
 }
 
 /// Build a single-node [`placement::NodeState`] from an OS string (the only
@@ -516,6 +541,75 @@ impl Cluster for RaftCluster {
             api_base_url: format!("http://{host}:{port}"),
             is_self: target == self.node_id,
         }))
+    }
+
+    /// Compute affinity-aware placement across the Ready raft node set and
+    /// dispatch each node its share of the replicas.
+    ///
+    /// Placement reuses the exact same machinery as [`place_container`]:
+    /// [`cluster_nodes_to_node_states`] over live raft state, then
+    /// [`place_service_replicas`], which honors `ServiceSpec.affinity`
+    /// (`Spread`/`Pack`/`Pin`) and reserves CPU/mem per replica so successive
+    /// replicas spread. Decisions are grouped into a `node_id -> count` map and
+    /// fanned out via [`dispatch_scale`] — the leader's own share short-circuits
+    /// to a local call there.
+    ///
+    /// Falls back to dispatching the whole request to this node when no Ready
+    /// node could be placed (e.g. raft state momentarily empty), preserving the
+    /// previous "all on leader" behavior rather than dropping the scale.
+    ///
+    /// [`place_container`]: RaftCluster::place_container
+    /// [`cluster_nodes_to_node_states`]: crate::cluster_nodes_to_node_states
+    /// [`place_service_replicas`]: crate::placement::place_service_replicas
+    /// [`dispatch_scale`]: Cluster::dispatch_scale
+    #[allow(clippy::cast_possible_truncation)]
+    async fn dispatch_scale_distributed(
+        &self,
+        req: InternalScaleRequest,
+    ) -> Result<(), ClusterError> {
+        // Prefer the spec attached to the wire request (the leader's live spec,
+        // carrying `affinity`); fall back to a default when absent. `spec` is
+        // boxed on the wire; deref to a `&ServiceSpec` for placement.
+        let spec: zlayer_spec::ServiceSpec = req.spec.as_deref().cloned().unwrap_or_default();
+        let replicas = req.replicas;
+
+        let state = self.raft.read_state().await;
+        let mut nodes = crate::cluster_nodes_to_node_states(&state.nodes);
+        let mut placements = crate::placement::PlacementState::new();
+        let decisions = crate::placement::place_service_replicas(
+            &req.service,
+            &spec,
+            replicas,
+            &mut nodes,
+            &mut placements,
+        );
+
+        // Group successful placements into a per-node replica count.
+        let mut per_node: HashMap<NodeId, u32> = HashMap::new();
+        for decision in &decisions {
+            if let Some(node_id) = decision.node_id {
+                *per_node.entry(node_id).or_insert(0) += 1;
+            }
+        }
+
+        if per_node.is_empty() {
+            // Nothing placed (no Ready node matched). Preserve prior behavior:
+            // run the whole scale on the leader rather than silently dropping it.
+            return self.dispatch_scale(self.node_id, req).await;
+        }
+
+        // Fan out: one dispatch per node with a non-zero share. Each carries
+        // that node's count plus the spec, so a fresh worker can register the
+        // service before scaling. The leader's own share short-circuits to a
+        // local call inside `dispatch_scale`.
+        for (node_id, count) in per_node {
+            let mut node_req = InternalScaleRequest::new(&req.service, count);
+            if let Some(spec) = req.spec.as_deref() {
+                node_req = node_req.with_spec(spec.clone());
+            }
+            self.dispatch_scale(node_id, node_req).await?;
+        }
+        Ok(())
     }
 }
 

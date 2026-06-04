@@ -1,0 +1,93 @@
+name: macOS VZ Base Images
+
+# Builds and publishes macOS **guest VM** base bundles for the Apple-
+# Virtualization (VZ) runtime (crates/zlayer-agent/src/runtimes/macos_vz.rs).
+# These are NOT the Seatbelt sandbox images built by `macos-images.yml`; they
+# are full-OS Tart-style bundles (disk.img + hardware-model.bin + aux.img)
+# minted by `zlayer vz build-base`, which drives a macOS `.ipsw` restore through
+# VZMacOSInstaller (~20-40 min) on a signed binary.
+#
+# Manual only (workflow_dispatch): building a macOS guest requires the
+# `com.apple.security.virtualization` entitlement, an Apple-Silicon runner, a
+# multi-GB `.ipsw`, and a long install — too heavy/expensive to schedule.
+
+on:
+  workflow_dispatch:
+    inputs:
+      latest:
+        description: 'Fetch the latest host-supported restore image from Apple'
+        required: false
+        type: boolean
+        default: true
+      ipsw_url:
+        description: 'Explicit .ipsw URL (used when "latest" is false)'
+        required: false
+        type: string
+        default: ''
+      os_tag:
+        description: 'Image tag for the published bundle (e.g. sequoia, sonoma)'
+        required: false
+        type: string
+        default: 'sequoia'
+      disk_size_gib:
+        description: 'Blank system-disk size in GiB (sparse)'
+        required: false
+        type: string
+        default: '50'
+
+env:
+  REGISTRY: ghcr.io/blackleafdigital/zlayer
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-push:
+    name: Build & Push macOS VZ Base Image
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Build zlayer
+        run: cargo build --release -p zlayer
+
+      - name: Sign binary with virtualization entitlement
+        run: ./scripts/sign-vz.sh ./target/release/zlayer
+
+      - name: Verify Virtualization.framework is available
+        run: |
+          # Surfaces an actionable error early if the runner can't virtualize
+          # (non-Apple-Silicon / missing entitlement) before the long install.
+          ./target/release/zlayer vz build-base --help >/dev/null
+
+      - name: Build and push macOS VZ base bundle
+        env:
+          ZLAYER_REGISTRY_USERNAME: ${{ github.actor }}
+          ZLAYER_REGISTRY_PASSWORD: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="${REGISTRY}/macos-vz:${{ inputs.os_tag }}"
+          echo "Publishing VZ base bundle to ${REF}"
+
+          ARGS=(vz build-base
+            --output ./macos-vz-base
+            --disk-size-gib "${{ inputs.disk_size_gib }}"
+            --push "${REF}")
+
+          if [[ "${{ inputs.latest }}" == "true" ]]; then
+            ARGS+=(--latest)
+          else
+            if [[ -z "${{ inputs.ipsw_url }}" ]]; then
+              echo "::error::Provide ipsw_url when 'latest' is false" >&2
+              exit 1
+            fi
+            ARGS+=(--ipsw "${{ inputs.ipsw_url }}")
+          fi
+
+          ./target/release/zlayer "${ARGS[@]}"

@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.12 - 2026-06-04
+
+### Added
+- **VZ base-image builder (`zlayer vz build-base`).** New producer for the macOS VZ runtime's base
+  bundles (`crates/zlayer-agent/src/runtimes/macos_vz_build.rs`): drives a macOS `.ipsw` restore image
+  through `VZMacOSRestoreImage` + `VZMacOSInstaller` to mint a Tart-style bundle (`disk.img` +
+  `hardware-model.bin` + `aux.img`) the runtime can pull. Supports `--ipsw <path|url>` or `--latest`
+  (fetch the host's latest supported restore image), with `--disk-size-gib`/`--cpus`/`--memory-mib`
+  overrides. With `--push <ref>` it packs the bundle into a single `tar+zstd` OCI layer
+  (`zlayer-registry::pack::pack_files_tar_zstd`) and publishes it via the new generic
+  `ImagePuller::push_artifact`, stamping the manifest annotation `com.zlayer.runtime=vz`. The install
+  reuses the runtime's proven queue/`build_configuration`/`block2`→channel FFI machinery. Pure helpers
+  are unit-tested; the multi-GB install is an `#[ignore]`d integration test (set `ZLAYER_TEST_IPSW`).
+- **`.forgejo/workflows/macos-vz-images.yml`** — manual (`workflow_dispatch`) pipeline that builds +
+  ad-hoc-signs `zlayer` on a macOS runner and publishes a VZ base bundle to GHCR. Distinct from
+  `macos-images.yml` (which builds Seatbelt sandbox rootfs images).
+
+### Changed
+- **VZ runtime is now preferred automatically for VZ base bundles.** The composite runtime's
+  `select_for` reads the `com.zlayer.runtime=vz` manifest annotation (cached during `pull_image*` via
+  the new `zlayer_registry::fetch_image_runtime_marker`) and routes such images to the VZ runtime —
+  the only runtime that can boot them. This is non-breaking: it fires only for genuine VZ bundles, so
+  Seatbelt-rootfs and Linux images are unaffected (Linux still routes to the libkrun delegate / a
+  peer). The per-service label still wins: `com.zlayer.isolation=vz` forces VZ; `=sandbox`/`=seatbelt`
+  forces the Seatbelt sandbox even for a VZ-annotated image.
+
+### Fixed
+- **Raft `cluster_scaling`: replicas now spread across the cluster on deploy.** The leader's
+  `ServiceManager::scale_service` previously dispatched **all** replicas to itself
+  (`dispatch_scale(self_node_id, …)`, a never-finished "Phase 1" placeholder), so affinity-aware
+  placement never ran on `zlayer deploy` and a 3-replica `affinity: spread` service piled onto node 1.
+  Added `Cluster::dispatch_scale_distributed` — `RaftCluster` computes affinity-aware placement
+  (`place_service_replicas` over live raft node state, honoring `Spread`/`Pack`/`Pin`) and fans out
+  one scale per node with its share (each carrying the spec; the leader's own share short-circuits to a
+  local call). `SingleNodeCluster`/`StaticCluster`/`WorkerTierCluster` keep their dispatch-to-self
+  behavior via the trait's default. This was the last `raft-e2e` ship-blocker (the companion
+  `cluster_upgrade` spec-propagation fix already passes in CI).
+
 ## 0.52.11 - 2026-06-04
 
 ### Added

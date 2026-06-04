@@ -1127,6 +1127,70 @@ pub(crate) enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// macOS Apple-Virtualization (VZ) base-image tooling.
+    ///
+    /// Builds and publishes the native-macOS guest bundles the VZ runtime
+    /// consumes. macOS-only.
+    #[cfg(target_os = "macos")]
+    #[command(subcommand, display_order = 52)]
+    Vz(VzCommands),
+}
+
+/// macOS VZ base-image subcommands.
+#[cfg(target_os = "macos")]
+#[derive(Debug, clap::Subcommand)]
+pub enum VzCommands {
+    /// Build a macOS VZ base-image bundle from a `.ipsw` restore image and,
+    /// optionally, push it to an OCI registry.
+    ///
+    /// The result is a Tart-style bundle (`disk.img`, `hardware-model.bin`,
+    /// `aux.img`) the VZ runtime can pull. Requires a signed binary
+    /// (`make build` / `scripts/sign-vz.sh`) for the virtualization
+    /// entitlement, and runs the macOS installer (~20-40 min).
+    ///
+    /// Examples:
+    ///   zlayer vz build-base --ipsw ~/UniversalMac.ipsw --output ./macos-base
+    ///   zlayer vz build-base --latest --push ghcr.io/org/macos-vz:sequoia
+    BuildBase {
+        /// Path or URL to a macOS `.ipsw` restore image. Mutually exclusive
+        /// with `--latest`.
+        #[arg(long, value_name = "PATH_OR_URL")]
+        ipsw: Option<String>,
+
+        /// Fetch the latest host-supported restore image from Apple instead of
+        /// supplying `--ipsw`.
+        #[arg(long, conflicts_with = "ipsw")]
+        latest: bool,
+
+        /// Output bundle directory.
+        #[arg(long, short = 'o', default_value = "./macos-vz-base")]
+        output: PathBuf,
+
+        /// Blank system-disk size in GiB (created sparse).
+        #[arg(long, default_value_t = 50)]
+        disk_size_gib: u64,
+
+        /// vCPU count for the install VM (default: the image's minimum).
+        #[arg(long)]
+        cpus: Option<u32>,
+
+        /// Memory in MiB for the install VM (default: the image's minimum).
+        #[arg(long)]
+        memory_mib: Option<u32>,
+
+        /// Push the built bundle to this OCI reference after building.
+        #[arg(long, value_name = "REFERENCE")]
+        push: Option<String>,
+
+        /// Registry username (or set `ZLAYER_REGISTRY_USERNAME`).
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Registry password (or set `ZLAYER_REGISTRY_PASSWORD`).
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 /// Windows-only maintenance commands. Currently exposes VHDX compaction;

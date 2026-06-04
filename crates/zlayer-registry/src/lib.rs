@@ -13,6 +13,7 @@ pub mod cache_config;
 pub mod client;
 pub mod error;
 pub mod image_config;
+pub mod pack;
 pub mod unpack;
 pub mod wasm;
 
@@ -39,7 +40,17 @@ pub use cache_config::CacheType;
 pub use client::*;
 pub use error::*;
 pub use image_config::{ImageConfig, ImageHealthcheck};
+pub use pack::pack_files_tar_zstd;
 pub use unpack::*;
+
+/// OCI manifest annotation key marking an image as a runtime-specific bundle.
+///
+/// Published by `zlayer vz build-base` (value [`ZLAYER_RUNTIME_VZ`]) and read by
+/// the agent's composite runtime (`crates/zlayer-agent/src/runtimes/composite.rs`)
+/// to auto-detect a macOS VZ base bundle and prefer the VZ runtime for it.
+pub const ZLAYER_RUNTIME_ANNOTATION: &str = "com.zlayer.runtime";
+/// [`ZLAYER_RUNTIME_ANNOTATION`] value for a macOS Apple-Virtualization bundle.
+pub const ZLAYER_RUNTIME_VZ: &str = "vz";
 pub use wasm::*;
 
 #[cfg(feature = "persistent")]

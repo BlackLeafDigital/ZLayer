@@ -13,6 +13,10 @@ pub mod wasm;
 #[cfg(all(target_os = "windows", feature = "wsl"))]
 pub mod windows;
 
+// macOS-only Apple-Virtualization (VZ) base-image tooling (`zlayer vz`).
+#[cfg(target_os = "macos")]
+pub mod vz;
+
 // Linux-only `zlayer runtime` runc-compatible CLI surface used by
 // `Wsl2DelegateRuntime` to drive containers inside the `zlayer` WSL2 distro.
 // Hidden from top-level `--help`; not a user-facing surface.

@@ -97,6 +97,33 @@ pub struct PushResult {
     pub reference: String,
 }
 
+/// One layer to publish as part of a generic OCI artifact via
+/// [`ImagePuller::push_artifact`]. `data` must already be in its final
+/// (compressed) form; the digest is computed over exactly these bytes.
+#[cfg(feature = "local")]
+#[derive(Debug, Clone)]
+pub struct ArtifactLayer {
+    /// Raw layer bytes (already compressed, matching `media_type`).
+    pub data: Vec<u8>,
+    /// OCI media type for the layer (e.g.
+    /// `application/vnd.oci.image.layer.v1.tar+zstd`).
+    pub media_type: String,
+    /// Optional `org.opencontainers.image.title` annotation — a filename hint
+    /// surfaced to tooling that inspects the layer.
+    pub title: Option<String>,
+}
+
+/// Compute the `sha256:<hex>` content digest of a blob, as expected by the
+/// OCI distribution API.
+#[cfg(feature = "local")]
+#[must_use]
+pub fn oci_sha256_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
 /// Map Rust architecture names to Go/OCI architecture names.
 fn go_arch_name() -> &'static str {
     match std::env::consts::ARCH {
@@ -1273,6 +1300,25 @@ impl ImagePuller {
             .and_then(zlayer_spec::OsKind::from_oci_str))
     }
 
+    /// Read the [`crate::ZLAYER_RUNTIME_ANNOTATION`] manifest annotation, used by
+    /// the agent's composite runtime to auto-detect runtime-specific bundles
+    /// (e.g. a macOS VZ base bundle published by `zlayer vz build-base`, which
+    /// stamps `com.zlayer.runtime=vz`). Returns `Ok(None)` for ordinary images.
+    ///
+    /// # Errors
+    /// Returns an error if the manifest cannot be fetched or parsed.
+    pub async fn image_runtime_marker(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Option<String>> {
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+        Ok(manifest
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(crate::ZLAYER_RUNTIME_ANNOTATION).cloned()))
+    }
+
     /// Fetch the `os.version` string carried by `image`'s OCI config blob.
     ///
     /// For Windows images this corresponds to the host build identifier
@@ -2047,6 +2093,146 @@ impl ImagePuller {
             reference: reference.to_string(),
         })
     }
+
+    /// Push a generic OCI artifact: a config blob plus an ordered set of
+    /// [`ArtifactLayer`]s, with arbitrary manifest-level annotations.
+    ///
+    /// This is the registry-agnostic primitive behind `zlayer vz build-base`,
+    /// which publishes a macOS VZ base bundle (`disk.img`, `hardware-model.bin`,
+    /// `aux.img`) packed by [`crate::pack::pack_files_tar_zstd`] as a single
+    /// `tar+zstd` layer. The manifest annotations carry the routing marker
+    /// (`com.zlayer.runtime=vz`) the agent's composite runtime reads to prefer
+    /// the VZ runtime for that image.
+    ///
+    /// Blob digests are computed here over the exact bytes provided. `oci-client`
+    /// 0.15 has no streaming blob upload, so each blob is held in memory during
+    /// its (chunked-over-the-wire) push; size the host accordingly for
+    /// multi-gigabyte disk layers.
+    ///
+    /// # Errors
+    /// Returns [`PushError`] on an invalid reference, auth failure, or a blob /
+    /// manifest upload failure.
+    #[cfg(feature = "local")]
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(name = "push_artifact", skip(self, config_blob, layers, annotations, auth), fields(reference = %reference, artifact_type = %artifact_type, layers = layers.len()))]
+    pub async fn push_artifact(
+        &self,
+        reference: &str,
+        artifact_type: &str,
+        config_media_type: &str,
+        config_blob: &[u8],
+        layers: &[ArtifactLayer],
+        annotations: std::collections::BTreeMap<String, String>,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<PushResult, PushError> {
+        let image_ref: Reference = reference.parse().map_err(|_| PushError::InvalidReference {
+            reference: reference.to_string(),
+        })?;
+
+        self.client
+            .auth(&image_ref, auth, RegistryOperation::Push)
+            .await
+            .map_err(|e| PushError::AuthenticationFailed {
+                registry: image_ref.resolve_registry().to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let mut blobs_pushed = Vec::new();
+
+        // --- config blob ---
+        let config_digest = oci_sha256_digest(config_blob);
+        self.client
+            .push_blob(&image_ref, config_blob, &config_digest)
+            .await
+            .map_err(|e| PushError::BlobUploadFailed {
+                digest: config_digest.clone(),
+                reason: e.to_string(),
+            })?;
+        blobs_pushed.push(config_digest.clone());
+
+        // --- layer blobs ---
+        let mut layer_descriptors = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let digest = oci_sha256_digest(&layer.data);
+            tracing::debug!(
+                digest = %digest,
+                size = layer.data.len(),
+                media_type = %layer.media_type,
+                "pushing artifact layer blob"
+            );
+            self.client
+                .push_blob(&image_ref, &layer.data, &digest)
+                .await
+                .map_err(|e| PushError::BlobUploadFailed {
+                    digest: digest.clone(),
+                    reason: e.to_string(),
+                })?;
+            blobs_pushed.push(digest.clone());
+
+            let layer_annotations = layer.title.as_ref().map(|title| {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("org.opencontainers.image.title".to_string(), title.clone());
+                m
+            });
+            #[allow(clippy::cast_possible_wrap)]
+            layer_descriptors.push(oci_client::manifest::OciDescriptor {
+                media_type: layer.media_type.clone(),
+                digest,
+                size: layer.data.len() as i64,
+                urls: None,
+                annotations: layer_annotations,
+            });
+        }
+
+        let manifest_annotations = if annotations.is_empty() {
+            None
+        } else {
+            Some(annotations)
+        };
+
+        #[allow(clippy::cast_possible_wrap)]
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            artifact_type: Some(artifact_type.to_string()),
+            config: oci_client::manifest::OciDescriptor {
+                media_type: config_media_type.to_string(),
+                digest: config_digest.clone(),
+                size: config_blob.len() as i64,
+                urls: None,
+                annotations: None,
+            },
+            layers: layer_descriptors,
+            annotations: manifest_annotations,
+            subject: None,
+        };
+
+        let manifest_url = self
+            .client
+            .push_manifest(&image_ref, &OciManifest::Image(manifest))
+            .await
+            .map_err(|e| PushError::ManifestUploadFailed {
+                reason: e.to_string(),
+            })?;
+
+        let manifest_digest = manifest_url
+            .rfind('@')
+            .map(|i| manifest_url[i + 1..].to_string())
+            .unwrap_or(manifest_url);
+
+        tracing::info!(
+            reference = %reference,
+            manifest_digest = %manifest_digest,
+            blobs_pushed = blobs_pushed.len(),
+            "OCI artifact pushed successfully"
+        );
+
+        Ok(PushResult {
+            manifest_digest,
+            blobs_pushed,
+            reference: reference.to_string(),
+        })
+    }
 }
 
 /// Image reference information
@@ -2280,6 +2466,24 @@ pub async fn fetch_image_os(
 
     let oci_auth = spec_auth_to_oci(auth);
     puller.image_os(image, &oci_auth).await
+}
+
+/// Convenience wrapper around [`ImagePuller::image_runtime_marker`] using a
+/// fresh default [`BlobCache`]. Returns the `com.zlayer.runtime` manifest
+/// annotation (e.g. `"vz"`) if present, else `Ok(None)`.
+///
+/// # Errors
+/// Returns an error if a blob cache cannot be created, or the manifest cannot
+/// be fetched/parsed.
+pub async fn fetch_image_runtime_marker(
+    image: &str,
+    auth: Option<&zlayer_spec::RegistryAuth>,
+) -> Result<Option<String>> {
+    let cache = crate::cache::BlobCache::new()?;
+    let puller = ImagePuller::new(cache);
+
+    let oci_auth = spec_auth_to_oci(auth);
+    puller.image_runtime_marker(image, &oci_auth).await
 }
 
 #[cfg(test)]
