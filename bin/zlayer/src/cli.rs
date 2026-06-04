@@ -1418,6 +1418,23 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// INTERNAL: register the `zlayer-overlayd` system service (requires root).
+    ///
+    /// The rootless macOS install re-execs this under `sudo` ONLY when the
+    /// overlay binary or its plist actually changed, so registering the overlay
+    /// (which owns a system-level WireGuard/utun adapter) is the single
+    /// privileged step of an otherwise user-owned install. Not intended for
+    /// direct use.
+    #[command(name = "_install-overlayd", hide = true)]
+    InstallOverlayd {
+        /// Absolute path to the staged `zlayer-overlayd` binary to register.
+        #[arg(long)]
+        overlayd_bin: std::path::PathBuf,
+        /// Register the plist/unit without starting the service.
+        #[arg(long)]
+        no_start: bool,
+    },
 }
 
 /// Tunnel management subcommands

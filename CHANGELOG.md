@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.52.8 - 2026-06-03
+
+### Changed
+- **Rootless macOS daemon install.** `zlayer daemon install/uninstall/start/stop/restart/reset/migrate`
+  no longer self-elevate on macOS — the main daemon installs as a per-user launchd **Agent**
+  (`gui/$uid`, `~/Library/LaunchAgents`) writing only to user-owned `~/.zlayer`, with `RunAtLoad` +
+  `KeepAlive` so it's owned by launchd (survives closing the shell, auto-restarts, relaunches at
+  login). The plist omits `GroupName` when non-root (a per-user Agent has no shared group; emitting it
+  made `launchctl bootstrap` fail `EX_CONFIG`). Root is now acquired **surgically and only when the
+  overlay system service actually changed**: a new change-gate (`overlayd_service_is_current`) compares
+  the installed `/Library/LaunchDaemons/com.zlayer.overlayd.plist` text + the overlayd binary's
+  SHA-256 + `launchctl print` liveness and skips the step entirely (no sudo) when unchanged; otherwise
+  it re-execs a hidden `daemon _install-overlayd` under `sudo` and caches `{binary_sha256, plist_sha256}`
+  to user-owned `~/.zlayer/overlayd-service.json`. A daemon-only reinstall now prompts for nothing.
+  Installing on a box with a legacy *root* `system/com.zlayer.daemon` is reconciled in one surgical
+  sudo (boot it out, drop its system plist, `chown -R` the data dir back to the user). `uninstall`
+  cleans both the `gui/$uid` Agent and any legacy system daemon (+ the overlayd system service)
+  regardless of euid. (Linux/Windows daemon installs are unchanged in this release.)
+
+### Fixed
+- **`daemon install` readiness probe used the wrong socket.** `wait_for_daemon_ready` always probed
+  the platform-default socket, so installing with a custom `--data-dir`/`--socket` reported a 45s
+  timeout even though the daemon was healthy on its configured socket. It now probes the socket the
+  daemon was actually configured with.
+- **macOS install failure diagnostics name the cause.** On a start timeout the installer now asks
+  launchd why (`launchctl print gui/$uid/<label>`): exit code 78 is reported as `EX_CONFIG`
+  (unwritable log/socket or a stale `GroupName` group), and a same-label job loaded in the other
+  (system) domain is flagged — instead of a generic "failed to start within 45s".
+- **`install-dev.sh`** reclaims ownership of the full `~/.zlayer` (not just `secrets`) for home-based
+  installs, so the rootless daemon can write a tree left root-owned by a prior system install.
+
 ## 0.52.7 - 2026-06-03
 
 ### Added

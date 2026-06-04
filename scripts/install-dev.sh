@@ -313,14 +313,28 @@ maybe_sudo "${ZLAYER_DEV_DATA_DIR}" mkdir -p \
     "${ZLAYER_DEV_DATA_DIR}/cache" \
     "${ZLAYER_DEV_DATA_DIR}/tmp" \
     "${ZLAYER_DEV_DATA_DIR}/volumes"
-# The secrets dir (and possibly other subdirs) may be left root-owned by a
-# prior root/system daemon install; `install -d -m 0750` then fails with
-# "Operation not permitted" for this non-root dev install because maybe_sudo
-# does NOT sudo for $HOME paths. Reclaim ownership first when we don't own it.
-if [ -d "${ZLAYER_DEV_DATA_DIR}/secrets" ] && [ ! -O "${ZLAYER_DEV_DATA_DIR}/secrets" ]; then
-    echo "Reclaiming ownership of ${ZLAYER_DEV_DATA_DIR}/secrets (was root-owned)..."
-    sudo chown -R "$(id -un)" "${ZLAYER_DEV_DATA_DIR}/secrets" || true
-fi
+# A prior root/system daemon install may have left the data dir (or subdirs)
+# root-owned; `install -d -m 0750` and the daemon's own writes then fail with
+# "Operation not permitted" for this non-root install because maybe_sudo does
+# NOT sudo for $HOME paths. When the data dir lives under $HOME (the rootless
+# per-user layout) reclaim ownership of the WHOLE tree once, so every subsequent
+# step — and the rootless daemon itself — can write it. For a system data dir
+# (e.g. /var/lib/zlayer) only reclaim the secrets subdir, leaving the system
+# tree owned by the system service.
+case "${ZLAYER_DEV_DATA_DIR}" in
+    "${HOME}"/*)
+        if [ -d "${ZLAYER_DEV_DATA_DIR}" ] && [ ! -O "${ZLAYER_DEV_DATA_DIR}" ]; then
+            echo "Reclaiming ownership of ${ZLAYER_DEV_DATA_DIR} (was root-owned)..."
+            sudo chown -R "$(id -un)" "${ZLAYER_DEV_DATA_DIR}" || true
+        fi
+        ;;
+    *)
+        if [ -d "${ZLAYER_DEV_DATA_DIR}/secrets" ] && [ ! -O "${ZLAYER_DEV_DATA_DIR}/secrets" ]; then
+            echo "Reclaiming ownership of ${ZLAYER_DEV_DATA_DIR}/secrets (was root-owned)..."
+            sudo chown -R "$(id -un)" "${ZLAYER_DEV_DATA_DIR}/secrets" || true
+        fi
+        ;;
+esac
 maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0750 "${ZLAYER_DEV_DATA_DIR}/secrets"
 
 # --- Install service unit + daemon (opt-in) ---
@@ -365,8 +379,12 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
                 install ${DAEMON_INSTALL_FLAGS}
             ;;
         darwin)
-            # No sudo on macOS — the daemon installs into ~/Library/LaunchAgents
-            # for non-root users (see launchd_context() in daemon.rs).
+            # No sudo on macOS: `daemon install` is rootless — it registers a
+            # per-user launchd Agent under ~/Library/LaunchAgents writing only to
+            # ~/.zlayer (see launchd_context()/install() in daemon.rs). It self-
+            # elevates with a single surgical sudo ONLY if the overlay system
+            # service actually changed; a daemon-only reinstall prompts for
+            # nothing.
             # Intentional word-splitting of DAEMON_INSTALL_FLAGS below.
             # shellcheck disable=SC2086
             "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" \
