@@ -170,6 +170,13 @@ zstd = "0.13"
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+[target.'cfg(target_os="macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-virtualization = "0.3.2"
+
 [dev-dependencies]
 base64.workspace = true
 hex.workspace = true
