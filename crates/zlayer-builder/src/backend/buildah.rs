@@ -10,13 +10,13 @@ use std::sync::mpsc;
 
 use tracing::{debug, info};
 
-use crate::buildah::{BuildahCommand, BuildahExecutor};
+use crate::buildah::{BuildahCommand, BuildahExecutor, DockerfileTranslator};
 use crate::builder::{BuildOptions, BuiltImage, PullBaseMode, RegistryAuth};
 use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction, RunMount, Stage};
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 
-use super::BuildBackend;
+use super::{BuildBackend, ImageOs};
 
 // ---------------------------------------------------------------------------
 // LayerCacheTracker (moved from builder.rs)
@@ -379,6 +379,14 @@ impl BuildBackend for BuildahBackend {
         // Initialize the layer cache tracker for this build session.
         let mut cache_tracker = LayerCacheTracker::new();
 
+        // Build a translator configured for this build. The BuildahBackend is
+        // always Linux-targeted (Windows builds dispatch through HcsBackend),
+        // so we pin `ImageOs::Linux` here. `host_network` is forwarded from
+        // `BuildOptions` so the `--host-network` CLI flag actually reaches
+        // every translated `RUN` as `--net=host` on the buildah invocation.
+        let translator =
+            DockerfileTranslator::new(ImageOs::Linux).with_host_network(options.host_network);
+
         for (stage_idx, stage) in stages.iter().enumerate() {
             let is_final_stage = stage_idx == stages.len() - 1;
 
@@ -525,7 +533,15 @@ impl BuildBackend for BuildahBackend {
                     1
                 };
 
-                let commands = BuildahCommand::from_instruction(&container_id, instruction_ref);
+                // Construct a fresh translator per instruction so we
+                // preserve the historical byte-for-byte behavior of the
+                // pre-host-network `BuildahCommand::from_instruction`
+                // wrapper (which also constructed a fresh translator each
+                // call and therefore did not persist SHELL state across
+                // instructions). The host_network flag is sticky for the
+                // whole build, so we read it from `options`.
+                let mut translator = translator.clone();
+                let commands = translator.translate(&container_id, instruction_ref);
 
                 let mut combined_output = String::new();
                 for cmd in commands {

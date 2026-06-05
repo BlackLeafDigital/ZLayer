@@ -371,15 +371,17 @@ fn convert_step(step: &ZStep) -> Result<Instruction> {
 // RUN
 // ---------------------------------------------------------------------------
 
-fn convert_run(cmd: &ZCommand, caches: &[ZCacheMount], _step: &ZStep) -> Instruction {
+fn convert_run(cmd: &ZCommand, caches: &[ZCacheMount], step: &ZStep) -> Instruction {
     let command = convert_command(cmd);
     let mounts: Vec<RunMount> = caches.iter().map(convert_cache_mount).collect();
+    let env = step.env.clone().unwrap_or_default();
 
     Instruction::Run(RunInstruction {
         command,
         mounts,
         network: None,
         security: None,
+        env,
     })
 }
 
@@ -828,6 +830,52 @@ steps:
         } else {
             panic!("Expected ADD instruction");
         }
+    }
+
+    #[test]
+    fn test_step_run_with_inline_env() {
+        // When a step has BOTH `run` and `env`, the env must be threaded
+        // into the RunInstruction (transient `--env=K=V` flags) rather than
+        // emitted as a separate Instruction::Env (which would persist into
+        // the image config).
+        let df = parse_and_convert(
+            r#"
+base: "alpine:3.19"
+steps:
+  - run: "env | grep -E '^(A|B)='"
+    env:
+      A: "1"
+      B: "2"
+"#,
+        );
+
+        let stage = &df.stages[0];
+
+        // Exactly one Instruction::Env should be absent for this step — only
+        // the RUN instruction should appear.
+        let env_count = stage
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Env(_)))
+            .count();
+        assert_eq!(
+            env_count, 0,
+            "step with run+env must NOT emit a separate ENV instruction"
+        );
+
+        // The RUN instruction should carry the env map.
+        let run = stage
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Run(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected a RUN instruction");
+
+        assert_eq!(run.env.get("A"), Some(&"1".to_string()));
+        assert_eq!(run.env.get("B"), Some(&"2".to_string()));
+        assert_eq!(run.env.len(), 2);
     }
 
     #[test]

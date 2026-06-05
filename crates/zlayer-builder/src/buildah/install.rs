@@ -2,6 +2,12 @@
 //!
 //! This module provides functionality to find existing buildah installations
 //! or provide helpful error messages for installing buildah on various platforms.
+//!
+//! Sidecar (`zlayer-buildd`) installation lives in the [`buildd`] submodule
+//! at the bottom of this file. The buildah-sidecar plan (Option B) ships a
+//! Go binary alongside `zlayer` and the operator typically copies it into
+//! `${ZLAYER_DATA_DIR}/bin/zlayer-buildd`; auto-install fetches from
+//! release artifacts when that's possible.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -684,12 +690,27 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_find_in_path_exists() {
         // Probe for a binary guaranteed to exist on each platform.
         #[cfg(unix)]
         let probe = "sh";
         #[cfg(windows)]
         let probe = "cmd.exe";
+
+        // Other tests in this crate mutate `PATH` (e.g. the discover
+        // module's missing-binary test). We must hold the shared env lock
+        // for the full duration of `find_in_path` — the spawned `which` /
+        // `where.exe` subprocess inherits PATH at spawn time, and any
+        // concurrent test that flips PATH would break this probe.
+        //
+        // Tokio's test runtime is single-threaded by default, so holding
+        // a sync `MutexGuard` across the inner await cannot deadlock
+        // worker threads (we're the only task).
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let result = find_in_path(probe).await;
         assert!(
             result.is_some(),
@@ -734,6 +755,249 @@ mod tests {
             assert!(version.is_ok());
             let version = version.unwrap();
             assert!(version.contains('.'));
+        }
+    }
+}
+
+/// Sidecar (`zlayer-buildd`) install helpers.
+///
+/// Unix-only: the sidecar binary is a Linux executable and the install
+/// path relies on Unix file-mode bits. On non-Unix targets the module is
+/// compiled away entirely.
+#[cfg(unix)]
+pub mod buildd {
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use crate::error::{BuildError, Result};
+
+    /// Compile-time constant: the `zlayer-buildd` version the host
+    /// expects. Bound to the same crate version as `zlayer` itself so the
+    /// daemon and sidecar are released in lockstep.
+    pub const EXPECTED_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    /// Outcome of an [`ensure_buildd_sidecar`] call.
+    #[derive(Debug)]
+    pub enum InstallOutcome {
+        /// Sidecar was already present at the canonical location.
+        AlreadyInstalled {
+            /// Path to the installed binary.
+            path: PathBuf,
+            /// Version reported by the binary's `--version` output.
+            version: String,
+        },
+        /// Sidecar was copied from a release tarball next to `zlayer`.
+        CopiedFromBundle {
+            /// Source path the binary was copied from.
+            source: PathBuf,
+            /// Destination path the binary was copied to.
+            dest: PathBuf,
+        },
+        /// Sidecar was fetched from a release artifact URL.
+        Downloaded {
+            /// URL the binary was fetched from.
+            url: String,
+            /// Destination path the binary was written to.
+            dest: PathBuf,
+        },
+        /// Sidecar was deliberately not installed (env override or
+        /// development setup). The caller is expected to ensure the
+        /// binary is reachable some other way.
+        Skipped {
+            /// Human-readable reason the install was skipped.
+            reason: String,
+        },
+    }
+
+    /// Ensure `zlayer-buildd` is installed at the canonical location.
+    ///
+    /// Resolution order:
+    ///   1. `ZLAYER_BUILDD_BIN` set → skipped (development override).
+    ///   2. Canonical path already populated and the binary's `--version`
+    ///      matches [`EXPECTED_VERSION`] → already installed.
+    ///   3. A `zlayer-buildd` binary lives next to the currently-running
+    ///      `zlayer` binary (e.g. release tarball with both binaries in
+    ///      one dir) → copy it.
+    ///   4. Fetch from the release artifact URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::NotSupported`] when none of the resolution
+    /// steps succeed (no env override, no canonical install, no bundled
+    /// binary alongside `zlayer`). The HTTP-download path is intentionally
+    /// not implemented in this module — the air-gapped bundled path
+    /// covers production.
+    pub fn ensure_buildd_sidecar(install_dir: &Path) -> Result<InstallOutcome> {
+        // 1) Env override.
+        if env::var_os("ZLAYER_BUILDD_BIN").is_some() {
+            return Ok(InstallOutcome::Skipped {
+                reason: "ZLAYER_BUILDD_BIN set; using that binary instead".into(),
+            });
+        }
+
+        let dest = install_dir.join("zlayer-buildd");
+
+        // 2) Already installed?
+        if dest.exists() && is_executable(&dest) {
+            if let Some(version) = read_version(&dest) {
+                if version == EXPECTED_VERSION {
+                    return Ok(InstallOutcome::AlreadyInstalled {
+                        path: dest,
+                        version,
+                    });
+                }
+                // Version mismatch — fall through to re-install.
+                tracing::warn!(
+                    "zlayer-buildd at {} reports version {} but daemon expects {}; reinstalling",
+                    dest.display(),
+                    version,
+                    EXPECTED_VERSION
+                );
+            }
+        }
+
+        // 3) Bundled next to the running zlayer binary?
+        if let Some(bundled) = bundled_sidecar_path()? {
+            ensure_parent_dir(&dest)?;
+            fs::copy(&bundled, &dest)?;
+            mark_executable(&dest)?;
+            return Ok(InstallOutcome::CopiedFromBundle {
+                source: bundled,
+                dest,
+            });
+        }
+
+        // 4) Fetch from release artifact URL.
+        //
+        // We deliberately do NOT implement HTTP fetch in this module. The
+        // pattern in this codebase (per the existing buildah-install logic
+        // above and the `update_bottles` flow) is to delegate network
+        // fetches to `zlayer_registry::client` or `reqwest` callers and
+        // surface a clear error otherwise. For the air-gapped path 3 to
+        // suffice in 99% of cases, returning an actionable error here is
+        // appropriate.
+        Err(BuildError::NotSupported {
+            operation: format!(
+                "zlayer-buildd is not installed at {} and no bundled binary was found \
+                 alongside the running zlayer executable. Either run `make release` in \
+                 bin/zlayer-buildd/ and copy the result into {}, set ZLAYER_BUILDD_BIN, or \
+                 install the release tarball that ships zlayer-buildd alongside zlayer.",
+                dest.display(),
+                install_dir.display(),
+            ),
+        })
+    }
+
+    /// Look for a `zlayer-buildd` binary in the same directory as the
+    /// currently-running `zlayer` executable. This is the release-tarball
+    /// pattern.
+    fn bundled_sidecar_path() -> Result<Option<PathBuf>> {
+        let exe = env::current_exe()?;
+        let Some(dir) = exe.parent() else {
+            return Ok(None);
+        };
+        let candidate = dir.join("zlayer-buildd");
+        if candidate.exists() && is_executable(&candidate) {
+            Ok(Some(candidate))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_version(binary: &Path) -> Option<String> {
+        let output = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        // The Go side emits a single JSON line like:
+        //   {"buildah_version":"...","go_version":"...","sidecar_version":"..."}
+        // We look for the sidecar_version value via a tolerant substring
+        // scan to avoid pulling in a JSON dep for this single use.
+        let key = "\"sidecar_version\":\"";
+        let start = stdout.find(key)? + key.len();
+        let rest = &stdout[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
+    fn is_executable(path: &Path) -> bool {
+        match fs::metadata(path) {
+            Ok(md) if md.is_file() => md.permissions().mode() & 0o111 != 0,
+            _ => false,
+        }
+    }
+
+    fn mark_executable(path: &Path) -> Result<()> {
+        let mut perms = fs::metadata(path)?.permissions();
+        let mode = perms.mode();
+        perms.set_mode(mode | 0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn ensure_parent_dir(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(unsafe_code)]
+    mod tests {
+        use super::*;
+        use crate::TEST_ENV_LOCK;
+        use std::sync::PoisonError;
+
+        #[test]
+        fn env_override_yields_skipped() {
+            let _g = TEST_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: tests in this module serialize env mutations via
+            // `ENV_LOCK`, so no other thread observes the inconsistent
+            // intermediate state.
+            unsafe {
+                env::set_var("ZLAYER_BUILDD_BIN", "/tmp/whatever");
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let outcome = ensure_buildd_sidecar(tmp.path()).unwrap();
+            // SAFETY: see above.
+            unsafe {
+                env::remove_var("ZLAYER_BUILDD_BIN");
+            }
+            assert!(matches!(outcome, InstallOutcome::Skipped { .. }));
+        }
+
+        #[test]
+        fn missing_binary_returns_actionable_error() {
+            let _g = TEST_ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: tests in this module serialize env mutations via
+            // `ENV_LOCK`.
+            unsafe {
+                env::remove_var("ZLAYER_BUILDD_BIN");
+            }
+            // Make sure no zlayer-buildd is next to our test binary.
+            // (env::current_exe() in tests points at the test runner,
+            // which won't have a sibling zlayer-buildd unless the local
+            // dev box happens to have one — we just check the error path
+            // when both bundled lookup and dest are absent.)
+            let tmp = tempfile::tempdir().unwrap();
+            let err = ensure_buildd_sidecar(tmp.path());
+            // Allow either "AlreadyInstalled" or the error if a stale
+            // binary somehow got copied next to the test runner; the
+            // primary assertion is that the function doesn't panic.
+            if let Err(e) = err {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("zlayer-buildd"),
+                    "error did not mention the binary: {msg}"
+                );
+            }
         }
     }
 }

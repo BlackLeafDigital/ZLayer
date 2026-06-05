@@ -417,6 +417,25 @@ pub struct BuildOptions {
     /// `windows_image_resolver::rewrite_image_for_windows`. `None` means
     /// the backend uses its built-in default (`ltsc2022`).
     pub windows_ltsc: Option<String>,
+    /// Force `--net=host` on every `buildah run` for this build.
+    ///
+    /// When `true`, the buildah backend asks [`DockerfileTranslator`] to
+    /// emit `--net=host` on every translated `RUN` instruction, overriding
+    /// any per-instruction `network` value. This mirrors Docker's
+    /// `docker build --network=host` flag and bypasses buildah's CNI /
+    /// netavark plumbing entirely — the container shares the host's
+    /// network namespace.
+    ///
+    /// Default: `false`. Wired up from the top-level `zlayer
+    /// --host-network` CLI flag (see `bin/zlayer/src/cli.rs`).
+    pub host_network: bool,
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` means "use `detect_backend()`'s default for the host × target
+    /// combination" (current behavior). `Some(kind)` forces that backend; if it's
+    /// unavailable for this host × target combination, the build fails with
+    /// `BuildError::NotSupported { operation: ... }`.
+    pub backend_override: Option<zlayer_types::builder::BuilderBackendKind>,
 }
 
 impl Default for BuildOptions {
@@ -448,6 +467,8 @@ impl Default for BuildOptions {
             pull: PullBaseMode::default(),
             update_bottles: false,
             windows_ltsc: None,
+            host_network: false,
+            backend_override: None,
         }
     }
 }
@@ -652,7 +673,9 @@ impl ImageBuilder {
     /// host/target combination (e.g. Windows image requested on a Linux host).
     pub async fn with_target_os(mut self, target_os: crate::backend::ImageOs) -> Result<Self> {
         self.target_os = Some(target_os);
-        self.backend = Some(crate::backend::detect_backend(target_os).await?);
+        self.backend = Some(
+            crate::backend::detect_backend_with_options(target_os, Some(&self.options)).await?,
+        );
         Ok(self)
     }
 
@@ -943,6 +966,39 @@ impl ImageBuilder {
     #[must_use]
     pub fn update_bottles(mut self, update_bottles: bool) -> Self {
         self.options.update_bottles = update_bottles;
+        self
+    }
+
+    /// Force `--net=host` on every `buildah run` emitted by this build.
+    ///
+    /// Mirrors Docker's `docker build --network=host` flag. When `on` is
+    /// `true`, every translated `RUN` instruction is annotated with
+    /// `RunNetwork::Host` regardless of any per-instruction `--network`
+    /// directive, and the buildah backend emits `--net=host` on the
+    /// resulting `buildah run` invocation. This bypasses buildah's CNI /
+    /// netavark plumbing entirely (the container shares the host's
+    /// network namespace).
+    ///
+    /// Wired from the top-level `zlayer --host-network` CLI flag.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.options.host_network = on;
+        self
+    }
+
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` (the default) leaves backend selection to `detect_backend()`.
+    /// `Some(kind)` forces that backend; if it is unavailable for the host ×
+    /// target combination, the eventual build will fail with
+    /// `BuildError::NotSupported`. Wired from the `zlayer build --backend`
+    /// CLI flag.
+    #[must_use]
+    pub fn with_backend_override(
+        mut self,
+        backend: Option<zlayer_types::builder::BuilderBackendKind>,
+    ) -> Self {
+        self.options.backend_override = backend;
         self
     }
 
@@ -1663,8 +1719,17 @@ impl ImageBuilder {
     /// hint, so they fall through to the caller's pin or the default.
     async fn resolve_target_os_and_backend(&mut self) -> Result<()> {
         // Explicit pin always wins: the backend was already detected for
-        // this OS by `new_with_os`/`with_target_os`. Nothing to do.
-        if self.target_os.is_some() {
+        // this OS by `new_with_os`/`with_target_os`. But the caller may
+        // have set `backend_override` AFTER construction (via
+        // `with_backend_override`), in which case the cached backend was
+        // selected without that hint — re-detect so the override is honored.
+        if let Some(target_os) = self.target_os {
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(target_os, Some(&self.options))
+                        .await?,
+                );
+            }
             return Ok(());
         }
 
@@ -1678,7 +1743,18 @@ impl ImageBuilder {
 
         let Some(path) = zimage_path else {
             // No ZImagefile — Dockerfile / runtime template paths have no OS
-            // metadata, so the initial Linux detection stands.
+            // metadata, so the initial Linux detection stands. If the caller
+            // set a backend_override after construction, re-resolve so the
+            // cached default backend is replaced.
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(
+                        crate::backend::ImageOs::Linux,
+                        Some(&self.options),
+                    )
+                    .await?,
+                );
+            }
             return Ok(());
         };
 
@@ -1694,16 +1770,31 @@ impl ImageBuilder {
         if let Some(resolved) = zimage.resolve_target_os() {
             // Re-detect only if the resolved OS differs from the one we
             // probed at construction. `new_with_os(None)` probes Linux, so
-            // the common Linux case short-circuits.
+            // the common Linux case short-circuits — unless the caller
+            // set a backend_override after construction, in which case we
+            // must re-detect even for the initial OS to apply the override.
             let initial = crate::backend::ImageOs::Linux;
-            if resolved != initial {
+            if resolved != initial || self.options.backend_override.is_some() {
                 info!(
                     "Re-detecting build backend for target OS {:?} (inferred from ZImagefile)",
                     resolved
                 );
-                self.backend = Some(crate::backend::detect_backend(resolved).await?);
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(resolved, Some(&self.options))
+                        .await?,
+                );
             }
             self.target_os = Some(resolved);
+        } else if self.options.backend_override.is_some() {
+            // ZImagefile present but resolves to no explicit OS — apply the
+            // override against the Linux default that was cached.
+            self.backend = Some(
+                crate::backend::detect_backend_with_options(
+                    crate::backend::ImageOs::Linux,
+                    Some(&self.options),
+                )
+                .await?,
+            );
         }
 
         Ok(())

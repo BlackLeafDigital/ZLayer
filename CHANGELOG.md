@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.56.0 - 2026-06-05
+
+### Added
+- **buildah-sidecar backend** (`crates/zlayer-builder/src/backend/buildah_sidecar/`): new gRPC-client backend that talks to a Go sidecar (`bin/zlayer-buildd/`) wrapping `imagebuildah.BuildDockerfiles` from `go.podman.io/buildah`. Transport is TCP with mTLS; the daemon spawns a local sidecar bound to `127.0.0.1:<auto-port>` on demand and tears it down after the configurable idle timeout (default 30s). mTLS material is generated on first run under `${ZLAYER_DATA_DIR}/buildd/` via `rcgen`.
+- **`zlayer-buildd` Go sidecar** (`bin/zlayer-buildd/`): standalone daemon shipping the buildah library behind a typed gRPC API. Single-file proto schema at `proto/buildah_sidecar.proto`; cross-arch release builds (linux/amd64 + linux/arm64) via `make release`. Documented system-library requirements (libgpgme, libassuan, libgpg-error, libseccomp) and devicemapper/btrfs graphdriver build-tag exclusions.
+- **`--backend` CLI flag** on `zlayer build`: explicit selection between `buildah-cli`, `buildah-sidecar`, `sandbox`, `hcs`. Defaults to auto-detect.
+- **`ZLAYER_BACKEND` env var**: same values as `--backend`, applied as a global override.
+- **`ZLAYER_BUILDD_BIN` env var**: bypasses sidecar binary discovery and uses the supplied absolute path (useful for development and CI).
+- **`ZLAYER_BUILDD_ADDR` env var** (consumed via `SidecarConfig.addr`): dial a remote `zlayer-buildd` over TCP+mTLS for cross-machine build dispatch.
+- **`zlayer_paths::ZLayerDirs::buildd()`** and **`buildd_bin()`** path helpers: canonical locations for mTLS material (`${data_dir}/buildd/`) and the sidecar binary (`${data_dir}/bin/zlayer-buildd`).
+- **5 RPCs** on the sidecar's `BuildService` beyond `Build`/`Cancel`/`Inspect`: `Push`, `Tag`, `ManifestCreate`, `ManifestAdd`, `ManifestPush` — full parity with the `BuildBackend` trait surface so the sidecar handles every post-build operation the CLI shellout did.
+- End-to-end integration test at `crates/zlayer-builder/tests/buildah_sidecar_e2e.rs` (ignored by default; runs against a real `buildah` install + built sidecar binary).
+- `crates/zlayer-types/src/builder.rs` (new module): `BuilderBackendKind`, `SidecarConfig`, `BuildSidecarRequest`, `BuildSidecarEvent` — shared types per the workspace's types-first rule.
+
+### Changed
+- **Default Linux backend**: `detect_backend(ImageOs::Linux)` on Linux hosts now prefers `BuildahSidecarBackend` over the legacy CLI-shellout `BuildahBackend`, falling back to the CLI when no sidecar binary is reachable. Operators wanting the legacy path explicitly should set `--backend buildah-cli` or `ZLAYER_BACKEND=buildah-cli`.
+- `BuildOptions` now carries `backend_override: Option<BuilderBackendKind>` so library callers can pin backend selection without going through env vars.
+- The Docker-compat socket server (`zlayer_docker::socket::serve`) now takes the daemon's own UDS explicitly and waits for the local daemon on that socket via `try_connect_to` (no auto-spawn), merging the branch's explicit-socket plumbing with dev's generous 300s readiness retry.
+
 ## 0.55.0 - 2026-06-05
 
 ### Added

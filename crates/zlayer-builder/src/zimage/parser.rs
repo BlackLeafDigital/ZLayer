@@ -150,7 +150,10 @@ fn validate_steps(image: &ZImage) -> Result<()> {
 /// Validate a single build step.
 ///
 /// Rules enforced:
-/// - Exactly one instruction type must be set (`run`, `copy`, `add`, `env`, `workdir`, `user`).
+/// - Exactly one instruction type must be set (`run`, `copy`, `add`, `env`, `workdir`, `user`),
+///   with one exception: `env` may appear alongside `run`, in which case `env` acts as a
+///   transient per-RUN modifier (env vars scoped to that single RUN command, not baked into
+///   the image) rather than a separate persistent ENV instruction.
 /// - `copy` and `add` steps must have a `to` field.
 /// - `cache` is only valid on `run` steps.
 /// - `from` is only valid on `copy`/`add` steps.
@@ -162,7 +165,7 @@ fn validate_step(step: &ZStep, index: usize, stage: Option<&str>) -> Result<()> 
     };
 
     // Count how many instruction fields are set.
-    let instructions: Vec<&str> = [
+    let mut instructions: Vec<&str> = [
         step.run.as_ref().map(|_| "run"),
         step.copy.as_ref().map(|_| "copy"),
         step.add.as_ref().map(|_| "add"),
@@ -173,6 +176,14 @@ fn validate_step(step: &ZStep, index: usize, stage: Option<&str>) -> Result<()> 
     .into_iter()
     .flatten()
     .collect();
+
+    // Special case: `run` + `env` is allowed. The `env` map is treated as
+    // transient environment variables scoped to that single RUN command (not a
+    // separate persistent ENV instruction), so it must not be counted toward
+    // the mutual-exclusion check.
+    if step.run.is_some() && step.env.is_some() {
+        instructions.retain(|i| *i != "env");
+    }
 
     match instructions.len() {
         0 => {
@@ -646,6 +657,85 @@ steps:
   - user: "nobody"
 "#;
         parse_zimagefile(yaml).unwrap();
+    }
+
+    // -- run + env modifier tests --------------------------------------------
+
+    /// Helper: construct an otherwise-empty [`ZStep`] for direct `validate_step`
+    /// tests. Mirrors the pattern of building literals since `ZStep` has no
+    /// `Default` impl.
+    fn empty_step() -> ZStep {
+        ZStep {
+            run: None,
+            copy: None,
+            add: None,
+            env: None,
+            workdir: None,
+            user: None,
+            to: None,
+            from: None,
+            owner: None,
+            chmod: None,
+            cache: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_step_run_plus_env_is_valid() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let step = ZStep {
+            run: Some(super::super::types::ZCommand::Shell("echo hi".to_string())),
+            env: Some(env),
+            ..empty_step()
+        };
+        validate_step(&step, 0, None).expect("run + env must be a valid combination");
+    }
+
+    #[test]
+    fn test_step_env_alone_is_valid() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let step = ZStep {
+            env: Some(env),
+            ..empty_step()
+        };
+        validate_step(&step, 0, None).expect("env alone must remain valid");
+    }
+
+    #[test]
+    fn test_step_env_plus_copy_is_rejected() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let step = ZStep {
+            copy: Some(super::super::types::ZCopySources::Single("src".to_string())),
+            to: Some("/dst".to_string()),
+            env: Some(env),
+            ..empty_step()
+        };
+        let err = validate_step(&step, 0, None).expect_err("env + copy must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple") && msg.contains("instruction type"),
+            "expected multiple-instruction-type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_step_env_plus_workdir_is_rejected() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let step = ZStep {
+            workdir: Some("/app".to_string()),
+            env: Some(env),
+            ..empty_step()
+        };
+        let err = validate_step(&step, 0, None).expect_err("env + workdir must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple") && msg.contains("instruction type"),
+            "expected multiple-instruction-type error, got: {msg}"
+        );
     }
 
     // -- Build directive tests ------------------------------------------------

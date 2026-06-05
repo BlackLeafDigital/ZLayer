@@ -49,19 +49,20 @@ pub(crate) struct SocketState {
 ///
 /// Returns an error if the socket/pipe cannot be bound, the daemon
 /// cannot be contacted, or the server fails.
-pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
+pub async fn serve(socket_path: &Path, daemon_socket: &Path) -> anyhow::Result<()> {
     // This Docker API server runs INSIDE the daemon process (spawned by `serve`
     // when `--docker-socket` is set), so it must connect to the LOCAL daemon's
-    // own API socket — and must NEVER use the auto-starting
+    // own API socket (`daemon_socket`) — and must NEVER use the auto-starting
     // `DaemonClient::connect()`. Auto-start spawns a SECOND `zlayer serve`
     // process that races the daemon we are part of for the API port/socket;
     // under launchd the freshly-bootstrapped job then fails to stay loaded
     // ("Daemon failed to start within 45s / no job loaded"). Instead, wait for
     // the in-process daemon to finish coming up. Its API/health only answers
     // after `init_daemon` (including deployment restoration), which can take a
-    // while, so retry `try_connect` (which never auto-starts) on a generous
-    // deadline.
-    let client = wait_for_local_daemon().await?;
+    // while, so retry `try_connect_to` (which never auto-starts) on a generous
+    // deadline. On Windows the daemon listens on TCP loopback, so the explicit
+    // socket path is ignored there.
+    let client = wait_for_local_daemon(daemon_socket).await?;
     let state = SocketState {
         client: Arc::new(client),
     };
@@ -85,20 +86,29 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
 /// Wait for the LOCAL daemon (the process this Docker API server runs inside)
 /// to finish starting and become reachable on its API socket.
 ///
-/// Uses [`DaemonClient::try_connect`] — which probes an already-running daemon
-/// and NEVER auto-starts one — in a bounded retry loop. This deliberately
-/// avoids [`DaemonClient::connect`]: auto-starting from here would fork a second
-/// `zlayer serve` that competes for the API port/socket and breaks the launchd
-/// install. The deadline is generous because the daemon's API only answers
-/// after full initialisation (overlay, storage, and deployment restoration),
-/// which can take tens of seconds on a host with restored deployments.
-async fn wait_for_local_daemon() -> anyhow::Result<DaemonClient> {
+/// Uses [`DaemonClient::try_connect_to`] — which probes an already-running
+/// daemon on the given socket and NEVER auto-starts one — in a bounded retry
+/// loop. This deliberately avoids [`DaemonClient::connect`]: auto-starting from
+/// here would fork a second `zlayer serve` that competes for the API
+/// port/socket and breaks the launchd install. The deadline is generous because
+/// the daemon's API only answers after full initialisation (overlay, storage,
+/// and deployment restoration), which can take tens of seconds on a host with
+/// restored deployments. On Windows the daemon listens on TCP loopback, so
+/// `daemon_socket` is ignored and the default probe is used.
+async fn wait_for_local_daemon(daemon_socket: &Path) -> anyhow::Result<DaemonClient> {
     use std::time::Duration;
 
     let poll = Duration::from_millis(250);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
-        match DaemonClient::try_connect().await {
+        #[cfg(unix)]
+        let probe = DaemonClient::try_connect_to(daemon_socket).await;
+        #[cfg(not(unix))]
+        let probe = {
+            let _ = daemon_socket;
+            DaemonClient::try_connect().await
+        };
+        match probe {
             Ok(Some(client)) => return Ok(client),
             Ok(None) | Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(poll).await;

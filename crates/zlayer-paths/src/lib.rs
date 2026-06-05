@@ -439,6 +439,23 @@ impl ZLayerDirs {
         self.data_dir.join("bin")
     }
 
+    /// Canonical install path for the `zlayer-buildd` sidecar binary:
+    /// `{data}/bin/zlayer-buildd`. Resolved by the buildah-sidecar
+    /// backend's discovery logic and written by the `zlayer install
+    /// --sidecar` installer.
+    #[must_use]
+    pub fn buildd_bin(&self) -> PathBuf {
+        self.bin().join("zlayer-buildd")
+    }
+
+    /// Directory holding sidecar mTLS material: `{data}/buildd`. Contains
+    /// `ca.pem`, `cert.pem`, and `key.pem` consumed by both ends of the
+    /// `zlayer-buildd` gRPC channel.
+    #[must_use]
+    pub fn buildd(&self) -> PathBuf {
+        self.data_dir.join("buildd")
+    }
+
     /// Toolchain download cache directory (`{data}/toolchain-cache`).
     pub fn toolchain_cache(&self) -> PathBuf {
         self.data_dir.join("toolchain-cache")
@@ -690,6 +707,11 @@ mod tests {
         assert_eq!(dirs.vms(), PathBuf::from("/test/data/vms"));
         assert_eq!(dirs.images(), PathBuf::from("/test/data/images"));
         assert_eq!(dirs.bin(), PathBuf::from("/test/data/bin"));
+        assert_eq!(
+            dirs.buildd_bin(),
+            PathBuf::from("/test/data/bin/zlayer-buildd")
+        );
+        assert_eq!(dirs.buildd(), PathBuf::from("/test/data/buildd"));
         assert_eq!(
             dirs.toolchain_cache(),
             PathBuf::from("/test/data/toolchain-cache")

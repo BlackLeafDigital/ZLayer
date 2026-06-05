@@ -754,6 +754,46 @@ impl DaemonClient {
         }
     }
 
+    /// Connect to a daemon at `socket_path`, polling for readiness, and
+    /// **never** falling through to auto-spawn.
+    ///
+    /// Designed for in-daemon callers (e.g. the Docker API socket task) that
+    /// must talk to the SAME daemon they live inside. The naive
+    /// [`connect_to`](Self::connect_to) path would auto-spawn a competing
+    /// daemon child if the UDS isn't ready yet — a guaranteed startup-race
+    /// loss when the API listener hasn't bound its socket yet at task-spawn
+    /// time. This method polls instead, with a hard timeout.
+    ///
+    /// Polling cadence: 50 ms ticks until `socket_path` exists, then a
+    /// single `try_build` (which performs a health probe). Returns an error
+    /// if either the path never appears within `timeout` or the health
+    /// probe never succeeds.
+    #[cfg(unix)]
+    pub async fn connect_to_no_autospawn(
+        socket_path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let deadline = std::time::Instant::now() + timeout;
+        let tick = Duration::from_millis(50);
+
+        loop {
+            if socket_path.exists() {
+                if let Ok(client) = Self::try_build(&socket_path).await {
+                    return Ok(client);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "Daemon UDS at {} did not become ready within {:?}",
+                    socket_path.display(),
+                    timeout
+                );
+            }
+            tokio::time::sleep(tick).await;
+        }
+    }
+
     /// Probe the daemon at `socket_path` and return a categorized result.
     ///
     /// Unlike [`try_connect_to`](Self::try_connect_to), this does NOT collapse
@@ -5844,6 +5884,51 @@ mod tests {
         assert_eq!(urlencoding("my-deployment"), "my-deployment");
         assert_eq!(urlencoding("service_v2"), "service_v2");
         assert_eq!(urlencoding("app.web"), "app.web");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_connect_to_no_autospawn_times_out_without_spawning() {
+        // Calling against a non-existent socket path must NEVER auto-spawn
+        // and must return an error within the timeout. The whole point of
+        // this method is to be safe from the in-daemon docker-socket task,
+        // where the naive `connect_to` would recursively spawn a competing
+        // daemon and lose a port-bind race.
+        let tmp = std::env::temp_dir().join(format!(
+            "zlayer-test-no-autospawn-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let start = std::time::Instant::now();
+        let result =
+            DaemonClient::connect_to_no_autospawn(&tmp, std::time::Duration::from_millis(250))
+                .await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("must error when socket is absent"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("did not become ready"),
+            "expected timeout error, got: {err}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "polled for full timeout window"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "did not block far beyond the timeout"
+        );
+        // Most important: the socket file we passed must NOT have been
+        // created by the call — i.e. nothing was spawned that would
+        // bind it.
+        assert!(
+            !tmp.exists(),
+            "no daemon process should have been auto-spawned"
+        );
     }
 
     #[test]
