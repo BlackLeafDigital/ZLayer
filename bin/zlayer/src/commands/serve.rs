@@ -955,6 +955,32 @@ fn take_pending_vacuum_secrets() -> bool {
     PENDING_VACUUM_SECRETS.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Pending `--secrets-only` flag.
+///
+/// When the daemon is launched with `--secrets-only` (or
+/// `ZLAYER_SECRETS_ONLY=true`), [`serve_with_external_shutdown`] mounts only
+/// the secrets/RBAC router surface (`/health`, `/auth`,
+/// `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`)
+/// and skips every orchestration nest. The HA secrets-store selection
+/// (`select_secrets_store`) is untouched — a clustered node with
+/// `wrapped_dek.bin` still serves through `RaftSecretsStore`.
+///
+/// Stored in a process-global slot so `main.rs` can stash the parsed CLI value
+/// before delegating to `serve()` / `serve_with_nat_overrides()` /
+/// `serve_with_external_shutdown()` (whose public signature is pinned by the
+/// Windows Service host in `daemon_service.rs`).
+static PENDING_SECRETS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_secrets_only(secrets_only: bool) {
+    PENDING_SECRETS_ONLY.store(secrets_only, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_secrets_only() -> bool {
+    PENDING_SECRETS_ONLY.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Idempotently delete `{data_dir}/join_secret`.
 ///
 /// Used by three call sites: the `--vacuum-secrets` flag at startup, the
@@ -1370,6 +1396,17 @@ pub(crate) async fn serve_with_external_shutdown(
     // constructs one, so the `Managed` ACME path never lacks a backing
     // resolver and we don't need a no-proxy guard here).
     let api_tls_overrides = take_pending_api_tls_overrides();
+
+    // Pick up the `--secrets-only` flag (or `ZLAYER_SECRETS_ONLY`). When set,
+    // the router below mounts ONLY the secrets/RBAC surface and skips every
+    // orchestration nest. The daemon's infrastructure (overlay, Raft,
+    // secrets store selection) is still fully initialised by `init_daemon`,
+    // so a clustered secrets-only node serves through `RaftSecretsStore`
+    // exactly as a full node would; only the HTTP surface is trimmed.
+    let secrets_only = take_pending_secrets_only();
+    if secrets_only {
+        info!("Secrets-only mode: mounting secrets/RBAC router surface only");
+    }
     // Resolve the JWT signing secret. Priority is:
     //   1. Explicit `--jwt-secret` flag / `ZLAYER_JWT_SECRET` env var
     //      (clap reads both into the `jwt_secret` parameter).
@@ -2302,15 +2339,26 @@ pub(crate) async fn serve_with_external_shutdown(
     // CLI/UI can show which node owns each container. `None` when Raft failed
     // to initialize.
     let local_node_id = _raft.as_ref().map(|r| r.node_id().to_string());
-    let base_router = zlayer_api::build_router_with_deployment_state(
-        &api_config,
-        deployment_state,
-        service_manager.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-        local_node_id,
-    );
+    // Under `--secrets-only` use the lean base router (only `/health`,
+    // `/auth`, `/api/v1/users`) and skip the orchestration-bearing
+    // deployment/daemon nests of the full base. `deployment_state` and
+    // `service_manager` are still constructed above (they are cheap handles)
+    // but go unused as the router state here — the secrets daemon never
+    // mounts a route that consumes them.
+    let base_router = if secrets_only {
+        zlayer_api::build_router_secrets_only_base(&api_config)
+    } else {
+        zlayer_api::build_router_with_deployment_state(
+            &api_config,
+            deployment_state,
+            service_manager.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            local_node_id,
+        )
+    };
 
     // Add internal routes for scheduler-to-agent communication.
+    // Skipped under `--secrets-only` (scheduler-to-agent is orchestration).
     // Include the overlay interface name so the add-peer endpoint can manage
     // WireGuard peers on this node.
     let overlay_interface = if config.host_network {
@@ -2342,7 +2390,16 @@ pub(crate) async fn serve_with_external_shutdown(
         internal_state
     };
     let internal_routes = zlayer_api::build_internal_routes(internal_state);
-    let base_router = base_router.nest("/api/v1/internal", internal_routes);
+    // Mount scheduler-to-agent internal routes only in full mode. Under
+    // `--secrets-only` the daemon runs no scheduler/agent surface, so the
+    // internal nest is skipped (the state is still built above so
+    // `service_manager` is consumed and `internal_token` stays available for
+    // the cluster routes the secrets daemon DOES mount).
+    let base_router = if secrets_only {
+        base_router
+    } else {
+        base_router.nest("/api/v1/internal", internal_routes)
+    };
 
     // Add secrets routes — env-aware so secrets handlers can resolve the
     // environment scope from the bundle's persistent environments store.
@@ -2375,59 +2432,68 @@ pub(crate) async fn serve_with_external_shutdown(
     // project's git repo lands in the same place.
     let projects_clone_root = config.data_dir.join("projects");
 
-    // Add project routes (CRUD + deployment linking + pull)
-    let mut project_state = zlayer_api::ProjectState::new(bundle.projects.clone());
-    project_state.clone_root.clone_from(&projects_clone_root);
-    let project_routes = zlayer_api::build_project_routes(project_state);
-    router = router.nest("/api/v1/projects", project_routes);
-
-    // Add sync routes (git-backed resource reconciliation).
-    // Sync apply upserts / deletes `DeploymentSpec` manifests, so it needs a
-    // handle to the persistent deployment store (the same one wired into the
-    // deployment routes above).
-    let sync_state = zlayer_api::SyncState::with_clone_root(
-        bundle.syncs.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-        projects_clone_root.clone(),
-    );
-    let sync_routes = zlayer_api::build_sync_routes(sync_state);
-    router = router.nest("/api/v1/syncs", sync_routes);
-
-    // Add variable routes (plaintext key-value config) — persistent store
-    let variable_state = zlayer_api::VariableState::new(bundle.variables.clone());
-    let variable_routes = zlayer_api::build_variable_routes(variable_state);
-    router = router.nest("/api/v1/variables", variable_routes);
-
-    // Add task routes (named runnable scripts) — persistent store
-    let tasks_state = zlayer_api::TasksState::new(bundle.tasks.clone());
-    let task_routes = zlayer_api::build_task_routes(tasks_state);
-    router = router.nest("/api/v1/tasks", task_routes);
-
     // Build the BuildState up front so it can be shared by both the build
-    // routes (mounted further below) and the workflow state (which needs
-    // the BuildManager for `BuildProject` actions).
+    // routes (mounted further below, full mode only) and the workflow state
+    // (which needs the BuildManager for `BuildProject` actions). Constructed
+    // unconditionally so it stays in scope for the full-mode build-route
+    // nest; under `--secrets-only` it is simply never mounted.
     let build_dir = config.data_dir.join("builds");
     let build_state = BuildState::new(build_dir);
 
-    // Add workflow routes (DAGs of steps composing tasks, builds, deploys, syncs).
-    // WorkflowsState carries every handle the action arms need so they execute
-    // for real (not a placeholder "would execute" string).
-    let workflows_state = zlayer_api::WorkflowsState::new(
-        bundle.workflows.clone(),
-        bundle.tasks.clone(),
-        bundle.projects.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-        bundle.syncs.clone(),
-        build_state.manager.clone(),
-        projects_clone_root.clone(),
-    );
-    let workflow_routes = zlayer_api::build_workflow_routes(workflows_state);
-    router = router.nest("/api/v1/workflows", workflow_routes);
+    // ── Orchestration-only resource routes ──────────────────────────────
+    // Projects, syncs, variables, tasks, workflows, and notifiers are all
+    // deploy/build-plane surfaces with no bearing on secrets serving, so the
+    // `--secrets-only` daemon skips them wholesale. Their state construction
+    // is gated too so no handles are built (and no "unused" warnings fire).
+    if !secrets_only {
+        // Add project routes (CRUD + deployment linking + pull)
+        let mut project_state = zlayer_api::ProjectState::new(bundle.projects.clone());
+        project_state.clone_root.clone_from(&projects_clone_root);
+        let project_routes = zlayer_api::build_project_routes(project_state);
+        router = router.nest("/api/v1/projects", project_routes);
 
-    // Add notifier routes (Slack, Discord, webhook, SMTP) — persistent store
-    let notifiers_state = zlayer_api::NotifiersState::new(bundle.notifiers.clone());
-    let notifier_routes = zlayer_api::build_notifier_routes(notifiers_state);
-    router = router.nest("/api/v1/notifiers", notifier_routes);
+        // Add sync routes (git-backed resource reconciliation).
+        // Sync apply upserts / deletes `DeploymentSpec` manifests, so it needs a
+        // handle to the persistent deployment store (the same one wired into the
+        // deployment routes above).
+        let sync_state = zlayer_api::SyncState::with_clone_root(
+            bundle.syncs.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            projects_clone_root.clone(),
+        );
+        let sync_routes = zlayer_api::build_sync_routes(sync_state);
+        router = router.nest("/api/v1/syncs", sync_routes);
+
+        // Add variable routes (plaintext key-value config) — persistent store
+        let variable_state = zlayer_api::VariableState::new(bundle.variables.clone());
+        let variable_routes = zlayer_api::build_variable_routes(variable_state);
+        router = router.nest("/api/v1/variables", variable_routes);
+
+        // Add task routes (named runnable scripts) — persistent store
+        let tasks_state = zlayer_api::TasksState::new(bundle.tasks.clone());
+        let task_routes = zlayer_api::build_task_routes(tasks_state);
+        router = router.nest("/api/v1/tasks", task_routes);
+
+        // Add workflow routes (DAGs of steps composing tasks, builds, deploys, syncs).
+        // WorkflowsState carries every handle the action arms need so they execute
+        // for real (not a placeholder "would execute" string).
+        let workflows_state = zlayer_api::WorkflowsState::new(
+            bundle.workflows.clone(),
+            bundle.tasks.clone(),
+            bundle.projects.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            bundle.syncs.clone(),
+            build_state.manager.clone(),
+            projects_clone_root.clone(),
+        );
+        let workflow_routes = zlayer_api::build_workflow_routes(workflows_state);
+        router = router.nest("/api/v1/workflows", workflow_routes);
+
+        // Add notifier routes (Slack, Discord, webhook, SMTP) — persistent store
+        let notifiers_state = zlayer_api::NotifiersState::new(bundle.notifiers.clone());
+        let notifier_routes = zlayer_api::build_notifier_routes(notifiers_state);
+        router = router.nest("/api/v1/notifiers", notifier_routes);
+    }
 
     // Add group routes (user group CRUD and membership) — persistent store
     let groups_state = zlayer_api::GroupsState::new(bundle.groups.clone());
@@ -2450,71 +2516,82 @@ pub(crate) async fn serve_with_external_shutdown(
         bundle.audit.clone(),
     )));
 
-    // Merge network access-control routes (shares the same policy list as the proxy)
-    let network_state = NetworkApiState {
-        networks: std::sync::Arc::clone(&network_policies),
-    };
-    let network_routes = build_network_routes(network_state);
-    router = router.nest("/api/v1/networks", network_routes);
-
-    // Merge node management routes
-    let node_state = NodeApiState::new();
-    let node_routes = build_node_routes(node_state);
-    router = router.nest("/api/v1/nodes", node_routes);
-
-    // Merge overlay network routes with real overlay manager and DNS references
-    let overlay_state = match (&overlay, &dns) {
-        (Some(om), Some(d)) => OverlayApiState::with_overlay_and_dns(Arc::clone(om), Arc::clone(d)),
-        (Some(om), None) => OverlayApiState::with_overlay(Arc::clone(om)),
-        _ => OverlayApiState::new(),
-    };
-    let overlay_routes = build_overlay_routes(overlay_state);
-    router = router.nest("/api/v1/overlay", overlay_routes);
-
-    // Merge tunnel routes -- reuse the state built in init_daemon so the
-    // daemon-side tunnel server's TokenValidator and the API handler share
-    // the same token map and access manager.
-    let tunnel_routes = build_tunnel_routes(tunnel_api_state);
-    router = router.nest("/api/v1/tunnels", tunnel_routes);
-
-    // Merge edge-cache eligibility routes (Track A — upstream control
-    // plane registers ZLayer nodes as eligible via these three endpoints).
-    // The registry is fresh / standalone — gossip-label broadcast is wired
-    // in a follow-on patch once we thread a GossipPool handle through to
-    // this scope; eligibility tracking already works without gossip.
-    let edge_cache_state = zlayer_api::handlers::EdgeCacheApiState::new();
-    let edge_cache_routes = build_edge_cache_routes(edge_cache_state);
-    router = router.merge(edge_cache_routes);
-
-    // Merge proxy status routes
-    let proxy_state = zlayer_api::ProxyApiState {
-        registry: Some(proxy.registry()),
-        load_balancer: Some(proxy.load_balancer()),
-        cert_manager: Some(Arc::clone(&cert_manager)),
-        stream_registry: Some(Arc::clone(&stream_registry)),
-    };
-    let proxy_routes = zlayer_api::build_proxy_routes(proxy_state);
-    router = router.nest("/api/v1/proxy", proxy_routes);
-
-    // Merge storage replication status routes
-    let storage_api_state = match replicator.as_ref() {
-        Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
-        None => zlayer_api::StorageState::new(),
-    };
-    let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
-    router = router.nest("/api/v1/storage", storage_routes);
-
     // Construct the daemon-wide event bus early so all resource states
     // (image, container, network, volume) publish lifecycle events on the
     // same broadcast channel. Subscribers of `GET /api/v1/events` then see
-    // every transition regardless of which handler emitted it.
+    // every transition regardless of which handler emitted it. Built
+    // unconditionally so both the full-mode image nest (below) and the
+    // container/volume nests (further below) share it; under `--secrets-only`
+    // it is simply never subscribed.
     let event_bus = zlayer_api::DaemonEventBus::new();
 
-    // Merge image management routes (list / rm / system prune)
-    let image_state =
-        zlayer_api::ImageState::new(runtime.clone()).with_event_bus(event_bus.clone());
-    let image_routes = zlayer_api::build_image_routes_with_state(image_state);
-    router = router.nest("/api/v1", image_routes);
+    // ── Networking / proxy / storage / image routes ─────────────────────
+    // All orchestration-plane surfaces — skipped under `--secrets-only`. The
+    // cluster routes (built just below) are NOT in this block: the secrets
+    // daemon participates in Raft, so `/api/v1/cluster` is always mounted.
+    if !secrets_only {
+        // Merge network access-control routes (shares the same policy list as the proxy)
+        let network_state = NetworkApiState {
+            networks: std::sync::Arc::clone(&network_policies),
+        };
+        let network_routes = build_network_routes(network_state);
+        router = router.nest("/api/v1/networks", network_routes);
+
+        // Merge node management routes
+        let node_state = NodeApiState::new();
+        let node_routes = build_node_routes(node_state);
+        router = router.nest("/api/v1/nodes", node_routes);
+
+        // Merge overlay network routes with real overlay manager and DNS references
+        let overlay_state = match (&overlay, &dns) {
+            (Some(om), Some(d)) => {
+                OverlayApiState::with_overlay_and_dns(Arc::clone(om), Arc::clone(d))
+            }
+            (Some(om), None) => OverlayApiState::with_overlay(Arc::clone(om)),
+            _ => OverlayApiState::new(),
+        };
+        let overlay_routes = build_overlay_routes(overlay_state);
+        router = router.nest("/api/v1/overlay", overlay_routes);
+
+        // Merge tunnel routes -- reuse the state built in init_daemon so the
+        // daemon-side tunnel server's TokenValidator and the API handler share
+        // the same token map and access manager.
+        let tunnel_routes = build_tunnel_routes(tunnel_api_state);
+        router = router.nest("/api/v1/tunnels", tunnel_routes);
+
+        // Merge edge-cache eligibility routes (Track A — upstream control
+        // plane registers ZLayer nodes as eligible via these three endpoints).
+        // The registry is fresh / standalone — gossip-label broadcast is wired
+        // in a follow-on patch once we thread a GossipPool handle through to
+        // this scope; eligibility tracking already works without gossip.
+        let edge_cache_state = zlayer_api::handlers::EdgeCacheApiState::new();
+        let edge_cache_routes = build_edge_cache_routes(edge_cache_state);
+        router = router.merge(edge_cache_routes);
+
+        // Merge proxy status routes
+        let proxy_state = zlayer_api::ProxyApiState {
+            registry: Some(proxy.registry()),
+            load_balancer: Some(proxy.load_balancer()),
+            cert_manager: Some(Arc::clone(&cert_manager)),
+            stream_registry: Some(Arc::clone(&stream_registry)),
+        };
+        let proxy_routes = zlayer_api::build_proxy_routes(proxy_state);
+        router = router.nest("/api/v1/proxy", proxy_routes);
+
+        // Merge storage replication status routes
+        let storage_api_state = match replicator.as_ref() {
+            Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
+            None => zlayer_api::StorageState::new(),
+        };
+        let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
+        router = router.nest("/api/v1/storage", storage_routes);
+
+        // Merge image management routes (list / rm / system prune)
+        let image_state =
+            zlayer_api::ImageState::new(runtime.clone()).with_event_bus(event_bus.clone());
+        let image_routes = zlayer_api::build_image_routes_with_state(image_state);
+        router = router.nest("/api/v1", image_routes);
+    }
 
     // Merge cluster routes (join, node listing)
     // Initialize CIDR-aware IP allocator for overlay address assignment
@@ -2661,93 +2738,108 @@ pub(crate) async fn serve_with_external_shutdown(
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
-    // Merge build routes (build_state was created earlier so WorkflowsState
-    // can share the same BuildManager).
-    let build_api_routes = build_routes().with_state(build_state);
-    router = router.nest("/api/v1", build_api_routes);
+    // ── Build / container / volume / job / cron routes ──────────────────
+    // The remaining orchestration surfaces (image build, container
+    // networks, container lifecycle + event stream, volumes, jobs, cron).
+    // All skipped under `--secrets-only`. The `--rm` auto-remove subscriber
+    // is only spawned in full mode, so its abort handle is an `Option` that
+    // stays `None` for a secrets-only daemon.
+    let auto_remove_handle = if secrets_only {
+        // Consume `event_bus` so it isn't flagged unused in secrets-only
+        // builds (full mode threads it into the states below).
+        let _ = &event_bus;
+        None
+    } else {
+        // Merge build routes (build_state was created earlier so WorkflowsState
+        // can share the same BuildManager).
+        let build_api_routes = build_routes().with_state(build_state);
+        router = router.nest("/api/v1", build_api_routes);
 
-    // Build the bridge-network (Docker-style `docker network create`) state.
-    // When the `docker` feature is enabled AND the daemon can connect to a
-    // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
-    // `POST /api/v1/container-networks` actually creates real Docker
-    // networks; otherwise the state stays in metadata-only mode and a
-    // warning is logged the first time a handler would need the runtime.
-    let bridge_network_state = build_bridge_network_state()
-        .await
-        .with_event_bus(event_bus.clone());
-    let container_network_routes = build_container_network_routes(bridge_network_state.clone());
-    router = router.nest("/api/v1/container-networks", container_network_routes);
+        // Build the bridge-network (Docker-style `docker network create`) state.
+        // When the `docker` feature is enabled AND the daemon can connect to a
+        // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
+        // `POST /api/v1/container-networks` actually creates real Docker
+        // networks; otherwise the state stays in metadata-only mode and a
+        // warning is logged the first time a handler would need the runtime.
+        let bridge_network_state = build_bridge_network_state()
+            .await
+            .with_event_bus(event_bus.clone());
+        let container_network_routes = build_container_network_routes(bridge_network_state.clone());
+        router = router.nest("/api/v1/container-networks", container_network_routes);
 
-    // Merge container lifecycle routes. The same `container_state` is used
-    // for the daemon-wide event stream at `/api/v1/events` so lifecycle
-    // handlers and event subscribers share the broadcast bus. The
-    // bridge-network state is threaded in so `CreateContainerRequest.networks`
-    // can attach freshly-created containers to user-defined networks.
-    let container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
-        .with_shared_event_bus(event_bus.clone())
-        .with_bridge_networks(bridge_network_state)
-        .with_standalone_storage(bundle.standalone_containers.clone())
-        .with_compose_storage(bundle.compose_projects.clone())
-        .with_cluster(cluster_handle.clone())
-        .with_internal_token(internal_token.clone());
+        // Merge container lifecycle routes. The same `container_state` is used
+        // for the daemon-wide event stream at `/api/v1/events` so lifecycle
+        // handlers and event subscribers share the broadcast bus. The
+        // bridge-network state is threaded in so `CreateContainerRequest.networks`
+        // can attach freshly-created containers to user-defined networks.
+        let container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
+            .with_shared_event_bus(event_bus.clone())
+            .with_bridge_networks(bridge_network_state)
+            .with_standalone_storage(bundle.standalone_containers.clone())
+            .with_compose_storage(bundle.compose_projects.clone())
+            .with_cluster(cluster_handle.clone())
+            .with_internal_token(internal_token.clone());
 
-    // Repopulate the in-memory standalone-container cache from disk so
-    // create / list / inspect / delete handlers see records that survived a
-    // daemon restart. A failure here is fatal — running with a half-empty
-    // cache would let a follow-up `delete` succeed at the runtime layer
-    // while a stale row sat in the database.
-    container_state
-        .repopulate_cache_from_storage()
-        .await
-        .context("Failed to repopulate standalone-container cache from storage")?;
+        // Repopulate the in-memory standalone-container cache from disk so
+        // create / list / inspect / delete handlers see records that survived a
+        // daemon restart. A failure here is fatal — running with a half-empty
+        // cache would let a follow-up `delete` succeed at the runtime layer
+        // while a stale row sat in the database.
+        container_state
+            .repopulate_cache_from_storage()
+            .await
+            .context("Failed to repopulate standalone-container cache from storage")?;
 
-    // Reconcile the standalone-container storage against the runtime listing
-    // exactly once at boot. This re-registers ContainerIdMap rows for entries
-    // that survived restart and prunes rows whose runtime bundles have been
-    // removed out-of-band. Failures here are non-fatal — log and continue —
-    // because a transient runtime hiccup at boot must not stop the daemon
-    // from serving (the next reconcile or REST call will re-surface issues).
-    match reconcile_standalone_containers(&container_state).await {
-        Ok(report) => {
-            info!(
-                matched = report.matched,
-                pruned = report.pruned,
-                orphans_seen = report.orphans_seen,
-                "standalone-container reconcile complete",
-            );
+        // Reconcile the standalone-container storage against the runtime listing
+        // exactly once at boot. This re-registers ContainerIdMap rows for entries
+        // that survived restart and prunes rows whose runtime bundles have been
+        // removed out-of-band. Failures here are non-fatal — log and continue —
+        // because a transient runtime hiccup at boot must not stop the daemon
+        // from serving (the next reconcile or REST call will re-surface issues).
+        match reconcile_standalone_containers(&container_state).await {
+            Ok(report) => {
+                info!(
+                    matched = report.matched,
+                    pruned = report.pruned,
+                    orphans_seen = report.orphans_seen,
+                    "standalone-container reconcile complete",
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "standalone-container reconcile failed; continuing boot");
+            }
         }
-        Err(e) => {
-            warn!(error = %e, "standalone-container reconcile failed; continuing boot");
-        }
-    }
 
-    // Spawn the daemon-side `--rm` (auto-remove) subscriber. The returned
-    // JoinHandle is held for the lifetime of the daemon — dropping it would
-    // cancel the task and leak `--rm` containers on exit. The handle is
-    // aborted explicitly during the post-shutdown cleanup phase below.
-    let auto_remove_handle = start_auto_remove_subscriber(container_state.clone());
+        // Spawn the daemon-side `--rm` (auto-remove) subscriber. The returned
+        // JoinHandle is held for the lifetime of the daemon — dropping it would
+        // cancel the task and leak `--rm` containers on exit. The handle is
+        // aborted explicitly during the post-shutdown cleanup phase below.
+        let handle = start_auto_remove_subscriber(container_state.clone());
 
-    let container_routes = build_container_routes(container_state.clone());
-    router = router.nest("/api/v1/containers", container_routes);
+        let container_routes = build_container_routes(container_state.clone());
+        router = router.nest("/api/v1/containers", container_routes);
 
-    let event_routes = build_event_routes(container_state);
-    router = router.nest("/api/v1/events", event_routes);
+        let event_routes = build_event_routes(container_state);
+        router = router.nest("/api/v1/events", event_routes);
 
-    // Merge volume management routes
-    let volume_dir = config.data_dir.join("volumes");
-    let volume_state = VolumeApiState::new(volume_dir).with_event_bus(event_bus.clone());
-    let volume_routes = build_volume_routes(volume_state);
-    router = router.nest("/api/v1/volumes", volume_routes);
+        // Merge volume management routes
+        let volume_dir = config.data_dir.join("volumes");
+        let volume_state = VolumeApiState::new(volume_dir).with_event_bus(event_bus.clone());
+        let volume_routes = build_volume_routes(volume_state);
+        router = router.nest("/api/v1/volumes", volume_routes);
 
-    let job_state = JobState {
-        executor: job_executor,
+        let job_state = JobState {
+            executor: job_executor,
+        };
+        router = router.nest("/api/v1/jobs", build_job_routes(job_state));
+
+        let cron_state = CronState {
+            scheduler: cron_scheduler,
+        };
+        router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
+
+        Some(handle)
     };
-    router = router.nest("/api/v1/jobs", build_job_routes(job_state));
-
-    let cron_state = CronState {
-        scheduler: cron_scheduler,
-    };
-    router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
 
     // Re-apply the auth extension layer AFTER all .nest() calls so that
     // routes added after the base router (containers, jobs, cron, build, etc.)
@@ -2858,10 +2950,13 @@ pub(crate) async fn serve_with_external_shutdown(
     // Stop the standalone `--rm` auto-remove subscriber. It would otherwise
     // exit on its own when the event bus is dropped, but aborting + awaiting
     // here ties its lifetime cleanly to the shutdown path so we don't leave a
-    // task running while later cleanup steps tear down shared state.
-    auto_remove_handle.abort();
-    let _ = auto_remove_handle.await;
-    info!("Auto-remove subscriber stopped");
+    // task running while later cleanup steps tear down shared state. `None`
+    // under `--secrets-only`, where the subscriber is never spawned.
+    if let Some(auto_remove_handle) = auto_remove_handle {
+        auto_remove_handle.abort();
+        let _ = auto_remove_handle.await;
+        info!("Auto-remove subscriber stopped");
+    }
 
     // Stop Raft RPC server
     if let Some(handle) = raft_server_handle {

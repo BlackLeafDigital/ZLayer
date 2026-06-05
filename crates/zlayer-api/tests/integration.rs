@@ -14,7 +14,8 @@ use tower::ServiceExt;
 use zlayer_agent::{MockRuntime, ServiceManager};
 use zlayer_api::storage::InMemoryStorage;
 use zlayer_api::{
-    build_router, build_router_with_internal, create_token, ApiConfig, INTERNAL_AUTH_HEADER,
+    build_router, build_router_secrets_only_base, build_router_with_internal, create_token,
+    ApiConfig, INTERNAL_AUTH_HEADER,
 };
 
 fn test_config() -> ApiConfig {
@@ -59,6 +60,84 @@ async fn test_health_liveness() {
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["status"], "ok");
+}
+
+/// Helper: issue a GET against `uri` on a fresh oneshot of `app` and return
+/// the response status. Each call rebuilds the router because `oneshot`
+/// consumes it.
+async fn status_for(
+    config: &ApiConfig,
+    build: impl Fn(&ApiConfig) -> axum::Router,
+    uri: &str,
+) -> StatusCode {
+    let app = build(config);
+    app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+/// `--secrets-only` gating: the lean secrets base router mounts ONLY the
+/// non-orchestration surfaces it shares with the full base (`/health`,
+/// `/auth`, `/api/v1/users`) and does NOT mount the orchestration nests
+/// (`/api/v1/deployments`, `/api/v1/daemon`). A 404 is the signal that a
+/// path is not routed at all; a non-404 (even 401/405) proves the prefix is
+/// mounted.
+#[tokio::test]
+async fn test_secrets_only_base_mounts_only_secrets_surface() {
+    let config = test_config();
+
+    // Mounted: health is reachable and returns 200 (unauthenticated).
+    assert_eq!(
+        status_for(&config, build_router_secrets_only_base, "/health/live").await,
+        StatusCode::OK,
+        "/health/live must be mounted in secrets-only mode",
+    );
+
+    // Mounted: /auth and /api/v1/users exist. We don't authenticate here, so
+    // we only assert they are NOT 404 (routed, even if they reject the
+    // unauthenticated/wrong-method request).
+    assert_ne!(
+        status_for(&config, build_router_secrets_only_base, "/auth/me").await,
+        StatusCode::NOT_FOUND,
+        "/auth must be mounted in secrets-only mode",
+    );
+    assert_ne!(
+        status_for(&config, build_router_secrets_only_base, "/api/v1/users").await,
+        StatusCode::NOT_FOUND,
+        "/api/v1/users must be mounted in secrets-only mode",
+    );
+
+    // NOT mounted: orchestration nests carried by the full base router are
+    // absent from the lean secrets base.
+    assert_eq!(
+        status_for(
+            &config,
+            build_router_secrets_only_base,
+            "/api/v1/deployments"
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "/api/v1/deployments must NOT be mounted in secrets-only mode",
+    );
+    assert_eq!(
+        status_for(
+            &config,
+            build_router_secrets_only_base,
+            "/api/v1/daemon/info"
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "/api/v1/daemon must NOT be mounted in secrets-only mode",
+    );
+
+    // Sanity check the inverse: the FULL base router DOES mount
+    // /api/v1/deployments (so the 404 above is meaningful, not a typo'd path).
+    assert_ne!(
+        status_for(&config, build_router, "/api/v1/deployments").await,
+        StatusCode::NOT_FOUND,
+        "/api/v1/deployments must be mounted by the full base router",
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,8 @@ members = [
   "crates/zlayer-py",
   "crates/zlayer-web",
   "crates/zlayer-secrets",
+  "crates/secrets-client-api",
+  "crates/zlayer-secrets-client",
   "crates/zlayer-tunnel",
   "bin/zlayer",
   "crates/zlayer-manager",

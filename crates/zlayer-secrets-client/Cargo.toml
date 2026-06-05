@@ -1,0 +1,26 @@
+[package]
+name = "zlayer-secrets-client"
+description = "Thin reqwest-based client for the ZLayer Secrets HTTP API (GET /api/v1/secrets/{name}). Implements the shared `secrets-client-api::SecretsClient` contract so consumers (e.g. ZBilling) can swap an env-var backend for ZLayer Secrets with a one-line change. Deliberately separate from `zlayer-secrets` so it does not pull the daemon's crypto / sqlx tree."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Shared contract (SecretScope / Secret / SecretsError / SecretsClient).
+secrets-client-api = { version = "0.0.0-dev", path = "../secrets-client-api" }
+
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+wiremock = "0.6"
+
+[lints]
+workspace = true

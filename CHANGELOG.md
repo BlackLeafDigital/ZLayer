@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.53.0 - 2026-06-04
+
+### Added
+- **`zlayer serve --secrets-only` daemon mode.** A lean HA secrets/RBAC service: mounts ONLY
+  `/health`, `/auth`, and `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`
+  and skips every orchestration nest (deployments, services, projects, sync, internal agent,
+  tunnel, docker-compat, overlay, container/image/volume/job/cron). The HA secrets-store
+  selection is unchanged — a clustered node with `{secrets_dir}/wrapped_dek.bin` still serves
+  through `RaftSecretsStore`. Flag also settable via `ZLAYER_SECRETS_ONLY`. New
+  `zlayer_api::build_router_secrets_only_base` builds the lean base router; gated in
+  `commands::serve`. This is the daemon behind the `zsecrets` HA deployment.
+- **`zlayer-secrets-client` + `secrets-client-api` crates.** A thin reqwest-based
+  `ZLayerSecretsClient` that reads secrets out of the secrets-only daemon
+  (`GET /api/v1/secrets/{name}?scope=…&reveal=true`, bearer auth, 404→`Ok(None)`), implementing
+  the shared `SecretsClient` trait lifted into the dependency-light `secrets-client-api` crate.
+  Lets consumers (ZBilling, ZRegistry, …) swap an env-var backend for ZLayer Secrets with a
+  one-line change, without a ZBilling→ZLayer dependency edge or the heavy `zlayer-secrets`
+  crypto/sqlx tree.
+- **`zsecrets` deploy artifacts.** `images/Dockerfile.zlayer-secrets` (slim secrets-only image),
+  `zsecrets.zlayer.yml` (2-replica dedicated-node deployment spec), and
+  `docs/RUNBOOK_zsecrets_ha.md` (leader-init / follower-join / sealed-DEK / DNS / auth-bridge
+  bring-up runbook).
+
 ## 0.52.13 - 2026-06-04
 
 ### Fixed

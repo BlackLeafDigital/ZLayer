@@ -8704,6 +8704,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrets-client-api"
+version = "0.0.0-dev"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13245,6 +13253,20 @@ dependencies = [
  "zlayer-api",
  "zlayer-paths",
  "zlayer-types",
+]
+
+[[package]]
+name = "zlayer-secrets-client"
+version = "0.0.0-dev"
+dependencies = [
+ "async-trait",
+ "reqwest 0.13.2",
+ "secrets-client-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+[package]
+name = "secrets-client-api"
+description = "Shared, dependency-light contract (SecretScope / Secret / SecretsError / SecretsClient) for ZLayer Secrets consumers. Lifted out of zbilling-secrets so the trait shape can be shared without a ZBilling -> ZLayer dependency edge or a heavy-crypto pull-in."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -628,6 +628,74 @@ pub fn build_router_with_deployment_state(
     router
 }
 
+/// Build the lean base router for `zlayer serve --secrets-only`.
+///
+/// Mounts ONLY the non-orchestration prefixes the secrets daemon needs from
+/// the base layer: `/health` (liveness/readiness, unauthenticated), `/auth`
+/// (login/whoami/token), and `/api/v1/users` (admin user CRUD). The caller
+/// (the `--secrets-only` branch in `commands::serve`) nests the remaining
+/// secrets-relevant surfaces — `/api/v1/{groups,permissions,audit,secrets,
+/// environments,cluster}` — on top, and deliberately skips deployments,
+/// services, daemon, projects, sync, internal, tunnel, overlay, container,
+/// image, volume, job, and cron routes.
+///
+/// This mirrors the middleware/CORS/Swagger stack of
+/// [`build_router_with_deployment_state`] so the auth, rate-limit, CSRF, and
+/// trace layers behave identically; it just omits the orchestration nests.
+///
+/// The trailing `AuthState` extension layer must be re-applied by the caller
+/// AFTER its own `.nest()` calls (same requirement as the full serve path) so
+/// routes nested after this base also see the `AuthState` extension.
+pub fn build_router_secrets_only_base(config: &ApiConfig) -> Router {
+    // Auth state
+    let auth_state = AuthState {
+        jwt_secret: config.jwt_secret.clone(),
+        credential_store: config.credential_store.clone(),
+        user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
+        cookie_secure: false,
+    };
+    log_auth_state_audit(&auth_state);
+
+    // Rate limiting
+    let rate_limit_state = RateLimitState::new(&config.rate_limit);
+    let ip_limiter = Arc::new(IpRateLimiter::new(config.rate_limit.clone()));
+
+    // CORS layer
+    let cors = build_cors_layer(config);
+
+    // Health routes (no auth required)
+    let health_routes = Router::new()
+        .route("/live", get(handlers::health::liveness))
+        .route("/ready", get(handlers::health::readiness));
+
+    // Auth + users routes
+    let auth_routes = build_auth_routes(auth_state.clone());
+    let users_routes = build_users_routes(auth_state.clone());
+
+    let mut router = Router::new()
+        .nest("/health", health_routes)
+        .nest("/auth", auth_routes)
+        .nest("/api/v1/users", users_routes)
+        .layer(Extension(auth_state))
+        .layer(Extension(rate_limit_state))
+        .layer(Extension(ip_limiter))
+        .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(middleware::from_fn(csrf_middleware))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // Add Swagger UI if enabled
+    if config.swagger_enabled {
+        router = router
+            .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    }
+
+    router
+}
+
 /// Build the internal routes for scheduler-to-agent communication
 ///
 /// These routes use a shared secret for authentication (via X-ZLayer-Internal-Token header)

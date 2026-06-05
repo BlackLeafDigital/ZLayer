@@ -742,6 +742,7 @@ async fn run(
             no_tunnel_server,
             restart_on_exit,
             vacuum_secrets,
+            secrets_only,
             ..
         } => {
             // Spawn Docker API socket server if enabled. On Unix this is a
@@ -790,6 +791,14 @@ async fn run(
             // `{data_dir}/join_secret` BEFORE the HS256 HMAC key derivation
             // runs. Defaults to `false`; consumed exactly once per process.
             commands::serve::set_pending_vacuum_secrets(*vacuum_secrets);
+
+            // Secrets-only mode: stash the flag so the daemon's boot path
+            // (`serve_with_external_shutdown`) mounts ONLY the secrets/RBAC
+            // router surface and skips orchestration nests. Same
+            // process-global-slot pattern as the flags above — keeps the
+            // `serve_with_external_shutdown` signature (pinned by the Windows
+            // Service host) untouched. Consumed exactly once per process.
+            commands::serve::set_pending_secrets_only(*secrets_only);
 
             // Resolve the daemon instance name from the top-level
             // `--daemon-name` flag (with current_exe fallback) so the

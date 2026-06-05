@@ -814,6 +814,23 @@ pub(crate) enum Commands {
         /// Ed25519-signed tokens are unaffected.
         #[clap(long, env = "ZLAYER_VACUUM_SECRETS")]
         vacuum_secrets: bool,
+
+        /// Run the daemon in secrets-only mode: a lean HA secrets/RBAC service.
+        ///
+        /// Mounts ONLY the secrets-relevant API surface — `/health`, `/auth`,
+        /// `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`
+        /// — and skips every orchestration nest (deployments, services,
+        /// projects, sync, internal agent, tunnel, docker-compat, overlay
+        /// reconcile, container/image/volume/job/cron routes). The HA secrets
+        /// store selection is unchanged: a `{secrets_dir}/wrapped_dek.bin`
+        /// (written by `zlayer node join`) switches the store to
+        /// `RaftSecretsStore` automatically, so a clustered secrets-only node
+        /// serves secrets through Raft.
+        ///
+        /// This is the daemon mode behind the `zsecrets` HA deployment
+        /// (`secrets.blackleafdigital.com`).
+        #[clap(long, env = "ZLAYER_SECRETS_ONLY")]
+        secrets_only: bool,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
