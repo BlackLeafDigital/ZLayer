@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.54.0 - 2026-06-04
+
+### Added
+- **vsock-based host→guest port forwarding for the macOS VZ-Linux runtime.** Published
+  container ports are now reachable from the host over the (already-working) virtio-vsock
+  channel instead of the broken VZ NAT path. New `proto::Msg::Forward { port }` wire variant
+  (appended as tag 9, with a round-trip test) tells the guest agent "splice THIS vsock
+  connection to `127.0.0.1:<port>` inside the guest". The in-guest `zlayer-vzagent` peeks the
+  first frame in `serve_connection`; on `Forward` it opens `TcpStream::connect(("127.0.0.1",
+  port))` and transparently pipes raw bytes between the vsock fd and the TCP stream (one thread
+  per direction, half-close on EOF), concurrent with `Run`/`Exec` and with PID-1 reaper
+  behavior intact. On the host, `start_container` spawns one loopback forwarder per distinct
+  published TCP container port: it binds `127.0.0.1:<container_port>` and, for each accepted
+  connection, opens a fresh vsock connection, writes a `Forward` frame, and bidirectionally
+  copies bytes between the host TCP connection and the vsock connection.
+
+### Changed
+- **`get_container_ip` reports host loopback for live VZ-Linux guests.** Reachability is via the
+  host loopback forwarders (vsock tunnel), not a guest NAT IP, so a running container returns
+  `127.0.0.1` (`Ok(None)` when not running). `port_mappings_container` reports each forwarded
+  port as `127.0.0.1:<container_port>` (host_port == container_port).
+- Removed the dead DHCP-lease poller (`guest_ip` cache, `ip_poll_task`, `resolve_guest_ip`) from
+  the VZ-Linux runtime — the NAT lease never appeared for this process. The NAT network device in
+  `build_config_linux` is retained (harmless) but no longer relied on for reachability.
+
 ## 0.53.0 - 2026-06-04
 
 ### Added

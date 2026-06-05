@@ -402,14 +402,26 @@ mod linux {
         // Ensure loopback is up — many runtimes assume 127.0.0.1 works.
         let _ = set_link_up("lo");
 
-        if let Err(e) = set_link_up("eth0") {
+        // The virtio-net device is probed asynchronously during boot, so it may
+        // not exist the instant PID 1 runs, and its name is not guaranteed to be
+        // `eth0`. Discover the first non-loopback interface, waiting briefly for
+        // it to appear.
+        let Some(iface) = wait_for_eth(std::time::Duration::from_secs(5)) else {
+            eprintln!(
+                "zlayer-vzagent: warning: no ethernet interface appeared; \
+                 continuing without networking"
+            );
+            return Ok(());
+        };
+
+        if let Err(e) = set_link_up(&iface) {
             // Not fatal: the workload may not need networking, and the host
             // surfaces the warning. Log and continue.
-            eprintln!("zlayer-vzagent: warning: failed to set eth0 up: {e}");
+            eprintln!("zlayer-vzagent: warning: failed to set {iface} up: {e}");
             return Ok(());
         }
 
-        if interface_has_ipv4("eth0") {
+        if interface_has_ipv4(&iface) {
             // Kernel IP_PNP already gave us a lease; nothing to do.
             return Ok(());
         }
@@ -426,7 +438,7 @@ mod linux {
             if path.ends_with("busybox") {
                 cmd.arg("udhcpc");
             }
-            cmd.args(["-i", "eth0", "-f", "-q", "-n", "-t", "5", "-T", "2"]);
+            cmd.args(["-i", iface.as_str(), "-f", "-q", "-n", "-t", "5", "-T", "2"]);
             match cmd.status() {
                 Ok(status) if status.success() => return Ok(()),
                 Ok(status) => {
@@ -440,6 +452,27 @@ mod linux {
         }
         eprintln!("zlayer-vzagent: no udhcpc/busybox found; relying on kernel ip=dhcp");
         Ok(())
+    }
+
+    /// Wait up to `timeout` for the first non-loopback network interface to
+    /// appear in `/sys/class/net`, returning its name. virtio-net is probed
+    /// asynchronously, so the NIC may not exist the instant PID 1 runs.
+    fn wait_for_eth(timeout: std::time::Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(entries) = fs::read_dir("/sys/class/net") {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name != "lo" {
+                        return Some(name);
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     /// Set a network interface administratively up via an ioctl on a dgram
@@ -541,41 +574,32 @@ mod linux {
             }
         }
 
-        // Make sure new_root is a mount point and the propagation is private so
-        // pivot_root succeeds.
+        // Make all mount propagation private so the root move below is allowed.
         mount("", "/", "", libc::MS_REC | libc::MS_PRIVATE, None)?;
 
-        // Bind-mount newroot onto itself so it is guaranteed to be a mount
-        // point (required by pivot_root).
-        mount(new_root, new_root, "", libc::MS_BIND | libc::MS_REC, None)?;
-
-        let put_old = "/newroot/.oldroot";
-        mkdir_p(put_old)?;
-
-        let c_new = CString::new(new_root).map_err(|_| err("nul in new_root"))?;
-        let c_old = CString::new(put_old).map_err(|_| err("nul in put_old"))?;
-        // SAFETY: SYS_pivot_root with two valid C-string paths.
-        let rc = unsafe { libc::syscall(libc::SYS_pivot_root, c_new.as_ptr(), c_old.as_ptr()) };
-        if rc != 0 {
-            return Err(errno("pivot_root"));
+        // We are PID 1 running from the initramfs, which is a rootfs/ramfs.
+        // `pivot_root(2)` CANNOT move the initial rootfs and returns EINVAL on
+        // it, so the kernel-documented technique for the initramfs→real-root
+        // transition is `switch_root` semantics: move the new-root mount on top
+        // of "/" and `chroot` into it (exactly what busybox `switch_root` does).
+        let c_newroot = CString::new(new_root).map_err(|_| err("nul in new_root"))?;
+        // SAFETY: chdir into the overlay mount (`/newroot`).
+        if unsafe { libc::chdir(c_newroot.as_ptr()) } != 0 {
+            return Err(errno("chdir(/newroot)"));
         }
-
-        // chdir into the new root and detach the old one.
+        // Move the overlay mount (now the cwd) onto "/". `.` resolves to the
+        // overlay mount itself, which is required for MS_MOVE onto the old root.
+        mount(".", "/", "", libc::MS_MOVE, None)?;
+        let c_dot = CString::new(".").unwrap();
+        // SAFETY: chroot into the relocated root ("." is now "/").
+        if unsafe { libc::chroot(c_dot.as_ptr()) } != 0 {
+            return Err(errno("chroot(.)"));
+        }
         let c_root = CString::new("/").unwrap();
-        // SAFETY: chdir to "/" (now the new root) — valid path.
+        // SAFETY: chdir to "/" inside the new root.
         if unsafe { libc::chdir(c_root.as_ptr()) } != 0 {
-            return Err(errno("chdir(/) after pivot"));
+            return Err(errno("chdir(/) after chroot"));
         }
-        let c_oldroot = CString::new("/.oldroot").unwrap();
-        // Lazy-detach the old root; it disappears once unused.
-        // SAFETY: umount2 with a valid path and MNT_DETACH flag.
-        if unsafe { libc::umount2(c_oldroot.as_ptr(), libc::MNT_DETACH) } != 0 {
-            eprintln!(
-                "zlayer-vzagent: warning: umount old root: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let _ = fs::remove_dir("/.oldroot");
         Ok(())
     }
 
@@ -643,6 +667,12 @@ mod linux {
         fn try_clone(&self) -> Result<VsockStream> {
             let dup = self.fd.try_clone().map_err(Error::from)?;
             Ok(VsockStream { fd: dup })
+        }
+    }
+
+    impl AsRawFd for VsockStream {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
         }
     }
 
@@ -846,6 +876,79 @@ mod linux {
     }
 
     // ----------------------------------------------------------------------
+    // Port forwarding (vsock <-> guest-local TCP tunnel)
+    // ----------------------------------------------------------------------
+
+    /// Copy bytes from `src` to `dst` until EOF or error, then half-close the
+    /// write side of `dst` so the peer observes EOF. Best-effort: any IO error
+    /// simply ends the copy (the other direction's thread will then also wind
+    /// down once its peer closes).
+    fn pump<R: Read, W: Write + AsRawFd>(mut src: R, mut dst: W) {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if dst.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                // Retry interrupted reads; any other error ends the copy.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = dst.flush();
+        // Half-close the write direction so the peer sees EOF promptly even if
+        // the reverse copy is still draining. SHUT_WR on the destination fd.
+        // SAFETY: `dst` owns a live fd for the duration of this call.
+        unsafe {
+            libc::shutdown(dst.as_raw_fd(), libc::SHUT_WR);
+        }
+    }
+
+    /// Turn a connection that opened with [`Msg::Forward`] into a transparent
+    /// byte tunnel between the vsock connection and `127.0.0.1:<port>` inside the
+    /// guest.
+    ///
+    /// Opens a guest-local TCP connection, then bidirectionally copies raw bytes
+    /// (one thread per direction) until either side reaches EOF/error. No proto
+    /// framing is exchanged after the `Forward` frame — this is a transparent
+    /// L4 tunnel. If the TCP connect fails, a single `Msg::Error` frame is
+    /// written back over the still-framed vsock connection before it closes.
+    fn serve_forward(conn: VsockStream, port: u16) -> Result<()> {
+        let tcp = match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => s,
+            Err(e) => {
+                // The connection has not been switched to raw mode yet, so we can
+                // still report the failure as a framed protocol error.
+                let mut w = conn;
+                let _ = proto::write_frame(
+                    &mut w,
+                    &Msg::Error {
+                        message: format!("forward connect 127.0.0.1:{port}: {e}"),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        // Independent owned handles for each direction. The vsock side clones the
+        // fd; the TCP side clones the TcpStream.
+        let vsock_read = conn.try_clone()?;
+        let vsock_write = conn;
+        let tcp_read = tcp.try_clone().map_err(Error::from)?;
+        let tcp_write = tcp;
+
+        // vsock -> tcp on this thread, tcp -> vsock on a helper thread.
+        let h = thread::spawn(move || {
+            pump(tcp_read, vsock_write);
+        });
+        pump(vsock_read, tcp_write);
+        let _ = h.join();
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
     // Protocol loop
     // ----------------------------------------------------------------------
 
@@ -862,8 +965,40 @@ mod linux {
     /// run/exec/signal, and stream output + exit codes back.
     fn serve_connection(conn: VsockStream) -> Result<()> {
         let mut reader = conn.try_clone()?;
-        let writer = conn;
 
+        // Peek the FIRST frame before standing up the framed writer thread: a
+        // `Forward` connection is a transparent L4 tunnel with NO proto framing
+        // after this point, so it must NOT share the framed writer machinery.
+        match proto::read_frame(&mut reader) {
+            Ok(Msg::Forward { port }) => {
+                // `reader` and `conn` are independent dup'd handles of the same
+                // vsock fd; hand the original `conn` to the splicer (it reuses it
+                // for both directions via its own try_clone). Drop our reader dup
+                // so only the splice owns live copies.
+                drop(reader);
+                serve_forward(conn, port)
+            }
+            Ok(first) => {
+                // A normal control connection: process the already-read first
+                // frame, then continue the framed loop below.
+                serve_framed(reader, conn, Some(first))
+            }
+            Err(proto::ProtoError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Host closed before sending anything: nothing to do.
+                Ok(())
+            }
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    /// The framed control loop (Run/Exec/Signal). `first` is the already-read
+    /// leading frame (if any); subsequent frames are read from `reader`. All
+    /// outbound frames go through a single serialized writer thread over `writer`.
+    fn serve_framed(
+        mut reader: VsockStream,
+        writer: VsockStream,
+        mut first: Option<Msg>,
+    ) -> Result<()> {
         // All outbound frames (stdout/stderr/started/exited/error) are
         // serialized through a single writer thread to avoid interleaving
         // partial frames from the output-pump threads.
@@ -878,18 +1013,23 @@ mod linux {
         });
 
         loop {
-            let msg = match proto::read_frame(&mut reader) {
-                Ok(m) => m,
-                Err(proto::ProtoError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Host closed the control connection cleanly.
-                    break;
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::Error {
-                        message: format!("read_frame: {e}"),
-                    });
-                    break;
-                }
+            let msg = match first.take() {
+                Some(m) => m,
+                None => match proto::read_frame(&mut reader) {
+                    Ok(m) => m,
+                    Err(proto::ProtoError::Io(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        // Host closed the control connection cleanly.
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error {
+                            message: format!("read_frame: {e}"),
+                        });
+                        break;
+                    }
+                },
             };
 
             match msg {

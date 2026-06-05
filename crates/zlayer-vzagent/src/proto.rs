@@ -89,6 +89,21 @@ pub enum Msg {
         /// Human-readable error description.
         message: String,
     },
+    /// Host → guest: turn **this** vsock connection into a transparent byte
+    /// tunnel to `127.0.0.1:<port>` inside the guest.
+    ///
+    /// This must be the **first** frame on a connection. After the guest reads
+    /// it, no further protocol framing is exchanged on this connection: the
+    /// guest opens `TcpStream::connect(("127.0.0.1", port))` and bidirectionally
+    /// pipes raw bytes between the vsock fd and the TCP stream until either side
+    /// reaches EOF/error. It is the mechanism behind host→guest published-port
+    /// reachability on the macOS VZ-Linux runtime, where VZ NAT establishes no
+    /// usable guest lease and a host loopback listener must tunnel each
+    /// connection over the (working) vsock channel instead.
+    Forward {
+        /// Guest-local TCP port to splice this connection to (on `127.0.0.1`).
+        port: u16,
+    },
 }
 
 impl Msg {
@@ -104,6 +119,7 @@ impl Msg {
             Msg::Started { .. } => 6,
             Msg::Exited { .. } => 7,
             Msg::Error { .. } => 8,
+            Msg::Forward { .. } => 9,
         }
     }
 }
@@ -201,7 +217,7 @@ pub fn decode(body: &[u8]) -> Result<Msg> {
     let (&tag, payload) = body.split_first().ok_or(ProtoError::EmptyFrame)?;
     // Validate the tag up front so we surface a clear error instead of letting
     // postcard choke on a bad enum discriminant.
-    if !(1..=8).contains(&tag) {
+    if !(1..=9).contains(&tag) {
         return Err(ProtoError::UnknownTag(tag));
     }
     let msg: Msg = postcard::from_bytes(payload)?;
@@ -295,7 +311,32 @@ mod tests {
             Msg::Error {
                 message: "rootfs mount failed".into(),
             },
+            Msg::Forward { port: 8080 },
+            Msg::Forward { port: 0 }, // edge: port 0
+            Msg::Forward { port: u16::MAX },
         ]
+    }
+
+    #[test]
+    fn forward_frame_roundtrips() {
+        for port in [0u16, 80, 443, 8080, 65535] {
+            let msg = Msg::Forward { port };
+            // Tag is the appended discriminant (9), kept stable.
+            assert_eq!(msg.tag(), 9, "Forward must use the appended tag 9");
+
+            // encode/decode round-trip.
+            let frame = encode(&msg).expect("encode Forward");
+            assert_eq!(frame[4], 9, "framing tag byte must be 9");
+            let decoded = decode(&frame[4..]).expect("decode Forward");
+            assert_eq!(decoded, msg, "Forward encode/decode mismatch");
+
+            // read_frame/write_frame round-trip over a stream.
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &msg).expect("write Forward");
+            let mut cursor = Cursor::new(buf);
+            let got = read_frame(&mut cursor).expect("read Forward");
+            assert_eq!(got, msg, "Forward frame round-trip mismatch");
+        }
     }
 
     #[test]

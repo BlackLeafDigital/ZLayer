@@ -192,34 +192,31 @@ pub(crate) struct VzLinuxContainer {
     outcome: Arc<RunOutcome>,
     /// Handle to the blocking vsock drain task, joined/aborted on stop/remove.
     drain_task: Option<JoinHandle<()>>,
-    /// The guest's NAT IP, cached once the background poller (or a `get_container_ip`
-    /// call) resolves the DHCP lease. `None` until the lease appears.
-    guest_ip: Arc<Mutex<Option<IpAddr>>>,
-    /// Background DHCP-lease poller spawned at start; aborted on stop/remove.
-    ip_poll_task: Option<JoinHandle<()>>,
-    /// Host-port forwarders for spec `port_mappings` that request a fixed host
-    /// port (each proxies `127.0.0.1:host_port` -> `guest_ip:container_port`).
-    /// Tracked so `stop`/`remove` can abort them. Paired with the published
-    /// `(host_port, container_port, protocol)` for `port_mappings_container`.
+    /// Host loopback forwarders for the container's published/exposed ports.
+    /// Each binds `127.0.0.1:<container_port>` and tunnels every connection over
+    /// a fresh vsock `Forward` to the guest agent. Tracked so `stop`/`remove`
+    /// can abort them and so `port_mappings_container` can report the bindings.
     port_forwards: Vec<PortForward>,
 }
 
 /// A spawned host-port forwarder for a published container port.
 ///
-/// On macOS the VZ NAT subnet is directly host-reachable, so `guest_ip:port`
-/// already works for any process that knows the guest IP. A `PortForward`
-/// additionally pins a *fixed host port* (Docker's `-p host:container`) by
-/// running a tokio TCP listener on `127.0.0.1:host_port` that proxies each
-/// accepted connection to `guest_ip:container_port`, so tooling that targets the
-/// stable host port (not the ephemeral NAT IP) reaches the guest.
+/// VZ NAT establishes no usable guest lease on this macOS, so there is no guest
+/// IP to dial. Instead each forwarder binds a host loopback TCP listener on
+/// `127.0.0.1:container_port` and, for every accepted connection, opens a NEW
+/// vsock connection to the guest agent ([`proto::CONTROL_PORT`]), writes a
+/// [`proto::Msg::Forward`] frame, and then transparently pipes raw bytes between
+/// the host TCP connection and the vsock connection. The guest agent connects to
+/// `127.0.0.1:container_port` inside the guest and splices the bytes (see
+/// `zlayer-vzagent`'s `serve_forward`). The host port equals the container port,
+/// so `127.0.0.1:<container_port>` on the host reaches the same service the
+/// workload listens on inside the guest.
 struct PortForward {
-    /// The fixed host port the forwarder listens on.
-    host_port: u16,
-    /// The guest container port traffic is proxied to.
+    /// The container port forwarded; also the host loopback port bound.
     container_port: u16,
     /// Transport protocol (currently only TCP forwards are spawned).
     protocol: zlayer_spec::PortProtocol,
-    /// The listener+proxy task; aborted on teardown.
+    /// The listener+tunnel task; aborted on teardown.
     task: JoinHandle<()>,
 }
 
@@ -430,75 +427,62 @@ impl VzLinuxRuntime {
         Ok(merged.split_off(start))
     }
 
-    /// Resolve the guest's NAT IP, waiting up to `timeout` for the DHCP lease.
+    /// Spawn a host loopback forwarder per **distinct published TCP container
+    /// port** the spec declares, tracking each on the container record for
+    /// teardown.
     ///
-    /// Returns the cached IP immediately when the background poller has already
-    /// recorded it. Otherwise it reads `/var/db/dhcpd_leases` by the container's
-    /// MAC, caching and returning the first hit, until `timeout` elapses
-    /// (`Ok(None)` if no lease appears in time). `Ok(None)` for an unknown
-    /// container as well.
-    async fn resolve_guest_ip(&self, dir_name: &str, timeout: Duration) -> Option<IpAddr> {
-        let (mac, guest_ip) = {
-            let guard = self.containers.read().await;
-            let c = guard.get(dir_name)?;
-            // Fast path: the background poller already cached the lease.
-            if let Some(ip) = c.guest_ip.lock().ok().and_then(|g| *g) {
-                return Some(ip);
-            }
-            (c.mac.clone(), Arc::clone(&c.guest_ip))
-        };
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(ip) = macos_vz_shared::current_guest_ip(&mac).await {
-                if let Ok(mut slot) = guest_ip.lock() {
-                    *slot = Some(ip);
-                }
-                return Some(ip);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(IP_POLL_INTERVAL).await;
-        }
-    }
-
-    /// Spawn `127.0.0.1:host_port -> guest_ip:container_port` TCP forwarders for
-    /// the container's spec `port_mappings` that pin a fixed (non-zero) host
-    /// port, tracking each on the container record for teardown.
+    /// Every forwarder binds `127.0.0.1:<container_port>` and tunnels each
+    /// accepted connection over a fresh vsock `Forward` to the guest agent (which
+    /// dials `127.0.0.1:<container_port>` inside the guest). The host port is the
+    /// container port: there is no separate "host port" to pin because the guest
+    /// has no routable NAT IP — loopback-on-host *is* the reachability path.
     ///
-    /// UDP and ephemeral (`host_port` None/0) mappings are not forwarded: the
-    /// raw NAT IP is directly host-reachable for those, and an ephemeral host
-    /// port has no stable target to bind.
+    /// UDP mappings are skipped (only TCP tunnels are spawned).
     async fn spawn_port_forwards(&self, dir_name: &str) {
-        let mappings: Vec<(u16, u16, zlayer_spec::PortProtocol)> = {
+        // Collect distinct TCP container ports from the spec's port mappings.
+        let (ports, live): (Vec<(u16, zlayer_spec::PortProtocol)>, Option<LiveVm>) = {
             let guard = self.containers.read().await;
             let Some(c) = guard.get(dir_name) else {
                 return;
             };
-            c.spec
+            let mut seen = std::collections::HashSet::new();
+            let ports = c
+                .spec
                 .port_mappings
                 .iter()
+                .filter(|m| m.protocol == zlayer_spec::PortProtocol::Tcp)
                 .filter_map(|m| {
-                    let hp = m.host_port?;
-                    if hp == 0 || m.protocol != zlayer_spec::PortProtocol::Tcp {
-                        return None;
+                    if seen.insert(m.container_port) {
+                        Some((m.container_port, m.protocol))
+                    } else {
+                        None
                     }
-                    Some((hp, m.container_port, m.protocol))
                 })
-                .collect()
+                .collect();
+            let live = c.live.as_ref().map(|l| LiveVm {
+                queue: l.queue.clone(),
+                vm: Arc::clone(&l.vm),
+            });
+            (ports, live)
         };
-        if mappings.is_empty() {
+        let Some(live) = live else {
+            return;
+        };
+        if ports.is_empty() {
             return;
         }
-        let mut forwards = Vec::with_capacity(mappings.len());
-        for (host_port, container_port, protocol) in mappings {
+        let mut forwards = Vec::with_capacity(ports.len());
+        for (container_port, protocol) in ports {
             let containers = Arc::clone(&self.containers);
             let dir = dir_name.to_string();
+            let live_for_task = LiveVm {
+                queue: live.queue.clone(),
+                vm: Arc::clone(&live.vm),
+            };
             let task = tokio::spawn(async move {
-                run_port_forward(containers, dir, host_port, container_port).await;
+                run_port_forward(containers, dir, live_for_task, container_port).await;
             });
             forwards.push(PortForward {
-                host_port,
                 container_port,
                 protocol,
                 task,
@@ -516,67 +500,43 @@ impl VzLinuxRuntime {
     }
 }
 
-/// Run one `127.0.0.1:host_port -> guest_ip:container_port` TCP forwarder.
+/// Run one host loopback forwarder that tunnels `127.0.0.1:<container_port>`
+/// (on the host) into the guest over vsock.
 ///
-/// Waits for the guest's NAT IP (polling its cached/leased value), binds the
-/// host loopback listener, then proxies every accepted connection to the guest
-/// with a bidirectional copy. Exits when the container disappears or its VM is
-/// torn down. Best-effort: bind/accept errors are logged, not fatal.
+/// Binds the host loopback listener, then for every accepted connection opens a
+/// **fresh** vsock connection to the guest agent, writes a
+/// [`proto::Msg::Forward`] frame naming `container_port`, and bidirectionally
+/// copies raw bytes between the accepted host TCP connection and the vsock
+/// connection (the guest splices it to `127.0.0.1:<container_port>` inside the
+/// guest). Exits when the container disappears or its VM is torn down.
+/// Best-effort: bind/accept/tunnel errors are logged, not fatal.
 async fn run_port_forward(
     containers: Arc<RwLock<HashMap<String, VzLinuxContainer>>>,
     dir_name: String,
-    host_port: u16,
+    live: LiveVm,
     container_port: u16,
 ) {
     use std::net::{Ipv4Addr, SocketAddr};
-    use tokio::io::copy_bidirectional;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
 
-    // Wait for the guest IP (poll the cached/leased value).
-    let guest_ip = {
-        let deadline = Instant::now() + IP_POLL_TIMEOUT;
-        loop {
-            let cached = {
-                let guard = containers.read().await;
-                match guard.get(&dir_name) {
-                    None => return,
-                    Some(c) => c.guest_ip.lock().ok().and_then(|g| *g),
-                }
-            };
-            if let Some(ip) = cached {
-                break ip;
-            }
-            if Instant::now() >= deadline {
-                tracing::warn!(
-                    container = %dir_name,
-                    host_port,
-                    "vz-linux: port-forward gave up waiting for guest IP"
-                );
-                return;
-            }
-            tokio::time::sleep(IP_POLL_INTERVAL).await;
-        }
-    };
-
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port);
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), container_port);
     let listener = match TcpListener::bind(bind_addr).await {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!(
                 container = %dir_name,
-                host_port,
+                container_port,
                 error = %e,
-                "vz-linux: failed to bind host-port forwarder"
+                "vz-linux: failed to bind loopback forwarder"
             );
             return;
         }
     };
-    let target = SocketAddr::new(guest_ip, container_port);
     tracing::info!(
         container = %dir_name,
         %bind_addr,
-        %target,
-        "vz-linux: host-port forwarder up"
+        container_port,
+        "vz-linux: loopback->vsock forwarder up"
     );
 
     loop {
@@ -588,7 +548,7 @@ async fn run_port_forward(
             }
         }
         let accept = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-        let (mut inbound, _peer) = match accept {
+        let (inbound, _peer) = match accept {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 tracing::debug!(container = %dir_name, error = %e, "vz-linux: forward accept error");
@@ -597,17 +557,88 @@ async fn run_port_forward(
             // Timeout: loop back to re-check liveness.
             Err(_) => continue,
         };
-        tokio::spawn(async move {
-            match TcpStream::connect(target).await {
-                Ok(mut outbound) => {
-                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
-                }
-                Err(e) => {
-                    tracing::debug!(%target, error = %e, "vz-linux: forward dial to guest failed");
-                }
+
+        // Convert the accepted tokio connection into a blocking std stream so the
+        // whole tunnel runs on a blocking thread alongside the blocking
+        // `connect_vsock`/`UnixStream` IO.
+        let inbound_std = match inbound.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(container = %dir_name, error = %e, "vz-linux: into_std failed");
+                continue;
             }
+        };
+        let live_for_conn = LiveVm {
+            queue: live.queue.clone(),
+            vm: Arc::clone(&live.vm),
+        };
+        let dir = dir_name.clone();
+        tokio::task::spawn_blocking(move || {
+            // The tokio stream was non-blocking; restore blocking mode for the
+            // synchronous copy loops below.
+            if let Err(e) = inbound_std.set_nonblocking(false) {
+                tracing::debug!(container = %dir, error = %e, "vz-linux: set_blocking failed");
+                return;
+            }
+            tunnel_connection_over_vsock(&live_for_conn, inbound_std, container_port, &dir);
         });
     }
+}
+
+/// Open a fresh vsock connection to the guest agent, send a
+/// [`proto::Msg::Forward`] frame for `container_port`, and bidirectionally pipe
+/// raw bytes between the host TCP connection and the vsock connection until
+/// either side reaches EOF/error. Runs on a blocking thread.
+fn tunnel_connection_over_vsock(
+    live: &LiveVm,
+    inbound: std::net::TcpStream,
+    container_port: u16,
+    dir_name: &str,
+) {
+    let mut vsock = match connect_vsock(live) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(container = %dir_name, error = %e, "vz-linux: forward vsock connect failed");
+            return;
+        }
+    };
+    // Frame the guest into transparent-tunnel mode for this connection.
+    if let Err(e) = proto::write_frame(
+        &mut vsock,
+        &proto::Msg::Forward {
+            port: container_port,
+        },
+    ) {
+        tracing::debug!(container = %dir_name, error = %e, "vz-linux: forward send Forward failed");
+        return;
+    }
+
+    // Independent owned halves for each direction. Both an `UnixStream` and a
+    // `TcpStream` can be cloned to split read/write across threads.
+    let (mut vsock_r, mut vsock_w) = match vsock.try_clone() {
+        Ok(clone) => (vsock, clone),
+        Err(e) => {
+            tracing::debug!(container = %dir_name, error = %e, "vz-linux: vsock clone failed");
+            return;
+        }
+    };
+    let (mut tcp_r, mut tcp_w) = match inbound.try_clone() {
+        Ok(clone) => (inbound, clone),
+        Err(e) => {
+            tracing::debug!(container = %dir_name, error = %e, "vz-linux: tcp clone failed");
+            return;
+        }
+    };
+
+    // host -> guest on a helper thread; guest -> host on this thread.
+    let h = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut tcp_r, &mut vsock_w);
+        // Half-close the vsock write side so the guest's splice sees EOF.
+        let _ = vsock_w.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut vsock_r, &mut tcp_w);
+    let _ = tcp_w.shutdown(std::net::Shutdown::Write);
+    let _ = h.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -640,18 +671,6 @@ const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause between vsock connect attempts.
 const VSOCK_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-
-/// How long the background DHCP-lease poller keeps looking for the guest's NAT
-/// IP after start. The guest has to finish DHCP before VZ's userspace DHCP
-/// server writes the lease to `/var/db/dhcpd_leases`, so the first reads miss.
-const IP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Pause between `dhcpd_leases` reads in the background poller.
-const IP_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Bounded wait inside [`VzLinuxRuntime::get_container_ip`] when the lease has
-/// not yet been cached (e.g. a caller asks before the background poller wins).
-const GET_IP_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Round-trip a MAC string through `VZMACAddress` (parse then re-stringify),
 /// returning the framework's canonical spelling or `None` when the string is
@@ -1362,8 +1381,6 @@ impl Runtime for VzLinuxRuntime {
             live: None,
             outcome: Arc::new(RunOutcome::default()),
             drain_task: None,
-            guest_ip: Arc::new(Mutex::new(None)),
-            ip_poll_task: None,
             port_forwards: Vec::new(),
         };
 
@@ -1501,52 +1518,13 @@ impl Runtime for VzLinuxRuntime {
             }
         }
 
-        // Kick off a background DHCP-lease poller so the guest's NAT IP is
-        // discoverable promptly without blocking `start_container` (the workload
-        // may not need inbound networking immediately). It writes the resolved
-        // IP into the container's shared `guest_ip` cell; `get_container_ip`
-        // reads that cell first and only falls back to a live lease read.
-        let (mac, guest_ip) = {
-            let guard = self.containers.read().await;
-            match guard.get(&dir_name) {
-                Some(c) => (c.mac.clone(), Arc::clone(&c.guest_ip)),
-                None => return Ok(()),
-            }
-        };
-        let containers = Arc::clone(&self.containers);
-        let dir_for_poll = dir_name.clone();
-        let ip_poll = tokio::spawn(async move {
-            let deadline = Instant::now() + IP_POLL_TIMEOUT;
-            while Instant::now() < deadline {
-                // Stop polling if the container disappeared or its VM is gone.
-                {
-                    let guard = containers.read().await;
-                    if guard.get(&dir_for_poll).is_none_or(|c| c.live.is_none()) {
-                        return;
-                    }
-                }
-                if let Some(ip) = macos_vz_shared::current_guest_ip(&mac).await {
-                    if let Ok(mut slot) = guest_ip.lock() {
-                        *slot = Some(ip);
-                    }
-                    return;
-                }
-                tokio::time::sleep(IP_POLL_INTERVAL).await;
-            }
-        });
-        {
-            let mut guard = self.containers.write().await;
-            if let Some(c) = guard.get_mut(&dir_name) {
-                c.ip_poll_task = Some(ip_poll);
-            }
-        }
-
-        // Stand up host-port forwarders for any spec `port_mappings` that pin a
-        // fixed host port. The VZ NAT IP is directly host-reachable, so a raw
-        // `guest_ip:container_port` already works once the lease resolves; these
-        // forwarders additionally expose a STABLE `127.0.0.1:host_port` -> guest
-        // mapping (Docker's `-p host:container`) that doesn't depend on the
-        // ephemeral NAT IP. Each forwarder waits for the guest IP internally.
+        // Stand up host loopback forwarders for the spec's published container
+        // ports. VZ NAT establishes no usable guest lease on this macOS, so the
+        // guest has no routable IP; instead each forwarder binds
+        // `127.0.0.1:<container_port>` on the host and tunnels every accepted
+        // connection over a fresh vsock `Forward` into the guest agent, which
+        // splices it to `127.0.0.1:<container_port>` inside the guest. This is
+        // the host->guest reachability path (replacing the broken NAT-IP route).
         self.spawn_port_forwards(&dir_name).await;
 
         Ok(())
@@ -1626,8 +1604,8 @@ impl Runtime for VzLinuxRuntime {
         }
 
         // Teardown phase: take the live VM + tasks out of the record, set the
-        // final state, abort the drain/IP-poll/port-forward tasks, then force the
-        // VM down and release it.
+        // final state, abort the drain + port-forward tasks, then force the VM
+        // down and release it.
         let (live, drain) = {
             let mut guard = self.containers.write().await;
             let Some(c) = guard.get_mut(&dir_name) else {
@@ -1638,16 +1616,9 @@ impl Runtime for VzLinuxRuntime {
             // recorded one; otherwise mark a forced stop as a clean exit.
             let recorded = c.outcome.terminal.lock().ok().and_then(|g| g.clone());
             c.state = recorded.unwrap_or(ContainerState::Exited { code: 0 });
-            // Drop network state: abort the IP poller + every host-port forwarder
-            // and clear the cached lease so a restart re-resolves it.
-            if let Some(poll) = c.ip_poll_task.take() {
-                poll.abort();
-            }
+            // Drop network state: abort every host loopback forwarder.
             for f in std::mem::take(&mut c.port_forwards) {
                 f.task.abort();
-            }
-            if let Ok(mut slot) = c.guest_ip.lock() {
-                *slot = None;
             }
             (c.live.take(), c.drain_task.take())
         };
@@ -1674,16 +1645,10 @@ impl Runtime for VzLinuxRuntime {
         // Remove the record outright, taking ownership of its VM + every spawned
         // task. Removing an unknown container is Ok (idempotent) — this matches
         // docker_runtime_test::test_remove_nonexistent_container.
-        let (state_dir, live, drain, ip_poll, forwards) = {
+        let (state_dir, live, drain, forwards) = {
             let mut guard = self.containers.write().await;
             match guard.remove(&dir_name) {
-                Some(c) => (
-                    Some(c.state_dir),
-                    c.live,
-                    c.drain_task,
-                    c.ip_poll_task,
-                    c.port_forwards,
-                ),
+                Some(c) => (Some(c.state_dir), c.live, c.drain_task, c.port_forwards),
                 None => return Ok(()),
             }
         };
@@ -1692,10 +1657,7 @@ impl Runtime for VzLinuxRuntime {
         if let Some(drain) = drain {
             drain.abort();
         }
-        // Drop network state: stop the IP poller + all host-port forwarders.
-        if let Some(poll) = ip_poll {
-            poll.abort();
-        }
+        // Drop network state: stop all host loopback forwarders.
         for f in forwards {
             f.task.abort();
         }
@@ -1894,20 +1856,22 @@ impl Runtime for VzLinuxRuntime {
     }
 
     async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>> {
+        use std::net::Ipv4Addr;
         let dir_name = Self::container_dir_name(id);
-        // Unknown container -> `Ok(None)` (mirrors the macOS-guest VZ runtime,
-        // which never errors here). Resolve the guest's NAT IP, waiting briefly
-        // for the DHCP lease so a caller right after start still gets it. The
-        // daemon's same-service loopback-reachability feature
-        // (`service.rs`/`proxy_manager.rs`) consumes this IP to publish
-        // `127.0.0.1:<port>` -> guest_ip:port.
-        {
-            let guard = self.containers.read().await;
-            if guard.get(&dir_name).is_none() {
-                return Ok(None);
-            }
+        // Reachability to a VZ-Linux guest is NOT via a guest NAT IP: on this
+        // macOS, Virtualization.framework's NAT never establishes a usable
+        // vmnet/DHCP lease for our process, so the guest never gets one we can
+        // route to. Instead each published port is reachable through a host
+        // loopback forwarder that tunnels the connection over vsock into the
+        // guest (see `run_port_forward`). So while the VM is live we report
+        // loopback — that is the address callers (service.rs/proxy_manager.rs)
+        // can actually reach the workload on. `Ok(None)` when not running or for
+        // an unknown container.
+        let guard = self.containers.read().await;
+        match guard.get(&dir_name) {
+            Some(c) if c.live.is_some() => Ok(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            _ => Ok(None),
         }
-        Ok(self.resolve_guest_ip(&dir_name, GET_IP_WAIT_TIMEOUT).await)
     }
 
     async fn port_mappings_container(
@@ -1916,65 +1880,34 @@ impl Runtime for VzLinuxRuntime {
     ) -> Result<Vec<crate::runtime::PortMappingEntry>> {
         let dir_name = Self::container_dir_name(id);
 
-        // Snapshot the published mappings + spawned host-port forwarders (as
-        // `(mappings, forwarded)`) without holding the lock across the (possibly
-        // waiting) IP resolution below.
-        #[allow(clippy::type_complexity)]
-        let (mappings, forwarded): (
-            Vec<zlayer_spec::PortMapping>,
-            Vec<(u16, u16, zlayer_spec::PortProtocol)>,
-        ) = {
+        // Report each spawned loopback forwarder as a binding on
+        // `127.0.0.1:<container_port>` (host_port == container_port). The host
+        // port equals the container port because reachability is via the host
+        // loopback forwarder that tunnels over vsock — there is no separate
+        // NAT-IP route or distinct host port to advertise.
+        let forwarded: Vec<(u16, zlayer_spec::PortProtocol)> = {
             let guard = self.containers.read().await;
             let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
                 container: dir_name.clone(),
                 reason: "not found".to_string(),
             })?;
-            (
-                c.spec.port_mappings.clone(),
-                c.port_forwards
-                    .iter()
-                    .map(|f| (f.host_port, f.container_port, f.protocol))
-                    .collect(),
-            )
+            c.port_forwards
+                .iter()
+                .map(|f| (f.container_port, f.protocol))
+                .collect()
         };
 
-        // The VZ NAT subnet is directly host-reachable, so the guest IP itself is
-        // a valid host binding for each published container port. Resolve it
-        // (waiting briefly for the lease); if it is not up yet, still report the
-        // declared host-port bindings so inspect/-p surfaces the mapping.
-        let guest_ip = self
-            .resolve_guest_ip(&dir_name, GET_IP_WAIT_TIMEOUT)
-            .await
-            .map(|ip| ip.to_string());
-
-        let mut out = Vec::new();
-        for m in &mappings {
-            let proto = m.protocol.as_str().to_string();
-            // 1. The raw NAT binding: guest_ip:container_port is reachable as-is.
-            if let Some(ref ip) = guest_ip {
-                out.push(crate::runtime::PortMappingEntry {
-                    container_port: m.container_port,
-                    protocol: proto.clone(),
-                    host_ip: Some(ip.clone()),
-                    host_port: Some(m.container_port),
-                });
-            }
-            // 2. The fixed host-port forward (when one was spawned for this
-            //    mapping): 127.0.0.1:host_port -> guest_ip:container_port.
-            if let Some(hp) = m.host_port.filter(|&hp| hp != 0) {
-                let has_forward = forwarded
-                    .iter()
-                    .any(|&(h, cp, p)| h == hp && cp == m.container_port && p == m.protocol);
-                if has_forward {
-                    out.push(crate::runtime::PortMappingEntry {
-                        container_port: m.container_port,
-                        protocol: proto.clone(),
-                        host_ip: Some("127.0.0.1".to_string()),
-                        host_port: Some(hp),
-                    });
-                }
-            }
-        }
+        let out = forwarded
+            .into_iter()
+            .map(
+                |(container_port, protocol)| crate::runtime::PortMappingEntry {
+                    container_port,
+                    protocol: protocol.as_str().to_string(),
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(container_port),
+                },
+            )
+            .collect();
         Ok(out)
     }
 
@@ -2323,8 +2256,11 @@ mod tests {
         let id = ContainerId::new("vzlinuxtest", 1);
         let spec = ServiceSpec::minimal("vzlinuxtest", "docker.io/library/alpine:3.19");
 
-        // Phase 2 boots from the initramfs alone — no image pull required. We
-        // still create the container record so console.log + state exist.
+        // The guest shares the image rootfs over virtiofs, so the image must be
+        // pulled before create_container (which records the rootfs path).
+        rt.pull_image("docker.io/library/alpine:3.19")
+            .await
+            .expect("pull alpine");
         rt.create_container(&id, &spec).await.expect("create");
         rt.start_container(&id).await.expect("start");
 
@@ -2573,11 +2509,15 @@ mod tests {
         rt.remove_container(&id).await.expect("remove");
     }
 
-    /// Phase 6: the guest acquires a NAT DHCP lease and its exposed port is
-    /// reachable from the host. Start an alpine container running a tiny TCP
-    /// listener on :8080, wait for `get_container_ip` to return `Some`, connect
-    /// directly to `guest_ip:8080`, and assert we read the listener's banner.
-    /// Also assert `port_mappings_container` reports the guest binding.
+    /// Port forwarding: a published container port is reachable from the host
+    /// via the vsock loopback forwarder (NOT a guest NAT IP — VZ NAT yields no
+    /// usable lease on this macOS). Start an alpine container running a tiny TCP
+    /// server on :8080, declare :8080 in the spec so the forwarder binds
+    /// `127.0.0.1:8080` on the host, assert `get_container_ip` reports loopback,
+    /// assert `port_mappings_container` reports the loopback binding, then
+    /// connect to `127.0.0.1:8080` and round-trip the server's banner — which
+    /// only succeeds if the host TCP -> vsock `Forward` -> guest 127.0.0.1:8080
+    /// tunnel works end to end.
     ///
     /// `#[ignore]`d: needs a code-signed (entitled) binary, the guest kernel +
     /// initramfs (with `zlayer-vzagent` PID1) via `ZLAYER_VZ_LINUX_KERNEL` /
@@ -2588,7 +2528,7 @@ mod tests {
     #[ignore = "needs the virtualization entitlement + vzagent kernel/initrd + alpine pull"]
     async fn vz_linux_guest_gets_ip_and_port_reachable() {
         use std::io::Read as _;
-        use std::net::TcpStream;
+        use std::net::{IpAddr as StdIpAddr, Ipv4Addr, TcpStream};
 
         let (Some(_kernel), Some(_initrd)) = (
             std::env::var_os("ZLAYER_VZ_LINUX_KERNEL"),
@@ -2613,9 +2553,11 @@ mod tests {
             "while true; do printf 'HTTP/1.1 200 OK\\r\\n\\r\\nhi' | nc -l -p 8080; done"
                 .to_string(),
         ]);
-        // Also publish a fixed host port so the forwarder path is exercised.
+        // Publish :8080 the same way the forwarder reads it (spec.port_mappings).
+        // The forwarder binds `127.0.0.1:8080` on the host (host_port ==
+        // container_port) and tunnels each connection over vsock to the guest.
         spec.port_mappings = vec![zlayer_spec::PortMapping {
-            host_port: Some(18080),
+            host_port: Some(8080),
             container_port: 8080,
             protocol: zlayer_spec::PortProtocol::Tcp,
             host_ip: "127.0.0.1".to_string(),
@@ -2627,33 +2569,39 @@ mod tests {
         rt.create_container(&id, &spec).await.expect("create");
         rt.start_container(&id).await.expect("start");
 
-        // Wait for the guest's NAT DHCP lease.
-        let mut guest_ip = None;
+        // Reachability is via host loopback (the vsock forwarder), so
+        // `get_container_ip` reports 127.0.0.1 while the VM is live.
+        let mut ip = None;
         for _ in 0..60 {
-            if let Ok(Some(ip)) = rt.get_container_ip(&id).await {
-                guest_ip = Some(ip);
+            if let Ok(Some(addr)) = rt.get_container_ip(&id).await {
+                ip = Some(addr);
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let guest_ip = guest_ip.expect("guest never acquired a NAT DHCP lease");
-        eprintln!("vz-linux guest IP: {guest_ip}");
-
-        // `port_mappings_container` must report the guest binding for :8080.
-        let maps = rt.port_mappings_container(&id).await.expect("port maps");
-        assert!(
-            maps.iter()
-                .any(|m| m.container_port == 8080
-                    && m.host_ip.as_deref() == Some(&guest_ip.to_string())),
-            "port_mappings_container should report the guest IP binding, got: {maps:?}"
+        let ip = ip.expect("get_container_ip never returned an address");
+        assert_eq!(
+            ip,
+            StdIpAddr::V4(Ipv4Addr::LOCALHOST),
+            "vz-linux reachability is via host loopback, not a guest NAT IP"
         );
 
-        // The listener may take a moment to bind; retry the direct connect to
-        // guest_ip:8080 and assert we read the banner.
+        // `port_mappings_container` must report the loopback binding for :8080.
+        let maps = rt.port_mappings_container(&id).await.expect("port maps");
+        assert!(
+            maps.iter().any(|m| m.container_port == 8080
+                && m.host_port == Some(8080)
+                && m.host_ip.as_deref() == Some("127.0.0.1")),
+            "port_mappings_container should report 127.0.0.1:8080, got: {maps:?}"
+        );
+
+        // The in-guest listener may take a moment to bind; retry the connect to
+        // the HOST loopback `127.0.0.1:8080` (the forwarder) and assert we read
+        // the banner the guest server emits — proving the vsock tunnel works.
         let mut ok = false;
         for _ in 0..30 {
             let connect = tokio::task::spawn_blocking(move || {
-                let target = std::net::SocketAddr::new(guest_ip, 8080);
+                let target = std::net::SocketAddr::new(StdIpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
                 let mut s = TcpStream::connect_timeout(&target, Duration::from_secs(2)).ok()?;
                 s.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut buf = [0u8; 64];
@@ -2672,7 +2620,7 @@ mod tests {
         }
         assert!(
             ok,
-            "guest_ip:8080 was not reachable / did not serve the banner"
+            "127.0.0.1:8080 (vsock forwarder) was not reachable / did not serve the banner"
         );
 
         rt.stop_container(&id, Duration::from_secs(10))
