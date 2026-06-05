@@ -6,6 +6,43 @@
 
 ---
 
+## ⟢ UPDATE 2026-06-03 (late) — session findings (read first)
+
+1. **The svcdump diagnostic described in NEXT ACTION is NOW IMPLEMENTED** (bundled into commit
+   `51383c54`, `#[cfg(feature="windows-debug")]`, env `ZLAYER_GCS_SVCDUMP=1`, default off): `sc.exe`
+   injection into `uvm.os_files_dir()\Windows\System32\sc.exe` (~hcs.rs:1559); the auto-start no-deps
+   `zlayer-svcdump` service registered in `build_uvm_registry_changes()` (~hcs.rs:2709) looping
+   `sc queryex mpssvc|netsetupsvc|BFE|RpcSs|nsi|gcs` + `sc qc` → `C:\zlayer-dbg\svcdump.txt`; on-box
+   mount-and-read of the kept scratch via `mount_and_read_svcdump` (~hcs.rs:2543) folding `svcdump.txt`
+   into the `CreateFailed` error + echoing to stderr. Also `container_logs`/`get_logs` are now real via
+   HCS pipe capture (`crates/zlayer-hcs/src/process.rs`, `ComputeProcess::create_capturing_blocking` +
+   `drain_pipe`). **So the box work is now: BUILD it + RUN it + READ the exit codes**, not implement it.
+   ⚠ `hcs.rs`/`process.rs` are `#[cfg(windows)]` — **only mac-build-verified, NOT Windows-compile-
+   verified** (the mac can't cross-compile: `ring`/`aws-lc-sys` need the Windows SDK C headers). FIRST
+   on the box: `cargo test --features hcs-runtime,wsl,windows-debug --package zlayer-agent --test
+   windows_hcs_hyperv_e2e … -- --ignored --nocapture` and fix any windows-only compile errors in the
+   bundled instrumentation. Run command + remaining steps unchanged from NEXT ACTION / §4 of `HANDOFF.md`.
+
+2. **The "daemon never starts / deadlock" fix this session does NOT affect Windows.** A stderr-capture
+   deadlock (`51383c54` console→stderr colliding with `serve`'s fd-2 `install_stderr_redirect_to_tracing`)
+   was fixed in `cfd18bff` (console→stdout for the daemon/file-writer arms of
+   `zlayer-observability::init_logging`). `install_stderr_redirect_to_tracing` is a **no-op on Windows**
+   (serve.rs:1320; Windows uses the SCM event log), so Windows `serve` was never affected. The logging
+   change is cross-platform but benign for the Windows daemon. No Windows action needed for it.
+
+3. **NEW cross-platform requirement — rootless daemon install on Windows too.** The user wants the
+   daemon install to NOT require admin/root when the **overlay does not need updating**, on every
+   platform. The Windows `install()` SCM arm (`bin/zlayer/src/commands/daemon.rs` ~3141, registers an
+   SCM `LocalSystem` service via `ServiceManager::create_service`) currently always elevates (UAC
+   `runas`). INVESTIGATE whether a **per-user** Windows service / scheduled-task is feasible so the main
+   daemon installs without admin, elevating only for the overlay (HNS/HCN adapter) change-gate or a
+   user-opted system service. This work lives with the **install/privilege track** (see
+   `MAC_TODO.md` → TRACK A, which owns all three OS `install()` arms in the shared daemon.rs) — the
+   Windows agent should coordinate the Windows SCM specifics there, not duplicate it. If a per-user
+   Windows service is genuinely infeasible, surface that as the concrete blocker (don't fake it).
+
+---
+
 ## ⟢ NEXT ACTION — name *why* the services fail, via a guest `sc queryex` dump (NO windbg)
 
 Working hypothesis: the stripped UtilityVM is **missing something those services need at runtime**

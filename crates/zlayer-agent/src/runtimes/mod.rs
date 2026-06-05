@@ -134,10 +134,21 @@ pub mod macos_sandbox;
 #[cfg(target_os = "macos")]
 pub mod macos_vm;
 
+// Guest-agnostic helpers shared by the macOS Apple-Virtualization runtimes
+// (native-macOS guests via `macos_vz`, Linux guests via `macos_vz_linux`).
+#[cfg(target_os = "macos")]
+pub mod macos_vz_shared;
+
 // Apple-Virtualization (VZ) runtime: ephemeral native-macOS guest VMs. Opt-in
 // only (label `com.zlayer.isolation=vz`); coexists with the Seatbelt sandbox.
 #[cfg(target_os = "macos")]
 pub mod macos_vz;
+
+// Apple-Virtualization Linux-guest runtime: boots real Linux guests on macOS
+// via `Virtualization.framework` (the default Linux path on macOS). Coexists
+// with the libkrun `macos_vm` runtime (reachable via `com.zlayer.isolation=vm`).
+#[cfg(target_os = "macos")]
+pub mod macos_vz_linux;
 
 // Producer for VZ base-image bundles: drives a macOS `.ipsw` restore through
 // `VZMacOSInstaller` to mint a Tart-style bundle (`disk.img`,
@@ -173,6 +184,9 @@ pub use macos_vm::VmRuntime;
 
 #[cfg(target_os = "macos")]
 pub use macos_vz::VzRuntime;
+
+#[cfg(target_os = "macos")]
+pub use macos_vz_linux::VzLinuxRuntime;
 
 #[cfg(feature = "docker")]
 pub use docker::DockerRuntime;

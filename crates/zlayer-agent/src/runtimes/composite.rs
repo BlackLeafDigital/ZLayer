@@ -59,6 +59,11 @@ enum DispatchTarget {
     /// automatically for `com.zlayer.runtime=vz` base bundles, or per-service
     /// via the `com.zlayer.isolation=vz` label.
     Vz,
+    /// The Apple-Virtualization **Linux-guest** delegate (macOS only). The
+    /// default Linux path on macOS: selected for Linux images, the
+    /// `com.zlayer.runtime=vz-linux` marker, or the
+    /// `com.zlayer.isolation=vz-linux` label.
+    VzLinux,
 }
 
 /// Routes each container to either the primary runtime or an optional delegate.
@@ -70,6 +75,10 @@ pub struct CompositeRuntime {
     /// Opt-in Apple-Virtualization delegate (macOS). Selected only when a
     /// service carries `com.zlayer.isolation=vz`.
     vz: Option<Arc<dyn Runtime>>,
+    /// Apple-Virtualization Linux-guest delegate (macOS). When present, it is
+    /// the default runtime for Linux images on this node; libkrun
+    /// (`delegate`) is then reachable only via `com.zlayer.isolation=vm`.
+    vz_linux: Option<Arc<dyn Runtime>>,
     /// Per-container dispatch cache. Populated on `create_container`, removed
     /// on `remove_container`.
     dispatch: Arc<RwLock<HashMap<ContainerId, DispatchTarget>>>,
@@ -97,6 +106,7 @@ impl CompositeRuntime {
             primary,
             delegate,
             vz: None,
+            vz_linux: None,
             dispatch: Arc::new(RwLock::new(HashMap::new())),
             image_os: Arc::new(RwLock::new(HashMap::new())),
             image_runtime: Arc::new(RwLock::new(HashMap::new())),
@@ -108,6 +118,17 @@ impl CompositeRuntime {
     #[must_use]
     pub fn with_vz_delegate(mut self, vz: Option<Arc<dyn Runtime>>) -> Self {
         self.vz = vz;
+        self
+    }
+
+    /// Attach the Apple-Virtualization Linux-guest delegate. When present it
+    /// becomes the **default** runtime for Linux images on this node (libkrun
+    /// is then reachable only via the explicit `com.zlayer.isolation=vm`
+    /// label); when `None`, Linux dispatch falls back to the libkrun delegate
+    /// or `RouteToPeer` as before.
+    #[must_use]
+    pub fn with_vz_linux_delegate(mut self, vz_linux: Option<Arc<dyn Runtime>>) -> Self {
+        self.vz_linux = vz_linux;
         self
     }
 
@@ -224,11 +245,24 @@ impl CompositeRuntime {
     async fn select_for(&self, service: &str, spec: &ServiceSpec) -> Result<DispatchTarget> {
         // Explicit per-service isolation label wins over everything below.
         //   `com.zlayer.isolation=vz`               -> VZ (native-macOS guest VM)
+        //   `com.zlayer.isolation=vz-linux`         -> VZ Linux-guest VM
+        //   `com.zlayer.isolation=vm|libkrun`       -> libkrun delegate (force VM)
         //   `com.zlayer.isolation=sandbox|seatbelt` -> Seatbelt sandbox (primary),
         //                                              opting OUT of VZ auto-detect.
         if let Some(label) = spec.labels.get("com.zlayer.isolation") {
             if self.vz.is_some() && label.eq_ignore_ascii_case("vz") {
                 return Ok(DispatchTarget::Vz);
+            }
+            if self.vz_linux.is_some() && label.eq_ignore_ascii_case("vz-linux") {
+                return Ok(DispatchTarget::VzLinux);
+            }
+            if label.eq_ignore_ascii_case("vm") || label.eq_ignore_ascii_case("libkrun") {
+                // Force the libkrun delegate. If no delegate exists the
+                // platform/image-OS rules below produce the appropriate
+                // `RouteToPeer`, so only short-circuit when one is present.
+                if self.delegate.is_some() {
+                    return Ok(DispatchTarget::Delegate);
+                }
             }
             if label.eq_ignore_ascii_case("sandbox") || label.eq_ignore_ascii_case("seatbelt") {
                 return Ok(DispatchTarget::Primary);
@@ -251,9 +285,25 @@ impl CompositeRuntime {
             return Ok(DispatchTarget::Vz);
         }
 
+        // Auto-detect a VZ Linux-guest image: when the manifest carries
+        // `com.zlayer.runtime=vz-linux`, prefer the VZ Linux runtime.
+        if self.vz_linux.is_some()
+            && self
+                .image_runtime
+                .read()
+                .await
+                .get(&spec.image.name.to_string())
+                .is_some_and(|m| m.eq_ignore_ascii_case(zlayer_registry::ZLAYER_RUNTIME_LINUX_VZ))
+        {
+            return Ok(DispatchTarget::VzLinux);
+        }
+
         if let Some(platform) = &spec.platform {
             let target = match platform.os {
                 OsKind::Windows | OsKind::Macos => DispatchTarget::Primary,
+                // On macOS the VZ Linux-guest runtime is the default Linux path;
+                // only fall back to the libkrun delegate when it is absent.
+                OsKind::Linux if self.vz_linux.is_some() => DispatchTarget::VzLinux,
                 OsKind::Linux => DispatchTarget::Delegate,
             };
             if matches!(target, DispatchTarget::Delegate) && self.delegate.is_none() {
@@ -278,7 +328,10 @@ impl CompositeRuntime {
         {
             return match os {
                 OsKind::Linux => {
-                    if self.delegate.is_some() {
+                    if self.vz_linux.is_some() {
+                        // VZ Linux-guest is the default Linux path on macOS.
+                        Ok(DispatchTarget::VzLinux)
+                    } else if self.delegate.is_some() {
                         Ok(DispatchTarget::Delegate)
                     } else {
                         // No delegate and the image manifest says Linux —
@@ -335,6 +388,9 @@ impl CompositeRuntime {
             // `select_for` only returns `Vz` when a vz delegate is present;
             // fall back to primary defensively.
             DispatchTarget::Vz => self.vz.as_ref().unwrap_or(&self.primary),
+            // `select_for` only returns `VzLinux` when a vz-linux delegate is
+            // present; fall back to primary defensively.
+            DispatchTarget::VzLinux => self.vz_linux.as_ref().unwrap_or(&self.primary),
         }
     }
 }
@@ -648,6 +704,7 @@ mod tests {
         Primary,
         Delegate,
         Vz,
+        VzLinux,
     }
 
     /// One recorded invocation: (runtime role, method name, container id).
@@ -691,6 +748,7 @@ mod tests {
                         Role::Primary => "primary-mock".to_string(),
                         Role::Delegate => "delegate-mock".to_string(),
                         Role::Vz => "vz-mock".to_string(),
+                        Role::VzLinux => "vz-linux-mock".to_string(),
                     },
                     expected: expected.to_string(),
                     actual: actual.to_string(),
@@ -1093,6 +1151,118 @@ services:
             role_for(&calls, "create_container"),
             Some(Role::Primary),
             "com.zlayer.isolation=sandbox should opt out of VZ auto-detect (force the sandbox)"
+        );
+    }
+
+    /// Composite with primary + delegate (libkrun) + a VZ Linux-guest delegate,
+    /// all sharing one call log. Mirrors `make_composite_with_vz`.
+    fn make_composite_with_vz_linux() -> (CompositeRuntime, CallLog) {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary = Arc::new(MockRuntime::new(Role::Primary, Arc::clone(&calls)));
+        let delegate =
+            Arc::new(MockRuntime::new(Role::Delegate, Arc::clone(&calls))) as Arc<dyn Runtime>;
+        let vz_linux =
+            Arc::new(MockRuntime::new(Role::VzLinux, Arc::clone(&calls))) as Arc<dyn Runtime>;
+        let rt = CompositeRuntime::new(primary as Arc<dyn Runtime>, Some(delegate))
+            .with_vz_linux_delegate(Some(vz_linux));
+        (rt, calls)
+    }
+
+    #[tokio::test]
+    async fn dispatch_vz_linux_label_forces_vz_linux() {
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("lin-svc", 0);
+        let mut spec = make_spec("docker.io/library/alpine:3.19", None);
+        spec.labels
+            .insert("com.zlayer.isolation".to_string(), "vz-linux".to_string());
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "com.zlayer.isolation=vz-linux must force the VZ Linux runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_vz_linux_marker_auto_routes_to_vz_linux() {
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("lin-svc", 0);
+        let image = "ghcr.io/org/linux-vz:bookworm";
+        rt.record_image_runtime(image, "vz-linux".to_string()).await;
+
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "a com.zlayer.runtime=vz-linux marker should auto-route to the VZ Linux runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_linux_platform_with_vz_linux_routes_to_vz_linux() {
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("lin-svc", 0);
+        // platform.os = linux: with a VZ Linux delegate present this is the
+        // default Linux path, NOT the libkrun delegate.
+        let spec = make_spec(
+            "docker.io/library/alpine:3.19",
+            Some(TargetPlatform::new(OsKind::Linux, ArchKind::Arm64)),
+        );
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "a Linux platform spec must default to the VZ Linux runtime when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_linux_image_os_with_vz_linux_routes_to_vz_linux() {
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("lin-svc", 0);
+        let image = "docker.io/library/nginx:1.25";
+        rt.record_image_os(image, OsKind::Linux).await;
+
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "a Linux image-OS cache hit must default to the VZ Linux runtime when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_vm_label_forces_libkrun_delegate() {
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("lin-svc", 0);
+        // Even with a VZ Linux delegate as the default, an explicit
+        // `com.zlayer.isolation=vm` label forces the libkrun delegate.
+        let mut spec = make_spec(
+            "docker.io/library/alpine:3.19",
+            Some(TargetPlatform::new(OsKind::Linux, ArchKind::Arm64)),
+        );
+        spec.labels
+            .insert("com.zlayer.isolation".to_string(), "vm".to_string());
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Delegate),
+            "com.zlayer.isolation=vm must force the libkrun delegate even when VZ Linux is default"
         );
     }
 

@@ -90,6 +90,7 @@ fn overlayd_binary_path() -> PathBuf {
 /// Returns an error only when, after attempting to start the service and/or
 /// spawn the binary, the overlayd socket still does not accept a connection
 /// within the bounded backoff window.
+#[cfg_attr(target_os = "macos", allow(unsafe_code))]
 pub(crate) async fn ensure_overlayd_running(data_dir: &Path) -> Result<()> {
     let socket = ZLayerDirs::default_overlayd_socket_path_for(data_dir);
     let socket_path = PathBuf::from(&socket);
@@ -113,6 +114,24 @@ pub(crate) async fn ensure_overlayd_running(data_dir: &Path) -> Result<()> {
     //    it actually issued a start command that the service manager accepted.
     let started_service = start_installed_service().await;
     if !started_service {
+        // On macOS the overlay utun device can ONLY be created by root, so a
+        // user-spawned overlayd would just EPERM on the device and never own the
+        // overlay. Don't spawn a doomed child — return cleanly and let the
+        // daemon run with cross-node overlay networking disabled until the root
+        // overlayd service is registered (`zlayer daemon install`, which
+        // elevates exactly once when the overlay actually changes). This is the
+        // "don't touch the overlay when we can't" path; the overlay only comes
+        // up via the installed root service.
+        #[cfg(target_os = "macos")]
+        if unsafe { libc::geteuid() } != 0 {
+            info!(
+                socket = %socket,
+                "overlayd system service not installed and not running as root; \
+                 cross-node overlay networking disabled (run `zlayer daemon install` \
+                 to register the root overlay service)"
+            );
+            return Ok(());
+        }
         spawn_overlayd_detached(data_dir, &socket_path)
             .context("failed to spawn zlayer-overlayd binary")?;
     }

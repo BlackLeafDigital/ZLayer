@@ -661,6 +661,7 @@ pub fn create_service_spec(
         replica_groups: None,
         isolation: None,
         overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     };
 
     Ok(ServiceSpec {

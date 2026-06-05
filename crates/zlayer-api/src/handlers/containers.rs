@@ -860,6 +860,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         replica_groups: None,
         isolation: None,
         overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     })
 }
 

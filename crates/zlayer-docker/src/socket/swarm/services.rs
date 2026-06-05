@@ -962,6 +962,7 @@ fn translate_service_only(body: &DockerServiceSpec) -> Result<ZServiceSpec, Stri
         replica_groups: None,
         isolation: None,
         overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     })
 }
 
@@ -1162,6 +1163,7 @@ mod tests {
             expose: Vec::new(),
             isolation: None,
             overlay: None,
+            localhost_reachability: zlayer_spec::LocalhostReachability::default(),
         }
     }
 

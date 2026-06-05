@@ -51,6 +51,11 @@ pub use unpack::*;
 pub const ZLAYER_RUNTIME_ANNOTATION: &str = "com.zlayer.runtime";
 /// [`ZLAYER_RUNTIME_ANNOTATION`] value for a macOS Apple-Virtualization bundle.
 pub const ZLAYER_RUNTIME_VZ: &str = "vz";
+/// [`ZLAYER_RUNTIME_ANNOTATION`] value for a macOS Apple-Virtualization
+/// **Linux-guest** image (boots a Linux kernel under `Virtualization.framework`
+/// via the agent's `macos_vz_linux` runtime). Distinct from [`ZLAYER_RUNTIME_VZ`],
+/// which marks a native-macOS guest bundle.
+pub const ZLAYER_RUNTIME_LINUX_VZ: &str = "vz-linux";
 pub use wasm::*;
 
 #[cfg(feature = "persistent")]

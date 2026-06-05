@@ -35,6 +35,7 @@ members = [
   "crates/zlayer-types",
   "crates/zlayer-overlayd",
   "crates/zlayer-cluster-rpc",
+  "crates/zlayer-vzagent",
   "xtask",
 ]
 

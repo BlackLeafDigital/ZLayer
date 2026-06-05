@@ -1,0 +1,29 @@
+[package]
+name = "zlayer-vzagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zlayer_vzagent"
+path = "src/lib.rs"
+
+# The PID1 guest agent binary. Inside the initramfs this binary is installed as
+# `/init` (the kernel's default initramfs entry point). The Linux-only body is
+# cfg-gated so the crate still builds on the macOS host that reuses the `proto`
+# library.
+[[bin]]
+name = "zlayer-vzagent"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+postcard = { version = "1.1.3", features = ["alloc"] }
+rustix = { version = "1.1.4", features = ["process", "fs", "net", "mount", "thread", "system"] }
+serde = { workspace = true, features = ["derive"] }
+
+[lints]
+workspace = true

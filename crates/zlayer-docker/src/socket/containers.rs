@@ -490,7 +490,13 @@ fn map_create_error(err: &anyhow::Error) -> Response {
     let msg = format!("{err:#}");
     let lower = msg.to_ascii_lowercase();
 
-    let status = if msg.starts_with("404 ") || msg.contains("404 Not Found") {
+    let status = if msg.starts_with("404 ")
+        || msg.contains("404 Not Found")
+        || lower.contains("no such image")
+        // The daemon auto-pulls on create and wraps a registry "not found" as a
+        // flat `Internal` (→ would be 500); Docker expects 404 "No such image".
+        || (lower.contains("failed to pull image") && lower.contains("not found"))
+    {
         StatusCode::NOT_FOUND
     } else if msg.contains(" 409 ")
         || lower.contains("conflict")
@@ -589,7 +595,10 @@ fn build_create_request(
     };
 
     Ok(CreateContainerRequest {
-        image: body.image.clone(),
+        // Normalize bare names to `docker.io/library/...` like real Docker, so
+        // the daemon's `IfNotPresent` auto-pull resolves them instead of hitting
+        // the native strict unqualified-name guard (→ 500).
+        image: super::normalize_compat_image(&body.image),
         name,
         pull_policy: None,
         env,
@@ -2846,7 +2855,10 @@ mod tests {
             .expect("translation must succeed");
 
         // Identity / image / name -------------------------------------------
-        assert_eq!(req.image, "nginx");
+        // The compat socket normalizes a bare Docker name to its canonical
+        // Docker Hub reference (`docker pull nginx` => docker.io/library/nginx),
+        // exactly as real Docker does, so the strict daemon guard accepts it.
+        assert_eq!(req.image, "docker.io/library/nginx:latest");
         assert_eq!(req.name.as_deref(), Some("myapp"));
         assert_eq!(req.hostname.as_deref(), Some("myapp.local"));
         assert_eq!(req.user.as_deref(), Some("1000:1000"));

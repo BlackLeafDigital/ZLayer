@@ -37,10 +37,8 @@ use objc2_virtualization::{
     VZMacOSRestoreImage, VZVirtualMachine,
 };
 
-use super::macos_vz::{
-    clamp_cpu_count, clamp_memory_bytes, file_url, ns_error_message, QueuePinned, VmBuildInputs,
-    VzContainer,
-};
+use super::macos_vz::{ns_error_message, VmBuildInputs, VzContainer};
+use super::macos_vz_shared::{clamp_cpu_count, clamp_memory_bytes, file_url, QueuePinned};
 
 /// Where the `.ipsw` restore image comes from.
 #[derive(Debug, Clone)]

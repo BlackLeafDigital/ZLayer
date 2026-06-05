@@ -1362,17 +1362,38 @@ pub trait Runtime: Send + Sync {
     /// runtime falls back to its credential-store lookup keyed by registry
     /// hostname (matching the semantics of [`Runtime::pull_image_with_policy`]).
     ///
-    /// The default implementation returns [`AgentError::Unsupported`].
     /// Backends override this with their native streaming pull
     /// (bollard's `create_image` for Docker, `zlayer-registry` for Youki).
+    ///
+    /// The default implementation performs a BLOCKING pull via
+    /// [`Runtime::pull_image_with_policy`] and then synthesizes a minimal
+    /// Docker-style progress stream (a `Status` line + a terminal `Done`). This
+    /// keeps the streaming `POST /images/create` (e.g. `docker pull` through
+    /// the `zlayer-docker` compat socket) working on runtimes that lack a native
+    /// streaming pull — notably the macOS sandbox. The streaming form means
+    /// "make this image available now", so it pulls if not already present.
     async fn pull_image_stream(
         &self,
-        _image: &str,
-        _auth: Option<&RegistryAuth>,
+        image: &str,
+        auth: Option<&RegistryAuth>,
     ) -> Result<PullProgressStream> {
-        Err(AgentError::Unsupported(
-            "pull_image_stream is not supported by this runtime".into(),
-        ))
+        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, auth)
+            .await?;
+        let reference = image.to_string();
+        let events: Vec<Result<PullProgress>> = vec![
+            Ok(PullProgress::Status {
+                id: None,
+                status: format!("Pulling from {reference}"),
+                progress: None,
+                current: None,
+                total: None,
+            }),
+            Ok(PullProgress::Done {
+                reference,
+                digest: None,
+            }),
+        ];
+        Ok(Box::pin(futures_util::stream::iter(events)))
     }
 
     /// List all images managed by this runtime's image storage.
@@ -2337,17 +2358,18 @@ mod tests {
         );
     }
 
-    // The default trait impls of `logs_stream`, `stats_stream`, and
-    // `pull_image_stream` still return `AgentError::Unsupported`. `MockRuntime`
+    // The default trait impls of `logs_stream` and `stats_stream` still return
+    // `AgentError::Unsupported`; `pull_image_stream` now performs a blocking
+    // pull and synthesizes a Status+Done progress stream. `MockRuntime`
     // overrides all three so tests can pre-script stream output (see
     // `mock_logs_stream_yields_queued_items_in_order` and friends below).
     // A trivial `BareRuntime` exercises the default trait impls without
     // dragging in MockRuntime's overrides.
 
     /// Minimal `Runtime` implementation used to exercise the default trait
-    /// impls of `logs_stream` / `stats_stream` / `pull_image_stream`. Every
-    /// non-default method panics — the bare runtime is only ever called for
-    /// the three streaming methods the tests care about.
+    /// impls of `logs_stream` / `stats_stream` / `pull_image_stream`. Most
+    /// methods panic, but `pull_image_with_policy` returns `Ok(())` so the
+    /// default `pull_image_stream` (which delegates to it) can be exercised.
     struct BareRuntime;
 
     #[async_trait::async_trait]
@@ -2361,7 +2383,9 @@ mod tests {
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
         ) -> Result<()> {
-            unimplemented!()
+            // The default `pull_image_stream` delegates here; return Ok so the
+            // streaming default can be exercised without a real registry.
+            Ok(())
         }
         async fn create_container(&self, _id: &ContainerId, _spec: &ServiceSpec) -> Result<()> {
             unimplemented!()
@@ -2426,13 +2450,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_pull_image_stream_is_unsupported() {
+    async fn default_pull_image_stream_synthesizes_progress() {
+        use futures_util::StreamExt as _;
+
+        // The default `pull_image_stream` now performs a blocking pull (via
+        // `pull_image_with_policy`, which `BareRuntime` answers with `Ok`) and
+        // synthesizes a Status + Done progress stream.
         let runtime = BareRuntime;
-        match runtime.pull_image_stream("alpine:latest", None).await {
-            Err(AgentError::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err(Unsupported), got Ok"),
-        }
+        let stream = runtime
+            .pull_image_stream("alpine:latest", None)
+            .await
+            .expect("default pull_image_stream should succeed when the pull succeeds");
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 2, "expected a Status then a Done event");
+        assert!(
+            matches!(events[0], Ok(PullProgress::Status { .. })),
+            "first event should be a Status line, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(events[1], Ok(PullProgress::Done { .. })),
+            "second event should be the terminal Done, got {:?}",
+            events[1]
+        );
     }
 
     #[tokio::test]

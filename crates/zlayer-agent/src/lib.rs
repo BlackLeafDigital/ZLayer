@@ -308,6 +308,12 @@ pub async fn create_runtime(
                     None
                 }
             };
+            // VZ Linux-guest delegate (the default Linux path on macOS). First
+            // party (no dylib), so this normally succeeds.
+            let vz_linux: Option<Arc<dyn Runtime>> =
+                runtimes::macos_vz_linux::VzLinuxRuntime::new(auth_ctx.clone())
+                    .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+                    .ok();
             // Opt-in VZ delegate (native-macOS guests via `com.zlayer.isolation=vz`).
             let vz: Option<Arc<dyn Runtime>> = match runtimes::macos_vz::VzRuntime::new(auth_ctx) {
                 Ok(rt) => Some(Arc::new(rt)),
@@ -317,7 +323,9 @@ pub async fn create_runtime(
                 }
             };
             Ok(Arc::new(
-                runtimes::composite::CompositeRuntime::new(primary, delegate).with_vz_delegate(vz),
+                runtimes::composite::CompositeRuntime::new(primary, delegate)
+                    .with_vz_delegate(vz)
+                    .with_vz_linux_delegate(vz_linux),
             ))
         }
         #[cfg(target_os = "macos")]
@@ -449,10 +457,17 @@ async fn create_auto_runtime(
         let vz: Option<Arc<dyn Runtime>> = runtimes::macos_vz::VzRuntime::new(auth_ctx.clone())
             .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
             .ok();
+        // VZ Linux-guest delegate — the default Linux path on macOS.
+        let vz_linux: Option<Arc<dyn Runtime>> =
+            runtimes::macos_vz_linux::VzLinuxRuntime::new(auth_ctx.clone())
+                .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+                .ok();
 
         if let Some(p) = primary {
             return Ok(Arc::new(
-                runtimes::composite::CompositeRuntime::new(p, delegate).with_vz_delegate(vz),
+                runtimes::composite::CompositeRuntime::new(p, delegate)
+                    .with_vz_delegate(vz)
+                    .with_vz_linux_delegate(vz_linux),
             ));
         }
         // If sandbox failed but VM succeeded, use the VM runtime on its own —

@@ -331,6 +331,7 @@ mod tests {
                 expose: Vec::new(),
                 isolation: None,
                 overlay: None,
+                localhost_reachability: zlayer_spec::LocalhostReachability::default(),
             },
         );
 

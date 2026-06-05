@@ -108,6 +108,46 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
     let listener = tokio::net::UnixListener::bind(endpoint)?;
+
+    // overlayd runs as ROOT (it owns the system utun adapter), so a bare bind
+    // leaves the IPC socket root-owned and not connectable by the per-user
+    // daemon — which then fails `setup_global_overlay` with "Permission denied"
+    // and silently loses cross-node networking. Mirror the main daemon's API
+    // socket policy (see `zlayer-api`'s `server.rs`): 0o660 + chown to the
+    // shared `zlayer` group so group members (the user daemon) can connect.
+    #[allow(unsafe_code)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o660)) {
+            tracing::debug!(error = %e, socket = %endpoint.display(), "failed to set overlayd socket perms 0o660");
+        }
+        // chown the socket to the shared `zlayer` group via libc (`nix` is not a
+        // macOS dependency of this crate). `getgrnam` is fine for a one-shot
+        // startup lookup. `uid = u32::MAX` leaves the owner unchanged.
+        if let (Ok(path_c), Ok(gname)) = (
+            std::ffi::CString::new(endpoint.as_os_str().as_bytes()),
+            std::ffi::CString::new("zlayer"),
+        ) {
+            // SAFETY: `gname`/`path_c` are valid NUL-terminated C strings that
+            // outlive the calls; we only read scalar fields from the returned
+            // `group` pointer when non-null.
+            unsafe {
+                let grp = libc::getgrnam(gname.as_ptr());
+                if grp.is_null() {
+                    tracing::debug!(socket = %endpoint.display(), "group 'zlayer' not present; skipping overlayd socket chown");
+                } else {
+                    let gid = (*grp).gr_gid;
+                    if libc::chown(path_c.as_ptr(), u32::MAX, gid) == 0 {
+                        tracing::info!(socket = %endpoint.display(), "overlayd socket chowned to <owner>:zlayer 0o660");
+                    } else {
+                        tracing::debug!(error = %std::io::Error::last_os_error(), socket = %endpoint.display(), "failed to chown overlayd socket to zlayer group");
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(endpoint = %endpoint.display(), "overlayd IPC listening (unix socket)");
     let handler = Arc::new(handler);
     loop {

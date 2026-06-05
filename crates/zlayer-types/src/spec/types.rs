@@ -1334,6 +1334,48 @@ pub struct ServiceSpec {
     /// implementation status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<crate::overlay::OverlayConfig>,
+
+    /// Policy for making this service's exposed ports reachable on the node's
+    /// loopback (`127.0.0.1:<port>`) for same-node consumers — the GitHub
+    /// Actions "service published to localhost" convention. See
+    /// [`LocalhostReachability`]. Default [`LocalhostReachability::Auto`].
+    #[serde(default, skip_serializing_if = "LocalhostReachability::is_default")]
+    pub localhost_reachability: LocalhostReachability,
+}
+
+/// How a service's exposed ports are made reachable on the node's loopback
+/// (`127.0.0.1:<port>`) for same-service / same-node consumers.
+///
+/// `127.0.0.1` always means *this container's own* loopback — isolated per
+/// container on Linux (youki netns), macOS VZ, and Windows HCS; shared with the
+/// host on the macOS seatbelt / libkrun runtimes. This setting never rewrites a
+/// container's own loopback. It controls only whether the daemon ALSO binds the
+/// service's exposed port on the *node's* loopback and L4-forwards it to the
+/// container, so a consumer that shares the node loopback can reach the service
+/// at `localhost:<port>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalhostReachability {
+    /// Publish to the node loopback only when the service is effectively
+    /// single-member (no replica groups, scaling disabled or capped at one
+    /// replica). A multi-member service is not a "pod", so name-based overlay
+    /// DNS (`<service>.service.local`) stays the addressing path to avoid an
+    /// ambiguous single loopback port fronting many replicas. Default.
+    #[default]
+    Auto,
+    /// Always publish each exposed port on the node loopback.
+    Always,
+    /// Never publish to the node loopback (name / overlay addressing only).
+    Never,
+}
+
+impl LocalhostReachability {
+    /// True for the serde default ([`LocalhostReachability::Auto`]); used to
+    /// skip serializing the field when it carries the default value.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 /// Deserialization shim for [`ServiceSpec`].
@@ -1453,6 +1495,8 @@ struct ServiceSpecCompat {
     expose: Vec<String>,
     #[serde(default)]
     overlay: Option<crate::overlay::OverlayConfig>,
+    #[serde(default)]
+    localhost_reachability: LocalhostReachability,
 }
 
 impl From<ServiceSpecCompat> for ServiceSpec {
@@ -1521,11 +1565,46 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             cgroup_parent: c.cgroup_parent,
             expose: c.expose,
             overlay: c.overlay,
+            localhost_reachability: c.localhost_reachability,
         }
     }
 }
 
 impl ServiceSpec {
+    /// True when this service is effectively a single member: it has no
+    /// (multi-member) replica groups and a scale policy that cannot exceed one
+    /// replica (`Fixed { 0 | 1 }`, `Adaptive { max <= 1 }`, or `Manual`).
+    ///
+    /// Used by [`LocalhostReachability::Auto`] to decide whether publishing the
+    /// service's ports on the node loopback is unambiguous — a genuine
+    /// multi-member service would put several backends behind one loopback port,
+    /// so name-based overlay DNS is the correct addressing for those instead.
+    #[must_use]
+    pub fn is_single_member(&self) -> bool {
+        if let Some(groups) = &self.replica_groups {
+            let total: u32 = groups.iter().map(|g| g.count).sum();
+            return groups.len() <= 1 && total <= 1;
+        }
+        match &self.scale {
+            ScaleSpec::Fixed { replicas } => *replicas <= 1,
+            ScaleSpec::Adaptive { max, .. } => *max <= 1,
+            ScaleSpec::Manual => true,
+        }
+    }
+
+    /// Whether the daemon should publish this service's exposed ports on the
+    /// node loopback (`127.0.0.1:<port>`), per its [`LocalhostReachability`]
+    /// policy. `Auto` publishes only for effectively single-member services
+    /// (see [`ServiceSpec::is_single_member`]).
+    #[must_use]
+    pub fn publish_to_node_loopback(&self) -> bool {
+        match self.localhost_reachability {
+            LocalhostReachability::Always => true,
+            LocalhostReachability::Never => false,
+            LocalhostReachability::Auto => self.is_single_member(),
+        }
+    }
+
     /// Construct a minimally-populated [`ServiceSpec`] with just the two
     /// fields callers always have to supply explicitly: the logical service
     /// name (used for diagnostics / labels at the call site — this struct
@@ -4191,8 +4270,8 @@ services:
 #[cfg(test)]
 mod replica_group_tests {
     use super::{
-        validate_unique_replica_group_roles, EndpointSpec, GroupAffinity, ReplicaGroup,
-        REPLICA_GROUP_ROLE_RE,
+        validate_unique_replica_group_roles, EndpointSpec, GroupAffinity, LocalhostReachability,
+        ReplicaGroup, ScaleSpec, ScaleTargets, ServiceSpec, REPLICA_GROUP_ROLE_RE,
     };
 
     #[test]
@@ -4291,5 +4370,115 @@ affinity: spread
         let yaml = "name: any\nprotocol: tcp\nport: 5432\n";
         let ep: EndpointSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(ep.target_role, None);
+    }
+
+    // ==========================================================================
+    // LocalhostReachability / single-member publishing tests
+    // ==========================================================================
+
+    fn spec_with_scale(scale: ScaleSpec) -> ServiceSpec {
+        let mut s = ServiceSpec::minimal("svc", "scratch:latest");
+        s.scale = scale;
+        s
+    }
+
+    fn replica_group(role: &str, count: u32) -> ReplicaGroup {
+        ReplicaGroup {
+            role: role.to_string(),
+            count,
+            image: None,
+            env: std::collections::HashMap::new(),
+            command: None,
+            resources: None,
+            affinity: GroupAffinity::Spread,
+        }
+    }
+
+    #[test]
+    fn is_single_member_across_scale_modes() {
+        assert!(spec_with_scale(ScaleSpec::Fixed { replicas: 1 }).is_single_member());
+        assert!(spec_with_scale(ScaleSpec::Fixed { replicas: 0 }).is_single_member());
+        assert!(!spec_with_scale(ScaleSpec::Fixed { replicas: 3 }).is_single_member());
+
+        let adaptive = |min, max| ScaleSpec::Adaptive {
+            min,
+            max,
+            cooldown: None,
+            targets: ScaleTargets::default(),
+        };
+        assert!(spec_with_scale(adaptive(1, 1)).is_single_member());
+        assert!(!spec_with_scale(adaptive(1, 5)).is_single_member());
+
+        assert!(spec_with_scale(ScaleSpec::Manual).is_single_member());
+    }
+
+    #[test]
+    fn is_single_member_with_replica_groups() {
+        // One group, total 1 -> single member.
+        let mut s = ServiceSpec::minimal("svc", "scratch:latest");
+        s.replica_groups = Some(vec![replica_group("only", 1)]);
+        assert!(s.is_single_member());
+
+        // One group, total 2 -> multi member.
+        s.replica_groups = Some(vec![replica_group("only", 2)]);
+        assert!(!s.is_single_member());
+
+        // Two groups, total 2 -> multi member.
+        s.replica_groups = Some(vec![replica_group("a", 1), replica_group("b", 1)]);
+        assert!(!s.is_single_member());
+
+        // replica_groups takes precedence over scale.
+        s.scale = ScaleSpec::Fixed { replicas: 1 };
+        s.replica_groups = Some(vec![replica_group("a", 1), replica_group("b", 1)]);
+        assert!(!s.is_single_member());
+    }
+
+    #[test]
+    fn publish_to_node_loopback_override_matrix() {
+        // Single-member base spec.
+        let single = spec_with_scale(ScaleSpec::Fixed { replicas: 1 });
+        // Multi-member base spec.
+        let multi = spec_with_scale(ScaleSpec::Fixed { replicas: 3 });
+
+        // Auto: follows single-member-ness.
+        let mut s = single.clone();
+        s.localhost_reachability = LocalhostReachability::Auto;
+        assert!(s.publish_to_node_loopback());
+        let mut m = multi.clone();
+        m.localhost_reachability = LocalhostReachability::Auto;
+        assert!(!m.publish_to_node_loopback());
+
+        // Always: publishes regardless of member count.
+        let mut s = single.clone();
+        s.localhost_reachability = LocalhostReachability::Always;
+        assert!(s.publish_to_node_loopback());
+        let mut m = multi.clone();
+        m.localhost_reachability = LocalhostReachability::Always;
+        assert!(m.publish_to_node_loopback());
+
+        // Never: never publishes regardless of member count.
+        let mut s = single;
+        s.localhost_reachability = LocalhostReachability::Never;
+        assert!(!s.publish_to_node_loopback());
+        let mut m = multi;
+        m.localhost_reachability = LocalhostReachability::Never;
+        assert!(!m.publish_to_node_loopback());
+    }
+
+    #[test]
+    fn localhost_reachability_default_is_auto() {
+        assert_eq!(
+            LocalhostReachability::default(),
+            LocalhostReachability::Auto
+        );
+        assert!(LocalhostReachability::Auto.is_default());
+        assert!(!LocalhostReachability::Always.is_default());
+        assert!(!LocalhostReachability::Never.is_default());
+        // A minimal spec defaults to Auto reachability, but the default scale
+        // is Adaptive { max: 10 } (multi-member), so Auto does NOT publish.
+        let minimal = ServiceSpec::minimal("svc", "scratch:latest");
+        assert_eq!(minimal.localhost_reachability, LocalhostReachability::Auto);
+        assert!(!minimal.is_single_member());
+        assert!(!minimal.publish_to_node_loopback());
     }
 }

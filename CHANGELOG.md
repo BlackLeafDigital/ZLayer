@@ -24,6 +24,203 @@ All notable changes to this project will be documented in this file.
   `zsecrets.zlayer.yml` (2-replica dedicated-node deployment spec), and
   `docs/RUNBOOK_zsecrets_ha.md` (leader-init / follower-join / sealed-DEK / DNS / auth-bridge
   bring-up runbook).
+## 0.52.19 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — complete (summary).** With Phase 7 below, the macOS
+  Apple-Virtualization Linux-guest runtime (`VzLinuxRuntime`,
+  `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`) is feature-complete: it runs OCI Linux
+  containers (`alpine`, etc.) on Apple Silicon by booting a ZLayer-built arm64 kernel `Image` +
+  initramfs through `Virtualization.framework`'s `VZLinuxBootLoader` — no external dylib (distinct
+  from the libkrun `macos_vm.rs` path) and a Linux kernel rather than a macOS bundle (distinct from
+  the macOS-guest `macos_vz.rs` path). The extracted image rootfs is shared into the guest over
+  virtiofs (tag `rootfs`, read-only) and overlaid with a tmpfs upper + `pivot_root`; the in-guest
+  `zlayer-vzagent` (initramfs `/init`, PID 1) speaks the `proto` vsock protocol on `AF_VSOCK` port
+  1024 (`Run`/`Exec`/`Signal` host→guest; `Stdout`/`Stderr`/`Started`/`Exited`/`Error` guest→host);
+  VZ NAT gives the guest a host-reachable `192.168.64.x` lease resolved by MAC from `dhcpd_leases`.
+  On macOS, Linux images route here by default when the runtime is available (libkrun reachable via
+  `com.zlayer.isolation=vm`); also selectable via the `com.zlayer.isolation=vz-linux` label or the
+  `com.zlayer.runtime=vz-linux` manifest marker. Implemented across Phases 0/2–7 (0.52.14–0.52.19);
+  the guest kernel + initramfs are built by `images/vz-linux/build.sh` (GPLv2 source, Linux-only
+  cross-compile; CI `.forgejo/workflows/vz-linux-images.yml`) and resolved at runtime from
+  `ZLAYER_VZ_LINUX_KERNEL`/`ZLAYER_VZ_LINUX_INITRD` or `{data_dir}/vz/linux/kernel/`. Requires the
+  `com.apple.security.virtualization` entitlement (already in `bin/zlayer/zlayer.entitlements`;
+  ad-hoc sign via `scripts/sign-vz.sh`); NAT needs no `com.apple.vm.networking`. Documented in
+  `docs/macos-vz-runtime.md` ("Linux guests"). The per-phase entries below (and in 0.52.14–0.52.18)
+  record how each piece landed.
+- **macOS VZ Linux-guest runtime — Phase 7: lifecycle polish (stop/remove/state/stats/kill/pause).**
+  Every remaining `Runtime` method on `VzLinuxRuntime` now has a real implementation — no method
+  returns an "unimplemented until a later phase" sentinel any longer.
+  - `stop_container(id, timeout)` is **graceful**: when the VM is live and the workload has not
+    already exited, it opens a fresh vsock control connection and sends
+    `proto::Msg::Signal { signum: SIGTERM(15) }` to the guest agent, then polls the shared
+    `RunOutcome` for the agent's `Exited`/`Failed` frame for up to `timeout` before force-stopping the
+    VM via `run_vm_lifecycle(Stop)`. It sets the final `ContainerState` (the recorded real exit code,
+    or `Exited{0}`), aborts the drain / IP-poll / port-forward tasks, clears the cached lease, and
+    releases the live VM (closing its vsock device + fds). Idempotent: stopping an already-stopped or
+    unknown container is `Ok`.
+  - `remove_container(id)` ensures the VM is fully stopped + released, aborts **all** spawned tasks
+    (drain, IP poll, port forwards), deletes the per-container state dir, and drops the record.
+    Idempotent (removing a nonexistent container returns `Ok`).
+  - `get_container_stats(id)` reports the configured allocation (VZ exposes no live per-VM metrics):
+    `memory_limit = ram_mib * 1024 * 1024` and a **non-zero** `memory_bytes` estimate (a quarter of
+    the limit, floored at 1) so `docker_runtime_test::test_container_stats`' `memory_bytes > 0`
+    assertion holds; `cpu_usage_usec` is 0.
+  - `kill_container(id, signal)` delivers a **real** signal: the validated/canonicalised signal name
+    is mapped to its Linux number (`signal_number`, defaulting to `SIGKILL(9)`) and sent to the guest
+    agent over vsock when a live agent exists, then the VM + tasks are torn down via `stop_container`;
+    with no live agent it falls straight through to a forced VM stop.
+  - `pause_container` / `unpause_container` use VZ's native pause/resume via
+    `run_vm_lifecycle(Pause/Resume)`, matching the macOS-guest VZ runtime.
+  - Added the `signal_number` name→Linux-number mapper and `signal_agent` vsock helper; pure unit
+    tests `signal_number_maps_canonical_names_and_defaults_to_sigkill` and
+    `signal_number_roundtrips_validate_signal_output`, plus the `#[ignore]`d end-to-end
+    `vz_linux_full_lifecycle` test (create→start→logs→stats→exec→stop→remove, asserting the state
+    transitions and that `container_state` errors after remove).
+
+## 0.52.18 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 6: NAT networking (guest IP + host-reachable ports).**
+  `build_config_linux` now attaches a `VZVirtioNetworkDeviceConfiguration` with a
+  `VZNATNetworkDeviceAttachment` whose MAC is pinned to the container's per-VM
+  `VZMACAddress` (round-tripped via `initWithString`), so VZ's userspace DHCP server hands the
+  guest a `192.168.64.x` lease that the host-side `/var/db/dhcpd_leases` lookup resolves by MAC
+  (`config.setNetworkDevices(...)`, mirroring the macOS-guest runtime's network device).
+  `VzLinuxRuntime::get_container_ip` is implemented: it reads the cached lease (populated by a
+  background DHCP poller spawned at start, 60 s budget) or polls `dhcpd_leases` by MAC for up to
+  15 s, returning the NAT IP. This is what the daemon's same-service localhost-reachability feature
+  (`service.rs` → `ProxyManager::publish_loopback_for_container`) consumes to publish
+  `127.0.0.1:<port>` → guest_ip:port, so that feature now works for VZ-Linux containers on macOS.
+  `port_mappings_container` reports each published port mapped to the directly-reachable guest IP,
+  plus any spawned fixed-host-port forward. Spec `port_mappings` with a fixed (non-zero) TCP host
+  port get a tokio listener on `127.0.0.1:host_port` that proxies (`copy_bidirectional`) to
+  guest_ip:container_port; the IP poller and all forwarders are tracked on the container and aborted
+  on `stop`/`remove`. Added the `#[ignore]`d integration test
+  `vz_linux_guest_gets_ip_and_port_reachable` (alpine `nc -l` listener on :8080; wait for
+  `get_container_ip`, connect directly to guest_ip:8080, assert the banner; assert
+  `port_mappings_container` reports the guest binding) and the non-ignored unit test
+  `mac_roundtrip_preserves_address_and_rejects_garbage`.
+
+## 0.52.17 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 5: `exec` into a running Linux guest over virtio-vsock.**
+  `VzLinuxRuntime::exec` now opens a **second** vsock connection to the same guest agent
+  (`proto::CONTROL_PORT` 1024, reusing the Phase-4 `connect_vsock` queue/`RcBlock`/dup-fd bridge with
+  its 30 s connect timeout), sends `proto::Msg::Exec { argv, env }` — inheriting the container spec's
+  environment — and drains the reply frames: `Stdout`/`Stderr` accumulate into separate buffers,
+  `Exited{code}` yields the real exit code, and `Error{message}` is surfaced as an `Err`. Returns
+  `(exit_code, stdout, stderr)` per the `Runtime::exec` contract; `exec_stream` uses the trait
+  default over this buffered path. The guest agent enters the running workload's PID namespace
+  (`setns` on `/proc/{pid}/ns/pid`; mount/net are already shared) so the exec'd process sees the
+  container view. `exec` returns a clear error when the container has no live VM/agent connection or
+  its workload has already exited, and the connect timeout prevents a dead guest from hanging the
+  call. Added `#[ignore]`d integration tests `vz_linux_exec_echo` (`sleep 600` workload, then
+  `exec ["echo","hi"]` → `(0, "hi", "")`) and `vz_linux_exec_exit_code` (`sh -c "exit 42"` → 42).
+  networking / stats / IP remain honest later-phase sentinels.
+
+## 0.52.16 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phases 3 & 4: virtiofs rootfs share + in-guest vsock agent
+  (workload runs, logs captured, real exit code).** `build_config_linux` now attaches two devices:
+  a `VZVirtioFileSystemDeviceConfiguration` (tag `rootfs`) that shares the extracted OCI image
+  rootfs into the guest **read-only** as a `VZSingleDirectoryShare` (the guest overlays a tmpfs upper
+  and `pivot_root`s onto it), and a `VZVirtioSocketDeviceConfiguration` for the host↔guest control
+  channel. After the VM reaches Running, `start_container` connects to the guest agent's
+  `AF_VSOCK` port `proto::CONTROL_PORT` (1024) — the connect is issued on the VM's serial dispatch
+  queue, its completion block `dup`s the connected fd and bridges it back over a `std::mpsc` channel
+  (with a ~250 ms retry up to 30 s while the agent finishes booting). A blocking drain task then
+  sends `proto::Msg::Run { argv, env, cwd, uid, gid }` (built from the spec) and streams the reply
+  frames: `Stdout`/`Stderr` are captured into an in-memory buffer **and** mirrored to `console.log`,
+  `Started{pid}` records the workload pid, and `Exited{code}`/`Error{message}` record the terminal
+  state + real exit code on the container. `wait_container` now returns the actual workload exit
+  code (no longer always 0), `container_state` reports the agent-authoritative `Exited{code}` /
+  `Failed{reason}`, and `container_logs`/`get_logs` merge the serial console with the captured
+  workload stdout/stderr. End state: `docker run --rm alpine echo hello` through the daemon yields
+  `hello` in logs and exit 0. Added `zlayer-vzagent` as a path dependency to reuse its `proto` wire
+  types. `exec` / networking / stats / IP remain honest later-phase sentinels.
+
+## 0.52.15 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 2: boots a real Linux kernel to the serial console.**
+  `VzLinuxRuntime::start_container` now builds a `VZVirtualMachineConfiguration` for a Linux guest
+  (generic platform + `VZLinuxBootLoader` from a kernel `Image` + `initramfs.cpio.gz`, headless,
+  serial console wired to `console.log`) on a dedicated serial dispatch queue, creates the
+  `VZVirtualMachine`, and starts it (uncapped — no macOS 2-VM licensing limit). `stop_container`
+  drives the VZ stop lifecycle and `container_state` reconciles against the live VM state. Kernel
+  artifacts resolve from `ZLAYER_VZ_LINUX_KERNEL` / `ZLAYER_VZ_LINUX_INITRD` (dev override) or the
+  `{data}/vz/linux/kernel/` cache, with a clear error pointing at `images/vz-linux/build.sh` when
+  absent. Boot command line `console=hvc0 rootfstag=rootfs rw` (`rootfstag` is the virtiofs marker
+  Phase 3 mounts as root). exec / stats / IP / vsock remain honest later-phase sentinels.
+
+### Changed
+- Promoted the guest-agnostic VZ config helpers (`clamp_cpu_count`, `clamp_memory_bytes`,
+  `spec_vcpus`, `spec_memory_mib`, `resolve_entrypoint`, `file_url`, `parse_memory_to_mib`) from the
+  macOS-guest runtime into `macos_vz_shared` so both the macOS- and Linux-guest runtimes share one
+  implementation. `spec_vcpus`/`spec_memory_mib` now take explicit default/floor args (macOS guests
+  keep 2 vCPU / 4096 MiB floor 2048; Linux guests use 2 vCPU / 512 MiB floor 128).
+
+## 0.52.14 - 2026-06-04
+
+### Fixed
+- **macOS rootless daemon install crash-loop ("Daemon failed to start within 45s / no job loaded").**
+  The actual root cause: with `--docker-socket`, `serve` spawns the in-process Docker API server, whose
+  `zlayer_docker::socket::serve` called the **auto-starting** `DaemonClient::connect()` before the
+  daemon's own API socket was ready — so it forked a SECOND `zlayer serve` that raced the launchd
+  daemon for the API port/socket, and the freshly-bootstrapped job never stayed loaded. The Docker
+  socket server now waits for the *local* daemon via a non-auto-starting `try_connect` retry loop, never
+  spawning a competitor. (Contributing fixes below were found and corrected along the way.)
+- **`kickstart -k` SIGKILLed the just-bootstrapped daemon.** The plist sets `RunAtLoad=true`, so
+  `bootstrap` already starts the daemon; the post-bootstrap `launchctl kickstart -k` then SIGKILLed it
+  mid-`init_daemon`. Now uses a plain `kickstart` (no `-k`).
+- **Root overlayd IPC socket was not connectable by the per-user daemon.** `zlayer-overlayd` runs as
+  root and bound its IPC socket with default ownership, so the user daemon's `setup_global_overlay`
+  failed with `Permission denied (os error 13)`. The socket is now `0o660` + chowned to the shared
+  `zlayer` group, mirroring the main daemon's API socket policy.
+- **macOS overlay never configured ("Failed to configure global overlay: No such file or directory").**
+  boringtun's `device` feature hardcodes its WireGuard UAPI control socket under `/var/run/wireguard/`
+  and ignores ZLayer's configured `uapi_sock_dir`, so the post-create discovery scan and UAPI `set`
+  looked in the wrong directory and failed `ENOENT`. The transport now resolves the UAPI socket
+  directory to `/var/run/wireguard` on macOS. The overlay now reports `Overlay transport configured
+  and up`.
+- **`install-dev.sh` now builds and stages `zlayer-overlayd`.** The script built only `zlayer` and
+  copied only `zlayer`, so the daemon could neither register the overlay system service (overlayd binary
+  not found next to `zlayer`) nor run a current overlayd. It now `cargo build`s `-p zlayer-overlayd` and
+  installs it next to the main binary.
+
+### Changed
+- **macOS rootless install registers the root overlay service BEFORE starting the main daemon.** The
+  overlayd change-gate + (one) sudo elevation now runs ahead of the daemon bootstrap, so `serve` finds
+  the root overlayd already running and cross-node overlay networking comes up on first boot — instead
+  of the daemon spawning a doomed user-level overlayd that `EPERM`s on the utun and never recovers
+  until a later restart. Per the change-gate: if the overlay service is already current, it is **not
+  touched** (no sudo); only a genuine overlay change elevates (try sudo, prompt once if not root).
+- **`serve` no longer spawns a doomed user-level `zlayer-overlayd` on rootless macOS.** When no root
+  overlayd system service is installed and we are not root, the overlay utun can never be created
+  (it requires root), so the supervisor now logs a single clear degraded-mode line and runs with
+  cross-node overlay networking disabled instead of spawning a child that only `EPERM`s.
+
+### Added
+- **Same-service `localhost:<port>` reachability (`localhost_reachability` on a service).** A service
+  can publish its exposed ports on the node's loopback (`127.0.0.1:<port>`) — the GitHub-Actions
+  "service published to localhost" convention — so a same-node consumer reaches it at `localhost:<port>`.
+  The daemon binds the node loopback port and L4-forwards to wherever the container actually listens
+  (its overlay IP on Linux/VZ/HCS, or `127.0.0.1:<assigned-port>` on the macOS seatbelt/libkrun
+  runtimes); a container's own `127.0.0.1` is never rewritten. Configurable via
+  `localhost_reachability: auto | always | never` (default `auto`, which publishes only for effectively
+  single-member, non-scaled services — a multi-member service stays addressed by overlay DNS name).
+- **macOS VZ Linux-guest runtime scaffold + routing (Phase 0).** A new `VzLinuxRuntime`
+  (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`) is wired into the composite runtime as the
+  **default Linux path on macOS**: Linux images, the `com.zlayer.runtime=vz-linux` manifest marker, and
+  the `com.zlayer.isolation=vz-linux` label all route to it, while libkrun stays reachable via the
+  explicit `com.zlayer.isolation=vm` label. Phase 0 implements real OCI image pulling (rootfs extraction)
+  and container-record creation; VM boot, exec, networking, and stats land in later phases (they return
+  honest "not implemented until a later phase" errors for now). Guest-agnostic VZ helpers were extracted
+  into a shared `macos_vz_shared` module reused by both the native-macOS-guest and Linux-guest runtimes.
+  Added the `ZLAYER_RUNTIME_LINUX_VZ` (`"vz-linux"`) registry marker constant.
 
 ## 0.52.13 - 2026-06-04
 

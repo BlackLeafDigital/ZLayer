@@ -336,11 +336,36 @@ impl OverlayTransport {
     /// zlayer install that owns `/var/run/wireguard`).
     #[cfg(not(windows))]
     fn uapi_sock_path(&self) -> String {
-        self.config
-            .uapi_sock_dir
+        self.effective_uapi_sock_dir()
             .join(format!("{}.sock", self.interface_name))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// The directory the boringtun `device` UAPI control socket actually lives
+    /// in.
+    ///
+    /// On Linux/Windows this is the configured [`OverlayConfig::uapi_sock_dir`]
+    /// (data-dir-scoped to avoid cross-instance collisions). On **macOS**,
+    /// boringtun's `device` feature HARDCODES its socket directory to
+    /// `/var/run/wireguard/` (`boringtun`'s `SOCK_DIR`) and ignores any
+    /// configured path, so we MUST look there — otherwise the post-create
+    /// discovery scan and the UAPI `set` connect to a directory boringtun never
+    /// writes to and fail with `ENOENT` ("Failed to configure global overlay:
+    /// No such file or directory"). Kernel-assigned `utunN` names keep the
+    /// per-socket filenames unique, so a shared `/var/run/wireguard` does not
+    /// collide across instances on macOS.
+    #[cfg(not(windows))]
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self))]
+    fn effective_uapi_sock_dir(&self) -> &std::path::Path {
+        #[cfg(target_os = "macos")]
+        {
+            std::path::Path::new("/var/run/wireguard")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.config.uapi_sock_dir.as_path()
+        }
     }
 
     /// Create the TUN interface.
@@ -389,9 +414,11 @@ impl OverlayTransport {
             .into());
         }
 
-        // Ensure the UAPI socket directory exists (data-dir-aware — see
-        // `OverlayConfig::uapi_sock_dir`).
-        tokio::fs::create_dir_all(&self.config.uapi_sock_dir).await?;
+        // Ensure the UAPI socket directory exists. On macOS this is boringtun's
+        // hardcoded `/var/run/wireguard`; on Linux it is the data-dir-aware
+        // `OverlayConfig::uapi_sock_dir`. See `effective_uapi_sock_dir`.
+        let uapi_dir = self.effective_uapi_sock_dir().to_path_buf();
+        tokio::fs::create_dir_all(&uapi_dir).await?;
 
         // On Linux, refuse to silently delete an existing kernel link. Stale
         // interfaces from a previous crashed daemon are swept by the
@@ -432,8 +459,7 @@ impl OverlayTransport {
 
         // Clean up stale UAPI socket left behind by a crashed process.
         let sock_path = self
-            .config
-            .uapi_sock_dir
+            .effective_uapi_sock_dir()
             .join(format!("{}.sock", self.interface_name));
         if tokio::fs::try_exists(&sock_path).await.unwrap_or(false) {
             tracing::warn!(path = %sock_path.display(), "removing stale UAPI socket");
@@ -445,7 +471,7 @@ impl OverlayTransport {
         #[cfg(target_os = "macos")]
         let existing_socks = {
             let mut set = std::collections::HashSet::new();
-            if let Ok(mut entries) = tokio::fs::read_dir(&self.config.uapi_sock_dir).await {
+            if let Ok(mut entries) = tokio::fs::read_dir(&uapi_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     set.insert(entry.file_name().to_string_lossy().to_string());
                 }
@@ -491,7 +517,7 @@ impl OverlayTransport {
         {
             // Small delay to let boringtun finish socket setup
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(mut entries) = tokio::fs::read_dir(&self.config.uapi_sock_dir).await {
+            if let Ok(mut entries) = tokio::fs::read_dir(&uapi_dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     if !existing_socks.contains(&fname)

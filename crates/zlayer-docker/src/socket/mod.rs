@@ -50,7 +50,18 @@ pub(crate) struct SocketState {
 /// Returns an error if the socket/pipe cannot be bound, the daemon
 /// cannot be contacted, or the server fails.
 pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
-    let client = DaemonClient::connect().await?;
+    // This Docker API server runs INSIDE the daemon process (spawned by `serve`
+    // when `--docker-socket` is set), so it must connect to the LOCAL daemon's
+    // own API socket — and must NEVER use the auto-starting
+    // `DaemonClient::connect()`. Auto-start spawns a SECOND `zlayer serve`
+    // process that races the daemon we are part of for the API port/socket;
+    // under launchd the freshly-bootstrapped job then fails to stay loaded
+    // ("Daemon failed to start within 45s / no job loaded"). Instead, wait for
+    // the in-process daemon to finish coming up. Its API/health only answers
+    // after `init_daemon` (including deployment restoration), which can take a
+    // while, so retry `try_connect` (which never auto-starts) on a generous
+    // deadline.
+    let client = wait_for_local_daemon().await?;
     let state = SocketState {
         client: Arc::new(client),
     };
@@ -69,6 +80,60 @@ pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
         let _ = (socket_path, app);
         anyhow::bail!("platform not supported for Docker API server");
     }
+}
+
+/// Wait for the LOCAL daemon (the process this Docker API server runs inside)
+/// to finish starting and become reachable on its API socket.
+///
+/// Uses [`DaemonClient::try_connect`] — which probes an already-running daemon
+/// and NEVER auto-starts one — in a bounded retry loop. This deliberately
+/// avoids [`DaemonClient::connect`]: auto-starting from here would fork a second
+/// `zlayer serve` that competes for the API port/socket and breaks the launchd
+/// install. The deadline is generous because the daemon's API only answers
+/// after full initialisation (overlay, storage, and deployment restoration),
+/// which can take tens of seconds on a host with restored deployments.
+async fn wait_for_local_daemon() -> anyhow::Result<DaemonClient> {
+    use std::time::Duration;
+
+    let poll = Duration::from_millis(250);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        match DaemonClient::try_connect().await {
+            Ok(Some(client)) => return Ok(client),
+            Ok(None) | Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(poll).await;
+            }
+            Ok(None) => {
+                anyhow::bail!(
+                    "local daemon did not become reachable within 300s; \
+                     Docker API socket server giving up"
+                );
+            }
+            Err(e) => return Err(e.context("probing the local daemon for the Docker API server")),
+        }
+    }
+}
+
+/// Apply Docker's default-registry normalization to an image reference for the
+/// Docker-compat socket path.
+///
+/// Real Docker resolves a bare name to the Docker Hub `library` namespace
+/// (`alpine` → `docker.io/library/alpine`, `alpine:latest` →
+/// `docker.io/library/alpine:latest`, `user/img` → `docker.io/user/img`).
+/// The native paths (`/api/v1`, `zlayer build`) deliberately REFUSE unqualified
+/// names — no silent Hub pulls — but a Docker *client* talking to our compat
+/// socket expects Docker's behaviour. So we canonicalize unqualified references
+/// here, upstream of the daemon's strict guard (`zlayer-registry`/`client.rs`),
+/// while leaving already-qualified refs (`ghcr.io/...`, `localhost:5000/...`,
+/// `…@sha256:…`) untouched. If parsing fails, fall back to the original string
+/// (the daemon will surface a clear error).
+pub(super) fn normalize_compat_image(image: &str) -> String {
+    if !zlayer_types::image_str_is_unqualified(image) {
+        return image.to_owned();
+    }
+    image
+        .parse::<zlayer_types::ImageReference>()
+        .map_or_else(|_| image.to_owned(), |r| r.whole())
 }
 
 /// Build the Docker Engine API router.

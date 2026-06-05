@@ -1055,6 +1055,7 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
         replica_groups: None,
         isolation: None,
         overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     };
 
     let mut services = HashMap::new();
@@ -1777,6 +1778,7 @@ mod tests {
             expose: Vec::new(),
             isolation: None,
             overlay: None,
+            localhost_reachability: zlayer_spec::LocalhostReachability::default(),
         };
         let mut services = HashMap::new();
         services.insert("nginx".to_string(), service);

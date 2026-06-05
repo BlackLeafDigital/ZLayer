@@ -148,8 +148,12 @@ echo ""
 
 # --- Build ---
 if [ -z "$ZLAYER_DEV_SKIP_BUILD" ]; then
-    echo "Building zlayer (release)..."
-    cargo build --release -p zlayer
+    echo "Building zlayer + zlayer-overlayd (release)..."
+    # Build overlayd too: the daemon install stages it next to `zlayer` to
+    # register the root overlay-networking system service. Building only `zlayer`
+    # leaves a stale (or missing) `target/release/zlayer-overlayd`, so the
+    # installed overlayd would not carry source changes.
+    cargo build --release -p zlayer -p zlayer-overlayd
 fi
 
 TARGET_BIN="${REPO_ROOT}/target/release/zlayer"
@@ -258,6 +262,20 @@ fi
 echo ""
 echo "Installing binary to ${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}..."
 sudo install -m 0755 "$TARGET_BIN" "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}"
+
+# Stage the overlay-network owner (`zlayer-overlayd`) NEXT TO the main binary.
+# `daemon install` resolves overlayd beside the running `zlayer` executable
+# (see resolve_and_stage_overlayd_binary / overlayd_binary_path); without it the
+# install can't register the root overlayd system service and cross-node overlay
+# networking is unavailable. Always named `zlayer-overlayd` regardless of the
+# main binary's install name.
+OVERLAYD_BIN="${REPO_ROOT}/target/release/zlayer-overlayd"
+if [ -x "$OVERLAYD_BIN" ]; then
+    echo "Installing overlay daemon to ${ZLAYER_DEV_BIN_DIR}/zlayer-overlayd..."
+    sudo install -m 0755 "$OVERLAYD_BIN" "${ZLAYER_DEV_BIN_DIR}/zlayer-overlayd"
+else
+    echo "Warning: ${OVERLAYD_BIN} not found; overlay networking will be unavailable." >&2
+fi
 
 # --- SELinux relabel (Linux only) ---
 if [ "$OS" = "linux" ] && command -v getenforce >/dev/null 2>&1; then

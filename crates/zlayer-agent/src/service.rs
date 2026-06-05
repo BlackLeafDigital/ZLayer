@@ -650,6 +650,26 @@ impl ServiceInstance {
                             // update_backend_health only updates *existing* backends.
                             proxy.add_backend(&self.service_name, backend_addr).await;
 
+                            // Publish this container's exposed ports on the node
+                            // loopback (`127.0.0.1:<endpoint.port>`) so a consumer
+                            // sharing the node loopback can reach the service at
+                            // `localhost:<port>`. Gated on the spec's policy
+                            // (`Auto` publishes only for single-member services).
+                            // Uses the SAME runtime-resolved `ip`/`port_override`
+                            // as the backend above: on macOS each replica shares
+                            // 127.0.0.1 with a unique override; on Linux/VM the
+                            // overlay IP carries the declared target port.
+                            if self.spec.publish_to_node_loopback() {
+                                proxy
+                                    .publish_loopback_for_container(
+                                        &self.service_name,
+                                        &self.spec,
+                                        ip,
+                                        port_override,
+                                    )
+                                    .await;
+                            }
+
                             Some((proxy, backend_addr))
                         } else {
                             None
@@ -759,6 +779,24 @@ impl ServiceInstance {
                     // Abort the health monitor task if it exists
                     if let Some(handle) = container.health_monitor {
                         handle.abort();
+                    }
+
+                    // Unpublish this container's node-loopback ports (mirror of
+                    // the publish in the start path above). Recomputes the same
+                    // backend from the container's stored runtime-resolved IP and
+                    // port override; the last replica's removal frees the
+                    // loopback listener. Gated identically to publish.
+                    if self.spec.publish_to_node_loopback() {
+                        if let (Some(proxy), Some(ip)) = (&self.proxy_manager, container.overlay_ip)
+                        {
+                            proxy
+                                .unpublish_loopback_for_container(
+                                    &self.spec,
+                                    ip,
+                                    container.port_override,
+                                )
+                                .await;
+                        }
                     }
 
                     // Remove DNS records for this container
@@ -926,6 +964,11 @@ impl ServiceInstance {
     /// Check if this service instance has a proxy manager configured
     pub fn has_proxy_manager(&self) -> bool {
         self.proxy_manager.is_some()
+    }
+
+    /// Get the proxy manager for this instance, if configured.
+    pub fn proxy_manager(&self) -> Option<&Arc<ProxyManager>> {
+        self.proxy_manager.as_ref()
     }
 
     /// Check if this service instance has a DNS server configured
@@ -2174,6 +2217,34 @@ impl ServiceManager {
                             );
                         }
                         _ => {} // HTTP routes handled above
+                    }
+                }
+            }
+            drop(services); // Release read lock
+        }
+
+        // Unpublish node-loopback ports for every live replica of this
+        // service so the loopback listeners are freed (mirror of the
+        // per-replica unpublish in `ServiceInstance::scale_to`). Gated on the
+        // spec's policy; recomputes each backend from the container's stored
+        // runtime-resolved IP and port override.
+        {
+            let services = self.services.read().await;
+            if let Some(instance) = services.get(name) {
+                if instance.spec.publish_to_node_loopback() {
+                    if let Some(proxy) = instance.proxy_manager() {
+                        let containers = instance.containers().read().await;
+                        for container in containers.values() {
+                            if let Some(ip) = container.overlay_ip {
+                                proxy
+                                    .unpublish_loopback_for_container(
+                                        &instance.spec,
+                                        ip,
+                                        container.port_override,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             }

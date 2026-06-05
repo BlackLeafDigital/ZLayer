@@ -1727,6 +1727,52 @@ async fn install(
         .with_context(|| format!("Failed to write plist to {}", path.display()))?;
     println!("Installed launchd plist: {}", path.display());
 
+    // Register overlayd as its OWN launchd service BEFORE we start the main
+    // daemon, so `serve` finds the root overlayd already running and the overlay
+    // comes up on first boot (rather than the daemon spawning a doomed
+    // user-level overlayd that EPERMs on the utun, then never recovering until a
+    // later restart). This must run before the `if !no_start` bootstrap below.
+    //
+    // overlayd is the ONLY component that needs root (it owns a system utun
+    // adapter → `/Library/LaunchDaemons`). The change-gate decides whether that
+    // root step is needed at all: if the installed plist + binary already match
+    // what we'd register AND the service is loaded, we skip it entirely (no
+    // sudo, no touch). Only a genuine overlay change elevates — try sudo, prompt
+    // once if not already root — and only the overlay step.
+    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, false) {
+        if is_root {
+            // Already root (e.g. legacy/system install) — register directly.
+            install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+        } else if overlayd_service_is_current(data_dir, &overlayd_bin) {
+            println!(
+                "Overlay networking service is up to date ({OVERLAYD_LAUNCHD_LABEL}); \
+                 skipping (no root needed)."
+            );
+        } else {
+            // The overlay changed (or is missing): elevate JUST this step.
+            if let Err(e) = elevate_overlayd_install(&overlayd_bin, no_start) {
+                eprintln!(
+                    "Warning: could not register the overlay networking system service: {e}. \
+                     The main daemon will run with cross-node overlay networking disabled."
+                );
+            } else {
+                // Persist the user-owned fast-path cache so the next
+                // daemon-only upgrade can confirm "unchanged" without a probe.
+                write_overlayd_service_cache(
+                    data_dir,
+                    &overlayd_bin,
+                    &render_overlayd_plist(data_dir, &overlayd_bin),
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "Warning: zlayer-overlayd binary not found next to {}; \
+             cross-node overlay networking will be unavailable.",
+            exe.display()
+        );
+    }
+
     if !no_start {
         // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
         // kill this CLI process while we wait for readiness.
@@ -1756,25 +1802,29 @@ async fn install(
             }
         }
 
-        // Kickstart the (possibly already-loaded) service so launchd
-        // re-reads the freshly-written plist and the daemon ends up
-        // running against the current ProgramArguments / env. `-k`
-        // terminates an existing instance first, then respawns. This is
-        // the macOS analog of `systemctl daemon-reload` + restart.
-        // Tolerate non-zero — on a fresh install the service was just
-        // bootstrapped and may not be running yet, and we don't want to
-        // fail the whole install over a cosmetic warning.
+        // Ensure the service is running, WITHOUT `-k`. The plist sets
+        // `RunAtLoad=true`, so the `bootstrap`/`load` above already spawned a
+        // fresh instance against the just-written plist (we boot out + unload +
+        // wait_for_label_unloaded + rewrite the plist before bootstrapping, so
+        // the loaded plist is always current). A plain `kickstart` is a no-op on
+        // an already-running job and only force-starts it if launchd somehow
+        // hasn't yet. We MUST NOT pass `-k`: `-k` SIGKILLs the running instance
+        // before restarting, and on a fresh install that instance is the daemon
+        // bootstrap just launched — killing it mid-`init_daemon` (right at the
+        // overlay-setup step) produced the crash-loop where the job never stays
+        // loaded ("Daemon failed to start within 45s / no job loaded"). Tolerate
+        // non-zero; it's cosmetic.
         let kickstart_out = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("{target}/{label}")])
+            .args(["kickstart", &format!("{target}/{label}")])
             .output()
             .await;
         match kickstart_out {
             Ok(o) if !o.status.success() => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 eprintln!(
-                    "Warning: launchctl kickstart -k {target}/{label} exited non-zero \
-                     (the freshly-installed plist is loaded; if the daemon was already \
-                     running it may still be on the old binary until next restart): {stderr}",
+                    "Warning: launchctl kickstart {target}/{label} exited non-zero \
+                     (the freshly-installed plist is loaded and RunAtLoad should have \
+                     started it): {stderr}",
                 );
             }
             Err(e) => {
@@ -1834,49 +1884,6 @@ async fn install(
                 return Err(e);
             }
         }
-    }
-
-    // Register overlayd as its OWN launchd service so it survives main-binary
-    // reinstalls. macOS does not relocate the main binary, so overlayd is found
-    // next to the running `zlayer` binary (copied_to_system = false).
-    //
-    // overlayd is the ONLY component that needs root (it owns a system utun
-    // adapter → `/Library/LaunchDaemons`). The change-gate decides whether that
-    // root step is needed at all: if the installed plist + binary already match
-    // what we'd register AND the service is loaded, we skip it entirely (no
-    // sudo). Only a genuine overlay change elevates — and only the overlay step.
-    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, false) {
-        if is_root {
-            // Already root (e.g. legacy/system install) — register directly.
-            install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
-        } else if overlayd_service_is_current(data_dir, &overlayd_bin) {
-            println!(
-                "Overlay networking service is up to date ({OVERLAYD_LAUNCHD_LABEL}); \
-                 skipping (no root needed)."
-            );
-        } else {
-            // The overlay changed (or is missing): elevate JUST this step.
-            if let Err(e) = elevate_overlayd_install(&overlayd_bin, no_start) {
-                eprintln!(
-                    "Warning: could not register the overlay networking system service: {e}. \
-                     The main daemon will spawn overlayd on demand instead."
-                );
-            } else {
-                // Persist the user-owned fast-path cache so the next
-                // daemon-only upgrade can confirm "unchanged" without a probe.
-                write_overlayd_service_cache(
-                    data_dir,
-                    &overlayd_bin,
-                    &render_overlayd_plist(data_dir, &overlayd_bin),
-                );
-            }
-        }
-    } else {
-        eprintln!(
-            "Warning: zlayer-overlayd binary not found next to {}; \
-             overlay networking will rely on the main daemon spawning it on demand.",
-            exe.display()
-        );
     }
 
     #[cfg(feature = "docker-compat")]

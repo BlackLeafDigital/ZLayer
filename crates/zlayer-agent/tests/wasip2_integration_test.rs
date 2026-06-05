@@ -187,6 +187,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         expose: Vec::new(),
         isolation: None,
         overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     }
 }
 
