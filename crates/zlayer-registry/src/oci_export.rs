@@ -535,6 +535,218 @@ pub async fn import_image_from_bytes(
         files.insert(path, contents);
     }
 
+    // Dispatch on archive format. An OCI Image Layout is marked by an
+    // `oci-layout` file; `docker save` / `podman save` instead emit a Docker
+    // Archive whose entry point is a top-level `manifest.json` array (and which
+    // has no `oci-layout`). Prefer OCI when both are present (hybrid archives).
+    if files.contains_key("oci-layout") {
+        import_from_oci_layout(registry, &files, tag, blob_cache).await
+    } else if files.contains_key("manifest.json") {
+        import_from_docker_archive(registry, &files, tag, blob_cache).await
+    } else {
+        Err(ImportError::InvalidLayout(
+            "archive is neither an OCI image layout (no oci-layout) nor a Docker \
+             archive (no manifest.json)"
+                .to_string(),
+        ))
+    }
+}
+
+/// A single image entry in a Docker Archive `manifest.json` (the format produced
+/// by `docker save` and `podman save --format docker-archive`).
+#[derive(Debug, Clone, Deserialize)]
+struct DockerManifestEntry {
+    /// Path within the archive to the image config JSON (e.g.
+    /// `blobs/sha256/<hash>` on modern engines, or `<hash>.json` on older ones).
+    #[serde(rename = "Config")]
+    config: String,
+    /// Repository tags this image was saved under (e.g. `["nginx:latest"]`).
+    #[serde(rename = "RepoTags")]
+    repo_tags: Option<Vec<String>>,
+    /// Ordered list of layer paths within the archive. Each entry may be an
+    /// uncompressed `tar` (`<id>/layer.tar`) or a `blobs/sha256/<hash>` blob.
+    #[serde(rename = "Layers", default)]
+    layers: Vec<String>,
+}
+
+/// Look up a file in an extracted archive, tolerating a leading `./` on either
+/// the stored tar path or the manifest-referenced path.
+fn archive_lookup<'a>(files: &'a HashMap<String, Vec<u8>>, key: &str) -> Option<&'a Vec<u8>> {
+    files
+        .get(key)
+        .or_else(|| files.get(key.trim_start_matches("./")))
+        .or_else(|| files.get(&format!("./{key}")))
+}
+
+/// Resolve the `(name, tag)` to store an imported image under.
+///
+/// Precedence: an explicit user-supplied `tag`, then the archive's own
+/// reference (OCI `ref.name` annotation or Docker `RepoTags[0]`), then a
+/// generated `imported-<shortdigest>` name. A trailing `:<tag>` is only treated
+/// as a tag when it is not actually a `registry:port` segment (i.e. the part
+/// after the last colon contains no `/`).
+fn resolve_name_and_tag(
+    tag: Option<&str>,
+    original_ref: Option<&str>,
+    manifest_digest: &str,
+) -> (String, Option<String>) {
+    let split_ref = |r: &str| -> (String, Option<String>) {
+        if let Some(at_pos) = r.find('@') {
+            return (r[..at_pos].to_string(), None);
+        }
+        if let Some(colon_pos) = r.rfind(':') {
+            let potential = &r[colon_pos + 1..];
+            if !potential.contains('/') && !potential.is_empty() {
+                return (r[..colon_pos].to_string(), Some(potential.to_string()));
+            }
+        }
+        (r.to_string(), Some("latest".to_string()))
+    };
+
+    if let Some(t) = tag {
+        split_ref(t)
+    } else if let Some(orig) = original_ref {
+        split_ref(orig)
+    } else {
+        // First 12 hex chars of the digest (skip the "sha256:" prefix).
+        let short_digest = &manifest_digest[7..19];
+        (format!("imported-{short_digest}"), None)
+    }
+}
+
+/// Import an image from a Docker Archive (`docker save` / `podman save`).
+///
+/// Docker archives differ from OCI image layouts: their entry point is a
+/// top-level `manifest.json` array referencing a config blob and an ordered set
+/// of layer blobs (which may be uncompressed `tar` or gzip-compressed). We read
+/// those blobs, synthesize an equivalent OCI image manifest over the bytes we
+/// store (labelling each layer `tar` or `tar+gzip` by gzip magic), and persist
+/// the config, layers, and manifest into the local registry + daemon blob cache
+/// exactly as the OCI path does — so an imported Docker archive is afterwards
+/// indistinguishable from a pulled image.
+async fn import_from_docker_archive(
+    registry: &LocalRegistry,
+    files: &HashMap<String, Vec<u8>>,
+    tag: Option<&str>,
+    blob_cache: Option<&dyn crate::cache::BlobCacheBackend>,
+) -> Result<ImportInfo, ImportError> {
+    let manifest_json = files
+        .get("manifest.json")
+        .ok_or_else(|| ImportError::InvalidLayout("missing manifest.json".to_string()))?;
+
+    let entries: Vec<DockerManifestEntry> = serde_json::from_slice(manifest_json)?;
+    let entry = entries.into_iter().next().ok_or_else(|| {
+        ImportError::InvalidLayout("manifest.json contains no images".to_string())
+    })?;
+
+    // Config blob.
+    let config_data = archive_lookup(files, &entry.config)
+        .ok_or_else(|| ImportError::BlobNotFound(entry.config.clone()))?;
+    let config_digest = compute_digest(config_data);
+    registry
+        .put_blob(config_data)
+        .await
+        .map_err(|e| ImportError::Registry(e.to_string()))?;
+    if let Some(cache) = blob_cache {
+        let _ = cache.put(&config_digest, config_data).await;
+    }
+    let config_desc = OciDescriptor {
+        media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+        digest: config_digest,
+        size: config_data.len() as u64,
+        urls: None,
+        annotations: None,
+        platform: None,
+    };
+
+    // Layer blobs (preserve manifest order).
+    let mut layer_descs = Vec::with_capacity(entry.layers.len());
+    for layer_ref in &entry.layers {
+        let layer_data = archive_lookup(files, layer_ref)
+            .ok_or_else(|| ImportError::BlobNotFound(layer_ref.clone()))?;
+        let digest = compute_digest(layer_data);
+        let media_type = if is_gzip(layer_data) {
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        } else {
+            "application/vnd.oci.image.layer.v1.tar"
+        };
+        registry
+            .put_blob(layer_data)
+            .await
+            .map_err(|e| ImportError::Registry(e.to_string()))?;
+        if let Some(cache) = blob_cache {
+            let _ = cache.put(&digest, layer_data).await;
+        }
+        layer_descs.push(OciDescriptor {
+            media_type: media_type.to_string(),
+            digest,
+            size: layer_data.len() as u64,
+            urls: None,
+            annotations: None,
+            platform: None,
+        });
+    }
+    let layer_count = layer_descs.len();
+
+    // Synthesize an OCI manifest over the stored bytes.
+    let manifest = OciManifest {
+        schema_version: 2,
+        media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+        config: Some(config_desc),
+        layers: layer_descs,
+        annotations: None,
+    };
+    let manifest_data = serde_json::to_vec(&manifest)?;
+    let manifest_digest = compute_digest(&manifest_data);
+
+    let original_ref = entry
+        .repo_tags
+        .as_ref()
+        .and_then(|tags| tags.first())
+        .cloned();
+    let (name, final_tag) = resolve_name_and_tag(tag, original_ref.as_deref(), &manifest_digest);
+
+    let reference = final_tag.clone().unwrap_or_else(|| manifest_digest.clone());
+    registry
+        .put_manifest(&name, &reference, &manifest_data)
+        .await
+        .map_err(|e| ImportError::Registry(e.to_string()))?;
+
+    if let Some(cache) = blob_cache {
+        let image_ref = if let Some(ref t) = final_tag {
+            format!("{name}:{t}")
+        } else {
+            name.clone()
+        };
+        let cache_key = crate::client::manifest_cache_key(&image_ref);
+        let _ = cache.put(&cache_key, &manifest_data).await;
+    }
+
+    let import_info = ImportInfo {
+        digest: manifest_digest.clone(),
+        tag: final_tag.map(|t| format!("{name}:{t}")),
+        layers: layer_count,
+    };
+
+    tracing::info!(
+        digest = %import_info.digest,
+        tag = ?import_info.tag,
+        layers = import_info.layers,
+        "imported image from Docker archive"
+    );
+
+    Ok(import_info)
+}
+
+/// Import an image from an OCI Image Layout archive (the format produced by
+/// `zlayer export`, `skopeo copy ... oci-archive:`, etc.).
+#[allow(clippy::too_many_lines)]
+async fn import_from_oci_layout(
+    registry: &LocalRegistry,
+    files: &HashMap<String, Vec<u8>>,
+    tag: Option<&str>,
+    blob_cache: Option<&dyn crate::cache::BlobCacheBackend>,
+) -> Result<ImportInfo, ImportError> {
     // Validate OCI layout
     let oci_layout_data = files
         .get("oci-layout")
@@ -638,40 +850,8 @@ pub async fn import_image_from_bytes(
         layer_count += 1;
     }
 
-    // Determine the tag to use
-    let (name, final_tag) = if let Some(tag_str) = tag {
-        // Parse user-provided tag
-        if let Some(at_pos) = tag_str.find('@') {
-            // Digest reference - just use name, no tag
-            (tag_str[..at_pos].to_string(), None)
-        } else if let Some(colon_pos) = tag_str.rfind(':') {
-            let potential_tag = &tag_str[colon_pos + 1..];
-            if !potential_tag.contains('/') && !potential_tag.is_empty() {
-                (
-                    tag_str[..colon_pos].to_string(),
-                    Some(potential_tag.to_string()),
-                )
-            } else {
-                (tag_str.to_string(), Some("latest".to_string()))
-            }
-        } else {
-            (tag_str.to_string(), Some("latest".to_string()))
-        }
-    } else if let Some(ref orig) = original_ref {
-        // Use original reference from archive
-        if let Some(colon_pos) = orig.rfind(':') {
-            (
-                orig[..colon_pos].to_string(),
-                Some(orig[colon_pos + 1..].to_string()),
-            )
-        } else {
-            (orig.clone(), Some("latest".to_string()))
-        }
-    } else {
-        // Generate a name from the digest
-        let short_digest = &manifest_digest[7..19]; // First 12 chars of hash
-        (format!("imported-{short_digest}"), None)
-    };
+    // Determine the name/tag to use (shared with the Docker-archive path).
+    let (name, final_tag) = resolve_name_and_tag(tag, original_ref.as_deref(), manifest_digest);
 
     // Store the manifest
     let reference = final_tag.clone().unwrap_or_else(|| manifest_digest.clone());
@@ -933,5 +1113,121 @@ mod tests {
             .unwrap();
 
         assert_eq!(import_info.layers, 1);
+    }
+
+    /// Build an in-memory Docker Archive (the `docker save` / `podman save`
+    /// layout): a top-level `manifest.json` array plus a config blob and the
+    /// listed layer blobs, stored at legacy `<id>/layer.tar` style paths.
+    fn build_docker_archive(repo_tags: &[&str], config: &[u8], layers: &[&[u8]]) -> Vec<u8> {
+        let mut builder = Builder::new(Vec::new());
+        add_file_to_tar(&mut builder, "config.json", config).unwrap();
+
+        let mut layer_paths = Vec::new();
+        for (i, layer) in layers.iter().enumerate() {
+            let path = format!("layer{i}/layer.tar");
+            add_file_to_tar(&mut builder, &path, layer).unwrap();
+            layer_paths.push(path);
+        }
+
+        let manifest = serde_json::json!([{
+            "Config": "config.json",
+            "RepoTags": repo_tags,
+            "Layers": layer_paths,
+        }]);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        add_file_to_tar(&mut builder, "manifest.json", &manifest_bytes).unwrap();
+
+        builder.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_import_docker_archive_with_tag() {
+        let (registry, _temp) = create_test_registry().await;
+
+        let config =
+            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:aaa"]}}"#;
+        let layer = b"uncompressed layer tar bytes";
+        let archive = build_docker_archive(&["nginx:latest"], config, &[layer]);
+
+        let info = import_image_from_bytes(&registry, archive, Some("myimg:v1"), None)
+            .await
+            .expect("docker archive should import");
+
+        assert_eq!(info.layers, 1);
+        assert_eq!(info.tag.as_deref(), Some("myimg:v1"));
+
+        // A synthesized OCI manifest is stored under the requested name:tag.
+        let manifest_bytes = registry.get_manifest("myimg", "v1").await.unwrap();
+        let manifest: OciManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest.layers.len(), 1);
+        // Uncompressed layer -> tar media type, digest over the stored bytes.
+        assert_eq!(
+            manifest.layers[0].media_type,
+            "application/vnd.oci.image.layer.v1.tar"
+        );
+        assert_eq!(manifest.layers[0].digest, compute_digest(layer));
+
+        // Config + layer blobs are retrievable from the registry.
+        let cfg = manifest.config.expect("config descriptor");
+        assert_eq!(cfg.digest, compute_digest(config));
+        assert!(registry.get_blob(&cfg.digest).await.is_ok());
+        assert!(registry.get_blob(&manifest.layers[0].digest).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_import_docker_archive_repotags_fallback() {
+        let (registry, _temp) = create_test_registry().await;
+
+        let config = br#"{"architecture":"amd64","os":"linux"}"#;
+        let layer = b"layer";
+        // No explicit tag -> name/tag taken from RepoTags[0].
+        let archive = build_docker_archive(&["library/nginx:1.27"], config, &[layer]);
+
+        let info = import_image_from_bytes(&registry, archive, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(info.tag.as_deref(), Some("library/nginx:1.27"));
+        assert!(registry.get_manifest("library/nginx", "1.27").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_import_docker_archive_gzipped_layer() {
+        let (registry, _temp) = create_test_registry().await;
+
+        // A gzip-compressed layer must be labelled tar+gzip in the manifest.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"compressed layer contents").unwrap();
+        let gz_layer = encoder.finish().unwrap();
+        assert!(is_gzip(&gz_layer));
+
+        let config = br#"{"os":"linux"}"#;
+        let archive = build_docker_archive(&["x:y"], config, &[&gz_layer]);
+
+        import_image_from_bytes(&registry, archive, Some("g:1"), None)
+            .await
+            .unwrap();
+
+        let manifest: OciManifest =
+            serde_json::from_slice(&registry.get_manifest("g", "1").await.unwrap()).unwrap();
+        assert_eq!(
+            manifest.layers[0].media_type,
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_archive_without_oci_or_docker_manifest_errors() {
+        let (registry, _temp) = create_test_registry().await;
+
+        // A valid tar that is neither an OCI layout nor a Docker archive.
+        let mut builder = Builder::new(Vec::new());
+        add_file_to_tar(&mut builder, "random.txt", b"hello").unwrap();
+        let archive = builder.into_inner().unwrap();
+
+        let err = import_image_from_bytes(&registry, archive, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ImportError::InvalidLayout(_)));
     }
 }

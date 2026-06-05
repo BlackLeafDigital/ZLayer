@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.55.0 - 2026-06-05
+
+### Added
+- **`zlayer import` now accepts Docker archives (`docker save` / `podman save`), not just OCI
+  image layouts.** Previously `import` required an `oci-layout` + `index.json` and failed on the
+  Docker Archive format (a top-level `manifest.json` array with `Config`/`RepoTags`/`Layers`),
+  which is what `podman save` emits by default. The importer now detects the archive format and,
+  for Docker archives, reads the config + layer blobs and synthesizes an equivalent OCI manifest
+  over the stored bytes — labelling each layer `tar` or `tar+gzip` by gzip magic, and resolving
+  the image name/tag from an explicit `--tag`, else the archive's `RepoTags[0]`. The config,
+  layers, and manifest are persisted into the local registry and daemon blob cache identically to
+  a pulled image, so an imported Docker archive is afterwards indistinguishable from a pull.
+  (`crates/zlayer-registry/src/oci_export.rs`; OCI and Docker paths share a `resolve_name_and_tag`
+  helper. Tests cover uncompressed + gzipped layers, RepoTags fallback, and the
+  neither-OCI-nor-Docker error.)
+
 ## 0.54.0 - 2026-06-04
 
 ### Added
