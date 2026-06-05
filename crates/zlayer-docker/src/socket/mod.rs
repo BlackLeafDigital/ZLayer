@@ -156,7 +156,7 @@ pub(super) fn normalize_compat_image(image: &str) -> String {
 /// 503 so Docker clients see a clean error instead of a 404. Each stub
 /// module documents what a real implementation would need.
 fn router(state: SocketState) -> Router {
-    Router::new()
+    let inner = Router::new()
         .merge(containers::routes(state.clone()))
         .merge(images::routes(state.clone()))
         .merge(build::routes(state.clone()))
@@ -166,6 +166,18 @@ fn router(state: SocketState) -> Router {
         .merge(buildkit::routes())
         .merge(swarm::routes(state))
         .merge(manifest::routes())
-        .merge(trust::routes())
+        .merge(trust::routes());
+
+    // Strip the Docker `/v1.NN` version prefix BEFORE routing. A plain
+    // `inner.layer(strip)` does NOT work for version-prefixed paths: in axum
+    // 0.8 `Router::layer` middleware only runs for requests that already match
+    // a route, but `/v1.47/containers/json` matches nothing until it is
+    // stripped — a chicken-and-egg that left every real Docker client (bollard,
+    // the `docker` CLI) getting a 404. Wrapping the merged router as the
+    // FALLBACK of an outer router and layering the strip there makes it run for
+    // EVERY request, rewrite the URI, then dispatch into `inner`, which now
+    // matches the version-less route.
+    Router::new()
+        .fallback_service(inner)
         .layer(axum::middleware::from_fn(version_middleware::strip_version))
 }

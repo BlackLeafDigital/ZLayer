@@ -126,4 +126,53 @@ mod tests {
     fn strips_multidigit() {
         assert_eq!(strip_version_path("/v12.345/x"), Some("/x"));
     }
+
+    // Routing-level regression test for the bug that shipped: the strip helper
+    // was unit-tested in isolation, but the middleware was wired with
+    // `inner.layer(strip)`, which in axum 0.8 only runs for ALREADY-matched
+    // routes — so every version-prefixed path (what real Docker clients send)
+    // matched nothing and 404'd before the strip ever ran. The fix wires the
+    // merged router as the FALLBACK of an outer router carrying the strip
+    // layer; this test exercises that exact composition end-to-end.
+    #[tokio::test]
+    async fn version_prefixed_paths_route_through_the_layer() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // Mirror `socket::router`'s wiring: version-less routes on an inner
+        // router, exposed as the fallback of an outer router that strips.
+        let inner = Router::new().route("/_ping", get(|| async { "OK" }));
+        let app = Router::new()
+            .fallback_service(inner)
+            .layer(axum::middleware::from_fn(strip_version));
+
+        // A version-prefixed request must reach the version-less handler.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1.47/_ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "version-prefixed /v1.47/_ping must route to /_ping"
+        );
+
+        // The bare path still works.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "bare /_ping must still route");
+    }
 }

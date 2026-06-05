@@ -645,15 +645,39 @@ pub(crate) async fn resolve_container_lookup(
         }
     }
 
-    // Fall-back: legacy service-name lookup. The storage map is keyed by
-    // the service-name string, so a present entry means the raw identifier
-    // is itself a valid storage key.
+    // Fall-back 1: the raw identifier is itself a valid storage key (the full
+    // `standalone-<name>` service-name string).
     let g = state.containers.read().await;
     if let Some(meta) = g.get(raw) {
         return Some(ResolvedContainer {
             container_id: meta.container_id.clone(),
             storage_key: raw.to_string(),
         });
+    }
+
+    // Fall-back 2: Docker addresses standalone containers by their user-facing
+    // NAME (`docker start <name>`), but the map is keyed by `standalone-<name>`
+    // (see `generate_container_id`). Try the prefixed key so start / stop /
+    // inspect / logs / exec / wait resolve a bare name like real Docker. Without
+    // this, every Docker client that addresses a container by name 404s even
+    // though the container exists.
+    let prefixed = format!("standalone-{raw}");
+    if let Some(meta) = g.get(&prefixed) {
+        return Some(ResolvedContainer {
+            container_id: meta.container_id.clone(),
+            storage_key: prefixed,
+        });
+    }
+
+    // Fall-back 3: match the recorded original name directly. Covers any key
+    // scheme and names that already begin with `standalone-`.
+    for (key, meta) in g.iter() {
+        if meta.name.as_deref() == Some(raw) {
+            return Some(ResolvedContainer {
+                container_id: meta.container_id.clone(),
+                storage_key: key.clone(),
+            });
+        }
     }
     None
 }
@@ -4590,6 +4614,46 @@ mod tests {
         assert!(resolve_container_lookup(&state, "no-such-container")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_resolves_bare_docker_name() {
+        // Real create stores standalone containers keyed by `standalone-<name>`
+        // (see `generate_container_id`) while recording the user-facing
+        // `<name>`. Docker clients address the container by the BARE name, so
+        // the resolver must map `demo` -> the `standalone-demo` entry. Before
+        // the fix this 404'd, which made `docker start <name>` / inspect / logs
+        // / exec / wait fail for every container created via the compat socket.
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::with_daemon_uuid(runtime, "test-daemon-uuid".to_string());
+        let cid = ContainerId::new("standalone-demo".to_string(), 0);
+        let _hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("demo".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-06-05T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-demo".to_string(), standalone);
+
+        // Bare docker name resolves to the prefixed storage key.
+        let resolved = resolve_container_lookup(&state, "demo")
+            .await
+            .expect("bare docker name must resolve to the standalone-<name> entry");
+        assert_eq!(resolved.container_id, cid);
+        assert_eq!(resolved.storage_key, "standalone-demo");
+
+        // The full storage key still resolves.
+        let resolved2 = resolve_container_lookup(&state, "standalone-demo")
+            .await
+            .expect("full storage key must still resolve");
+        assert_eq!(resolved2.container_id, cid);
     }
 
     // -----------------------------------------------------------------------
