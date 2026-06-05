@@ -166,6 +166,11 @@ build_busybox() {
   if ! grep -q '^CONFIG_STATIC=y' "${src_dir}/.config"; then
     echo 'CONFIG_STATIC=y' >>"${src_dir}/.config"
   fi
+  # Disable the `tc` applet: busybox 1.38's networking/tc.c references CBQ
+  # qdisc structs/constants (TCA_CBQ_*, struct tc_cbq_*) that were removed
+  # from modern Linux kernel headers (>=6.x), which breaks the build. The
+  # guest never needs traffic control.
+  sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' "${src_dir}/.config"
   # busybox's bundled kconfig has no `olddefconfig` target (that's a Linux
   # kernel target); normalize the edited .config with `oldconfig`, feeding
   # EOF so any NEW-symbol prompt takes its default non-interactively. (Piping
