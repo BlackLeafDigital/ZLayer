@@ -167,9 +167,11 @@ build_busybox() {
     echo 'CONFIG_STATIC=y' >>"${src_dir}/.config"
   fi
   # busybox's bundled kconfig has no `olddefconfig` target (that's a Linux
-  # kernel target); normalize the edited .config with a non-interactive
-  # `oldconfig`, answering any NEW-symbol prompts with their default.
-  yes "" | make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" oldconfig
+  # kernel target); normalize the edited .config with `oldconfig`, feeding
+  # EOF so any NEW-symbol prompt takes its default non-interactively. (Piping
+  # `yes` instead trips `set -o pipefail` when kconfig closes the pipe early
+  # — `yes` dies with SIGPIPE and aborts the build.)
+  make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" oldconfig </dev/null
 
   log "building static busybox (-j${JOBS})"
   make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"${JOBS}" busybox
