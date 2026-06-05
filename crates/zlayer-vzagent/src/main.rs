@@ -465,7 +465,14 @@ mod linux {
 
         // Read current flags.
         // SAFETY: ioctl with a properly-initialized ifreq on a valid fd.
-        if unsafe { libc::ioctl(owned.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
+        if unsafe {
+            libc::ioctl(
+                owned.as_raw_fd(),
+                libc::SIOCGIFFLAGS as libc::Ioctl,
+                &mut ifr,
+            )
+        } < 0
+        {
             return Err(errno(&format!("SIOCGIFFLAGS {ifname}")));
         }
         // SAFETY: ifr_flags union field is valid after the get ioctl above.
@@ -473,7 +480,7 @@ mod linux {
             ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
         // SAFETY: ioctl with the updated ifreq on a valid fd.
-        if unsafe { libc::ioctl(owned.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) } < 0 {
+        if unsafe { libc::ioctl(owned.as_raw_fd(), libc::SIOCSIFFLAGS as libc::Ioctl, &ifr) } < 0 {
             return Err(errno(&format!("SIOCSIFFLAGS {ifname}")));
         }
         Ok(())
@@ -496,7 +503,13 @@ mod linux {
         }
         // SIOCGIFADDR succeeds only if an address is assigned.
         // SAFETY: valid fd + initialized ifreq.
-        unsafe { libc::ioctl(owned.as_raw_fd(), libc::SIOCGIFADDR, &mut ifr) == 0 }
+        unsafe {
+            libc::ioctl(
+                owned.as_raw_fd(),
+                libc::SIOCGIFADDR as libc::Ioctl,
+                &mut ifr,
+            ) == 0
+        }
     }
 
     // ----------------------------------------------------------------------
