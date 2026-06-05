@@ -166,7 +166,10 @@ build_busybox() {
   if ! grep -q '^CONFIG_STATIC=y' "${src_dir}/.config"; then
     echo 'CONFIG_STATIC=y' >>"${src_dir}/.config"
   fi
-  make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+  # busybox's bundled kconfig has no `olddefconfig` target (that's a Linux
+  # kernel target); normalize the edited .config with a non-interactive
+  # `oldconfig`, answering any NEW-symbol prompts with their default.
+  yes "" | make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" oldconfig
 
   log "building static busybox (-j${JOBS})"
   make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"${JOBS}" busybox
