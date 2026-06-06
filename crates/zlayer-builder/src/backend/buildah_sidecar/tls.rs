@@ -143,6 +143,7 @@ fn set_file_mode_0600(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_file_mode_0600(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -157,6 +158,7 @@ pub(super) fn set_dir_mode_0700(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn set_dir_mode_0700(_path: &Path) -> Result<()> {
     Ok(())
 }

@@ -653,8 +653,21 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Returns `true` when the current process is running with superuser /
-/// Administrator privileges.
+/// Windows analogue of the Unix `is_root()` check.
+///
+/// Returns `true` when the current process token carries administrator
+/// privileges (elevated or running as LocalSystem). Backed by
+/// `IsUserAnAdmin` from `shell32`, which is the cheapest call that
+/// covers both interactive elevation and service-account scenarios.
+///
+/// The name `is_root()` is retained deliberately: callers across the
+/// workspace gate privileged filesystem/network setup on this
+/// function, and "admin" is the closest semantic analogue on Windows.
+///
+/// Exposed as `pub` so the Windows cluster-bootstrap CLI
+/// (`zlayer node init` / `zlayer node join` / `zlayer join`) can gate
+/// privileged subsystem setup (service-manager registration, firewall
+/// rules, Wintun adapter creation) on elevation before attempting them.
 #[cfg(windows)]
 #[must_use]
 pub fn is_root() -> bool {

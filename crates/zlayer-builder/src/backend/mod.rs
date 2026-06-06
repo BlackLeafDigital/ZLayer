@@ -275,6 +275,7 @@ pub async fn detect_backend_with_options(
 /// Anything outside that matrix is rejected with
 /// [`BuildError::NotSupported`] so the operator gets a clear error instead
 /// of a silent fallback.
+#[cfg_attr(windows, allow(clippy::needless_return))]
 async fn construct_backend(
     kind: zlayer_types::builder::BuilderBackendKind,
     target_os: ImageOs,

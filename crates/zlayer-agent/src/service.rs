@@ -3219,6 +3219,15 @@ services:
     ///   * a `Command { command: "true" }` health check (always passes host-side),
     /// then asserts the shared `health_states` map receives `Healthy` for the
     /// service — proving the bridge fires unconditionally.
+    ///
+    /// Gated to `#[cfg(unix)]` because `HealthCheck::Command` is executed via
+    /// `sh -c <command>` in `crate::health::HealthChecker::check_command`. On
+    /// Windows hosts without `sh` on PATH (the default Windows CI image), no
+    /// Command-based health check can ever pass, so the test would fail for
+    /// reasons unrelated to the bridge it is regression-testing. The bridge
+    /// behavior under test is platform-agnostic; only the test fixture's
+    /// "always-passes command" needs a Unix shell.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_health_states_bridge_fires_without_proxy() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());

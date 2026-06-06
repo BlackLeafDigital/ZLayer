@@ -23,15 +23,23 @@ pub enum WslError {
     #[error("Path translation failed: {0}")]
     PathTranslation(String),
 
+    /// User declined the WSL2 auto-install consent prompt.
+    ///
+    /// Callers should surface this as a non-fatal, actionable message pointing
+    /// the operator at `--install-wsl yes` (or at running `wsl --install`
+    /// themselves and re-running `zlayer`).
     #[error(
-        "WSL2 install declined by user. Re-run with `--install-wsl yes` to accept, or install \
-         WSL2 manually: `wsl.exe --install --no-distribution`"
+        "WSL2 auto-install was declined. Re-run with `--install-wsl yes` to auto-install, \
+         or install WSL2 manually (as Administrator):\n\
+         \n  wsl.exe --install --no-distribution\n\
+         \nthen re-run the command."
     )]
     InstallRefused,
 
+    /// WSL2 install succeeded but Windows requires a reboot before it can be used.
     #[error(
-        "WSL2 installation completed but requires a system reboot. Please reboot and re-run the \
-         command."
+        "WSL2 installation completed but requires a system reboot. \
+         Please reboot and re-run the command."
     )]
     RebootRequired,
 

@@ -688,4 +688,11 @@ package = "zlayer:example"
         let runtime = detect_runtime(dir.path());
         assert_eq!(runtime, Some(Runtime::Node20));
     }
+
+    #[test]
+    fn test_empty_dir_does_not_detect_windows() {
+        let dir = create_temp_dir();
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, None);
+    }
 }

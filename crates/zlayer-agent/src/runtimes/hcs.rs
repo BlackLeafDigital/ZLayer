@@ -4084,7 +4084,7 @@ impl Runtime for HcsRuntime {
     }
 
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
-        use zlayer_hcs::process::CapturedProcess;
+        use zlayer_hcs::process::ComputeProcess;
 
         if cmd.is_empty() {
             return Err(AgentError::InvalidSpec(
@@ -4125,7 +4125,7 @@ impl Runtime for HcsRuntime {
         // The blocking closure returns the (Send) `ComputeProcess` plus the
         // drained output; we then poll the authoritative exit code in async.
         let (process, stdout, stderr) = tokio::task::spawn_blocking(move || {
-            let captured = CapturedProcess::create_capturing_blocking(system_handle, &params)?;
+            let captured = ComputeProcess::create_capturing_blocking(system_handle, &params)?;
             Ok::<_, zlayer_hcs::error::HcsError>(captured.drain_with_process())
         })
         .await

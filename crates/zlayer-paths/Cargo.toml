@@ -17,5 +17,11 @@ zlayer-types = { workspace = true }
 nix = { workspace = true, features = ["user"] }
 libc = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+# Windows-only: used by `is_root()` to probe administrator status via
+# `IsUserAnAdmin` (shell32). Keep the feature list minimal — only what
+# the Windows branch of this crate actually calls.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+] }

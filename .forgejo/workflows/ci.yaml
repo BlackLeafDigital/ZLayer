@@ -445,6 +445,9 @@ jobs:
           packages: 'protoc'
           cross-platform: 'true'
 
+      - name: Install Git Bash
+        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
+
       - name: Export PROTOC env
         if: steps.check.outputs.completed != 'true'
         shell: bash

@@ -107,7 +107,7 @@ run_remote_ps() {
   # pyo3-build-config (zlayer-py dep, pulled transitively into --workspace)
   # can find a Python at build time. MiniWindows has uv installed via
   # chocolatey but no system Python on the SSH session PATH.
-  if ssh "$ZLAYER_WIN_HOST" "\$env:PROTOC = 'C:\\ProgramData\\chocolatey\\bin\\protoc.exe'; cd '$REMOTE_WIN_PATH'; uv run --python 3.12 -- $cmd"; then
+  if ssh "$ZLAYER_WIN_HOST" "\$env:Path = 'C:\\Users\\Admin\\.cargo\\bin;' + \$env:Path; \$env:PROTOC = 'C:\\ProgramData\\chocolatey\\bin\\protoc.exe'; cd '$REMOTE_WIN_PATH'; uv run --python 3.12 -- $cmd"; then
     echo "   >> OK: $label"
   else
     local rc=$?

@@ -76,7 +76,7 @@ pub struct LogForwardListener {
     listener: HvSockListener,
     /// Host-side sink path (`<debug_dir>\gcs-forward.log`). Forwarded records
     /// are appended here so `read_uvm_debug_dump` folds them into the
-    /// CreateFailed error on an accept timeout.
+    /// `CreateFailed` error on an accept timeout.
     sink_path: PathBuf,
     /// Tripped on [`LogForwardListener::stop`] / drop to unblock the loop.
     stop: Arc<Notify>,

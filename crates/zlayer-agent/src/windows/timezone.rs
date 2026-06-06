@@ -13,7 +13,7 @@
 //! production hcsshim host would.
 //!
 //! The produced JSON matches `hcsschema.TimeZoneInformation` EXACTLY:
-//! PascalCase keys, names decoded from the UTF-16 `[u16; 32]` Win32 buffers,
+//! `PascalCase` keys, names decoded from the UTF-16 `[u16; 32]` Win32 buffers,
 //! and `StandardDate` / `DaylightDate` as nested `SystemTime` objects. Go's
 //! `omitempty` semantics are mirrored: zero-valued integer fields and all-zero
 //! `SYSTEMTIME` transition dates are omitted (a no-DST timezone serialises with
@@ -33,6 +33,7 @@ use windows::Win32::System::Time::{
 /// hcsshim produces). Prefers `GetDynamicTimeZoneInformation`; falls back to
 /// `GetTimeZoneInformation`. Returns `None` if both Win32 calls report
 /// `TIME_ZONE_ID_INVALID` so the caller can fall back to the UTC constant.
+#[must_use]
 pub fn host_timezone_information() -> Option<Value> {
     // SAFETY: `GetDynamicTimeZoneInformation` writes a fully-initialized
     // `DYNAMIC_TIME_ZONE_INFORMATION` into the out-pointer. We pass a zeroed,

@@ -73,10 +73,8 @@ fn describe_response_error(stage: &str, base: &ResponseBase) -> String {
     let records = if base.error_records.is_null() {
         String::new()
     } else {
-        match serde_json::to_string(&base.error_records) {
-            Ok(s) => format!(" error_records={s}"),
-            Err(_) => String::new(),
-        }
+        serde_json::to_string(&base.error_records)
+            .map_or_else(|_| String::new(), |s| format!(" error_records={s}"))
     };
     format!(
         "{stage} returned HRESULT {hresult:#x}: {}{records}",
@@ -88,7 +86,7 @@ fn describe_response_error(stage: &str, base: &ResponseBase) -> String {
 /// `stage` it occurred in, so a mid-handshake hangup reads as e.g.
 /// `negotiation: cold-start Create: bridge closed` rather than a bare
 /// `bridge closed` that gives no hint which RPC the guest rejected.
-fn stage_err(stage: &str, err: GcsError) -> GcsError {
+fn stage_err(stage: &str, err: &GcsError) -> GcsError {
     GcsError::Negotiation(format!("{stage}: {err}"))
 }
 
@@ -165,7 +163,7 @@ impl GcsBridge {
         let resp: NegotiateProtocolResponse = self
             .send_rpc_json(RpcMessageType::NegotiateProtocol, &req)
             .await
-            .map_err(|e| stage_err("negotiate", e))?;
+            .map_err(|e| stage_err("negotiate", &e))?;
         if resp.base.result != 0 {
             return Err(GcsError::Negotiation(describe_response_error(
                 "negotiate",
@@ -252,15 +250,17 @@ impl GcsBridge {
         // i.e. the canonical Windows TZ names (NOT the bare `"UTC"` our prior
         // body used, which `TIME_ZONE_INFORMATION` rejects) plus empty
         // `StandardDate`/`DaylightDate` objects (`&SystemTime{}` → `{}`).
-        let timezone_information = match host_tz {
-            Some(tz) => tz.clone(),
-            None => serde_json::json!({
-                "StandardName": "Coordinated Universal Time",
-                "DaylightName": "Coordinated Universal Time",
-                "StandardDate": {},
-                "DaylightDate": {},
-            }),
-        };
+        let timezone_information = host_tz.map_or_else(
+            || {
+                serde_json::json!({
+                    "StandardName": "Coordinated Universal Time",
+                    "DaylightName": "Coordinated Universal Time",
+                    "StandardDate": {},
+                    "DaylightDate": {},
+                })
+            },
+            Clone::clone,
+        );
         let uvm_config_str = serde_json::to_string(&serde_json::json!({
             "SystemType": "Container",
             "TimeZoneInformation": timezone_information,
@@ -273,7 +273,7 @@ impl GcsBridge {
         let create_resp: ResponseBase = self
             .send_rpc_json(RpcMessageType::Create, &create_body)
             .await
-            .map_err(|e| stage_err("cold-start Create", e))?;
+            .map_err(|e| stage_err("cold-start Create", &e))?;
         if create_resp.result != 0 {
             return Err(GcsError::Negotiation(describe_response_error(
                 "cold-start Create",
@@ -291,7 +291,7 @@ impl GcsBridge {
         let start_resp: ResponseBase = self
             .send_rpc_json(RpcMessageType::Start, &start_body)
             .await
-            .map_err(|e| stage_err("cold-start Start", e))?;
+            .map_err(|e| stage_err("cold-start Start", &e))?;
         if start_resp.result != 0 {
             return Err(GcsError::Negotiation(describe_response_error(
                 "cold-start Start",
@@ -339,7 +339,7 @@ impl GcsBridge {
         let resp: ResponseBase = self
             .send_rpc_json(RpcMessageType::ModifyServiceSettings, &body)
             .await
-            .map_err(|e| stage_err("StartLogForwarding", e))?;
+            .map_err(|e| stage_err("StartLogForwarding", &e))?;
         if resp.result != 0 {
             return Err(GcsError::Negotiation(describe_response_error(
                 "StartLogForwarding",
@@ -430,6 +430,7 @@ impl GcsBridge {
             let mut frames_seen: u32 = 0;
             loop {
                 let mut hdr_buf = [0u8; HEADER_LEN];
+                #[cfg_attr(not(feature = "windows-debug"), allow(unused_variables))]
                 if let Err(e) = stream.read_exact(&mut hdr_buf).await {
                     gcs_debug!(
                         "gcs-bridge-reader: header read failed after {} frame(s): {}",
@@ -440,6 +441,7 @@ impl GcsBridge {
                 }
                 let hdr = match frame::decode_header(&hdr_buf) {
                     Ok(h) => h,
+                    #[cfg_attr(not(feature = "windows-debug"), allow(unused_variables))]
                     Err(e) => {
                         gcs_debug!(
                             "gcs-bridge-reader: header decode failed (bytes={:02x?}): {}",
@@ -459,6 +461,7 @@ impl GcsBridge {
                 let body_len = (hdr.size as usize) - HEADER_LEN;
                 let mut body = vec![0u8; body_len];
                 if body_len > 0 {
+                    #[cfg_attr(not(feature = "windows-debug"), allow(unused_variables))]
                     if let Err(e) = stream.read_exact(&mut body).await {
                         gcs_debug!(
                             "gcs-bridge-reader: body read failed (need {} bytes): {}",

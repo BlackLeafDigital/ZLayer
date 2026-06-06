@@ -14,6 +14,13 @@
 //! signature it had before the migration so existing callers compile unchanged;
 //! the body simply builds the matching [`OverlaydRequest`], issues
 //! `client.call(req)`, and maps the response.
+//!
+//! On Windows, the manager additionally maintains a small `hcn_cleanup` map
+//! (HCN namespace GUID -> (`service_name`, `allocated_ip`)) so that
+//! agent-side bookkeeping for autoclean attaches survives even though the
+//! authoritative HCN state lives in overlayd. The map is populated on
+//! `attach_container_hcn(autoclean = true)` and drained on
+//! `detach_container_hcn`.
 
 use crate::error::AgentError;
 use ipnetwork::IpNetwork;
@@ -142,6 +149,18 @@ pub struct OverlayManager {
     /// Override for the `WireGuard` UAPI socket directory. overlayd owns the
     /// real transport, so this is retained only for API/diagnostic parity.
     uapi_sock_dir: Option<PathBuf>,
+    /// Map of HCN namespace GUID -> (`service_name`, `allocated_ip`) for autoclean.
+    /// When a Windows container is attached with `autoclean = true`, its entry
+    /// is inserted here; `detach_container_hcn` removes it. overlayd is the
+    /// authoritative owner of the HCN namespace/endpoint state, but the agent
+    /// keeps this side-map so it can answer "what attachments do I still need
+    /// to release on shutdown?" without an IPC round-trip per query.
+    #[cfg(target_os = "windows")]
+    hcn_cleanup: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<windows::core::GUID, (String, std::net::IpAddr)>,
+        >,
+    >,
 }
 
 impl OverlayManager {
@@ -177,6 +196,10 @@ impl OverlayManager {
             dns_domain: None,
             nat_config: None,
             uapi_sock_dir: None,
+            #[cfg(target_os = "windows")]
+            hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -210,6 +233,10 @@ impl OverlayManager {
             dns_domain: None,
             nat_config: None,
             uapi_sock_dir: None,
+            #[cfg(target_os = "windows")]
+            hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -545,6 +572,12 @@ impl OverlayManager {
     /// created inside overlayd, and `HcsRuntime` needs that GUID to embed in the
     /// compute-system document.
     ///
+    /// When `autoclean` is true and overlayd reports back a namespace GUID, an
+    /// entry is recorded in [`OverlayManager::hcn_cleanup`] so a later
+    /// [`OverlayManager::detach_container_hcn`] (or process teardown) can drain
+    /// it. The cleanup map is purely agent-side bookkeeping; overlayd remains
+    /// the authoritative owner of the HCN namespace/endpoint state.
+    ///
     /// # Errors
     /// Returns an error if overlayd cannot attach the container.
     #[cfg(target_os = "windows")]
@@ -554,7 +587,7 @@ impl OverlayManager {
         container_id: &str,
         service_name: &str,
         ip_override: Option<std::net::IpAddr>,
-        _autoclean: bool,
+        autoclean: bool,
         dns_server: Option<std::net::IpAddr>,
         dns_domain: Option<String>,
     ) -> Result<(std::net::IpAddr, Option<String>), AgentError> {
@@ -571,7 +604,29 @@ impl OverlayManager {
             })
             .await?;
         match resp {
-            OverlaydResponse::Attached(result) => Ok((result.ip, result.namespace_guid)),
+            OverlaydResponse::Attached(result) => {
+                // Record agent-side autoclean bookkeeping. We key by the
+                // overlayd-issued namespace GUID; if overlayd did not return
+                // one (e.g. host-network attach), there is nothing to track.
+                if autoclean {
+                    if let Some(ns_str) = result.namespace_guid.as_deref() {
+                        match windows::core::GUID::try_from(ns_str) {
+                            Ok(ns_guid) => {
+                                let mut cleanup = self.hcn_cleanup.lock().await;
+                                cleanup.insert(ns_guid, (service_name.to_string(), result.ip));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    ns = %ns_str,
+                                    error = %e,
+                                    "overlayd returned a non-GUID namespace handle; skipping hcn_cleanup insert"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok((result.ip, result.namespace_guid))
+            }
             other => Err(AgentError::Network(format!(
                 "overlayd AttachContainer(WindowsContainer) returned unexpected response: {other:?}"
             ))),
@@ -580,10 +635,37 @@ impl OverlayManager {
 
     /// Detach and release a Windows HCN container by its bare namespace GUID.
     ///
+    /// Drains the agent-side [`OverlayManager::hcn_cleanup`] entry (if any)
+    /// before forwarding `DetachContainer` to overlayd. Safe to call with an
+    /// unknown GUID — the map drain is a no-op in that case.
+    ///
     /// # Errors
     /// Returns an error if overlayd reports a detach failure.
     #[cfg(target_os = "windows")]
     pub async fn detach_container_hcn(&self, namespace_guid: &str) -> Result<(), AgentError> {
+        // Drain the agent-side cleanup map first so a later overlayd error does
+        // not leave a stale entry behind.
+        match windows::core::GUID::try_from(namespace_guid) {
+            Ok(ns_guid) => {
+                let mut cleanup = self.hcn_cleanup.lock().await;
+                if let Some((service_name, ip)) = cleanup.remove(&ns_guid) {
+                    tracing::info!(
+                        ns = %namespace_guid,
+                        service = %service_name,
+                        ip = %ip,
+                        "Released HCN overlay attachment (agent-side cleanup)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ns = %namespace_guid,
+                    error = %e,
+                    "detach_container_hcn called with non-GUID handle; skipping hcn_cleanup drain"
+                );
+            }
+        }
+
         self.call(OverlaydRequest::DetachContainer {
             handle: AttachHandle::WindowsContainer {
                 container_id: namespace_guid.to_string(),
@@ -626,6 +708,15 @@ impl OverlayManager {
     pub async fn cleanup(&mut self) -> Result<(), AgentError> {
         self.call(OverlaydRequest::TeardownGlobalOverlay).await?;
         self.global_interface = None;
+        // Best-effort drain of any agent-side autoclean bookkeeping we still
+        // hold on Windows. overlayd already tore down the HCN namespaces in
+        // response to `TeardownGlobalOverlay`; this just empties the side-map
+        // so a subsequent reuse of this manager starts clean.
+        #[cfg(target_os = "windows")]
+        {
+            let mut cleanup = self.hcn_cleanup.lock().await;
+            cleanup.clear();
+        }
         Ok(())
     }
 
@@ -1003,6 +1094,43 @@ mod tests {
                 );
             }
             other => panic!("expected RemovePeer, got {other:?}"),
+        }
+    }
+
+    /// Windows-only: verify the `hcn_cleanup` side-map starts empty on both
+    /// constructor paths. Live insert/drain coverage lives behind the overlayd
+    /// IPC layer (which is exercised by the windows e2e tests), but this
+    /// sanity-checks that the field is wired correctly through `new()` and
+    /// `with_slice()`.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn hcn_cleanup_map_starts_empty() {
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
+            .await
+            .unwrap();
+        {
+            let map = om.hcn_cleanup.lock().await;
+            assert!(
+                map.is_empty(),
+                "hcn_cleanup map must start empty from new()"
+            );
+        }
+
+        let cluster: IpNetwork = "10.200.0.0/16".parse().unwrap();
+        let slice: IpNetwork = "10.200.42.0/28".parse().unwrap();
+        let om = OverlayManager::with_slice(
+            "test-deploy".to_string(),
+            cluster,
+            slice,
+            51820,
+            "test".to_string(),
+        );
+        {
+            let map = om.hcn_cleanup.lock().await;
+            assert!(
+                map.is_empty(),
+                "hcn_cleanup map must start empty from with_slice()"
+            );
         }
     }
 }

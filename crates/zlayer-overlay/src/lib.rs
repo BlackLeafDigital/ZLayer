@@ -14,6 +14,7 @@
 //! - [`config`] - Configuration types for overlay networks
 //! - [`dns`] - DNS server for service discovery
 //! - [`error`] - Error types for overlay operations
+//! - [`firewall`] - Inbound firewall-rule management (Windows; stub on other OSes)
 //! - [`health`] - Health checking for peer connectivity
 //! - [`transport`] - Overlay transport (boringtun device management via UAPI)
 //!

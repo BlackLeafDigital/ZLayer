@@ -56,7 +56,9 @@ pub const WINDOWS_GCS_HV_HOST_ID: windows::core::GUID =
 
 /// `WindowsLoggingHvsockServiceID` — the hvsock service ID the in-guest GCS
 /// log-forward service connects to (on the host partition) to stream its log
-/// records out to the host. Matches hcsshim
+/// records out to the host.
+///
+/// Matches hcsshim
 /// `internal/gcs/prot/protocol.go::WindowsLoggingHvsockServiceID`
 /// (172dad59-976d-45f2-8b6c-6d1b13f2ac4d).
 ///

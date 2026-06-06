@@ -249,9 +249,9 @@ pub(crate) async fn handle_daemon(
     match action {
         DaemonAction::Install(args) => {
             // `install_wsl` / `no_nat` / `stun_servers` / `turn_servers` /
-            // `relay_server_bind` are parsed for forward-compatibility; the
-            // Unix install path forwards only the daemon-environment flags
-            // below.
+            // `relay_server_bind` are parsed for forward-compatibility (Windows
+            // daemon install is a separate task); the Unix install path forwards
+            // only the daemon-environment flags below.
             install(
                 &daemon_name,
                 data_dir,
@@ -2381,7 +2381,7 @@ fn overlayd_service_is_current(data_dir: &Path, staged_overlayd_bin: &Path) -> b
 }
 
 /// Write + enable + start the overlayd systemd unit. overlayd is the overlay
-/// owner, so it ALWAYS gets the tun + CAP_NET_ADMIN/CAP_SYS_ADMIN capability
+/// owner, so it ALWAYS gets the tun + `CAP_NET_ADMIN/CAP_SYS_ADMIN` capability
 /// block regardless of the main daemon's `--with-overlay` flag. Always run as
 /// root (directly, or via the `_install-overlayd` sudo re-exec).
 #[cfg(target_os = "linux")]
@@ -4578,6 +4578,7 @@ fn truncate_daemon_logs(log_dir: &std::path::Path) {
 /// On timeout, [`get_daemon_failure_context`] auto-surfaces the error from
 /// the OS service manager (systemctl/journalctl on Linux, the stderr log on
 /// macOS) so the user sees why it failed without running a separate command.
+#[cfg_attr(windows, allow(unused_variables))]
 async fn wait_for_daemon_ready(
     daemon_name: &str,
     socket: Option<&Path>,

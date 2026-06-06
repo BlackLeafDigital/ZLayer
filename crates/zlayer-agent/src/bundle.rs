@@ -19,6 +19,14 @@ use oci_spec::runtime::{
 #[cfg(unix)]
 use oci_spec::runtime::LinuxIdMappingBuilder;
 use std::collections::{HashMap, HashSet};
+// `MetadataExt` is only meaningful on Unix-like hosts where `/dev/*` nodes exist
+// and have major/minor numbers. On Windows this module is still built so that
+// `BundleBuilder::build_spec_only` (cross-platform OCI Spec generation) can be
+// called from the WSL2 delegate runtime, which then pipes the generated
+// `config.json` into a Linux WSL2 distro that owns the actual device
+// fingerprint. See G-1 / G-2 in the Windows plan. The import is performed
+// inside `get_device_major_minor` itself to avoid an unused-import warning on
+// non-Unix platforms.
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -245,6 +253,13 @@ pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
 }
 
 /// Get major and minor device numbers from a device path
+///
+/// Unix-only: relies on `MetadataExt::rdev()` which isn't available on Windows.
+/// When `bundle.rs` is compiled for a Windows host (for the WSL2 delegate's
+/// cross-platform `build_spec_only` path), device probing is skipped entirely —
+/// the Linux side of the delegate is responsible for its own device fingerprint.
+/// The non-Unix stub below returns `Unsupported` so the `if let Ok(..)` /
+/// `.unwrap_or(..)` call sites at the CDI / GPU passthrough paths skip cleanly.
 #[cfg(unix)]
 #[allow(clippy::cast_possible_wrap)]
 fn get_device_major_minor(path: &str) -> std::io::Result<(i64, i64)> {
@@ -267,6 +282,9 @@ fn get_device_major_minor(_path: &str) -> std::io::Result<(i64, i64)> {
 }
 
 /// Detect device type from path
+///
+/// Unix-only: uses `FileTypeExt::is_char_device` / `is_block_device` which are
+/// not available on Windows. See `get_device_major_minor` for the rationale.
 #[cfg(unix)]
 fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
     use std::os::unix::fs::FileTypeExt;
@@ -578,6 +596,14 @@ impl BundleBuilder {
     /// # Errors
     /// - `AgentError::CreateFailed` if directory creation fails
     /// - `AgentError::InvalidSpec` if the OCI spec generation fails
+    ///
+    /// # Platform
+    /// Unix-only. Uses `tokio::fs::symlink` which is defined in terms of
+    /// `std::os::unix::fs::symlink` and does not exist on Windows. The Windows
+    /// WSL2 delegate path should call [`BundleBuilder::build_spec_only`] to
+    /// obtain the OCI [`Spec`] and pipe it into the WSL2 distro, where the
+    /// Linux side of the delegate handles bundle directory creation.
+    #[cfg(unix)]
     pub async fn build(&self, container_id: &ContainerId, spec: &ServiceSpec) -> Result<PathBuf> {
         // Create bundle directory
         fs::create_dir_all(&self.bundle_dir)
@@ -635,7 +661,7 @@ impl BundleBuilder {
 
         // Generate OCI runtime spec
         let oci_spec = self
-            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .build_spec_only(container_id, spec, &self.volume_paths)
             .await?;
 
         // Write config.json
@@ -665,15 +691,22 @@ impl BundleBuilder {
     /// Render the OCI runtime spec without creating a bundle directory
     /// or writing `config.json`.
     ///
-    /// Used by the WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`):
-    /// the Windows host renders the spec, then streams the JSON into the
-    /// WSL distro filesystem where `youki` will consume it. The bundle
-    /// path passed to `BundleBuilder::new` is purely informational in
-    /// that flow; this method never touches the filesystem.
+    /// This is the cross-platform entry point for OCI spec generation and is
+    /// the only bundle-builder method that is callable on Windows. Used by the
+    /// WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`): the Windows host
+    /// renders the spec, then streams the JSON into the WSL distro filesystem
+    /// where `youki` will consume it. The bundle path passed to
+    /// `BundleBuilder::new` is purely informational in that flow; this method
+    /// never touches the filesystem.
+    ///
+    /// Unix hosts that want both the spec *and* the on-disk bundle layout
+    /// (rootfs symlink, `config.json`, parent directories) should continue to
+    /// use [`BundleBuilder::build`] or [`BundleBuilder::write_config`].
     ///
     /// # Errors
-    ///
-    /// Returns [`AgentError::InvalidSpec`] if the spec generation fails.
+    /// Returns [`AgentError::InvalidSpec`] if any of the OCI `*Builder` types
+    /// reject the configuration, or if environment-variable secret resolution
+    /// fails.
     pub async fn build_spec_only(
         &self,
         container_id: &ContainerId,
@@ -746,7 +779,24 @@ impl BundleBuilder {
         }
     }
 
-    /// Build the OCI runtime spec from `ServiceSpec`
+    /// Build the OCI runtime spec from `ServiceSpec`.
+    ///
+    /// The full, CDI-aware implementation that backs both
+    /// [`BundleBuilder::build_spec_only`] (cross-platform, public) and the
+    /// Unix-only [`BundleBuilder::build`] / [`BundleBuilder::write_config`]
+    /// paths that additionally manage the bundle directory on disk.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidSpec`] if any of the OCI `*Builder` types
+    /// reject the configuration, or if environment-variable secret resolution
+    /// fails.
+    ///
+    /// # Panics
+    /// Panics if the builder-internal `MountBuilder::build()` call fails for
+    /// the optional `ZLayer` API socket bind-mount. This is only reachable when
+    /// [`BundleBuilder::with_socket_mount`] has been used with a malformed
+    /// path, and is treated as a programmer error because all fields are
+    /// statically constructed from known-good inputs.
     #[allow(clippy::too_many_lines)]
     async fn build_oci_spec(
         &self,
@@ -2067,7 +2117,10 @@ impl BundleBuilder {
                 rules.push(rule);
             }
 
-            // Allow specific devices from spec
+            // Allow specific devices from spec (Unix-only: requires /dev/* fs
+            // probing via `MetadataExt::rdev`). On Windows the WSL2 delegate
+            // path regenerates these inside the Linux distro, so we skip here.
+            #[cfg(unix)]
             for device in &spec.devices {
                 if let Ok((major, minor)) = get_device_major_minor(&device.path) {
                     let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
@@ -2209,265 +2262,315 @@ impl BundleBuilder {
     }
 
     /// Build Linux device entries for passthrough
+    ///
+    /// # Platform
+    /// Every branch below walks `/dev/*` on the host to resolve major/minor
+    /// numbers via `MetadataExt::rdev`. On Windows (where this module is
+    /// compiled only to feed the WSL2 delegate's cross-platform spec path) we
+    /// skip device discovery and return an empty list — the Linux side of the
+    /// delegate re-runs this step inside the WSL2 distro.
     #[allow(clippy::unused_self, clippy::too_many_lines)]
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::needless_return))]
     fn build_devices(
         &self,
         spec: &ServiceSpec,
         gpu_indices: Option<&[u32]>,
         skip_gpu_defaults: bool,
     ) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
-        let mut devices = Vec::new();
-
-        for device in &spec.devices {
-            if let Ok((major, minor)) = get_device_major_minor(&device.path) {
-                let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
-
-                let linux_device = LinuxDeviceBuilder::default()
-                    .path(device.path.clone())
-                    .typ(dev_type)
-                    .major(major)
-                    .minor(minor)
-                    .file_mode(0o666u32)
-                    .uid(0u32)
-                    .gid(0u32)
-                    .build()
-                    .map_err(|e| {
-                        AgentError::InvalidSpec(format!(
-                            "failed to build device {}: {}",
-                            device.path, e
-                        ))
-                    })?;
-
-                devices.push(linux_device);
-            }
+        #[cfg(not(unix))]
+        {
+            let _ = (spec, gpu_indices, skip_gpu_defaults);
+            return Ok(Vec::new());
         }
 
-        // When CDI is providing GPU device descriptors the caller will append
-        // the vendor-supplied entries; skip our hard-coded `/dev/nvidiaN`
-        // enumeration so we don't end up with both sources of truth.
-        if skip_gpu_defaults {
-            return Ok(devices);
-        }
+        #[cfg(unix)]
+        {
+            let mut devices = Vec::new();
 
-        // Auto-inject GPU devices when gpu spec is set
-        if let Some(ref gpu) = spec.resources.gpu {
-            let indices: Vec<u32> =
-                gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
+            for device in &spec.devices {
+                if let Ok((major, minor)) = get_device_major_minor(&device.path) {
+                    let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
 
-            match gpu.vendor.as_str() {
-                "nvidia" => {
-                    // Always needed: nvidiactl, nvidia-uvm, nvidia-uvm-tools
-                    let always_devices =
-                        ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"];
-                    for dev_path in &always_devices {
-                        if let Ok((major, minor)) = get_device_major_minor(dev_path) {
-                            let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path((*dev_path).to_string())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+                    let linux_device = LinuxDeviceBuilder::default()
+                        .path(device.path.clone())
+                        .typ(dev_type)
+                        .major(major)
+                        .minor(minor)
+                        .file_mode(0o666u32)
+                        .uid(0u32)
+                        .gid(0u32)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build device {}: {}",
+                                device.path, e
+                            ))
+                        })?;
 
-                    // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/nvidia{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-                }
-                "amd" => {
-                    // AMD ROCm: /dev/kfd is always required for compute
-                    let amd_always_devices = ["/dev/kfd"];
-                    for dev_path in &amd_always_devices {
-                        if let Ok((major, minor)) = get_device_major_minor(dev_path) {
-                            let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path((*dev_path).to_string())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-
-                    // DRI render nodes: /dev/dri/renderD128, renderD129, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-
-                    // DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/card{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-                }
-                "intel" => {
-                    // Intel GPU: DRI render nodes /dev/dri/renderD128, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-
-                    // Intel DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/card{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-                }
-                other => {
-                    // Unknown vendor - try DRI render nodes as default
-                    tracing::warn!(
-                        vendor = %other,
-                        "Unknown GPU vendor, attempting DRI device passthrough"
-                    );
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+                    devices.push(linux_device);
                 }
             }
-        }
 
-        Ok(devices)
+            // When CDI is providing GPU device descriptors the caller will
+            // append the vendor-supplied entries; skip our hard-coded
+            // `/dev/nvidiaN` enumeration so we don't end up with both sources
+            // of truth.
+            if skip_gpu_defaults {
+                return Ok(devices);
+            }
+
+            // Auto-inject GPU devices when gpu spec is set
+            if let Some(ref gpu) = spec.resources.gpu {
+                let indices: Vec<u32> =
+                    gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
+
+                match gpu.vendor.as_str() {
+                    "nvidia" => {
+                        // Always needed: nvidiactl, nvidia-uvm, nvidia-uvm-tools
+                        let always_devices =
+                            ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"];
+                        for dev_path in &always_devices {
+                            if let Ok((major, minor)) = get_device_major_minor(dev_path) {
+                                let dev_type =
+                                    get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path((*dev_path).to_string())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/nvidia{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                    "amd" => {
+                        // AMD ROCm: /dev/kfd is always required for compute
+                        let amd_always_devices = ["/dev/kfd"];
+                        for dev_path in &amd_always_devices {
+                            if let Ok((major, minor)) = get_device_major_minor(dev_path) {
+                                let dev_type =
+                                    get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path((*dev_path).to_string())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // DRI render nodes: /dev/dri/renderD128, renderD129, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // DRI card nodes: /dev/dri/card0, card1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/card{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                    "intel" => {
+                        // Intel GPU: DRI render nodes /dev/dri/renderD128, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // Intel DRI card nodes: /dev/dri/card0, card1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/card{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                    other => {
+                        // Unknown vendor - try DRI render nodes as default
+                        tracing::warn!(
+                            vendor = %other,
+                            "Unknown GPU vendor, attempting DRI device passthrough"
+                        );
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(devices)
+        } // end #[cfg(unix)]
     }
 
     /// Generate the OCI spec and write config.json to the bundle directory
@@ -2488,7 +2591,7 @@ impl BundleBuilder {
     ) -> Result<PathBuf> {
         // Generate OCI runtime spec
         let oci_spec = self
-            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .build_spec_only(container_id, spec, &self.volume_paths)
             .await?;
 
         // Write config.json
@@ -2588,6 +2691,13 @@ impl BundleBuilder {
 ///
 /// # Errors
 /// Returns an error if bundle creation fails.
+///
+/// # Platform
+/// Unix-only — wraps [`BundleBuilder::build`], which uses
+/// `tokio::fs::symlink` (not available on Windows). Windows callers should
+/// use [`BundleBuilder::build_spec_only`] directly and pipe the result into
+/// a WSL2 delegate.
+#[cfg(unix)]
 pub async fn create_bundle(
     container_id: &ContainerId,
     spec: &ServiceSpec,
@@ -2741,7 +2851,7 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2763,7 +2873,7 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2789,7 +2899,7 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2818,7 +2928,7 @@ services:
             .with_env("EXTRA_VAR".to_string(), "extra_value".to_string());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2842,7 +2952,7 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
@@ -2868,7 +2978,7 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into()).with_host_network(true);
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
@@ -3132,7 +3242,7 @@ services:
         let volume_paths = std::collections::HashMap::new();
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &volume_paths)
+            .build_spec_only(&id, &spec, &volume_paths)
             .await
             .unwrap();
 
