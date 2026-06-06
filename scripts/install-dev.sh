@@ -360,6 +360,20 @@ case "${ZLAYER_DEV_DATA_DIR}" in
             echo "Reclaiming ownership of ${ZLAYER_DEV_DATA_DIR}/secrets (was root-owned)..."
             sudo chown -R "$(id -un)" "${ZLAYER_DEV_DATA_DIR}/secrets" || true
         fi
+        # Linux-only: the systemd unit runs the daemon with Group=zlayer and
+        # CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN — the latter strips
+        # CAP_DAC_OVERRIDE so the (uid 0) process can't bypass DAC. The chown
+        # above leaves the dir owner=$user, group=root, mode 750, which is 0
+        # perms for the daemon. Restore group access by re-grouping to zlayer
+        # and granting g+rwX so the daemon can read/write its secrets store.
+        # macOS uses launchd + a different ownership model and has no `zlayer`
+        # group, so this block is gated on both `$OS = linux` and a real
+        # `getent group zlayer` to stay a no-op on macOS or pre-install Linux.
+        if [ "$OS" = "linux" ] && [ -d "${ZLAYER_DEV_DATA_DIR}/secrets" ] \
+            && getent group zlayer >/dev/null 2>&1; then
+            sudo chgrp -R zlayer "${ZLAYER_DEV_DATA_DIR}/secrets" 2>/dev/null || true
+            sudo chmod -R g+rwX "${ZLAYER_DEV_DATA_DIR}/secrets" 2>/dev/null || true
+        fi
         ;;
 esac
 maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0750 "${ZLAYER_DEV_DATA_DIR}/secrets"
