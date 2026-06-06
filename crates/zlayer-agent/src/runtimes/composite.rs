@@ -40,14 +40,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
-use zlayer_observability::logs::LogEntry;
+use zlayer_observability::logs::{LogEntry, LogStream};
 use zlayer_spec::{OsKind, PullPolicy, RegistryAuth, ServiceSpec};
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{
-    ContainerId, ContainerInspectDetails, ContainerState, ExecEventStream, ImageInfo, PruneResult,
-    Runtime, WaitCondition, WaitOutcome,
+    ContainerId, ContainerInspectDetails, ContainerState, ExecEventStream, ImageInfo, LogChannel,
+    LogChunk, LogsStream, LogsStreamOptions, PruneResult, Runtime, StatsSample, StatsStream,
+    WaitCondition, WaitOutcome,
 };
 
 /// Which underlying runtime a given container was dispatched to.
@@ -92,6 +93,25 @@ pub struct CompositeRuntime {
     /// `select_for` can auto-detect a VZ base bundle and prefer the VZ runtime
     /// for it without requiring a per-service label.
     image_runtime: Arc<RwLock<HashMap<String, String>>>,
+    /// Filesystem paths of the persistent blob caches that the runtimes pull
+    /// into, tried IN ORDER for image-OS / runtime-marker inspection. Typically:
+    ///
+    /// 1. the VZ-Linux runtime's `{data_dir}/vz/linux/images/blobs.redb` (the
+    ///    delegate that actually runs the Linux workload), and
+    /// 2. the primary Sandbox runtime's `{data_dir}/images/blobs.redb`.
+    ///
+    /// Both stores matter because `pull_image` pulls into BOTH (primary first,
+    /// then VZ-Linux), and either pull may short-circuit under
+    /// `PullPolicy::IfNotPresent` when its rootfs already exists — leaving the
+    /// manifest/config in only ONE of the two caches. Inspection therefore
+    /// probes them in order and stops at the first store that resolves the OS,
+    /// LOCAL-ONLY via [`zlayer_registry::fetch_image_os_in_cache_only`] — so an
+    /// already-pulled Linux image is detected as Linux (and routed to VZ-Linux)
+    /// with NO network call, even under a Docker Hub rate-limit. For the OS
+    /// dispatch path there is intentionally **no** network fallback: a local
+    /// miss yields "OS unknown" and dispatch uses its safe macOS default rather
+    /// than risking a 429 (see [`CompositeRuntime::inspect_image_os`]).
+    os_inspect_cache_paths: Vec<std::path::PathBuf>,
 }
 
 impl CompositeRuntime {
@@ -110,7 +130,137 @@ impl CompositeRuntime {
             dispatch: Arc::new(RwLock::new(HashMap::new())),
             image_os: Arc::new(RwLock::new(HashMap::new())),
             image_runtime: Arc::new(RwLock::new(HashMap::new())),
+            os_inspect_cache_paths: Vec::new(),
         }
+    }
+
+    /// Point image-OS / runtime-marker inspection at a single persistent blob
+    /// cache the runtimes pull into, so the OS of an already-pulled image
+    /// resolves from the LOCAL config blob with no network round-trip.
+    ///
+    /// Convenience wrapper over [`CompositeRuntime::with_os_inspect_cache_paths`]
+    /// for callers that only have one store. `path` is the on-disk blob-cache
+    /// file (e.g. the VZ-Linux runtime's `{data_dir}/vz/linux/images/blobs.redb`).
+    #[must_use]
+    pub fn with_os_inspect_cache_path(self, path: Option<std::path::PathBuf>) -> Self {
+        self.with_os_inspect_cache_paths(path.into_iter().collect())
+    }
+
+    /// Point image-OS / runtime-marker inspection at an ORDERED list of
+    /// persistent blob caches the runtimes pull into.
+    ///
+    /// Inspection probes each store LOCAL-ONLY (no network) in order and stops
+    /// at the first that resolves the image's OS / marker. This matters because
+    /// `pull_image` pulls into BOTH the VZ-Linux store and the primary Sandbox
+    /// store, and either pull may short-circuit under `PullPolicy::IfNotPresent`
+    /// when its rootfs already exists — leaving the manifest/config in only ONE
+    /// of the two caches. Probing both (VZ-Linux first, then primary) is what
+    /// lets a locally-cached Linux image route to VZ-Linux under a Docker Hub
+    /// rate-limit (see [`zlayer_registry::fetch_image_os_in_cache_only`]).
+    #[must_use]
+    pub fn with_os_inspect_cache_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.os_inspect_cache_paths = paths;
+        self
+    }
+
+    /// Resolve `image`'s OS for **dispatch**, probing each configured local blob
+    /// cache in order, **LOCAL-ONLY — never a network call**.
+    ///
+    /// This is the dispatch-population path: it runs inside `pull_image*` purely
+    /// to fill the image-OS cache that [`CompositeRuntime::select_for`] consults.
+    /// It MUST NOT touch the wire. The image's layers have already been pulled
+    /// and extracted by the time we get here, and the runtimes that did the pull
+    /// (VZ-Linux / Sandbox) wrote the manifest+config into the very blob caches
+    /// `os_inspect_cache_paths` points at — so the OS is knowable with zero
+    /// network round-trips.
+    ///
+    /// The old code fell back to a network inspection (`fetch_image_os`) when no
+    /// local cache resolved the OS. That network call was reachable on a Docker
+    /// Hub 429, and a failed inspection left the cache empty → a cached Linux
+    /// image (e.g. `alpine`) fell through to the Seatbelt sandbox (`Primary`),
+    /// which cannot exec a Linux ELF (exit 127). The network fallback is gone:
+    /// a registry rate-limit can no longer break dispatch here. A genuine local
+    /// miss simply returns `Ok(None)` (dispatch then uses its safe macOS
+    /// fallthrough), and it never errors or blocks.
+    async fn inspect_image_os(
+        &self,
+        image: &str,
+    ) -> std::result::Result<Option<OsKind>, zlayer_registry::RegistryError> {
+        for path in &self.os_inspect_cache_paths {
+            match zlayer_registry::CacheType::persistent_at(path)
+                .build()
+                .await
+            {
+                Ok(cache) => {
+                    match zlayer_registry::fetch_image_os_in_cache_only(image, cache, None).await {
+                        Ok(Some(os)) => return Ok(Some(os)),
+                        Ok(None) => {
+                            tracing::trace!(
+                                image,
+                                cache = %path.display(),
+                                "image OS not resolvable from this local cache; trying next",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        image,
+                        cache = %path.display(),
+                        error = %e,
+                        "failed to open OS-inspect blob cache; trying next",
+                    );
+                }
+            }
+        }
+        // No local cache resolved it. We deliberately do NOT fall back to a
+        // network inspection: a Docker Hub 429 must never reach this
+        // dispatch-population path (see the doc comment above). A clean local
+        // miss is `Ok(None)` — dispatch falls through to its safe macOS default.
+        Ok(None)
+    }
+
+    /// Resolve `image`'s `com.zlayer.runtime` marker, probing each configured
+    /// local blob cache in order (no network per cache) before any network call.
+    async fn inspect_image_runtime_marker(
+        &self,
+        image: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> std::result::Result<Option<String>, zlayer_registry::RegistryError> {
+        for path in &self.os_inspect_cache_paths {
+            match zlayer_registry::CacheType::persistent_at(path)
+                .build()
+                .await
+            {
+                Ok(cache) => {
+                    match zlayer_registry::fetch_image_runtime_marker_in_cache_only(
+                        image, cache, None,
+                    )
+                    .await
+                    {
+                        Ok(Some(marker)) => return Ok(Some(marker)),
+                        Ok(None) => {
+                            tracing::trace!(
+                                image,
+                                cache = %path.display(),
+                                "runtime marker not resolvable from this local cache; trying next",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        image,
+                        cache = %path.display(),
+                        error = %e,
+                        "failed to open marker-inspect blob cache; trying next",
+                    );
+                }
+            }
+        }
+        zlayer_registry::fetch_image_runtime_marker(image, auth).await
     }
 
     /// Attach an opt-in Apple-Virtualization delegate. Services labelled
@@ -242,6 +392,19 @@ impl CompositeRuntime {
     /// `spec.platform` was explicitly set, but fell through to primary for
     /// specs without a platform — producing cryptic downstream errors when the
     /// image-OS cache said `Linux`. We now return `RouteToPeer` in both cases.
+    ///
+    /// Routing precedence, locally-known OS only (NO network call ever happens
+    /// here — the image-OS cache is filled local-only at pull time):
+    /// 1. explicit `com.zlayer.isolation` label,
+    /// 2. `com.zlayer.runtime` manifest marker (`vz` / `vz-linux`),
+    /// 3. `spec.platform.os`,
+    /// 4. the image-OS cache: `Linux` -> `VzLinux` (when present), `Macos` /
+    ///    `Windows` -> `Primary`,
+    /// 5. FINAL fallthrough — OS genuinely unknown: on a macOS host (proxied by
+    ///    the presence of a `vz_linux` delegate) default to `VzLinux`, because
+    ///    almost every registry image is Linux and the Seatbelt sandbox cannot
+    ///    exec a Linux ELF. A macOS-native rootfs never reaches this branch: it
+    ///    resolves `os == Macos` at step 4 and routes to `Primary`.
     async fn select_for(&self, service: &str, spec: &ServiceSpec) -> Result<DispatchTarget> {
         // Explicit per-service isolation label wins over everything below.
         //   `com.zlayer.isolation=vz`               -> VZ (native-macOS guest VM)
@@ -354,6 +517,24 @@ impl CompositeRuntime {
             };
         }
 
+        // OS genuinely unknown (no isolation label, no runtime marker, no
+        // `spec.platform`, no image-OS cache hit). On a macOS host with a
+        // VZ-Linux delegate, default to VZ-Linux: the overwhelming majority of
+        // images pulled from public registries are Linux, and the Seatbelt
+        // sandbox (the primary) cannot exec a Linux ELF — sending an unknown
+        // image there is the exit-127 failure this fix exists to prevent. The
+        // user is fine with VZ-Linux as the default; the only hard rule is that
+        // a macOS-native rootfs must never go to the Linux VM, and that is
+        // already guaranteed above by the `image_os == Macos -> Primary` branch
+        // (a native bundle resolves its OS locally and never reaches here).
+        //
+        // The `vz_linux` delegate is only ever attached on a macOS host, so its
+        // presence is a sufficient proxy for "macOS host" — non-macOS hosts
+        // (Windows HCS, Linux) keep the historical primary fallthrough.
+        if self.vz_linux.is_some() {
+            return Ok(DispatchTarget::VzLinux);
+        }
+
         Ok(DispatchTarget::Primary)
     }
 
@@ -393,6 +574,178 @@ impl CompositeRuntime {
             DispatchTarget::VzLinux => self.vz_linux.as_ref().unwrap_or(&self.primary),
         }
     }
+
+    /// Build the ordered list of backends to try for a per-container read
+    /// (logs / stats), owning backend first.
+    ///
+    /// The container's dispatch record (recorded at `create_container`) names
+    /// the runtime that actually ran it, so we try that one first. The other
+    /// configured backends follow as a defensive fallback for the case where
+    /// the owning backend can answer container lifecycle calls but not a
+    /// particular read (e.g. the macOS `SandboxRuntime` primary implements
+    /// `container_logs`/`get_container_stats` but not the *streaming*
+    /// `logs_stream`/`stats_stream`, so it returns `Unsupported` for the
+    /// latter). Returns `NotFound` when the id was never dispatched.
+    async fn read_backends(
+        &self,
+        id: &ContainerId,
+    ) -> Result<Vec<(&'static str, Arc<dyn Runtime>)>> {
+        let owner =
+            self.dispatch
+                .read()
+                .await
+                .get(id)
+                .copied()
+                .ok_or_else(|| AgentError::NotFound {
+                    container: id.to_string(),
+                    reason: "no dispatch record in CompositeRuntime".to_string(),
+                })?;
+
+        // Owning backend first, then every other configured backend (de-duped
+        // against the owner) so a read the owner can't serve can still be
+        // satisfied elsewhere instead of 500-ing.
+        let all: [(DispatchTarget, Option<&Arc<dyn Runtime>>); 4] = [
+            (DispatchTarget::Primary, Some(&self.primary)),
+            (DispatchTarget::Delegate, self.delegate.as_ref()),
+            (DispatchTarget::Vz, self.vz.as_ref()),
+            (DispatchTarget::VzLinux, self.vz_linux.as_ref()),
+        ];
+
+        let label_for = |t: DispatchTarget| match t {
+            DispatchTarget::Primary => "primary",
+            DispatchTarget::Delegate => "delegate",
+            DispatchTarget::Vz => "vz",
+            DispatchTarget::VzLinux => "vz_linux",
+        };
+
+        let mut out: Vec<(&'static str, Arc<dyn Runtime>)> =
+            vec![(label_for(owner), self.runtime_for(owner).clone())];
+        for (target, rt) in all {
+            if target != owner {
+                if let Some(rt) = rt {
+                    out.push((label_for(target), rt.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Accumulates per-backend errors while a read fans out across the
+/// owner-first fallback chain, so the *final* error reflects the right HTTP
+/// status.
+///
+/// Every backend in the chain is tried; a backend that does not own the
+/// container returns [`AgentError::NotFound`] (a *skip*, not authoritative),
+/// while a backend that owns it but cannot serve this particular read returns
+/// some other error (notably the `Unsupported` default for an unimplemented
+/// streaming read) — a *soft miss* we fall back from. The distinction matters
+/// for the final error: if **every** backend returned `NotFound`, the container
+/// genuinely does not exist here and we surface `NotFound` (→ 404); if any
+/// backend produced a non-`NotFound` error, that is the more informative
+/// failure to report (→ 500) once no backend could serve the read.
+#[derive(Default)]
+struct ReadMissAccumulator {
+    /// The most recent non-`NotFound` error, if any backend produced one.
+    soft_err: Option<AgentError>,
+    /// The most recent `NotFound`, used only when *no* soft error occurred.
+    not_found: Option<AgentError>,
+}
+
+impl ReadMissAccumulator {
+    fn record(&mut self, e: AgentError) {
+        if matches!(e, AgentError::NotFound { .. }) {
+            self.not_found = Some(e);
+        } else {
+            self.soft_err = Some(e);
+        }
+    }
+
+    /// Resolve the accumulated misses into the final error for a read where no
+    /// backend succeeded. Prefers a soft error (more informative → 500) over a
+    /// bare `NotFound`; falls back to a synthesised `Unsupported` only if
+    /// nothing was recorded at all (an empty backend list, which cannot happen
+    /// in practice since the owner is always present).
+    fn into_error(self, what: &str) -> AgentError {
+        self.soft_err
+            .or(self.not_found)
+            .unwrap_or_else(|| AgentError::Unsupported(format!("no backend could serve {what}")))
+    }
+}
+
+/// Build a bounded one-shot [`LogsStream`] from a captured-log snapshot.
+///
+/// Used by [`CompositeRuntime::logs_stream`] when no backend offers a native
+/// log stream but one can produce a `container_logs` snapshot (e.g. the macOS
+/// `SandboxRuntime`). Mirrors the VZ-Linux runtime's own snapshot-to-stream
+/// translation so the wire shape is identical regardless of which backend
+/// served the data: honour the per-channel filters and re-attach the newline
+/// the line-splitter stripped.
+fn one_shot_logs_stream(entries: Vec<LogEntry>, opts: &LogsStreamOptions) -> LogsStream {
+    use futures_util::stream;
+
+    // Docker's default (neither stdout nor stderr explicitly requested) means
+    // "both"; equivalently, keep stdout unless stderr was the *only* channel
+    // requested, and vice-versa.
+    let want_stdout = opts.stdout || !opts.stderr;
+    let want_stderr = opts.stderr || !opts.stdout;
+    let timestamps = opts.timestamps;
+
+    let chunks: Vec<Result<LogChunk>> = entries
+        .into_iter()
+        .filter_map(|e| {
+            let channel = match e.stream {
+                LogStream::Stdout => LogChannel::Stdout,
+                LogStream::Stderr => LogChannel::Stderr,
+            };
+            let keep = match channel {
+                LogChannel::Stdout => want_stdout,
+                LogChannel::Stderr => want_stderr,
+                LogChannel::Stdin => false,
+            };
+            if !keep {
+                return None;
+            }
+            let mut bytes = e.message.into_bytes();
+            bytes.push(b'\n');
+            Some(Ok(LogChunk {
+                stream: channel,
+                bytes: bytes::Bytes::from(bytes),
+                timestamp: timestamps.then_some(e.timestamp),
+            }))
+        })
+        .collect();
+
+    Box::pin(stream::iter(chunks))
+}
+
+/// Build a bounded one-shot [`StatsStream`] from a single [`ContainerStats`]
+/// snapshot.
+///
+/// Used by [`CompositeRuntime::stats_stream`] when no backend offers a native
+/// stats stream but one can produce a `get_container_stats` snapshot. The
+/// [`ContainerStats`] CPU figure is microseconds; [`StatsSample::cpu_total_ns`]
+/// is nanoseconds, so we scale. `online_cpus` is unknown from this coarse
+/// snapshot (the non-streaming API does not carry it) and is reported as `1`
+/// so the Docker-compat CPU-percent math has a sane divisor.
+fn one_shot_stats_stream(stats: &ContainerStats) -> StatsStream {
+    use futures_util::stream;
+
+    let sample = StatsSample {
+        cpu_total_ns: stats.cpu_usage_usec.saturating_mul(1_000),
+        cpu_system_ns: 0,
+        online_cpus: 1,
+        mem_used_bytes: stats.memory_bytes,
+        mem_limit_bytes: stats.memory_limit,
+        net_rx_bytes: 0,
+        net_tx_bytes: 0,
+        blkio_read_bytes: 0,
+        blkio_write_bytes: 0,
+        pids_current: 0,
+        pids_limit: None,
+        timestamp: chrono::Utc::now(),
+    };
+    Box::pin(stream::iter(vec![Ok(sample)]))
 }
 
 #[async_trait]
@@ -428,13 +781,36 @@ impl Runtime for CompositeRuntime {
                 );
             }
         }
+        // VZ + VZ-Linux delegates (macOS). The VZ-Linux runtime is the default
+        // execution path for Linux images on macOS and owns its OWN image store
+        // (`image_rootfs`); if we never pull into it, the image is absent both
+        // when `create_container` dispatches there AND from `list_images` /
+        // `inspect_image` (which is what `docker pull` verifies). Pulling here
+        // makes the image actually present where it runs and listable. Errors
+        // are non-fatal for the same wrong-OS reason as the delegate above.
+        for (label, rt) in [
+            self.vz.as_ref().map(|r| ("vz", r)),
+            self.vz_linux.as_ref().map(|r| ("vz_linux", r)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(e) = rt.pull_image(image).await {
+                tracing::debug!(
+                    image,
+                    runtime = label,
+                    error = %e,
+                    "vz delegate failed to pull image (likely wrong OS); continuing",
+                );
+            }
+        }
 
         // Inspect the OCI manifest's `config.os` so `select_for(spec)` can
         // dispatch correctly when `spec.platform` is `None`. Non-fatal: any
         // failure here just means dispatch falls through to primary.
-        let os_result = zlayer_registry::fetch_image_os(image, None).await;
+        let os_result = self.inspect_image_os(image).await;
         self.apply_image_os_inspection(image, os_result).await;
-        let marker_result = zlayer_registry::fetch_image_runtime_marker(image, None).await;
+        let marker_result = self.inspect_image_runtime_marker(image, None).await;
         self.apply_image_runtime_inspection(image, marker_result)
             .await;
 
@@ -472,10 +848,29 @@ impl Runtime for CompositeRuntime {
                 );
             }
         }
+        // See `pull_image` above: the VZ-Linux runtime owns its own image store
+        // and is the default Linux execution path on macOS, so pull into it (and
+        // the opt-in VZ delegate) too. Non-fatal per-backend errors.
+        for (label, rt) in [
+            self.vz.as_ref().map(|r| ("vz", r)),
+            self.vz_linux.as_ref().map(|r| ("vz_linux", r)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(e) = rt.pull_image_with_policy(image, policy, auth).await {
+                tracing::debug!(
+                    image,
+                    runtime = label,
+                    error = %e,
+                    "vz delegate failed to pull image (likely wrong OS); continuing",
+                );
+            }
+        }
 
-        let os_result = zlayer_registry::fetch_image_os(image, auth).await;
+        let os_result = self.inspect_image_os(image).await;
         self.apply_image_os_inspection(image, os_result).await;
-        let marker_result = zlayer_registry::fetch_image_runtime_marker(image, auth).await;
+        let marker_result = self.inspect_image_runtime_marker(image, auth).await;
         self.apply_image_runtime_inspection(image, marker_result)
             .await;
 
@@ -523,8 +918,23 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
-        let rt = self.lookup(id).await?;
-        rt.container_logs(id, tail).await
+        let backends = self.read_backends(id).await?;
+        let mut misses = ReadMissAccumulator::default();
+        for (label, rt) in backends {
+            match rt.container_logs(id, tail).await {
+                Ok(logs) => return Ok(logs),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite container_logs: backend could not serve logs; trying next backend",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+        Err(misses.into_error("container_logs"))
     }
 
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
@@ -538,8 +948,24 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
-        let rt = self.lookup(id).await?;
-        rt.get_container_stats(id).await
+        let backends = self.read_backends(id).await?;
+        let mut misses = ReadMissAccumulator::default();
+        for (label, rt) in backends {
+            match rt.get_container_stats(id).await {
+                Ok(stats) => return Ok(stats),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite get_container_stats: backend could not serve stats; \
+                         trying next backend",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+        Err(misses.into_error("get_container_stats"))
     }
 
     async fn wait_container(&self, id: &ContainerId) -> Result<i32> {
@@ -567,8 +993,117 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
-        let rt = self.lookup(id).await?;
-        rt.get_logs(id).await
+        let backends = self.read_backends(id).await?;
+        let mut misses = ReadMissAccumulator::default();
+        for (label, rt) in backends {
+            match rt.get_logs(id).await {
+                Ok(logs) => return Ok(logs),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite get_logs: backend could not serve logs; trying next backend",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+        Err(misses.into_error("get_logs"))
+    }
+
+    async fn logs_stream(&self, id: &ContainerId, opts: LogsStreamOptions) -> Result<LogsStream> {
+        // Route to the backend that actually created the container. The default
+        // trait impl returns `Unsupported`, which surfaced as a swallowed 500 on
+        // `GET /containers/{id}/logs` whenever the owning backend did not
+        // implement streaming (e.g. the macOS `SandboxRuntime` primary, which
+        // implements `container_logs` but not `logs_stream`).
+        //
+        // Try each backend's `logs_stream` (owner first); on a soft miss
+        // (`Unsupported`/error that is not `NotFound`) fall back to the same
+        // backend's non-streaming `container_logs` and SYNTHESISE a one-shot
+        // stream from it. Only a genuine `NotFound` propagates (→ 404).
+        let backends = self.read_backends(id).await?;
+        let mut misses = ReadMissAccumulator::default();
+        for (label, rt) in &backends {
+            match rt.logs_stream(id, opts.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite logs_stream: backend has no native log stream; \
+                         falling back to a one-shot snapshot",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+
+        // No backend offered a native stream. Synthesise one from whichever
+        // backend can produce a captured-log snapshot (`container_logs`).
+        let tail = opts
+            .tail
+            .map_or(1000, |n| usize::try_from(n).unwrap_or(1000));
+        for (label, rt) in &backends {
+            match rt.container_logs(id, tail).await {
+                Ok(entries) => {
+                    return Ok(one_shot_logs_stream(entries, &opts));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite logs_stream: backend snapshot fallback failed; trying next",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+        Err(misses.into_error("container logs"))
+    }
+
+    async fn stats_stream(&self, id: &ContainerId) -> Result<StatsStream> {
+        // Same rationale as `logs_stream`: forward to the owning backend so
+        // `GET /containers/{id}/stats` reaches the runtime that ran the
+        // container instead of hitting the `Unsupported` default (→ swallowed
+        // 500). On a soft miss, fall back to the non-streaming
+        // `get_container_stats` and synthesise a one-shot sample.
+        let backends = self.read_backends(id).await?;
+        let mut misses = ReadMissAccumulator::default();
+        for (label, rt) in &backends {
+            match rt.stats_stream(id).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite stats_stream: backend has no native stats stream; \
+                         falling back to a one-shot sample",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+
+        for (label, rt) in &backends {
+            match rt.get_container_stats(id).await {
+                Ok(stats) => return Ok(one_shot_stats_stream(&stats)),
+                Err(e) => {
+                    tracing::warn!(
+                        container = %id,
+                        runtime = label,
+                        error = %e,
+                        "composite stats_stream: backend sample fallback failed; trying next",
+                    );
+                    misses.record(e);
+                }
+            }
+        }
+        Err(misses.into_error("container stats"))
     }
 
     async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
@@ -601,17 +1136,62 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
-        let mut out = self.primary.list_images().await?;
-        if let Some(delegate) = &self.delegate {
-            match delegate.list_images().await {
-                Ok(extra) => out.extend(extra),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "delegate runtime list_images failed; returning primary results only",
-                ),
+        // Fan out over every configured runtime and merge their image lists.
+        // Crucially, a *single* backend's failure must not fail the whole
+        // call: on macOS the `primary` (SandboxRuntime) does not implement
+        // `list_images` at all (it returns `Unsupported`), yet pulled Linux
+        // images live in the `vz_linux` delegate's store. Propagating the
+        // primary's error via `?` here used to surface as a 500 on
+        // `GET /images/json` (and, via the inspect fallback, broke every
+        // `docker pull` verification). Tolerate per-backend errors the same
+        // way we already tolerate the delegate's, and include the VZ +
+        // VZ-Linux delegates so their images are actually listable.
+        let mut out: Vec<ImageInfo> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut any_ok = false;
+        let mut last_err: Option<AgentError> = None;
+
+        for (label, rt) in [
+            Some(("primary", &self.primary)),
+            self.delegate.as_ref().map(|d| ("delegate", d)),
+            self.vz.as_ref().map(|d| ("vz", d)),
+            self.vz_linux.as_ref().map(|d| ("vz_linux", d)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match rt.list_images().await {
+                Ok(images) => {
+                    any_ok = true;
+                    for img in images {
+                        // De-dup by reference so an image registered in more
+                        // than one backend isn't reported twice.
+                        if seen.insert(img.reference.clone()) {
+                            out.push(img);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        runtime = label,
+                        error = %e,
+                        "composite list_images: backend returned an error; skipping it",
+                    );
+                    last_err = Some(e);
+                }
             }
         }
-        Ok(out)
+
+        // Only fail if *every* backend errored. With at least one success we
+        // return the merged (possibly empty) list — an empty image set is a
+        // valid response, not an error.
+        if any_ok {
+            Ok(out)
+        } else {
+            Err(last_err.unwrap_or_else(|| {
+                AgentError::Unsupported("no runtime implements list_images".into())
+            }))
+        }
     }
 
     async fn remove_image(&self, image: &str, force: bool) -> Result<()> {
@@ -722,12 +1302,37 @@ mod tests {
         role: Role,
         calls: CallLog,
         list_images_response: Vec<ImageInfo>,
+        /// When set, `list_images` returns `AgentError::Unsupported(msg)`
+        /// instead of `list_images_response`. Models a backend (e.g. the macOS
+        /// `SandboxRuntime` primary) that does not implement image listing.
+        list_images_error: Option<String>,
         pull_image_error: Option<String>,
         /// When set, both `pull_image` and `pull_image_with_policy` return a
         /// freshly-built [`AgentError::WrongPlatform`] using these fields
         /// (`expected`, `actual`). Takes precedence over `pull_image_error`
         /// so tests can simulate a wrong-platform soft skip end-to-end.
         pull_image_wrong_platform: Option<(&'static str, &'static str)>,
+        /// When `true`, the *streaming* reads (`logs_stream` / `stats_stream`)
+        /// return `AgentError::Unsupported`, modelling a backend (e.g. the macOS
+        /// `SandboxRuntime` primary) that implements the snapshot reads
+        /// (`container_logs` / `get_container_stats`) but not the streaming
+        /// ones — exactly the case that used to surface as a swallowed 500.
+        stream_unsupported: bool,
+        /// When `true`, *every* per-container read (`container_logs`,
+        /// `get_logs`, `get_container_stats`, `logs_stream`, `stats_stream`)
+        /// returns `AgentError::NotFound`, modelling a backend that does not own
+        /// the container at all. The composite must NOT mask this as success,
+        /// and a genuine all-not-found must propagate as `NotFound` (404).
+        reads_not_found: bool,
+        /// Captured-log snapshot returned by `container_logs` / `get_logs`
+        /// (unless `reads_not_found`). Lets a delegate model real workload
+        /// output the composite's snapshot fallback should surface.
+        logs_response: Vec<LogEntry>,
+        /// When `true`, the snapshot `get_container_stats` returns
+        /// `AgentError::Unsupported` (a soft miss), modelling a backend that
+        /// owns the container but cannot report stats at all. Forces the
+        /// composite to fall back to another backend.
+        stats_snapshot_unsupported: bool,
     }
 
     impl MockRuntime {
@@ -736,9 +1341,38 @@ mod tests {
                 role,
                 calls,
                 list_images_response: Vec::new(),
+                list_images_error: None,
                 pull_image_error: None,
                 pull_image_wrong_platform: None,
+                stream_unsupported: false,
+                reads_not_found: false,
+                logs_response: Vec::new(),
+                stats_snapshot_unsupported: false,
             }
+        }
+
+        /// Streaming reads return `Unsupported`; snapshot reads still work.
+        fn with_stream_unsupported(mut self) -> Self {
+            self.stream_unsupported = true;
+            self
+        }
+
+        /// Every per-container read returns `NotFound`.
+        fn with_reads_not_found(mut self) -> Self {
+            self.reads_not_found = true;
+            self
+        }
+
+        /// Set the captured-log snapshot returned by the snapshot reads.
+        fn with_logs(mut self, logs: Vec<LogEntry>) -> Self {
+            self.logs_response = logs;
+            self
+        }
+
+        /// Snapshot `get_container_stats` returns `Unsupported` (a soft miss).
+        fn with_stats_snapshot_unsupported(mut self) -> Self {
+            self.stats_snapshot_unsupported = true;
+            self
         }
 
         fn build_wrong_platform_error(&self, image: &str) -> Option<AgentError> {
@@ -820,7 +1454,10 @@ mod tests {
 
         async fn container_logs(&self, id: &ContainerId, _tail: usize) -> Result<Vec<LogEntry>> {
             self.record("container_logs", Some(id));
-            Ok(Vec::new())
+            if self.reads_not_found {
+                return Err(mock_not_found());
+            }
+            Ok(self.logs_response.clone())
         }
 
         async fn exec(&self, id: &ContainerId, _cmd: &[String]) -> Result<(i32, String, String)> {
@@ -830,10 +1467,16 @@ mod tests {
 
         async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
             self.record("get_container_stats", Some(id));
+            if self.reads_not_found {
+                return Err(mock_not_found());
+            }
+            if self.stats_snapshot_unsupported {
+                return Err(AgentError::Unsupported("mock has no snapshot stats".into()));
+            }
             Ok(ContainerStats {
-                cpu_usage_usec: 0,
-                memory_bytes: 0,
-                memory_limit: 0,
+                cpu_usage_usec: 1_000,
+                memory_bytes: 4096,
+                memory_limit: 8192,
                 timestamp: std::time::Instant::now(),
             })
         }
@@ -845,7 +1488,54 @@ mod tests {
 
         async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
             self.record("get_logs", Some(id));
-            Ok(Vec::new())
+            if self.reads_not_found {
+                return Err(mock_not_found());
+            }
+            Ok(self.logs_response.clone())
+        }
+
+        async fn logs_stream(
+            &self,
+            id: &ContainerId,
+            _opts: LogsStreamOptions,
+        ) -> Result<LogsStream> {
+            self.record("logs_stream", Some(id));
+            if self.reads_not_found {
+                return Err(mock_not_found());
+            }
+            if self.stream_unsupported {
+                return Err(AgentError::Unsupported("mock has no log stream".into()));
+            }
+            // A backend that owns a native stream replays its captured logs.
+            Ok(one_shot_logs_stream(
+                self.logs_response.clone(),
+                &LogsStreamOptions::default(),
+            ))
+        }
+
+        async fn stats_stream(&self, id: &ContainerId) -> Result<StatsStream> {
+            use futures_util::stream;
+            self.record("stats_stream", Some(id));
+            if self.reads_not_found {
+                return Err(mock_not_found());
+            }
+            if self.stream_unsupported {
+                return Err(AgentError::Unsupported("mock has no stats stream".into()));
+            }
+            Ok(Box::pin(stream::iter(vec![Ok(StatsSample {
+                cpu_total_ns: 0,
+                cpu_system_ns: 0,
+                online_cpus: 1,
+                mem_used_bytes: 4096,
+                mem_limit_bytes: 8192,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
+                blkio_read_bytes: 0,
+                blkio_write_bytes: 0,
+                pids_current: 0,
+                pids_limit: None,
+                timestamp: chrono::Utc::now(),
+            })])))
         }
 
         async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
@@ -860,6 +1550,9 @@ mod tests {
 
         async fn list_images(&self) -> Result<Vec<ImageInfo>> {
             self.record("list_images", None);
+            if let Some(msg) = &self.list_images_error {
+                return Err(AgentError::Unsupported(msg.clone()));
+            }
             Ok(self.list_images_response.clone())
         }
     }
@@ -915,6 +1608,14 @@ services:
             .iter()
             .find(|(_, m, _)| m == method)
             .map(|(role, _, _)| *role)
+    }
+
+    /// The `NotFound` a `MockRuntime` returns when it does not own a container.
+    fn mock_not_found() -> AgentError {
+        AgentError::NotFound {
+            container: "mock".to_string(),
+            reason: "mock backend does not own this container".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1244,6 +1945,315 @@ services:
     }
 
     #[tokio::test]
+    async fn dispatch_macos_image_os_with_vz_linux_routes_to_primary() {
+        // A macOS-native rootfs must NEVER go to the Linux VM. Even with a
+        // VZ-Linux delegate present (the default Linux path), an image whose
+        // locally-known OS is macOS routes to the primary (Seatbelt sandbox).
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("mac-svc", 0);
+        let image = "ghcr.io/zlayer/macos-native:latest";
+        rt.record_image_os(image, OsKind::Macos).await;
+
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Primary),
+            "image_os == Macos must route to primary even when VZ-Linux is the default",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_os_with_vz_linux_defaults_to_vz_linux() {
+        // OS genuinely unknown (no isolation label, no runtime marker, no
+        // platform, no image-OS cache hit) on a macOS host with a VZ-Linux
+        // delegate: default to VZ-Linux. Sending an unknown (overwhelmingly
+        // Linux) image to the Seatbelt sandbox is the exit-127 failure this fix
+        // exists to prevent.
+        let (rt, calls) = make_composite_with_vz_linux();
+        let id = cid("svc", 0);
+        let spec = make_spec("docker.io/library/whatever:latest", None);
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "an unknown-OS image must default to VZ-Linux when the delegate is present",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_os_without_vz_linux_falls_through_to_primary() {
+        // The unknown-OS default to VZ-Linux is keyed on the delegate's
+        // presence (a proxy for "macOS host"). Without a VZ-Linux delegate the
+        // historical primary fallthrough is preserved for non-macOS hosts.
+        let (rt, calls) = make_composite(true);
+        let id = cid("svc", 0);
+        let spec = make_spec("docker.io/library/whatever:latest", None);
+
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Primary),
+            "without a VZ-Linux delegate an unknown-OS image keeps the primary fallthrough",
+        );
+    }
+
+    /// Seed a persistent blob cache at `path` with a manifest + config blob for
+    /// `image` whose config declares `os = linux`, mirroring what a real
+    /// VZ-Linux pull writes to `{data_dir}/vz/linux/images/blobs.redb`.
+    async fn seed_persistent_linux_cache(path: &std::path::Path, image: &str) {
+        seed_persistent_cache_with_os(path, image, "linux").await;
+    }
+
+    /// Like [`seed_persistent_linux_cache`] but lets the test pick the config
+    /// `os` value (e.g. `"darwin"` for a macOS-native bundle).
+    async fn seed_persistent_cache_with_os(path: &std::path::Path, image: &str, os: &str) {
+        let cache = zlayer_registry::CacheType::persistent_at(path)
+            .build()
+            .await
+            .expect("open persistent blob cache");
+
+        let config_json = serde_json::json!({
+            "architecture": "arm64",
+            "os": os,
+            "config": {},
+        });
+        let config_bytes = serde_json::to_vec(&config_json).unwrap();
+        let config_digest = zlayer_registry::compute_digest(&config_bytes);
+        cache.put(&config_digest, &config_bytes).await.unwrap();
+
+        let manifest = zlayer_registry::OciImageManifest {
+            schema_version: 2,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            artifact_type: None,
+            config: oci_client::manifest::OciDescriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: config_digest.clone(),
+                size: i64::try_from(config_bytes.len()).unwrap(),
+                urls: None,
+                annotations: None,
+            },
+            layers: vec![],
+            annotations: None,
+            subject: None,
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = zlayer_registry::compute_digest(&manifest_bytes);
+        cache
+            .put(&zlayer_registry::manifest_cache_key(image), &manifest_bytes)
+            .await
+            .unwrap();
+        cache
+            .put(
+                &zlayer_registry::manifest_digest_cache_key(image),
+                manifest_digest.as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// End-to-end of the macOS rate-limit routing fix: a Linux image whose OS
+    /// lives ONLY in the local persistent blob cache (no network) must be
+    /// inspected at `pull_image` time and then routed to the VZ-Linux runtime
+    /// by `select_for` — exactly the path that breaks under a Docker Hub 429
+    /// when inspection goes to the wire.
+    #[tokio::test]
+    async fn pull_then_dispatch_resolves_linux_os_from_local_cache_routes_to_vz_linux() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("blobs.redb");
+        let image = "docker.io/library/alpine:latest";
+        seed_persistent_linux_cache(&cache_path, image).await;
+
+        let (rt, calls) = make_composite_with_vz_linux();
+        let rt = rt.with_os_inspect_cache_path(Some(cache_path));
+
+        // pull_image drives the real local-first OS inspection; no network.
+        rt.pull_image(image).await.unwrap();
+
+        // The OS must now be cached as Linux purely from the local store.
+        assert_eq!(
+            rt.image_os.read().await.get(image).copied(),
+            Some(OsKind::Linux),
+            "pull_image must resolve Linux OS from the local persistent cache",
+        );
+
+        // And select_for must route the (platform-less) spec to VZ-Linux.
+        let id = cid("lin-svc", 0);
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "a Linux image whose OS came from the local cache must route to VZ-Linux",
+        );
+    }
+
+    /// LIVE BUG #1, end-to-end: the cache is seeded under the QUALIFIED ref
+    /// (`docker.io/library/alpine:latest`, as the pull writes it) but the spec —
+    /// and therefore every `pull_image` / `inspect_image_os` / `select_for`
+    /// lookup — uses the BARE `alpine:latest`. With the canonical manifest-key
+    /// normalization, the bare-ref inspect hits the qualified-seeded cache with
+    /// NO network call, so the Linux image still routes to VZ-Linux.
+    #[tokio::test]
+    async fn bare_ref_spec_resolves_os_from_qualified_seeded_cache_routes_to_vz_linux() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("blobs.redb");
+        // Seed under the QUALIFIED ref, exactly as a real pull persists it.
+        seed_persistent_linux_cache(&cache_path, "docker.io/library/alpine:latest").await;
+
+        let (rt, calls) = make_composite_with_vz_linux();
+        let rt = rt.with_os_inspect_cache_paths(vec![cache_path]);
+
+        // Everything below uses the BARE ref, exactly as the live daemon does
+        // (`ImageRef::Display` yields the user-original string).
+        let bare = "alpine:latest";
+        rt.pull_image(bare).await.unwrap();
+
+        assert_eq!(
+            rt.image_os.read().await.get(bare).copied(),
+            Some(OsKind::Linux),
+            "bare-ref inspect must resolve Linux from the qualified-seeded cache",
+        );
+
+        let id = cid("lin-svc", 0);
+        let spec = make_spec(bare, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "bare-ref Linux image routes to VZ-Linux via the canonical-key cache hit",
+        );
+    }
+
+    /// LIVE BUG #2 / multi-cache fallback: the manifest+config live ONLY in the
+    /// SECOND configured cache (the primary Sandbox store), because the
+    /// VZ-Linux pull short-circuited under `IfNotPresent`. Inspection must probe
+    /// the empty first cache (no network), then resolve from the second — still
+    /// with NO network — and route to VZ-Linux.
+    #[tokio::test]
+    async fn os_resolves_from_second_cache_when_first_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_cache = tmp.path().join("vz-linux-blobs.redb");
+        let primary_cache = tmp.path().join("primary-blobs.redb");
+        // Create the first cache empty (so opening it succeeds but it misses).
+        zlayer_registry::CacheType::persistent_at(&empty_cache)
+            .build()
+            .await
+            .unwrap();
+        // Only the SECOND cache has the image.
+        seed_persistent_linux_cache(&primary_cache, "docker.io/library/alpine:latest").await;
+
+        let (rt, calls) = make_composite_with_vz_linux();
+        let rt = rt.with_os_inspect_cache_paths(vec![empty_cache, primary_cache]);
+
+        let bare = "alpine:latest";
+        rt.pull_image(bare).await.unwrap();
+
+        assert_eq!(
+            rt.image_os.read().await.get(bare).copied(),
+            Some(OsKind::Linux),
+            "OS must resolve from the second cache after the first misses (no network)",
+        );
+
+        let id = cid("lin-svc", 0);
+        let spec = make_spec(bare, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(role_for(&calls, "create_container"), Some(Role::VzLinux),);
+    }
+
+    /// The exact LIVE bug, simulated end-to-end: a `pull_image` whose network OS
+    /// re-inspection WOULD 429 still leaves dispatch fully working, because the
+    /// image's OS is resolved purely from the local persistent blob cache the
+    /// runtime already populated during extract — with NO network call at all.
+    ///
+    /// We model the 429 by pointing `os_inspect_cache_paths` at a real seeded
+    /// cache (so the local resolver succeeds) while using a synthetic
+    /// `*.invalid` registry host: if the dispatch-population path ever reached
+    /// the network it would fail to resolve, leaving the cache empty and routing
+    /// the Linux image to the Seatbelt primary (exit 127). It must not — the
+    /// local cache hit is authoritative and the image routes to VZ-Linux.
+    #[tokio::test]
+    async fn pull_with_network_429_still_dispatches_via_local_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("blobs.redb");
+        // The image ref uses a host that cannot be resolved on the wire; only
+        // the LOCAL cache knows its OS.
+        let image = "registry.invalid.example/library/alpine:latest";
+        seed_persistent_linux_cache(&cache_path, image).await;
+
+        let (rt, calls) = make_composite_with_vz_linux();
+        let rt = rt.with_os_inspect_cache_path(Some(cache_path));
+
+        // `pull_image` drives the dispatch-population inspection. Even though a
+        // real registry inspection of `*.invalid` would fail (our stand-in for a
+        // 429), the local-only path resolves Linux and the call succeeds.
+        rt.pull_image(image).await.unwrap();
+        assert_eq!(
+            rt.image_os.read().await.get(image).copied(),
+            Some(OsKind::Linux),
+            "OS must be resolved from the local cache with no network call",
+        );
+
+        // And dispatch routes the Linux image to VZ-Linux, not the primary.
+        let id = cid("lin-svc", 0);
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::VzLinux),
+            "a would-be-429 pull must still route the cached Linux image to VZ-Linux",
+        );
+    }
+
+    /// Companion to the macOS-native dispatch guard, but driving the resolution
+    /// through the real local-cache inspection at `pull_image` time: a bundle
+    /// whose config declares `os = darwin` in the local cache must route to the
+    /// primary, never the Linux VM.
+    #[tokio::test]
+    async fn pull_then_dispatch_resolves_macos_os_from_local_cache_routes_to_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("blobs.redb");
+        let image = "ghcr.io/zlayer/macos-native:latest";
+        seed_persistent_cache_with_os(&cache_path, image, "darwin").await;
+
+        let (rt, calls) = make_composite_with_vz_linux();
+        let rt = rt.with_os_inspect_cache_path(Some(cache_path));
+
+        rt.pull_image(image).await.unwrap();
+        assert_eq!(
+            rt.image_os.read().await.get(image).copied(),
+            Some(OsKind::Macos),
+            "pull_image must resolve macOS OS from the local persistent cache",
+        );
+
+        let id = cid("mac-svc", 0);
+        let spec = make_spec(image, None);
+        rt.create_container(&id, &spec).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "create_container"),
+            Some(Role::Primary),
+            "a macOS-native rootfs must route to primary even with VZ-Linux as default",
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_vm_label_forces_libkrun_delegate() {
         let (rt, calls) = make_composite_with_vz_linux();
         let id = cid("lin-svc", 0);
@@ -1495,6 +2505,346 @@ services:
         assert!(
             refs.contains(&"primary/image:1") && refs.contains(&"delegate/image:1"),
             "merged list should contain both entries, got {refs:?}",
+        );
+    }
+
+    /// Regression (macOS `GET /images/json` 500): when the *primary* runtime
+    /// does not implement `list_images` (the `SandboxRuntime` returns
+    /// `Unsupported`), the composite must NOT propagate that error. It must
+    /// fall back to the other backends — in particular the VZ-Linux delegate
+    /// that actually owns pulled Linux images — and return their list. Before
+    /// the fix the composite used `self.primary.list_images().await?`, which
+    /// surfaced as a 500 and (via the inspect fallback) broke `docker pull`.
+    #[tokio::test]
+    async fn list_images_tolerates_primary_unsupported_and_uses_vz_linux() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        primary.list_images_error = Some("list_images is not supported".to_string());
+        let mut vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls));
+        vz_linux.list_images_response = vec![ImageInfo {
+            reference: "docker.io/library/alpine:latest".to_string(),
+            digest: None,
+            size_bytes: None,
+        }];
+
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+
+        let images = rt
+            .list_images()
+            .await
+            .expect("primary Unsupported must not fail the composite list_images");
+        let refs: Vec<&str> = images.iter().map(|i| i.reference.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["docker.io/library/alpine:latest"],
+            "should return the VZ-Linux delegate's images, got {refs:?}",
+        );
+    }
+
+    /// When EVERY backend fails `list_images`, the composite surfaces an error
+    /// (rather than silently returning an empty list, which would mask a total
+    /// backend outage).
+    #[tokio::test]
+    async fn list_images_errors_only_when_all_backends_fail() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        primary.list_images_error = Some("unsupported".to_string());
+        let mut vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls));
+        vz_linux.list_images_error = Some("also unsupported".to_string());
+
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+
+        let err = rt.list_images().await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::Unsupported(_)),
+            "all-backends-fail should surface Unsupported, got {err:?}",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-container read routing (logs / stats).
+    //
+    // These guard the macOS Docker-compat `/logs` and `/stats` 500 fix: when
+    // the owning backend cannot serve a particular read (the primary
+    // `SandboxRuntime` implements snapshot reads but returns `Unsupported` for
+    // the *streaming* ones, or a different backend owns the container), the
+    // composite must route to / fall back across backends and return real data
+    // instead of propagating `Unsupported` as a swallowed 500. Only a genuine
+    // all-not-found is a 404.
+    // ----------------------------------------------------------------------
+
+    /// Build a `LogEntry` with the given stream + message for read tests.
+    fn log_entry(stream: LogStream, message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: chrono::Utc::now(),
+            stream,
+            source: zlayer_observability::logs::LogSource::Container("test".to_string()),
+            message: message.to_string(),
+            service: None,
+            deployment: None,
+        }
+    }
+
+    /// Drain a `LogsStream` into the concatenated UTF-8 body bytes.
+    async fn drain_logs(stream: LogsStream) -> String {
+        use futures_util::StreamExt as _;
+        let mut out = Vec::new();
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            out.extend_from_slice(&item.expect("log chunk ok").bytes);
+        }
+        String::from_utf8(out).expect("utf8 log body")
+    }
+
+    /// Collect a `StatsStream` into a Vec of samples.
+    async fn drain_stats(stream: StatsStream) -> Vec<StatsSample> {
+        use futures_util::StreamExt as _;
+        let mut out = Vec::new();
+        let mut s = stream;
+        while let Some(item) = s.next().await {
+            out.push(item.expect("stats sample ok"));
+        }
+        out
+    }
+
+    /// Build a composite whose primary models the macOS `SandboxRuntime`
+    /// (snapshot reads work, streaming reads return `Unsupported`) and whose
+    /// VZ-Linux delegate owns the container with working native streams.
+    /// Returns (composite, call-log) with a container already dispatched to the
+    /// chosen owner.
+    async fn make_read_composite(owner: Role) -> (CompositeRuntime, ContainerId, CallLog) {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let logs = vec![
+            log_entry(LogStream::Stdout, "hello stdout"),
+            log_entry(LogStream::Stderr, "hello stderr"),
+        ];
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls))
+            .with_stream_unsupported()
+            .with_logs(logs.clone());
+        let vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls)).with_logs(logs);
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+
+        let id = cid("read-svc", 0);
+        // Dispatch the container to the chosen owner without going through the
+        // (platform-dependent) `select_for` path.
+        let target = match owner {
+            Role::Primary => DispatchTarget::Primary,
+            Role::VzLinux => DispatchTarget::VzLinux,
+            other => panic!("make_read_composite supports Primary/VzLinux, not {other:?}"),
+        };
+        rt.dispatch.write().await.insert(id.clone(), target);
+        (rt, id, calls)
+    }
+
+    #[tokio::test]
+    async fn logs_stream_falls_back_to_snapshot_when_owner_has_no_stream() {
+        // Sole backend = primary (SandboxRuntime model): `logs_stream` is
+        // Unsupported, but `container_logs` works. With no other backend the
+        // composite must synthesise a stream from the snapshot rather than 500.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let logs = vec![
+            log_entry(LogStream::Stdout, "hello stdout"),
+            log_entry(LogStream::Stderr, "hello stderr"),
+        ];
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls))
+            .with_stream_unsupported()
+            .with_logs(logs);
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None);
+        let id = cid("read-svc", 0);
+        rt.dispatch
+            .write()
+            .await
+            .insert(id.clone(), DispatchTarget::Primary);
+
+        let stream = rt
+            .logs_stream(&id, LogsStreamOptions::default())
+            .await
+            .expect("logs_stream must not 500 when snapshot reads work");
+        let body = drain_logs(stream).await;
+        assert!(
+            body.contains("hello stdout") && body.contains("hello stderr"),
+            "synthesised stream must carry the captured logs, got: {body:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_stream_routes_to_delegate_owner_native_stream() {
+        // Owner = VZ-Linux delegate with a working native stream; the primary's
+        // streaming read is Unsupported but must not be consulted first.
+        let (rt, id, calls) = make_read_composite(Role::VzLinux).await;
+        let stream = rt
+            .logs_stream(&id, LogsStreamOptions::default())
+            .await
+            .expect("delegate-owned logs_stream must succeed");
+        let body = drain_logs(stream).await;
+        assert!(body.contains("hello stdout"), "got: {body:?}");
+
+        let log = calls.lock().expect("call-log mutex poisoned");
+        assert_eq!(
+            role_for(&log, "logs_stream"),
+            Some(Role::VzLinux),
+            "logs_stream must hit the owning delegate first, calls: {log:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_logs_falls_back_across_backends() {
+        // Owner = primary; here snapshot `get_logs` works on primary directly,
+        // so it should succeed on the owner without ever consulting the
+        // delegate. (Soft-miss fallback is exercised by the stats test below.)
+        let (rt, id, _calls) = make_read_composite(Role::Primary).await;
+        let logs = rt.get_logs(&id).await.expect("get_logs must succeed");
+        assert_eq!(logs.len(), 2, "owner snapshot logs should be returned");
+    }
+
+    #[tokio::test]
+    async fn stats_stream_falls_back_to_snapshot_when_owner_has_no_stream() {
+        // Sole backend = primary (SandboxRuntime model): `stats_stream` is
+        // Unsupported but `get_container_stats` works. With no other backend
+        // offering a native stream, the composite must synthesise a single
+        // non-empty sample from the snapshot rather than 500.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls)).with_stream_unsupported();
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None);
+        let id = cid("read-svc", 0);
+        rt.dispatch
+            .write()
+            .await
+            .insert(id.clone(), DispatchTarget::Primary);
+
+        let stream = rt
+            .stats_stream(&id)
+            .await
+            .expect("stats_stream must not 500 when get_container_stats works");
+        let samples = drain_stats(stream).await;
+        assert_eq!(samples.len(), 1, "snapshot fallback yields one sample");
+        assert!(
+            samples[0].mem_used_bytes > 0,
+            "synthesised sample must carry non-zero memory, got {:?}",
+            samples[0],
+        );
+        assert_eq!(
+            samples[0].cpu_total_ns, 1_000_000,
+            "cpu microseconds must be scaled to nanoseconds in the synthesised sample",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_container_stats_tolerates_owner_miss_and_uses_other_backend() {
+        // Owner = primary whose snapshot `get_container_stats` returns
+        // `Unsupported` (a soft miss); the delegate that follows in the fallback
+        // chain serves it. The composite must NOT propagate the owner's
+        // Unsupported as a 500.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary =
+            MockRuntime::new(Role::Primary, Arc::clone(&calls)).with_stats_snapshot_unsupported();
+        let vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls));
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+        let id = cid("read-svc", 0);
+        rt.dispatch
+            .write()
+            .await
+            .insert(id.clone(), DispatchTarget::Primary);
+
+        let stats = rt
+            .get_container_stats(&id)
+            .await
+            .expect("owner Unsupported must fall back to the delegate, not 500");
+        assert!(stats.memory_bytes > 0, "delegate stats should be returned");
+
+        let log = calls.lock().expect("call-log mutex poisoned");
+        assert!(
+            log.iter()
+                .any(|(role, method, _)| *role == Role::Primary && method == "get_container_stats"),
+            "primary must have been tried first, calls: {log:?}",
+        );
+        assert!(
+            log.iter()
+                .any(|(role, method, _)| *role == Role::VzLinux && method == "get_container_stats"),
+            "delegate must have served the fallback, calls: {log:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_propagate_not_found_when_no_backend_owns_container() {
+        // Every backend returns NotFound for the dispatched container: the
+        // composite must surface NotFound (→ 404), NOT mask it as Unsupported
+        // or empty success.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls)).with_reads_not_found();
+        let vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls)).with_reads_not_found();
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+        let id = cid("read-svc", 0);
+        rt.dispatch
+            .write()
+            .await
+            .insert(id.clone(), DispatchTarget::Primary);
+
+        // `LogsStream`/`StatsStream` are not `Debug`, so match instead of
+        // `unwrap_err()`.
+        match rt.logs_stream(&id, LogsStreamOptions::default()).await {
+            Err(AgentError::NotFound { .. }) => {}
+            other => panic!(
+                "all-not-found logs_stream must be NotFound (404), got {:?}",
+                other.err(),
+            ),
+        }
+        match rt.stats_stream(&id).await {
+            Err(AgentError::NotFound { .. }) => {}
+            other => panic!(
+                "all-not-found stats_stream must be NotFound (404), got {:?}",
+                other.err(),
+            ),
+        }
+        let cl_err = rt.container_logs(&id, 10).await.unwrap_err();
+        assert!(
+            matches!(cl_err, AgentError::NotFound { .. }),
+            "all-not-found container_logs must be NotFound (404), got {cl_err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_on_undispatched_container_are_not_found() {
+        // No dispatch record at all → NotFound (the id was never created here).
+        let (rt, _calls) = make_composite(false);
+        let id = cid("ghost", 0);
+        match rt.logs_stream(&id, LogsStreamOptions::default()).await {
+            Err(AgentError::NotFound { .. }) => {}
+            other => panic!(
+                "undispatched logs_stream must be NotFound, got {:?}",
+                other.err()
+            ),
+        }
+    }
+
+    /// Regression: `pull_image` must fan out to the VZ-Linux delegate so the
+    /// image lands in the store where Linux containers actually execute on
+    /// macOS (and so it becomes listable/inspectable). Before the fix the
+    /// composite only pulled into `primary` + `delegate`, leaving the
+    /// VZ-Linux `image_rootfs` empty.
+    #[tokio::test]
+    async fn pull_image_fans_out_to_vz_linux() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        let vz_linux = MockRuntime::new(Role::VzLinux, Arc::clone(&calls));
+
+        let rt = CompositeRuntime::new(Arc::new(primary) as Arc<dyn Runtime>, None)
+            .with_vz_linux_delegate(Some(Arc::new(vz_linux) as Arc<dyn Runtime>));
+
+        rt.pull_image("docker.io/library/alpine:latest")
+            .await
+            .expect("pull should succeed");
+
+        let log = calls.lock().expect("call-log mutex poisoned");
+        assert!(
+            log.iter()
+                .any(|(role, method, _)| *role == Role::VzLinux && method == "pull_image"),
+            "pull_image must reach the VZ-Linux delegate, recorded calls: {log:?}",
         );
     }
 

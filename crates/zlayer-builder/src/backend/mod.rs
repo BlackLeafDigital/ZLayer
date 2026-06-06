@@ -314,11 +314,11 @@ async fn construct_backend(
             }
             #[cfg(not(target_os = "linux"))]
             {
-                return Err(BuildError::NotSupported {
+                Err(BuildError::NotSupported {
                     operation: "buildah-sidecar backend currently only runs on Linux hosts \
                                 (zlayer-buildd is Linux-only)"
                         .to_string(),
-                });
+                })
             }
             #[cfg(target_os = "linux")]
             {

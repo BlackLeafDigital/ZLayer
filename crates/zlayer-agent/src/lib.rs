@@ -322,10 +322,33 @@ pub async fn create_runtime(
                     None
                 }
             };
+            // Point image-OS inspection at BOTH persistent blob caches the
+            // composite's `pull_image` writes into, tried in order:
+            //   1. the VZ-Linux runtime's `{data_dir}/vz/linux/images/blobs.redb`
+            //      (the delegate that actually runs the Linux workload), and
+            //   2. the primary Sandbox runtime's `{data_dir}/images/blobs.redb`.
+            // `pull_image` pulls into BOTH (primary first, then VZ-Linux), and
+            // either pull short-circuits under `IfNotPresent` when its rootfs
+            // already exists — so an already-pulled image's manifest+config may
+            // live in only ONE of the two stores. Probing both (local-only, no
+            // network per cache) lets the composite resolve a locally-cached
+            // Linux image's OS with NO network call — so the workload still
+            // routes to VZ-Linux even when Docker Hub is rate-limiting the
+            // redundant OS re-inspection.
+            let data_dir = zlayer_paths::ZLayerDirs::default_data_dir();
+            let os_inspect_cache_paths = vec![
+                data_dir
+                    .join("vz")
+                    .join("linux")
+                    .join("images")
+                    .join("blobs.redb"),
+                data_dir.join("images").join("blobs.redb"),
+            ];
             Ok(Arc::new(
                 runtimes::composite::CompositeRuntime::new(primary, delegate)
                     .with_vz_delegate(vz)
-                    .with_vz_linux_delegate(vz_linux),
+                    .with_vz_linux_delegate(vz_linux)
+                    .with_os_inspect_cache_paths(os_inspect_cache_paths),
             ))
         }
         #[cfg(target_os = "macos")]
@@ -464,10 +487,26 @@ async fn create_auto_runtime(
                 .ok();
 
         if let Some(p) = primary {
+            // Point image-OS dispatch inspection at BOTH persistent blob caches
+            // the composite's `pull_image` writes into (VZ-Linux first, then the
+            // primary Sandbox store), so an already-pulled image's OS resolves
+            // LOCAL-ONLY with no network round-trip — the cached Linux image
+            // routes to VZ-Linux even when Docker Hub is rate-limiting. Mirrors
+            // the `RuntimeConfig::MacSandbox` arm above.
+            let data_dir = zlayer_paths::ZLayerDirs::default_data_dir();
+            let os_inspect_cache_paths = vec![
+                data_dir
+                    .join("vz")
+                    .join("linux")
+                    .join("images")
+                    .join("blobs.redb"),
+                data_dir.join("images").join("blobs.redb"),
+            ];
             return Ok(Arc::new(
                 runtimes::composite::CompositeRuntime::new(p, delegate)
                     .with_vz_delegate(vz)
-                    .with_vz_linux_delegate(vz_linux),
+                    .with_vz_linux_delegate(vz_linux)
+                    .with_os_inspect_cache_paths(os_inspect_cache_paths),
             ));
         }
         // If sandbox failed but VM succeeded, use the VM runtime on its own —

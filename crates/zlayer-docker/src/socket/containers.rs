@@ -138,7 +138,20 @@ fn map_daemon_error(err: &anyhow::Error) -> Response {
 /// zlayer's lifecycle string to work from, so `Status` mirrors `State`
 /// with a little formatting.
 fn docker_state(zlayer_state: &str) -> (&'static str, String) {
-    match zlayer_state {
+    // zlayer's `state` string for an exited container carries the captured exit
+    // code as `exited(N)` (see `state_to_string` in zlayer-api), and a failed
+    // container as `failed: <reason>`. Normalize the bare lifecycle word first
+    // so both the explicit `exited` and the `exited(42)` forms map to Docker's
+    // `exited` state with `Running: false` — a workload that has exited must
+    // never report `Up`, even while the backing VM is still tearing down.
+    // Strip any `(...)` suffix (`exited(42)` → `exited`) or `: ...` suffix
+    // (`failed: reason` → `failed`) to recover the bare lifecycle word.
+    let bare = zlayer_state
+        .split(['(', ':'])
+        .next()
+        .unwrap_or(zlayer_state)
+        .trim();
+    match bare {
         "running" => ("running", "Up".to_owned()),
         "pending" | "created" => ("created", "Created".to_owned()),
         "exited" | "stopped" => ("exited", "Exited".to_owned()),
@@ -146,6 +159,43 @@ fn docker_state(zlayer_state: &str) -> (&'static str, String) {
         "failed" => ("dead", "Dead".to_owned()),
         other => ("exited", format!("Exited ({other})")),
     }
+}
+
+/// Build Docker's inspect `State` object from a daemon `ContainerInfo` value.
+///
+/// Pure projection so it can be unit-tested without spinning up the handler.
+/// Two fields previously misreported for an exited macOS VZ-Linux container:
+///
+/// * `ExitCode` was hardcoded to `0`. It is now read from the daemon's
+///   `exit_code` field, which carries the workload's REAL captured exit code
+///   (the same value `POST /containers/{id}/wait` returns). Absent/null →
+///   Docker's default `0`.
+/// * `Status`/`Running` are derived from [`docker_state`], which now maps the
+///   `exited(N)` form to Docker's `exited` state with `Running: false` — a
+///   workload that has exited must never report `Up`/`running`, even while the
+///   backing VZ VM is still tearing down (Docker semantics: the container is
+///   `exited` once its main process exits).
+fn build_inspect_state(v: &serde_json::Value, pid: u64) -> serde_json::Value {
+    let zstate = v.get("state").and_then(|x| x.as_str()).unwrap_or("unknown");
+    let (docker_state_str, _status_str) = docker_state(zstate);
+    let running = docker_state_str == "running";
+    let exit_code = v
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "Status": docker_state_str,
+        "Running": running,
+        "Paused": docker_state_str == "paused",
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": docker_state_str == "dead",
+        "Pid": pid,
+        "ExitCode": exit_code,
+        "Error": "",
+        "StartedAt": "",
+        "FinishedAt": "",
+    })
 }
 
 /// Parse an ISO-8601 `created_at` into a Unix timestamp (seconds).
@@ -646,6 +696,11 @@ fn build_create_request(
         // create locally.
         node_selector: None,
         platform: None,
+        // Docker's `POST /containers/create` is create-only: the container
+        // must stay in `created` state until the client issues an explicit
+        // `POST /containers/{id}/start`. The native endpoint defaults to
+        // start-on-create, so we opt out here.
+        start: Some(false),
     })
 }
 
@@ -1119,8 +1174,9 @@ async fn inspect_container(State(state): State<SocketState>, Path(id): Path<Stri
     let image = v.get("image").and_then(|x| x.as_str()).unwrap_or("");
     let created_at = v.get("created_at").and_then(|x| x.as_str()).unwrap_or("");
     let zstate = v.get("state").and_then(|x| x.as_str()).unwrap_or("unknown");
-    let (docker_state_str, status_str) = docker_state(zstate);
-    let running = docker_state_str == "running";
+    // `State` is built by `build_inspect_state`; here we only need the
+    // short status string for the top-level `Status` field below.
+    let (_, status_str) = docker_state(zstate);
     let pid = v
         .get("pid")
         .and_then(serde_json::Value::as_u64)
@@ -1135,19 +1191,7 @@ async fn inspect_container(State(state): State<SocketState>, Path(id): Path<Stri
         "Created": created_at,
         "Path": "",
         "Args": [],
-        "State": {
-            "Status": docker_state_str,
-            "Running": running,
-            "Paused": docker_state_str == "paused",
-            "Restarting": false,
-            "OOMKilled": false,
-            "Dead": docker_state_str == "dead",
-            "Pid": pid,
-            "ExitCode": 0,
-            "Error": "",
-            "StartedAt": "",
-            "FinishedAt": "",
-        },
+        "State": build_inspect_state(&v, pid),
         "Image": image,
         "ResolvConfPath": "",
         "HostnamePath": "",
@@ -2687,6 +2731,69 @@ mod tests {
     }
 
     #[test]
+    fn state_mapping_exited_with_code_is_exited_not_up() {
+        // zlayer's `state_to_string` renders an exited container as `exited(42)`.
+        // That MUST map to Docker's `exited` state (Running: false), not the
+        // `other` fallback's `Up`/`running`.
+        let (s, _) = docker_state("exited(42)");
+        assert_eq!(s, "exited");
+    }
+
+    #[test]
+    fn state_mapping_failed_with_reason_is_dead() {
+        let (s, _) = docker_state("failed: VM entered error state");
+        assert_eq!(s, "dead");
+    }
+
+    #[test]
+    fn inspect_state_surfaces_real_exit_code_for_exited_vz_container() {
+        // Regression: a VZ-Linux container that ran `sh -c "sleep 2 && exit 42"`
+        // exits with code 42. The daemon's `ContainerInfo` carries
+        // `state: "exited(42)"` + `exit_code: 42`; the inspect `State` object
+        // must report `ExitCode: 42`, `Status: "exited"`, `Running: false`
+        // (previously `ExitCode` was hardcoded to 0).
+        let v = serde_json::json!({
+            "id": "abc123",
+            "image": "alpine",
+            "state": "exited(42)",
+            "exit_code": 42,
+        });
+        let st = build_inspect_state(&v, 0);
+        assert_eq!(st["ExitCode"].as_i64(), Some(42));
+        assert_eq!(st["Status"].as_str(), Some("exited"));
+        assert_eq!(st["Running"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn inspect_state_running_container_has_zero_exit_code() {
+        let v = serde_json::json!({
+            "id": "abc123",
+            "image": "alpine",
+            "state": "running",
+            // exit_code field absent (skip_serializing_if None) while running
+        });
+        let st = build_inspect_state(&v, 4321);
+        assert_eq!(st["ExitCode"].as_i64(), Some(0));
+        assert_eq!(st["Status"].as_str(), Some("running"));
+        assert_eq!(st["Running"].as_bool(), Some(true));
+        assert_eq!(st["Pid"].as_u64(), Some(4321));
+    }
+
+    #[test]
+    fn inspect_state_clean_exit_zero() {
+        let v = serde_json::json!({
+            "id": "abc123",
+            "image": "alpine",
+            "state": "exited(0)",
+            "exit_code": 0,
+        });
+        let st = build_inspect_state(&v, 0);
+        assert_eq!(st["ExitCode"].as_i64(), Some(0));
+        assert_eq!(st["Status"].as_str(), Some("exited"));
+        assert_eq!(st["Running"].as_bool(), Some(false));
+    }
+
+    #[test]
     fn parse_bool_truthy() {
         assert!(parse_bool(Some("1")));
         assert!(parse_bool(Some("true")));
@@ -2865,7 +2972,7 @@ mod tests {
         assert_eq!(req.work_dir.as_deref(), Some("/app"));
 
         // Command (cmd alone — no entrypoint) -------------------------------
-        let cmd = req.command.expect("command must be set");
+        let cmd = req.command.clone().expect("command must be set");
         assert_eq!(cmd, vec!["nginx", "-g", "daemon off;"]);
 
         // Env: KEY=VALUE plus a bare token ----------------------------------
@@ -2960,6 +3067,20 @@ mod tests {
         assert!(
             req.lifecycle.delete_on_exit,
             "auto_remove=true should set lifecycle.delete_on_exit"
+        );
+
+        // Create-only contract: Docker's `POST /containers/create` must NOT
+        // auto-start. The translated request opts out of the native daemon's
+        // start-on-create default so the container lands in `created` state
+        // until an explicit `POST /containers/{id}/start`.
+        assert_eq!(
+            req.start,
+            Some(false),
+            "Docker create must be create-only (start=false)"
+        );
+        assert!(
+            !req.should_start_on_create(),
+            "should_start_on_create() must be false for a Docker create-only request"
         );
     }
 

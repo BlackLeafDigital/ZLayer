@@ -1544,6 +1544,25 @@ impl Runtime for SandboxRuntime {
                 reason: format!("Failed to pull image layers: {e}"),
             })?;
 
+        // Persist the OCI image CONFIG blob into the same `blobs.redb` while we
+        // still have the network. `pull_image` caches the manifest + layers but
+        // NOT the config blob, and the config's `os` field is what the
+        // composite's LOCAL-ONLY dispatch inspection
+        // (`fetch_image_os_in_cache_only`) reads to route an image correctly on a
+        // later `create_container` with NO network. Caching it here is what lets
+        // a macOS-native bundle pulled through the sandbox resolve `os=darwin`
+        // locally (so it never gets mis-routed to the Linux VM) even under a
+        // Docker Hub rate-limit. Non-fatal: a config-blob miss only costs the
+        // local OS hint.
+        if let Err(e) = puller.pull_image_config(image, &auth).await {
+            tracing::debug!(
+                image = %image,
+                error = %e,
+                "sandbox: failed to cache OCI config blob for local OS inspection; \
+                 dispatch will rely on its fallthrough",
+            );
+        }
+
         tracing::info!(
             image = %image,
             layer_count = layers.len(),

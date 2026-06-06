@@ -976,6 +976,30 @@ fn state_to_string(state: &ContainerState) -> String {
     }
 }
 
+/// Reconcile the reported `exit_code` with the live container state.
+///
+/// `inspect.exit_code` comes from the runtime's `inspect_detailed` override,
+/// which not every runtime implements (e.g. the macOS VZ-Linux runtime returns
+/// the default empty record, so its `exit_code` is `None`). The authoritative
+/// captured exit code for those runtimes is instead surfaced through
+/// `container_state`, which returns `ContainerState::Exited { code }` once the
+/// workload's outcome is captured — the SAME source `wait_container` reads.
+///
+/// So when `inspect_detailed` didn't carry an exit code, fall back to the code
+/// embedded in `ContainerState::Exited` (reusing the `container_state` result
+/// the caller already fetched). This keeps inspect's `exit_code` consistent with
+/// `wait` without introducing a second source of truth. A non-`None`
+/// `inspect.exit_code` always wins (the runtime spoke explicitly).
+fn reconcile_exit_code(inspect_exit_code: Option<i32>, state: &ContainerState) -> Option<i32> {
+    if inspect_exit_code.is_some() {
+        return inspect_exit_code;
+    }
+    match state {
+        ContainerState::Exited { code } => Some(*code),
+        _ => None,
+    }
+}
+
 /// Wire-format projection of [`ContainerInspectDetails`] — the fields
 /// [`ContainerInfo`] carries on top of the basic identity/state fields.
 ///
@@ -1489,35 +1513,43 @@ async fn create_container_local(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to create container: {e}")))?;
 
-    // Start the container
-    state
-        .runtime
-        .start_container(&container_id)
-        .await
-        .map_err(|e| {
-            // Best-effort cleanup: remove the created-but-not-started container
-            let rt = state.runtime.clone();
-            let cid = container_id.clone();
-            tokio::spawn(async move {
-                let _ = rt.remove_container(&cid).await;
-            });
-            ApiError::Internal(format!("Failed to start container: {e}"))
-        })?;
+    // Honour the create-only contract: native callers (and any client that
+    // omits `start`) get the historical create-and-start behaviour, while the
+    // Docker-compat shim sets `start: false` so `POST /containers/create`
+    // leaves the container in `created`/`pending` state until an explicit
+    // `POST /containers/{id}/start`.
+    let started = request.should_start_on_create();
+    if started {
+        // Start the container
+        state
+            .runtime
+            .start_container(&container_id)
+            .await
+            .map_err(|e| {
+                // Best-effort cleanup: remove the created-but-not-started container
+                let rt = state.runtime.clone();
+                let cid = container_id.clone();
+                tokio::spawn(async move {
+                    let _ = rt.remove_container(&cid).await;
+                });
+                ApiError::Internal(format!("Failed to start container: {e}"))
+            })?;
 
-    // Attach the container to any user-defined bridge networks requested in
-    // the body. We do this AFTER the container is started so Docker has a
-    // concrete container to wire an endpoint up to. If any attachment fails,
-    // best-effort roll back already-completed attachments and stop/remove
-    // the container before returning the error.
-    if !request.networks.is_empty() {
-        attach_container_to_networks(
-            state.bridge_networks.as_ref(),
-            &state.runtime,
-            &container_id,
-            request.name.as_deref(),
-            &request.networks,
-        )
-        .await?;
+        // Attach the container to any user-defined bridge networks requested in
+        // the body. We do this AFTER the container is started so Docker has a
+        // concrete container to wire an endpoint up to. If any attachment fails,
+        // best-effort roll back already-completed attachments and stop/remove
+        // the container before returning the error.
+        if !request.networks.is_empty() {
+            attach_container_to_networks(
+                state.bridge_networks.as_ref(),
+                &state.runtime,
+                &container_id,
+                request.name.as_deref(),
+                &request.networks,
+            )
+            .await?;
+        }
     }
 
     // Get PID
@@ -1566,17 +1598,23 @@ async fn create_container_local(
         .id_map
         .register(state.id_map.daemon_uuid(), &container_id);
 
-    // Emit container.start event on the daemon-wide bus.
-    state.event_bus.publish(ContainerEvent::start(
-        hex_id.clone(),
-        request.labels.clone(),
-    ));
+    // Emit container.start event on the daemon-wide bus — but only when the
+    // container was actually started. A create-only request (Docker compat)
+    // emits no start event; the explicit `POST /containers/{id}/start` will.
+    if started {
+        state.event_bus.publish(ContainerEvent::start(
+            hex_id.clone(),
+            request.labels.clone(),
+        ));
+    }
 
     let info = ContainerInfo {
         id: hex_id,
         name: request.name,
         image: request.image,
-        state: "running".to_string(),
+        // Create-only requests (Docker compat) leave the container in
+        // `pending`; native start-on-create requests report `running`.
+        state: if started { "running" } else { "pending" }.to_string(),
         labels: request.labels,
         created_at: now,
         pid,
@@ -1687,7 +1725,7 @@ pub async fn list_containers(
             networks: inspect.networks,
             ipv4: inspect.ipv4,
             health: inspect.health,
-            exit_code: inspect.exit_code,
+            exit_code: reconcile_exit_code(inspect.exit_code, &runtime_state),
         });
     }
 
@@ -1775,7 +1813,7 @@ pub async fn get_container(
         networks: inspect.networks,
         ipv4: inspect.ipv4,
         health: inspect.health,
-        exit_code: inspect.exit_code,
+        exit_code: reconcile_exit_code(inspect.exit_code, &runtime_state),
     }))
 }
 
@@ -3089,7 +3127,19 @@ pub async fn get_container_logs(
             zlayer_agent::AgentError::NotFound { reason, .. } => {
                 ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Failed to start log stream: {other}")),
+            other => {
+                // Previously this 500'd silently — the error was mapped to
+                // `ApiError::Internal` with NOTHING logged, so a runtime that
+                // returned `Unsupported` (e.g. a backend with no log stream)
+                // produced an opaque `internal_error` with no daemon-log trail.
+                // Log it so the failure is diagnosable.
+                tracing::error!(
+                    container = %container_id,
+                    error = %other,
+                    "GET /containers/{{id}}/logs: runtime logs_stream failed — returning 500",
+                );
+                ApiError::Internal(format!("Failed to start log stream: {other}"))
+            }
         })?;
 
     let (content_type, body_stream): (&'static str, StreamingBody) = match format {
@@ -3793,7 +3843,18 @@ pub async fn get_container_stats(
             zlayer_agent::AgentError::NotFound { reason, .. } => {
                 ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Failed to start stats stream: {other}")),
+            other => {
+                // Previously this 500'd silently (see `get_container_logs`).
+                // Log the runtime error so a swallowed `Unsupported` no longer
+                // surfaces as an opaque `internal_error` with no daemon-log
+                // trail.
+                tracing::error!(
+                    container = %container_id,
+                    error = %other,
+                    "GET /containers/{{id}}/stats: runtime stats_stream failed — returning 500",
+                );
+                ApiError::Internal(format!("Failed to start stats stream: {other}"))
+            }
         })?;
 
     let body_stream: StreamingBody = if query.stream {
@@ -6634,5 +6695,163 @@ mod tests {
         .await
         .expect_err("missing path must yield BadRequest");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // exit_code reconciliation — inspect must surface the REAL captured exit
+    // code for an exited VZ-Linux container even when the runtime doesn't
+    // override `inspect_detailed` (so `inspect.exit_code` is None). The
+    // authoritative code is carried by `container_state`'s
+    // `ContainerState::Exited { code }` — the same source `wait_container` uses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reconcile_exit_code_prefers_runtime_inspect_value() {
+        // An explicit runtime-reported exit code always wins.
+        let state = ContainerState::Exited { code: 7 };
+        assert_eq!(reconcile_exit_code(Some(137), &state), Some(137));
+    }
+
+    #[test]
+    fn reconcile_exit_code_falls_back_to_exited_state() {
+        // `inspect_detailed` returned None (VZ-Linux case): derive from the
+        // captured `Exited { code }`.
+        let state = ContainerState::Exited { code: 42 };
+        assert_eq!(reconcile_exit_code(None, &state), Some(42));
+    }
+
+    #[test]
+    fn reconcile_exit_code_running_is_none() {
+        assert_eq!(reconcile_exit_code(None, &ContainerState::Running), None);
+    }
+
+    /// Runtime whose `container_state` reports `Exited { code: 42 }` and whose
+    /// `inspect_detailed` is the default (all-`None`, so `exit_code: None`) —
+    /// exactly the VZ-Linux shape. The `get_container` handler must derive
+    /// `ContainerInfo.exit_code == Some(42)` from the state.
+    #[derive(Default)]
+    struct ExitedStateRuntime {
+        inner: zlayer_agent::MockRuntime,
+        code: i32,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for ExitedStateRuntime {
+        async fn pull_image(&self, image: &str) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image(image).await
+        }
+        async fn pull_image_with_policy(
+            &self,
+            image: &str,
+            policy: zlayer_spec::PullPolicy,
+            auth: Option<&zlayer_spec::RegistryAuth>,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image_with_policy(image, policy, auth).await
+        }
+        async fn create_container(
+            &self,
+            id: &ContainerId,
+            spec: &zlayer_spec::ServiceSpec,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.create_container(id, spec).await
+        }
+        async fn start_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.start_container(id).await
+        }
+        async fn stop_container(
+            &self,
+            id: &ContainerId,
+            t: std::time::Duration,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.stop_container(id, t).await
+        }
+        async fn remove_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.remove_container(id).await
+        }
+        async fn container_state(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ContainerState> {
+            Ok(ContainerState::Exited { code: self.code })
+        }
+        // NB: no `inspect_detailed` override → default record → exit_code: None,
+        // mirroring the macOS VZ-Linux runtime.
+        async fn container_logs(
+            &self,
+            id: &ContainerId,
+            tail: usize,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.container_logs(id, tail).await
+        }
+        async fn exec(
+            &self,
+            id: &ContainerId,
+            cmd: &[String],
+        ) -> zlayer_agent::error::Result<(i32, String, String)> {
+            self.inner.exec(id, cmd).await
+        }
+        async fn get_container_stats(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::cgroups_stats::ContainerStats> {
+            self.inner.get_container_stats(id).await
+        }
+        async fn wait_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<i32> {
+            // Same captured code the state path reports — single source of truth.
+            Ok(self.code)
+        }
+        async fn get_logs(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.get_logs(id).await
+        }
+        async fn get_container_pid(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<u32>> {
+            self.inner.get_container_pid(id).await
+        }
+        async fn get_container_ip(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<std::net::IpAddr>> {
+            self.inner.get_container_ip(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn get_container_surfaces_real_exit_code_for_exited_vz_container() {
+        // Regression: `sh -c "sleep 2 && exit 42"` on the VZ-Linux runtime.
+        // `container_state` -> Exited{42}, `inspect_detailed` -> None. The
+        // handler must report `exit_code == Some(42)` and `state == "exited(42)"`,
+        // matching what `POST /containers/{id}/wait` returns.
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(ExitedStateRuntime {
+            code: 42,
+            ..ExitedStateRuntime::default()
+        });
+        let state = ContainerApiState::with_daemon_uuid(runtime, "exit-test-uuid".to_string());
+        let cid = ContainerId::new("standalone-exit42".to_string(), 0);
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("exit42".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-06-05T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-exit42".to_string(), standalone);
+
+        let Json(info) = get_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("get_container must succeed for an exited container");
+
+        assert_eq!(info.exit_code, Some(42));
+        assert_eq!(info.state, "exited(42)");
     }
 }

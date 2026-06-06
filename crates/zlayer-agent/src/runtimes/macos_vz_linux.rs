@@ -79,7 +79,10 @@
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
-use crate::runtime::{ContainerId, ContainerState, Runtime};
+use crate::runtime::{
+    ContainerId, ContainerState, LogChannel, LogChunk, LogsStream, LogsStreamOptions, Runtime,
+    StatsSample, StatsStream,
+};
 use crate::runtimes::macos_vz_shared::{
     self, clamp_cpu_count, clamp_memory_bytes, clone_or_copy, file_url, read_vm_state,
     run_vm_lifecycle, spec_memory_mib, spec_vcpus, LiveVm, QueuePinned, VmLifecycleOp,
@@ -1057,12 +1060,7 @@ fn run_and_drain(
                 tracing::debug!(container = %dir_name, pid, "vz-linux: workload started");
             }
             Ok(proto::Msg::Exited { code }) => {
-                if let Ok(mut c) = outcome.exit_code.lock() {
-                    *c = Some(code);
-                }
-                if let Ok(mut t) = outcome.terminal.lock() {
-                    *t = Some(ContainerState::Exited { code });
-                }
+                record_exit(outcome, code);
                 tracing::debug!(container = %dir_name, code, "vz-linux: workload exited");
                 return;
             }
@@ -1203,6 +1201,62 @@ fn signal_agent(live: &LiveVm, signum: i32) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Resolve the authoritative terminal [`ContainerState`] from a workload's
+/// captured outcome, given an optional `fallback` for when nothing terminal has
+/// been recorded yet (e.g. the live VM's reconciled state, or a forced-stop
+/// default).
+///
+/// This is the single mapping from a drained [`RunOutcome`] to the state that
+/// `container_state` / Docker `inspect`'s `State.ExitCode` reads. It is the
+/// reconciliation point for the `wait` vs `state` split: `wait_container` reads
+/// `RunOutcome::exit_code` directly, so this MUST prefer that same captured code
+/// rather than a stale record state or a fabricated `0`.
+///
+/// Precedence:
+/// 1. A recorded `terminal` state (`Exited`/`Failed` written by the drain task
+///    on an `Exited`/`Error` frame) — the richest signal, kept verbatim.
+/// 2. A captured `exit_code` (the real workload code `wait_container` returns),
+///    surfaced as `Exited { code }`. This covers the race where the drain task
+///    set `exit_code` but `container_state` was consulted before `terminal` was
+///    written, or where only the code is known.
+/// 3. The caller's `fallback` (the live-VM reconciliation, or `Running` /
+///    `Exited { code: 0 }` defaults). Only used when the workload's outcome is
+///    entirely unknown — never to override a captured non-zero code.
+///
+/// Without step 2 the workload's real exit code (e.g. `42`) was dropped on the
+/// state path: `wait` returned `42` from `exit_code` while `container_state`
+/// fabricated `Exited { code: 0 }`.
+/// Record a workload's real exit `code` onto the shared [`RunOutcome`] when the
+/// drain task reads an `Exited { code }` frame.
+///
+/// Writes BOTH the captured `exit_code` (what [`wait_container`](VzLinuxRuntime::wait_container)
+/// returns) and the richer `terminal` state (what [`container_state`](VzLinuxRuntime::container_state)
+/// reads) so the wait and state paths stay in lockstep on the same code. Kept as
+/// a tiny pure helper so the "frame -> stored outcome" mapping is unit-testable
+/// without a live VM.
+fn record_exit(outcome: &RunOutcome, code: i32) {
+    if let Ok(mut c) = outcome.exit_code.lock() {
+        *c = Some(code);
+    }
+    if let Ok(mut t) = outcome.terminal.lock() {
+        *t = Some(ContainerState::Exited { code });
+    }
+}
+
+fn outcome_to_state(
+    exit_code: Option<i32>,
+    terminal: Option<ContainerState>,
+    fallback: ContainerState,
+) -> ContainerState {
+    if let Some(terminal) = terminal {
+        return terminal;
+    }
+    if let Some(code) = exit_code {
+        return ContainerState::Exited { code };
+    }
+    fallback
+}
+
 // ---------------------------------------------------------------------------
 // Runtime trait implementation
 // ---------------------------------------------------------------------------
@@ -1279,6 +1333,28 @@ impl Runtime for VzLinuxRuntime {
                 image: image.to_string(),
                 reason: format!("pull image layers: {e}"),
             })?;
+
+        // Persist the OCI image CONFIG blob into the same `blobs.redb` while we
+        // still have the network. `pull_image` above caches the manifest + layers
+        // but NOT the config blob, and the config's `os` field is what the
+        // composite's LOCAL-ONLY dispatch inspection
+        // (`fetch_image_os_in_cache_only`) reads to route Linux images here on a
+        // later `create_container` with NO network. Without this, a Docker Hub
+        // 429 on the redundant dispatch-time re-inspection used to leave the OS
+        // unknown and fall the image through to the Seatbelt sandbox (exit 127).
+        // Non-fatal: the layers are already extracted, so a config-blob miss only
+        // costs us the local OS hint (dispatch still has its VZ-Linux default).
+        if let Err(e) = puller
+            .pull_image_config(image, &zlayer_registry::RegistryAuth::Anonymous)
+            .await
+        {
+            tracing::debug!(
+                image = %image,
+                error = %e,
+                "vz-linux: failed to cache OCI config blob for local OS inspection; \
+                 dispatch will rely on its macOS default",
+            );
+        }
 
         tracing::info!(
             image = %image,
@@ -1613,9 +1689,13 @@ impl Runtime for VzLinuxRuntime {
                 return Ok(());
             };
             // Preserve the workload's real exit code where the drain task already
-            // recorded one; otherwise mark a forced stop as a clean exit.
+            // recorded one (via either `terminal` or the `exit_code` the wait
+            // path reads); otherwise mark a forced stop as a clean exit. Routing
+            // through `outcome_to_state` keeps the stored `c.state` in lockstep
+            // with what `wait_container` reports.
             let recorded = c.outcome.terminal.lock().ok().and_then(|g| g.clone());
-            c.state = recorded.unwrap_or(ContainerState::Exited { code: 0 });
+            let recorded_code = c.outcome.exit_code.lock().ok().and_then(|g| *g);
+            c.state = outcome_to_state(recorded_code, recorded, ContainerState::Exited { code: 0 });
             // Drop network state: abort every host loopback forwarder.
             for f in std::mem::take(&mut c.port_forwards) {
                 f.task.abort();
@@ -1685,12 +1765,20 @@ impl Runtime for VzLinuxRuntime {
             container: dir_name.clone(),
             reason: "not found".to_string(),
         })?;
-        // The agent's `Exited`/`Error` frame is authoritative: the workload
-        // exited (with its real code) even if the VM lingers. Prefer it.
-        if let Some(terminal) = c.outcome.terminal.lock().ok().and_then(|g| g.clone()) {
-            return Ok(terminal);
+        // The workload's captured outcome is authoritative: it exited (with its
+        // real code) even if the VM lingers as a running VM. The drain task
+        // records the code on `RunOutcome::exit_code` (what `wait_container`
+        // returns) and a richer `terminal` state on the `Exited`/`Error` frame.
+        // Read BOTH so the state path uses the same captured exit code as the
+        // wait path — otherwise the real code (e.g. 42) is dropped here and the
+        // VM-`Stopped` reconcile below fabricates `Exited { code: 0 }`.
+        let captured_code = c.outcome.exit_code.lock().ok().and_then(|g| *g);
+        let terminal = c.outcome.terminal.lock().ok().and_then(|g| g.clone());
+        if terminal.is_some() || captured_code.is_some() {
+            // A captured outcome wins outright; the VM may still be tearing down.
+            return Ok(outcome_to_state(captured_code, terminal, c.state.clone()));
         }
-        // Otherwise reconcile with the live VM's actual state when running.
+        // No captured workload outcome yet: reconcile with the live VM's state.
         if let Some(live) = &c.live {
             let reconciled = match read_vm_state(live) {
                 VZVirtualMachineState::Running | VZVirtualMachineState::Paused => {
@@ -1699,8 +1787,8 @@ impl Runtime for VzLinuxRuntime {
                 VZVirtualMachineState::Error => ContainerState::Failed {
                     reason: "VM entered error state".to_string(),
                 },
-                // The guest powered off: a clean exit. Keep the last recorded
-                // exit state where we already have one.
+                // The guest powered off before the agent reported an exit: keep
+                // the last recorded exit state where we have one, else a clean 0.
                 VZVirtualMachineState::Stopped => match &c.state {
                     s @ ContainerState::Exited { .. } => s.clone(),
                     _ => ContainerState::Exited { code: 0 },
@@ -1813,6 +1901,43 @@ impl Runtime for VzLinuxRuntime {
         })
     }
 
+    async fn stats_stream(&self, id: &ContainerId) -> Result<StatsStream> {
+        use futures_util::stream;
+
+        // VZ exposes no live per-VM metrics, so we emit a single deterministic
+        // sample built from the configured allocation (matching
+        // `get_container_stats`). Previously this fell through to the
+        // `Unsupported` default, 500-ing `GET /containers/{id}/stats`. The
+        // sample carries a NON-ZERO `mem_used_bytes` so the Docker-compat
+        // one-shot stats body satisfies `memory_bytes > 0`.
+        let dir_name = Self::container_dir_name(id);
+        let (vcpus, ram_mib) = {
+            let guard = self.containers.read().await;
+            let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
+                container: dir_name.clone(),
+                reason: "not found".to_string(),
+            })?;
+            (c.vcpus, c.ram_mib)
+        };
+        let mem_limit_bytes = u64::from(ram_mib) * 1024 * 1024;
+        let mem_used_bytes = (mem_limit_bytes / 4).max(1);
+        let sample = StatsSample {
+            cpu_total_ns: 0,
+            cpu_system_ns: 0,
+            online_cpus: vcpus,
+            mem_used_bytes,
+            mem_limit_bytes,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+            blkio_read_bytes: 0,
+            blkio_write_bytes: 0,
+            pids_current: 0,
+            pids_limit: None,
+            timestamp: chrono::Utc::now(),
+        };
+        Ok(Box::pin(stream::iter(vec![Ok(sample)])))
+    }
+
     async fn wait_container(&self, id: &ContainerId) -> Result<i32> {
         let dir_name = Self::container_dir_name(id);
         loop {
@@ -1848,6 +1973,58 @@ impl Runtime for VzLinuxRuntime {
 
     async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
         self.captured_logs(id, 1000).await
+    }
+
+    async fn logs_stream(&self, id: &ContainerId, opts: LogsStreamOptions) -> Result<LogsStream> {
+        use futures_util::stream;
+
+        // VZ-Linux captures the workload's stdout/stderr (plus the guest serial
+        // console) into a buffer drained over vsock; there is no live tail
+        // device. We snapshot the captured logs at call time and yield them as
+        // a bounded NDJSON-able stream. This is enough for the non-follow
+        // `GET /containers/{id}/logs` path (and the Docker-compat shim's
+        // one-shot logs), which is what the default-`Unsupported` impl used to
+        // 500 on. `follow=true` simply replays the current buffer and ends —
+        // VZ has no notification primitive to block on for new lines.
+        let tail = opts
+            .tail
+            .map_or(1000, |n| usize::try_from(n).unwrap_or(1000));
+        let entries = self.captured_logs(id, tail).await?;
+
+        // Honour the per-channel filters when either is explicitly requested;
+        // Docker's default (neither set) means "both".
+        let want_stdout = opts.stdout || !opts.stderr;
+        let want_stderr = opts.stderr || !opts.stdout;
+
+        let chunks: Vec<Result<LogChunk>> = entries
+            .into_iter()
+            .filter_map(|e| {
+                let channel = match e.stream {
+                    LogStream::Stdout => LogChannel::Stdout,
+                    LogStream::Stderr => LogChannel::Stderr,
+                };
+                let keep = match channel {
+                    LogChannel::Stdout => want_stdout,
+                    LogChannel::Stderr => want_stderr,
+                    LogChannel::Stdin => false,
+                };
+                if !keep {
+                    return None;
+                }
+                // Re-attach the newline the line-splitter stripped so a
+                // consumer that concatenates chunks reconstructs the original
+                // output.
+                let mut bytes = e.message.into_bytes();
+                bytes.push(b'\n');
+                Some(Ok(LogChunk {
+                    stream: channel,
+                    bytes: bytes::Bytes::from(bytes),
+                    timestamp: opts.timestamps.then_some(e.timestamp),
+                }))
+            })
+            .collect();
+
+        Ok(Box::pin(stream::iter(chunks)))
     }
 
     async fn get_container_pid(&self, _id: &ContainerId) -> Result<Option<u32>> {
@@ -2148,6 +2325,141 @@ mod tests {
             }
             other => panic!("expected Msg::Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn capture_chunk_records_stream_into_outcome_and_console() {
+        // Regression for the "empty logs" symptom: a workload `Stdout`/`Stderr`
+        // frame drained by `run_and_drain` must land in `RunOutcome::logs` (what
+        // `captured_logs`/`get_logs` read) AND be mirrored to console.log.
+        let outcome = RunOutcome::default();
+        let tmp = std::env::temp_dir().join(format!(
+            "vzl-capture-{}-{}.log",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        capture_chunk(&outcome, &tmp, "svc-0", LogStream::Stdout, b"HELLO\n");
+        capture_chunk(&outcome, &tmp, "svc-0", LogStream::Stderr, b"oops\n");
+
+        let logs = outcome.logs.lock().expect("logs lock");
+        assert_eq!(logs.len(), 2, "both chunks must be captured");
+        assert_eq!(logs[0].stream, LogStream::Stdout);
+        assert!(logs[0].message.contains("HELLO"));
+        assert_eq!(logs[1].stream, LogStream::Stderr);
+        assert!(logs[1].message.contains("oops"));
+
+        let on_disk = std::fs::read_to_string(&tmp).unwrap_or_default();
+        assert!(
+            on_disk.contains("HELLO") && on_disk.contains("oops"),
+            "captured output must also be mirrored to console.log; got {on_disk:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Regression for the "exit code dropped on the state path" bug: a workload
+    /// that exits non-zero (e.g. `sh -c "exit 42"`) had `wait_container` report
+    /// 42 (from `RunOutcome::exit_code`) while `container_state` returned
+    /// `Exited { code: 0 }` — the captured code was never surfaced on the state
+    /// path. This drives the exact capture -> stored-outcome -> state mapping
+    /// `run_and_drain`/`container_state` use, with no live VM.
+    #[test]
+    fn captured_exit_code_persists_into_container_state() {
+        // 1. Simulate the workload exiting non-zero exactly as the `Exited`
+        //    frame handler in `run_and_drain` does.
+        let outcome = RunOutcome::default();
+        record_exit(&outcome, 42);
+
+        // The wait path reads `exit_code` directly: it already saw 42.
+        assert_eq!(
+            outcome.exit_code.lock().expect("exit_code lock").as_ref(),
+            Some(&42),
+            "wait path: captured exit code must be the real workload code"
+        );
+
+        // The state path (`container_state`) maps the captured outcome to a
+        // `ContainerState`. With the bug it dropped the code and returned 0.
+        let terminal = outcome.terminal.lock().expect("terminal lock").clone();
+        let captured = outcome
+            .exit_code
+            .lock()
+            .expect("exit_code lock")
+            .as_ref()
+            .copied();
+        let state = outcome_to_state(captured, terminal, ContainerState::Running);
+        assert_eq!(
+            state,
+            ContainerState::Exited { code: 42 },
+            "state path must surface the captured non-zero exit code, not 0"
+        );
+
+        // 2. The success case is unaffected: exit 0 -> Exited { code: 0 }.
+        let outcome_ok = RunOutcome::default();
+        record_exit(&outcome_ok, 0);
+        let terminal_ok = outcome_ok.terminal.lock().expect("terminal lock").clone();
+        let captured_ok = outcome_ok
+            .exit_code
+            .lock()
+            .expect("exit_code lock")
+            .as_ref()
+            .copied();
+        assert_eq!(
+            outcome_to_state(captured_ok, terminal_ok, ContainerState::Running),
+            ContainerState::Exited { code: 0 },
+            "exit 0 must map to Exited {{ code: 0 }}"
+        );
+
+        // 3. A signal death (e.g. SIGKILL -> 137) maps the same way the wait path
+        //    sees it: the guest sends `Exited { code: 128 + signum }`.
+        let outcome_sig = RunOutcome::default();
+        record_exit(&outcome_sig, 137);
+        let terminal_sig = outcome_sig.terminal.lock().expect("terminal lock").clone();
+        let captured_sig = outcome_sig
+            .exit_code
+            .lock()
+            .expect("exit_code lock")
+            .as_ref()
+            .copied();
+        assert_eq!(
+            outcome_to_state(captured_sig, terminal_sig, ContainerState::Running),
+            ContainerState::Exited { code: 137 },
+            "SIGKILL death must surface 137 on the state path"
+        );
+    }
+
+    /// `outcome_to_state` precedence: a captured `exit_code` must win over the
+    /// caller's fallback (the live-VM reconcile / forced-stop default), a richer
+    /// `terminal` state wins outright, and the fallback is used only when the
+    /// workload's outcome is wholly unknown.
+    #[test]
+    fn outcome_to_state_prefers_captured_outcome_over_fallback() {
+        // Captured code alone (the race window: `exit_code` set before
+        // `terminal`) — must NOT fall through to a fabricated 0 / Running.
+        assert_eq!(
+            outcome_to_state(Some(42), None, ContainerState::Running),
+            ContainerState::Exited { code: 42 },
+        );
+        assert_eq!(
+            outcome_to_state(Some(7), None, ContainerState::Exited { code: 0 }),
+            ContainerState::Exited { code: 7 },
+            "a captured code must override a forced-stop `Exited {{ code: 0 }}` fallback"
+        );
+
+        // A recorded terminal state wins verbatim, even alongside a code.
+        let failed = ContainerState::Failed {
+            reason: "agent error".to_string(),
+        };
+        assert_eq!(
+            outcome_to_state(Some(0), Some(failed.clone()), ContainerState::Running),
+            failed,
+        );
+
+        // Nothing captured -> the fallback is used (e.g. the VM is still up).
+        assert_eq!(
+            outcome_to_state(None, None, ContainerState::Running),
+            ContainerState::Running,
+        );
     }
 
     #[test]

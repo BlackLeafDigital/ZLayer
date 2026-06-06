@@ -183,6 +183,7 @@ base64.workspace = true
 hex.workspace = true
 ipnet.workspace = true
 rand = { workspace = true }
+serial_test = "3.5.0"
 tempfile = "3.24.0"
 wat = "1.244.0"
 

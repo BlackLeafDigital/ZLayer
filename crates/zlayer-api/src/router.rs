@@ -1582,6 +1582,18 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         // tests and the Docker compat shim's translation layer; the active
         // wire shape on this path is now the create-exec one.
         .route("/{id}/exec", post(handlers::exec_instances::create_exec))
+        // Buffered one-shot exec: run `command` to completion inside the
+        // container and return a single JSON `{exit_code, stdout, stderr}`
+        // body (or an SSE stream when `?stream=true`). This is the shape the
+        // Docker-compat shim's non-interactive exec path
+        // (`DaemonClient::exec_in_container`) consumes. Kept distinct from
+        // `/{id}/exec`, whose create-exec handler returns `{"Id": ...}` for
+        // the interactive WebSocket flow — pointing the buffered client at
+        // that path made it fail to parse `exit_code`.
+        .route(
+            "/{id}/exec_sync",
+            post(handlers::containers::exec_in_container),
+        )
         .route("/{id}/resize", post(handlers::containers::resize_container))
         .route("/{id}/wait", get(handlers::containers::wait_container))
         .route(

@@ -719,6 +719,65 @@ mod linux {
     // Workload execution
     // ----------------------------------------------------------------------
 
+    /// Fallback `PATH` applied to spawned children when neither the image nor
+    /// the spec supplied one.
+    ///
+    /// `Command` resolves the *program* (`argv[0]`) via the agent's own libc
+    /// search, but the program itself — most importantly `/bin/sh` running a
+    /// `sh -c "..."` workload — relies on the **child's** `$PATH` to locate any
+    /// external command it invokes (`sleep`, `ls`, …). PID 1 is exec'd by the
+    /// kernel with an empty environment, and the host only forwards the spec's
+    /// env, so without this default a workload like `sh -c "sleep 1 && exit 0"`
+    /// fails to find `sleep` and the shell exits **127** ("command not found")
+    /// with no stdout — exactly the bug this constant fixes. The value matches
+    /// Docker's built-in default and the other `ZLayer` runtimes
+    /// (`wasm.rs`'s `build_env_vars`).
+    const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    /// Apply the host-provided environment to `cmd`, clearing any inherited
+    /// (PID 1) environment first and guaranteeing a usable `PATH`.
+    ///
+    /// The agent is PID 1 with an effectively empty environment, so we start
+    /// from `env_clear()` and layer only what the host sent. If the host's env
+    /// carries no `PATH` (a bare image with no `ENV PATH`), we inject
+    /// [`DEFAULT_PATH`] so the workload's own command lookups succeed; an
+    /// explicit `PATH` from the spec/image always wins.
+    fn apply_env(cmd: &mut Command, env: &[(String, String)]) {
+        cmd.env_clear();
+        let mut saw_path = false;
+        for (k, v) in env {
+            if k == "PATH" {
+                saw_path = true;
+            }
+            cmd.env(k, v);
+        }
+        if !saw_path {
+            cmd.env("PATH", DEFAULT_PATH);
+        }
+    }
+
+    /// Resolve the workload's working directory.
+    ///
+    /// Docker `WorkingDir` semantics: an empty string means "no explicit
+    /// workdir" (use the root), and a configured directory is *created* if it
+    /// does not exist rather than aborting the spawn. We therefore ignore an
+    /// empty/whitespace value, and for a real absolute path best-effort
+    /// `mkdir -p` it before handing it to `Command::current_dir`. A failure to
+    /// create it is non-fatal: we simply leave the cwd unset so the workload
+    /// still starts from `/` instead of failing with `ENOENT` (which the host
+    /// would otherwise see as a spawn error, never a clean run).
+    fn resolve_cwd(cwd: Option<&str>) -> Option<String> {
+        let dir = cwd.map(str::trim).filter(|d| !d.is_empty())?;
+        // Best-effort create so a baked-in WORKDIR that isn't materialised in
+        // the image layers still works (matching Docker).
+        let _ = fs::create_dir_all(dir);
+        if Path::new(dir).is_dir() {
+            Some(dir.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Spawn the workload entrypoint described by a `Run` message, with stdio
     /// piped back to the host. Sets uid/gid/cwd/env. Returns the [`Child`].
     fn spawn_workload(
@@ -731,11 +790,8 @@ mod linux {
         let program = argv.first().ok_or_else(|| err("Run: empty argv"))?;
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..]);
-        cmd.env_clear();
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        if let Some(dir) = cwd {
+        apply_env(&mut cmd, env);
+        if let Some(dir) = resolve_cwd(cwd) {
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null());
@@ -837,10 +893,7 @@ mod linux {
         let program = argv.first().ok_or_else(|| err("Exec: empty argv"))?;
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..]);
-        cmd.env_clear();
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        apply_env(&mut cmd, env);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -1242,4 +1295,103 @@ mod linux {
     // Silence unused-import lints for items only used on some libc versions.
     #[allow(dead_code)]
     fn _assert_cstr(_: &CStr) {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::{apply_env, resolve_cwd, status_to_code, DEFAULT_PATH};
+        use std::process::Command;
+
+        /// Read back the environment a `Command` would hand its child. There is
+        /// no public getter, so we observe behaviour through `get_envs` (which
+        /// reflects `env_clear` + `env` calls in order).
+        fn collected_env(cmd: &Command) -> Vec<(String, String)> {
+            cmd.get_envs()
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.to_string_lossy().into_owned(),
+                        v?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn apply_env_injects_default_path_when_absent() {
+            let mut cmd = Command::new("true");
+            apply_env(&mut cmd, &[("FOO".into(), "bar".into())]);
+            let env = collected_env(&cmd);
+            assert!(
+                env.contains(&("FOO".to_string(), "bar".to_string())),
+                "spec env must be forwarded"
+            );
+            assert!(
+                env.contains(&("PATH".to_string(), DEFAULT_PATH.to_string())),
+                "a default PATH must be injected when the spec carries none (this is the 127 fix); got {env:?}"
+            );
+        }
+
+        #[test]
+        fn apply_env_preserves_explicit_path() {
+            let mut cmd = Command::new("true");
+            apply_env(
+                &mut cmd,
+                &[
+                    ("PATH".into(), "/opt/custom/bin".into()),
+                    ("A".into(), "1".into()),
+                ],
+            );
+            let env = collected_env(&cmd);
+            assert!(
+                env.contains(&("PATH".to_string(), "/opt/custom/bin".to_string())),
+                "an explicit PATH from the spec/image must win over the default"
+            );
+            assert!(
+                !env.contains(&("PATH".to_string(), DEFAULT_PATH.to_string())),
+                "the default PATH must not be appended when an explicit one exists"
+            );
+        }
+
+        #[test]
+        fn resolve_cwd_ignores_empty_and_whitespace() {
+            // Docker WorkingDir="" means "no explicit workdir": must be None so
+            // the spawn never fails with ENOENT on an empty current_dir.
+            assert_eq!(resolve_cwd(None), None);
+            assert_eq!(resolve_cwd(Some("")), None);
+            assert_eq!(resolve_cwd(Some("   ")), None);
+        }
+
+        #[test]
+        fn resolve_cwd_creates_and_keeps_real_dir() {
+            let base = std::env::temp_dir().join(format!("vzagent-cwd-{}", std::process::id()));
+            let dir = base.join("nested/work");
+            let dir_str = dir.to_string_lossy().into_owned();
+            let _ = std::fs::remove_dir_all(&base);
+            // Directory does not exist yet — resolve_cwd must create it (Docker
+            // WORKDIR semantics) and return it.
+            assert_eq!(resolve_cwd(Some(&dir_str)), Some(dir_str.clone()));
+            assert!(
+                dir.is_dir(),
+                "resolve_cwd must mkdir -p a configured workdir"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn status_to_code_maps_exit_and_signal() {
+            // A clean exit 0 must round-trip to 0 (the exit-0 regression).
+            let exited_0 = 0; // WIFEXITED, WEXITSTATUS == 0
+            assert_eq!(status_to_code(exited_0), 0);
+            // exit(42): WEXITSTATUS is in the high byte on Linux wait status.
+            let exited_42 = 42 << 8;
+            assert_eq!(status_to_code(exited_42), 42);
+            // exit(127): the "command not found" code must pass through, not be
+            // remapped — so the host sees the true shell failure.
+            let exited_127 = 127 << 8;
+            assert_eq!(status_to_code(exited_127), 127);
+            // Killed by SIGKILL (9): low 7 bits hold the signal number; mapped
+            // to 128 + signum.
+            let signaled_9 = 9;
+            assert_eq!(status_to_code(signaled_9), 128 + 9);
+        }
+    }
 }

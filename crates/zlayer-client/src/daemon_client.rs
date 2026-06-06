@@ -203,12 +203,19 @@ pub struct WaitContainerResponse {
     /// Container exit code, or `0` when the container exited cleanly. When
     /// the container was killed by signal `N`, this is typically `128 + N`,
     /// matching Docker's convention.
+    ///
+    /// `POST /api/v1/containers/{id}/wait` returns the Docker-shaped body
+    /// (`{"StatusCode": N, "Error": {"Message": ..}}`, `PascalCase`), so we
+    /// accept the `StatusCode` wire name via `alias` (and the snake form too,
+    /// for any caller that emits it). Without the alias serde fails with
+    /// "missing field `status_code`", surfacing as a 500 to Docker clients.
+    #[serde(alias = "StatusCode")]
     pub status_code: i64,
     /// Optional error envelope surfaced when the wait itself failed. Absent
     /// on a normal exit; present when the daemon could not honour the
     /// requested wait condition (for example, the container was removed
     /// before it reached `not-running`).
-    #[serde(default)]
+    #[serde(default, alias = "Error")]
     pub error: Option<WaitContainerError>,
 }
 
@@ -216,6 +223,7 @@ pub struct WaitContainerResponse {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WaitContainerError {
     /// Human-readable description of why the wait failed.
+    #[serde(alias = "Message")]
     pub message: String,
 }
 
@@ -338,12 +346,21 @@ pub struct StatsSample {
 
 /// One progress event emitted by [`DaemonClient::stream_image_pull`].
 ///
-/// Mirrors `zlayer_agent::runtime::PullProgress`. Uses serde's internally-
-/// tagged enum representation (`{"type":"status",...}` vs
-/// `{"type":"done",...}`) so a single NDJSON parser can distinguish the
-/// two variants without out-of-band context.
+/// Mirrors the wire-format `zlayer_types::api::images::PullProgressDto`
+/// emitted by the daemon's `POST /api/v1/images/create` streaming pull
+/// handler. Uses serde's internally-tagged enum representation keyed on
+/// `kind` (`{"kind":"status",...}` vs `{"kind":"done",...}`) so a single
+/// NDJSON parser can distinguish the two variants without out-of-band
+/// context.
+///
+/// **The tag key MUST stay `kind`** to match the bytes the daemon actually
+/// writes (see `PullProgressDto` in `zlayer-types`). A previous revision
+/// tagged this on `type`, which deserialized cleanly in hand-fed unit tests
+/// but silently rejected every real pull event (the parser logged
+/// "skipping malformed NDJSON line" and the Docker-compat `/images/create`
+/// stream produced no progress, breaking `docker pull`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PullProgress {
     /// Progress update for an in-flight layer or stage.
     Status {
@@ -2514,21 +2531,25 @@ impl DaemonClient {
     /// Execute a command inside a standalone container and wait for it to
     /// finish.
     ///
-    /// `POST /api/v1/containers/{id}/exec` with `{"command": [...]}`.
+    /// `POST /api/v1/containers/{id}/exec_sync` with `{"command": [...]}`.
     /// Returns a [`ContainerExecResponse`] with `exit_code`, `stdout`, and
     /// `stderr`.
     ///
-    /// Note: the daemon's container exec endpoint is non-interactive -- it
-    /// runs the command to completion and buffers the output. It does not
-    /// accept `tty` or `interactive` flags. For attached/TTY exec against a
-    /// managed service, use
-    /// [`exec_command`](Self::exec_command) instead.
+    /// Note: this targets the daemon's *buffered* exec endpoint
+    /// (`exec_sync`), which runs the command to completion and returns a
+    /// single JSON `{exit_code, stdout, stderr}` body. The plain
+    /// `/{id}/exec` path is the *interactive* create-exec endpoint and
+    /// returns `{"Id": "<hex>"}` — parsing that as a buffered exec result
+    /// fails with `missing field 'exit_code'`, which is why the buffered
+    /// helper must use the dedicated `exec_sync` route. It does not accept
+    /// `tty` or `interactive` flags. For attached/TTY exec against a managed
+    /// service, use [`exec_command`](Self::exec_command) instead.
     pub async fn exec_in_container(
         &self,
         id: &str,
         cmd: Vec<String>,
     ) -> Result<ContainerExecResponse> {
-        let path = format!("/api/v1/containers/{}/exec", urlencoding(id));
+        let path = format!("/api/v1/containers/{}/exec_sync", urlencoding(id));
         let payload = serde_json::json!({ "command": cmd });
         let (status, body) = self.post_json(&path, &payload.to_string()).await?;
         Self::check_status(status, &body)?;
@@ -6390,6 +6411,27 @@ mod tests {
         assert_eq!(err.message, "container removed before reaching not-running");
     }
 
+    #[test]
+    fn wait_container_parses_docker_pascalcase_wire() {
+        // REGRESSION: `POST /api/v1/containers/{id}/wait` returns the
+        // Docker-shaped body `{"StatusCode": N, "Error": {"Message": ..}}`
+        // (PascalCase) — which is what `DaemonClient::wait_container` actually
+        // receives. The prior round-trip test only fed snake_case, so the
+        // missing serde rename went unnoticed and every `docker wait` 500'd
+        // ("missing field `status_code`"). This asserts the real wire shape.
+        let success = br#"{"StatusCode": 0}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(success).expect("Docker-shape wait must parse");
+        assert_eq!(resp.status_code, 0);
+        assert!(resp.error.is_none());
+
+        let nonzero = br#"{"StatusCode": 7, "Error": {"Message": "boom"}}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(nonzero).expect("Docker-shape wait with error must parse");
+        assert_eq!(resp.status_code, 7);
+        assert_eq!(resp.error.expect("error present").message, "boom");
+    }
+
     // ----------------------------------------------------------------------
     // events_stream — URL building + NDJSON parse loop.
     //
@@ -6707,17 +6749,19 @@ mod tests {
         use futures_util::StreamExt as _;
 
         // One Status line for an in-flight layer + one terminal Done line.
-        // Verifies the `tag = "type"` enum representation deserializes both
-        // variants from a single NDJSON parser.
+        // Verifies the `tag = "kind"` enum representation deserializes both
+        // variants from a single NDJSON parser. The `kind` key is the wire
+        // shape the daemon actually emits (`PullProgressDto`); feeding it here
+        // is what makes this a real regression test rather than a tautology.
         let body = ChunkedBody::new(vec![
             Bytes::from_static(
-                b"{\"type\":\"status\",\"id\":\"sha256:abc\",\
+                b"{\"kind\":\"status\",\"id\":\"sha256:abc\",\
                   \"status\":\"Downloading\",\
                   \"progress\":\"[==>      ] 1.2MB/4.0MB\",\
                   \"current\":1200000,\"total\":4000000}\n",
             ),
             Bytes::from_static(
-                b"{\"type\":\"done\",\"reference\":\"docker.io/library/alpine:3\",\
+                b"{\"kind\":\"done\",\"reference\":\"docker.io/library/alpine:3\",\
                   \"digest\":\"sha256:deadbeef\"}\n",
             ),
         ]);
@@ -6760,6 +6804,63 @@ mod tests {
         }
 
         assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    /// Regression guard for the pull-progress wire contract: the bytes the
+    /// daemon serializes (`zlayer_types::api::images::PullProgressDto`) MUST
+    /// deserialize into the client-side [`PullProgress`]. A mismatch in the
+    /// serde tag key (`kind` vs `type`) silently breaks `docker pull`, because
+    /// the Docker-compat `/images/create` stream then emits no progress lines.
+    /// Serializing the canonical DTO and round-tripping it through the client
+    /// type catches that drift without a running daemon.
+    #[test]
+    fn pull_progress_wire_compatible_with_dto() {
+        use zlayer_types::api::images::PullProgressDto;
+
+        let status_dto = PullProgressDto::Status {
+            id: Some("sha256:abc".to_string()),
+            status: "Downloading".to_string(),
+            progress: Some("[==>   ] 1MB/4MB".to_string()),
+            current: Some(1_000_000),
+            total: Some(4_000_000),
+        };
+        let bytes = serde_json::to_vec(&status_dto).expect("dto serializes");
+        // The wire byte stream must be keyed on `kind`, never `type`.
+        let raw = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(
+            raw.contains("\"kind\":\"status\""),
+            "DTO must serialize with the `kind` tag key, got: {raw}"
+        );
+        match serde_json::from_slice::<PullProgress>(&bytes).expect("client type parses DTO bytes")
+        {
+            PullProgress::Status {
+                id,
+                status,
+                current,
+                total,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("sha256:abc"));
+                assert_eq!(status, "Downloading");
+                assert_eq!(current, Some(1_000_000));
+                assert_eq!(total, Some(4_000_000));
+            }
+            PullProgress::Done { .. } => panic!("expected Status, got Done"),
+        }
+
+        let done_dto = PullProgressDto::Done {
+            reference: "docker.io/library/alpine:latest".to_string(),
+            digest: Some("sha256:deadbeef".to_string()),
+        };
+        let bytes = serde_json::to_vec(&done_dto).expect("dto serializes");
+        match serde_json::from_slice::<PullProgress>(&bytes).expect("client type parses DTO bytes")
+        {
+            PullProgress::Done { reference, digest } => {
+                assert_eq!(reference, "docker.io/library/alpine:latest");
+                assert_eq!(digest.as_deref(), Some("sha256:deadbeef"));
+            }
+            PullProgress::Status { .. } => panic!("expected Done, got Status"),
+        }
     }
 
     // ----------------------------------------------------------------------

@@ -19,6 +19,32 @@ use zlayer_spec::PullPolicy;
 #[cfg(feature = "local")]
 use crate::wasm_export::WasmExportResult;
 
+/// Normalize an image reference to the canonical form used as the *stem* of
+/// every manifest cache key.
+///
+/// This is the load-bearing fix for the macOS image-OS-resolution bug. The
+/// pull path and the OS-inspect path receive the SAME image through different
+/// spellings: the VZ-Linux delegate pulls `docker.io/library/alpine:latest`
+/// (already qualified by the service layer) and writes the manifest under that
+/// key, while the composite runtime's `inspect_image_os` is invoked with the
+/// BARE `alpine:latest`. With a raw `format!("manifest:{image}")` key those two
+/// land in different cache slots, so the inspect misses the cached manifest and
+/// goes to the network — which then 429s under a Docker Hub rate-limit.
+///
+/// Normalizing both spellings through `oci_client::Reference` collapses them
+/// onto one canonical `registry/repository:tag` (or `…@sha256:…`) key, so the
+/// reader queries exactly what the writer wrote. Inputs that don't parse as a
+/// reference (should not happen for real images) fall back to the raw string so
+/// the key is still deterministic.
+#[must_use]
+fn canonical_manifest_ref(image: &str) -> String {
+    use std::str::FromStr;
+    match oci_client::Reference::from_str(image) {
+        Ok(reference) => reference.whole(),
+        Err(_) => image.to_string(),
+    }
+}
+
 /// Blob-cache key under which the OCI manifest body for `image` is stored.
 ///
 /// Both the registry-side pull paths and the agent-side runtimes
@@ -27,9 +53,14 @@ use crate::wasm_export::WasmExportResult;
 /// drift between writer and reader silently breaks image lookup; we just
 /// burned one debugging session on exactly that bug class for the digest
 /// sidecar key (see [`manifest_digest_cache_key`]).
+///
+/// The key stem is the *canonical* reference (see [`canonical_manifest_ref`]),
+/// so a bare `alpine:latest` and a qualified `docker.io/library/alpine:latest`
+/// resolve to the SAME entry — the writer (pull, qualified) and the reader
+/// (OS inspect, bare) always agree.
 #[must_use]
 pub fn manifest_cache_key(image: &str) -> String {
-    format!("manifest:{image}")
+    format!("manifest:{}", canonical_manifest_ref(image))
 }
 
 /// Blob-cache key under which the registry's content-addressable manifest
@@ -37,9 +68,12 @@ pub fn manifest_cache_key(image: &str) -> String {
 /// pull paths and the agent-side runtimes (e.g. youki's `list_images`)
 /// must agree on this key — otherwise readers silently miss the digest
 /// and image-drift detection short-circuits to "no recreate."
+///
+/// Keyed on the canonical reference (see [`manifest_cache_key`]) so the digest
+/// sidecar tracks the manifest body across bare/qualified spellings.
 #[must_use]
 pub fn manifest_digest_cache_key(image: &str) -> String {
-    format!("manifest:digest-{image}")
+    format!("manifest:digest-{}", canonical_manifest_ref(image))
 }
 
 /// Errors that can occur during push operations
@@ -466,6 +500,15 @@ pub struct ImagePuller {
     client: oci_client::Client,
     cache: Arc<Box<dyn BlobCacheBackend>>,
     concurrency_limit: Arc<Semaphore>,
+    /// Count of network round-trips actually issued against the remote registry
+    /// through `self.client`. Bumped by [`ImagePuller::note_network_call`] at
+    /// every method that talks to the registry over the wire. It exists so the
+    /// *local-only* resolution paths (`resolve_manifest_local_only`,
+    /// `image_os_in_cache_only`, `image_runtime_marker_in_cache_only`) can be
+    /// proven, in tests, to issue ZERO network calls even when the cache misses
+    /// — the macOS Docker-Hub-429 regression was precisely a "local-only" path
+    /// silently falling through to the network.
+    network_calls: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(feature = "local")]
     local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
 }
@@ -483,6 +526,7 @@ impl ImagePuller {
             client,
             cache: Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>),
             concurrency_limit: Arc::new(Semaphore::new(3)),
+            network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "local")]
             local_registry: None,
         }
@@ -501,6 +545,7 @@ impl ImagePuller {
             client,
             cache,
             concurrency_limit: Arc::new(Semaphore::new(3)),
+            network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "local")]
             local_registry: None,
         }
@@ -523,9 +568,28 @@ impl ImagePuller {
             client,
             cache,
             concurrency_limit: Arc::new(Semaphore::new(3)),
+            network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "local")]
             local_registry: None,
         }
+    }
+
+    /// Record that a network round-trip is about to be issued against the
+    /// remote registry. Every method that calls `self.client` over the wire
+    /// must invoke this first so that the local-only paths can be *proven* (in
+    /// tests) to never reach the network. Cheap relaxed atomic increment.
+    fn note_network_call(&self) {
+        self.network_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of network round-trips issued against the remote registry so far.
+    /// Test-only spy used to assert that the local-only resolution paths stay
+    /// offline (see the `*_in_cache_only` regression tests).
+    #[cfg(test)]
+    fn network_call_count(&self) -> usize {
+        self.network_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Store authentication for a registry
@@ -721,6 +785,7 @@ impl ImagePuller {
             image: image.to_string(),
         })?;
 
+        self.note_network_call();
         match self.client.fetch_manifest_digest(&reference, auth).await {
             Ok(digest) => Ok(Some(digest)),
             Err(oci_client::errors::OciDistributionError::ImageManifestNotFoundError(_)) => {
@@ -1060,6 +1125,7 @@ impl ImagePuller {
 
         tracing::info!(image = %image, "pulling manifest from registry");
 
+        self.note_network_call();
         match self.client.pull_image_manifest(&reference, auth).await {
             Ok((manifest, digest)) => {
                 tracing::debug!(
@@ -1092,6 +1158,128 @@ impl ImagePuller {
                 Err(RegistryError::Oci(remote_err))
             }
         }
+    }
+
+    /// Resolve a manifest STRICTLY from local stores — the blob cache and (with
+    /// the `local` feature) the local registry — with NO network call.
+    ///
+    /// Returns `Ok(Some(..))` on a local hit, `Ok(None)` when the image is not
+    /// present locally. Unlike [`pull_manifest_inner`], a local miss never falls
+    /// through to a remote pull, so a caller can probe several caches in turn
+    /// without each miss triggering (and rate-limiting) a Docker Hub round-trip.
+    ///
+    /// This is the no-network half of the macOS image-OS-resolution fix: the
+    /// composite runtime probes the VZ-Linux cache and then the primary Sandbox
+    /// cache, and only hits the network as a deliberate final fallback.
+    async fn resolve_manifest_local_only(&self, image: &str) -> Option<(OciImageManifest, String)> {
+        let cache_key = manifest_cache_key(image);
+        let digest_key = manifest_digest_cache_key(image);
+
+        // 1. Blob-cache content read FIRST — this is the authoritative source and
+        //    must win before anything else. The pull writes the *resolved* (per-
+        //    arch) manifest body under `manifest_cache_key(image)` (e.g.
+        //    `manifest:docker.io/library/alpine:latest`), and the canonical key
+        //    normalization (see `canonical_manifest_ref`) makes a BARE
+        //    `alpine:latest` inspect collide with that qualified writer key.
+        //
+        //    Under `IfNotPresent`, `try_cached_manifest` returns the cached body
+        //    with NO digest revalidation and NO network call (the network-only
+        //    `Newer`/`Always` + mutable-tag branch is unreachable here). We must
+        //    NOT route through the `manifest:digest-<ref>` sidecar to drive a
+        //    by-digest fetch: that sidecar holds the multi-arch INDEX digest,
+        //    which is never stored as content and is irrelevant to reading the
+        //    already-resolved manifest. The blob-cache content read below is the
+        //    one and only manifest source in the local-only path.
+        if let Some(hit) = self
+            .try_cached_manifest(
+                image,
+                &RegistryAuth::Anonymous,
+                &cache_key,
+                &digest_key,
+                PullPolicy::IfNotPresent,
+            )
+            .await
+        {
+            return Some(hit);
+        }
+
+        // 2. ONLY THEN consult the local registry, and treat every outcome as a
+        //    pure hit-or-miss — `try_local_registry` returns `Option`, so a
+        //    bare-name miss (and its "not found in registry local" log) is a
+        //    `None` we fall through on, NEVER a propagated error that could
+        //    short-circuit the caller before the blob-cache content was tried.
+        //    On a hit, populate the blob cache so the next inspect is a direct
+        //    content hit. This probe is local-disk only — no network.
+        #[cfg(feature = "local")]
+        if let Some((manifest, digest)) = self.try_local_registry(image).await {
+            if let Ok(bytes) = serde_json::to_vec(&manifest) {
+                let _ = self.cache.put(&cache_key, &bytes).await;
+                let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
+            }
+            return Some((manifest, digest));
+        }
+
+        // 3. Genuine local miss. Return `None` (→ `Ok(None)` at the callers) so
+        //    the composite runtime probes the next cache. NEVER fall through to
+        //    a network fetch from a `*_local_only` / `*_in_cache_only` path.
+        None
+    }
+
+    /// Resolve `image`'s OCI `os` field STRICTLY from local stores, with no
+    /// network call. Returns `Ok(None)` when the image (its manifest/config) is
+    /// not present locally — the caller should then probe the next cache or, as
+    /// a last resort, the network.
+    ///
+    /// # Errors
+    /// Returns an error only when a locally-present config blob cannot be read
+    /// or parsed — never for a plain local miss (that is `Ok(None)`).
+    pub async fn image_os_in_cache_only(&self, image: &str) -> Result<Option<zlayer_spec::OsKind>> {
+        let Some((manifest, _digest)) = self.resolve_manifest_local_only(image).await else {
+            return Ok(None);
+        };
+
+        let config_digest = &manifest.config.digest;
+        // The config blob is content-addressed by digest; a local-only blob
+        // read never hits the network. If it is somehow absent, treat it as a
+        // local miss (Ok(None)) so the caller falls through rather than failing.
+        let Some(config_blob) = self.cache.get(config_digest).await.ok().flatten() else {
+            return Ok(None);
+        };
+
+        let config_root: OciImageConfigRoot =
+            serde_json::from_slice(&config_blob).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    image = %image,
+                    config_digest = %config_digest,
+                    "failed to parse cached image config JSON for OS inspection"
+                );
+                RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+                    "failed to parse image config for {image}: {e}"
+                )))
+            })?;
+
+        Ok(config_root
+            .os
+            .as_deref()
+            .and_then(zlayer_spec::OsKind::from_oci_str))
+    }
+
+    /// Resolve `image`'s `com.zlayer.runtime` manifest annotation STRICTLY from
+    /// local stores, with no network call. `Ok(None)` on a local miss (or when
+    /// the annotation is absent).
+    ///
+    /// # Errors
+    /// Currently infallible in practice; the `Result` mirrors
+    /// [`ImagePuller::image_os_in_cache_only`] for a uniform caller contract.
+    pub async fn image_runtime_marker_in_cache_only(&self, image: &str) -> Result<Option<String>> {
+        let Some((manifest, _digest)) = self.resolve_manifest_local_only(image).await else {
+            return Ok(None);
+        };
+        Ok(manifest
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(crate::ZLAYER_RUNTIME_ANNOTATION).cloned()))
     }
 
     /// Pull an image manifest, honoring the requested [`PullPolicy`].
@@ -1276,7 +1464,32 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<Option<zlayer_spec::OsKind>> {
-        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+        self.image_os_with_policy(image, auth, PullPolicy::Newer)
+            .await
+    }
+
+    /// Like [`ImagePuller::image_os`] but honoring an explicit [`PullPolicy`].
+    ///
+    /// The composite runtime's OS dispatch path drives this with
+    /// [`PullPolicy::IfNotPresent`] so that a locally-cached image (its config
+    /// blob already in the persistent blob cache / local registry) is inspected
+    /// WITHOUT any network round-trip. This is what keeps a Linux image routing
+    /// to the VZ-Linux runtime under a Docker Hub rate-limit: the OS comes from
+    /// the local store the pull already wrote, never a re-inspection over the
+    /// wire. `IfNotPresent`/`Never` cause [`pull_manifest_inner`] to trust the
+    /// cache without the mutable-tag HEAD revalidation that `Newer` would do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or
+    /// if the config blob cannot be parsed as valid JSON.
+    pub async fn image_os_with_policy(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        policy: PullPolicy,
+    ) -> Result<Option<zlayer_spec::OsKind>> {
+        let (manifest, _digest) = self.pull_manifest_inner(image, auth, policy).await?;
 
         let config_digest = &manifest.config.digest;
         let config_blob = self.pull_blob(image, config_digest, auth).await?;
@@ -1312,7 +1525,24 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<Option<String>> {
-        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+        self.image_runtime_marker_with_policy(image, auth, PullPolicy::Newer)
+            .await
+    }
+
+    /// Like [`ImagePuller::image_runtime_marker`] but honoring an explicit
+    /// [`PullPolicy`]. The composite runtime drives this with
+    /// [`PullPolicy::IfNotPresent`] so the `com.zlayer.runtime` marker resolves
+    /// from the already-pulled local manifest without a network re-fetch.
+    ///
+    /// # Errors
+    /// Returns an error if the manifest cannot be fetched or parsed.
+    pub async fn image_runtime_marker_with_policy(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        policy: PullPolicy,
+    ) -> Result<Option<String>> {
+        let (manifest, _digest) = self.pull_manifest_inner(image, auth, policy).await?;
         Ok(manifest
             .annotations
             .as_ref()
@@ -2433,16 +2663,45 @@ fn spec_auth_to_oci(auth: Option<&zlayer_spec::RegistryAuth>) -> RegistryAuth {
     }
 }
 
-/// Fetch the OCI operating system of `image` without pulling any layers.
+/// Build an [`ImagePuller`] for one-shot OS / runtime-marker inspection,
+/// reusing an existing blob cache (and, when compiled with the `local`
+/// feature, an optional [`LocalRegistry`]) so the lookup sees the SAME store
+/// the daemon's pull already wrote its manifest and config blob to.
 ///
-/// Convenience wrapper that constructs an ephemeral [`ImagePuller`] backed by
-/// an in-memory [`BlobCache`] and calls [`ImagePuller::image_os`]. Intended
-/// for callers that need a one-shot OS inspection and don't otherwise own a
-/// long-lived puller — e.g. the agent's `CompositeRuntime` deciding which
-/// child runtime should run a freshly-pulled image. The caller's own
-/// long-lived puller has already pulled the blobs to its persistent cache;
-/// this helper only touches the ~1–5 KB config blob, so the redundant fetch
-/// is negligible.
+/// `cache` should be the persistent blob cache the runtime pulled into (e.g.
+/// the VZ-Linux runtime's `{data_dir}/vz/linux/images/blobs.redb`). When that
+/// store holds the image, [`ImagePuller::image_os_with_policy`] driven with
+/// [`PullPolicy::IfNotPresent`] resolves the OS with no network call.
+// Only the `local`-gated `fetch_*_in_cache*` helpers construct an inspection
+// puller (they are the entry points that take an explicit on-disk store plus
+// an optional local registry), so this helper is itself `local`-gated. Without
+// the feature there are no callers, and a non-`local` variant would be dead.
+#[cfg(feature = "local")]
+fn inspection_puller(
+    cache: Arc<Box<dyn BlobCacheBackend>>,
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
+) -> ImagePuller {
+    let puller = ImagePuller::with_cache(cache);
+    match local_registry {
+        Some(reg) => puller.with_local_registry(reg),
+        None => puller,
+    }
+}
+
+/// Fetch the OCI operating system of `image` LOCAL-FIRST, without pulling any
+/// layers and without a network round-trip when the image is already cached.
+///
+/// Constructs an ephemeral [`ImagePuller`] backed by an in-memory
+/// [`BlobCache`] and calls [`ImagePuller::image_os_with_policy`] with
+/// [`PullPolicy::IfNotPresent`]. Intended for callers that need a one-shot OS
+/// inspection and don't otherwise own a long-lived puller.
+///
+/// NOTE: because this overload uses a *fresh empty* in-memory cache, the
+/// image will not be found locally and a network fetch is required. Callers
+/// that own the daemon's persistent store (e.g. the agent's
+/// `CompositeRuntime`) should prefer [`fetch_image_os_in_cache`] so the OS is
+/// resolved from the already-pulled config blob even under a registry
+/// rate-limit. This bare wrapper is kept for callers without a store.
 ///
 /// Auth is the same [`zlayer_spec::RegistryAuth`] carried on the
 /// [`Runtime::pull_image_with_policy`](crate) trait; `None` maps to
@@ -2465,12 +2724,51 @@ pub async fn fetch_image_os(
     let puller = ImagePuller::new(cache);
 
     let oci_auth = spec_auth_to_oci(auth);
-    puller.image_os(image, &oci_auth).await
+    puller
+        .image_os_with_policy(image, &oci_auth, PullPolicy::IfNotPresent)
+        .await
 }
 
-/// Convenience wrapper around [`ImagePuller::image_runtime_marker`] using a
-/// fresh default [`BlobCache`]. Returns the `com.zlayer.runtime` manifest
-/// annotation (e.g. `"vz"`) if present, else `Ok(None)`.
+/// Resolve the OCI operating system of `image` from an EXISTING local store
+/// (the daemon's persistent blob cache plus an optional [`LocalRegistry`])
+/// without a network call when the image is present.
+///
+/// This is the fix for the macOS image-OS-resolution bug: the composite
+/// runtime's pull writes the manifest and config blob into a persistent blob
+/// cache, then needs to inspect `config.os` to route the workload. Passing
+/// that same `cache` (and `local_registry`) here lets
+/// [`ImagePuller::image_os_with_policy`] satisfy the lookup from the cached
+/// config blob under [`PullPolicy::IfNotPresent`] — so a locally-cached Linux
+/// image is detected as Linux and routed to VZ-Linux even when Docker Hub is
+/// returning `429 Too Many Requests`. Only a genuinely-absent image falls
+/// back to the network.
+///
+/// # Errors
+///
+/// Returns an error if the manifest or config blob cannot be resolved from the
+/// local store AND a fallback network fetch also fails, or if the config blob
+/// cannot be parsed. Hot-path callers should treat any error as non-fatal.
+#[cfg(feature = "local")]
+pub async fn fetch_image_os_in_cache(
+    image: &str,
+    auth: Option<&zlayer_spec::RegistryAuth>,
+    cache: Arc<Box<dyn BlobCacheBackend>>,
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
+) -> Result<Option<zlayer_spec::OsKind>> {
+    let puller = inspection_puller(cache, local_registry);
+    let oci_auth = spec_auth_to_oci(auth);
+    puller
+        .image_os_with_policy(image, &oci_auth, PullPolicy::IfNotPresent)
+        .await
+}
+
+/// Convenience wrapper around [`ImagePuller::image_runtime_marker_with_policy`]
+/// using a fresh default [`BlobCache`] and [`PullPolicy::IfNotPresent`].
+/// Returns the `com.zlayer.runtime` manifest annotation (e.g. `"vz"`) if
+/// present, else `Ok(None)`.
+///
+/// Prefer [`fetch_image_runtime_marker_in_cache`] when the daemon's persistent
+/// store is available, so the marker resolves with no network round-trip.
 ///
 /// # Errors
 /// Returns an error if a blob cache cannot be created, or the manifest cannot
@@ -2483,7 +2781,68 @@ pub async fn fetch_image_runtime_marker(
     let puller = ImagePuller::new(cache);
 
     let oci_auth = spec_auth_to_oci(auth);
-    puller.image_runtime_marker(image, &oci_auth).await
+    puller
+        .image_runtime_marker_with_policy(image, &oci_auth, PullPolicy::IfNotPresent)
+        .await
+}
+
+/// Resolve the `com.zlayer.runtime` marker of `image` from an EXISTING local
+/// store (persistent blob cache + optional [`LocalRegistry`]) without a
+/// network call when the image is present. The marker counterpart to
+/// [`fetch_image_os_in_cache`].
+///
+/// # Errors
+/// Returns an error if the manifest cannot be resolved locally and a fallback
+/// network fetch also fails, or the manifest cannot be parsed.
+#[cfg(feature = "local")]
+pub async fn fetch_image_runtime_marker_in_cache(
+    image: &str,
+    auth: Option<&zlayer_spec::RegistryAuth>,
+    cache: Arc<Box<dyn BlobCacheBackend>>,
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
+) -> Result<Option<String>> {
+    let puller = inspection_puller(cache, local_registry);
+    let oci_auth = spec_auth_to_oci(auth);
+    puller
+        .image_runtime_marker_with_policy(image, &oci_auth, PullPolicy::IfNotPresent)
+        .await
+}
+
+/// Resolve `image`'s OCI operating system from an EXISTING local store with NO
+/// network fallback — `Ok(None)` signals a clean local miss.
+///
+/// This differs from [`fetch_image_os_in_cache`], which falls through to the
+/// network when the image is absent. Use this when probing SEVERAL caches in
+/// turn (e.g. the composite runtime's VZ-Linux cache then the primary Sandbox
+/// cache): each miss must NOT trigger a Docker Hub round-trip, or the rate-limit
+/// the whole feature exists to avoid would fire on the first empty cache.
+///
+/// # Errors
+/// Returns an error only when a locally-present config blob cannot be parsed.
+#[cfg(feature = "local")]
+pub async fn fetch_image_os_in_cache_only(
+    image: &str,
+    cache: Arc<Box<dyn BlobCacheBackend>>,
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
+) -> Result<Option<zlayer_spec::OsKind>> {
+    let puller = inspection_puller(cache, local_registry);
+    puller.image_os_in_cache_only(image).await
+}
+
+/// Resolve `image`'s `com.zlayer.runtime` marker from an EXISTING local store
+/// with NO network fallback. The marker counterpart to
+/// [`fetch_image_os_in_cache_only`].
+///
+/// # Errors
+/// Mirrors [`fetch_image_os_in_cache_only`]; infallible in practice.
+#[cfg(feature = "local")]
+pub async fn fetch_image_runtime_marker_in_cache_only(
+    image: &str,
+    cache: Arc<Box<dyn BlobCacheBackend>>,
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
+) -> Result<Option<String>> {
+    let puller = inspection_puller(cache, local_registry);
+    puller.image_runtime_marker_in_cache_only(image).await
 }
 
 #[cfg(test)]
@@ -3938,18 +4297,43 @@ mod tests {
 
     #[test]
     fn manifest_cache_key_is_stable() {
+        // The key stem is the CANONICAL reference, so a bare Docker Hub name is
+        // normalized to its `docker.io/library/...` form (this is the macOS
+        // image-OS-resolution fix: the qualified pull and the bare inspect must
+        // land on the SAME key).
         assert_eq!(
             manifest_cache_key("alpine:latest"),
-            "manifest:alpine:latest"
+            "manifest:docker.io/library/alpine:latest"
         );
+        // An already-qualified ref is unchanged.
+        assert_eq!(
+            manifest_cache_key("docker.io/library/alpine:latest"),
+            "manifest:docker.io/library/alpine:latest"
+        );
+        // A non-parseable input falls back to the raw string (deterministic).
         assert_eq!(manifest_cache_key(""), "manifest:");
+    }
+
+    #[test]
+    fn manifest_cache_key_normalizes_bare_and_qualified_to_same_key() {
+        // This is bug #1 from the live evidence: the VZ-Linux pull wrote the
+        // manifest under the QUALIFIED ref while the composite's inspect queried
+        // the BARE ref. Both must hash to one key.
+        assert_eq!(
+            manifest_cache_key("alpine:latest"),
+            manifest_cache_key("docker.io/library/alpine:latest"),
+        );
+        assert_eq!(
+            manifest_digest_cache_key("alpine:latest"),
+            manifest_digest_cache_key("docker.io/library/alpine:latest"),
+        );
     }
 
     #[test]
     fn manifest_digest_cache_key_is_stable() {
         assert_eq!(
             manifest_digest_cache_key("alpine:latest"),
-            "manifest:digest-alpine:latest"
+            "manifest:digest-docker.io/library/alpine:latest"
         );
     }
 
@@ -3973,5 +4357,255 @@ mod tests {
                 "digest key shape: {digest}"
             );
         }
+    }
+
+    // =========================================================================
+    // Local-first image-OS / runtime-marker inspection (the macOS rate-limit
+    // routing fix). These resolve OS / marker from a pre-seeded blob cache with
+    // NO network access, exercising the real `pull_manifest_inner` →
+    // `try_cached_manifest` → `pull_blob` (cache-hit) path under
+    // `PullPolicy::IfNotPresent`.
+    // =========================================================================
+
+    /// Seed `cache` with a manifest + config blob for `image` whose config
+    /// declares `os = <os>` and the given optional `com.zlayer.runtime` marker.
+    /// Returns the in-memory cache wrapped for `ImagePuller::with_cache`.
+    fn seed_cache_with_os(
+        image: &str,
+        os: &str,
+        runtime_marker: Option<&str>,
+    ) -> Arc<Box<dyn BlobCacheBackend>> {
+        let cache = crate::cache::BlobCache::new().unwrap();
+
+        // Config blob carrying the OS field.
+        let config_json = serde_json::json!({
+            "architecture": "arm64",
+            "os": os,
+            "config": {},
+        });
+        let config_bytes = serde_json::to_vec(&config_json).unwrap();
+        let config_digest = crate::cache::compute_digest(&config_bytes);
+        cache.put(&config_digest, &config_bytes).unwrap();
+
+        let annotations = runtime_marker.map(|m| {
+            let mut a = std::collections::BTreeMap::new();
+            a.insert(crate::ZLAYER_RUNTIME_ANNOTATION.to_string(), m.to_string());
+            a
+        });
+
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            artifact_type: None,
+            config: oci_client::manifest::OciDescriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: config_digest.clone(),
+                size: i64::try_from(config_bytes.len()).unwrap(),
+                urls: None,
+                annotations: None,
+            },
+            layers: vec![],
+            annotations,
+            subject: None,
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_digest = crate::cache::compute_digest(&manifest_bytes);
+
+        // Store under the exact keys the puller reads.
+        cache
+            .put(&manifest_cache_key(image), &manifest_bytes)
+            .unwrap();
+        cache
+            .put(
+                &manifest_digest_cache_key(image),
+                manifest_digest.as_bytes(),
+            )
+            .unwrap();
+
+        Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>)
+    }
+
+    #[tokio::test]
+    async fn image_os_with_policy_resolves_linux_from_local_cache_no_network() {
+        // A locally-cached Linux image must resolve to `OsKind::Linux` purely
+        // from the seeded cache — no network. We use a MUTABLE tag (`:latest`)
+        // on purpose: under `IfNotPresent` the cache is authoritative and NO
+        // remote HEAD revalidation is performed, which is exactly the behaviour
+        // that survives a Docker Hub 429.
+        let image = "docker.io/library/alpine:latest";
+        let cache = seed_cache_with_os(image, "linux", None);
+        let puller = ImagePuller::with_cache(cache);
+
+        let os = puller
+            .image_os_with_policy(image, &RegistryAuth::Anonymous, PullPolicy::IfNotPresent)
+            .await
+            .expect("local-first OS inspection must not error");
+        assert_eq!(os, Some(zlayer_spec::OsKind::Linux));
+    }
+
+    #[cfg(feature = "local")]
+    #[tokio::test]
+    async fn fetch_image_os_in_cache_resolves_linux_no_network() {
+        // Drive the public `fetch_image_os_in_cache` entry point (the one the
+        // composite uses) against a seeded cache and confirm it returns
+        // `Linux` with no network call.
+        let image = "docker.io/library/alpine:latest";
+        let cache = seed_cache_with_os(image, "linux", None);
+
+        let os = fetch_image_os_in_cache(image, None, cache, None)
+            .await
+            .expect("local-first OS inspection must not error");
+        assert_eq!(os, Some(zlayer_spec::OsKind::Linux));
+    }
+
+    #[cfg(feature = "local")]
+    #[tokio::test]
+    async fn fetch_image_runtime_marker_in_cache_resolves_marker_no_network() {
+        let image = "ghcr.io/example/vz-base:1.0";
+        let cache = seed_cache_with_os(image, "linux", Some("vz"));
+
+        let marker = fetch_image_runtime_marker_in_cache(image, None, cache, None)
+            .await
+            .expect("local-first marker inspection must not error");
+        assert_eq!(marker.as_deref(), Some("vz"));
+    }
+
+    // -- Live-bug reproductions ------------------------------------------------
+
+    #[tokio::test]
+    async fn bare_ref_resolves_from_cache_seeded_under_qualified_ref() {
+        // LIVE BUG #1: the VZ-Linux pull wrote the manifest under the QUALIFIED
+        // `docker.io/library/alpine:latest`, but the composite's inspect was
+        // invoked with the BARE `alpine:latest`. With the canonical key
+        // normalization, the bare-ref inspect now hits the qualified-seeded
+        // cache — with NO network call.
+        let cache = seed_cache_with_os("docker.io/library/alpine:latest", "linux", None);
+        let puller = ImagePuller::with_cache(cache);
+
+        let os = puller
+            .image_os_in_cache_only("alpine:latest")
+            .await
+            .expect("bare-ref local inspection must not error");
+        assert_eq!(
+            os,
+            Some(zlayer_spec::OsKind::Linux),
+            "bare `alpine:latest` must resolve from a cache seeded under the qualified ref",
+        );
+    }
+
+    #[cfg(feature = "local")]
+    #[tokio::test]
+    async fn fetch_image_os_in_cache_only_bare_ref_no_network() {
+        // Same bug, driven through the public entry point the composite uses.
+        let cache = seed_cache_with_os("docker.io/library/alpine:latest", "linux", None);
+        let os = fetch_image_os_in_cache_only("alpine:latest", cache, None)
+            .await
+            .expect("local-only inspection must not error");
+        assert_eq!(os, Some(zlayer_spec::OsKind::Linux));
+    }
+
+    #[tokio::test]
+    async fn image_os_in_cache_only_no_network_when_manifest_and_config_present() {
+        // LIVE BUG #2: resolution must succeed with NO network when the
+        // manifest + config are present under `IfNotPresent`. `image_os_in_cache_only`
+        // never touches the network, so a green assertion here proves the
+        // short-circuit. We use a MUTABLE tag on purpose — the cache must be
+        // authoritative without a remote HEAD revalidation (the path that
+        // survives a Docker Hub 429).
+        let image = "docker.io/library/alpine:latest";
+        let cache = seed_cache_with_os(image, "linux", None);
+        let puller = ImagePuller::with_cache(cache);
+
+        let os = puller
+            .image_os_in_cache_only(image)
+            .await
+            .expect("cached manifest+config must resolve OS with no network");
+        assert_eq!(os, Some(zlayer_spec::OsKind::Linux));
+    }
+
+    #[tokio::test]
+    async fn image_os_in_cache_only_returns_none_on_clean_local_miss() {
+        // A genuinely-absent image must be a clean `Ok(None)` (so the composite
+        // can probe the NEXT cache), NOT a network fetch or an error. The cache
+        // is empty, so there is nothing to hit the network with anyway.
+        let cache: Arc<Box<dyn BlobCacheBackend>> = Arc::new(Box::new(
+            crate::cache::BlobCache::new().unwrap(),
+        )
+            as Box<dyn BlobCacheBackend>);
+        let puller = ImagePuller::with_cache(cache);
+
+        let os = puller
+            .image_os_in_cache_only("docker.io/library/absent:latest")
+            .await
+            .expect("a local miss must be Ok(None), never an error");
+        assert_eq!(os, None);
+        // Even on a clean MISS the local-only path must stay offline.
+        assert_eq!(
+            puller.network_call_count(),
+            0,
+            "image_os_in_cache_only must never issue a network call, even on a local miss",
+        );
+    }
+
+    #[tokio::test]
+    async fn image_os_in_cache_only_bare_ref_issues_zero_network_calls() {
+        // The load-bearing regression assertion: the BARE `alpine:latest`
+        // inspect, served from a cache seeded under the QUALIFIED writer key,
+        // must resolve to `Linux` while the network-call spy stays at zero.
+        // This is the exact macOS path that previously re-inspected Docker Hub
+        // and 429'd, misrouting a cached Linux image to a sandbox (exit 127).
+        let cache = seed_cache_with_os("docker.io/library/alpine:latest", "linux", None);
+        let puller = ImagePuller::with_cache(cache);
+
+        let os = puller
+            .image_os_in_cache_only("alpine:latest")
+            .await
+            .expect("bare-ref local inspection must not error");
+
+        assert_eq!(os, Some(zlayer_spec::OsKind::Linux));
+        assert_eq!(
+            puller.network_call_count(),
+            0,
+            "a cached image's OS must resolve with ZERO network calls (no Docker Hub re-inspect)",
+        );
+    }
+
+    #[tokio::test]
+    async fn image_runtime_marker_in_cache_only_bare_ref_zero_network() {
+        // Mirror of the OS path for the `com.zlayer.runtime` annotation: bare
+        // ref, qualified-seeded cache, marker resolved, network spy at zero.
+        let cache = seed_cache_with_os("docker.io/library/alpine:latest", "linux", Some("vz"));
+        let puller = ImagePuller::with_cache(cache);
+
+        let marker = puller
+            .image_runtime_marker_in_cache_only("alpine:latest")
+            .await
+            .expect("bare-ref marker inspection must not error");
+
+        assert_eq!(marker.as_deref(), Some("vz"));
+        assert_eq!(
+            puller.network_call_count(),
+            0,
+            "runtime-marker inspection must resolve from cache with ZERO network calls",
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_key_collides_bare_qualified_and_literal() {
+        // Bug #1, asserted end-to-end: the bare ref, the qualified ref, and the
+        // exact on-disk writer key must all be ONE key. Reader (bare inspect)
+        // and writer (qualified pull) collide → the cache hit lands.
+        assert_eq!(
+            manifest_cache_key("alpine:latest"),
+            "manifest:docker.io/library/alpine:latest",
+        );
+        assert_eq!(
+            manifest_cache_key("docker.io/library/alpine:latest"),
+            "manifest:docker.io/library/alpine:latest",
+        );
+        assert_eq!(
+            manifest_cache_key("alpine:latest"),
+            manifest_cache_key("docker.io/library/alpine:latest"),
+        );
     }
 }

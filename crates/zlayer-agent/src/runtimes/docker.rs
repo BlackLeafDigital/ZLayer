@@ -18,9 +18,9 @@ use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, CreateImageInfo,
-    DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, ContainerWaitResponse,
+    CreateImageInfo, DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect,
+    PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
@@ -607,6 +607,48 @@ fn parse_memory(memory: &str) -> Option<i64> {
 
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     Some((num * multiplier as f64) as i64)
+}
+
+/// Map a single frame from bollard's `wait_container` stream to the
+/// container's exit code.
+///
+/// bollard (0.20) does NOT surface a non-zero exit as `Ok`. Its
+/// `wait_container` adapter rewrites any `ContainerWaitResponse` whose
+/// `status_code > 0` into
+/// [`BollardError::DockerContainerWaitError { error, code }`], where `code`
+/// IS the container's exit code and `error` is frequently empty (the daemon
+/// returns a clean `{"StatusCode":N}` with no `Error` field). A zero exit
+/// arrives as `Ok(ContainerWaitResponse { status_code: 0, .. })`.
+///
+/// Therefore both
+/// - `Ok(resp)`                    → `resp.status_code`
+/// - `DockerContainerWaitError { code, .. }` → `code`
+///
+/// are SUCCESSFUL waits and must yield `Ok(exit_code)`. Only genuine
+/// transport / not-found failures — the stream closing with no frame, or any
+/// other [`BollardError`] variant — are mapped to an [`AgentError`].
+#[allow(clippy::cast_possible_truncation)]
+fn wait_exit_code_from_frame(
+    frame: Option<std::result::Result<ContainerWaitResponse, BollardError>>,
+    container: &str,
+) -> Result<i32> {
+    match frame {
+        // Clean terminal frame: exit code 0 (or any code bollard left as Ok).
+        Some(Ok(resp)) => Ok(resp.status_code as i32),
+        // bollard turns a non-zero (`status_code > 0`) wait result into this
+        // error variant — `code` is the real exit code, NOT a wait failure.
+        Some(Err(BollardError::DockerContainerWaitError { code, .. })) => Ok(code as i32),
+        // Any other bollard error is a genuine transport/daemon failure.
+        Some(Err(e)) => Err(AgentError::NotFound {
+            container: container.to_string(),
+            reason: format!("failed to wait for container: {e}"),
+        }),
+        // Stream closed without yielding a frame at all.
+        None => Err(AgentError::NotFound {
+            container: container.to_string(),
+            reason: "wait stream closed unexpectedly".to_string(),
+        }),
+    }
 }
 
 #[async_trait::async_trait]
@@ -1580,21 +1622,10 @@ impl Runtime for DockerRuntime {
 
         let mut stream = self.docker.wait_container(&name, Some(options));
 
-        // Get the first (and only) result from the wait stream
-        let wait_response = stream
-            .next()
-            .await
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.clone(),
-                reason: "wait stream closed unexpectedly".to_string(),
-            })?
-            .map_err(|e| AgentError::NotFound {
-                container: name.clone(),
-                reason: format!("failed to wait for container: {e}"),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let exit_code = wait_response.status_code as i32;
+        // Get the first (and only) result from the wait stream. bollard maps a
+        // non-zero exit into `DockerContainerWaitError { code, .. }`, so the
+        // exit-code extraction is centralized in `wait_exit_code_from_frame`.
+        let exit_code = wait_exit_code_from_frame(stream.next().await, &name)?;
 
         tracing::info!(container = %name, exit_code = exit_code, "container exited");
 
@@ -1723,20 +1754,10 @@ impl Runtime for DockerRuntime {
 
         let mut stream = self.docker.wait_container(&name, Some(options));
 
-        let wait_response = stream
-            .next()
-            .await
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.clone(),
-                reason: "wait stream closed unexpectedly".to_string(),
-            })?
-            .map_err(|e| AgentError::NotFound {
-                container: name.clone(),
-                reason: format!("failed to wait for container: {e}"),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let exit_code_from_wait = wait_response.status_code as i32;
+        // bollard surfaces a non-zero exit as `DockerContainerWaitError`, which
+        // carries the real exit code; `wait_exit_code_from_frame` normalizes
+        // both that and the clean `Ok` (exit 0) frame into an exit code.
+        let exit_code_from_wait = wait_exit_code_from_frame(stream.next().await, &name)?;
 
         // For `Removed`, the container is gone by definition: we cannot
         // inspect it. Emit a minimal `Exited` outcome carrying just the
@@ -3669,6 +3690,63 @@ mod tests {
     fn test_container_name() {
         let id = ContainerId::new("myservice".to_string(), 1);
         assert_eq!(container_name(&id), "zlayer-myservice-1");
+    }
+
+    #[test]
+    fn wait_exit_code_zero_is_ok() {
+        // Exit 0 arrives as a clean `Ok(ContainerWaitResponse)`.
+        let frame = Some(Ok(ContainerWaitResponse {
+            status_code: 0,
+            error: None,
+        }));
+        assert_eq!(wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(), 0);
+    }
+
+    #[test]
+    fn wait_exit_code_nonzero_error_variant_is_ok() {
+        // bollard rewrites a non-zero exit into `DockerContainerWaitError`
+        // (often with an EMPTY `error` string). This is a successful wait whose
+        // exit code is `code`, NOT a failure.
+        let frame = Some(Err(BollardError::DockerContainerWaitError {
+            error: String::new(),
+            code: 42,
+        }));
+        assert_eq!(
+            wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn wait_exit_code_nonzero_with_message_is_ok() {
+        // Even when the daemon includes an `Error.Message`, a non-zero exit is
+        // still the exit code, not a transport failure.
+        let frame = Some(Err(BollardError::DockerContainerWaitError {
+            error: "container exited".to_string(),
+            code: 137,
+        }));
+        assert_eq!(
+            wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(),
+            137
+        );
+    }
+
+    #[test]
+    fn wait_exit_code_closed_stream_errors() {
+        // A stream that yields no frame at all is a genuine failure.
+        let err = wait_exit_code_from_frame(None, "zlayer-svc-0").unwrap_err();
+        assert!(matches!(err, AgentError::NotFound { .. }));
+    }
+
+    #[test]
+    fn wait_exit_code_other_bollard_error_errors() {
+        // A non-wait bollard error is a real transport/daemon failure.
+        let frame = Some(Err(BollardError::DockerResponseServerError {
+            status_code: 404,
+            message: "no such container".to_string(),
+        }));
+        let err = wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap_err();
+        assert!(matches!(err, AgentError::NotFound { .. }));
     }
 
     #[test]
