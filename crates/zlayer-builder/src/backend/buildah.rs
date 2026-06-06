@@ -12,7 +12,10 @@ use tracing::{debug, info};
 
 use crate::buildah::{BuildahCommand, BuildahExecutor, DockerfileTranslator};
 use crate::builder::{BuildOptions, BuiltImage, PullBaseMode, RegistryAuth};
-use crate::dockerfile::{Dockerfile, DockerfileFromTarget, Instruction, RunMount, Stage};
+use crate::dockerfile::{
+    expand_variables, Dockerfile, DockerfileFromTarget, EnvInstruction, Instruction, RunMount,
+    ShellOrExec, Stage,
+};
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 
@@ -390,6 +393,24 @@ impl BuildBackend for BuildahBackend {
         for (stage_idx, stage) in stages.iter().enumerate() {
             let is_final_stage = stage_idx == stages.len() - 1;
 
+            // Build-time variable bindings for this stage, mirroring the macOS
+            // sandbox builder so the buildah CLI path actually expands `${ARG}`
+            // / build args (e.g. `${FORGEJO_TOKEN}`) in
+            // ENV/RUN/COPY/ADD/WORKDIR/USER/LABEL instead of handing them to
+            // buildah literally. ARG scope is per-stage (Docker semantics): we
+            // reset to the passed build args + the global (pre-FROM) ARG
+            // defaults at each stage, then accumulate stage-local ARG/ENV
+            // bindings as we walk the instructions.
+            let mut arg_values: HashMap<String, String> = options.build_args.clone();
+            for global_arg in &dockerfile.global_args {
+                if !arg_values.contains_key(&global_arg.name) {
+                    if let Some(default) = &global_arg.default {
+                        arg_values.insert(global_arg.name.clone(), default.clone());
+                    }
+                }
+            }
+            let mut env_values: HashMap<String, String> = HashMap::new();
+
             Self::send_event(
                 event_tx.as_ref(),
                 BuildEvent::StageStarted {
@@ -525,6 +546,17 @@ impl BuildBackend for BuildahBackend {
                 } else {
                     instruction_ref
                 };
+
+                // Expand build-time variables (`${ARG}` / `$ENV`) using the
+                // bindings accumulated for this stage so far, and fold ARG/ENV
+                // instructions into those bindings for subsequent instructions.
+                // This is what makes build args reach the buildah build: without
+                // it, `RUN ... ${FORGEJO_TOKEN}`, `ENV TOKEN=${FORGEJO_TOKEN}`,
+                // `COPY ${SRC} ...` and friends were handed to buildah
+                // unexpanded.
+                let expanded_instruction =
+                    expand_instruction(instruction_ref, &mut arg_values, &mut env_values);
+                let instruction_ref = &expanded_instruction;
 
                 let is_run_instruction = matches!(instruction_ref, Instruction::Run(_));
                 let max_attempts = if is_run_instruction {
@@ -804,6 +836,95 @@ impl BuildBackend for BuildahBackend {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Expand `${VAR}` / `$VAR` references in an instruction's build-time-expandable
+/// fields using the current ARG + ENV bindings, and fold `ARG` / `ENV`
+/// instructions into those bindings so later instructions observe them.
+///
+/// Mirrors the macOS sandbox builder (`sandbox_builder::execute_instruction`):
+/// Docker performs build-time variable substitution on ENV/COPY/ADD/WORKDIR/
+/// USER/LABEL, and we additionally expand the RUN command so build args reach
+/// the executed shell. Without this the buildah CLI backend handed
+/// `${FORGEJO_TOKEN}` (and any other build arg) straight to buildah unexpanded —
+/// the bug this fixes. The expansion engine ([`expand_variables`]) is shared
+/// with the sandbox path so both backends resolve a Dockerfile identically.
+fn expand_instruction(
+    instruction: &Instruction,
+    arg_values: &mut HashMap<String, String>,
+    env_values: &mut HashMap<String, String>,
+) -> Instruction {
+    match instruction {
+        Instruction::Run(run) => {
+            let mut run = run.clone();
+            run.command = match &run.command {
+                ShellOrExec::Shell(s) => {
+                    ShellOrExec::Shell(expand_variables(s, arg_values, env_values))
+                }
+                ShellOrExec::Exec(args) => ShellOrExec::Exec(
+                    args.iter()
+                        .map(|a| expand_variables(a, arg_values, env_values))
+                        .collect(),
+                ),
+            };
+            Instruction::Run(run)
+        }
+        Instruction::Env(env) => {
+            let mut vars = HashMap::with_capacity(env.vars.len());
+            for (key, value) in &env.vars {
+                let expanded = expand_variables(value, arg_values, env_values);
+                env_values.insert(key.clone(), expanded.clone());
+                vars.insert(key.clone(), expanded);
+            }
+            Instruction::Env(EnvInstruction { vars })
+        }
+        Instruction::Copy(copy) => {
+            let mut copy = copy.clone();
+            copy.sources = copy
+                .sources
+                .iter()
+                .map(|s| expand_variables(s, arg_values, env_values))
+                .collect();
+            copy.destination = expand_variables(&copy.destination, arg_values, env_values);
+            Instruction::Copy(copy)
+        }
+        Instruction::Add(add) => {
+            let mut add = add.clone();
+            add.sources = add
+                .sources
+                .iter()
+                .map(|s| expand_variables(s, arg_values, env_values))
+                .collect();
+            add.destination = expand_variables(&add.destination, arg_values, env_values);
+            Instruction::Add(add)
+        }
+        Instruction::Workdir(dir) => {
+            Instruction::Workdir(expand_variables(dir, arg_values, env_values))
+        }
+        Instruction::User(user) => {
+            Instruction::User(expand_variables(user, arg_values, env_values))
+        }
+        Instruction::Label(labels) => {
+            let expanded = labels
+                .iter()
+                .map(|(k, v)| (k.clone(), expand_variables(v, arg_values, env_values)))
+                .collect();
+            Instruction::Label(expanded)
+        }
+        Instruction::Arg(arg) => {
+            // `ARG NAME=default` contributes its (expanded) default only when
+            // the build did not already pass a value for it; a bare `ARG NAME`
+            // leaves the variable unset (preserved as-is by `expand_variables`).
+            if !arg_values.contains_key(&arg.name) {
+                if let Some(default) = &arg.default {
+                    let expanded = expand_variables(default, arg_values, env_values);
+                    arg_values.insert(arg.name.clone(), expanded);
+                }
+            }
+            instruction.clone()
+        }
+        other => other.clone(),
+    }
+}
+
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let duration = SystemTime::now()
@@ -893,5 +1014,61 @@ mod tests {
 
         tracker.record("key".to_string(), "base".to_string(), true);
         assert!(tracker.is_cached("key", "base"));
+    }
+
+    /// Regression: the buildah CLI backend used to hand `${ARG}` / build args to
+    /// buildah unexpanded (only the macOS sandbox path substituted them), so
+    /// `${FORGEJO_TOKEN}` never resolved on the Linux/CI build. `expand_instruction`
+    /// must resolve build args in RUN/ENV/COPY and track ARG/ENV bindings for
+    /// later instructions — matching the sandbox builder.
+    #[test]
+    fn expand_instruction_resolves_build_args_in_run_env_copy() {
+        use crate::dockerfile::{ArgInstruction, CopyInstruction, EnvInstruction, RunInstruction};
+
+        let mut args: HashMap<String, String> = HashMap::new();
+        args.insert("FORGEJO_TOKEN".to_string(), "s3cr3t".to_string());
+        let mut env: HashMap<String, String> = HashMap::new();
+
+        // RUN ${FORGEJO_TOKEN} — the exact bug: previously passed through literally.
+        let run = Instruction::Run(RunInstruction::shell(
+            "echo //forge/:_authToken=${FORGEJO_TOKEN} > .npmrc",
+        ));
+        let Instruction::Run(expanded) = expand_instruction(&run, &mut args, &mut env) else {
+            panic!("expected Run");
+        };
+        let ShellOrExec::Shell(cmd) = expanded.command else {
+            panic!("expected shell form");
+        };
+        assert!(
+            cmd.contains("s3cr3t"),
+            "RUN must expand the build arg: {cmd}"
+        );
+        assert!(
+            !cmd.contains("FORGEJO_TOKEN"),
+            "literal var must be gone: {cmd}"
+        );
+
+        // ENV TOKEN=${FORGEJO_TOKEN} — expands AND records into env_values.
+        let env_inst = Instruction::Env(EnvInstruction::new("TOKEN", "${FORGEJO_TOKEN}"));
+        let Instruction::Env(e) = expand_instruction(&env_inst, &mut args, &mut env) else {
+            panic!("expected Env");
+        };
+        assert_eq!(e.vars.get("TOKEN").map(String::as_str), Some("s3cr3t"));
+        assert_eq!(env.get("TOKEN").map(String::as_str), Some("s3cr3t"));
+
+        // COPY app /opt/${TOKEN} — uses the ENV binding just set above.
+        let copy = Instruction::Copy(CopyInstruction::new(
+            vec!["app".to_string()],
+            "/opt/${TOKEN}".to_string(),
+        ));
+        let Instruction::Copy(c) = expand_instruction(&copy, &mut args, &mut env) else {
+            panic!("expected Copy");
+        };
+        assert_eq!(c.destination, "/opt/s3cr3t");
+
+        // ARG EXTRA=fallback — default only fills an unset arg.
+        let arg = Instruction::Arg(ArgInstruction::with_default("EXTRA", "fallback"));
+        let _ = expand_instruction(&arg, &mut args, &mut env);
+        assert_eq!(args.get("EXTRA").map(String::as_str), Some("fallback"));
     }
 }

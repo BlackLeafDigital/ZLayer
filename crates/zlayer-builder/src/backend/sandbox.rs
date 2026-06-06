@@ -875,6 +875,12 @@ mod sandbox_push {
 
 #[cfg(not(feature = "cache"))]
 mod sandbox_push {
+    // These stubs intentionally keep the `async` signature of their
+    // `cache`-enabled counterparts so call sites `.await` them identically
+    // regardless of the feature flag; they just return `NotSupported`
+    // synchronously when the `cache` feature is off.
+    #![allow(clippy::unused_async)]
+
     use std::path::Path;
 
     use crate::builder::RegistryAuth;
