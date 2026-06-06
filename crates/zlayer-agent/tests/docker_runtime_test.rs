@@ -72,6 +72,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         image: ImageSpec {
             name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
@@ -282,7 +283,12 @@ async fn test_pull_image_if_not_present() {
 
     let result = tokio::time::timeout(
         SHORT_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::IfNotPresent, None),
+        runtime.pull_image_with_policy(
+            TEST_IMAGE,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        ),
     )
     .await;
 
@@ -915,7 +921,12 @@ async fn test_pull_never_policy() {
 
     println!("Testing Never pull policy with non-existent image");
     let result = runtime
-        .pull_image_with_policy(nonexistent_image, PullPolicy::Never, None)
+        .pull_image_with_policy(
+            nonexistent_image,
+            PullPolicy::Never,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
         .await;
 
     // Never policy should return Ok immediately without pulling
@@ -938,7 +949,12 @@ async fn test_pull_always_policy() {
     println!("Testing Always pull policy");
     let result = tokio::time::timeout(
         LONG_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::Always, None),
+        runtime.pull_image_with_policy(
+            TEST_IMAGE,
+            PullPolicy::Always,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        ),
     )
     .await;
 

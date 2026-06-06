@@ -905,6 +905,7 @@ fn translate_service_only(body: &DockerServiceSpec) -> Result<ZServiceSpec, Stri
         image: ImageSpec {
             name: image_ref,
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources: zlayer_spec::ResourcesSpec::default(),
         env,
@@ -1099,6 +1100,7 @@ mod tests {
             image: ImageSpec {
                 name: image.parse().expect("valid image"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
             resources: zlayer_spec::ResourcesSpec::default(),
             env: HashMap::from([

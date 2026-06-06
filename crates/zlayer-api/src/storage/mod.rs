@@ -159,6 +159,7 @@ mod tests {
                 image: ImageSpec {
                     name: "test:latest".parse().expect("valid image reference"),
                     pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
+                    source_policy: None,
                 },
                 resources: zlayer_spec::ResourcesSpec::default(),
                 env: HashMap::default(),

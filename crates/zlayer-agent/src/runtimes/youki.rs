@@ -537,15 +537,17 @@ impl YoukiRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
     ) -> Result<Vec<(Vec<u8>, String)>> {
-        // Use the shared blob cache instead of opening a new one each time
-        let puller = {
-            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
-            if let Some(ref registry) = self.local_registry {
-                p.with_local_registry(registry.clone())
-            } else {
-                p
-            }
-        };
+        // Use the shared blob cache instead of opening a new one each time.
+        // The central constructor wires the S3 tier + default registry from
+        // env; no per-image source is in scope here, so use the default.
+        let mut puller = zlayer_registry::ImagePuller::from_env_for_runtime(
+            self.blob_cache.clone(),
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await;
+        if let Some(ref registry) = self.local_registry {
+            puller = puller.with_local_registry(registry.clone());
+        }
         let auth = self.auth_resolver.resolve(image);
 
         if matches!(policy, zlayer_spec::PullPolicy::Never) {
@@ -721,8 +723,13 @@ impl Runtime for YoukiRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            zlayer_spec::PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull an image to local storage with a specific pull policy
@@ -730,33 +737,41 @@ impl Runtime for YoukiRuntime {
     /// This downloads image layers to the blob cache. Layers are extracted
     /// per-container in `create_container` to avoid race conditions.
     ///
-    /// The `_auth` parameter is accepted for trait conformance (§3.10) but
-    /// currently ignored: `zlayer-registry` resolves credentials through the
-    /// existing `AuthResolver` (hostname lookup in the persistent secret
-    /// store). Callers that need inline auth should use the Docker runtime.
+    /// Caller-supplied `auth_in` (inline spec creds, or a daemon-resolved stored
+    /// credential by registry host) is HONORED: it wins over the hostname-based
+    /// [`AuthResolver`], which is only the fallback when no auth is passed. This
+    /// is the registry-auth passthrough — without it, an authenticated private
+    /// pull resolved by the daemon handler was silently dropped here and failed.
     #[instrument(
-        skip(self, _auth),
+        skip(self, auth_in, source),
         fields(
             otel.name = "image.pull",
             container.image.name = %image,
             pull_policy = ?policy,
+            source_policy = ?source,
         )
     )]
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: zlayer_spec::PullPolicy,
-        _auth: Option<&RegistryAuth>,
+        auth_in: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
-        let puller = {
-            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
-            if let Some(ref registry) = self.local_registry {
-                p.with_local_registry(registry.clone())
-            } else {
-                p
-            }
+        // Central constructor: wires the S3 tier + default registry from env AND
+        // sets the per-image source policy. Chain the local registry when present.
+        let mut puller =
+            zlayer_registry::ImagePuller::from_env_for_runtime(self.blob_cache.clone(), source)
+                .await;
+        if let Some(ref registry) = self.local_registry {
+            puller = puller.with_local_registry(registry.clone());
+        }
+        // Honor caller-supplied auth (inline / daemon-resolved by host); fall
+        // back to the hostname-based AuthResolver when none was passed.
+        let auth = match auth_in {
+            Some(a) => zlayer_registry::spec_auth_to_oci(Some(a)),
+            None => self.auth_resolver.resolve(image),
         };
-        let auth = self.auth_resolver.resolve(image);
 
         // For Never policy, skip pulling layers from the remote, but STILL
         // fetch the image config from the local blob cache (populated by a
@@ -2088,8 +2103,21 @@ impl Runtime for YoukiRuntime {
                 .flatten()
                 .and_then(|bytes| String::from_utf8(bytes).ok());
 
+            // Surface the user's ORIGINAL image ref when one was recorded at
+            // pull time; fall back to the canonical reference. The orig-key is
+            // idempotent on an already-canonical ref (same invariant the
+            // `manifest_digest_cache_key(&reference)` lookup above relies on).
+            let display_ref = self
+                .blob_cache
+                .get(&zlayer_registry::manifest_orig_cache_key(&reference))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| reference.clone());
+
             images.push(ImageInfo {
-                reference,
+                reference: display_ref,
                 digest,
                 size_bytes,
             });
@@ -2890,12 +2918,11 @@ impl Runtime for YoukiRuntime {
     /// `current` cannot be reported until the puller gains a streaming
     /// callback.
     ///
-    /// `auth` is currently ignored on this backend — youki resolves
-    /// credentials through the persistent secret store via
-    /// [`zlayer_core::AuthResolver`], matching the semantics of
-    /// [`Self::pull_image_with_policy`].
+    /// Caller-supplied `auth_in` is HONORED (same passthrough as
+    /// [`Self::pull_image_with_policy`]); the hostname-based
+    /// [`zlayer_core::AuthResolver`] is the fallback when none is passed.
     #[instrument(
-        skip(self, _auth),
+        skip(self, auth_in),
         fields(
             otel.name = "image.pull.stream",
             container.image.name = %image,
@@ -2904,21 +2931,26 @@ impl Runtime for YoukiRuntime {
     async fn pull_image_stream(
         &self,
         image: &str,
-        _auth: Option<&RegistryAuth>,
+        auth_in: Option<&RegistryAuth>,
     ) -> Result<PullProgressStream> {
         let (tx, rx) = mpsc::channel::<Result<PullProgress>>(32);
 
-        // Build the puller eagerly (cheap clone of cache + optional
-        // local registry) so the spawned task owns everything it needs.
-        let puller = {
-            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
-            if let Some(ref registry) = self.local_registry {
-                p.with_local_registry(registry.clone())
-            } else {
-                p
-            }
+        // Build the puller eagerly (cheap clone of cache + optional local
+        // registry) so the spawned task owns everything it needs. The central
+        // constructor wires the S3 tier + default registry from env; the
+        // streaming path has no per-image source in scope, so use the default.
+        let mut puller = zlayer_registry::ImagePuller::from_env_for_runtime(
+            self.blob_cache.clone(),
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await;
+        if let Some(ref registry) = self.local_registry {
+            puller = puller.with_local_registry(registry.clone());
+        }
+        let auth = match auth_in {
+            Some(a) => zlayer_registry::spec_auth_to_oci(Some(a)),
+            None => self.auth_resolver.resolve(image),
         };
-        let auth = self.auth_resolver.resolve(image);
         let image_owned = image.to_string();
 
         tokio::spawn(async move {

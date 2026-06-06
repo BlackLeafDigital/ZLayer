@@ -167,7 +167,12 @@ impl ServiceInstance {
         let policy = self.spec.image.pull_policy;
 
         self.runtime
-            .pull_image_with_policy(&image_str, policy, None)
+            .pull_image_with_policy(
+                &image_str,
+                policy,
+                None,
+                self.spec.image.source_policy.unwrap_or_default(),
+            )
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: self.spec.image.name.to_string(),

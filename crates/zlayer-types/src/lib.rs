@@ -171,6 +171,75 @@ pub fn image_str_is_unqualified(s: &str) -> bool {
     true
 }
 
+/// Candidate `(name, reference)` spellings for the LITERAL image string,
+/// in priority order, for cross-spelling lookups in a local store.
+///
+/// This is pure string work — it NEVER canonicalizes the reference or
+/// invents a registry host. It exists so a store that extracted an image
+/// under one spelling (e.g. `docker.io/library/alpine:latest`) can still be
+/// found when the user later asks for an equivalent spelling (`alpine:latest`)
+/// WITHOUT rewriting the storage key to a canonical form. The `reference`
+/// (tag or digest body) is split off once and shared across every candidate.
+///
+/// Order (first match wins; duplicates removed):
+/// 1. The primary name as given.
+/// 2. With `docker.io/` prefix stripped.
+/// 3. With `docker.io/library/` prefix stripped.
+/// 4. With `library/` prefix stripped.
+/// 5. With `library/` prefix added (only when the primary name has no `/`).
+/// 6. The bare last path segment.
+#[must_use]
+pub fn image_ref_candidates(image: &str) -> Vec<(String, String)> {
+    // Split off digest/tag to get the primary name + reference.
+    let (primary, reference) = if let Some(at_pos) = image.find('@') {
+        (image[..at_pos].to_string(), image[at_pos + 1..].to_string())
+    } else if let Some(colon_pos) = image.rfind(':') {
+        let potential_tag = &image[colon_pos + 1..];
+        if !potential_tag.contains('/') && !potential_tag.is_empty() {
+            (image[..colon_pos].to_string(), potential_tag.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        }
+    } else {
+        (image.to_string(), "latest".to_string())
+    };
+
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push = |name: String| {
+        if seen.insert(name.clone()) {
+            candidates.push((name, reference.clone()));
+        }
+    };
+
+    // 1. Primary name as-is.
+    push(primary.clone());
+    // 2. Strip `docker.io/` prefix.
+    if let Some(rest) = primary.strip_prefix("docker.io/") {
+        push(rest.to_string());
+    }
+    // 3. Strip `docker.io/library/` prefix.
+    if let Some(rest) = primary.strip_prefix("docker.io/library/") {
+        push(rest.to_string());
+    }
+    // 4. Strip `library/` prefix.
+    if let Some(rest) = primary.strip_prefix("library/") {
+        push(rest.to_string());
+    }
+    // 5. Add `library/` prefix when the primary has no `/` at all.
+    if !primary.contains('/') {
+        push(format!("library/{primary}"));
+    }
+    // 6. Bare last path segment.
+    if let Some(last) = primary.rsplit('/').next() {
+        if !last.is_empty() {
+            push(last.to_string());
+        }
+    }
+
+    candidates
+}
+
 impl std::str::FromStr for ImageRef {
     type Err = <ImageReference as std::str::FromStr>::Err;
 

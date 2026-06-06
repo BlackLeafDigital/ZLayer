@@ -28,6 +28,166 @@ pub struct TunnelInstallArgs<'a> {
     pub disabled: bool,
 }
 
+/// Idempotently inject (or update) a single environment entry in the installed
+/// daemon service unit so the daemon picks it up on its next start.
+///
+/// Resolves the SAME unit/plist path that `daemon install` writes to (launchd
+/// plist on macOS, systemd unit on Linux), edits it in place, and returns
+/// `Ok(())`. If no installed unit is found (a dev / unmanaged daemon), returns
+/// an error describing the situation so the caller can print actionable
+/// guidance rather than silently writing to a location nothing reads.
+///
+/// The caller is responsible for telling the user to restart the daemon for the
+/// change to take effect.
+pub(crate) fn set_daemon_env_var(key: &str, value: &str) -> Result<()> {
+    let daemon_name = crate::cli::resolve_daemon_name(None);
+
+    #[cfg(target_os = "macos")]
+    {
+        let (plist_dir, _target) = launchd_context()?;
+        let path = plist_path_for(&plist_dir, &daemon_name);
+        if !path.exists() {
+            bail!(
+                "no installed launchd plist at {} (daemon not installed as a service?)",
+                path.display()
+            );
+        }
+        let plist = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let updated = upsert_plist_env_var(&plist, key, value)?;
+        std::fs::write(&path, &updated)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let path = unit_path(&daemon_name);
+        if !path.exists() {
+            bail!(
+                "no installed systemd unit at {} (daemon not installed as a service?)",
+                path.display()
+            );
+        }
+        let unit = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let updated = upsert_systemd_env_var(&unit, key, value)?;
+        std::fs::write(&path, &updated)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (key, value, daemon_name);
+        bail!("setting daemon environment variables is not supported on this platform");
+    }
+}
+
+/// Insert or replace one `<key>/<string>` pair inside the `EnvironmentVariables`
+/// dict of a launchd plist. If the dict is absent, it is created just before the
+/// closing `</dict>` of the top-level plist dict.
+#[cfg(target_os = "macos")]
+fn upsert_plist_env_var(plist: &str, key: &str, value: &str) -> Result<String> {
+    let key_line = format!("<key>{key}</key>");
+
+    // If the EnvironmentVariables dict already declares this key, replace the
+    // immediately-following <string>…</string> value.
+    if let Some(key_pos) = plist.find(&key_line) {
+        // Only treat it as the env entry if an EnvironmentVariables dict exists
+        // and this key sits after it (guards against a same-named top-level key,
+        // of which there are none today, but stay defensive).
+        let after_key = &plist[key_pos + key_line.len()..];
+        if let Some(open_rel) = after_key.find("<string>") {
+            if let Some(close_rel) = after_key.find("</string>") {
+                if open_rel < close_rel {
+                    let open_abs = key_pos + key_line.len() + open_rel + "<string>".len();
+                    let close_abs = key_pos + key_line.len() + close_rel;
+                    let mut out = String::with_capacity(plist.len() + value.len());
+                    out.push_str(&plist[..open_abs]);
+                    out.push_str(value);
+                    out.push_str(&plist[close_abs..]);
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    let entry = format!("        <key>{key}</key>\n        <string>{value}</string>");
+
+    // Existing EnvironmentVariables dict: append the entry before its </dict>.
+    if let Some(ev_pos) = plist.find("<key>EnvironmentVariables</key>") {
+        let after_ev = &plist[ev_pos..];
+        if let Some(dict_open_rel) = after_ev.find("<dict>") {
+            let dict_open_abs = ev_pos + dict_open_rel + "<dict>".len();
+            if let Some(dict_close_rel) = plist[dict_open_abs..].find("</dict>") {
+                let dict_close_abs = dict_open_abs + dict_close_rel;
+                let mut out = String::with_capacity(plist.len() + entry.len() + 2);
+                out.push_str(&plist[..dict_close_abs]);
+                out.push_str(&entry);
+                out.push('\n');
+                out.push_str("    ");
+                out.push_str(&plist[dict_close_abs..]);
+                return Ok(out);
+            }
+        }
+        bail!("malformed EnvironmentVariables dict in installed plist");
+    }
+
+    // No EnvironmentVariables dict: create one before the final </dict> of the
+    // top-level plist dict.
+    let block = format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entry}\n    </dict>\n");
+    if let Some(last_dict_close) = plist.rfind("</dict>") {
+        let mut out = String::with_capacity(plist.len() + block.len());
+        out.push_str(&plist[..last_dict_close]);
+        out.push_str(&block);
+        out.push_str(&plist[last_dict_close..]);
+        return Ok(out);
+    }
+    bail!("malformed plist: no closing </dict> found");
+}
+
+/// Insert or replace one `Environment=KEY=value` line in the `[Service]` section
+/// of a systemd unit.
+#[cfg(target_os = "linux")]
+fn upsert_systemd_env_var(unit: &str, key: &str, value: &str) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let prefix = format!("Environment={key}=");
+    let new_line = format!("Environment={key}={value}");
+
+    let mut out = String::with_capacity(unit.len() + new_line.len() + 1);
+    let mut replaced = false;
+    for line in unit.lines() {
+        if line.trim_start().starts_with(&prefix) {
+            out.push_str(&new_line);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if replaced {
+        return Ok(out);
+    }
+
+    // Not present yet: append under the [Service] section header.
+    let mut result = String::with_capacity(unit.len() + new_line.len() + 1);
+    let mut injected = false;
+    for line in unit.lines() {
+        writeln!(result, "{line}").unwrap();
+        if !injected && line.trim() == "[Service]" {
+            writeln!(result, "{new_line}").unwrap();
+            injected = true;
+        }
+    }
+    if !injected {
+        bail!("malformed systemd unit: no [Service] section found");
+    }
+    Ok(result)
+}
+
 /// Write `password` to `<data_dir>/.bootstrap_password` with mode 0600 on Unix
 /// and return the path. Used by the `--admin-password*` flags and the
 /// interactive prompt.

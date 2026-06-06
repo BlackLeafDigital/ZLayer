@@ -109,7 +109,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 
 # HTTP
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["form"] }
 base64 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }

@@ -830,6 +830,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
                 Some("never") => PullPolicy::Never,
                 _ => PullPolicy::IfNotPresent,
             },
+            source_policy: None,
         },
         resources,
         env: request.env.clone(),
@@ -1500,7 +1501,12 @@ async fn create_container_local(
     .await?;
     state
         .runtime
-        .pull_image_with_policy(&request.image, pull_policy, resolved_auth.as_ref())
+        .pull_image_with_policy(
+            &request.image,
+            pull_policy,
+            resolved_auth.as_ref(),
+            spec.image.source_policy.unwrap_or_default(),
+        )
         .await
         .map_err(|e| {
             ApiError::Internal(format!("Failed to pull image '{}': {e}", request.image))
@@ -2303,6 +2309,135 @@ pub async fn kill_container(
         .publish(ContainerEvent::die(hex_id, labels, None, Some(reason)));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Interactive stdin (host -> guest pipeline for `zlayer run -it`)
+// ---------------------------------------------------------------------------
+
+/// Write a chunk of raw stdin bytes to a running container's main process.
+///
+/// Powers the host→guest direction of an interactive (`-it`) session: the CLI's
+/// raw-mode terminal reader streams chunks here, the daemon forwards them to the
+/// runtime ([`Runtime::write_stdin`]), and the VZ-Linux runtime relays each as a
+/// `Msg::Stdin` frame to the in-guest agent which pipes it to the workload.
+///
+/// The request body is the raw bytes to write (`application/octet-stream`); an
+/// empty body is a no-op success. Use `DELETE /api/v1/containers/{id}/stdin` to
+/// signal end-of-input (Ctrl-D).
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime does
+/// not support interactive stdin, and 500 for other runtime errors.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/stdin",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body(content = Vec<u8>, description = "Raw stdin bytes", content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "Stdin chunk accepted"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support interactive stdin"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn write_container_stdin(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    // An empty body carries no bytes; treat it as a no-op so callers can flush
+    // without special-casing.
+    if body.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    state
+        .runtime
+        .write_stdin(&container_id, &body)
+        .await
+        .map_err(map_stdin_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Signal end-of-input (close stdin) for a running container.
+///
+/// Powers Ctrl-D / detach for an interactive session: the CLI calls this once
+/// the host terminal reaches EOF, the daemon forwards to the runtime
+/// ([`Runtime::close_stdin`]), and the VZ-Linux runtime drops its stdin sender
+/// so the drain task emits a final `Msg::StdinEof` to the guest.
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime does
+/// not support interactive stdin, and 500 for other runtime errors.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/containers/{id}/stdin",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 204, description = "Stdin closed"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support interactive stdin"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn close_container_stdin(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    state
+        .runtime
+        .close_stdin(&container_id)
+        .await
+        .map_err(map_stdin_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map a runtime stdin error onto the right HTTP status: 404 for a vanished
+/// container, 501 for runtimes that don't implement interactive stdin, 500
+/// otherwise.
+fn map_stdin_error(e: zlayer_agent::AgentError) -> ApiError {
+    match e {
+        zlayer_agent::AgentError::NotFound { reason, .. } => {
+            ApiError::NotFound(format!("Container not found: {reason}"))
+        }
+        zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(format!(
+            "Runtime does not support interactive stdin: {reason}"
+        )),
+        other => ApiError::Internal(format!("Failed to write stdin: {other}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4752,8 +4887,11 @@ mod tests {
             image: &str,
             policy: zlayer_spec::PullPolicy,
             auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
         ) -> zlayer_agent::error::Result<()> {
-            self.inner.pull_image_with_policy(image, policy, auth).await
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
         }
         async fn create_container(
             &self,
@@ -4942,8 +5080,11 @@ mod tests {
                 image: &str,
                 policy: zlayer_spec::PullPolicy,
                 auth: Option<&zlayer_spec::RegistryAuth>,
+                source: zlayer_spec::SourcePolicy,
             ) -> AgentResult<()> {
-                self.inner.pull_image_with_policy(image, policy, auth).await
+                self.inner
+                    .pull_image_with_policy(image, policy, auth, source)
+                    .await
             }
             async fn create_container(
                 &self,
@@ -5119,8 +5260,11 @@ mod tests {
                 image: &str,
                 policy: zlayer_spec::PullPolicy,
                 auth: Option<&zlayer_spec::RegistryAuth>,
+                source: zlayer_spec::SourcePolicy,
             ) -> AgentResult<()> {
-                self.inner.pull_image_with_policy(image, policy, auth).await
+                self.inner
+                    .pull_image_with_policy(image, policy, auth, source)
+                    .await
             }
             async fn create_container(
                 &self,
@@ -6083,6 +6227,7 @@ mod tests {
                 _image: &str,
                 _policy: zlayer_spec::PullPolicy,
                 _auth: Option<&zlayer_spec::RegistryAuth>,
+                _source: zlayer_spec::SourcePolicy,
             ) -> std::result::Result<(), zlayer_agent::AgentError> {
                 Ok(())
             }
@@ -6263,8 +6408,11 @@ mod tests {
             image: &str,
             policy: zlayer_spec::PullPolicy,
             auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
         ) -> zlayer_agent::error::Result<()> {
-            self.inner.pull_image_with_policy(image, policy, auth).await
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
         }
         async fn create_container(
             &self,
@@ -6745,8 +6893,11 @@ mod tests {
             image: &str,
             policy: zlayer_spec::PullPolicy,
             auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
         ) -> zlayer_agent::error::Result<()> {
-            self.inner.pull_image_with_policy(image, policy, auth).await
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
         }
         async fn create_container(
             &self,

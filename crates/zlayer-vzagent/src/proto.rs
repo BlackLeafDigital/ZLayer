@@ -104,6 +104,24 @@ pub enum Msg {
         /// Guest-local TCP port to splice this connection to (on `127.0.0.1`).
         port: u16,
     },
+    /// Host → guest: bind-mount a host-shared virtiofs directory at a target
+    /// path inside the container root. The host exposes one virtiofs share per
+    /// bind mount (by `tag`) in the VM config; the guest mounts that tag and
+    /// makes it visible at `target`. Sent after [`Msg::Run`] is acknowledged
+    /// but before the workload is execed, so mounts are in place first.
+    Mount {
+        /// virtiofs device tag the host assigned to this share (e.g. `zlmnt0`).
+        tag: String,
+        /// Absolute target path inside the container (e.g. `/work`).
+        target: String,
+        /// Mount read-only when true.
+        readonly: bool,
+    },
+    /// Host → guest: a chunk of stdin for the running workload. The guest writes
+    /// the bytes to the workload's stdin pipe. Used for `-it` interactive runs.
+    Stdin(Vec<u8>),
+    /// Host → guest: stdin reached EOF; the guest closes the workload's stdin.
+    StdinEof,
 }
 
 impl Msg {
@@ -120,6 +138,9 @@ impl Msg {
             Msg::Exited { .. } => 7,
             Msg::Error { .. } => 8,
             Msg::Forward { .. } => 9,
+            Msg::Mount { .. } => 10,
+            Msg::Stdin(_) => 11,
+            Msg::StdinEof => 12,
         }
     }
 }
@@ -217,7 +238,7 @@ pub fn decode(body: &[u8]) -> Result<Msg> {
     let (&tag, payload) = body.split_first().ok_or(ProtoError::EmptyFrame)?;
     // Validate the tag up front so we surface a clear error instead of letting
     // postcard choke on a bad enum discriminant.
-    if !(1..=9).contains(&tag) {
+    if !(1..=12).contains(&tag) {
         return Err(ProtoError::UnknownTag(tag));
     }
     let msg: Msg = postcard::from_bytes(payload)?;
@@ -314,6 +335,19 @@ mod tests {
             Msg::Forward { port: 8080 },
             Msg::Forward { port: 0 }, // edge: port 0
             Msg::Forward { port: u16::MAX },
+            Msg::Mount {
+                tag: "zlmnt0".into(),
+                target: "/work".into(),
+                readonly: false,
+            },
+            Msg::Mount {
+                tag: "zlmnt1".into(),
+                target: "/ro".into(),
+                readonly: true,
+            },
+            Msg::Stdin(b"echo hi\n".to_vec()),
+            Msg::Stdin(Vec::new()), // empty chunk
+            Msg::StdinEof,
         ]
     }
 

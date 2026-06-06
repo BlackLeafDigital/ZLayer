@@ -195,11 +195,25 @@ pub(crate) struct VzLinuxContainer {
     outcome: Arc<RunOutcome>,
     /// Handle to the blocking vsock drain task, joined/aborted on stop/remove.
     drain_task: Option<JoinHandle<()>>,
+    /// Handle to the `delete_on_exit` watcher task (spawned only when the spec's
+    /// `lifecycle.delete_on_exit` is set). It waits for the workload to reach a
+    /// terminal state, then tears the VM down and removes the container record +
+    /// state dir. Aborted on `stop`/`remove` so an explicit teardown wins the
+    /// race and the watcher can't double-free.
+    cleanup_task: Option<JoinHandle<()>>,
     /// Host loopback forwarders for the container's published/exposed ports.
     /// Each binds `127.0.0.1:<container_port>` and tunnels every connection over
     /// a fresh vsock `Forward` to the guest agent. Tracked so `stop`/`remove`
     /// can abort them and so `port_mappings_container` can report the bindings.
     port_forwards: Vec<PortForward>,
+    /// Sender half of the interactive-stdin channel, present only while the VM
+    /// is running. The receiver half is owned by the `run_and_drain` blocking
+    /// drain task, which forwards each chunk to the guest as a `Msg::Stdin`
+    /// frame. [`Runtime::write_stdin`] sends host terminal bytes here;
+    /// [`Runtime::close_stdin`] drops it so the drain task's `recv()` errs and
+    /// it emits a final `Msg::StdinEof`. `None` before `start_container` wires
+    /// the channel (and after `close_stdin` clears it).
+    stdin_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
 }
 
 /// A spawned host-port forwarder for a published container port.
@@ -303,6 +317,37 @@ impl VzLinuxRuntime {
     /// `{data_dir}/vz/linux/images` — shared image rootfs store.
     fn images_dir(&self) -> PathBuf {
         self.linux_dir().join("images")
+    }
+
+    /// Find an already-extracted, populated rootfs for `image`, trying the
+    /// literal key first and then every candidate spelling.
+    ///
+    /// The store key is always the literal user ref (see [`sanitize_image_name`]),
+    /// but an image may have been extracted under an equivalent spelling on an
+    /// earlier pull (e.g. `docker.io/library/alpine:latest` vs `alpine:latest`).
+    /// Rather than rewrite keys to a canonical form (which would silently bind
+    /// bare names to docker.io), we probe each candidate spelling at lookup
+    /// time via [`zlayer_types::image_ref_candidates`] and return the first
+    /// directory whose `rootfs` is populated. Returns `None` when nothing is
+    /// present (so the caller pulls).
+    fn resolve_existing_rootfs(&self, image: &str) -> Option<PathBuf> {
+        let images_dir = self.images_dir();
+        // 1. Literal user ref, exactly as typed.
+        let literal = images_dir.join(sanitize_image_name(image)).join("rootfs");
+        if rootfs_is_populated(&literal) {
+            return Some(literal);
+        }
+        // 2. Candidate spellings (name + reference recombined into `name:ref`).
+        for (name, reference) in zlayer_types::image_ref_candidates(image) {
+            let spelling = format!("{name}:{reference}");
+            let rootfs = images_dir
+                .join(sanitize_image_name(&spelling))
+                .join("rootfs");
+            if rootfs_is_populated(&rootfs) {
+                return Some(rootfs);
+            }
+        }
+        None
     }
 
     /// `{data_dir}/vz/linux/cache` — blob/registry cache.
@@ -649,8 +694,30 @@ fn tunnel_connection_over_vsock(
 // ---------------------------------------------------------------------------
 
 /// Sanitize an image reference for use as a filesystem directory name.
+///
+/// Keyed on the **literal** user reference — separators (`/ : @`) replaced
+/// with `_`, and NOTHING else. NO canonicalization: `alpine:latest` becomes
+/// `alpine_latest`, NOT `docker.io_library_alpine_latest`; `ghcr.io/o/r:1`
+/// becomes `ghcr.io_o_r_1`. `ZLayer` never silently rewrites a bare name onto
+/// docker.io, so the store key is exactly what the user typed.
+///
+/// The cross-spelling problem this used to "solve" by canonicalizing (a pull
+/// stored under `docker.io_library_alpine_latest` while the deploy looked up
+/// `alpine_latest` → empty share → guest `/bin/sh` ENOENT) is instead handled
+/// at LOOKUP time by [`VzLinuxRuntime::resolve_existing_rootfs`], which tries
+/// every candidate spelling without rewriting the key.
 fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
+}
+
+/// Whether an extracted-image rootfs directory exists AND has at least one
+/// entry. A bare-existing-but-empty `…/rootfs` is the residue of a pull that
+/// created the directory and then failed (or was interrupted) before extracting
+/// any layers; treating it as "present" would let an `IfNotPresent` pull
+/// short-circuit forever and would share an empty filesystem into the guest
+/// (no `/bin/sh`). So "present" requires non-empty.
+fn rootfs_is_populated(rootfs_dir: &std::path::Path) -> bool {
+    std::fs::read_dir(rootfs_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Default Linux-guest kernel command line.
@@ -709,6 +776,27 @@ fn not_yet(op: &str) -> AgentError {
 // VM configuration (all VZ calls happen on the per-VM queue)
 // ---------------------------------------------------------------------------
 
+/// A single host->guest bind mount exported over its own virtiofs share.
+///
+/// Derived from a [`zlayer_spec::StorageSpec::Bind`] entry on the container's
+/// spec: `host` is the host source directory, `tag` is the unique virtiofs
+/// device tag (`zlmnt{i}`), `target` is the in-guest mount point, and
+/// `readonly` is the share's access mode. The host attaches one
+/// `VZVirtioFileSystemDeviceConfiguration` per bind (in addition to the rootfs
+/// share); the guest agent receives a matching [`proto::Msg::Mount`] frame
+/// (same `tag`/`target`/`readonly`) and mounts the virtiofs share at `target`.
+#[derive(Clone, Debug)]
+pub(crate) struct BindMount {
+    /// Host source directory shared into the guest.
+    pub(crate) host: PathBuf,
+    /// Unique virtiofs device tag (`zlmnt0`, `zlmnt1`, ...).
+    pub(crate) tag: String,
+    /// In-guest mount point the agent mounts this share at.
+    pub(crate) target: String,
+    /// Whether the share (and the guest mount) is read-only.
+    pub(crate) readonly: bool,
+}
+
 /// Plain (`Send`) inputs for building a Linux-guest VM configuration on the
 /// VM's serial dispatch queue.
 #[derive(Clone)]
@@ -728,6 +816,10 @@ pub(crate) struct LinuxVmBuildInputs {
     /// round-tripped into a `VZMACAddress` so the host's `dhcpd_leases` lookup
     /// by MAC resolves the NAT IP the guest acquires.
     pub(crate) mac: String,
+    /// Host bind mounts, one extra virtiofs share each (tag `zlmnt{i}`), in
+    /// addition to the rootfs share. The matching [`proto::Msg::Mount`] frames
+    /// are sent to the guest agent after `Run`.
+    pub(crate) bind_mounts: Vec<BindMount>,
 }
 
 /// Build a [`VZVirtualMachineConfiguration`] for a **Linux** guest.
@@ -787,6 +879,10 @@ pub(crate) fn build_config_linux(
         // correct: the per-container writable layer lives in the guest tmpfs, so
         // the shared image rootfs is never mutated and can be shared across
         // replicas.
+        // Collect every directory-sharing device: the rootfs share first, then
+        // one virtiofs device per host bind mount (tag `zlmnt{i}`).
+        let mut fs_devices: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = Vec::new();
+
         let tag = NSString::from_str(VIRTIOFS_ROOTFS_TAG);
         let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
             VZVirtioFileSystemDeviceConfiguration::alloc(),
@@ -802,7 +898,38 @@ pub(crate) fn build_config_linux(
         fs.setShare(Some(&share_super));
         // VZVirtioFileSystemDeviceConfiguration -> VZDirectorySharingDeviceConfiguration.
         let fs_super: Retained<VZDirectorySharingDeviceConfiguration> = Retained::into_super(fs);
-        let fs_arr = NSArray::from_retained_slice(&[fs_super]);
+        fs_devices.push(fs_super);
+
+        // --- virtiofs: one extra share per host bind mount ---
+        // Each bind mount gets its own `VZVirtioFileSystemDeviceConfiguration`
+        // tagged `zlmnt{i}` (matching the tag the guest agent receives in the
+        // `Msg::Mount` frame) pointing at the host source dir, with the share's
+        // `readOnly` taken from the mount. Mirrors the rootfs share's object
+        // shape exactly, just per-bind tag/url/readonly.
+        for bind in &inputs.bind_mounts {
+            let bind_tag = NSString::from_str(&bind.tag);
+            let bind_fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &bind_tag,
+            );
+            let bind_url = file_url(&bind.host);
+            let bind_dir = VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &bind_url,
+                bind.readonly,
+            );
+            let bind_share = VZSingleDirectoryShare::initWithDirectory(
+                VZSingleDirectoryShare::alloc(),
+                &bind_dir,
+            );
+            let bind_share_super: Retained<VZDirectoryShare> = Retained::into_super(bind_share);
+            bind_fs.setShare(Some(&bind_share_super));
+            let bind_fs_super: Retained<VZDirectorySharingDeviceConfiguration> =
+                Retained::into_super(bind_fs);
+            fs_devices.push(bind_fs_super);
+        }
+
+        let fs_arr = NSArray::from_retained_slice(&fs_devices);
         config.setDirectorySharingDevices(&fs_arr);
 
         // --- network: virtio-net + NAT, with the per-VM MAC ---
@@ -869,6 +996,37 @@ pub(crate) fn build_run_message(spec: &ServiceSpec) -> proto::Msg {
         uid,
         gid,
     }
+}
+
+/// Derive the host bind mounts from a [`ServiceSpec`]'s storage list.
+///
+/// Walks `spec.storage` for [`zlayer_spec::StorageSpec::Bind`] entries and maps
+/// each to a [`BindMount`] with a sequential virtiofs tag `zlmnt{i}` (i in
+/// declaration order). The same `tag`/`target`/`readonly` triple is used both
+/// to attach the per-bind virtiofs device in [`build_config_linux`] and to emit
+/// the matching [`proto::Msg::Mount`] frame the guest agent mounts — so this is
+/// the single source of truth that keeps the two sides in lockstep. Non-`Bind`
+/// storage kinds (named/anonymous/tmpfs/s3) are not host-dir virtiofs shares
+/// and are skipped here.
+pub(crate) fn derive_bind_mounts(spec: &ServiceSpec) -> Vec<BindMount> {
+    spec.storage
+        .iter()
+        .filter_map(|s| match s {
+            zlayer_spec::StorageSpec::Bind {
+                source,
+                target,
+                readonly,
+            } => Some((source.clone(), target.clone(), *readonly)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(i, (source, target, readonly))| BindMount {
+            host: PathBuf::from(source),
+            tag: format!("zlmnt{i}"),
+            target,
+            readonly,
+        })
+        .collect()
 }
 
 /// Parse a Docker-style `--user` value (`"uid"` or `"uid:gid"`) into a
@@ -1015,9 +1173,12 @@ fn capture_chunk(
 ///
 /// Runs on a blocking thread (NOT the VZ queue): all frame IO is synchronous
 /// `UnixStream` read/write via the `proto` framing helpers.
+#[allow(clippy::too_many_lines)]
 fn run_and_drain(
     live: &LiveVm,
     run_msg: &proto::Msg,
+    bind_mounts: &[BindMount],
+    stdin_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     outcome: &RunOutcome,
     console_log: &std::path::Path,
     dir_name: &str,
@@ -1044,6 +1205,60 @@ fn run_and_drain(
         tracing::warn!(container = %dir_name, error = %e, "vz-linux: failed to send Run");
         return;
     }
+
+    // Immediately after `Run`, ask the guest agent to mount each host bind mount
+    // (one virtiofs share per `tag`, attached in `build_config_linux`) at its
+    // `target`. The tag/target/readonly triple is the SAME one used to attach
+    // the share, so the guest can pair the frame to its device. A failed Mount
+    // frame is logged (best-effort) but does not abort the workload drain — the
+    // workload may not need the mount, and the guest surfaces a hard mount error
+    // over its own `Error`/`Stderr` channel.
+    for bind in bind_mounts {
+        if let Err(e) = proto::write_frame(
+            &mut stream,
+            &proto::Msg::Mount {
+                tag: bind.tag.clone(),
+                target: bind.target.clone(),
+                readonly: bind.readonly,
+            },
+        ) {
+            tracing::warn!(
+                container = %dir_name,
+                tag = %bind.tag,
+                target = %bind.target,
+                error = %e,
+                "vz-linux: failed to send Mount frame"
+            );
+        }
+    }
+
+    // STDIN seam: when a stdin source is wired (the interactive `-it`
+    // CLI->daemon->vsock pipeline passes `Some(rx)` from `start_container`),
+    // forward each chunk to the guest as a `Msg::Stdin` frame and a final
+    // `Msg::StdinEof` once the channel closes, on a helper thread so it runs
+    // concurrently with the drain loop below. `close_stdin` (and container
+    // teardown) drop the sender half, which ends `rx.recv()` and emits the
+    // EOF. Non-interactive callers may still pass `None`, in which case this
+    // spawns nothing. A second writer half is cloned so the drain loop keeps
+    // reading on `stream`.
+    // Held for the function's duration (detached): the helper thread exits on
+    // its own when the channel closes or the workload's drain returns and the
+    // stream is dropped. Named with a leading underscore so it stays bound to
+    // end-of-scope (a bare `_` would drop and join it immediately).
+    let _stdin_handle = stdin_rx.and_then(|rx| match stream.try_clone() {
+        Ok(mut stdin_w) => Some(std::thread::spawn(move || {
+            while let Ok(chunk) = rx.recv() {
+                if proto::write_frame(&mut stdin_w, &proto::Msg::Stdin(chunk)).is_err() {
+                    return;
+                }
+            }
+            let _ = proto::write_frame(&mut stdin_w, &proto::Msg::StdinEof);
+        })),
+        Err(e) => {
+            tracing::debug!(error = %e, "vz-linux: stdin stream clone failed; stdin disabled");
+            None
+        }
+    });
 
     loop {
         match proto::read_frame(&mut stream) {
@@ -1099,6 +1314,94 @@ fn run_and_drain(
                 return;
             }
         }
+    }
+}
+
+/// Tear a VZ-Linux container down completely and free its resources: remove the
+/// record from the shared `containers` map (taking ownership of its VM + every
+/// spawned task), abort the drain + port-forward tasks, force the VM down +
+/// release it (closing the vsock device + its fds), and delete the per-container
+/// state directory (rootfs/overlay + console.log + config.json).
+///
+/// This is the shared teardown used by both the `delete_on_exit` watcher
+/// ([`watch_for_auto_remove`]) and (logically) [`VzLinuxRuntime::remove_container`].
+/// Removing an unknown container is a no-op. The `cleanup_task` handle is NOT
+/// aborted here (a watcher calling this would be aborting itself); callers that
+/// hold the watcher handle abort it separately.
+async fn teardown_container(
+    containers: &Arc<RwLock<HashMap<String, VzLinuxContainer>>>,
+    dir_name: &str,
+) {
+    let (state_dir, live, drain, forwards) = {
+        let mut guard = containers.write().await;
+        match guard.remove(dir_name) {
+            Some(c) => (Some(c.state_dir), c.live, c.drain_task, c.port_forwards),
+            None => return,
+        }
+    };
+    // Abort the drain task FIRST so its blocking vsock read can't race the VM
+    // teardown below.
+    if let Some(drain) = drain {
+        drain.abort();
+    }
+    // Drop network state: stop all host loopback forwarders.
+    for f in forwards {
+        f.task.abort();
+    }
+    // Ensure the VM is fully stopped + released before deleting its state dir.
+    if let Some(live) = live {
+        let _ = tokio::task::spawn_blocking(move || {
+            let r = run_vm_lifecycle(&live, VmLifecycleOp::Stop);
+            drop(live);
+            r
+        })
+        .await;
+    }
+    if let Some(dir) = state_dir {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+}
+
+/// `delete_on_exit` watcher: poll the container's shared [`RunOutcome`] until the
+/// workload reaches a terminal state (an `Exited`/`Failed`/`Error` frame, or the
+/// drain stream ending), then [`teardown_container`] it — the VZ-Linux analog of
+/// Docker `--rm`. Spawned by [`start_container`](VzLinuxRuntime::start_container)
+/// only when the spec's `lifecycle.delete_on_exit` is set.
+///
+/// The VM does not power itself off when the workload exits, so without this the
+/// VM + its tasks + state dir would leak until an explicit `remove`. The watcher
+/// is aborted by `stop`/`remove` (which take the handle out of the record and
+/// `abort()` it) so an explicit teardown wins the race and the watcher can never
+/// double-free a record another path already removed.
+async fn watch_for_auto_remove(
+    containers: Arc<RwLock<HashMap<String, VzLinuxContainer>>>,
+    dir_name: String,
+) {
+    loop {
+        // The container vanished (explicit remove won the race): nothing to do.
+        let outcome = {
+            let guard = containers.read().await;
+            match guard.get(&dir_name) {
+                Some(c) => Arc::clone(&c.outcome),
+                None => return,
+            }
+        };
+        let terminal = outcome
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some();
+        let exited = outcome.exit_code.lock().ok().and_then(|g| *g).is_some();
+        if terminal || exited {
+            tracing::info!(
+                container = %dir_name,
+                "vz-linux: delete_on_exit — workload terminal, removing container"
+            );
+            teardown_container(&containers, &dir_name).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -1264,16 +1567,23 @@ fn outcome_to_state(
 #[async_trait::async_trait]
 impl Runtime for VzLinuxRuntime {
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            zlayer_spec::PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: zlayer_spec::PullPolicy,
-        _auth: Option<&RegistryAuth>,
+        auth: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
+        // The store key is always the LITERAL user ref (no canonicalization).
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);
         let rootfs_dir = image_dir.join("rootfs");
@@ -1283,27 +1593,32 @@ impl Runtime for VzLinuxRuntime {
                 // Always re-pull; drift detection happens at the service layer.
             }
             zlayer_spec::PullPolicy::IfNotPresent => {
-                if rootfs_dir.exists() {
-                    tracing::debug!(image = %image, "vz-linux image already present; skipping pull");
-                    self.image_rootfs
-                        .write()
-                        .await
-                        .insert(safe_name, rootfs_dir);
+                // "Present" requires a NON-EMPTY rootfs (a bare-existing-but-empty
+                // dir is the residue of a failed pull and must NOT short-circuit,
+                // or the empty share is shared into the guest forever — no
+                // `/bin/sh`). Probe the literal key AND candidate spellings so an
+                // image extracted under an equivalent spelling is reused instead
+                // of needlessly re-pulled, WITHOUT rewriting the key.
+                if let Some(existing) = self.resolve_existing_rootfs(image) {
+                    tracing::debug!(
+                        image = %image,
+                        rootfs = %existing.display(),
+                        "vz-linux image already present; skipping pull"
+                    );
+                    self.image_rootfs.write().await.insert(safe_name, existing);
                     return Ok(());
                 }
             }
             zlayer_spec::PullPolicy::Never => {
-                if !rootfs_dir.exists() {
-                    return Err(AgentError::PullFailed {
-                        image: image.to_string(),
-                        reason: "image not present and pull policy is Never".to_string(),
-                    });
+                if let Some(existing) = self.resolve_existing_rootfs(image) {
+                    self.image_rootfs.write().await.insert(safe_name, existing);
+                    return Ok(());
                 }
-                self.image_rootfs
-                    .write()
-                    .await
-                    .insert(safe_name, rootfs_dir);
-                return Ok(());
+                return Err(AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: "image not present (or its rootfs is empty) and pull policy is Never"
+                        .to_string(),
+                });
             }
         }
 
@@ -1325,14 +1640,26 @@ impl Runtime for VzLinuxRuntime {
                 reason: format!("open blob cache: {e}"),
             })?;
 
-        let puller = zlayer_registry::ImagePuller::with_cache(blob_cache);
-        let layers = puller
-            .pull_image(image, &zlayer_registry::RegistryAuth::Anonymous)
-            .await
-            .map_err(|e| AgentError::PullFailed {
-                image: image.to_string(),
-                reason: format!("pull image layers: {e}"),
-            })?;
+        // Resolve auth from the caller (the daemon/composite resolves per-registry
+        // credentials — inline spec creds or, via the credential store, by host —
+        // and passes them down); Anonymous when none was supplied.
+        let pull_auth = zlayer_registry::spec_auth_to_oci(auth);
+
+        // Central constructor: wires the local persistent blob cache through the
+        // full source chain — the shared S3 tier (when ZLAYER_S3_BUCKET is
+        // configured) and the last-resort default registry (when
+        // ZLAYER_DEFAULT_REGISTRY is set) — AND applies the per-image source
+        // policy. This runtime has no local_registry field, so no chaining.
+        let puller = zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+
+        let layers =
+            puller
+                .pull_image(image, &pull_auth)
+                .await
+                .map_err(|e| AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!("pull image layers: {e}"),
+                })?;
 
         // Persist the OCI image CONFIG blob into the same `blobs.redb` while we
         // still have the network. `pull_image` above caches the manifest + layers
@@ -1344,10 +1671,7 @@ impl Runtime for VzLinuxRuntime {
         // unknown and fall the image through to the Seatbelt sandbox (exit 127).
         // Non-fatal: the layers are already extracted, so a config-blob miss only
         // costs us the local OS hint (dispatch still has its VZ-Linux default).
-        if let Err(e) = puller
-            .pull_image_config(image, &zlayer_registry::RegistryAuth::Anonymous)
-            .await
-        {
+        if let Err(e) = puller.pull_image_config(image, &pull_auth).await {
             tracing::debug!(
                 image = %image,
                 error = %e,
@@ -1388,14 +1712,23 @@ impl Runtime for VzLinuxRuntime {
         let dir_name = Self::container_dir_name(id);
         let state_dir = self.vm_dir(id);
 
-        // Locate the base image rootfs (from the pull cache, or the on-disk
-        // default location).
+        // Locate the base image rootfs. `spec.image.name` is an `ImageRef` whose
+        // `to_string()` preserves the user's raw bytes (`alpine:latest`). The
+        // store is keyed by that LITERAL ref (no canonicalization), so:
+        //   1. the in-memory `image_rootfs` map (populated by the pull) under the
+        //      literal key, then
+        //   2. `resolve_existing_rootfs`, which probes the literal key AND every
+        //      candidate spelling on disk — so an image extracted under an
+        //      equivalent spelling (e.g. by an explicit
+        //      `pull docker.io/library/alpine:latest`) is still found for a
+        //      deploy of `alpine:latest`, WITHOUT rewriting the key onto docker.io.
         let image_name = spec.image.name.to_string();
         let safe_image = sanitize_image_name(&image_name);
         let image_rootfs = {
             let images = self.image_rootfs.read().await;
             images.get(&safe_image).cloned()
         }
+        .or_else(|| self.resolve_existing_rootfs(&image_name))
         .unwrap_or_else(|| self.images_dir().join(&safe_image).join("rootfs"));
 
         if !image_rootfs.exists() {
@@ -1403,6 +1736,27 @@ impl Runtime for VzLinuxRuntime {
                 id: dir_name,
                 reason: format!(
                     "image rootfs not found at {}; pull the image first",
+                    image_rootfs.display()
+                ),
+            });
+        }
+
+        // Guard against an EMPTY rootfs share. `pull_image_with_policy` creates
+        // the `…/rootfs` dir BEFORE extracting layers, and the composite swallows
+        // a per-backend pull error (e.g. a Docker Hub 429) as non-fatal — so a
+        // failed pull can leave the directory present-but-empty. Under
+        // `PullPolicy::IfNotPresent` that empty dir then short-circuits every
+        // subsequent pull, and sharing it into the guest pivot_roots onto an
+        // empty filesystem where `/bin/sh` does not exist ("No such file or
+        // directory"). Refuse here with an actionable error instead of booting a
+        // doomed guest, so the caller re-pulls (or the operator clears the dir).
+        if !rootfs_is_populated(&image_rootfs) {
+            return Err(AgentError::CreateFailed {
+                id: dir_name,
+                reason: format!(
+                    "image rootfs at {} is empty (a previous pull was interrupted or failed); \
+                     re-pull the image — remove the empty directory if the re-pull keeps \
+                     short-circuiting under PullPolicy::IfNotPresent",
                     image_rootfs.display()
                 ),
             });
@@ -1457,7 +1811,9 @@ impl Runtime for VzLinuxRuntime {
             live: None,
             outcome: Arc::new(RunOutcome::default()),
             drain_task: None,
+            cleanup_task: None,
             port_forwards: Vec::new(),
+            stdin_tx: None,
         };
 
         self.containers.write().await.insert(dir_name, container);
@@ -1486,6 +1842,7 @@ impl Runtime for VzLinuxRuntime {
                 cpu_count: clamp_cpu_count(c.vcpus),
                 memory_bytes: clamp_memory_bytes(c.ram_mib),
                 mac: c.mac.clone(),
+                bind_mounts: derive_bind_mounts(&c.spec),
             }
         };
 
@@ -1555,8 +1912,12 @@ impl Runtime for VzLinuxRuntime {
             vm: Arc::clone(&live.vm),
         };
 
-        // Build the `Run` message + capture handles, then record the running VM.
-        let (run_msg, outcome, console_log) = {
+        // Build the `Run` message + bind-mount list + capture handles, then
+        // record the running VM. The bind mounts are derived from the SAME spec
+        // storage that produced the per-bind virtiofs shares in
+        // `build_config_linux`, so the `Msg::Mount` frames sent below name tags
+        // the guest has matching virtiofs devices for.
+        let (run_msg, bind_mounts, outcome, console_log) = {
             let mut guard = self.containers.write().await;
             let c = guard
                 .get_mut(&dir_name)
@@ -1570,18 +1931,33 @@ impl Runtime for VzLinuxRuntime {
             c.started_at = Some(Instant::now());
             (
                 build_run_message(&c.spec),
+                derive_bind_mounts(&c.spec),
                 Arc::clone(&c.outcome),
                 c.console_log.clone(),
             )
         };
 
+        // Interactive `-it` stdin channel: the sender half is stored in the
+        // container record so `write_stdin` can push host terminal bytes; the
+        // receiver half is handed to the blocking drain task, which forwards
+        // each chunk as a `Msg::Stdin` frame. Dropping the sender (via
+        // `close_stdin` or container teardown) makes the drain task's `recv()`
+        // err and emit a final `Msg::StdinEof`. We wire it unconditionally —
+        // no interactivity flag is plumbed to this runtime yet, and an unread
+        // channel is harmless (the drain task just blocks on `recv()` and the
+        // guest sees no stdin frames until bytes arrive).
+        let (stdin_tx, stdin_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
         // Spawn the blocking vsock drain task: connect to the guest agent,
-        // send `Run`, then stream stdout/stderr/exit into the shared outcome.
+        // send `Run`, emit one `Mount` frame per bind mount, forward stdin
+        // chunks, then stream stdout/stderr/exit into the shared outcome.
         let dir_for_drain = dir_name.clone();
         let drain = tokio::task::spawn_blocking(move || {
             run_and_drain(
                 &live_for_drain,
                 &run_msg,
+                &bind_mounts,
+                Some(stdin_rx),
                 &outcome,
                 &console_log,
                 &dir_for_drain,
@@ -1591,6 +1967,35 @@ impl Runtime for VzLinuxRuntime {
             let mut guard = self.containers.write().await;
             if let Some(c) = guard.get_mut(&dir_name) {
                 c.drain_task = Some(drain);
+                c.stdin_tx = Some(stdin_tx);
+            }
+        }
+
+        // `--rm` / delete_on_exit: when the spec asks for it, spawn a watcher
+        // that tears the container down (VM + tasks + state dir) once the
+        // workload reaches a terminal state. The VM does not power itself off on
+        // workload exit, so this is what frees the resources. The handle is
+        // tracked so an explicit `stop`/`remove` can abort it and win the race.
+        let delete_on_exit = {
+            let guard = self.containers.read().await;
+            guard
+                .get(&dir_name)
+                .is_some_and(|c| c.spec.lifecycle.delete_on_exit)
+        };
+        if delete_on_exit {
+            let containers = Arc::clone(&self.containers);
+            let dir_for_cleanup = dir_name.clone();
+            let cleanup =
+                tokio::spawn(
+                    async move { watch_for_auto_remove(containers, dir_for_cleanup).await },
+                );
+            let mut guard = self.containers.write().await;
+            if let Some(c) = guard.get_mut(&dir_name) {
+                c.cleanup_task = Some(cleanup);
+            } else {
+                // Container vanished between the drain spawn and here: don't leak
+                // the watcher task.
+                cleanup.abort();
             }
         }
 
@@ -1680,9 +2085,9 @@ impl Runtime for VzLinuxRuntime {
         }
 
         // Teardown phase: take the live VM + tasks out of the record, set the
-        // final state, abort the drain + port-forward tasks, then force the VM
-        // down and release it.
-        let (live, drain) = {
+        // final state, abort the drain + port-forward + cleanup tasks, then
+        // force the VM down and release it.
+        let (live, drain, cleanup) = {
             let mut guard = self.containers.write().await;
             let Some(c) = guard.get_mut(&dir_name) else {
                 // Vanished mid-stop: nothing more to do.
@@ -1700,8 +2105,13 @@ impl Runtime for VzLinuxRuntime {
             for f in std::mem::take(&mut c.port_forwards) {
                 f.task.abort();
             }
-            (c.live.take(), c.drain_task.take())
+            (c.live.take(), c.drain_task.take(), c.cleanup_task.take())
         };
+        // Abort the delete_on_exit watcher so an explicit stop wins the race and
+        // the watcher can't race this teardown / double-free the record.
+        if let Some(cleanup) = cleanup {
+            cleanup.abort();
+        }
         // The drain task blocks on vsock IO; aborting drops its future. The fd
         // it owns is closed when the VM stops, so the blocking read unblocks.
         if let Some(drain) = drain {
@@ -1725,13 +2135,24 @@ impl Runtime for VzLinuxRuntime {
         // Remove the record outright, taking ownership of its VM + every spawned
         // task. Removing an unknown container is Ok (idempotent) — this matches
         // docker_runtime_test::test_remove_nonexistent_container.
-        let (state_dir, live, drain, forwards) = {
+        let (state_dir, live, drain, cleanup, forwards) = {
             let mut guard = self.containers.write().await;
             match guard.remove(&dir_name) {
-                Some(c) => (Some(c.state_dir), c.live, c.drain_task, c.port_forwards),
+                Some(c) => (
+                    Some(c.state_dir),
+                    c.live,
+                    c.drain_task,
+                    c.cleanup_task,
+                    c.port_forwards,
+                ),
                 None => return Ok(()),
             }
         };
+        // Abort the delete_on_exit watcher (if any) so it can't race this
+        // explicit removal.
+        if let Some(cleanup) = cleanup {
+            cleanup.abort();
+        }
         // Abort the drain task FIRST so its blocking vsock read can't race the
         // VM teardown below.
         if let Some(drain) = drain {
@@ -2150,6 +2571,43 @@ impl Runtime for VzLinuxRuntime {
         self.stop_container(id, Duration::from_secs(0)).await
     }
 
+    async fn write_stdin(&self, id: &ContainerId, data: &[u8]) -> Result<()> {
+        let dir_name = Self::container_dir_name(id);
+        let guard = self.containers.read().await;
+        let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
+            container: dir_name.clone(),
+            reason: "not found".to_string(),
+        })?;
+        // No sender means stdin was already closed (Ctrl-D) or the workload has
+        // exited and the drain task dropped the receiver. Surface a clear error
+        // rather than silently dropping the bytes.
+        let tx = c.stdin_tx.as_ref().ok_or_else(|| {
+            AgentError::Internal(format!("stdin is closed for container {dir_name}"))
+        })?;
+        tx.send(data.to_vec()).map_err(|_| {
+            AgentError::Internal(format!(
+                "stdin receiver gone for container {dir_name} (workload exited?)"
+            ))
+        })?;
+        Ok(())
+    }
+
+    async fn close_stdin(&self, id: &ContainerId) -> Result<()> {
+        let dir_name = Self::container_dir_name(id);
+        let mut guard = self.containers.write().await;
+        let c = guard
+            .get_mut(&dir_name)
+            .ok_or_else(|| AgentError::NotFound {
+                container: dir_name.clone(),
+                reason: "not found".to_string(),
+            })?;
+        // Dropping the sender makes the drain task's `recv()` return `Err`, which
+        // is exactly how `run_and_drain` decides to emit the final
+        // `Msg::StdinEof`. Idempotent: clearing an already-`None` sender is fine.
+        c.stdin_tx = None;
+        Ok(())
+    }
+
     async fn list_images(&self) -> Result<Vec<crate::runtime::ImageInfo>> {
         let images = self.image_rootfs.read().await;
         Ok(images
@@ -2226,6 +2684,109 @@ mod tests {
             sanitize_image_name("docker.io/library/alpine:3.19"),
             "docker.io_library_alpine_3.19"
         );
+        // Digest refs: both `@` and `:` collapse to `_`.
+        assert_eq!(
+            sanitize_image_name("ghcr.io/o/r@sha256:abc"),
+            "ghcr.io_o_r_sha256_abc"
+        );
+    }
+
+    /// The store key is the LITERAL user ref — NO canonicalization, NO silent
+    /// docker.io injection. `alpine:latest` keys `alpine_latest`, NOT
+    /// `docker.io_library_alpine_latest`. A bare name and its docker.io-qualified
+    /// form are DIFFERENT strings → DIFFERENT keys, exactly as the user requires.
+    /// (Cross-spelling reuse of an already-extracted rootfs is handled at lookup
+    /// time by `resolve_existing_rootfs`, not by rewriting the key.)
+    #[test]
+    fn sanitize_image_name_is_literal_no_docker_hub_injection() {
+        assert_eq!(sanitize_image_name("alpine"), "alpine");
+        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
+        assert_eq!(
+            sanitize_image_name("library/alpine:latest"),
+            "library_alpine_latest"
+        );
+        assert_eq!(
+            sanitize_image_name("docker.io/library/alpine:latest"),
+            "docker.io_library_alpine_latest"
+        );
+        // Bare and qualified are DIFFERENT keys.
+        assert_ne!(
+            sanitize_image_name("alpine:latest"),
+            sanitize_image_name("docker.io/library/alpine:latest"),
+        );
+    }
+
+    /// A `ServiceSpec` built from the raw shorthand (`image: alpine:latest`)
+    /// keys the LITERAL `alpine_latest` directory via the SAME
+    /// `spec.image.name.to_string()` -> `sanitize_image_name` chain that both
+    /// `pull_image_with_policy` and `create_container` use — so pull and create
+    /// agree on the key with no canonicalization.
+    #[test]
+    fn service_spec_shorthand_keys_literal_image_dir() {
+        let spec = ServiceSpec::minimal("svc", "alpine:latest");
+        assert_eq!(
+            sanitize_image_name(&spec.image.name.to_string()),
+            "alpine_latest",
+        );
+    }
+
+    /// `resolve_existing_rootfs` reuses an already-extracted rootfs across
+    /// equivalent spellings WITHOUT rewriting the literal key: a rootfs
+    /// extracted under the bare `alpine_latest` is found when later referenced by
+    /// the fully-qualified `docker.io/library/alpine:latest` (the safe
+    /// qualified->bare direction, via `image_ref_candidates`' prefix-stripping).
+    /// It NEVER injects docker.io for a bare lookup.
+    #[test]
+    fn resolve_existing_rootfs_finds_cross_spelling() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zlayer-vz-resolve-test-{}-{}",
+            std::process::id(),
+            "alpine"
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rt = VzLinuxRuntime {
+            data_dir: tmp.clone(),
+            log_dir: tmp.join("logs"),
+            containers: Arc::new(RwLock::new(HashMap::new())),
+            image_rootfs: Arc::new(RwLock::new(HashMap::new())),
+        };
+        // Extract a rootfs under the bare literal key `alpine_latest`.
+        let bare_rootfs = rt.images_dir().join("alpine_latest").join("rootfs");
+        std::fs::create_dir_all(bare_rootfs.join("bin")).unwrap();
+        std::fs::write(bare_rootfs.join("bin").join("sh"), b"#!/bin/sh\n").unwrap();
+
+        // Found directly by the bare ref.
+        assert_eq!(
+            rt.resolve_existing_rootfs("alpine:latest"),
+            Some(bare_rootfs.clone())
+        );
+        // Found by the fully-qualified ref via prefix-stripping candidates.
+        assert_eq!(
+            rt.resolve_existing_rootfs("docker.io/library/alpine:latest"),
+            Some(bare_rootfs)
+        );
+        // A different image is NOT matched.
+        assert_eq!(rt.resolve_existing_rootfs("nginx:latest"), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rootfs_is_populated_distinguishes_empty_from_nonempty() {
+        let tmp =
+            std::env::temp_dir().join(format!("zlayer-vzlinux-rootfs-test-{}", std::process::id()));
+        let empty = tmp.join("empty");
+        let full = tmp.join("full");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(full.join("bin")).unwrap();
+        std::fs::write(full.join("bin").join("sh"), b"#!/bin/sh\n").unwrap();
+
+        // Missing dir, empty dir -> not populated; non-empty dir -> populated.
+        assert!(!rootfs_is_populated(&tmp.join("does-not-exist")));
+        assert!(!rootfs_is_populated(&empty));
+        assert!(rootfs_is_populated(&full));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2325,6 +2886,55 @@ mod tests {
             }
             other => panic!("expected Msg::Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derive_bind_mounts_maps_only_binds_with_sequential_tags() {
+        // Only `StorageSpec::Bind` entries become host->guest virtiofs shares,
+        // tagged `zlmnt{i}` in declaration order. Other storage kinds
+        // (tmpfs/named/anonymous/s3) are NOT host-dir shares and are skipped, so
+        // tag indices count only the binds, keeping host shares <-> Mount frames
+        // in lockstep with `build_config_linux`.
+        let mut spec = ServiceSpec::minimal("svc", "docker.io/library/alpine:latest");
+        spec.storage = vec![
+            zlayer_spec::StorageSpec::Bind {
+                source: "/host/a".to_string(),
+                target: "/work".to_string(),
+                readonly: false,
+            },
+            zlayer_spec::StorageSpec::Tmpfs {
+                target: "/tmp".to_string(),
+                size: None,
+                mode: None,
+            },
+            zlayer_spec::StorageSpec::Bind {
+                source: "/host/b".to_string(),
+                target: "/data".to_string(),
+                readonly: true,
+            },
+        ];
+
+        let binds = derive_bind_mounts(&spec);
+        assert_eq!(binds.len(), 2, "only the two Bind entries map to shares");
+
+        assert_eq!(binds[0].host, PathBuf::from("/host/a"));
+        assert_eq!(binds[0].tag, "zlmnt0");
+        assert_eq!(binds[0].target, "/work");
+        assert!(!binds[0].readonly);
+
+        // The tmpfs entry between the binds must NOT consume a tag index.
+        assert_eq!(binds[1].host, PathBuf::from("/host/b"));
+        assert_eq!(binds[1].tag, "zlmnt1");
+        assert_eq!(binds[1].target, "/data");
+        assert!(binds[1].readonly);
+    }
+
+    #[test]
+    fn derive_bind_mounts_empty_when_no_binds() {
+        // A spec with no Bind storage yields no extra virtiofs shares (only the
+        // rootfs share is attached by build_config_linux).
+        let spec = ServiceSpec::minimal("svc", "docker.io/library/alpine:latest");
+        assert!(derive_bind_mounts(&spec).is_empty());
     }
 
     #[test]

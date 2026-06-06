@@ -1613,6 +1613,13 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
             post(handlers::containers::restart_container),
         )
         .route("/{id}/kill", post(handlers::containers::kill_container))
+        // Interactive `-it` stdin: POST writes a chunk of host stdin to the
+        // workload; DELETE signals end-of-input (Ctrl-D / detach).
+        .route(
+            "/{id}/stdin",
+            post(handlers::containers::write_container_stdin)
+                .delete(handlers::containers::close_container_stdin),
+        )
         .route("/{id}/pause", post(handlers::containers::pause_container))
         .route(
             "/{id}/unpause",

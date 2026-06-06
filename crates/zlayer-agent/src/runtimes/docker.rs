@@ -662,14 +662,22 @@ impl Runtime for DockerRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull an image to local storage with a specific policy, honouring an
     /// optional inline [`RegistryAuth`] (§3.10).
+    ///
+    /// `_source` is accepted for trait conformance but ignored: the Docker
+    /// backend delegates to `dockerd`, which performs its own tier resolution.
     #[instrument(
-        skip(self, auth),
+        skip(self, auth, _source),
         fields(
             otel.name = "image.pull",
             container.image.name = %image,
@@ -682,6 +690,7 @@ impl Runtime for DockerRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Handle Never policy - don't pull at all
         if matches!(policy, PullPolicy::Never) {
@@ -3968,6 +3977,7 @@ mod tests {
             image: ImageSpec {
                 name: "test:latest".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
             endpoints,
             health: HealthSpec {

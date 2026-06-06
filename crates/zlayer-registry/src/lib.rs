@@ -36,7 +36,7 @@ pub mod oci_export;
 pub mod wasm_export;
 
 pub use cache::*;
-pub use cache_config::CacheType;
+pub use cache_config::{default_registry_from_env, s3_cache_from_env, CacheType};
 pub use client::*;
 pub use error::*;
 pub use image_config::{ImageConfig, ImageHealthcheck};

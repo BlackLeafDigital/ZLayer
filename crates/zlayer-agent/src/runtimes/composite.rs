@@ -822,11 +822,12 @@ impl Runtime for CompositeRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // See `pull_image` above for the `WrongPlatform` soft-skip rationale.
         if let Err(e) = self
             .primary
-            .pull_image_with_policy(image, policy, auth)
+            .pull_image_with_policy(image, policy, auth, source)
             .await
         {
             if matches!(e, AgentError::WrongPlatform { .. }) {
@@ -840,7 +841,10 @@ impl Runtime for CompositeRuntime {
             }
         }
         if let Some(delegate) = &self.delegate {
-            if let Err(e) = delegate.pull_image_with_policy(image, policy, auth).await {
+            if let Err(e) = delegate
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
+            {
                 tracing::debug!(
                     image,
                     error = %e,
@@ -858,7 +862,7 @@ impl Runtime for CompositeRuntime {
         .into_iter()
         .flatten()
         {
-            if let Err(e) = rt.pull_image_with_policy(image, policy, auth).await {
+            if let Err(e) = rt.pull_image_with_policy(image, policy, auth, source).await {
                 tracing::debug!(
                     image,
                     runtime = label,
@@ -1416,6 +1420,7 @@ mod tests {
             image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
+            _source: zlayer_spec::SourcePolicy,
         ) -> Result<()> {
             self.record("pull_image_with_policy", None);
             if let Some(err) = self.build_wrong_platform_error(image) {
@@ -2439,6 +2444,7 @@ services:
             "docker.io/library/alpine:3.19",
             PullPolicy::IfNotPresent,
             None,
+            zlayer_spec::SourcePolicy::default(),
         )
         .await
         .expect("composite pull_image_with_policy must tolerate WrongPlatform from primary");
@@ -2939,9 +2945,14 @@ services:
         let (rt, _calls) = make_composite(true);
         let image = "invalid.example.invalid/ghost:v1";
 
-        rt.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
-            .unwrap();
+        rt.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cached_os(&rt, image).await, None);
     }

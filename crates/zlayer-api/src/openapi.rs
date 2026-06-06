@@ -121,12 +121,13 @@ use crate::handlers::container_networks::{
 };
 use crate::handlers::containers::{
     __path_archive_get, __path_archive_head, __path_archive_put, __path_changes_container,
-    __path_create_container, __path_delete_container, __path_exec_in_container,
-    __path_get_container, __path_get_container_logs, __path_get_container_stats,
-    __path_kill_container, __path_list_containers, __path_pause_container, __path_port_container,
-    __path_prune_containers, __path_rename_container, __path_restart_container,
-    __path_start_container, __path_stop_container, __path_top_container, __path_unpause_container,
-    __path_update_container, __path_wait_container, __path_wait_container_post,
+    __path_close_container_stdin, __path_create_container, __path_delete_container,
+    __path_exec_in_container, __path_get_container, __path_get_container_logs,
+    __path_get_container_stats, __path_kill_container, __path_list_containers,
+    __path_pause_container, __path_port_container, __path_prune_containers,
+    __path_rename_container, __path_restart_container, __path_start_container,
+    __path_stop_container, __path_top_container, __path_unpause_container, __path_update_container,
+    __path_wait_container, __path_wait_container_post, __path_write_container_stdin,
 };
 use crate::handlers::credentials::{
     __path_create_git_credential, __path_create_registry_credential, __path_delete_git_credential,
@@ -322,6 +323,8 @@ impl Modify for SecurityAddon {
         start_container,
         restart_container,
         kill_container,
+        write_container_stdin,
+        close_container_stdin,
         pause_container,
         unpause_container,
         top_container,

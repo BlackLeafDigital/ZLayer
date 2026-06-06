@@ -2648,6 +2648,36 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Write a chunk of raw stdin bytes to a running container's main process.
+    ///
+    /// `POST /api/v1/containers/{id}/stdin` with an `application/octet-stream`
+    /// body of the raw bytes. Powers the host→guest direction of an interactive
+    /// (`-it`) session: the CLI's raw-mode terminal reader calls this per chunk.
+    /// Returns `Ok(())` on 204.
+    pub async fn write_container_stdin(&self, id: &str, data: &[u8]) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/stdin", urlencoding(id));
+        let (status, body) = self
+            .post_bytes(
+                &path,
+                "application/octet-stream",
+                Bytes::copy_from_slice(data),
+            )
+            .await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Signal end-of-input (close stdin) for a running container.
+    ///
+    /// `DELETE /api/v1/containers/{id}/stdin`. Powers Ctrl-D / detach for an
+    /// interactive session. Returns `Ok(())` on 204.
+    pub async fn close_container_stdin(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/stdin", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
     /// List the processes running inside a standalone container.
     ///
     /// `GET /api/v1/containers/{id}/top?ps_args=<...>`. Returns the daemon's

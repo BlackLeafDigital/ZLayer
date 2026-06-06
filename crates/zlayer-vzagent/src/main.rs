@@ -71,7 +71,7 @@ mod linux {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::Path;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{mpsc, Mutex, OnceLock};
     use std::thread;
@@ -86,6 +86,12 @@ mod linux {
     /// PID of the currently-running primary workload, shared with the
     /// `Signal`/teardown paths. `0` means "no workload running".
     static WORKLOAD_PID: AtomicI32 = AtomicI32::new(0);
+
+    /// Write half of the current workload's stdin pipe, shared with the
+    /// `Stdin`/`StdinEof` handlers. `None` means "no workload running" or its
+    /// stdin was never piped. Taking the value (`StdinEof`) drops the
+    /// [`ChildStdin`], which closes the pipe so the workload sees EOF.
+    static WORKLOAD_STDIN: Mutex<Option<ChildStdin>> = Mutex::new(None);
 
     type Result<T> = std::result::Result<T, Error>;
 
@@ -387,6 +393,24 @@ mod linux {
             Some("lowerdir=/lower,upperdir=/run/overlay/upper,workdir=/run/overlay/work"),
         )?;
         Ok(())
+    }
+
+    /// Mount a host-shared virtiofs directory (addressed by its device `tag`)
+    /// at `target` inside the **container root**.
+    ///
+    /// By the time the host sends [`Msg::Mount`] the agent has already
+    /// `pivot_into_newroot`ed (see [`run`]), so the current `/` *is* the
+    /// container root and `target` resolves against it directly — exactly the
+    /// filesystem the workload runs in. The mount technique mirrors the rootfs
+    /// mount in [`assemble_container_root`]: the virtiofs share is addressed by
+    /// its tag as the mount source, fstype `"virtiofs"`, and `MS_RDONLY` is
+    /// folded into the flags when a read-only mount is requested (the same way
+    /// the rootfs lower layer is mounted read-only). The target directory is
+    /// created first (`mkdir -p`).
+    fn mount_share(tag: &str, target: &str, readonly: bool) -> Result<()> {
+        mkdir_p(target)?;
+        let flags = if readonly { libc::MS_RDONLY } else { 0 };
+        mount(tag, target, "virtiofs", flags, None)
     }
 
     // ----------------------------------------------------------------------
@@ -794,7 +818,10 @@ mod linux {
         if let Some(dir) = resolve_cwd(cwd) {
             cmd.current_dir(dir);
         }
-        cmd.stdin(Stdio::null());
+        // Pipe stdin so the host can stream interactive input (`-it`) via
+        // `Msg::Stdin`/`Msg::StdinEof`; the write half is retained in
+        // [`WORKLOAD_STDIN`] by the `Run` handler.
+        cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -866,6 +893,41 @@ mod linux {
         });
 
         (h_out, h_err)
+    }
+
+    /// Write a chunk of host-supplied stdin to the running workload.
+    ///
+    /// Robust if stdin was never piped (no workload, or its stdin handle was
+    /// already taken by [`StdinEof`](Msg::StdinEof)): such a write is a no-op,
+    /// never a panic. A write error (e.g. the workload closed its stdin / exited)
+    /// is surfaced to the caller, and the now-broken handle is dropped so we stop
+    /// trying.
+    fn write_workload_stdin(bytes: &[u8]) -> Result<()> {
+        let mut guard = WORKLOAD_STDIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stdin) = guard.as_mut() else {
+            // No stdin to write to (no workload, or EOF already sent). Silently
+            // ignore: the host may race a stdin chunk against workload exit.
+            return Ok(());
+        };
+        if let Err(e) = stdin.write_all(bytes) {
+            // The pipe is broken (workload closed stdin / exited). Drop the
+            // handle so subsequent chunks are quietly ignored, and report once.
+            *guard = None;
+            return Err(err(format!("write workload stdin: {e}")));
+        }
+        Ok(())
+    }
+
+    /// Close the workload's stdin so it observes EOF, by taking and dropping the
+    /// retained [`ChildStdin`]. Idempotent and safe if stdin was never piped.
+    fn close_workload_stdin() {
+        let mut guard = WORKLOAD_STDIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Dropping the ChildStdin closes the write end of the pipe -> EOF.
+        *guard = None;
     }
 
     /// Deliver a signal to the running workload (and its process group).
@@ -1100,29 +1162,52 @@ mod linux {
                             // captured even if the child exits immediately.
                             let status_rx = Reaper::global().register(pid);
                             WORKLOAD_PID.store(pid, Ordering::SeqCst);
+                            // Retain the workload's stdin write half so the
+                            // `Stdin`/`StdinEof` handlers below can feed it. The
+                            // child's stdin was piped in `spawn_workload`.
+                            {
+                                let mut guard = WORKLOAD_STDIN
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                *guard = child.stdin.take();
+                            }
                             let _ = tx.send(Msg::Started { pid });
                             let (h_out, h_err) = stream_child_output(&mut child, &tx);
-                            // Hand reaping to the dedicated reaper thread: do
-                            // NOT call child.wait() (that would race the reaper
-                            // for the child's status). We only kept `child` to
-                            // own the stdio pipes; forget it so its Drop never
-                            // touches the pid the reaper now owns.
-                            let raw_status = wait_via_reaper(&status_rx);
-                            std::mem::forget(child);
-                            // Ensure all buffered output has been pumped.
-                            let _ = h_out.join();
-                            let _ = h_err.join();
-                            WORKLOAD_PID.store(0, Ordering::SeqCst);
-                            if let Some(s) = raw_status {
-                                let _ = tx.send(Msg::Exited {
-                                    code: status_to_code(s),
-                                });
-                            } else {
-                                let _ = tx.send(Msg::Error {
-                                    message: "wait: reaper channel closed".into(),
-                                });
-                                let _ = tx.send(Msg::Exited { code: -1 });
-                            }
+                            // Reap + report exit on a DEDICATED thread so this
+                            // control loop keeps reading frames while the
+                            // workload runs — interactive `-it` stdin
+                            // (`Msg::Stdin`/`Msg::StdinEof`), `Signal`, and
+                            // `Mount` all arrive on THIS connection after `Run`
+                            // and must be serviced concurrently rather than
+                            // blocking until the workload exits.
+                            let exit_tx = tx.clone();
+                            thread::spawn(move || {
+                                // Hand reaping to the dedicated reaper thread: do
+                                // NOT call child.wait() (that would race the
+                                // reaper for the child's status). We only kept
+                                // `child` to own the stdio pipes; forget it so
+                                // its Drop never touches the pid the reaper now
+                                // owns.
+                                let raw_status = wait_via_reaper(&status_rx);
+                                std::mem::forget(child);
+                                // Ensure all buffered output has been pumped.
+                                let _ = h_out.join();
+                                let _ = h_err.join();
+                                WORKLOAD_PID.store(0, Ordering::SeqCst);
+                                // The workload is gone; drop its stdin handle so
+                                // late stdin chunks become no-ops.
+                                close_workload_stdin();
+                                if let Some(s) = raw_status {
+                                    let _ = exit_tx.send(Msg::Exited {
+                                        code: status_to_code(s),
+                                    });
+                                } else {
+                                    let _ = exit_tx.send(Msg::Error {
+                                        message: "wait: reaper channel closed".into(),
+                                    });
+                                    let _ = exit_tx.send(Msg::Exited { code: -1 });
+                                }
+                            });
                         }
                         Err(e) => {
                             let _ = tx.send(Msg::Error {
@@ -1156,6 +1241,30 @@ mod linux {
                             message: format!("Signal failed: {e}"),
                         });
                     }
+                }
+                Msg::Mount {
+                    tag,
+                    target,
+                    readonly,
+                } => {
+                    // The agent has already pivoted into the container root, so
+                    // `target` resolves against the workload's filesystem.
+                    // Failure is reported but never aborts the agent.
+                    if let Err(e) = mount_share(&tag, &target, readonly) {
+                        let _ = tx.send(Msg::Error {
+                            message: format!("Mount {tag} -> {target} failed: {e}"),
+                        });
+                    }
+                }
+                Msg::Stdin(bytes) => {
+                    if let Err(e) = write_workload_stdin(&bytes) {
+                        let _ = tx.send(Msg::Error {
+                            message: format!("Stdin failed: {e}"),
+                        });
+                    }
+                }
+                Msg::StdinEof => {
+                    close_workload_stdin();
                 }
                 // Guest→host-only messages are never expected from the host;
                 // reply with an error rather than silently dropping them.

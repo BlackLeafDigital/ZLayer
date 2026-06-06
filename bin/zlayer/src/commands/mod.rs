@@ -36,6 +36,7 @@ pub mod group;
 pub mod image;
 pub mod job;
 pub mod join;
+pub mod login;
 pub mod network;
 pub mod node;
 pub mod notifier;

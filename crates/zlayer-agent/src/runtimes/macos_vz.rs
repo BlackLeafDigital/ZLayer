@@ -485,8 +485,13 @@ fn ssh_user(spec: &ServiceSpec) -> String {
 #[async_trait::async_trait]
 impl Runtime for VzRuntime {
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            zlayer_spec::PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     async fn pull_image_with_policy(
@@ -494,6 +499,7 @@ impl Runtime for VzRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         let bundle = self.bundle_dir(image);
         let have_bundle = bundle.join("disk.img").exists()

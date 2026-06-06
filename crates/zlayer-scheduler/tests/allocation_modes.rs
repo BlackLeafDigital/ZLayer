@@ -40,6 +40,7 @@ fn make_spec(node_mode: NodeMode, cpu_per_replica: Option<f64>) -> ServiceSpec {
         image: ImageSpec {
             name: "test:latest".parse().expect("valid image reference"),
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources,
         health: HealthSpec {

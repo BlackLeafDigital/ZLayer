@@ -9,7 +9,7 @@ use zlayer_spec::{
     DeploymentSpec, DeviceSpec, EndpointSpec, ErrorsSpec, ExposeType, GpuSpec, HealthCheck,
     HealthSpec, ImageSpec, InitSpec, LifecycleSpec, NetworkMode, NodeMode, Protocol, PullPolicy,
     ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec, ServiceType,
-    StorageSpec, StorageTier, TimeoutAction, UlimitSpec,
+    SourcePolicy, StorageSpec, StorageTier, TimeoutAction, UlimitSpec,
 };
 
 use super::types::{
@@ -113,9 +113,16 @@ fn convert_service(
         .map(super::types::StringOrList::into_list)
         .unwrap_or_default();
 
+    let source_policy = svc
+        .extensions
+        .get("x-zlayer-source-policy")
+        .and_then(serde_yaml::Value::as_str)
+        .and_then(parse_source_policy);
+
     let image = ImageSpec {
         name: image.name,
         pull_policy: pull_policy.unwrap_or(image.pull_policy),
+        source_policy,
     };
 
     // Plumb additional groups (`group_add:`) into `extra_groups`.
@@ -409,6 +416,7 @@ fn convert_image(project: &str, svc_name: &str, svc: &ComposeService) -> crate::
                 ))
             })?,
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         });
     }
 
@@ -433,6 +441,7 @@ fn convert_image(project: &str, svc_name: &str, svc: &ComposeService) -> crate::
             ))
         })?,
         pull_policy: PullPolicy::IfNotPresent,
+        source_policy: None,
     })
 }
 
@@ -1050,6 +1059,25 @@ fn parse_pull_policy(s: Option<&str>) -> Option<PullPolicy> {
         "build" => None,
         other => {
             warn!(value = other, "unknown compose pull_policy; ignoring");
+            None
+        }
+    }
+}
+
+/// Parse the `x-zlayer-source-policy` extension value into a [`SourcePolicy`].
+/// Accepts both `snake_case` and kebab-case spellings, case-insensitively:
+/// `local_first`/`local-first`, `s3_first`/`s3-first`,
+/// `remote_only`/`remote-only`, `local_only`/`local-only`. Unknown values are
+/// warned about and ignored.
+fn parse_source_policy(s: &str) -> Option<SourcePolicy> {
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "local_first" | "local-first" => Some(SourcePolicy::LocalFirst),
+        "s3_first" | "s3-first" => Some(SourcePolicy::S3First),
+        "remote_only" | "remote-only" => Some(SourcePolicy::RemoteOnly),
+        "local_only" | "local-only" => Some(SourcePolicy::LocalOnly),
+        other => {
+            warn!(value = other, "unknown x-zlayer-source-policy; ignoring");
             None
         }
     }

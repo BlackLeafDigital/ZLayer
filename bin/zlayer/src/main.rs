@@ -706,8 +706,36 @@ async fn run(
             )
             .await
         }
-        Commands::Pull { image } => {
-            commands::registry::handle_pull(image.as_deref(), &cli.effective_data_dir()).await
+        Commands::Pull {
+            image,
+            username,
+            password,
+        } => {
+            commands::registry::handle_pull(
+                image.as_deref(),
+                username.clone(),
+                password.clone(),
+                &cli.effective_data_dir(),
+            )
+            .await
+        }
+        Commands::Login {
+            registry,
+            username,
+            password,
+            auth_type,
+            default,
+            zauth,
+        } => {
+            commands::login::run(
+                registry.clone(),
+                username.clone(),
+                password.clone(),
+                auth_type.to_string(),
+                *default,
+                *zauth,
+            )
+            .await
         }
 
         // =================================================================
@@ -1005,26 +1033,8 @@ async fn run(
         }
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
         Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
-        Commands::Run {
-            env,
-            no_global,
-            merge,
-            project,
-            dry_run,
-            unmask,
-            command,
-        } => {
-            commands::run::handle_run(
-                env,
-                *no_global,
-                merge,
-                project.as_deref(),
-                *dry_run,
-                *unmask,
-                command,
-            )
-            .await
-        }
+        #[cfg(feature = "docker-compat")]
+        Commands::Run(run_args) => commands::run::handle_container_run(run_args).await,
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await
         }
@@ -1061,6 +1071,26 @@ async fn run(
                 description,
             } => commands::env::update(id.clone(), name.clone(), description.clone()).await,
             cli::EnvCommands::Delete { id, yes } => commands::env::delete(id.clone(), *yes).await,
+            cli::EnvCommands::Run {
+                env_id,
+                no_global,
+                merge,
+                project,
+                dry_run,
+                unmask,
+                command,
+            } => {
+                commands::run::handle_env_run(
+                    env_id,
+                    *no_global,
+                    merge,
+                    project.as_deref(),
+                    *dry_run,
+                    *unmask,
+                    command,
+                )
+                .await
+            }
         },
         Commands::Task(task_cmd) => match task_cmd {
             cli::TaskCommands::List { project, output } => {

@@ -595,6 +595,52 @@ pub(crate) enum Commands {
     Pull {
         /// Image reference. If omitted, pulls every image from the auto-discovered spec.
         image: Option<String>,
+
+        /// Registry username for authenticated pulls. Falls back to
+        /// `ZLAYER_REGISTRY_USERNAME`, then anonymous.
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Registry password/token for authenticated pulls. Falls back to
+        /// `ZLAYER_REGISTRY_PASSWORD`, then anonymous.
+        #[arg(short = 'p', long)]
+        password: Option<String>,
+    },
+
+    /// Log in to a container registry (stores a credential in the daemon).
+    ///
+    /// Ergonomic wrapper over `zlayer credential registry add`. Prompts for any
+    /// omitted username/password. With `--zauth`, mints a bearer via a `ZAuth`
+    /// OIDC client-credentials exchange and stores it as a token credential.
+    ///
+    /// Examples:
+    ///   zlayer login ghcr.io --username me
+    ///   zlayer login registry.blackleafdigital.com --zauth
+    ///   zlayer login ghcr.io --username me --default
+    #[command(verbatim_doc_comment, display_order = 21)]
+    Login {
+        /// Container registry URL (e.g. `ghcr.io`, `docker.io`).
+        registry: String,
+
+        /// Registry username (prompted if omitted; ignored with `--zauth`).
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Registry password or token (prompted if omitted; ignored with `--zauth`).
+        #[arg(short = 'p', long)]
+        password: Option<String>,
+
+        /// Authentication type.
+        #[arg(long, value_enum, default_value_t = CliRegistryAuthType::Basic)]
+        auth_type: CliRegistryAuthType,
+
+        /// Persist this registry as the daemon's default (`ZLAYER_DEFAULT_REGISTRY`).
+        #[arg(long)]
+        default: bool,
+
+        /// Mint a bearer token via a `ZAuth` OIDC client-credentials exchange.
+        #[arg(long)]
+        zauth: bool,
     },
 
     /// Export an image to a tar file (OCI Image Layout)
@@ -910,54 +956,31 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 38)]
     Secret(SecretCommands),
 
-    /// Run a local command with secrets injected as env vars.
+    /// Run a container (docker-run semantics), optionally injecting a
+    /// ZLayer secret-environment.
     ///
-    /// Resolution order (later wins on collision):
-    ///   1. Parent env (inherited)
-    ///   2. `global` env secrets (auto-merged unless --no-global)
-    ///   3. Each --merge <slug> env in order
-    ///   4. --env <slug> secrets (highest priority)
+    /// `--env <SLUG>` selects a ZLayer secret-ENVIRONMENT whose secrets are
+    /// resolved and injected into the container. Individual container env
+    /// vars use the SHORT `-e KEY=VAL` flag (docker-style); they override
+    /// any secret of the same name.
+    ///
+    /// Secret precedence (base, lowest → highest):
+    ///   1. `global` env secrets (auto-merged unless --no-global)
+    ///   2. Each --merge <slug> env in order
+    ///   3. --env <slug> secrets (primary)
+    /// then individual `-e KEY=VAL` flags win over all of the above.
+    ///
+    /// To run a local process with only secrets injected (no container),
+    /// use `zlayer env run` instead.
     ///
     /// Examples:
-    ///   zlayer run --env dev -- pnpm run dev
-    ///   zlayer run --env staging --no-global -- bash ./deploy.sh
-    ///   zlayer run --env prod --merge global --merge baseline -- ./bin/server
-    ///   zlayer run --env dev --dry-run         # masked preview
-    ///   zlayer run --env dev --dry-run --unmask  # plaintext (admin)
+    ///   zlayer run --env dev -e PORT=8080 -v /host:/work -w /work rust:1.91 -- cargo build
+    ///   zlayer run -it --rm ubuntu:24.04 -- bash
+    ///   zlayer run -d --name web -p 8080:80 nginx:latest
+    #[cfg(feature = "docker-compat")]
+    #[allow(clippy::doc_markdown, clippy::doc_lazy_continuation)]
     #[command(verbatim_doc_comment, display_order = 39)]
-    Run {
-        /// Primary environment to resolve secrets from (id or name).
-        #[arg(long)]
-        env: String,
-
-        /// Skip the implicit `global` env merge. Off by default.
-        #[arg(long, default_value_t = false)]
-        no_global: bool,
-
-        /// Additional env(s) to merge under the primary env. Left-to-right
-        /// order: later flags win over earlier ones (but the primary --env
-        /// always wins).
-        #[arg(long = "merge", value_name = "SLUG")]
-        merge: Vec<String>,
-
-        /// Project id used to resolve non-UUID env names.
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Print the resolved env instead of spawning. Values are masked
-        /// as `***` unless --unmask is also passed.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-
-        /// Reveal plaintext values in --dry-run output (admin only).
-        #[arg(long, default_value_t = false, requires = "dry_run")]
-        unmask: bool,
-
-        /// Command and arguments to run. Use `--` to separate from zlayer args.
-        /// Example: `zlayer run --env dev -- pnpm run dev`
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
-        command: Vec<String>,
-    },
+    Run(Box<RunArgs>),
 
     /// Environment management commands
     ///
@@ -2031,6 +2054,105 @@ pub(crate) enum SecretCommands {
     },
 }
 
+/// Arguments for the top-level `zlayer run` container runner.
+///
+/// Mirrors the subset of `docker run` flags that the VZ-Linux runtime
+/// supports, plus the ZLayer secret-environment selectors (`--env`,
+/// `--merge`, `--no-global`, `--project`). Note the deliberate flag split:
+/// `--env <SLUG>` names a ZLayer secret-environment to inject, while the
+/// docker-style individual env var is the SHORT `-e KEY=VAL` (no `--env`
+/// long alias).
+#[cfg(feature = "docker-compat")]
+#[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools, clippy::doc_markdown)]
+pub(crate) struct RunArgs {
+    /// Image to run (e.g. `rust:1.91`, `nginx:latest`).
+    pub image: String,
+
+    /// Command (and args) to run in the container. Use `--` to separate
+    /// from zlayer flags, e.g. `zlayer run rust:1.91 -- cargo build`.
+    #[arg(trailing_var_arg = true, num_args = 0..)]
+    pub command: Vec<String>,
+
+    // ---- ZLayer secret-environment selectors ----
+    /// ZLayer secret-ENVIRONMENT (id or slug) to resolve and inject into
+    /// the container. This is the secret-env concept, NOT a single env var.
+    #[arg(long)]
+    pub env: Option<String>,
+
+    /// Additional secret-env(s) to merge under the primary `--env`.
+    /// Left-to-right: later flags win over earlier ones (the primary
+    /// `--env` always wins over merges).
+    #[arg(long = "merge", value_name = "SLUG")]
+    pub merge: Vec<String>,
+
+    /// Skip the implicit `global` secret-env merge. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub no_global: bool,
+
+    /// Project id used to resolve non-UUID secret-env names.
+    #[arg(long)]
+    pub project: Option<String>,
+
+    // ---- docker-run container flags ----
+    /// Bind mount a volume (`HOST:CONTAINER[:OPTS]`).
+    #[arg(short = 'v', long = "volume")]
+    pub volumes: Vec<String>,
+
+    /// Set container env var KEY=VAL (docker-style, short `-e` only).
+    /// Overrides any secret of the same name.
+    #[arg(short = 'e')]
+    pub env_vars: Vec<String>,
+
+    /// Publish a container's port(s) to the host (`HOST:CONTAINER[/PROTO]`).
+    #[arg(short = 'p', long = "publish")]
+    pub ports: Vec<String>,
+
+    /// Working directory inside the container.
+    #[arg(short = 'w', long = "workdir")]
+    pub workdir: Option<String>,
+
+    /// Allocate a pseudo-TTY.
+    #[arg(short = 't', long = "tty")]
+    pub tty: bool,
+
+    /// Keep STDIN open even if not attached.
+    #[arg(short = 'i', long = "interactive")]
+    pub interactive: bool,
+
+    /// Automatically remove the container when it exits.
+    #[arg(long)]
+    pub rm: bool,
+
+    /// Run the container in the background and print its id.
+    #[arg(short = 'd', long = "detach")]
+    pub detach: bool,
+
+    /// Assign a name to the container.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Overwrite the default ENTRYPOINT of the image.
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+
+    /// Username or UID (`<name|uid>[:<group|gid>]`).
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Memory limit (e.g. `512m`, `2g`).
+    #[arg(long)]
+    pub memory: Option<String>,
+
+    /// Number of CPUs (e.g. `1.5`).
+    #[arg(long)]
+    pub cpus: Option<String>,
+
+    /// Connect the container to a network.
+    #[arg(long)]
+    pub network: Option<String>,
+}
+
 /// Environment management subcommands.
 ///
 /// An environment is a named, isolated namespace for secrets (and, in
@@ -2091,6 +2213,55 @@ pub(crate) enum EnvCommands {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+    },
+
+    /// Run a local command with secrets injected as env vars (no container).
+    ///
+    /// Resolution order (later wins on collision):
+    ///   1. Parent env (inherited)
+    ///   2. `global` env secrets (auto-merged unless --no-global)
+    ///   3. Each --merge <slug> env in order
+    ///   4. <env_id> secrets (highest priority)
+    ///
+    /// Examples:
+    ///   zlayer env run dev -- pnpm run dev
+    ///   zlayer env run staging --no-global -- bash ./deploy.sh
+    ///   zlayer env run prod --merge global --merge baseline -- ./bin/server
+    ///   zlayer env run dev --dry-run             # masked preview
+    ///   zlayer env run dev --dry-run --unmask    # plaintext (admin)
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Run {
+        /// Primary environment to resolve secrets from (id or name).
+        env_id: String,
+
+        /// Skip the implicit `global` env merge. Off by default.
+        #[arg(long, default_value_t = false)]
+        no_global: bool,
+
+        /// Additional env(s) to merge under the primary env. Left-to-right
+        /// order: later flags win over earlier ones (but the primary env
+        /// always wins).
+        #[arg(long = "merge", value_name = "SLUG")]
+        merge: Vec<String>,
+
+        /// Project id used to resolve non-UUID env names.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the resolved env instead of spawning. Values are masked
+        /// as `***` unless --unmask is also passed.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Reveal plaintext values in --dry-run output (admin only).
+        #[arg(long, default_value_t = false, requires = "dry_run")]
+        unmask: bool,
+
+        /// Command and arguments to run. Use `--` to separate from zlayer args.
+        /// Example: `zlayer env run dev -- pnpm run dev`
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
     },
 }
 

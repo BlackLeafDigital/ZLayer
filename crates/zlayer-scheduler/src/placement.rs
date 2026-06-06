@@ -1400,6 +1400,7 @@ mod tests {
             image: ImageSpec {
                 name: "test:latest".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
             health: zlayer_spec::HealthSpec {
                 start_grace: None,

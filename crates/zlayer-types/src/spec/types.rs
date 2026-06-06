@@ -1638,6 +1638,7 @@ impl ServiceSpec {
             image: ImageSpec {
                 name: image_ref,
                 pull_policy: default_pull_policy(),
+                source_policy: None,
             },
             ..Self::default()
         }
@@ -1688,6 +1689,28 @@ pub enum ResourceType {
     Cron,
 }
 
+/// Per-image override for the registry resolution chain order.
+///
+/// The puller's default chain is LOCAL store → local CACHE → shared S3 tier →
+/// the ref's own registry (URL) → last-resort default registry. A spec/compose
+/// entry may pin a different behavior; `None` on [`ImageSpec`] == [`Self::LocalFirst`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePolicy {
+    /// Default chain order (local store → cache → S3 → URL → fallback).
+    #[default]
+    LocalFirst,
+    /// Probe the shared S3 tier BEFORE the local in-process cache (otherwise
+    /// the default order). Useful when S3 is the fleet's canonical warm pool.
+    S3First,
+    /// Skip every local/cached/S3 source — always resolve from the ref's own
+    /// registry (or the configured default registry for a bare name).
+    RemoteOnly,
+    /// Resolve ONLY from local sources (local store + cache); never touch S3,
+    /// the network, or the default-registry fallback. A miss is an error.
+    LocalOnly,
+}
+
 /// Container image specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
 #[serde(deny_unknown_fields)]
@@ -1698,6 +1721,11 @@ pub struct ImageSpec {
     /// When to pull the image
     #[serde(default = "default_pull_policy")]
     pub pull_policy: PullPolicy,
+
+    /// Optional override for the registry resolution chain order.
+    /// `None` is treated as [`SourcePolicy::LocalFirst`] (the default chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_policy: Option<SourcePolicy>,
 }
 
 fn default_pull_policy() -> PullPolicy {
@@ -1718,6 +1746,7 @@ impl Default for ImageSpec {
             name: crate::ImageRef::from_str("scratch:latest")
                 .expect("'scratch:latest' is a valid image reference"),
             pull_policy: default_pull_policy(),
+            source_policy: None,
         }
     }
 }

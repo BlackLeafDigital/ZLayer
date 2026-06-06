@@ -3536,7 +3536,7 @@ impl Runtime for HcsRuntime {
     }
 
     #[instrument(
-        skip(self, auth),
+        skip(self, auth, _source),
         fields(otel.name = "image.pull", container.image.name = %image, pull_policy = ?policy)
     )]
     async fn pull_image_with_policy(
@@ -3544,6 +3544,7 @@ impl Runtime for HcsRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&SpecRegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         if matches!(policy, PullPolicy::Never) {
             // Never policy: succeed only if we already have it cached.

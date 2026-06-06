@@ -130,6 +130,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         image: ImageSpec {
             name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::Never, // Using local cache
+            source_policy: None,
         },
         resources: ResourcesSpec::default(),
         env: HashMap::new(),

@@ -270,6 +270,7 @@ mod tests {
             _image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
+            _source: zlayer_spec::SourcePolicy,
         ) -> AgentResult<()> {
             Err(AgentError::Unsupported("pull_image_with_policy".into()))
         }

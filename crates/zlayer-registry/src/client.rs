@@ -76,6 +76,19 @@ pub fn manifest_digest_cache_key(image: &str) -> String {
     format!("manifest:digest-{}", canonical_manifest_ref(image))
 }
 
+/// Blob-cache key under which the user's ORIGINAL (as-typed) reference for a
+/// cached manifest is stored, so `list_images` can surface what the user typed
+/// (`alpine:latest`) rather than the canonical form used as the cache key
+/// (`docker.io/library/alpine:latest`).
+///
+/// The prefix is `manifest-orig:` (a hyphen, NOT `manifest:`) so it is NOT
+/// enumerated by `keys_with_prefix("manifest:")` in `list_images`. Keyed on the
+/// canonical ref (like [`manifest_cache_key`]) so writer and reader agree.
+#[must_use]
+pub fn manifest_orig_cache_key(image: &str) -> String {
+    format!("manifest-orig:{}", canonical_manifest_ref(image))
+}
+
 /// Errors that can occur during push operations
 #[derive(Debug, Error)]
 pub enum PushError {
@@ -236,61 +249,10 @@ fn is_mutable_tag(image: &str) -> bool {
 /// 6. The bare last path segment.
 #[cfg(feature = "local")]
 fn local_image_ref_candidates(image: &str) -> Vec<(String, String)> {
-    // Split off digest/tag to get the primary name + reference.
-    let (primary, reference) = if let Some(at_pos) = image.find('@') {
-        (image[..at_pos].to_string(), image[at_pos + 1..].to_string())
-    } else if let Some(colon_pos) = image.rfind(':') {
-        let potential_tag = &image[colon_pos + 1..];
-        if !potential_tag.contains('/') && !potential_tag.is_empty() {
-            (image[..colon_pos].to_string(), potential_tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        }
-    } else {
-        (image.to_string(), "latest".to_string())
-    };
-
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let push = |name: String,
-                candidates: &mut Vec<(String, String)>,
-                seen: &mut std::collections::HashSet<String>| {
-        if seen.insert(name.clone()) {
-            candidates.push((name, reference.clone()));
-        }
-    };
-
-    // 1. Primary name as-is.
-    push(primary.clone(), &mut candidates, &mut seen);
-
-    // 2. Strip `docker.io/` prefix.
-    if let Some(rest) = primary.strip_prefix("docker.io/") {
-        push(rest.to_string(), &mut candidates, &mut seen);
-    }
-
-    // 3. Strip `docker.io/library/` prefix.
-    if let Some(rest) = primary.strip_prefix("docker.io/library/") {
-        push(rest.to_string(), &mut candidates, &mut seen);
-    }
-
-    // 4. Strip `library/` prefix.
-    if let Some(rest) = primary.strip_prefix("library/") {
-        push(rest.to_string(), &mut candidates, &mut seen);
-    }
-
-    // 5. Add `library/` prefix when the primary has no `/` at all.
-    if !primary.contains('/') {
-        push(format!("library/{primary}"), &mut candidates, &mut seen);
-    }
-
-    // 6. Bare last path segment.
-    if let Some(last) = primary.rsplit('/').next() {
-        if !last.is_empty() {
-            push(last.to_string(), &mut candidates, &mut seen);
-        }
-    }
-
-    candidates
+    // Delegates to the shared, non-cfg helper in `zlayer-types` so the agent
+    // crate (VZ rootfs cross-spelling lookup) and the registry use identical
+    // candidate logic. See `zlayer_types::image_ref_candidates`.
+    zlayer_types::image_ref_candidates(image)
 }
 
 #[cfg(all(test, feature = "local"))]
@@ -509,6 +471,19 @@ pub struct ImagePuller {
     /// — the macOS Docker-Hub-429 regression was precisely a "local-only" path
     /// silently falling through to the network.
     network_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Optional SHARED/remote blob cache (typically S3) probed AFTER the
+    /// primary `cache` and BEFORE the network. A hit here is written through to
+    /// `cache` (warm) on the way out; a fresh network pull is propagated down
+    /// into it. `None` = no S3 tier (single-cache behavior, unchanged).
+    s3_cache: Option<Arc<Box<dyn BlobCacheBackend>>>,
+    /// Last-resort default registry host for bare/unqualified names found
+    /// nowhere in the chain (e.g. `docker.io`). `None` = a bare name resolves
+    /// nowhere → actionable error; `ZLayer` never silently invents docker.io.
+    default_registry: Option<String>,
+    /// Per-image override of the resolution chain order (default
+    /// [`zlayer_spec::SourcePolicy::LocalFirst`] = the full chain). Read once in
+    /// [`Self::pull_manifest_inner`].
+    source_policy: zlayer_spec::SourcePolicy,
     #[cfg(feature = "local")]
     local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
 }
@@ -527,6 +502,9 @@ impl ImagePuller {
             cache: Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>),
             concurrency_limit: Arc::new(Semaphore::new(3)),
             network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            s3_cache: None,
+            default_registry: None,
+            source_policy: zlayer_spec::SourcePolicy::LocalFirst,
             #[cfg(feature = "local")]
             local_registry: None,
         }
@@ -546,6 +524,9 @@ impl ImagePuller {
             cache,
             concurrency_limit: Arc::new(Semaphore::new(3)),
             network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            s3_cache: None,
+            default_registry: None,
+            source_policy: zlayer_spec::SourcePolicy::LocalFirst,
             #[cfg(feature = "local")]
             local_registry: None,
         }
@@ -569,6 +550,9 @@ impl ImagePuller {
             cache,
             concurrency_limit: Arc::new(Semaphore::new(3)),
             network_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            s3_cache: None,
+            default_registry: None,
+            source_policy: zlayer_spec::SourcePolicy::LocalFirst,
             #[cfg(feature = "local")]
             local_registry: None,
         }
@@ -616,6 +600,62 @@ impl ImagePuller {
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = Arc::new(Semaphore::new(limit));
         self
+    }
+
+    /// Attach a SHARED/remote blob cache (typically S3) as the write-through
+    /// tier probed after the primary cache and before the network. See the
+    /// `s3_cache` field. Build one from the environment with
+    /// [`crate::s3_cache_from_env`].
+    #[must_use]
+    pub fn with_s3_cache(mut self, s3: Arc<Box<dyn BlobCacheBackend>>) -> Self {
+        self.s3_cache = Some(s3);
+        self
+    }
+
+    /// Set the last-resort default registry host for bare/unqualified names
+    /// (e.g. `docker.io`). With no default set, a bare name found nowhere in the
+    /// chain is an error — `ZLayer` never silently invents docker.io.
+    #[must_use]
+    pub fn with_default_registry(mut self, registry: impl Into<String>) -> Self {
+        let host = registry.into();
+        self.default_registry = if host.trim().is_empty() {
+            None
+        } else {
+            Some(host)
+        };
+        self
+    }
+
+    /// Override the resolution chain order for this puller (per-image policy).
+    #[must_use]
+    pub fn with_source_policy(mut self, source: zlayer_spec::SourcePolicy) -> Self {
+        self.source_policy = source;
+        self
+    }
+
+    /// Central runtime-puller constructor: wraps `cache` and wires the shared S3
+    /// tier (`ZLAYER_S3_BUCKET`) + last-resort default registry
+    /// (`ZLAYER_DEFAULT_REGISTRY`) from the environment, plus the per-image
+    /// `source` policy. This is the SINGLE place runtimes get the full source
+    /// chain — they must not re-implement the env wiring. Callers add
+    /// `.with_local_registry(..)` afterward when they have one (it is
+    /// feature-gated, so it stays at the call site).
+    pub async fn from_env_for_runtime(
+        cache: Arc<Box<dyn BlobCacheBackend>>,
+        source: zlayer_spec::SourcePolicy,
+    ) -> Self {
+        let mut puller = Self::with_cache(cache).with_source_policy(source);
+        match crate::cache_config::s3_cache_from_env().await {
+            Ok(Some(s3)) => puller = puller.with_s3_cache(s3),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "S3 cache tier configured but failed to initialize; continuing without it");
+            }
+        }
+        if let Some(default_registry) = crate::cache_config::default_registry_from_env() {
+            puller = puller.with_default_registry(default_registry);
+        }
+        puller
     }
 
     /// Set a local OCI registry for image resolution.
@@ -680,10 +720,20 @@ impl ImagePuller {
         urls: &[String],
         expected_size: Option<i64>,
     ) -> Result<Vec<u8>> {
-        // Check cache first (now async)
+        // Check the local cache first (now async).
         if let Some(data) = self.cache.get(digest).await? {
             tracing::debug!(digest = %digest, "blob found in cache");
             return Ok(data);
+        }
+
+        // Then the shared S3 tier (digest-addressed → immutable, no
+        // revalidation). A hit warms the local cache so the next pull is local.
+        if let Some(s3) = &self.s3_cache {
+            if let Ok(Some(data)) = s3.get(digest).await {
+                tracing::debug!(digest = %digest, "blob found in S3 tier; warming local cache");
+                let _ = self.cache.put(digest, &data).await;
+                return Ok(data);
+            }
         }
 
         // Store auth before pulling blob
@@ -752,8 +802,17 @@ impl ImagePuller {
             )));
         }
 
-        // Cache the blob (now async)
+        // Cache the blob locally (now async).
         self.cache.put(digest, &buffer).await?;
+
+        // Propagate DOWN into the shared S3 tier so other nodes (and this node
+        // after a cold restart) can serve it without re-hitting the origin.
+        // Best-effort: an S3 write failure must not fail an otherwise-good pull.
+        if let Some(s3) = &self.s3_cache {
+            if let Err(e) = s3.put(digest, &buffer).await {
+                tracing::debug!(digest = %digest, error = %e, "failed to propagate blob to S3 tier");
+            }
+        }
 
         tracing::debug!(digest = %digest, size = buffer.len(), "blob cached successfully");
 
@@ -1040,35 +1099,50 @@ impl ImagePuller {
         auth: &RegistryAuth,
         policy: PullPolicy,
     ) -> Result<(OciImageManifest, String)> {
+        use zlayer_spec::SourcePolicy;
         let cache_key = manifest_cache_key(image);
         let digest_key = manifest_digest_cache_key(image);
+        let source = self.source_policy;
 
-        // 1. Blob cache hit?
-        if let Some(hit) = self
-            .try_cached_manifest(image, auth, &cache_key, &digest_key, policy)
-            .await
-        {
-            return Ok(hit);
-        }
+        // The resolution chain — LOCAL store -> local CACHE -> shared S3 tier ->
+        // the ref's own registry (URL) -> last-resort default registry. Lower
+        // tiers are populated ("propagated down") from a higher-authority hit so
+        // the chain stays consistent. Mutable tags revalidate against the ORIGIN;
+        // on any upstream-check error we serve the copy we already have
+        // (fail-safe — serving stale beats crashing a redeploy on a Docker Hub
+        // 429). Pinned tags / digests are immutable and never re-checked.
+        //
+        // `source` (the per-image [`SourcePolicy`]) selects which tiers run:
+        //   - LocalFirst (default): the full chain, local CACHE before S3.
+        //   - S3First:    like LocalFirst but probe S3 BEFORE the local cache.
+        //   - LocalOnly:  local store + cache only; never S3/network/fallback.
+        //   - RemoteOnly: skip every local/cached/S3 source; go to origin.
+        // The local in-process CACHE is probed before the network S3 tier under
+        // LocalFirst (faster; byte-identical for immutable, both revalidate vs
+        // origin for mutable).
+        let use_local = !matches!(source, SourcePolicy::RemoteOnly);
+        let use_s3 = matches!(source, SourcePolicy::LocalFirst | SourcePolicy::S3First);
+        let use_origin = !matches!(source, SourcePolicy::LocalOnly);
 
-        // 2. Local registry hit? Populate blob cache from it.
+        // 1. LOCAL store — owned/built images via the local registry. Highest
+        //    authority for "we already have THIS image".
         #[cfg(feature = "local")]
-        if let Some((manifest, digest)) = self.try_local_registry(image).await {
-            if let Ok(bytes) = serde_json::to_vec(&manifest) {
-                let _ = self.cache.put(&cache_key, &bytes).await;
-                let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
-            }
+        if use_local {
+            if let Some((manifest, digest)) = self.try_local_registry(image).await {
+                // Owned images warm the LOCAL cache only — never propagate a
+                // locally-built manifest up into the shared S3 tier.
+                self.warm_local_cache(image, &cache_key, &digest_key, &manifest, &digest)
+                    .await;
 
-            // IfNotPresent/Never: trust local, no remote check.
-            if matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never) {
-                tracing::debug!(
-                    image = %image,
-                    "local manifest hit, IfNotPresent/Never policy, skipping remote check"
-                );
-                return Ok((manifest, digest));
-            }
-
-            if is_mutable_tag(image) {
+                // Serve local unless we may AND should revalidate a mutable tag
+                // against the origin (never under LocalOnly / IfNotPresent / Never
+                // / a pinned ref).
+                let revalidate = use_origin
+                    && !matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never)
+                    && is_mutable_tag(image);
+                if !revalidate {
+                    return Ok((manifest, digest));
+                }
                 match self.remote_manifest_digest(image, auth).await {
                     Ok(Some(remote_digest)) if remote_digest != digest => {
                         tracing::info!(
@@ -1077,56 +1151,117 @@ impl ImagePuller {
                             remote = %remote_digest,
                             "remote has newer manifest, pulling fresh"
                         );
-                        // Fall through to remote pull below
+                        // Newer upstream — fall through to the origin pull.
                     }
-                    Ok(Some(_)) => {
-                        tracing::debug!(image = %image, "local manifest matches remote, using local");
-                        return Ok((manifest, digest));
-                    }
-                    Ok(None) => {
-                        tracing::debug!(image = %image, "image not on remote registry, using local");
-                        return Ok((manifest, digest));
-                    }
+                    Ok(Some(_) | None) => return Ok((manifest, digest)),
                     Err(e) => {
                         tracing::warn!(image = %image, error = %e, "remote check failed, using local manifest");
                         return Ok((manifest, digest));
                     }
                 }
-            } else {
-                return Ok((manifest, digest));
+                return self
+                    .pull_from_origin(image, auth, &cache_key, &digest_key)
+                    .await;
             }
         }
 
-        // 3. Refuse to silently route unqualified names to Docker Hub.
-        //
-        // `oci_client::Reference::from_str` happily turns `foo:latest` into
-        // `docker.io/library/foo:latest` — but if the user wanted Docker Hub
-        // they should have written it explicitly. A bare name almost always
-        // refers to a locally-built image; falling through to docker.io here
-        // is how a locally-built `zarcrunner-executor:latest` becomes a 401
-        // against `index.docker.io/v2/library/zarcrunner-executor`.
-        if zlayer_types::image_str_is_unqualified(image) {
+        // 2 & 3. Local blob/manifest CACHE and the shared S3 tier, ordered by
+        //    policy. Skipped entirely under RemoteOnly.
+        if use_local {
+            if matches!(source, SourcePolicy::S3First) {
+                if let Some(hit) = self
+                    .try_s3_manifest(image, auth, &cache_key, &digest_key, policy)
+                    .await
+                {
+                    return Ok(hit);
+                }
+                if let Some(hit) = self
+                    .try_cached_manifest(image, auth, &cache_key, &digest_key, policy)
+                    .await
+                {
+                    return Ok(hit);
+                }
+            } else {
+                if let Some(hit) = self
+                    .try_cached_manifest(image, auth, &cache_key, &digest_key, policy)
+                    .await
+                {
+                    return Ok(hit);
+                }
+                if use_s3 {
+                    if let Some(hit) = self
+                        .try_s3_manifest(image, auth, &cache_key, &digest_key, policy)
+                        .await
+                    {
+                        return Ok(hit);
+                    }
+                }
+            }
+        }
+
+        // 4 & 5. Origin (the ref's own registry / configured default registry).
+        //    Skipped under LocalOnly — a local miss there is a clean error.
+        if !use_origin {
             return Err(RegistryError::NotFound {
                 registry: "local".to_string(),
                 image: format!(
-                    "{image} (unqualified image not found locally; ZLayer does not silently \
-                     pull bare names from Docker Hub — use a full registry URL such as \
-                     docker.io/library/{image} for a remote pull, or run `zlayer build` to \
-                     produce it locally)"
+                    "{image} (source_policy=local_only: not present in any local source \
+                     and remote resolution is disabled for this image)"
                 ),
             });
         }
+        self.pull_from_origin(image, auth, &cache_key, &digest_key)
+            .await
+    }
 
-        // 4. Pull from remote registry
-        let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
-            registry: "unknown".to_string(),
-            image: image.to_string(),
-        })?;
+    /// Steps 4 & 5 of the chain: pull the manifest from the ref's OWN registry
+    /// (URL), or — for a bare/unqualified name found nowhere locally — from the
+    /// configured last-resort default registry. `ZLayer` NEVER silently invents
+    /// docker.io: a bare name with no default registry configured is an
+    /// actionable error. A successful pull is propagated DOWN the chain (local
+    /// cache + S3). On remote failure, the local registry is the last resort.
+    async fn pull_from_origin(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        cache_key: &str,
+        digest_key: &str,
+    ) -> Result<(OciImageManifest, String)> {
+        let pull_ref: Reference = if zlayer_types::image_str_is_unqualified(image) {
+            let Some(default) = self.default_registry.as_deref() else {
+                return Err(RegistryError::NotFound {
+                    registry: "local".to_string(),
+                    image: format!(
+                        "{image} (unqualified image not found locally; ZLayer does not silently \
+                         pull bare names from a public registry — use a full registry URL such as \
+                         registry.example.com/{image} for a remote pull, configure a default with \
+                         `zlayer login --default <host>` (or ZLAYER_DEFAULT_REGISTRY), or run \
+                         `zlayer build` to produce it locally)"
+                    ),
+                });
+            };
+            let qualified = format!("{}/{}", default.trim_end_matches('/'), image);
+            tracing::info!(
+                image = %image,
+                default_registry = %default,
+                qualified = %qualified,
+                "bare name resolved nowhere; using configured last-resort default registry"
+            );
+            qualified.parse().map_err(|_| RegistryError::NotFound {
+                registry: default.to_string(),
+                image: qualified.clone(),
+            })?
+        } else {
+            image.parse().map_err(|_| RegistryError::NotFound {
+                registry: "unknown".to_string(),
+                image: image.to_string(),
+            })?
+        };
 
-        tracing::info!(image = %image, "pulling manifest from registry");
+        tracing::info!(image = %image, reference = %pull_ref, "pulling manifest from registry");
 
         self.note_network_call();
-        match self.client.pull_image_manifest(&reference, auth).await {
+        match self.client.pull_image_manifest(&pull_ref, auth).await {
             Ok((manifest, digest)) => {
                 tracing::debug!(
                     image = %image,
@@ -1135,15 +1270,16 @@ impl ImagePuller {
                     "manifest pulled successfully"
                 );
 
-                if let Ok(bytes) = serde_json::to_vec(&manifest) {
-                    let _ = self.cache.put(&cache_key, &bytes).await;
-                    let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
-                }
+                // Propagate DOWN the chain: both the local cache AND the shared
+                // S3 tier get the fresh body so later resolves (here or on other
+                // nodes) stay consistent.
+                self.propagate_manifest_down(image, cache_key, digest_key, &manifest, &digest)
+                    .await;
 
                 Ok((manifest, digest))
             }
             Err(remote_err) => {
-                // 4. Remote failed — try local registry as last resort
+                // Remote failed — try local registry as last resort.
                 #[cfg(feature = "local")]
                 if let Some((manifest, digest)) = self.try_local_registry(image).await {
                     tracing::warn!(
@@ -1156,6 +1292,115 @@ impl ImagePuller {
 
                 tracing::error!(error = %remote_err, image = %image, "failed to pull manifest");
                 Err(RegistryError::Oci(remote_err))
+            }
+        }
+    }
+
+    /// Record the user's ORIGINAL (as-typed) `image` ref in the local cache so
+    /// `list_images` can surface it instead of the canonical key. Best-effort.
+    /// One place writes this sidecar (called from both warm + propagate).
+    async fn record_original_ref(&self, image: &str) {
+        let _ = self
+            .cache
+            .put(&manifest_orig_cache_key(image), image.as_bytes())
+            .await;
+    }
+
+    /// Write a manifest body + digest into the LOCAL cache only (warming it from
+    /// a higher-authority tier) and record the original ref. Best-effort —
+    /// failures are ignored; the already-resolved manifest is still returned.
+    async fn warm_local_cache(
+        &self,
+        image: &str,
+        cache_key: &str,
+        digest_key: &str,
+        manifest: &OciImageManifest,
+        digest: &str,
+    ) {
+        if let Ok(bytes) = serde_json::to_vec(manifest) {
+            let _ = self.cache.put(cache_key, &bytes).await;
+            let _ = self.cache.put(digest_key, digest.as_bytes()).await;
+        }
+        self.record_original_ref(image).await;
+    }
+
+    /// Propagate a remote-origin manifest DOWN the chain: into the local cache
+    /// AND the shared S3 tier (when configured), and record the original ref.
+    /// Best-effort; an S3 write failure is logged and never fails the resolve.
+    async fn propagate_manifest_down(
+        &self,
+        image: &str,
+        cache_key: &str,
+        digest_key: &str,
+        manifest: &OciImageManifest,
+        digest: &str,
+    ) {
+        let Ok(bytes) = serde_json::to_vec(manifest) else {
+            return;
+        };
+        let _ = self.cache.put(cache_key, &bytes).await;
+        let _ = self.cache.put(digest_key, digest.as_bytes()).await;
+        self.record_original_ref(image).await;
+        if let Some(s3) = &self.s3_cache {
+            if let Err(e) = s3.put(cache_key, &bytes).await {
+                tracing::debug!(error = %e, "failed to propagate manifest body to S3 tier");
+            }
+            if let Err(e) = s3.put(digest_key, digest.as_bytes()).await {
+                tracing::debug!(error = %e, "failed to propagate manifest digest to S3 tier");
+            }
+        }
+    }
+
+    /// Probe the shared S3 tier for a cached manifest, mirroring
+    /// [`Self::try_cached_manifest`]'s revalidation policy. A hit is written
+    /// through to the LOCAL cache (warming it) before returning. Returns `None`
+    /// when no S3 tier is configured, it misses, or its copy is stale vs origin.
+    async fn try_s3_manifest(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        cache_key: &str,
+        digest_key: &str,
+        policy: PullPolicy,
+    ) -> Option<(OciImageManifest, String)> {
+        let s3 = self.s3_cache.as_ref()?;
+        let data = s3.get(cache_key).await.ok().flatten()?;
+        let manifest = serde_json::from_slice::<OciImageManifest>(&data).ok()?;
+        let cached_digest = s3
+            .get(digest_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok());
+
+        // IfNotPresent/Never or pinned ref: serve without revalidation.
+        if matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never) || !is_mutable_tag(image)
+        {
+            let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+            self.warm_local_cache(image, cache_key, digest_key, &manifest, &digest)
+                .await;
+            tracing::debug!(image = %image, "manifest S3 tier hit");
+            return Some((manifest, digest));
+        }
+
+        // Mutable + Newer: revalidate against the origin registry.
+        match self.remote_manifest_digest(image, auth).await {
+            Ok(Some(remote_digest)) if cached_digest.as_deref() == Some(remote_digest.as_str()) => {
+                self.warm_local_cache(image, cache_key, digest_key, &manifest, &remote_digest)
+                    .await;
+                tracing::debug!(image = %image, "manifest S3 tier hit (revalidated)");
+                Some((manifest, remote_digest))
+            }
+            Ok(Some(_)) => {
+                tracing::info!(image = %image, "S3 manifest stale vs origin, refetching");
+                None
+            }
+            Ok(None) | Err(_) => {
+                let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+                self.warm_local_cache(image, cache_key, digest_key, &manifest, &digest)
+                    .await;
+                tracing::warn!(image = %image, "S3 manifest revalidation unavailable, serving S3 copy");
+                Some((manifest, digest))
             }
         }
     }
@@ -2652,7 +2897,8 @@ pub async fn fetch_archive_from_url(url: &str, auth: Option<(&str, &str)>) -> Re
 /// the client's bearer-token path is a parsing detail handled by
 /// `oci-client` itself. The explicit match keeps us honest when a future
 /// [`zlayer_spec::RegistryAuthType`] variant lands with different semantics.
-fn spec_auth_to_oci(auth: Option<&zlayer_spec::RegistryAuth>) -> RegistryAuth {
+#[must_use]
+pub fn spec_auth_to_oci(auth: Option<&zlayer_spec::RegistryAuth>) -> RegistryAuth {
     let Some(a) = auth else {
         return RegistryAuth::Anonymous;
     };

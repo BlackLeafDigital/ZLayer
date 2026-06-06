@@ -211,8 +211,10 @@ pub struct RunVolumesArgs {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RunRuntimeArgs {
-    /// Set environment variables
-    #[clap(short, long = "env")]
+    /// Set environment variables (KEY=VAL). Short `-e` only: the long
+    /// `--env` is reserved by the top-level `zlayer run` for selecting a
+    /// `ZLayer` secret-environment to inject.
+    #[clap(short = 'e')]
     pub env: Vec<String>,
 
     /// Read in a file of environment variables
@@ -700,6 +702,111 @@ impl From<RunArgs> for FlatRunArgs {
     }
 }
 
+impl From<&RunArgs> for FlatRunArgs {
+    /// By-reference flatten used by [`build_deployment_spec`] so the spec
+    /// builder can be reused (e.g. by the top-level `zlayer run` container
+    /// runner) without consuming the parsed args. Every field is cloned.
+    fn from(p: &RunArgs) -> Self {
+        Self {
+            detach: p.lifecycle.detach,
+            attach: p.lifecycle.attach.clone(),
+            interactive: p.lifecycle.interactive,
+            tty: p.lifecycle.tty,
+            rm: p.lifecycle.rm,
+            sig_proxy: p.lifecycle.sig_proxy,
+            cidfile: p.lifecycle.cidfile.clone(),
+            disable_content_trust: p.lifecycle.disable_content_trust,
+            ports: p.networking.ports.clone(),
+            publish_all: p.networking.publish_all,
+            network: p.networking.network.clone(),
+            network_alias: p.networking.network_alias.clone(),
+            link: p.networking.link.clone(),
+            link_local_ip: p.networking.link_local_ip.clone(),
+            ip: p.networking.ip.clone(),
+            ip6: p.networking.ip6.clone(),
+            mac_address: p.networking.mac_address.clone(),
+            expose: p.networking.expose.clone(),
+            domainname: p.networking.domainname.clone(),
+            dns: p.networking.dns.clone(),
+            dns_option: p.networking.dns_option.clone(),
+            dns_search: p.networking.dns_search.clone(),
+            add_host: p.networking.add_host.clone(),
+            volumes: p.volumes_group.volumes.clone(),
+            volumes_from: p.volumes_group.volumes_from.clone(),
+            volume_driver: p.volumes_group.volume_driver.clone(),
+            mount: p.volumes_group.mount.clone(),
+            tmpfs: p.volumes_group.tmpfs.clone(),
+            read_only: p.volumes_group.read_only,
+            storage_opt: p.volumes_group.storage_opt.clone(),
+            shm_size: p.volumes_group.shm_size.clone(),
+            env: p.runtime.env.clone(),
+            env_file: p.runtime.env_file.clone(),
+            name: p.runtime.name.clone(),
+            restart: p.runtime.restart.clone(),
+            entrypoint: p.runtime.entrypoint.clone(),
+            workdir: p.runtime.workdir.clone(),
+            labels: p.runtime.labels.clone(),
+            label_file: p.runtime.label_file.clone(),
+            init: p.runtime.init,
+            platform: p.runtime.platform.clone(),
+            pull: p.runtime.pull.clone(),
+            no_healthcheck: p.runtime.no_healthcheck,
+            health_cmd: p.runtime.health_cmd.clone(),
+            health_interval: p.runtime.health_interval.clone(),
+            health_retries: p.runtime.health_retries,
+            health_start_period: p.runtime.health_start_period.clone(),
+            health_start_interval: p.runtime.health_start_interval.clone(),
+            health_timeout: p.runtime.health_timeout.clone(),
+            memory: p.resources.memory.clone(),
+            memory_reservation: p.resources.memory_reservation.clone(),
+            memory_swap: p.resources.memory_swap.clone(),
+            memory_swappiness: p.resources.memory_swappiness,
+            kernel_memory: p.resources.kernel_memory.clone(),
+            oom_score_adj: p.resources.oom_score_adj,
+            oom_kill_disable: p.resources.oom_kill_disable,
+            pids_limit: p.resources.pids_limit,
+            cpus: p.resources.cpus.clone(),
+            cpu_period: p.resources.cpu_period,
+            cpu_quota: p.resources.cpu_quota,
+            cpu_rt_period: p.resources.cpu_rt_period,
+            cpu_rt_runtime: p.resources.cpu_rt_runtime,
+            cpu_shares: p.resources.cpu_shares,
+            cpuset_cpus: p.resources.cpuset_cpus.clone(),
+            cpuset_mems: p.resources.cpuset_mems.clone(),
+            blkio_weight: p.resources.blkio_weight,
+            blkio_weight_device: p.resources.blkio_weight_device.clone(),
+            device_read_bps: p.resources.device_read_bps.clone(),
+            device_read_iops: p.resources.device_read_iops.clone(),
+            device_write_bps: p.resources.device_write_bps.clone(),
+            device_write_iops: p.resources.device_write_iops.clone(),
+            gpus: p.resources.gpus.clone(),
+            device: p.resources.device.clone(),
+            device_cgroup_rule: p.resources.device_cgroup_rule.clone(),
+            cap_add: p.security.cap_add.clone(),
+            cap_drop: p.security.cap_drop.clone(),
+            privileged: p.security.privileged,
+            security_opt: p.security.security_opt.clone(),
+            user: p.security.user.clone(),
+            group_add: p.security.group_add.clone(),
+            userns: p.security.userns.clone(),
+            uts: p.security.uts.clone(),
+            pid: p.security.pid.clone(),
+            ipc: p.security.ipc.clone(),
+            cgroupns: p.security.cgroupns.clone(),
+            cgroup_parent: p.security.cgroup_parent.clone(),
+            isolation: p.security.isolation.clone(),
+            runtime: p.security.runtime.clone(),
+            hostname: p.misc.hostname.clone(),
+            sysctl: p.misc.sysctl.clone(),
+            ulimit: p.misc.ulimit.clone(),
+            stop_signal: p.misc.stop_signal.clone(),
+            stop_timeout: p.misc.stop_timeout,
+            image: p.image.clone(),
+            command: p.command.clone(),
+        }
+    }
+}
+
 /// Handle the `docker run` command.
 ///
 /// Translates the Docker-style flags into a single-service `ZLayer`
@@ -713,13 +820,84 @@ impl From<RunArgs> for FlatRunArgs {
 /// Returns an error if the image name cannot be derived to a service name,
 /// a port/env/volume argument is malformed, the daemon cannot be reached,
 /// or the daemon rejects the generated spec.
-#[allow(clippy::too_many_lines)]
 pub async fn handle_run(parsed: RunArgs) -> Result<()> {
-    // Flatten the grouped arg structs into a single, by-value `args`
-    // shape so the rest of this function can keep its existing field
-    // access pattern. The grouping only exists to reduce clap's
-    // debug-build stack consumption when the parent CLI walks its
-    // command tree (large flat structs blow the test-thread stack).
+    // Capture the values we need after the deploy before the spec build
+    // consumes nothing (build takes a reference). `want_attach` mirrors
+    // the historical `-it` interactive-attach gate.
+    let detach = parsed.lifecycle.detach;
+    let want_attach = parsed.lifecycle.tty && parsed.lifecycle.interactive && !detach;
+
+    let spec = build_deployment_spec(&parsed)?;
+
+    let deployment_name = spec.deployment.clone();
+    let service_name = spec
+        .services
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| deployment_name.clone());
+
+    let spec_yaml = serde_yaml::to_string(&spec)
+        .context("Failed to serialize generated DeploymentSpec to YAML")?;
+    tracing::debug!(
+        deployment = %deployment_name,
+        service = %service_name,
+        "Deploying generated spec from docker run"
+    );
+
+    // ------------------------------------------------------------------
+    // Submit to the daemon
+    // ------------------------------------------------------------------
+
+    let client = DaemonClient::connect_to(default_socket_path())
+        .await
+        .context("Failed to connect to zlayer daemon")?;
+
+    let resp = client
+        .create_deployment(&spec_yaml)
+        .await
+        .context("Failed to create deployment via daemon")?;
+
+    // Docker echoes the container ID; we echo the deployment ID or name.
+    if !want_attach {
+        if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
+            println!("{id}");
+        } else if let Some(name) = resp.get("name").and_then(|v| v.as_str()) {
+            println!("{name}");
+        } else {
+            println!("{deployment_name}");
+        }
+    }
+
+    if want_attach {
+        attach_interactive(&client, &deployment_name, &service_name).await?;
+    } else if !detach {
+        eprintln!("(running in background; use `zlayer docker logs {service_name}` to follow)");
+    }
+
+    Ok(())
+}
+
+/// Translate the parsed Docker `run` flags into a single-service `ZLayer`
+/// [`DeploymentSpec`].
+///
+/// This is the spec-building half of [`handle_run`], factored out so the
+/// top-level `zlayer run` container runner (which also injects `ZLayer`
+/// secret-environments) can reuse the exact same translation. It emits the
+/// same `tracing::warn!`/`tracing::debug!` lines for unsupported flags that
+/// `handle_run` historically did, and produces an identical spec.
+///
+/// # Errors
+///
+/// Returns an error if the image name cannot be derived to a service name,
+/// or a port/env/volume/label/network/restart/resource argument is malformed.
+#[allow(clippy::too_many_lines)]
+pub fn build_deployment_spec(parsed: &RunArgs) -> Result<DeploymentSpec> {
+    // Flatten the grouped arg structs into a single `args` shape so the
+    // rest of this function can keep its existing field access pattern.
+    // The grouping only exists to reduce clap's debug-build stack
+    // consumption when the parent CLI walks its command tree (large flat
+    // structs blow the test-thread stack).
     let args = FlatRunArgs::from(parsed);
     tracing::info!("docker run: image={}, detach={}", args.image, args.detach);
 
@@ -730,7 +908,13 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
     // silently dropped.
     // ------------------------------------------------------------------
     if args.interactive && !args.tty {
-        tracing::warn!("--interactive without --tty: stdin attach is not yet implemented");
+        // Interactive stdin forwarding is wired for the `-it` (TTY) path via
+        // `attach_interactive`. The non-TTY pipe case (`-i` alone, e.g.
+        // `echo x | zlayer run -i ...`) is not routed through that attach loop,
+        // so host stdin is not forwarded for this flag combination — use `-it`.
+        tracing::warn!(
+            "--interactive without --tty: stdin is forwarded only on the -it (TTY) path"
+        );
     }
     if !args.attach.is_empty() {
         tracing::warn!("--attach is accepted but not yet forwarded");
@@ -1004,6 +1188,7 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
                 .parse()
                 .with_context(|| format!("invalid image reference '{}'", args.image))?,
             pull_policy,
+            source_policy: None,
         },
         resources,
         env,
@@ -1070,46 +1255,7 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
         api: zlayer_spec::ApiSpec::default(),
     };
 
-    let spec_yaml = serde_yaml::to_string(&spec)
-        .context("Failed to serialize generated DeploymentSpec to YAML")?;
-    tracing::debug!(
-        deployment = %deployment_name,
-        service = %service_name,
-        "Deploying generated spec from docker run"
-    );
-
-    // ------------------------------------------------------------------
-    // Submit to the daemon
-    // ------------------------------------------------------------------
-
-    let client = DaemonClient::connect_to(default_socket_path())
-        .await
-        .context("Failed to connect to zlayer daemon")?;
-
-    let resp = client
-        .create_deployment(&spec_yaml)
-        .await
-        .context("Failed to create deployment via daemon")?;
-
-    // Docker echoes the container ID; we echo the deployment ID or name.
-    let want_attach = args.tty && args.interactive && !args.detach;
-    if !want_attach {
-        if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
-            println!("{id}");
-        } else if let Some(name) = resp.get("name").and_then(|v| v.as_str()) {
-            println!("{name}");
-        } else {
-            println!("{deployment_name}");
-        }
-    }
-
-    if want_attach {
-        attach_interactive(&client, &deployment_name, &service_name).await?;
-    } else if !args.detach {
-        eprintln!("(running in background; use `zlayer docker logs {service_name}` to follow)");
-    }
-
-    Ok(())
+    Ok(spec)
 }
 
 /// Wait for the first container of `(deployment, service)` to appear and
@@ -1149,19 +1295,46 @@ async fn wait_for_first_container(
     }
 }
 
+/// RAII guard that puts the local TTY into raw mode and restores cooked mode
+/// on drop — including panic / early-return paths. Owning this for the whole
+/// attach session guarantees the terminal is never left in raw mode.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    /// Enter raw mode, returning the guard. Restored automatically on drop.
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode on local TTY")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        // Best-effort restore; nothing useful to do if this fails.
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// Drive the `docker run -it` interactive attach.
 ///
 /// Sets the local terminal to raw mode, streams the container's combined
-/// stdout/stderr in raw form to the host stdout, and on Ctrl-C sends
-/// `stop_container` and exits. Stdin attach is **not** implemented yet —
-/// keystrokes from the host are not forwarded to the container, but the
-/// container's output is rendered live so this is still a useful preview
-/// for `-it` workloads (it matches `docker logs --follow` plus a TTY).
+/// stdout/stderr in raw form to the host stdout, and forwards host keystrokes
+/// to the container's stdin (via `POST /containers/{id}/stdin`). Ctrl-D (EOF
+/// on host stdin) closes the container's stdin; Ctrl-C sends `stop_container`
+/// and detaches.
 ///
-/// Restores the terminal to cooked mode on every exit path.
-async fn attach_interactive(client: &DaemonClient, deployment: &str, service: &str) -> Result<()> {
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-
+/// Restores the terminal to cooked mode on every exit path (RAII guard).
+///
+/// # Errors
+///
+/// Returns an error if the target container never appears within the wait
+/// window, the daemon log stream cannot be opened, or terminal raw-mode
+/// toggling fails.
+pub async fn attach_interactive(
+    client: &DaemonClient,
+    deployment: &str,
+    service: &str,
+) -> Result<()> {
     let container_id = wait_for_first_container(
         client,
         deployment,
@@ -1171,18 +1344,18 @@ async fn attach_interactive(client: &DaemonClient, deployment: &str, service: &s
     .await?;
 
     eprintln!(
-        "(attached to container {} — note: stdin forwarding is not yet implemented; press Ctrl-C to detach and stop)",
+        "(attached to container {} — stdin forwarded; Ctrl-D closes stdin, Ctrl-C detaches and stops)",
         &container_id[..container_id.len().min(12)]
     );
 
-    enable_raw_mode().context("Failed to enable raw mode on local TTY")?;
+    // Hold raw mode for the whole session; the guard restores cooked mode on
+    // every exit path (including the `?` early return below and any panic).
+    let _raw = RawModeGuard::enter()?;
 
     let result = run_attach_loop(client, &container_id).await;
 
-    // Always restore cooked mode, even on error paths.
-    let _ = disable_raw_mode();
-
     // Print a trailing newline so the next shell prompt starts on its own line.
+    // (Raw mode is still active here; restored when `_raw` drops on return.)
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(b"\r\n");
     let _ = stdout.flush();
@@ -1212,6 +1385,42 @@ async fn run_attach_loop(client: &DaemonClient, container_id: &str) -> Result<()
 
     let mut stdout = std::io::stdout();
 
+    // Host stdin -> daemon: in raw mode we read the host terminal byte stream
+    // on a dedicated blocking thread (raw `std::io::stdin` reads can't run on
+    // the async reactor) and hand chunks back over a tokio channel. `None`
+    // signals EOF (Ctrl-D), at which point we close the container's stdin.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(64);
+    let stdin_handle = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => {
+                    // EOF (Ctrl-D): signal close and stop reading.
+                    let _ = stdin_tx.blocking_send(None);
+                    break;
+                }
+                Ok(n) => {
+                    if stdin_tx.blocking_send(Some(buf[..n].to_vec())).is_err() {
+                        // Receiver gone (attach loop ended): stop reading.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("attach stdin read error: {e}");
+                    let _ = stdin_tx.blocking_send(None);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Once host stdin has reached EOF (or its reader thread ended) we stop
+    // polling the stdin branch so the select loop doesn't spin hot on a closed
+    // channel — output streaming continues normally.
+    let mut stdin_open = true;
+
     loop {
         tokio::select! {
             // Ctrl-C from the local terminal: ask the daemon to stop the
@@ -1224,6 +1433,30 @@ async fn run_attach_loop(client: &DaemonClient, container_id: &str) -> Result<()
                 break;
             }
 
+            // Host keystrokes: forward each chunk to the container's stdin.
+            // `Some(None)` is EOF (Ctrl-D) -> close stdin but keep streaming
+            // output. `None` means the reader thread ended.
+            maybe_input = stdin_rx.recv(), if stdin_open => {
+                match maybe_input {
+                    Some(Some(chunk)) => {
+                        if let Err(e) = client.write_container_stdin(container_id, &chunk).await {
+                            tracing::debug!("attach stdin forward error: {e}");
+                            break;
+                        }
+                    }
+                    Some(None) => {
+                        let _ = client.close_container_stdin(container_id).await;
+                        // Keep rendering output until the container exits or
+                        // the user detaches; just stop forwarding stdin.
+                        stdin_open = false;
+                    }
+                    None => {
+                        // Reader thread gone; nothing more to forward.
+                        stdin_open = false;
+                    }
+                }
+            }
+
             // Next chunk of raw stdcopy framing from the daemon. Decode it
             // best-effort and write the payload bytes straight to stdout.
             chunk = stream.next() => {
@@ -1231,6 +1464,8 @@ async fn run_attach_loop(client: &DaemonClient, container_id: &str) -> Result<()
                     Some(Ok(bytes)) => {
                         for payload in decode_stdcopy_chunks(&bytes) {
                             if stdout.write_all(payload).is_err() {
+                                drop(stdin_rx);
+                                let _ = stdin_handle.join();
                                 return Ok(());
                             }
                         }
@@ -1246,10 +1481,88 @@ async fn run_attach_loop(client: &DaemonClient, container_id: &str) -> Result<()
         }
     }
 
+    // Drop the receiver so the blocking stdin thread's next `blocking_send`
+    // fails and it exits; then reap it so it doesn't linger. The thread may be
+    // parked in a blocking `read` until the next keystroke — joining is
+    // best-effort and we don't block the command shutdown on it.
+    drop(stdin_rx);
+    drop(stdin_handle);
+
     // Surface the container's exit code so `docker run -it` callers can
     // chain on it. We swallow errors here — a missing wait endpoint is not
     // worth failing the whole command over.
     if let Ok(resp) = client.wait_container(container_id, None).await {
+        if resp.status_code != 0 {
+            anyhow::bail!("container exited with status {}", resp.status_code);
+        }
+    }
+
+    Ok(())
+}
+
+/// Non-TTY foreground follow: stream a one-shot container's combined
+/// stdout/stderr to the host until it exits, then propagate its exit code.
+///
+/// Unlike [`attach_interactive`], this does NOT touch terminal raw mode —
+/// it is the analogue of `docker run` (no `-it`) where output is piped
+/// straight through. Stdin is not forwarded (there is nothing to forward in
+/// the non-interactive case). Used by the top-level `zlayer run` container
+/// runner for non-detached, non-`-it` invocations.
+///
+/// # Errors
+///
+/// Returns an error if no container appears in time, the log stream cannot
+/// be opened, or the container exits with a non-zero status.
+pub async fn stream_until_exit(
+    client: &DaemonClient,
+    deployment: &str,
+    service: &str,
+) -> Result<()> {
+    use futures_util::StreamExt as _;
+
+    let container_id = wait_for_first_container(
+        client,
+        deployment,
+        service,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+
+    let mut stream = client
+        .stream_container_logs(
+            &container_id,
+            true,  // follow
+            None,  // tail
+            None,  // since
+            None,  // until
+            false, // timestamps
+            true,  // stdout
+            true,  // stderr
+            true,  // format_raw
+        )
+        .await
+        .context("Failed to open log stream for foreground run")?;
+
+    let mut stdout = std::io::stdout();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                for payload in decode_stdcopy_chunks(&bytes) {
+                    if stdout.write_all(payload).is_err() {
+                        break;
+                    }
+                }
+                let _ = stdout.flush();
+            }
+            Err(e) => {
+                tracing::debug!("foreground log stream error: {e}");
+                break;
+            }
+        }
+    }
+
+    // Propagate the container's exit code.
+    if let Ok(resp) = client.wait_container(&container_id, None).await {
         if resp.status_code != 0 {
             anyhow::bail!("container exited with status {}", resp.status_code);
         }
@@ -1710,6 +2023,7 @@ mod tests {
             image: ImageSpec {
                 name: "nginx:alpine".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
             resources: zlayer_spec::ResourcesSpec::default(),
             env: HashMap::new(),

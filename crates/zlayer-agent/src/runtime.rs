@@ -1075,11 +1075,18 @@ pub trait Runtime: Send + Sync {
     /// store by hostname, and inline auth is primarily a Docker-backend
     /// concern. Ignoring it is safe: callers that need inline auth should use
     /// the Docker runtime.
+    ///
+    /// `source` is the per-image [`zlayer_spec::SourcePolicy`] selecting which
+    /// tiers (local store, S3, remote registry) the pull may consult and in
+    /// what order. Runtimes that build the `zlayer-registry` `ImagePuller`
+    /// chain (youki, macOS VZ-Linux) honor it; runtimes that delegate to an
+    /// external daemon (Docker/WSL/HCS) accept but ignore it.
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
     ) -> Result<()>;
 
     /// Create a container
@@ -1377,8 +1384,13 @@ pub trait Runtime: Send + Sync {
         image: &str,
         auth: Option<&RegistryAuth>,
     ) -> Result<PullProgressStream> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, auth)
-            .await?;
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            auth,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await?;
         let reference = image.to_string();
         let events: Vec<Result<PullProgress>> = vec![
             Ok(PullProgress::Status {
@@ -1440,6 +1452,35 @@ pub trait Runtime: Send + Sync {
     async fn kill_container(&self, _id: &ContainerId, _signal: Option<&str>) -> Result<()> {
         Err(AgentError::Unsupported(
             "kill_container is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Write a chunk of stdin to a running container's main process.
+    ///
+    /// Powers the host→guest direction of interactive (`-it`) sessions: the
+    /// daemon's `POST /api/v1/containers/{id}/stdin` endpoint forwards raw
+    /// terminal bytes here, which the runtime relays to the workload (for the
+    /// macOS VZ-Linux backend, as `Msg::Stdin` frames to the in-guest agent).
+    ///
+    /// The default implementation returns [`AgentError::Unsupported`] so
+    /// non-interactive backends keep compiling.
+    async fn write_stdin(&self, _id: &ContainerId, _data: &[u8]) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "write_stdin is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Signal end-of-input (close stdin) for a running container.
+    ///
+    /// Powers Ctrl-D / detach for interactive sessions: the daemon's
+    /// `DELETE /api/v1/containers/{id}/stdin` endpoint calls this, which causes
+    /// the runtime to stop forwarding stdin and emit a final close marker (for
+    /// the macOS VZ-Linux backend, `Msg::StdinEof` to the in-guest agent).
+    ///
+    /// The default implementation returns [`AgentError::Unsupported`].
+    async fn close_stdin(&self, _id: &ContainerId) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "close_stdin is not supported by this runtime".into(),
         ))
     }
 
@@ -1910,8 +1951,13 @@ impl Default for MockRuntime {
 #[async_trait::async_trait]
 impl Runtime for MockRuntime {
     async fn pull_image(&self, _image: &str) -> Result<()> {
-        self.pull_image_with_policy(_image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            _image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     async fn pull_image_with_policy(
@@ -1919,6 +1965,7 @@ impl Runtime for MockRuntime {
         _image: &str,
         _policy: PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Mock: always succeeds
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2382,6 +2429,7 @@ mod tests {
             _image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
+            _source: zlayer_spec::SourcePolicy,
         ) -> Result<()> {
             // The default `pull_image_stream` delegates here; return Ok so the
             // streaming default can be exercised without a real registry.

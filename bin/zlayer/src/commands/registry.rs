@@ -137,14 +137,23 @@ pub(crate) async fn handle_import(
 /// When `image` is `Some`, pulls that single image. When `None`, auto-discovers
 /// the deployment spec in the current directory and pulls every distinct image
 /// referenced by services declared in the spec.
-pub(crate) async fn handle_pull(image: Option<&str>, cli_data_dir: &std::path::Path) -> Result<()> {
+pub(crate) async fn handle_pull(
+    image: Option<&str>,
+    username: Option<String>,
+    password: Option<String>,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     match image {
-        Some(img) => handle_pull_single(img, cli_data_dir).await,
-        None => handle_pull_from_spec(cli_data_dir).await,
+        Some(img) => handle_pull_single(img, username, password, cli_data_dir).await,
+        None => handle_pull_from_spec(username, password, cli_data_dir).await,
     }
 }
 
-async fn handle_pull_from_spec(cli_data_dir: &std::path::Path) -> Result<()> {
+async fn handle_pull_from_spec(
+    username: Option<String>,
+    password: Option<String>,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     use crate::util::{discover_spec_path, parse_spec};
     use std::collections::BTreeSet;
 
@@ -174,7 +183,7 @@ async fn handle_pull_from_spec(cli_data_dir: &std::path::Path) -> Result<()> {
         spec_path.display()
     );
     for img in &images {
-        handle_pull_single(img, cli_data_dir).await?;
+        handle_pull_single(img, username.clone(), password.clone(), cli_data_dir).await?;
     }
     println!("Pulled {} image(s).", images.len());
     Ok(())
@@ -182,7 +191,12 @@ async fn handle_pull_from_spec(cli_data_dir: &std::path::Path) -> Result<()> {
 
 /// Pull a single image reference from a remote registry into the local cache.
 #[allow(clippy::cast_precision_loss)]
-async fn handle_pull_single(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
+async fn handle_pull_single(
+    image: &str,
+    username: Option<String>,
+    password: Option<String>,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 
     info!(image = %image, "Pulling image from registry");
@@ -201,9 +215,16 @@ async fn handle_pull_single(image: &str, cli_data_dir: &std::path::Path) -> Resu
     let cache = BlobCache::open(&cache_dir).context("Failed to create blob cache")?;
     let puller = ImagePuller::new(cache);
 
-    // Use anonymous auth (for public images) or check for credentials
-    // TODO: Support authenticated registries via config or env vars
-    let auth = RegistryAuth::Anonymous;
+    // Resolve auth: explicit --username/--password flags take precedence, then
+    // the ZLAYER_REGISTRY_USERNAME/ZLAYER_REGISTRY_PASSWORD env vars, else
+    // anonymous (public images). This CLI-direct pull runs in-process, so it
+    // cannot read the daemon's credential store.
+    let resolved_user = username.or_else(|| std::env::var("ZLAYER_REGISTRY_USERNAME").ok());
+    let resolved_pass = password.or_else(|| std::env::var("ZLAYER_REGISTRY_PASSWORD").ok());
+    let auth = match (resolved_user, resolved_pass) {
+        (Some(user), Some(pass)) => RegistryAuth::Basic(user, pass),
+        _ => RegistryAuth::Anonymous,
+    };
 
     // Pull manifest first to show what we're pulling
     println!("Fetching manifest...");

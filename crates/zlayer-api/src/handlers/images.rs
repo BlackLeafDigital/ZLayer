@@ -385,7 +385,12 @@ pub async fn pull_image_handler(
 
     state
         .runtime
-        .pull_image_with_policy(&reference_str, policy, resolved_auth.as_ref())
+        .pull_image_with_policy(
+            &reference_str,
+            policy,
+            resolved_auth.as_ref(),
+            zlayer_spec::SourcePolicy::default(),
+        )
         .await
         .map_err(|e| ApiError::Internal(format!("failed to pull image: {e}")))?;
 

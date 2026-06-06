@@ -602,6 +602,7 @@ pub fn create_service_spec(
                 pyo3::exceptions::PyValueError::new_err(format!("invalid image reference: {e}"))
             })?,
             pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources: zlayer_spec::ResourcesSpec::default(),
         env: HashMap::new(),

@@ -949,8 +949,13 @@ impl Runtime for WasmRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull a WASM image with a specific policy.
@@ -960,7 +965,7 @@ impl Runtime for WasmRuntime {
     /// existing `AuthResolver` (hostname-based lookup in the secret store).
     /// Callers that need inline auth should use the Docker runtime.
     #[instrument(
-        skip(self, _auth),
+        skip(self, _auth, _source),
         fields(
             otel.name = "wasm.pull",
             container.image.name = %image,
@@ -972,6 +977,7 @@ impl Runtime for WasmRuntime {
         image: &str,
         policy: PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Handle Never policy
         if matches!(policy, PullPolicy::Never) {

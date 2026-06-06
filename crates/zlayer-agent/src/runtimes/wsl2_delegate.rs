@@ -826,8 +826,13 @@ impl Wsl2DelegateRuntime {
 #[async_trait]
 impl Runtime for Wsl2DelegateRuntime {
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     async fn pull_image_with_policy(
@@ -835,6 +840,7 @@ impl Runtime for Wsl2DelegateRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Fast path: already cached and the policy allows reuse.
         if matches!(policy, PullPolicy::IfNotPresent | PullPolicy::Never)
@@ -934,8 +940,13 @@ impl Runtime for Wsl2DelegateRuntime {
         let cached = if let Some(c) = self.image_cache.read().await.get(&image_name).cloned() {
             c
         } else {
-            self.pull_image_with_policy(&image_name, spec.image.pull_policy, None)
-                .await?;
+            self.pull_image_with_policy(
+                &image_name,
+                spec.image.pull_policy,
+                None,
+                spec.image.source_policy.unwrap_or_default(),
+            )
+            .await?;
             self.image_cache
                 .read()
                 .await
