@@ -363,20 +363,24 @@ case "${ZLAYER_DEV_DATA_DIR}" in
         # Linux-only: the systemd unit runs the daemon with Group=zlayer and
         # CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN — the latter strips
         # CAP_DAC_OVERRIDE so the (uid 0) process can't bypass DAC. The chown
-        # above leaves the dir owner=$user, group=root, mode 750, which is 0
-        # perms for the daemon. Restore group access by re-grouping to zlayer
-        # and granting g+rwX so the daemon can read/write its secrets store.
-        # macOS uses launchd + a different ownership model and has no `zlayer`
-        # group, so this block is gated on both `$OS = linux` and a real
-        # `getent group zlayer` to stay a no-op on macOS or pre-install Linux.
+        # above gives the dir owner=$user, group=$user's-primary, which leaves
+        # the daemon (gid zlayer) with "others" perms — i.e. zero. Restore
+        # group access by re-grouping to zlayer; the mode is set just below by
+        # `install -d -m 0770`. macOS uses launchd with a different ownership
+        # model and has no `zlayer` group, so this block is gated on both
+        # `$OS = linux` and a real `getent group zlayer`.
         if [ "$OS" = "linux" ] && [ -d "${ZLAYER_DEV_DATA_DIR}/secrets" ] \
             && getent group zlayer >/dev/null 2>&1; then
             sudo chgrp -R zlayer "${ZLAYER_DEV_DATA_DIR}/secrets" 2>/dev/null || true
-            sudo chmod -R g+rwX "${ZLAYER_DEV_DATA_DIR}/secrets" 2>/dev/null || true
         fi
         ;;
 esac
-maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0750 "${ZLAYER_DEV_DATA_DIR}/secrets"
+# Mode 0770 (not 0750): the daemon's gid is zlayer (see Group= in the systemd
+# unit) and SQLite needs to create -wal/-shm sidecars in this dir, so the
+# group needs write + execute, not just read + execute. Still no "others" bit
+# so the perimeter is unchanged. On macOS the rootless agent owns the dir, so
+# the group bits are inert anyway.
+maybe_sudo "${ZLAYER_DEV_DATA_DIR}" install -d -m 0770 "${ZLAYER_DEV_DATA_DIR}/secrets"
 
 # --- Install service unit + daemon (opt-in) ---
 if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
