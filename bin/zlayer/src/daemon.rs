@@ -792,6 +792,55 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 match dns.start_background().await {
                     Ok(handle) => {
                         info!(%dns_addr, "DNS server started");
+
+                        // VZ-guest reachability: the loopback listener above is
+                        // unreachable from a VZ Linux guest (it lives in its own
+                        // network namespace and reaches us only over the overlay).
+                        // Bind a SECOND listener on the node's overlay IP, port 53,
+                        // sharing this server's authority, and tell the overlay
+                        // manager to advertise `<node_overlay_ip>:53` to guests as
+                        // their `dns_server`. Compose service names (registered in
+                        // ServiceManager) then resolve from inside the guest.
+                        if let Some(om_arc) = overlay.clone() {
+                            let node_ip = om_arc.read().await.node_ip();
+                            if let Some(node_ip) = node_ip {
+                                // Bind on the node overlay IP at the (non-privileged)
+                                // overlay DNS port. An unprivileged macOS daemon cannot
+                                // bind port 53, so the in-guest vzagent runs a tiny
+                                // 127.0.0.1:53 -> <node_ip>:<dns_port> UDP relay and
+                                // points the workload's resolv.conf at 127.0.0.1. The
+                                // port the guest relays to is the canonical overlay DNS
+                                // port (zlayer_overlay::DEFAULT_DNS_PORT), which equals
+                                // config.dns_port's default.
+                                let guest_dns_addr = SocketAddr::new(node_ip, config.dns_port);
+                                match dns.bind_secondary(guest_dns_addr).await {
+                                    Ok(_) => {
+                                        info!(
+                                            %guest_dns_addr,
+                                            "overlay DNS listener bound on node overlay IP (guest-reachable)"
+                                        );
+                                        // Advertise the node overlay IP to guests as
+                                        // their resolver; the guest relay forwards to
+                                        // <node_ip>:<DEFAULT_DNS_PORT>.
+                                        om_arc.write().await.set_dns_config(
+                                            Some(guest_dns_addr),
+                                            Some(zone.trim_end_matches('.').to_string()),
+                                        );
+                                    }
+                                    Err(e) => warn!(
+                                        %guest_dns_addr,
+                                        "failed to bind overlay DNS listener on node IP \
+                                         (VZ-guest service-name DNS will be unavailable): {e}"
+                                    ),
+                                }
+                            } else {
+                                warn!(
+                                    "overlay manager has no node IP yet; VZ-guest service-name \
+                                     DNS will be unavailable until overlay is up"
+                                );
+                            }
+                        }
+
                         (Some(dns), Some(handle))
                     }
                     Err(e) => {

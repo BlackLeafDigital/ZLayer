@@ -505,6 +505,27 @@ impl ServiceInstance {
 
                         // Register DNS for service discovery
                         if let Some(dns) = &self.dns_server {
+                            // Register the BARE compose service name ({service}) so
+                            // sibling containers can resolve each other by the name
+                            // docker-compose uses (e.g. `postgres`), not just the
+                            // FQDN. This is what `FORGEJO__database__HOST=postgres`
+                            // and every other compose service reference depends on.
+                            // Multiple replicas upsert the same name; the in-memory
+                            // authority keeps the most recent A record (round-robin
+                            // is not required for the single-replica compose case).
+                            match dns.add_record(&self.service_name, ip).await {
+                                Ok(()) => tracing::debug!(
+                                    hostname = %self.service_name,
+                                    ip = %ip,
+                                    "registered bare service-name DNS (compose discovery)"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    hostname = %self.service_name,
+                                    error = %e,
+                                    "failed to register bare service-name DNS"
+                                ),
+                            }
+
                             // Register service-level hostname: {service}.service.local
                             let service_hostname = format!("{}.service.local", self.service_name);
 
@@ -2333,40 +2354,8 @@ impl ServiceManager {
             tracing::debug!(service = %name, "Unregistered containers from supervisor");
         }
 
-        // Clean up DNS records for the service
-        if let Some(dns) = &self.dns_server {
-            // Remove the service-level DNS entry
-            let service_hostname = format!("{name}.service.local");
-            if let Err(e) = dns.remove_record(&service_hostname).await {
-                tracing::warn!(
-                    hostname = %service_hostname,
-                    error = %e,
-                    "failed to remove service DNS record"
-                );
-            } else {
-                tracing::debug!(
-                    hostname = %service_hostname,
-                    "removed service DNS record"
-                );
-            }
-
-            // Also remove any remaining replica-specific DNS entries
-            let services = self.services.read().await;
-            if let Some(instance) = services.get(name) {
-                let containers = instance.containers().read().await;
-                for (id, _) in containers.iter() {
-                    let replica_hostname = format!("{}.{}.service.local", id.replica, name);
-                    if let Err(e) = dns.remove_record(&replica_hostname).await {
-                        tracing::warn!(
-                            hostname = %replica_hostname,
-                            error = %e,
-                            "failed to remove replica DNS record during service removal"
-                        );
-                    }
-                }
-            }
-            drop(services); // Release read lock before write lock
-        }
+        // Clean up DNS records for the service (bare name + FQDNs).
+        self.cleanup_service_dns(name).await;
 
         // Remove from services map (may or may not exist depending on rtype)
         let mut services = self.services.write().await;
@@ -2375,6 +2364,53 @@ impl ServiceManager {
         }
 
         Ok(())
+    }
+
+    /// Remove every DNS record this service registered on attach: the bare
+    /// compose service name (`{service}`), the service-level FQDN
+    /// (`{service}.service.local`), and each replica's FQDN
+    /// (`{replica}.{service}.service.local`). Best-effort; failures are logged.
+    async fn cleanup_service_dns(&self, name: &str) {
+        let Some(dns) = &self.dns_server else {
+            return;
+        };
+
+        // Bare compose service-name record (compose discovery).
+        if let Err(e) = dns.remove_record(name).await {
+            tracing::warn!(
+                hostname = %name,
+                error = %e,
+                "failed to remove bare service-name DNS record"
+            );
+        }
+
+        // Service-level FQDN.
+        let service_hostname = format!("{name}.service.local");
+        if let Err(e) = dns.remove_record(&service_hostname).await {
+            tracing::warn!(
+                hostname = %service_hostname,
+                error = %e,
+                "failed to remove service DNS record"
+            );
+        } else {
+            tracing::debug!(hostname = %service_hostname, "removed service DNS record");
+        }
+
+        // Any remaining replica-specific FQDNs.
+        let services = self.services.read().await;
+        if let Some(instance) = services.get(name) {
+            let containers = instance.containers().read().await;
+            for (id, _) in containers.iter() {
+                let replica_hostname = format!("{}.{}.service.local", id.replica, name);
+                if let Err(e) = dns.remove_record(&replica_hostname).await {
+                    tracing::warn!(
+                        hostname = %replica_hostname,
+                        error = %e,
+                        "failed to remove replica DNS record during service removal"
+                    );
+                }
+            }
+        }
     }
 
     /// Introspect service infrastructure wiring.

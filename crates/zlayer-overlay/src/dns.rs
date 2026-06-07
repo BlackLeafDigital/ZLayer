@@ -340,8 +340,26 @@ impl DnsServer {
     /// and fall back to the primary 15353 listener for non-Windows workloads.
     #[allow(clippy::unused_async)]
     pub async fn bind_windows_fallback(&self, bind_ip: IpAddr) -> Result<DnsHandle, DnsError> {
+        self.bind_secondary(SocketAddr::new(bind_ip, 53)).await
+    }
+
+    /// Bind an additional DNS listener on an arbitrary `listen_addr`, sharing
+    /// this server's authority + zone so the same records answer on both the
+    /// primary listener and this one.
+    ///
+    /// Unlike [`bind_windows_fallback`](Self::bind_windows_fallback) (which is
+    /// hard-wired to port 53 for Windows HNS containers), this lets the caller
+    /// pick a **non-privileged** port — required on macOS where an unprivileged
+    /// daemon cannot bind below 1024. The VZ-Linux path uses this to expose the
+    /// overlay resolver on `<node_overlay_ip>:<dns_port>` so a tiny in-guest
+    /// relay can forward the guest's port-53 queries to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::Io` when either the UDP or TCP socket cannot be bound.
+    #[allow(clippy::unused_async)]
+    pub async fn bind_secondary(&self, listen_addr: SocketAddr) -> Result<DnsHandle, DnsError> {
         let handle = self.handle();
-        let listen_addr = SocketAddr::new(bind_ip, 53);
         let zone_origin = self.zone_origin.clone();
         let authority = Arc::clone(&self.authority);
 
@@ -359,10 +377,10 @@ impl DnsServer {
             server.register_listener(tcp_listener, Duration::from_secs(30));
             tracing::info!(
                 addr = %listen_addr,
-                "Windows fallback DNS listener started on port 53",
+                "secondary DNS listener started",
             );
             if let Err(e) = server.block_until_done().await {
-                tracing::error!("Windows fallback DNS listener error: {}", e);
+                tracing::error!("secondary DNS listener error: {}", e);
             }
         });
 

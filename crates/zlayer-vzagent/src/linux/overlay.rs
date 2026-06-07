@@ -124,12 +124,116 @@ pub fn apply_overlay_config(
     // 5. Install overlay DNS for the workload, if the host supplied it. The
     //    agent has already pivoted into the container root, so /etc/resolv.conf
     //    here is the file the workload will see.
-    if dns_server.is_some() || dns_domain.is_some() {
-        if let Err(e) = write_resolv_conf(dns_server, dns_domain) {
+    //
+    //    The host advertises the node's OVERLAY IP as `dns_server`, but the
+    //    overlay resolver actually listens on `<dns_server>:OVERLAY_DNS_PORT`
+    //    (a non-privileged port — an unprivileged macOS daemon can't bind 53).
+    //    A workload's libc resolver always queries port 53, so we run a tiny
+    //    in-guest UDP relay on `127.0.0.1:53` that forwards to
+    //    `<dns_server>:OVERLAY_DNS_PORT`, and point resolv.conf at `127.0.0.1`
+    //    as the FIRST nameserver (overlay-first; external DNS stays as fallback).
+    if let Some(server) = dns_server.map(str::trim).filter(|s| !s.is_empty()) {
+        let upstream: IpAddr = match server.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("zlayer-vzagent: overlay: bad dns_server {server:?}: {e}");
+                return Ok(());
+            }
+        };
+        match start_dns_relay(upstream, OVERLAY_DNS_PORT) {
+            Ok(()) => {
+                if let Err(e) = write_resolv_conf(Some("127.0.0.1"), dns_domain) {
+                    eprintln!("zlayer-vzagent: overlay: writing /etc/resolv.conf failed: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("zlayer-vzagent: overlay: DNS relay start failed: {e}");
+                // Relay unavailable: fall back to pointing the workload directly
+                // at the upstream on port 53 (works only if the host ever gets
+                // privilege to bind 53; harmless otherwise).
+                if let Err(e) = write_resolv_conf(Some(server), dns_domain) {
+                    eprintln!("zlayer-vzagent: overlay: writing /etc/resolv.conf failed: {e}");
+                }
+            }
+        }
+    } else if dns_domain.is_some() {
+        if let Err(e) = write_resolv_conf(None, dns_domain) {
             eprintln!("zlayer-vzagent: overlay: writing /etc/resolv.conf failed: {e}");
         }
     }
 
+    Ok(())
+}
+
+/// Non-privileged UDP port the host's overlay DNS listener binds on the node
+/// overlay IP. Must match `zlayer_overlay::DEFAULT_DNS_PORT` / the daemon's
+/// `config.dns_port` default. The in-guest relay forwards `127.0.0.1:53`
+/// queries here.
+const OVERLAY_DNS_PORT: u16 = 15353;
+
+/// Spawn a tiny UDP DNS relay on `127.0.0.1:53` that forwards every datagram to
+/// `<upstream>:<upstream_port>` (the overlay resolver) and relays the reply back
+/// to the original client. Idempotent: a second call no-ops if the relay is
+/// already bound.
+///
+/// This exists because the host overlay resolver listens on a non-privileged
+/// port (an unprivileged macOS daemon can't bind 53), but a container's libc
+/// resolver always queries port 53. The guest is PID 1 (root), so it CAN bind
+/// 53 here. The relay is deliberately minimal — single-socket, per-query
+/// upstream socket, short read timeout — which is plenty for the low-QPS
+/// service-discovery use case (a handful of A lookups during startup).
+fn start_dns_relay(upstream: IpAddr, upstream_port: u16) -> Result<()> {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // Bind only once for the lifetime of the agent (a re-pushed OverlayConfig
+    // must not try to re-bind 53 and fail with EADDRINUSE).
+    static RELAY_STARTED: AtomicBool = AtomicBool::new(false);
+    if RELAY_STARTED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let sock = match UdpSocket::bind(("127.0.0.1", 53)) {
+        Ok(s) => s,
+        Err(e) => {
+            // Reset so a later attempt can retry.
+            RELAY_STARTED.store(false, Ordering::SeqCst);
+            return Err(err(format!("bind 127.0.0.1:53 for DNS relay: {e}")));
+        }
+    };
+
+    let upstream_addr = SocketAddr::new(upstream, upstream_port);
+
+    std::thread::Builder::new()
+        .name("vzagent-dnsrelay".into())
+        .spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok((n, client)) = sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                // Per-query ephemeral upstream socket keeps the relay simple and
+                // correctly correlates each reply with its client without
+                // tracking DNS transaction IDs.
+                let Ok(up) = UdpSocket::bind(("0.0.0.0", 0)) else {
+                    continue;
+                };
+                let _ = up.set_read_timeout(Some(Duration::from_secs(3)));
+                if up.send_to(&buf[..n], upstream_addr).is_err() {
+                    continue;
+                }
+                let mut rbuf = [0u8; 4096];
+                if let Ok((rn, _)) = up.recv_from(&mut rbuf) {
+                    let _ = sock.send_to(&rbuf[..rn], client);
+                }
+            }
+        })
+        .map_err(|e| err(format!("spawn DNS relay thread: {e}")))?;
+
+    eprintln!(
+        "zlayer-vzagent: overlay DNS relay 127.0.0.1:53 -> {upstream_addr} started"
+    );
     Ok(())
 }
 
@@ -596,26 +700,38 @@ fn parse_cidr(cidr: &str) -> std::result::Result<(IpAddr, u8), String> {
     Ok((ip, prefix))
 }
 
-/// Write overlay DNS into `/etc/resolv.conf` for the workload.
+/// Write overlay DNS into `/etc/resolv.conf` for the workload, **overlay-first**.
 ///
 /// The agent has already pivoted into the container root, so this path is the
-/// resolver file the workload sees. We mirror the udhcpc lease script's format
-/// (`nameserver <ip>` lines) and append a `search <domain>` line for the search
-/// domain, without clobbering any nameservers a prior DHCP lease wrote — overlay
-/// DNS is additive.
+/// resolver file the workload sees. The ordering here is load-bearing: a libc
+/// stub resolver tries `nameserver` lines in file order and only falls through
+/// to the next on a *timeout*, NOT on an `NXDOMAIN`. So if external DNS
+/// (`1.1.1.1`/`8.8.8.8`, seeded by [`ensure_container_resolv_conf`] /
+/// `bring_up_network`) is listed first, a bare compose service name like
+/// `postgres` returns NXDOMAIN from `1.1.1.1` and resolution FAILS — it never
+/// reaches the overlay resolver. We therefore REWRITE (not append) the file so
+/// the overlay resolver is the **first** `nameserver`, preserving any
+/// previously-written external nameservers as fallback lines after it.
+///
+/// We also emit a `search <domain>` line so an unqualified name is also tried as
+/// `<name>.<domain>` (e.g. `postgres` → `postgres.service.local`), which lets
+/// the FQDN registrations resolve even for callers that rely on the search
+/// suffix.
 fn write_resolv_conf(dns_server: Option<&str>, dns_domain: Option<&str>) -> Result<()> {
-    use std::io::Write;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
 
     // Validate the server is a real IP before writing, so we never emit a
     // malformed resolv.conf line.
-    if let Some(server) = dns_server {
-        let server = server.trim();
-        if !server.is_empty() {
+    let overlay_ns = match dns_server.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(server) => {
             let _ip: IpAddr = server
                 .parse()
                 .map_err(|e| err(format!("dns_server {server:?}: {e}")))?;
+            Some(server.to_string())
         }
-    }
+        None => None,
+    };
 
     // The agent has pivoted into the container root, whose `/etc` may not exist
     // yet (a minimal image layer, or the pre-pivot udhcpc warning we saw).
@@ -627,24 +743,67 @@ fn write_resolv_conf(dns_server: Option<&str>, dns_domain: Option<&str>) -> Resu
         }
     }
 
+    // Read whatever is already there (the seeded external resolvers and/or a
+    // DHCP lease's nameservers) so we can preserve them as *fallback* lines
+    // after the overlay resolver, instead of clobbering them.
+    let existing = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+
+    // Collect existing `nameserver` entries (in order), excluding the overlay
+    // resolver itself so it never appears twice and always stays first.
+    let mut fallback_ns: Vec<String> = Vec::new();
+    let mut existing_search: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("nameserver ") {
+            let ns = rest.trim().to_string();
+            if ns.is_empty() {
+                continue;
+            }
+            if overlay_ns.as_deref() == Some(ns.as_str()) {
+                continue;
+            }
+            if !fallback_ns.contains(&ns) {
+                fallback_ns.push(ns);
+            }
+        } else if let Some(rest) = line.strip_prefix("search ") {
+            existing_search.push(rest.trim().to_string());
+        }
+    }
+
+    // Build the new file: search line first, overlay resolver first nameserver,
+    // then the preserved external resolvers as fallback.
+    let mut out = String::new();
+
+    // search domain: prefer the overlay-supplied domain; otherwise keep any
+    // pre-existing search directive.
+    if let Some(domain) = dns_domain.map(str::trim).filter(|d| !d.is_empty()) {
+        let _ = writeln!(out, "search {domain}");
+    } else if let Some(first) = existing_search.first() {
+        if !first.is_empty() {
+            let _ = writeln!(out, "search {first}");
+        }
+    }
+
+    if let Some(ns) = &overlay_ns {
+        let _ = writeln!(out, "nameserver {ns}");
+    }
+    for ns in &fallback_ns {
+        let _ = writeln!(out, "nameserver {ns}");
+    }
+
+    // If somehow nothing was produced (no overlay server and no prior contents),
+    // fall back to a sane default so libc resolvers don't error out.
+    if out.is_empty() {
+        out.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    }
+
     let mut f = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open("/etc/resolv.conf")
         .map_err(|e| err(format!("open /etc/resolv.conf: {e}")))?;
-
-    if let Some(server) = dns_server {
-        let server = server.trim();
-        if !server.is_empty() {
-            writeln!(f, "nameserver {server}")
-                .map_err(|e| err(format!("write resolv.conf: {e}")))?;
-        }
-    }
-    if let Some(domain) = dns_domain {
-        let domain = domain.trim();
-        if !domain.is_empty() {
-            writeln!(f, "search {domain}").map_err(|e| err(format!("write resolv.conf: {e}")))?;
-        }
-    }
+    f.write_all(out.as_bytes())
+        .map_err(|e| err(format!("write resolv.conf: {e}")))?;
     Ok(())
 }
