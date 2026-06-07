@@ -488,12 +488,12 @@ mod linux {
     /// probed asynchronously, so the NIC may not exist the instant PID 1 runs.
     ///
     /// We must NOT just grab the first non-loopback interface: the kernel
-    /// auto-creates an IPv6-in-IPv4 tunnel `sit0` (ARPHRD_SIT) as soon as the
+    /// auto-creates an IPv6-in-IPv4 tunnel `sit0` (`ARPHRD_SIT`) as soon as the
     /// `sit` module is present, and directory order is unspecified, so a naive
     /// scan can pick `sit0` and run DHCP on the wrong (useless) interface while
-    /// the real `eth0` stays down. Filter on `/sys/class/net/<if>/type ==
-    /// ARPHRD_ETHER (1)`, which selects virtio-net and excludes `lo` (772),
-    /// `sit0` (776), and other tunnels.
+    /// the real `eth0` stays down. Filter on the interface's `type` sysfs file
+    /// being `ARPHRD_ETHER` (`1`), which selects virtio-net and excludes `lo`
+    /// (`772`), `sit0` (`776`), and other tunnels.
     fn wait_for_eth(timeout: std::time::Duration) -> Option<String> {
         const ARPHRD_ETHER: &str = "1";
         let deadline = std::time::Instant::now() + timeout;
@@ -506,9 +506,12 @@ mod linux {
                     }
                     // Only consider real ethernet links (virtio-net is ETHER).
                     let type_path = format!("/sys/class/net/{name}/type");
-                    match fs::read_to_string(&type_path) {
-                        Ok(t) if t.trim() == ARPHRD_ETHER => return Some(name),
-                        _ => continue,
+                    // First ethernet device wins; anything else (tunnels, read
+                    // errors) is skipped by falling through to the next entry.
+                    if let Ok(t) = fs::read_to_string(&type_path) {
+                        if t.trim() == ARPHRD_ETHER {
+                            return Some(name);
+                        }
                     }
                 }
             }
