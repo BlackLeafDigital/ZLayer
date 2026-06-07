@@ -370,6 +370,180 @@ mod linux {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY)
     }
 
+    /// True if the last OS error was `EEXIST`.
+    fn is_eexist() -> bool {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+    }
+
+    /// Create a character device node at `path` with the given `major`/`minor`,
+    /// tolerating `EEXIST` (devtmpfs may have already populated it). Permission
+    /// bits default to `0o666` (matching runc's standard `/dev` nodes).
+    fn mknod_char(path: &str, major: u32, minor: u32, mode: libc::mode_t) -> Result<()> {
+        let c_path = CString::new(path).map_err(|_| err("mknod: nul in path"))?;
+        // SAFETY: `dev` is a valid device number from `makedev`; `c_path` is a
+        // live NUL-terminated string; result is checked below.
+        let dev = libc::makedev(major, minor);
+        let rc = unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFCHR | mode, dev) };
+        if rc != 0 && !is_eexist() {
+            return Err(errno(&format!("mknod {path} ({major},{minor})")));
+        }
+        // `mknod(2)` applies the process umask to `mode` (e.g. umask 022 turns a
+        // requested 0666 into 0644), which would leave /dev/null et al. not
+        // world-writable and break non-root workloads (`/dev/null: Permission
+        // denied`). And on EEXIST the pre-existing node may have the wrong mode.
+        // Force the exact mode unconditionally with chmod (umask-immune).
+        // SAFETY: live NUL-terminated path; result checked.
+        let rc = unsafe { libc::chmod(c_path.as_ptr(), mode) };
+        if rc != 0 {
+            return Err(errno(&format!("chmod {path}")));
+        }
+        Ok(())
+    }
+
+    /// `symlink(target, link)` tolerating `EEXIST` idempotently.
+    fn symlink_idempotent(target: &str, link: &str) -> Result<()> {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(err(format!("symlink {link} -> {target}: {e}"))),
+        }
+    }
+
+    /// Provision the container's `/dev` exactly as a real OCI runtime (runc /
+    /// containerd) does, **after** the pivot so the path resolves inside the
+    /// container root.
+    ///
+    /// The pivot moved the boot devtmpfs to `/dev`; we mount a fresh `tmpfs`
+    /// over it so the workload sees a clean, runc-shaped `/dev` (the devtmpfs
+    /// stays mounted underneath, shadowed — harmless). Then we create the
+    /// standard device nodes, the `/dev/fd`+std{in,out,err} symlinks (these are
+    /// what fix bash process-substitution / `/dev/fd/63` in images like
+    /// `postgres:*-alpine`), plus `/dev/pts` and `/dev/shm`.
+    ///
+    /// Individual node failures are logged and tolerated (mirroring
+    /// `bring_up_network`), EXCEPT the `/dev/fd` symlink which is load-bearing
+    /// for many entrypoints and is logged loudly on failure.
+    fn setup_container_dev() -> Result<()> {
+        // Fresh tmpfs over /dev: a clean, writable, runc-shaped device dir.
+        // `nosuid` + `mode=0755` mirror runc's default /dev mount options.
+        if let Err(e) = mount(
+            "tmpfs",
+            "/dev",
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_STRICTATIME,
+            Some("mode=0755,size=65536k"),
+        ) {
+            // If the fresh mount fails we fall back to whatever /dev already
+            // exists (the moved-in devtmpfs); node/symlink creation below is
+            // still attempted and is idempotent.
+            eprintln!("zlayer-vzagent: warning: tmpfs /dev mount failed, using existing /dev: {e}");
+        }
+
+        // Standard device nodes (mirrors runc's defaults). 0o666 except the
+        // tty/console pair which runc also creates 0o666.
+        let nodes: &[(&str, u32, u32)] = &[
+            ("/dev/null", 1, 3),
+            ("/dev/zero", 1, 5),
+            ("/dev/full", 1, 7),
+            ("/dev/random", 1, 8),
+            ("/dev/urandom", 1, 9),
+            ("/dev/tty", 5, 0),
+            ("/dev/console", 5, 1),
+            ("/dev/ptmx", 5, 2),
+        ];
+        for &(path, major, minor) in nodes {
+            if let Err(e) = mknod_char(path, major, minor, 0o666) {
+                eprintln!("zlayer-vzagent: warning: could not create {path}: {e}");
+            }
+        }
+
+        // /dev/pts (devpts) — required for the /dev/ptmx multiplexor and for
+        // exec/attach pseudo-terminals. `ptmxmode=0666` makes the bind-mounted
+        // ptmx usable; `gid=5` matches the conventional `tty` group.
+        if let Err(e) = mkdir_p("/dev/pts") {
+            eprintln!("zlayer-vzagent: warning: mkdir /dev/pts: {e}");
+        }
+        if let Err(e) = mount(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
+        ) {
+            eprintln!("zlayer-vzagent: warning: mount /dev/pts: {e}");
+        }
+
+        // /dev/shm (tmpfs) — POSIX shared memory; many images (postgres
+        // included) expect it to exist and be writable.
+        if let Err(e) = mkdir_p("/dev/shm") {
+            eprintln!("zlayer-vzagent: warning: mkdir /dev/shm: {e}");
+        }
+        if let Err(e) = mount(
+            "tmpfs",
+            "/dev/shm",
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=1777,size=65536k"),
+        ) {
+            eprintln!("zlayer-vzagent: warning: mount /dev/shm: {e}");
+        }
+
+        // /proc must be mounted in the container root for the /dev/fd family of
+        // symlinks to resolve. The pivot moves it in; verify and (re)mount if
+        // it's somehow absent.
+        if !Path::new("/proc/self/fd").exists() {
+            if let Err(e) = mkdir_p("/proc") {
+                eprintln!("zlayer-vzagent: warning: mkdir /proc: {e}");
+            }
+            if let Err(e) = mount("proc", "/proc", "proc", 0, None) {
+                eprintln!("zlayer-vzagent: warning: mount /proc in container root: {e}");
+            }
+        }
+
+        // The /dev/fd family — runc always creates these. `/dev/fd` in
+        // particular is load-bearing for bash process substitution (the
+        // `/dev/fd/63` failure in postgres:*-alpine's initdb), so failing to
+        // create it is logged loudly.
+        if let Err(e) = symlink_idempotent("/proc/self/fd", "/dev/fd") {
+            eprintln!("zlayer-vzagent: ERROR: failed to create /dev/fd symlink (process substitution and /dev/fd/N will break): {e}");
+        }
+        for (target, link) in [
+            ("/proc/self/fd/0", "/dev/stdin"),
+            ("/proc/self/fd/1", "/dev/stdout"),
+            ("/proc/self/fd/2", "/dev/stderr"),
+        ] {
+            if let Err(e) = symlink_idempotent(target, link) {
+                eprintln!("zlayer-vzagent: warning: could not create {link} symlink: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure the container root has a usable `/etc/resolv.conf` after the pivot.
+    ///
+    /// The pre-pivot udhcpc lease script writes into the *initramfs* `/etc`,
+    /// which the pivot swaps away (hence the benign
+    /// "can't create /etc/resolv.conf: nonexistent directory" warning). The
+    /// authoritative DNS for the workload comes from
+    /// [`Msg::OverlayConfig`](crate::proto::Msg::OverlayConfig)
+    /// (`overlay::apply_overlay_config` → `write_resolv_conf`, which writes this
+    /// same post-pivot path). Until/unless that arrives, the workload still
+    /// needs the file to exist so libc resolvers don't error out — so we create
+    /// `/etc` and seed a sane default (`1.1.1.1` / `8.8.8.8`, matching the VZ
+    /// NAT's upstreams) only when no resolv.conf is present yet. The overlay
+    /// handler appends to (never clobbers) whatever is here.
+    fn ensure_container_resolv_conf() -> Result<()> {
+        mkdir_p("/etc")?;
+        if Path::new("/etc/resolv.conf").exists() {
+            return Ok(());
+        }
+        fs::write(
+            "/etc/resolv.conf",
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+        )
+        .map_err(|e| err(format!("seed /etc/resolv.conf: {e}")))
+    }
+
     /// Mount the host-shared OCI rootfs (virtiofs tag `rootfs`) read-only at
     /// `/lower`, then build a writable overlay at `/newroot`:
     /// `lowerdir=/lower, upperdir=/run/overlay/upper, workdir=/run/overlay/work`.
@@ -1378,6 +1552,18 @@ mod linux {
         // networking is best-effort, exactly as the inline path was.
         let _ = net_thread.join();
         pivot_into_newroot()?;
+
+        // Now that `/` is the container root, give the workload the minimal
+        // runtime environment a real OCI runtime provides: a runc-shaped `/dev`
+        // (standard nodes + the `/dev/fd` family of symlinks + pts/shm) and a
+        // usable `/etc/resolv.conf`. Best-effort: a malformed `/dev` would only
+        // hurt the workload, so failures are logged, not fatal.
+        if let Err(e) = setup_container_dev() {
+            eprintln!("zlayer-vzagent: warning: container /dev setup failed: {e}");
+        }
+        if let Err(e) = ensure_container_resolv_conf() {
+            eprintln!("zlayer-vzagent: warning: ensuring /etc/resolv.conf failed: {e}");
+        }
 
         // Initialize the global reaper registry and start the SINGLE dedicated
         // reaper thread before any child can be spawned. As PID 1 we are the

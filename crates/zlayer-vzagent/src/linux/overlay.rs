@@ -617,6 +617,16 @@ fn write_resolv_conf(dns_server: Option<&str>, dns_domain: Option<&str>) -> Resu
         }
     }
 
+    // The agent has pivoted into the container root, whose `/etc` may not exist
+    // yet (a minimal image layer, or the pre-pivot udhcpc warning we saw).
+    // Create it first so the open below can't fail with ENOENT. Tolerate the
+    // dir already existing.
+    if let Err(e) = std::fs::create_dir_all("/etc") {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(err(format!("mkdir /etc: {e}")));
+        }
+    }
+
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

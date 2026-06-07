@@ -121,6 +121,15 @@ CONFIG_BLK_CGROUP=y
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 
+# --- IPC: System V (shmget/semget/msgget) + POSIX message queues ------------
+# Real workloads need these even though the kernel is minimal: PostgreSQL's
+# bootstrap calls shmget() and fails with "could not create shared memory
+# segment: Function not implemented" (ENOSYS) without CONFIG_SYSVIPC. The IPC
+# namespace (CONFIG_IPC_NS, above) only *isolates* SysV IPC — it does not enable
+# the syscalls. POSIX_MQUEUE backs /dev/mqueue + mq_* for other apps.
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+
 # --- Misc hardening / essentials --------------------------------------------
 CONFIG_MULTIUSER=y
 CONFIG_POSIX_TIMERS=y
