@@ -6,8 +6,11 @@
 //! container plus the host-side plumbing the build needs:
 //!
 //! 1. **Ensure running** — probe the sidecar's `Health` RPC on
-//!    `127.0.0.1:8099`; if it is not `SERVING`, (re)start the
-//!    `zlayer-buildd-v2:arm64` container (the image imported in Phase A)
+//!    `127.0.0.1:8099`; if it is not `SERVING`, (re)start the buildd
+//!    container (the public `ghcr.io/blackleafdigital/zlayer/buildd:arm64`
+//!    image by default, overridable via `$ZLAYER_BUILDD_IMAGE`, falling back
+//!    to the local Phase-A `zlayer-buildd-v2:arm64` import when the
+//!    configured/ghcr image can't be resolved)
 //!    with the gRPC port published to host loopback, the persistent
 //!    storage volume, the shared mTLS directory, and a **build-context
 //!    bind mount** so build inputs are visible to the in-guest buildah.
@@ -32,8 +35,32 @@ use tracing::{info, warn};
 
 /// Container/deployment name for the managed sidecar.
 pub const BUILDD_NAME: &str = "zlayer-buildd";
-/// OCI image (imported into the local registry in Phase A) the sidecar runs.
-const BUILDD_IMAGE: &str = "zlayer-buildd-v2:arm64";
+/// Published, anonymously-pullable OCI image the sidecar runs by default.
+///
+/// This lives in the same ghcr namespace as `ZLayer`'s other OCI images
+/// (`ghcr.io/blackleafdigital/zlayer/*`). When the package is public any macOS
+/// host pulls it without credentials; while it is org-`internal` a host needs a
+/// ghcr read credential (`zlayer credential registry add --registry ghcr.io`).
+/// Either way the [`BUILDD_IMAGE_LOCAL`] fallback keeps a dev Mac working if the
+/// remote can't be resolved. The CI workflow `.forgejo/workflows/
+/// buildd-image.yml` rebuilds + republishes it.
+const BUILDD_IMAGE_GHCR: &str = "ghcr.io/blackleafdigital/zlayer/buildd:arm64";
+/// Local dev fallback: the image imported into the local store in Phase A on
+/// this build Mac. Used only when the configured/ghcr image can't be resolved
+/// (e.g. offline dev with the ghcr image not yet pulled).
+const BUILDD_IMAGE_LOCAL: &str = "zlayer-buildd-v2:arm64";
+/// Env var to override the buildd image (full ref). Takes precedence over the
+/// ghcr default; empty/unset falls back to [`BUILDD_IMAGE_GHCR`].
+const BUILDD_IMAGE_ENV: &str = "ZLAYER_BUILDD_IMAGE";
+
+/// The buildd image to start: `$ZLAYER_BUILDD_IMAGE` if set (and non-empty),
+/// otherwise the published ghcr default.
+fn buildd_image() -> String {
+    match std::env::var(BUILDD_IMAGE_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => BUILDD_IMAGE_GHCR.to_string(),
+    }
+}
 /// gRPC bind/publish address on host loopback.
 const BUILDD_HOST_ADDR: &str = "127.0.0.1:8099";
 /// In-guest gRPC bind address (published to `BUILDD_HOST_ADDR`).
@@ -138,13 +165,34 @@ pub async fn ensure_buildd() -> Result<BuilddHandle> {
     // fresh one with the context bind mount.
     remove_existing().await;
 
-    start_container(&tls_dir, &context_host_root)
-        .await
-        .context("starting zlayer-buildd container")?;
-
-    wait_for_health(&handle)
-        .await
-        .context("waiting for zlayer-buildd Health = SERVING")?;
+    // Start with the configured/ghcr image; if that container never reaches
+    // SERVING (e.g. the public image can't be pulled in an offline dev env),
+    // fall back to the local Phase-A import so this dev Mac keeps working.
+    let primary = buildd_image();
+    let used_image = match start_and_wait(&handle, &tls_dir, &context_host_root, &primary).await {
+        Ok(()) => primary,
+        Err(e) if primary != BUILDD_IMAGE_LOCAL => {
+            warn!(
+                image = %primary,
+                fallback = %BUILDD_IMAGE_LOCAL,
+                "buildd image failed to come up ({e:#}); retrying with local fallback"
+            );
+            remove_existing().await;
+            start_and_wait(&handle, &tls_dir, &context_host_root, BUILDD_IMAGE_LOCAL)
+                .await
+                .with_context(|| {
+                    format!(
+                        "starting zlayer-buildd with fallback image {BUILDD_IMAGE_LOCAL} \
+                         (primary {primary} also failed)"
+                    )
+                })?;
+            BUILDD_IMAGE_LOCAL.to_string()
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("starting zlayer-buildd from {primary}"));
+        }
+    };
+    info!(image = %used_image, "zlayer-buildd container up");
 
     // buildah overlay-mounts the build-context dir via fuse-overlayfs, which
     // needs `/dev/fuse`. VZ-Linux containers don't get one by default, so
@@ -162,11 +210,30 @@ fn zlayer_exe() -> Result<PathBuf> {
     std::env::current_exe().context("resolving current zlayer executable path")
 }
 
+/// Start the container from `image` and wait for `Health = SERVING`. On any
+/// failure (run failed, or never reached SERVING) the partial container is
+/// torn down so the caller can cleanly retry with a different image.
+async fn start_and_wait(
+    handle: &BuilddHandle,
+    tls_dir: &Path,
+    context_dir: &Path,
+    image: &str,
+) -> Result<()> {
+    start_container(tls_dir, context_dir, image)
+        .await
+        .with_context(|| format!("`zlayer run -d` for buildd image {image}"))?;
+    if let Err(e) = wait_for_health(handle).await {
+        remove_existing().await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// `zlayer run -d --name zlayer-buildd --memory 8Gi -p ... -v tls -v context
 /// <image> -- <buildd flags>`. Mirrors the verified Phase-A command, plus
 /// the `/context` bind mount, generous RAM, and a tmpfs-backed graph root
 /// (see [`GUEST_GRAPH_ROOT`] for why the graph must not be on virtiofs).
-async fn start_container(tls_dir: &Path, context_dir: &Path) -> Result<()> {
+async fn start_container(tls_dir: &Path, context_dir: &Path, image: &str) -> Result<()> {
     let exe = zlayer_exe()?;
 
     let tls_mount = format!("{}:{GUEST_TLS_DIR}", tls_dir.display());
@@ -186,7 +253,7 @@ async fn start_container(tls_dir: &Path, context_dir: &Path) -> Result<()> {
         .arg(&tls_mount)
         .arg("-v")
         .arg(&context_mount)
-        .arg(BUILDD_IMAGE)
+        .arg(image)
         .arg("--")
         .arg("--bind")
         .arg(BUILDD_GUEST_BIND)

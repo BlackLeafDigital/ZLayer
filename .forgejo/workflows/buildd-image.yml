@@ -1,0 +1,136 @@
+name: buildd OCI Image
+
+# Builds + publishes the `zlayer-buildd` OCI image — the Go gRPC/buildah server
+# that ZLayer's macOS build-sidecar (bin/zlayer/src/commands/buildd_manager.rs)
+# runs inside a VZ-Linux container to build Linux images on Apple Silicon.
+#
+# The image is pushed to the same ghcr namespace as ZLayer's other OCI images
+# (ghcr.io/blackleafdigital/zlayer/*). buildd_manager.rs pulls
+# `ghcr.io/blackleafdigital/zlayer/buildd:arm64` by default (overridable via
+# $ZLAYER_BUILDD_IMAGE) so any macOS host can run the sidecar without a
+# locally-imported image.
+#
+# arm64 is the MUST-HAVE (macOS = Apple Silicon). amd64 is built too so the
+# published tag is a multi-arch manifest. The base is quay.io/buildah/stable.
+#
+# Triggers: manual (workflow_dispatch) or a push touching the buildd source /
+# its proto / this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Extra tag to publish alongside :arm64/:latest (e.g. a date or sha)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches: [dev]
+    paths:
+      - 'bin/zlayer-buildd/**'
+      - 'proto/buildah_sidecar.proto'
+      - '.forgejo/workflows/buildd-image.yml'
+
+env:
+  REGISTRY: ghcr.io/blackleafdigital/zlayer
+  IMAGE: buildd
+
+jobs:
+  build-and-push:
+    name: Build & Push buildd image
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip]') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # protobuf-compiler for the Go bindings; the aarch64 GNU cross
+          # toolchain for the cgo arm64 build; buildah/podman + qemu for the
+          # OCI image assembly + cross-arch manifest; jq for the smoke test.
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            buildah podman qemu-user-static jq ca-certificates
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Cross-build buildd release binaries (arm64 + amd64)
+        id: build
+        shell: bash
+        working-directory: bin/zlayer-buildd
+        run: |
+          set -euo pipefail
+          # arm64 is the must-have; amd64 is built so the published tag is a
+          # multi-arch manifest. Both are cgo-enabled (buildah needs gpgme/
+          # seccomp); the Makefile selects the cross-CC for arm64.
+          make release-arm64
+          make release-amd64
+          ls -la release/
+          test -x release/zlayer-buildd-linux-arm64
+          test -x release/zlayer-buildd-linux-amd64
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Assemble + push multi-arch buildd image
+        shell: bash
+        working-directory: bin/zlayer-buildd
+        run: |
+          set -euo pipefail
+          REPO="${REGISTRY}/${IMAGE}"
+          DATE="$(date -u +%Y%m%d)"
+          SHA="$(git rev-parse --short HEAD)"
+          MANIFEST="zlayer-buildd:multiarch"
+
+          buildah manifest rm "${MANIFEST}" 2>/dev/null || true
+          buildah manifest create "${MANIFEST}"
+
+          # One Containerfile per arch (FROM the arch-matched buildah base +
+          # COPY the matching binary). No boottime/date entrypoint hack — the
+          # guest clock is set at boot by the vzagent (host injects
+          # zlayer.boottime), so it is obsolete.
+          build_arch() {
+            local goarch="$1" platform="$2" bin="$3"
+            local cf
+            cf="$(mktemp)"
+            cat > "${cf}" <<EOF
+          FROM quay.io/buildah/stable:latest
+          COPY ${bin} /usr/local/bin/zlayer-buildd
+          ENV STORAGE_DRIVER=vfs
+          ENTRYPOINT ["/usr/local/bin/zlayer-buildd"]
+          EOF
+            buildah bud \
+              --platform "${platform}" \
+              --manifest "${MANIFEST}" \
+              -f "${cf}" \
+              .
+            rm -f "${cf}"
+          }
+
+          build_arch arm64 linux/arm64 release/zlayer-buildd-linux-arm64
+          build_arch amd64 linux/amd64 release/zlayer-buildd-linux-amd64
+
+          # Push the manifest under :arm64 (the legacy must-have tag consumed by
+          # buildd_manager.rs), :latest, and a date-sha tag. Each push of the
+          # SAME manifest list publishes the multi-arch index under that tag.
+          for TAG in arm64 latest "arm64-${DATE}-${SHA}"; do
+            echo "Pushing ${REPO}:${TAG}"
+            buildah manifest push --all "${MANIFEST}" "docker://${REPO}:${TAG}"
+          done
+
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "Pushing extra tag ${REPO}:${{ inputs.tag }}"
+            buildah manifest push --all "${MANIFEST}" "docker://${REPO}:${{ inputs.tag }}"
+          fi
+
+          echo "Published ${REPO} {arm64, latest, arm64-${DATE}-${SHA}}"
