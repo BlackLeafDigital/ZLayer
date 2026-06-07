@@ -4,5 +4,6 @@ steps:
   - run: apt-get install -y nodejs
 
 labels:
+  org.opencontainers.image.source: "https://github.com/BlackLeafDigital/ZLayer"
   org.opencontainers.image.title: "ZLayer macOS Node.js"
   org.opencontainers.image.vendor: "Black Leaf Digital"

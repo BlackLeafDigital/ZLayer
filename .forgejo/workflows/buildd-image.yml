@@ -107,6 +107,9 @@ jobs:
           FROM quay.io/buildah/stable:latest
           COPY ${bin} /usr/local/bin/zlayer-buildd
           ENV STORAGE_DRIVER=vfs
+          LABEL org.opencontainers.image.source="https://github.com/BlackLeafDigital/ZLayer"
+          LABEL org.opencontainers.image.title="ZLayer buildd (macOS buildah-in-VZ sidecar)"
+          LABEL org.opencontainers.image.licenses="MIT"
           ENTRYPOINT ["/usr/local/bin/zlayer-buildd"]
           EOF
             buildah bud \
