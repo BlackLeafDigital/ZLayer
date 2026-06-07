@@ -136,6 +136,7 @@ sqlx.workspace = true
 # mirror the settings in `zlayer-agent`.
 bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
 ed25519-dalek.workspace = true
+dirs = "5"
 
 [features]
 default = []

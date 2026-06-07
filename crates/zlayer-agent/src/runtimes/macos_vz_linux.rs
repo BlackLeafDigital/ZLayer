@@ -329,6 +329,28 @@ impl VzLinuxRuntime {
         })
     }
 
+    /// Resolve OCI pull auth for `image`.
+    ///
+    /// When the spec supplies auth, honor it via [`zlayer_registry::spec_auth_to_oci`]
+    /// (inline / daemon-resolved credentials). When it does NOT, fall back to the
+    /// hostname-based [`zlayer_core::AuthResolver`] whose default
+    /// [`zlayer_core::AuthConfig`] reads `~/.docker/config.json` (`DockerConfig`) —
+    /// matching youki's behavior so `zlayer login`-written credentials are picked
+    /// up here too instead of degrading to anonymous. The resolver is built
+    /// per-pull (cheap) so freshly-written docker-config creds are seen
+    /// immediately by an already-running daemon.
+    fn resolve_pull_auth(
+        auth: Option<&RegistryAuth>,
+        image: &str,
+    ) -> zlayer_registry::RegistryAuth {
+        match auth {
+            Some(a) => zlayer_registry::spec_auth_to_oci(Some(a)),
+            None => {
+                zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image)
+            }
+        }
+    }
+
     /// `"{service}-{replica}"` — the per-container directory / map key.
     fn container_dir_name(id: &ContainerId) -> String {
         format!("{}-{}", id.service, id.replica)
@@ -460,7 +482,7 @@ impl VzLinuxRuntime {
         if let Some(reg) = self.open_local_registry().await {
             puller = puller.with_local_registry(reg);
         }
-        let pull_auth = zlayer_registry::spec_auth_to_oci(auth);
+        let pull_auth = Self::resolve_pull_auth(auth, image);
         write_image_config_sidecar(&puller, image, &pull_auth, image_dir).await;
     }
 
@@ -1940,8 +1962,10 @@ impl Runtime for VzLinuxRuntime {
 
         // Resolve auth from the caller (the daemon/composite resolves per-registry
         // credentials — inline spec creds or, via the credential store, by host —
-        // and passes them down); Anonymous when none was supplied.
-        let pull_auth = zlayer_registry::spec_auth_to_oci(auth);
+        // and passes them down). When NONE was supplied, fall back to the
+        // hostname-based AuthResolver (DockerConfig → ~/.docker/config.json),
+        // matching youki — so `zlayer login`-written creds are honored here too.
+        let pull_auth = Self::resolve_pull_auth(auth, image);
 
         // Central constructor: wires the local persistent blob cache through the
         // full source chain — the shared S3 tier (when ZLAYER_S3_BUCKET is

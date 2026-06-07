@@ -1933,6 +1933,15 @@ pub(crate) async fn serve_with_external_shutdown(
         }
     }
 
+    // Capture the concrete `Arc<PersistentSecretsStore>` backing the API-key
+    // `CredentialStore` BEFORE it's moved into `api_config`. The credential
+    // routes (`/api/v1/credentials/*`, nested further below) need this concrete
+    // handle to build the typed Registry/Git credential stores — `CredentialState`
+    // is generic over `Arc<PersistentSecretsStore>`, NOT the `Arc<dyn SecretsStore>`
+    // that `SecretsState` consumes. `CredentialStore::store()` returns the inner
+    // `Arc`, so this is a cheap refcount clone over the same on-disk store.
+    let persistent_secrets_for_creds = credential_store.store().clone();
+
     let api_config = ApiConfig {
         bind: bind_addr,
         tls: api_tls,
@@ -2426,6 +2435,23 @@ pub(crate) async fn serve_with_external_shutdown(
     let environments_state = zlayer_api::EnvironmentsState::new(bundle.environments.clone());
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);
+
+    // Registry/Git credential routes (`zlayer login` writes here). Backed by the
+    // SAME concrete `Arc<PersistentSecretsStore>` as the API-key credential store
+    // (captured above before it was moved into `api_config`), so credentials land
+    // in the daemon's on-disk secrets DB and are visible to image pulls.
+    let credential_state = zlayer_api::CredentialState::new(
+        std::sync::Arc::new(zlayer_secrets::RegistryCredentialStore::new(
+            persistent_secrets_for_creds.clone(),
+        )),
+        std::sync::Arc::new(zlayer_secrets::GitCredentialStore::new(
+            persistent_secrets_for_creds.clone(),
+        )),
+    );
+    router = router.nest(
+        "/api/v1/credentials",
+        zlayer_api::build_credential_routes(credential_state),
+    );
 
     // Add environment routes (CRUD; cascade-safety check against secrets state)
     let environment_routes =

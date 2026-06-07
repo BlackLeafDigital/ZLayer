@@ -72,6 +72,18 @@ impl<S: SecretsStore> CredentialStore<S> {
         Self { store }
     }
 
+    /// Borrow the underlying secrets store.
+    ///
+    /// Useful for constructing sibling typed stores (e.g.
+    /// [`crate::RegistryCredentialStore`] / [`crate::GitCredentialStore`]) that
+    /// share the same concrete backing store without re-opening it. When `S` is
+    /// an `Arc<_>` (the common case), call `.clone()` on the returned reference
+    /// for a cheap refcount bump.
+    #[must_use]
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     /// Validate an API key and secret pair.
     ///
     /// Returns `Some(roles)` if the credentials are valid, `None` if invalid.
