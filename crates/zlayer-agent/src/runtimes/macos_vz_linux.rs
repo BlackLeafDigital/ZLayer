@@ -398,6 +398,27 @@ impl VzLinuxRuntime {
         self.linux_dir().join("cache")
     }
 
+    /// Open the daemon-wide local OCI registry at `{data_dir}/registry` — the
+    /// store `zlayer import` / `zlayer build` write into. Opened lazily (just
+    /// loads `index.json`) so the runtime constructor can stay synchronous.
+    ///
+    /// Returns `None` (with a warning) if the registry cannot be opened, so a
+    /// missing local store degrades to the cache/S3/origin chain rather than
+    /// hard-failing the pull.
+    async fn open_local_registry(
+        &self,
+    ) -> Option<std::sync::Arc<zlayer_registry::LocalRegistry>> {
+        let registry_path = self.data_dir.join("registry");
+        match zlayer_registry::LocalRegistry::new(registry_path).await {
+            Ok(reg) => Some(std::sync::Arc::new(reg)),
+            Err(e) => {
+                tracing::warn!(error = %e, "vz-linux: failed to open local registry; \
+                                            imported/built images will be invisible");
+                None
+            }
+        }
+    }
+
     /// Backfill the `image-config.json` sidecar for an ALREADY-present image.
     ///
     /// `pull_image_with_policy` writes the sidecar on a fresh pull, but an
@@ -430,7 +451,11 @@ impl VzLinuxRuntime {
             tracing::debug!(image = %image, "vz-linux: sidecar backfill skipped (blob cache open failed)");
             return;
         };
-        let puller = zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+        let mut puller =
+            zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+        if let Some(reg) = self.open_local_registry().await {
+            puller = puller.with_local_registry(reg);
+        }
         let pull_auth = zlayer_registry::spec_auth_to_oci(auth);
         write_image_config_sidecar(&puller, image, &pull_auth, image_dir).await;
     }
@@ -1894,8 +1919,14 @@ impl Runtime for VzLinuxRuntime {
         // full source chain — the shared S3 tier (when ZLAYER_S3_BUCKET is
         // configured) and the last-resort default registry (when
         // ZLAYER_DEFAULT_REGISTRY is set) — AND applies the per-image source
-        // policy. This runtime has no local_registry field, so no chaining.
-        let puller = zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+        // policy. The daemon-wide local OCI registry (`{data_dir}/registry`,
+        // written by `zlayer import` / `zlayer build`) is chained in so
+        // imported/built images resolve here without a remote pull.
+        let mut puller =
+            zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+        if let Some(reg) = self.open_local_registry().await {
+            puller = puller.with_local_registry(reg);
+        }
 
         let layers =
             puller

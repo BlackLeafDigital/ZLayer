@@ -736,6 +736,26 @@ impl ImagePuller {
             }
         }
 
+        // Then the daemon-wide local OCI registry (`zlayer import` / `zlayer
+        // build` store). Blobs are digest-addressed → immutable, so a hit is
+        // authoritative; warm the local cache so subsequent pulls are pure
+        // cache hits. This is what lets an IMPORTED image's layers resolve
+        // without ever touching a remote registry (the manifest already
+        // resolves via `try_local_registry`).
+        #[cfg(feature = "local")]
+        if let Some(registry) = &self.local_registry {
+            if let Ok(data) = registry.get_blob(digest).await {
+                if !data.is_empty() {
+                    tracing::debug!(
+                        digest = %digest,
+                        "blob found in local registry; warming local cache"
+                    );
+                    let _ = self.cache.put(digest, &data).await;
+                    return Ok(data);
+                }
+            }
+        }
+
         // Store auth before pulling blob
         self.store_auth(image, auth).await?;
 
