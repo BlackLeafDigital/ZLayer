@@ -128,6 +128,10 @@ pub(crate) async fn handle_build(
     // (the library's own local-registry import path can't reach the
     // in-guest store, so we skip it here and do it ourselves).
     // ------------------------------------------------------------------
+    // `context` is only mutated on the macOS sidecar path below
+    // (`setup_macos_sidecar(&mut context)`); on every other target the binding
+    // is read-only, so silence the platform-specific `unused_mut`.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut context = context;
     #[cfg(target_os = "macos")]
     let mac_sidecar = {
