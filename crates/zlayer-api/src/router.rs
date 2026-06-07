@@ -1767,12 +1767,8 @@ pub fn build_router_with_containers(
     local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(
-        config,
-        storage,
-        Arc::clone(&service_manager),
-        local_node_id,
-    );
+    let base_router =
+        build_router_with_services(config, storage, Arc::clone(&service_manager), local_node_id);
 
     // Create container state (carries the shared event bus). Attach the
     // ServiceManager so the unified name resolver + `docker ps` can see compose

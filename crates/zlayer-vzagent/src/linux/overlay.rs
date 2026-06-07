@@ -231,9 +231,7 @@ fn start_dns_relay(upstream: IpAddr, upstream_port: u16) -> Result<()> {
         })
         .map_err(|e| err(format!("spawn DNS relay thread: {e}")))?;
 
-    eprintln!(
-        "zlayer-vzagent: overlay DNS relay 127.0.0.1:53 -> {upstream_addr} started"
-    );
+    eprintln!("zlayer-vzagent: overlay DNS relay 127.0.0.1:53 -> {upstream_addr} started");
     Ok(())
 }
 

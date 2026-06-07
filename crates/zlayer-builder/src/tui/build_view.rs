@@ -304,6 +304,50 @@ mod tests {
     }
 
     #[test]
+    fn instructions_pane_not_waiting_when_plan_present() {
+        // Once a BuildPlan has populated the stages, the Instructions pane
+        // must render the (pending) instruction list, never the
+        // "Waiting for build to start..." placeholder.
+        let state = BuildState {
+            stages: vec![StageState {
+                index: 0,
+                name: None,
+                base_image: "alpine".to_string(),
+                instructions: vec![
+                    InstructionState {
+                        text: "RUN echo a".to_string(),
+                        status: InstructionStatus::Pending,
+                    },
+                    InstructionState {
+                        text: "RUN echo b".to_string(),
+                        status: InstructionStatus::Pending,
+                    },
+                ],
+                complete: false,
+            }],
+            total_stages: 1,
+            total_instructions: 2,
+            ..Default::default()
+        };
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 24));
+        let view = BuildView::new(&state);
+        view.render(Rect::new(0, 0, 60, 24), &mut buf);
+
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(
+            !content.contains("Waiting for build to start"),
+            "instruction pane should show the plan, not the waiting placeholder"
+        );
+        assert!(content.contains("RUN echo a"));
+    }
+
+    #[test]
     fn test_header_border_style_complete() {
         let state = BuildState {
             completed: true,

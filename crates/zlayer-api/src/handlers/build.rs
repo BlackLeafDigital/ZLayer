@@ -219,6 +219,19 @@ pub fn build_event_to_wrapper(event: BuildEvent) -> BuildEventWrapper {
                 "total_instructions": total_instructions,
             }),
         },
+        BuildEvent::BuildPlan { stages } => BuildEventWrapper {
+            event_type: "build_plan".to_string(),
+            data: serde_json::json!({
+                "stages": stages
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "name": s.name,
+                        "base_image": s.base_image,
+                        "instructions": s.instructions,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        },
         BuildEvent::StageStarted {
             index,
             name,

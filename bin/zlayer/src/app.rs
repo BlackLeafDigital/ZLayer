@@ -513,6 +513,46 @@ General:
                                     build_state.total_stages = total_stages;
                                     build_state.total_instructions = total_instructions;
                                 }
+                                BuildEvent::BuildPlan { stages } => {
+                                    // Pre-fill the full instruction list from the
+                                    // parsed Dockerfile (used by the buildah
+                                    // sidecar, which can't emit live per-step
+                                    // events). Entries land Pending and are
+                                    // advanced by later InstructionStarted/
+                                    // InstructionComplete events.
+                                    use zlayer_builder::tui::{InstructionState, StageState};
+                                    build_state.stages = stages
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(index, s)| StageState {
+                                            index,
+                                            name: s.name,
+                                            base_image: s.base_image,
+                                            instructions: s
+                                                .instructions
+                                                .into_iter()
+                                                .map(|text| InstructionState {
+                                                    text,
+                                                    status:
+                                                        zlayer_builder::InstructionStatus::Pending,
+                                                })
+                                                .collect(),
+                                            complete: false,
+                                        })
+                                        .collect();
+                                    if build_state.total_stages == 0 {
+                                        build_state.total_stages = build_state.stages.len();
+                                    }
+                                    if build_state.total_instructions == 0 {
+                                        build_state.total_instructions = build_state
+                                            .stages
+                                            .iter()
+                                            .map(|s| s.instructions.len())
+                                            .sum();
+                                    }
+                                    build_state.current_stage = 0;
+                                    build_state.current_instruction = 0;
+                                }
                                 BuildEvent::StageStarted {
                                     index,
                                     name,

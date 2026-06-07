@@ -113,9 +113,10 @@ impl PlainLogger {
                 }
             }
 
-            BuildEvent::Output { .. } => {
-                // In non-verbose mode, we skip individual output lines
-            }
+            // In non-verbose mode we skip individual output lines; `BuildPlan`
+            // never prints (its per-instruction lines arrive via
+            // InstructionStarted/Output — it only pre-populates the TUI list).
+            BuildEvent::Output { .. } | BuildEvent::BuildPlan { .. } => {}
 
             BuildEvent::InstructionComplete { cached, .. } => {
                 if *cached && self.verbose {

@@ -270,11 +270,15 @@ fn build_event_to_ndjson(event: &BuildEvent) -> Option<Bytes> {
         BuildEvent::StageComplete { index } => {
             Some(stream_event(&format!(" ---> Stage {} complete", index + 1)))
         }
-        // BuildStarted, InstructionComplete{cached:false}, BuildComplete, and
-        // BuildFailed are intentionally silent: BuildStarted is metadata only,
-        // a non-cached InstructionComplete is implied by Output lines, and the
-        // terminal aux/errorDetail lines are emitted by the caller.
+        // BuildStarted, BuildPlan, InstructionComplete{cached:false},
+        // BuildComplete, and BuildFailed are intentionally silent: BuildStarted
+        // and BuildPlan are metadata only (the docker NDJSON stream has no
+        // up-front-plan concept; per-step lines come via StageStarted/
+        // InstructionStarted/Output), a non-cached InstructionComplete is
+        // implied by Output lines, and the terminal aux/errorDetail lines are
+        // emitted by the caller.
         BuildEvent::BuildStarted { .. }
+        | BuildEvent::BuildPlan { .. }
         | BuildEvent::InstructionComplete { cached: false, .. }
         | BuildEvent::BuildComplete { .. }
         | BuildEvent::BuildFailed { .. } => None,

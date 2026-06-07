@@ -2573,8 +2573,8 @@ impl DaemonClient {
             working_dir,
             env,
         };
-        let body = serde_json::to_string(&request)
-            .context("Failed to serialize ContainerExecRequest")?;
+        let body =
+            serde_json::to_string(&request).context("Failed to serialize ContainerExecRequest")?;
         let (status, resp) = self.post_json(&path, &body).await?;
         Self::check_status(status, &resp)?;
         Self::parse_json(&resp)

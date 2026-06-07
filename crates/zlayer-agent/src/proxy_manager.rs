@@ -164,8 +164,8 @@ impl ProxyManager {
         // fast enough that a transient blip during a CI build (sibling
         // containers churning the overlay) clears well within a single e2e
         // step, without hammering backends.
-        let lb_health_checker = load_balancer
-            .spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
+        let lb_health_checker =
+            load_balancer.spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
 
         Self {
             config,

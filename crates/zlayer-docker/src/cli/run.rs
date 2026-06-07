@@ -495,6 +495,10 @@ struct FlatRunArgs {
     attach: Vec<String>,
     interactive: bool,
     tty: bool,
+    // `--rm` is handled on the top-level `zlayer run` path (foreground teardown)
+    // and advised on the `zlayer docker run` path in `handle_run`; the flattened
+    // spec builder itself does not read it.
+    #[allow(dead_code)]
     rm: bool,
     #[allow(dead_code)]
     sig_proxy: bool,
@@ -827,6 +831,21 @@ pub async fn handle_run(parsed: RunArgs) -> Result<()> {
     let detach = parsed.lifecycle.detach;
     let want_attach = parsed.lifecycle.tty && parsed.lifecycle.interactive && !detach;
 
+    // The `zlayer docker run` shim does not auto-remove on exit (unlike the
+    // top-level `zlayer run`, which honors `--rm` client-side). Advise so the
+    // container isn't left behind silently.
+    if parsed.lifecycle.rm {
+        tracing::warn!(
+            "`zlayer docker run --rm` does not auto-remove; run `zlayer docker rm {}` when done \
+             (the top-level `zlayer run --rm` does auto-remove)",
+            parsed
+                .runtime
+                .name
+                .clone()
+                .unwrap_or_else(|| derive_service_name(&parsed.image))
+        );
+    }
+
     let spec = build_deployment_spec(&parsed)?;
 
     let deployment_name = spec.deployment.clone();
@@ -1015,14 +1034,11 @@ pub fn build_deployment_spec(parsed: &RunArgs) -> Result<DeploymentSpec> {
     if args.runtime.is_some() {
         tracing::warn!("--runtime is accepted but not yet forwarded");
     }
-    if args.rm {
-        tracing::warn!(
-            "--rm has no direct analogue; use `zlayer docker rm {}` when done",
-            args.name
-                .clone()
-                .unwrap_or_else(|| derive_service_name(&args.image))
-        );
-    }
+    // NOTE: `--rm` is intentionally NOT warned about here. `build_deployment_spec`
+    // is shared by the top-level `zlayer run`, which fully implements `--rm`
+    // (foreground teardown + `delete_on_exit` for detached) — warning here would
+    // be a false negative on that path. The `zlayer docker run` shim, which does
+    // not auto-remove, emits the advisory itself in `handle_run`.
     if args.no_healthcheck {
         tracing::debug!("--no-healthcheck: emitting a placeholder TCP healthcheck on port 0");
     }

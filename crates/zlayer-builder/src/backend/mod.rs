@@ -379,9 +379,7 @@ async fn construct_backend(
                 // explicit `--backend buildah-sidecar` / `ZLAYER_BACKEND`
                 // dials the managed VZ buildd instead of trying to spawn one
                 // locally (which can't run on macOS).
-                Ok(Arc::new(
-                    sidecar_from_env().unwrap_or_default(),
-                ))
+                Ok(Arc::new(sidecar_from_env().unwrap_or_default()))
             }
             #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
             {

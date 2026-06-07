@@ -2778,15 +2778,14 @@ pub(crate) async fn serve_with_external_shutdown(
         // handlers and event subscribers share the broadcast bus. The
         // bridge-network state is threaded in so `CreateContainerRequest.networks`
         // can attach freshly-created containers to user-defined networks.
-        let mut container_state =
-            ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
-                .with_shared_event_bus(event_bus.clone())
-                .with_bridge_networks(bridge_network_state)
-                .with_standalone_storage(bundle.standalone_containers.clone())
-                .with_compose_storage(bundle.compose_projects.clone())
-                .with_cluster(cluster_handle.clone())
-                .with_internal_token(internal_token.clone())
-                .with_service_manager(Arc::clone(&container_service_manager));
+        let mut container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
+            .with_shared_event_bus(event_bus.clone())
+            .with_bridge_networks(bridge_network_state)
+            .with_standalone_storage(bundle.standalone_containers.clone())
+            .with_compose_storage(bundle.compose_projects.clone())
+            .with_cluster(cluster_handle.clone())
+            .with_internal_token(internal_token.clone())
+            .with_service_manager(Arc::clone(&container_service_manager));
 
         // Wire the overlay manager + overlay DNS so the container-create handler
         // can satisfy user-defined network attachments via the encrypted overlay

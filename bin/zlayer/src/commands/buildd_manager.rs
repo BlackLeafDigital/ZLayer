@@ -135,8 +135,12 @@ pub async fn ensure_buildd() -> Result<BuilddHandle> {
     let tls_dir = base.clone();
     let context_host_root = base.join("context");
 
-    std::fs::create_dir_all(&context_host_root)
-        .with_context(|| format!("creating shared context dir {}", context_host_root.display()))?;
+    std::fs::create_dir_all(&context_host_root).with_context(|| {
+        format!(
+            "creating shared context dir {}",
+            context_host_root.display()
+        )
+    })?;
 
     let handle = BuilddHandle {
         addr: BUILDD_HOST_ADDR.to_string(),
@@ -375,7 +379,9 @@ async fn guest_has_context_mount() -> bool {
         .arg("--")
         .arg("sh")
         .arg("-c")
-        .arg(format!("test -d {GUEST_CONTEXT_DIR} && grep -q {GUEST_CONTEXT_DIR} /proc/mounts"))
+        .arg(format!(
+            "test -d {GUEST_CONTEXT_DIR} && grep -q {GUEST_CONTEXT_DIR} /proc/mounts"
+        ))
         .output()
         .await;
     matches!(out, Ok(o) if o.status.success())
@@ -538,7 +544,9 @@ fn is_ignored(ignore: &DockerIgnore, rel: &Path) -> bool {
         let pat = pat.trim_end_matches('/');
         if rel_str == pat
             || rel_str.starts_with(&format!("{pat}/"))
-            || pat.strip_prefix('*').is_some_and(|suf| rel_str.ends_with(suf))
+            || pat
+                .strip_prefix('*')
+                .is_some_and(|suf| rel_str.ends_with(suf))
         {
             return true;
         }
@@ -549,27 +557,21 @@ fn is_ignored(ignore: &DockerIgnore, rel: &Path) -> bool {
 /// Recursively copy `dir` into `dst_root`, preserving structure relative to
 /// `ctx_root`, skipping `.git` and `.dockerignore`d paths.
 fn copy_tree(ctx_root: &Path, dir: &Path, dst_root: &Path, ignore: &DockerIgnore) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         let file_name = entry.file_name();
         if file_name == ".git" {
             continue;
         }
-        let rel = path
-            .strip_prefix(ctx_root)
-            .unwrap_or(&path)
-            .to_path_buf();
+        let rel = path.strip_prefix(ctx_root).unwrap_or(&path).to_path_buf();
         if is_ignored(ignore, &rel) {
             continue;
         }
         let dst = dst_root.join(&rel);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            std::fs::create_dir_all(&dst)
-                .with_context(|| format!("mkdir {}", dst.display()))?;
+            std::fs::create_dir_all(&dst).with_context(|| format!("mkdir {}", dst.display()))?;
             copy_tree(ctx_root, &path, dst_root, ignore)?;
         } else if file_type.is_symlink() {
             // Copy the link target's bytes (deref) — buildah contexts are
@@ -582,8 +584,7 @@ fn copy_tree(ctx_root: &Path, dir: &Path, dst_root: &Path, ignore: &DockerIgnore
                         std::fs::create_dir_all(parent).ok();
                     }
                     let _ = std::fs::remove_file(&dst);
-                    symlink(&target, &dst)
-                        .with_context(|| format!("symlink {}", dst.display()))?;
+                    symlink(&target, &dst).with_context(|| format!("symlink {}", dst.display()))?;
                 }
             }
         } else {

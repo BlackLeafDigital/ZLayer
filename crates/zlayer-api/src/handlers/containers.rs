@@ -1249,8 +1249,7 @@ async fn attach_container_to_overlay(
     // Service name for the overlay identity: prefer the human container name,
     // else the runtime service component. This is what overlayd uses for the
     // canonical service-name DNS record.
-    let service_name =
-        container_name.map_or_else(|| container_id.service.clone(), str::to_string);
+    let service_name = container_name.map_or_else(|| container_id.service.clone(), str::to_string);
 
     // Only the in-guest vsock path is reachable from the docker-compat create
     // handler (host-process overlay attach is done by the supervisor, which has
@@ -2142,10 +2141,7 @@ async fn append_deployment_containers(
             view.service.clone(),
         );
         if let Some(ref cn) = view.container_name {
-            labels.insert(
-                "com.docker.compose.container_name".to_string(),
-                cn.clone(),
-            );
+            labels.insert("com.docker.compose.container_name".to_string(), cn.clone());
         }
         results.push(ContainerInfo {
             id: hex_id,

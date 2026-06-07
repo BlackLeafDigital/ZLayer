@@ -803,8 +803,7 @@ pub fn load_project(ctx: &ComposeContextArgs) -> anyhow::Result<LoadedProject> {
     //    run. This is load-bearing: the short-port parser splits on `:`, so an
     //    un-interpolated `${PORT:-3080}:3000` would be truncated at the `:` in
     //    `:-`, leaving a brace-less `${PORT` that fails interpolation.
-    interpolate_yaml_value(&mut value, &env)
-        .context("failed to interpolate compose variables")?;
+    interpolate_yaml_value(&mut value, &env).context("failed to interpolate compose variables")?;
 
     // 3. Deserialize into the typed ComposeFile, then resolve `extends:`.
     let mut compose: ComposeFile =

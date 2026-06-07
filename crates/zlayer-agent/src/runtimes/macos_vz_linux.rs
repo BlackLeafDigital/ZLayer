@@ -108,14 +108,14 @@ use objc2::{AnyThread, ClassType};
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString};
 use objc2_virtualization::{
     VZBootLoader, VZDirectoryShare, VZDirectorySharingDeviceConfiguration,
-    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment,
-    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZMACAddress,
-    VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZPlatformConfiguration,
-    VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
+    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
+    VZLinuxBootLoader, VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
+    VZPlatformConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
+    VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZVirtualMachineState,
 };
 
 // ---------------------------------------------------------------------------
@@ -411,9 +411,7 @@ impl VzLinuxRuntime {
     /// Returns `None` (with a warning) if the registry cannot be opened, so a
     /// missing local store degrades to the cache/S3/origin chain rather than
     /// hard-failing the pull.
-    async fn open_local_registry(
-        &self,
-    ) -> Option<std::sync::Arc<zlayer_registry::LocalRegistry>> {
+    async fn open_local_registry(&self) -> Option<std::sync::Arc<zlayer_registry::LocalRegistry>> {
         let registry_path = self.data_dir.join("registry");
         match zlayer_registry::LocalRegistry::new(registry_path).await {
             Ok(reg) => Some(std::sync::Arc::new(reg)),
@@ -887,9 +885,7 @@ async fn write_image_config_sidecar(
 /// WorkingDir/User. Returns `None` when the sidecar is absent (e.g. a pull that
 /// predates the sidecar) or unparseable — the caller then runs the spec-only
 /// path. A missing/unparseable sidecar is logged at debug, not fatal.
-fn read_image_config_sidecar(
-    rootfs_dir: &std::path::Path,
-) -> Option<zlayer_registry::ImageConfig> {
+fn read_image_config_sidecar(rootfs_dir: &std::path::Path) -> Option<zlayer_registry::ImageConfig> {
     let sidecar = rootfs_dir.parent()?.join("image-config.json");
     let bytes = std::fs::read(&sidecar).ok()?;
     match serde_json::from_slice::<zlayer_registry::ImageConfig>(&bytes) {
@@ -3727,10 +3723,7 @@ mod tests {
                     argv,
                     vec!["docker-entrypoint.sh".to_string(), "postgres".to_string()]
                 );
-                assert!(env.contains(&(
-                    "PATH".to_string(),
-                    "/usr/local/bin:/usr/bin".to_string()
-                )));
+                assert!(env.contains(&("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())));
                 assert_eq!(cwd, Some("/var/lib/postgresql".to_string()));
                 assert_eq!((uid, gid), (70, 70));
             }

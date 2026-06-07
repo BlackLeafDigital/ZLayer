@@ -135,8 +135,7 @@ pub(crate) async fn handle_build(
     let mut context = context;
     #[cfg(target_os = "macos")]
     let mac_sidecar = {
-        let target_is_linux =
-            matches!(cli_target_os, None | Some(ImageOs::Linux));
+        let target_is_linux = matches!(cli_target_os, None | Some(ImageOs::Linux));
         if target_is_linux {
             Some(setup_macos_sidecar(&mut context).await?)
         } else {
@@ -422,9 +421,7 @@ async fn finalize_macos_sidecar(
     let registry_path = data_dir.join("registry");
     let registry = zlayer_registry::LocalRegistry::new(registry_path.clone())
         .await
-        .with_context(|| {
-            format!("opening local registry at {}", registry_path.display())
-        })?;
+        .with_context(|| format!("opening local registry at {}", registry_path.display()))?;
     let cache_path = data_dir.join("cache").join("blobs.redb");
     let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path)
         .await
@@ -438,9 +435,10 @@ async fn finalize_macos_sidecar(
         .context("exporting built image from sidecar")?;
 
     for tag in &result.tags {
-        let info = zlayer_registry::import_image(&registry, &tar, Some(tag.as_str()), Some(&blob_cache))
-            .await
-            .with_context(|| format!("importing '{tag}' into local registry"))?;
+        let info =
+            zlayer_registry::import_image(&registry, &tar, Some(tag.as_str()), Some(&blob_cache))
+                .await
+                .with_context(|| format!("importing '{tag}' into local registry"))?;
         println!("  Imported {tag} (digest {})", info.digest);
     }
 

@@ -175,8 +175,7 @@ pub(crate) fn resolve_entrypoint(spec: &ServiceSpec, image: Option<&ImageConfig>
 /// order, minus any the spec overrides), then spec vars (in spec order).
 pub(crate) fn merge_env(spec: &ServiceSpec, image: Option<&ImageConfig>) -> Vec<(String, String)> {
     // Spec env keys win — collect them first so we can skip image vars they shadow.
-    let spec_keys: std::collections::HashSet<&str> =
-        spec.env.keys().map(String::as_str).collect();
+    let spec_keys: std::collections::HashSet<&str> = spec.env.keys().map(String::as_str).collect();
 
     let mut out: Vec<(String, String)> = Vec::new();
 
@@ -220,15 +219,11 @@ pub(crate) fn resolve_workdir(spec: &ServiceSpec, image: Option<&ImageConfig>) -
 /// is therefore preserved; a NAME-form image user (e.g. `postgres`) currently
 /// degrades to `0:0` — documented limitation, not a silent drop of the field.
 pub(crate) fn resolve_user(spec: &ServiceSpec, image: Option<&ImageConfig>) -> (u32, u32) {
-    let chosen = spec
-        .user
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .or_else(|| {
-            image
-                .and_then(|c| c.user.as_deref())
-                .filter(|u| !u.is_empty())
-        });
+    let chosen = spec.user.as_deref().filter(|u| !u.is_empty()).or_else(|| {
+        image
+            .and_then(|c| c.user.as_deref())
+            .filter(|u| !u.is_empty())
+    });
     parse_user(chosen)
 }
 
@@ -241,7 +236,10 @@ pub(crate) fn parse_user(user: Option<&str>) -> (u32, u32) {
         return (0, 0);
     };
     let mut parts = user.splitn(2, ':');
-    let uid = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let uid = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
     let gid = parts
         .next()
         .and_then(|s| s.parse::<u32>().ok())
@@ -525,14 +523,19 @@ mod tests {
         spec.command.args = Some(vec!["-c".to_string(), "echo hi".to_string()]);
         assert_eq!(
             resolve_entrypoint(&spec, Some(&cfg())),
-            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()]
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string()
+            ]
         );
     }
 
     #[test]
     fn merge_env_layers_image_under_spec() {
         let mut spec = ServiceSpec::minimal("svc", "img");
-        spec.env.insert("PG_MAJOR".to_string(), "override".to_string());
+        spec.env
+            .insert("PG_MAJOR".to_string(), "override".to_string());
         spec.env
             .insert("POSTGRES_PASSWORD".to_string(), "x".to_string());
         let merged = merge_env(&spec, Some(&cfg()));
@@ -558,7 +561,10 @@ mod tests {
             Some("/var/lib/postgresql".to_string())
         );
         spec.command.workdir = Some("/app".to_string());
-        assert_eq!(resolve_workdir(&spec, Some(&cfg())), Some("/app".to_string()));
+        assert_eq!(
+            resolve_workdir(&spec, Some(&cfg())),
+            Some("/app".to_string())
+        );
         // No spec workdir AND no image config -> None (guest defaults to /).
         let bare = ServiceSpec::minimal("svc", "img");
         assert_eq!(resolve_workdir(&bare, None), None);
