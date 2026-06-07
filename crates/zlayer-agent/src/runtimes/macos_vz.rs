@@ -551,8 +551,12 @@ impl Runtime for VzRuntime {
                 reason: format!("open blob cache: {e}"),
             })?;
         let puller = zlayer_registry::ImagePuller::with_cache(cache);
+        // Honor ~/.docker/config.json (AuthConfig default = DockerConfig) so
+        // `zlayer login` creds / Docker Hub auth apply instead of anonymous.
+        let auth =
+            zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
         let layers = puller
-            .pull_image(image, &zlayer_registry::RegistryAuth::Anonymous)
+            .pull_image(image, &auth)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),

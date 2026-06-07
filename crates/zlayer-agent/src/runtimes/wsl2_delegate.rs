@@ -868,7 +868,11 @@ impl Runtime for Wsl2DelegateRuntime {
         // into the distro at `create_container` time.
         let registry_auth = match auth {
             Some(a) => zlayer_registry::RegistryAuth::Basic(a.username.clone(), a.password.clone()),
-            None => zlayer_registry::RegistryAuth::Anonymous,
+            // Honor ~/.docker/config.json (AuthConfig default = DockerConfig) so
+            // `zlayer login` creds / Docker Hub auth apply instead of anonymous.
+            None => {
+                zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image)
+            }
         };
         let cache = zlayer_registry::BlobCache::new().map_err(|e| AgentError::PullFailed {
             image: image.to_string(),

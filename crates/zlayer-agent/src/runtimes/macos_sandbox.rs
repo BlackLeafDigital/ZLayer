@@ -1540,7 +1540,10 @@ impl Runtime for SandboxRuntime {
             })?;
 
         let puller = zlayer_registry::ImagePuller::with_cache(blob_cache);
-        let auth = zlayer_registry::RegistryAuth::Anonymous;
+        // Honor ~/.docker/config.json (AuthConfig default = DockerConfig) so
+        // `zlayer login` creds / Docker Hub auth apply instead of anonymous.
+        let auth =
+            zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
         let layers = puller
             .pull_image(image, &auth)

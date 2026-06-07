@@ -423,9 +423,10 @@ pub async fn create_runtime_for_image(
     image: &str,
     registry: Arc<ImagePuller>,
 ) -> Result<Arc<dyn Runtime + Send + Sync>> {
-    // Use anonymous auth for manifest detection
-    // In production, the caller should configure auth on the registry client
-    let auth = zlayer_registry::RegistryAuth::Anonymous;
+    // Resolve registry auth from ~/.docker/config.json (AuthConfig default =
+    // DockerConfig) for manifest detection, so `zlayer login` creds / Docker Hub
+    // auth apply instead of anonymous (and avoid Docker Hub rate-limits).
+    let auth = zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
     tracing::info!(image = %image, "detecting artifact type for runtime selection");
 
@@ -491,7 +492,9 @@ pub async fn detect_image_artifact_type(
     image: &str,
     registry: Arc<ImagePuller>,
 ) -> Result<zlayer_registry::ArtifactType> {
-    let auth = zlayer_registry::RegistryAuth::Anonymous;
+    // Resolve registry auth from ~/.docker/config.json (AuthConfig default =
+    // DockerConfig) so `zlayer login` creds / Docker Hub auth apply.
+    let auth = zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
     let (artifact_type, _manifest, _digest) = registry
         .detect_artifact_type(image, &auth)
