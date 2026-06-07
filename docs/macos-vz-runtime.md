@@ -204,6 +204,27 @@ Step by step:
    `-p host:container`), so tooling targeting a stable host port reaches the
    guest even though the NAT IP is ephemeral.
 
+   > **Kernel requirement (load-bearing).** The guest only gets `eth0` if the
+   > kernel was built with `CONFIG_NETDEVICES=y` **and** `CONFIG_VIRTIO_NET=y`.
+   > `VIRTIO_NET` lives inside the `if NETDEVICES` block and `NETDEVICES` is
+   > `default y if UML` (→ `n` on arm64), so listing `CONFIG_VIRTIO_NET=y` alone
+   > in the defconfig is silently dropped by `make olddefconfig` — the guest then
+   > boots with only `lo` and no DHCP ever happens. `images/vz-linux/build.sh`
+   > asserts every load-bearing symbol survived `olddefconfig` for exactly this
+   > reason. The in-guest agent picks the NIC by `ARPHRD_ETHER` (`/sys/class/net/
+   > <if>/type == 1`), never the kernel's auto-created `sit0` tunnel.
+5. **overlay (cross-node mesh).** A VZ guest is a full VM with no host
+   netns/PID, so the Linux veth-by-PID overlay attach can't apply. Instead the
+   runtime reports `OverlayAttachKind::InGuestVsock`; the service layer asks
+   overlayd for a **guest-managed** config (`AttachHandle::GuestManaged` →
+   `GuestOverlayConfig`: overlay IP + WireGuard keypair + peer set, with the
+   guest's public key registered in the mesh), and pushes it to the guest as a
+   `proto::Msg::OverlayConfig` over a fresh vsock connection. The in-guest agent
+   brings up a **kernel WireGuard** interface `zl-overlay0` (needs
+   `CONFIG_WIREGUARD=y`) via netlink. `get_container_ip` then prefers the overlay
+   IP over the NAT lease. On macOS the runtime is a `CompositeRuntime`, which
+   forwards `overlay_attach_kind`/`push_overlay_config` to its VZ-Linux delegate.
+
 ### Directory layout
 
 ```text

@@ -8,6 +8,24 @@ ZLayer's v0.51 overlay collapses what used to be a forest of per-service WireGua
 
 Every node always brings up `zl-overlay0`, even when running standalone. On Linux and macOS the data plane is userspace boringtun; on Windows the underlying transport is HCN. The interface holds one cryptographic peer per remote node, and each peer's `AllowedIPs` is rewritten as services come and go: every subnet currently allocated to that remote node (across every service) appears as a CIDR entry. There is no per-service WG device anywhere in the stack.
 
+## VZ-Linux guests (macOS): in-guest attach over vsock
+
+A macOS Apple-Virtualization (VZ) Linux guest is a full VM with no
+host-visible netns/PID, so the veth-by-PID container attach can't reach it.
+For these guests the attach is **guest-managed**: overlayd allocates the
+overlay identity (`AttachHandle::GuestManaged` → `GuestOverlayConfig`: the
+overlay IP, a freshly generated WireGuard keypair, and the current peer set),
+registers the generated public key as a global mesh peer (roaming endpoint —
+the guest is behind VZ NAT, so its source is learned from keepalive traffic),
+and returns the config to the agent. The agent ships it to the guest as a
+`proto::Msg::OverlayConfig` over a vsock control connection, and the in-guest
+init brings up a **kernel WireGuard** `zl-overlay0` (one peer per node, plus
+this node as the relay), assigning the overlay IP and the cluster-CIDR route.
+The guest reaches the rest of the mesh via that node's `zl-overlay0`. See
+[`macos-vz-runtime.md`](macos-vz-runtime.md). (The host-side capability is
+`Runtime::overlay_attach_kind() == InGuestVsock`; `CompositeRuntime` forwards
+it + `push_overlay_config` to its VZ-Linux delegate.)
+
 ## Per-service Linux bridge
 
 On Linux, each service gets its own bridge per node: `br-svc-<hash>`, where the hash is derived from the service name. The bridge holds the L3 gateway address (the first usable IP in the per-(service, node) subnet); containers' veth-host ends are added as bridge members via `netlink::add_link_to_bridge`, and the container's default route points at the bridge gateway. The previous `/32` host-route-per-container scheme is gone.
