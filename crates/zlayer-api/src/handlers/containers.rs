@@ -679,6 +679,29 @@ pub(crate) async fn resolve_container_lookup(
             });
         }
     }
+    drop(g);
+
+    // Fall-back 4: the raw identifier is a deployment container's `ContainerId`
+    // Display string (`{service}-{role}-{replica}-on-{node}` or the legacy
+    // `{service}-rep-{replica}`). Deployment containers live in the
+    // ServiceManager/runtime, NOT the standalone-container map — but the runtime
+    // is the SAME shared instance, so once we recover the `ContainerId` the
+    // logs / inspect / state handlers resolve it directly. The foreground
+    // `zlayer run` path discovers a container via the deployment-scoped
+    // `list_containers` (which emits this Display string) and then streams its
+    // logs through `/api/v1/containers/{id}/logs` — without this fallback that
+    // id resolves to nothing here and the run path 404s even though the
+    // container is up. Verify the runtime actually knows it (don't resolve a
+    // bogus string into a phantom container).
+    if let Some(cid) = ContainerId::parse_display(raw) {
+        if state.runtime.container_state(&cid).await.is_ok() {
+            let storage_key = raw.to_string();
+            return Some(ResolvedContainer {
+                container_id: cid,
+                storage_key,
+            });
+        }
+    }
     None
 }
 

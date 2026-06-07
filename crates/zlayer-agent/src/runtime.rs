@@ -127,6 +127,44 @@ impl ContainerId {
     pub fn is_legacy_shape(&self) -> bool {
         self.role == "default" && self.node_id == 0
     }
+
+    /// Parse a `ContainerId` back from its [`Display`](std::fmt::Display) form.
+    ///
+    /// This is the exact inverse of `Display`:
+    /// - `"{service}-rep-{replica}"` (legacy shape) → `ContainerId::new`.
+    /// - `"{service}-{role}-{replica}-on-{node_id}"` (cluster shape) →
+    ///   `ContainerId::with_role_and_node`.
+    ///
+    /// The service name may itself contain `-`, so parsing anchors on the
+    /// rightmost structural markers (`-on-` then the trailing `-rep-`/`-{role}-`
+    /// segment) rather than splitting left-to-right. Returns `None` for any
+    /// string that does not match either shape (e.g. a hex id or a bare name).
+    #[must_use]
+    pub fn parse_display(s: &str) -> Option<Self> {
+        // Cluster shape: `{service}-{role}-{replica}-on-{node_id}`.
+        if let Some((head, node_str)) = s.rsplit_once("-on-") {
+            let node_id: u64 = node_str.parse().ok()?;
+            // `head` = `{service}-{role}-{replica}`. The replica is the last
+            // `-`-segment; the role is the segment before it; everything left
+            // of that is the (possibly hyphenated) service.
+            let (service_role, replica_str) = head.rsplit_once('-')?;
+            let replica: u32 = replica_str.parse().ok()?;
+            let (service, role) = service_role.rsplit_once('-')?;
+            if service.is_empty() || role.is_empty() {
+                return None;
+            }
+            return Some(Self::with_role_and_node(service, replica, role, node_id));
+        }
+        // Legacy shape: `{service}-rep-{replica}`.
+        if let Some((service, replica_str)) = s.rsplit_once("-rep-") {
+            let replica: u32 = replica_str.parse().ok()?;
+            if service.is_empty() {
+                return None;
+            }
+            return Some(Self::new(service, replica));
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for ContainerId {
@@ -2255,6 +2293,49 @@ mod tests {
 
         let state = runtime.container_state(&id).await.unwrap();
         assert_eq!(state, ContainerState::Running);
+    }
+
+    #[test]
+    fn parse_display_round_trips_cluster_shape() {
+        // The exact id the deployment-run path surfaces: service=alpine,
+        // role=default, replica=1, node_id=1 → `alpine-default-1-on-1`.
+        let cid = ContainerId::with_role_and_node("alpine", 1, "default", 1);
+        let s = cid.to_string();
+        assert_eq!(s, "alpine-default-1-on-1");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_round_trips_legacy_shape() {
+        let cid = ContainerId::new("alpine", 3);
+        let s = cid.to_string();
+        assert_eq!(s, "alpine-rep-3");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_handles_hyphenated_service() {
+        // A service name containing `-` must round-trip: the parser anchors on
+        // the rightmost structural markers, not a left-to-right split.
+        let cid = ContainerId::with_role_and_node("my-web-app", 2, "read", 7);
+        let s = cid.to_string();
+        assert_eq!(s, "my-web-app-read-2-on-7");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_rejects_non_ids() {
+        // A 64-char hex id, a bare name, and obvious garbage must not parse.
+        assert_eq!(ContainerId::parse_display("alpine"), None);
+        assert_eq!(
+            ContainerId::parse_display(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ),
+            None
+        );
+        assert_eq!(ContainerId::parse_display("alpine-default-x-on-1"), None);
+        assert_eq!(ContainerId::parse_display("alpine-default-1-on-y"), None);
+        assert_eq!(ContainerId::parse_display(""), None);
     }
 
     #[test]

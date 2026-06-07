@@ -338,7 +338,28 @@ impl ContainerSupervisor {
         container_id: &ContainerId,
         panic_action: PanicAction,
     ) -> Result<()> {
-        let state = self.runtime.container_state(container_id).await?;
+        // A supervised container the runtime doesn't (yet) know about is a
+        // registration race — not a health failure. The supervisor is told to
+        // `supervise()` a replica as soon as `scale_to` is invoked, which can
+        // land a poll BEFORE the runtime's `create_container` has inserted the
+        // record (or AFTER an auto-remove `--rm` teardown has dropped it).
+        // Treating that `NotFound` as a hard error aborts the entire
+        // `check_all_containers` cycle (every other container goes unchecked)
+        // and spams `error!`. Skip this round for that container instead; the
+        // next poll picks it up once the record exists, and `unsupervise` (on
+        // teardown) removes it for good.
+        let state = match self.runtime.container_state(container_id).await {
+            Ok(state) => state,
+            Err(AgentError::NotFound { .. }) => {
+                tracing::debug!(
+                    container = %container_id,
+                    "supervised container not yet known to runtime (registration race); \
+                     skipping this health-check round"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         match state {
             ContainerState::Running

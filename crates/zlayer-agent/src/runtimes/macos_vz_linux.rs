@@ -157,6 +157,18 @@ pub(crate) struct RunOutcome {
     terminal: Mutex<Option<ContainerState>>,
 }
 
+/// Carried state for the `logs_stream` follow loop
+/// ([`VzLinuxRuntime::logs_stream`]). Threaded through `stream::unfold` so each
+/// poll can re-read the growing [`RunOutcome::logs`] buffer without borrowing
+/// the runtime. `next` is the offset into that workload buffer already emitted;
+/// `done` latches once the workload is terminal and the buffer is fully drained.
+struct LogFollowState {
+    containers: Arc<RwLock<HashMap<String, VzLinuxContainer>>>,
+    dir_name: String,
+    next: usize,
+    done: bool,
+}
+
 /// Per-container state for a VZ Linux guest.
 ///
 /// `kernel` is populated by [`start_container`](VzLinuxRuntime::start_container)
@@ -2396,56 +2408,177 @@ impl Runtime for VzLinuxRuntime {
         self.captured_logs(id, 1000).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn logs_stream(&self, id: &ContainerId, opts: LogsStreamOptions) -> Result<LogsStream> {
-        use futures_util::stream;
+        use futures_util::{stream, StreamExt as _};
 
         // VZ-Linux captures the workload's stdout/stderr (plus the guest serial
-        // console) into a buffer drained over vsock; there is no live tail
-        // device. We snapshot the captured logs at call time and yield them as
-        // a bounded NDJSON-able stream. This is enough for the non-follow
-        // `GET /containers/{id}/logs` path (and the Docker-compat shim's
-        // one-shot logs), which is what the default-`Unsupported` impl used to
-        // 500 on. `follow=true` simply replays the current buffer and ends —
-        // VZ has no notification primitive to block on for new lines.
-        let tail = opts
-            .tail
-            .map_or(1000, |n| usize::try_from(n).unwrap_or(1000));
-        let entries = self.captured_logs(id, tail).await?;
-
+        // console) into an append-only buffer drained over vsock; there is no
+        // live tail device. Both the guest `console.log` and the
+        // [`RunOutcome::logs`] workload buffer only ever GROW, so we can follow
+        // them by re-merging and emitting the lines past a running offset.
+        //
         // Honour the per-channel filters when either is explicitly requested;
         // Docker's default (neither set) means "both".
         let want_stdout = opts.stdout || !opts.stderr;
         let want_stderr = opts.stderr || !opts.stdout;
+        let with_ts = opts.timestamps;
 
-        let chunks: Vec<Result<LogChunk>> = entries
+        // Convert a `LogEntry` into a `LogChunk`, applying the channel filter.
+        let to_chunk = move |e: LogEntry| -> Option<Result<LogChunk>> {
+            let channel = match e.stream {
+                LogStream::Stdout => LogChannel::Stdout,
+                LogStream::Stderr => LogChannel::Stderr,
+            };
+            let keep = match channel {
+                LogChannel::Stdout => want_stdout,
+                LogChannel::Stderr => want_stderr,
+                LogChannel::Stdin => false,
+            };
+            if !keep {
+                return None;
+            }
+            // Re-attach the newline the line-splitter stripped so a consumer
+            // that concatenates chunks reconstructs the original output.
+            let mut bytes = e.message.into_bytes();
+            bytes.push(b'\n');
+            Some(Ok(LogChunk {
+                stream: channel,
+                bytes: bytes::Bytes::from(bytes),
+                timestamp: with_ts.then_some(e.timestamp),
+            }))
+        };
+
+        // ---- Non-follow: one-shot snapshot honouring `tail`. ----
+        if !opts.follow {
+            let tail = opts
+                .tail
+                .map_or(1000, |n| usize::try_from(n).unwrap_or(1000));
+            let entries = self.captured_logs(id, tail).await?;
+            let chunks: Vec<Result<LogChunk>> = entries.into_iter().filter_map(to_chunk).collect();
+            return Ok(Box::pin(stream::iter(chunks)));
+        }
+
+        // ---- Follow: emit the initial `tail` snapshot, then poll the
+        // append-only merged buffer for new lines until the workload reaches a
+        // terminal state (and one final drain after, to catch the lines that
+        // arrived alongside the `Exited` frame). This is what the foreground
+        // `zlayer run` path relies on: without a real follow the stream ended
+        // mid-boot and the run "completed" before `echo` ever ran. ----
+
+        // Snapshot the full merged log once to seed the initial emit. The merged
+        // snapshot is `console.log` (kernel/boot serial output) ++ the
+        // `RunOutcome::logs` workload buffer captured SO FAR. We emit the last
+        // `tail` of it, then the follow loop tracks ONLY the workload buffer's
+        // growth.
+        //
+        // The follow offset MUST be seeded from the workload buffer's length at
+        // snapshot time — NOT the merged total. The two live in different index
+        // spaces (the merged list interleaves the console, which the follow loop
+        // does not re-read); seeding the follow cursor with the merged total
+        // makes `next` (e.g. 12, counting boot console lines) overshoot the
+        // workload buffer's real length (e.g. 0), so the follow loop never emits
+        // the workload's stdout (`HELLO_FROM_GUEST` / `uname -m`) even though it
+        // arrives. Seed from the buffer's own length so we resume exactly where
+        // the snapshot left off and emit each subsequent workload line once.
+        let dir_name = Self::container_dir_name(id);
+        // Read the workload-buffer length BEFORE the merged snapshot so a line
+        // that appears between the two reads is re-emitted by the follow loop
+        // rather than dropped (at worst a duplicate, never a gap).
+        let workload_seen = {
+            let guard = self.containers.read().await;
+            guard
+                .get(&dir_name)
+                .and_then(|c| c.outcome.logs.lock().ok().map(|b| b.len()))
+                .unwrap_or(0)
+        };
+        let full = self.captured_logs(id, usize::MAX).await?;
+        let total = full.len();
+        let tail = opts
+            .tail
+            .map_or(total, |n| usize::try_from(n).unwrap_or(total));
+        let seed_start = total.saturating_sub(tail);
+        let initial: Vec<Result<LogChunk>> = full
             .into_iter()
-            .filter_map(|e| {
-                let channel = match e.stream {
-                    LogStream::Stdout => LogChannel::Stdout,
-                    LogStream::Stderr => LogChannel::Stderr,
-                };
-                let keep = match channel {
-                    LogChannel::Stdout => want_stdout,
-                    LogChannel::Stderr => want_stderr,
-                    LogChannel::Stdin => false,
-                };
-                if !keep {
-                    return None;
-                }
-                // Re-attach the newline the line-splitter stripped so a
-                // consumer that concatenates chunks reconstructs the original
-                // output.
-                let mut bytes = e.message.into_bytes();
-                bytes.push(b'\n');
-                Some(Ok(LogChunk {
-                    stream: channel,
-                    bytes: bytes::Bytes::from(bytes),
-                    timestamp: opts.timestamps.then_some(e.timestamp),
-                }))
-            })
+            .skip(seed_start)
+            .filter_map(to_chunk)
             .collect();
 
-        Ok(Box::pin(stream::iter(chunks)))
+        // The follow loop closes over a clone of the containers map and the
+        // container id so it can re-read the growing workload buffer without
+        // borrowing `self`. State: (next offset into `RunOutcome::logs`, whether
+        // we've done the final post-terminal drain).
+        let containers = Arc::clone(&self.containers);
+
+        let seed_state = LogFollowState {
+            containers,
+            dir_name,
+            next: workload_seen,
+            done: false,
+        };
+
+        let follow = stream::unfold(seed_state, move |mut st| {
+            // `to_chunk` is a `Copy` closure (captures only flags), so it is
+            // freely usable in each iteration without an explicit clone.
+            async move {
+                loop {
+                    if st.done {
+                        return None;
+                    }
+
+                    // Re-read the workload buffer + terminal flag. The console
+                    // (kernel/boot) output is captured up front in the initial
+                    // snapshot; live follow tracks the vsock workload buffer,
+                    // which is the stdout/stderr callers actually want.
+                    let (entries, terminal): (Vec<LogEntry>, bool) = {
+                        let guard = st.containers.read().await;
+                        match guard.get(&st.dir_name) {
+                            Some(c) => {
+                                let entries =
+                                    c.outcome.logs.lock().map(|b| b.clone()).unwrap_or_default();
+                                let terminal = c
+                                    .outcome
+                                    .terminal
+                                    .lock()
+                                    .ok()
+                                    .and_then(|t| t.clone())
+                                    .is_some()
+                                    || c.outcome.exit_code.lock().ok().and_then(|g| *g).is_some();
+                                (entries, terminal)
+                            }
+                            // Container removed (e.g. `--rm` teardown): end the
+                            // stream cleanly.
+                            None => return None,
+                        }
+                    };
+
+                    if st.next < entries.len() {
+                        // Emit the next not-yet-seen line.
+                        let entry = entries[st.next].clone();
+                        st.next += 1;
+                        if let Some(chunk) = to_chunk(entry) {
+                            return Some((chunk, st));
+                        }
+                        // Filtered out (wrong channel): keep scanning without
+                        // sleeping.
+                        continue;
+                    }
+
+                    // No new lines. If the workload is terminal AND we've
+                    // drained everything, do one last pass next iteration then
+                    // stop.
+                    if terminal {
+                        st.done = true;
+                        return None;
+                    }
+
+                    // Still running, nothing new yet — poll again shortly.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+
+        Ok(Box::pin(stream::iter(initial).chain(follow)))
     }
 
     async fn get_container_pid(&self, _id: &ContainerId) -> Result<Option<u32>> {

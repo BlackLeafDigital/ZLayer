@@ -237,7 +237,18 @@ pub(crate) async fn handle_container_run(args: &crate::cli::RunArgs) -> Result<(
     // `--rm` => auto-remove on exit. `build_deployment_spec` only warns on
     // `--rm` (no native analogue in the docker shim path), so set the
     // lifecycle flag explicitly here.
-    if rm {
+    //
+    // BUT only for DETACHED runs. For a FOREGROUND run the client streams the
+    // container's logs to completion and then reads its exit code via
+    // `wait_container`; if the runtime auto-removes the container the instant
+    // the workload exits (which for a fast `echo` is ~tens of ms — long before
+    // the client's poll loop has even opened the log stream), the captured
+    // output AND the exit code are gone before they can be consumed, and the
+    // run prints only the boot console with no workload output. Docker's own
+    // `run --rm` (foreground) streams first, THEN removes. So we mirror that:
+    // leave `delete_on_exit` unset for foreground and tear the deployment down
+    // client-side once `stream_until_exit` / `attach_interactive` returns.
+    if rm && detach {
         if let Some(service) = spec.services.values_mut().next() {
             service.lifecycle.delete_on_exit = true;
         }
@@ -274,16 +285,28 @@ pub(crate) async fn handle_container_run(args: &crate::cli::RunArgs) -> Result<(
         return Ok(());
     }
 
-    if want_attach {
+    let stream_result = if want_attach {
         // `-it`: raw-mode TTY attach. Stdin forwarding into the container is
         // a later pass — see `attach_interactive` in zlayer-docker.
-        attach_interactive(&client, &deployment_name, &service_name).await?;
+        attach_interactive(&client, &deployment_name, &service_name).await
     } else {
         // Foreground non-TTY: stream logs to completion, propagate exit code.
-        stream_until_exit(&client, &deployment_name, &service_name).await?;
+        stream_until_exit(&client, &deployment_name, &service_name).await
+    };
+
+    // `--rm` for a foreground run is honoured client-side AFTER the stream has
+    // drained the workload's output and read its exit code (see the
+    // `delete_on_exit` comment above): tear the deployment down now. Run this
+    // even when the stream returned an error (a non-zero exit is reported as an
+    // `Err` by `stream_until_exit`) so `--rm` still cleans up on failure, then
+    // propagate the original stream result.
+    if rm && !detach {
+        if let Err(e) = client.delete_deployment(&deployment_name).await {
+            debug!(error = %e, deployment = %deployment_name, "foreground --rm teardown failed");
+        }
     }
 
-    Ok(())
+    stream_result
 }
 
 /// Run a local command with secrets injected as env vars (no container).
