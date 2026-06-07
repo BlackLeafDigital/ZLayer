@@ -34,3 +34,7 @@ clients/typescript-client/dist/
 
 # Agent iteration logs (scripts/iterate-fix.sh)
 .iter/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
