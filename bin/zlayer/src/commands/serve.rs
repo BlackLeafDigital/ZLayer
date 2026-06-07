@@ -2778,14 +2778,28 @@ pub(crate) async fn serve_with_external_shutdown(
         // handlers and event subscribers share the broadcast bus. The
         // bridge-network state is threaded in so `CreateContainerRequest.networks`
         // can attach freshly-created containers to user-defined networks.
-        let container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
-            .with_shared_event_bus(event_bus.clone())
-            .with_bridge_networks(bridge_network_state)
-            .with_standalone_storage(bundle.standalone_containers.clone())
-            .with_compose_storage(bundle.compose_projects.clone())
-            .with_cluster(cluster_handle.clone())
-            .with_internal_token(internal_token.clone())
-            .with_service_manager(Arc::clone(&container_service_manager));
+        let mut container_state =
+            ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
+                .with_shared_event_bus(event_bus.clone())
+                .with_bridge_networks(bridge_network_state)
+                .with_standalone_storage(bundle.standalone_containers.clone())
+                .with_compose_storage(bundle.compose_projects.clone())
+                .with_cluster(cluster_handle.clone())
+                .with_internal_token(internal_token.clone())
+                .with_service_manager(Arc::clone(&container_service_manager));
+
+        // Wire the overlay manager + overlay DNS so the container-create handler
+        // can satisfy user-defined network attachments via the encrypted overlay
+        // on hosts with no Docker bridge-network runtime (macOS VZ-Linux). This
+        // is what lets a ZArcRunner job container get a `zl-overlay0` IP and reach
+        // the runner's cache server (e.g. http://10.200.0.1:...), Forgejo, and
+        // sibling containers — instead of 500ing on the missing bridge runtime.
+        if let Some(om) = overlay.as_ref() {
+            container_state = container_state.with_overlay_manager(Arc::clone(om));
+        }
+        if let Some(d) = dns.as_ref() {
+            container_state = container_state.with_dns_server(Arc::clone(d));
+        }
 
         // Repopulate the in-memory standalone-container cache from disk so
         // create / list / inspect / delete handlers see records that survived a

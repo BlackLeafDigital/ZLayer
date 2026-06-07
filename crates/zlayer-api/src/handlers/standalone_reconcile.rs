@@ -368,6 +368,8 @@ mod tests {
             internal_token: None,
             http_client: reqwest::Client::new(),
             service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 

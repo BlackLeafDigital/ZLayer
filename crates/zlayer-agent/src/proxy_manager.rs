@@ -132,6 +132,21 @@ pub struct ProxyManager {
     /// Active loopback UDP listeners keyed by published port. See
     /// [`Self::loopback_tcp`].
     loopback_udp: RwLock<HashMap<u16, tokio::task::JoinHandle<()>>>,
+    /// Background TCP health-check task for the L7 load balancer. Periodically
+    /// TCP-connects to every registered backend and flips its health status,
+    /// so a backend that was marked unhealthy by a transient request-path
+    /// failure (e.g. the overlay momentarily reconfiguring while sibling
+    /// containers churn during a CI build) AUTO-RECOVERS once it answers
+    /// connects again. Without this the L7 LB had no recovery path of its own
+    /// and a single transient blip left a service stuck on "no healthy
+    /// backends" until a daemon restart. Aborted on drop.
+    lb_health_checker: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProxyManager {
+    fn drop(&mut self) {
+        self.lb_health_checker.abort();
+    }
 }
 
 impl ProxyManager {
@@ -143,6 +158,14 @@ impl ProxyManager {
         cert_manager: Option<Arc<CertManager>>,
     ) -> Self {
         let load_balancer = Arc::new(LoadBalancer::new());
+
+        // Spawn the L7 load balancer's own TCP health checker so unhealthy
+        // backends auto-recover. Probe every 5s with a 2s per-probe timeout:
+        // fast enough that a transient blip during a CI build (sibling
+        // containers churning the overlay) clears well within a single e2e
+        // step, without hammering backends.
+        let lb_health_checker = load_balancer
+            .spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
 
         Self {
             config,
@@ -159,6 +182,7 @@ impl ProxyManager {
             loopback_registry: Arc::new(StreamRegistry::new()),
             loopback_tcp: RwLock::new(HashMap::new()),
             loopback_udp: RwLock::new(HashMap::new()),
+            lb_health_checker,
         }
     }
 

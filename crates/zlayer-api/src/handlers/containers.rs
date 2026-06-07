@@ -146,6 +146,23 @@ pub struct ContainerApiState {
     /// manager, `runtime.exec(...)` drives the right container. `None` in
     /// read-only / test states that have no manager.
     pub service_manager: Option<Arc<RwLock<zlayer_agent::ServiceManager>>>,
+    /// Optional overlay manager. Populated by the daemon when the encrypted
+    /// `WireGuard` overlay is active. On hosts where there is no Docker
+    /// bridge-network runtime (notably macOS VZ-Linux), this is the mechanism
+    /// used to satisfy `CreateContainerRequest::networks` attachments: instead
+    /// of failing, the create handler attaches the standalone container to the
+    /// overlay (allocating an overlay IP via overlayd) so the container can
+    /// reach the node overlay IP (e.g. the CI runner's cache server at
+    /// `10.200.0.1`), sibling containers, and overlay DNS. `None` on daemons
+    /// with no overlay.
+    pub overlay_manager: Option<Arc<RwLock<zlayer_agent::OverlayManager>>>,
+    /// Optional overlay DNS authority. Populated alongside
+    /// [`Self::overlay_manager`]; lets the overlay-attach path register the
+    /// requested user-defined network name(s) + the container name as A
+    /// records pointing at the container's overlay IP, so sibling containers
+    /// resolve each other by name (mirroring the bare-service-name DNS the
+    /// deployment supervisor registers). `None` when no overlay DNS is running.
+    pub dns_server: Option<Arc<zlayer_overlay::DnsServer>>,
 }
 
 /// Metadata for a standalone container (not managed by a deployment)
@@ -195,6 +212,8 @@ impl ContainerApiState {
             internal_token: None,
             http_client: reqwest::Client::new(),
             service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -217,6 +236,8 @@ impl ContainerApiState {
             internal_token: None,
             http_client: reqwest::Client::new(),
             service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -243,6 +264,8 @@ impl ContainerApiState {
             internal_token: None,
             http_client: reqwest::Client::new(),
             service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -324,6 +347,27 @@ impl ContainerApiState {
         service_manager: Arc<RwLock<zlayer_agent::ServiceManager>>,
     ) -> Self {
         self.service_manager = Some(service_manager);
+        self
+    }
+
+    /// Attach the overlay manager so the container-create handler can fall back
+    /// to overlay attachment when there is no Docker bridge-network runtime
+    /// (e.g. macOS VZ-Linux). See [`Self::overlay_manager`].
+    #[must_use]
+    pub fn with_overlay_manager(
+        mut self,
+        overlay_manager: Arc<RwLock<zlayer_agent::OverlayManager>>,
+    ) -> Self {
+        self.overlay_manager = Some(overlay_manager);
+        self
+    }
+
+    /// Attach the overlay DNS authority so the overlay-attach fallback can
+    /// register the requested network name(s) + container name as A records.
+    /// See [`Self::dns_server`].
+    #[must_use]
+    pub fn with_dns_server(mut self, dns_server: Arc<zlayer_overlay::DnsServer>) -> Self {
+        self.dns_server = Some(dns_server);
         self
     }
 
@@ -1117,6 +1161,180 @@ fn runtime_container_name(id: &ContainerId) -> String {
     format!("zlayer-{}-{}", id.service, id.replica)
 }
 
+/// How the create handler will satisfy a request's `networks` attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkAttachMode {
+    /// No attachment to perform (empty request, or no mechanism available so
+    /// we degrade to a no-network create).
+    None,
+    /// Attach via the Docker bridge-network runtime (bollard).
+    Bridge,
+    /// Attach to the encrypted `WireGuard` overlay (macOS VZ-Linux / bridgeless
+    /// overlay hosts).
+    Overlay,
+}
+
+/// True when a real Docker bridge-network runtime is wired into the registry.
+///
+/// The registry can exist in metadata-only mode (`runtime: None`) on hosts
+/// where Docker was unreachable at boot — notably macOS, which has no Docker
+/// daemon at all. In that case bridge attachment is impossible and the create
+/// handler routes to the overlay (or no-network) path instead of 500ing.
+fn has_bridge_runtime(registry: Option<&BridgeNetworkApiState>) -> bool {
+    registry.is_some_and(|r| r.runtime.is_some())
+}
+
+/// Structural-only validation of network attachments, used by the overlay
+/// path: the requested network does not have to pre-exist (overlay membership
+/// is a single flat mesh), but the `network` name must be non-empty and any
+/// `ipv4_address` must parse.
+fn validate_network_attachments_structural(attachments: &[NetworkAttachmentRequest]) -> Result<()> {
+    for attach in attachments {
+        if attach.network.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "network attachment entry has empty 'network' field".to_string(),
+            ));
+        }
+        if let Some(ip) = attach.ipv4_address.as_deref() {
+            ip.parse::<std::net::Ipv4Addr>().map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "network attachment for '{}': invalid ipv4_address '{ip}': {e}",
+                    attach.network
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Attach a started standalone container to the encrypted `WireGuard` overlay,
+/// mapping the requested user-defined network(s) onto the flat overlay mesh.
+///
+/// This mirrors the deployment supervisor's overlay-attach path
+/// (`zlayer_agent::service::ServiceInstance::scale_to`): for a VM-guest runtime
+/// (`OverlayAttachKind::InGuestVsock`, i.e. macOS VZ-Linux) it asks overlayd to
+/// allocate the overlay identity (keypair + address + peer set), pushes that
+/// config into the guest over vsock, and registers DNS so siblings resolve each
+/// other by name. The result is the container gets a `zl-overlay0` IP and can
+/// reach the node overlay IP (e.g. the CI runner's cache server at
+/// `10.200.0.1`), Forgejo, and any sibling job containers.
+///
+/// Unlike the bridge path there is no per-network endpoint: the overlay is one
+/// flat mesh. The requested user-defined network name(s) + any aliases + the
+/// container's own name are therefore registered purely as overlay-DNS A
+/// records pointing at the single overlay IP, so name-based discovery still
+/// works (e.g. a service reaching the executor by its `runner` alias).
+///
+/// # Errors
+/// Returns an error if no overlay manager is configured, if overlayd cannot
+/// allocate/push the guest config, or if the runtime is not a guest-managed
+/// (vsock) runtime (overlay attachment for host-process runtimes is handled by
+/// the deployment supervisor via veth+netns and is not reachable here).
+async fn attach_container_to_overlay(
+    state: &ContainerApiState,
+    container_id: &ContainerId,
+    container_name: Option<&str>,
+    attachments: &[NetworkAttachmentRequest],
+) -> Result<()> {
+    let Some(overlay) = state.overlay_manager.as_ref() else {
+        return Err(ApiError::Internal(
+            "overlay attachment requested but no overlay manager is configured".to_string(),
+        ));
+    };
+
+    // The overlay scopes its allocation by the container id string; use the
+    // same `service-replica` handle the runtime + supervisor use so a later
+    // teardown can release it.
+    let cid = container_id.to_string();
+    // Service name for the overlay identity: prefer the human container name,
+    // else the runtime service component. This is what overlayd uses for the
+    // canonical service-name DNS record.
+    let service_name =
+        container_name.map_or_else(|| container_id.service.clone(), str::to_string);
+
+    // Only the in-guest vsock path is reachable from the docker-compat create
+    // handler (host-process overlay attach is done by the supervisor, which has
+    // the PID). Guard explicitly so a misconfigured host fails loudly.
+    if state.runtime.overlay_attach_kind() != zlayer_agent::runtime::OverlayAttachKind::InGuestVsock
+    {
+        return Err(ApiError::Internal(format!(
+            "overlay attachment for standalone container requested but runtime \
+             attach kind is {:?}, not InGuestVsock; cannot attach over vsock",
+            state.runtime.overlay_attach_kind()
+        )));
+    }
+
+    let overlay_guard = overlay.read().await;
+    let cfg = overlay_guard
+        .attach_container_guest(&cid, &service_name, true)
+        .await
+        .map_err(|e| ApiError::Internal(format!("overlayd guest allocation failed: {e}")))?;
+    let overlay_ip = cfg.overlay_ip;
+
+    if let Err(e) = state.runtime.push_overlay_config(container_id, &cfg).await {
+        // Roll back the overlayd allocation so we don't leak an IP/peer.
+        if let Err(de) = overlay_guard.detach_container_guest(&cid).await {
+            tracing::warn!(
+                container = %container_id,
+                error = %de,
+                "failed to roll back guest overlay allocation after push failure"
+            );
+        }
+        return Err(ApiError::Internal(format!(
+            "failed to push overlay config into guest: {e}"
+        )));
+    }
+    drop(overlay_guard);
+
+    tracing::info!(
+        container = %container_id,
+        overlay_ip = %overlay_ip,
+        "attached standalone container to overlay (docker-network -> overlay mapping)"
+    );
+
+    // Register overlay-DNS A records so name-based discovery works. We register:
+    //   * the container's own name + the runtime service name (so siblings can
+    //     reach it the way the deployment supervisor registers bare names),
+    //   * every requested user-defined network name (docker maps the network
+    //     to a resolvable scope; on the flat overlay we approximate that by
+    //     making the name resolve to this container — sufficient for the
+    //     single-attached-container discovery the runner relies on),
+    //   * every requested alias.
+    if let Some(dns) = state.dns_server.as_ref() {
+        let mut names: Vec<String> = vec![service_name.clone()];
+        if let Some(n) = container_name {
+            if n != service_name {
+                names.push(n.to_string());
+            }
+        }
+        for attach in attachments {
+            names.push(attach.network.clone());
+            for alias in &attach.aliases {
+                names.push(alias.clone());
+            }
+        }
+        for name in names {
+            if name.trim().is_empty() {
+                continue;
+            }
+            match dns.add_record(&name, overlay_ip).await {
+                Ok(()) => tracing::debug!(
+                    hostname = %name,
+                    ip = %overlay_ip,
+                    "registered overlay DNS record for standalone container"
+                ),
+                Err(e) => tracing::warn!(
+                    hostname = %name,
+                    error = %e,
+                    "failed to register overlay DNS record"
+                ),
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate the `networks` field of a [`CreateContainerRequest`] up-front.
 ///
 /// Checks that:
@@ -1528,13 +1746,46 @@ async fn create_container_local(
         }
     }
 
-    // Pre-validate bridge-network attachments: every referenced network must
-    // already exist in the registry (if attached) and any static IPv4 must
-    // parse. We do this up-front — before the image pull — so we fail fast
-    // without side effects when the request is malformed.
-    if !request.networks.is_empty() {
+    // Decide HOW we will satisfy any requested network attachments, and
+    // pre-validate accordingly — before the image pull — so a malformed
+    // request fails fast without side effects.
+    //
+    // Three modes:
+    //   * `Bridge`  — a Docker bridge-network runtime is wired in; validate the
+    //                 referenced networks against the bridge registry and attach
+    //                 via bollard after start (the historical behaviour).
+    //   * `Overlay` — no bridge runtime, but the daemon has the encrypted
+    //                 WireGuard overlay (macOS VZ-Linux). Map the requested
+    //                 user-defined network(s) onto the overlay: the container
+    //                 gets a `zl-overlay0` IP and overlay-DNS records so it can
+    //                 reach the node overlay IP (e.g. the CI runner cache at
+    //                 10.200.0.1), sibling containers, and resolve names.
+    //   * `None`    — neither is available. Succeed the create WITHOUT the
+    //                 network (so callers' documented "network failed -> no-
+    //                 network fallback" can engage) rather than hard-500.
+    let network_mode = if request.networks.is_empty() {
+        NetworkAttachMode::None
+    } else if has_bridge_runtime(state.bridge_networks.as_ref()) {
         validate_network_attachments(&request.networks, state.bridge_networks.as_ref())?;
-    }
+        NetworkAttachMode::Bridge
+    } else if state.overlay_manager.is_some() {
+        // Overlay mode: only structural validation (non-empty network names +
+        // parseable static IPv4). We don't require the network to pre-exist —
+        // overlay membership is a single flat mesh, so the requested
+        // user-defined network name is just registered as a DNS alias.
+        validate_network_attachments_structural(&request.networks)?;
+        NetworkAttachMode::Overlay
+    } else {
+        // No bridge runtime AND no overlay: degrade to no-network instead of
+        // erroring, so the caller's no-network fallback path engages.
+        tracing::warn!(
+            networks = ?request.networks.iter().map(|n| &n.network).collect::<Vec<_>>(),
+            "container requested user-defined network attachment but daemon has \
+             neither a bridge-network runtime nor an overlay; creating WITHOUT \
+             network attachment"
+        );
+        NetworkAttachMode::None
+    };
 
     let (id_str, container_id) = generate_container_id(request.name.as_deref());
     let mut spec = build_service_spec(&request)?;
@@ -1610,20 +1861,48 @@ async fn create_container_local(
                 ApiError::Internal(format!("Failed to start container: {e}"))
             })?;
 
-        // Attach the container to any user-defined bridge networks requested in
-        // the body. We do this AFTER the container is started so Docker has a
-        // concrete container to wire an endpoint up to. If any attachment fails,
-        // best-effort roll back already-completed attachments and stop/remove
-        // the container before returning the error.
-        if !request.networks.is_empty() {
-            attach_container_to_networks(
-                state.bridge_networks.as_ref(),
-                &state.runtime,
-                &container_id,
-                request.name.as_deref(),
-                &request.networks,
-            )
-            .await?;
+        // Attach the container to any user-defined networks requested in the
+        // body. We do this AFTER the container is started so we have a concrete,
+        // running container (bollard needs a live endpoint; the overlay path
+        // needs a booted guest to push the WireGuard config into over vsock).
+        match network_mode {
+            NetworkAttachMode::Bridge => {
+                // If any attachment fails, best-effort roll back already-
+                // completed attachments and stop/remove the container.
+                attach_container_to_networks(
+                    state.bridge_networks.as_ref(),
+                    &state.runtime,
+                    &container_id,
+                    request.name.as_deref(),
+                    &request.networks,
+                )
+                .await?;
+            }
+            NetworkAttachMode::Overlay => {
+                // macOS VZ-Linux (and any bridgeless overlay host): map the
+                // requested user-defined network(s) onto the overlay so the
+                // container gets a `zl-overlay0` IP + DNS records.
+                if let Err(e) = attach_container_to_overlay(
+                    state,
+                    &container_id,
+                    request.name.as_deref(),
+                    &request.networks,
+                )
+                .await
+                {
+                    // Best-effort cleanup, then surface the error: the runner's
+                    // no-network fallback only engages when CREATE itself fails,
+                    // so failing here is the correct signal.
+                    let rt = state.runtime.clone();
+                    let cid = container_id.clone();
+                    tokio::spawn(async move {
+                        let _ = rt.stop_container(&cid, Duration::from_secs(5)).await;
+                        let _ = rt.remove_container(&cid).await;
+                    });
+                    return Err(e);
+                }
+            }
+            NetworkAttachMode::None => {}
         }
     }
 

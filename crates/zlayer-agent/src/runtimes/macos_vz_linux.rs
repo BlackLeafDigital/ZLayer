@@ -338,8 +338,12 @@ impl VzLinuxRuntime {
     ///
     /// A VM has no host-visible PID, but the overlay-attach contract wants a
     /// `Some(pid)` so PID-gated bookkeeping runs (see [`get_container_pid`]). We
-    /// hash the container id into the high half of the u32 space (bit 31 set) so
-    /// it can never collide with a real low host PID, and force it nonzero.
+    /// hash the container id into the upper-but-still-positive-`i32` range
+    /// (`[2^30, 2^31)`, bit 30 set) so it can never collide with a real low
+    /// host PID (`pid_max` is a few million), is guaranteed nonzero, AND still
+    /// fits in a signed 32-bit integer. The latter matters because Docker /
+    /// docker-compat clients (e.g. the `ZArcRunner` SDK) deserialize `pid` as an
+    /// `int32`: a value with bit 31 set overflows that and breaks the client.
     ///
     /// [`get_container_pid`]: Runtime::get_container_pid
     fn pseudo_pid(id: &ContainerId) -> u32 {
@@ -347,9 +351,10 @@ impl VzLinuxRuntime {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         id.service.hash(&mut h);
         id.replica.hash(&mut h);
-        // Take the low 31 bits (always fits in u32, so try_from can't fail),
-        // then set the top bit so it's high-half + guaranteed nonzero.
-        u32::try_from(h.finish() & 0x7fff_ffff).unwrap_or(0) | 0x8000_0000
+        // Take the low 30 bits (always fits in u32, so try_from can't fail),
+        // then set bit 30 so it lands in [2^30, 2^31): high enough to never
+        // collide with a real host PID, nonzero, and within positive i32.
+        u32::try_from(h.finish() & 0x3fff_ffff).unwrap_or(0) | 0x4000_0000
     }
 
     /// `{data_dir}/vz/linux` — the runtime's base directory.
