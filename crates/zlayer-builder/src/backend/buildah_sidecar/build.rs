@@ -35,7 +35,7 @@ impl BuildahSidecarBackend {
         let live = self.lifecycle.ensure().await?;
         let mut client = live.client();
 
-        let request = build_request_from(context, dockerfile, options);
+        let request = build_request_from(context, dockerfile, options, self.config());
         let stream = client
             .build(Request::new(request))
             .await
@@ -53,10 +53,22 @@ fn build_request_from(
     context: &Path,
     _dockerfile: &Dockerfile,
     options: &BuildOptions,
+    config: &zlayer_types::builder::SidecarConfig,
 ) -> proto::BuildRequest {
+    // Resolve the path the *sidecar* sees for the context. For a same-host
+    // sidecar this is the host path verbatim; for a cross-namespace sidecar
+    // (e.g. `zlayer-buildd` inside a VZ-Linux container) we rewrite the
+    // host-side mount prefix to the in-guest mount prefix.
+    let context_dir = translate_context_path(context, config);
+
     let dockerfile_path = options.dockerfile.clone().map_or_else(
-        || context.join("Dockerfile").to_string_lossy().into_owned(),
-        |p| p.to_string_lossy().into_owned(),
+        || {
+            std::path::Path::new(&context_dir)
+                .join("Dockerfile")
+                .to_string_lossy()
+                .into_owned()
+        },
+        |p| translate_context_path(&p, config),
     );
 
     let platforms = options
@@ -90,7 +102,7 @@ fn build_request_from(
 
     proto::BuildRequest {
         request_id: String::new(),
-        context_dir: context.to_string_lossy().into_owned(),
+        context_dir,
         dockerfile_paths: vec![dockerfile_path],
         tags: options.tags.clone(),
         platforms,
@@ -117,6 +129,26 @@ fn build_request_from(
         rewrite_timestamp: false,
         isolation: detect_default_isolation(),
     }
+}
+
+/// Rewrite a host-side path to the path the sidecar sees, honoring the
+/// optional `context_mount` prefix translation on [`SidecarConfig`].
+///
+/// With no `context_mount` (same-host sidecar) the path is returned
+/// verbatim. With `Some((host_prefix, guest_prefix))` any path under
+/// `host_prefix` has that prefix swapped for `guest_prefix`; paths outside
+/// the mount are returned unchanged (the caller is responsible for keeping
+/// the context inside the shared mount).
+fn translate_context_path(
+    path: &Path,
+    config: &zlayer_types::builder::SidecarConfig,
+) -> String {
+    if let Some((host_prefix, guest_prefix)) = config.context_mount.as_ref() {
+        if let Ok(rel) = path.strip_prefix(host_prefix) {
+            return guest_prefix.join(rel).to_string_lossy().into_owned();
+        }
+    }
+    path.to_string_lossy().into_owned()
 }
 
 /// Pick the safe isolation backend for the *current process*.
@@ -371,7 +403,7 @@ mod tests {
             ..BuildOptions::default()
         };
 
-        let req = build_request_from(context, &df, &options);
+        let req = build_request_from(context, &df, &options, &zlayer_types::builder::SidecarConfig::default());
         assert_eq!(req.context_dir, "/tmp/ctx");
         assert_eq!(req.tags, vec!["test/img:latest".to_string()]);
         assert!(req.platforms.is_empty());
@@ -397,7 +429,7 @@ mod tests {
             dockerfile: Some(Path::new("/custom/Dockerfile.web").into()),
             ..BuildOptions::default()
         };
-        let req = build_request_from(context, &df, &options);
+        let req = build_request_from(context, &df, &options, &zlayer_types::builder::SidecarConfig::default());
         assert_eq!(
             req.dockerfile_paths,
             vec!["/custom/Dockerfile.web".to_string()]
@@ -412,7 +444,7 @@ mod tests {
             platform: Some(" linux/amd64 , linux/arm64 ".to_string()),
             ..BuildOptions::default()
         };
-        let req = build_request_from(context, &df, &options);
+        let req = build_request_from(context, &df, &options, &zlayer_types::builder::SidecarConfig::default());
         assert_eq!(
             req.platforms,
             vec!["linux/amd64".to_string(), "linux/arm64".to_string()]
@@ -432,7 +464,7 @@ mod tests {
             pipeline_vars,
             ..BuildOptions::default()
         };
-        let req = build_request_from(context, &df, &options);
+        let req = build_request_from(context, &df, &options, &zlayer_types::builder::SidecarConfig::default());
         assert_eq!(req.build_args.get("FOO"), Some(&"1".to_string()));
         assert_eq!(req.build_args.get("LTSC"), Some(&"ltsc2025".to_string()));
     }

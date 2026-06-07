@@ -1,5 +1,7 @@
 // Cross-platform commands
 pub mod build;
+#[cfg(target_os = "macos")]
+pub mod buildd_manager;
 pub mod completions;
 pub mod lifecycle;
 pub mod manager;

@@ -108,10 +108,11 @@ use objc2::{AnyThread, ClassType};
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString};
 use objc2_virtualization::{
     VZBootLoader, VZDirectoryShare, VZDirectorySharingDeviceConfiguration,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
-    VZMACAddress, VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration,
-    VZPlatformConfiguration, VZSharedDirectory, VZSingleDirectoryShare,
-    VZSocketDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment,
+    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZMACAddress,
+    VZNATNetworkDeviceAttachment, VZNetworkDeviceConfiguration, VZPlatformConfiguration,
+    VZSharedDirectory, VZSingleDirectoryShare, VZSocketDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
@@ -1141,6 +1142,20 @@ pub(crate) fn build_config_linux(
         let net_super: Retained<VZNetworkDeviceConfiguration> = Retained::into_super(net);
         let net_arr = NSArray::from_retained_slice(&[net_super]);
         config.setNetworkDevices(&net_arr);
+
+        // --- entropy: virtio-rng so the guest CSPRNG seeds promptly ---
+        // A VZ guest has no hardware RNG; without a virtio entropy device the
+        // kernel CSPRNG never seeds, so anything reading it (Go's crypto/rand,
+        // TLS handshakes, sshd) blocks ~60s+ at startup ("crypto/rand: blocked
+        // for 60 seconds waiting to read random data from the kernel"). Needs
+        // CONFIG_HW_RANDOM_VIRTIO in the guest kernel.
+        // SAFETY: standard VZ device construction on the config queue (already
+        // inside this fn's `unsafe` block); the array is a valid NSArray of
+        // entropy device configs.
+        let entropy = VZVirtioEntropyDeviceConfiguration::new();
+        let entropy_super: Retained<VZEntropyDeviceConfiguration> = Retained::into_super(entropy);
+        let entropy_arr = NSArray::from_retained_slice(&[entropy_super]);
+        config.setEntropyDevices(&entropy_arr);
 
         // --- vsock: virtio socket device for the host<->agent control channel ---
         // The guest agent listens on AF_VSOCK port `proto::CONTROL_PORT`; the

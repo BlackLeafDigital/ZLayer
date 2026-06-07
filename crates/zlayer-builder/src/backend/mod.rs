@@ -214,6 +214,21 @@ pub async fn detect_backend_with_options(
     {
         match target_os {
             ImageOs::Linux => {
+                // Preferred macOS path: route to a `zlayer-buildd` sidecar
+                // running in a VZ-Linux container when one has been wired up
+                // by the build front-end (env-configured remote addr). This
+                // is the only way to run real Linux Dockerfile `RUN` steps on
+                // a macOS host — native buildah can't, and the Seatbelt
+                // sandbox only covers a narrow subset.
+                if let Some(sidecar) = sidecar_from_env() {
+                    if sidecar.is_available().await {
+                        return Ok(Arc::new(sidecar));
+                    }
+                    tracing::warn!(
+                        "ZLAYER_BUILDD_ADDR set but sidecar not reachable; \
+                         falling back to buildah-cli / sandbox"
+                    );
+                }
                 if let Ok(backend) = BuildahBackend::try_new().await {
                     Ok(Arc::new(backend))
                 } else {
@@ -259,6 +274,44 @@ pub async fn detect_backend_with_options(
             }),
         }
     }
+}
+
+/// Build a [`BuildahSidecarBackend`] from environment configuration, if the
+/// macOS build front-end has wired one up.
+///
+/// The front-end (`zlayer build` on macOS) starts a `zlayer-buildd` in a
+/// VZ-Linux container and exports the wiring through env vars:
+///
+/// - `ZLAYER_BUILDD_ADDR` — `host:port` to dial (required; presence is the
+///   on/off switch).
+/// - `ZLAYER_BUILDD_TLS_DIR` — mTLS material dir (optional; defaults to the
+///   per-user `${data}/buildd`).
+/// - `ZLAYER_BUILDD_CONTEXT_MOUNT` — `HOST_PREFIX:GUEST_PREFIX` so the
+///   backend rewrites context paths to what the in-guest buildah sees.
+///
+/// Returns `None` when `ZLAYER_BUILDD_ADDR` is unset (no managed sidecar).
+#[cfg(target_os = "macos")]
+fn sidecar_from_env() -> Option<BuildahSidecarBackend> {
+    use std::path::PathBuf;
+    use zlayer_types::builder::SidecarConfig;
+
+    let addr = std::env::var("ZLAYER_BUILDD_ADDR").ok()?;
+    let tls_dir = std::env::var("ZLAYER_BUILDD_TLS_DIR")
+        .ok()
+        .map(PathBuf::from);
+    let context_mount = std::env::var("ZLAYER_BUILDD_CONTEXT_MOUNT")
+        .ok()
+        .and_then(|s| {
+            s.split_once(':')
+                .map(|(h, g)| (PathBuf::from(h), PathBuf::from(g)))
+        });
+
+    Some(BuildahSidecarBackend::new(SidecarConfig {
+        addr: Some(addr),
+        tls_dir,
+        context_mount,
+        ..Default::default()
+    }))
 }
 
 /// Construct the backend implementation for the requested
@@ -313,17 +366,30 @@ async fn construct_backend(
                     ),
                 });
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err(BuildError::NotSupported {
-                    operation: "buildah-sidecar backend currently only runs on Linux hosts \
-                                (zlayer-buildd is Linux-only)"
-                        .to_string(),
-                })
-            }
+            // Linux hosts spawn a local sidecar; macOS hosts dial a
+            // `zlayer-buildd` running in a VZ-Linux container (env-wired by
+            // the `zlayer build` front-end). Windows has no sidecar path.
             #[cfg(target_os = "linux")]
             {
                 Ok(Arc::new(BuildahSidecarBackend::default()))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // Honor the env-configured remote sidecar when present so an
+                // explicit `--backend buildah-sidecar` / `ZLAYER_BACKEND`
+                // dials the managed VZ buildd instead of trying to spawn one
+                // locally (which can't run on macOS).
+                Ok(Arc::new(
+                    sidecar_from_env().unwrap_or_default(),
+                ))
+            }
+            #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+            {
+                Err(BuildError::NotSupported {
+                    operation: "buildah-sidecar backend is not available on this host \
+                                (zlayer-buildd runs on Linux or in a macOS VZ container)"
+                        .to_string(),
+                })
             }
         }
         BuilderBackendKind::Sandbox => {

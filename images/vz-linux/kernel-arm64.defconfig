@@ -45,6 +45,12 @@ CONFIG_VIRTIO_PCI_LEGACY=y
 CONFIG_VIRTIO_BALLOON=y
 CONFIG_VIRTIO_INPUT=y
 
+# virtio-rng: seeds the guest CSPRNG. Without it the guest has no entropy source
+# and /dev/urandom never initializes, so Go's crypto/rand, TLS, and sshd block
+# ~60s+ at startup. The VZ runtime attaches a VZVirtioEntropyDeviceConfiguration.
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
 # --- virtio device drivers --------------------------------------------------
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y

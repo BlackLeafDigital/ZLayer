@@ -500,6 +500,7 @@ mod tests {
             storage_graph_root: Some(tmp.path().join("storage").join("graph")),
             storage_run_root: Some(tmp.path().join("storage").join("run")),
             storage_driver: Some("vfs".into()),
+            context_mount: None,
         });
         let lifecycle = SidecarLifecycle::new(cfg);
         let live = lifecycle

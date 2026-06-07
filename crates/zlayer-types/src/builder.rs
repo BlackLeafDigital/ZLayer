@@ -98,6 +98,21 @@ pub struct SidecarConfig {
     /// running as root may switch to `overlay` for performance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<String>,
+
+    /// Build-context mount translation for a remote (cross-host) sidecar.
+    ///
+    /// When the sidecar runs in a different mount namespace than the client
+    /// (e.g. a `zlayer-buildd` inside a VZ-Linux container on a macOS host),
+    /// the build context must be shared in via a bind / virtiofs mount and
+    /// the `context_dir` sent on the wire must be the path *the sidecar*
+    /// sees, not the host path the client computed.
+    ///
+    /// `Some((host_prefix, guest_prefix))` rewrites any `context_dir` that
+    /// starts with `host_prefix` so the prefix becomes `guest_prefix`. The
+    /// dockerfile paths are translated the same way. `None` (the default,
+    /// same-host sidecar) passes paths through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mount: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl SidecarConfig {
@@ -118,6 +133,7 @@ impl Default for SidecarConfig {
             storage_graph_root: None,
             storage_run_root: None,
             storage_driver: None,
+            context_mount: None,
         }
     }
 }
