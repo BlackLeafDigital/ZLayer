@@ -1030,7 +1030,19 @@ pub(crate) fn build_config_linux(
             VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
         let initrd_url = file_url(&inputs.kernel.initramfs);
         linux_boot.setInitialRamdiskURL(Some(&initrd_url));
-        let cmdline = NSString::from_str(LINUX_CMDLINE);
+        // Inject the host wall-clock epoch so the guest can set its clock at
+        // boot. A VZ Linux guest has no RTC and starts at epoch 0 (1970), which
+        // breaks TLS cert validity, build timestamps, and anything time-aware.
+        // The vzagent reads `zlayer.boottime=<unix_secs>` from /proc/cmdline and
+        // `settimeofday`s before serving. Falls back to a static cmdline if the
+        // clock is somehow unavailable.
+        let cmdline_str = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or_else(
+                |_| LINUX_CMDLINE.to_string(),
+                |d| format!("{LINUX_CMDLINE} zlayer.boottime={}", d.as_secs()),
+            );
+        let cmdline = NSString::from_str(&cmdline_str);
         linux_boot.setCommandLine(&cmdline);
         let boot: Retained<VZBootLoader> = Retained::into_super(linux_boot);
         config.setBootLoader(Some(&boot));

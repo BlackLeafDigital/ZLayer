@@ -1707,6 +1707,44 @@ mod linux {
     // ----------------------------------------------------------------------
 
     /// Full PID1 bring-up sequence followed by the control loop.
+    /// Set the guest wall clock from the `zlayer.boottime=<unix_secs>` kernel
+    /// argument the host injects. A VZ Linux guest has no RTC and boots at epoch
+    /// 0 (1970), which breaks TLS cert validity, build timestamps, and any
+    /// time-aware workload. Best-effort: any missing arg / parse / syscall
+    /// failure is logged and ignored. `/proc` must already be mounted.
+    fn set_guest_clock_from_cmdline() {
+        let cmdline = match fs::read_to_string("/proc/cmdline") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zlayer-vzagent: warning: read /proc/cmdline: {e}");
+                return;
+            }
+        };
+        let Some(secs) = cmdline
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("zlayer.boottime="))
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            return;
+        };
+        let tv = libc::timeval {
+            // musl `time_t` is 64-bit (i64), matching `secs` — direct assignment
+            // avoids both the deprecated-alias warning and a useless conversion.
+            tv_sec: secs,
+            tv_usec: 0,
+        };
+        // SAFETY: `tv` is a valid timeval; a null timezone pointer is allowed.
+        let rc = unsafe { libc::settimeofday(&raw const tv, std::ptr::null()) };
+        if rc == 0 {
+            eprintln!("zlayer-vzagent: guest clock set to epoch {secs}");
+        } else {
+            eprintln!(
+                "zlayer-vzagent: warning: settimeofday({secs}): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
     pub fn run() -> Result<()> {
         // Reassure ourselves we're actually PID 1.
         // SAFETY: getpid is always safe.
@@ -1716,6 +1754,12 @@ mod linux {
         }
 
         mount_core_filesystems()?;
+
+        // Set the guest wall clock from the host-injected `zlayer.boottime=`
+        // kernel arg (a VZ guest has no RTC and boots at epoch 0/1970, which
+        // breaks TLS cert validity, build timestamps, and any time-aware
+        // workload). Best-effort; /proc is mounted by mount_core_filesystems.
+        set_guest_clock_from_cmdline();
 
         // Bring up the guest NIC + DHCP concurrently with assembling the
         // container root, to overlap the DHCP round-trip with the virtiofs /
