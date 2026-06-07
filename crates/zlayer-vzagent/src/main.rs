@@ -1148,7 +1148,129 @@ mod linux {
     /// the exec'd process already shares the container filesystem. We attach it
     /// to the workload's PID namespace if one exists so tools like `ps` see the
     /// container view.
-    fn spawn_exec(argv: &[String], env: &[(String, String)]) -> Result<Child> {
+    /// Resolve the effective `(uid, gid)` for an exec from the host-supplied
+    /// `--user` request.
+    ///
+    /// Precedence:
+    /// 1. A NAME (`user = Some("git")`) is resolved against the container's
+    ///    `/etc/passwd` (read post-pivot from the workload root). On a hit the
+    ///    looked-up uid AND primary gid win, so `docker exec --user git` lands as
+    ///    the image's `git` user with the right group. A `name:group` form is
+    ///    split first; the group half may itself be a name (resolved via
+    ///    `/etc/group`) or numeric. On a miss the name is dropped and we fall
+    ///    back to the numeric `uid`/`gid` (if any).
+    /// 2. Numeric `uid`/`gid` (already parsed by the host) are used directly.
+    ///    When a uid is present but no gid, the gid mirrors the uid (Docker's
+    ///    behavior for a bare numeric `--user N`).
+    ///
+    /// Returns `(None, None)` to mean "keep the agent's identity" (root).
+    fn resolve_exec_user(
+        uid: Option<u32>,
+        gid: Option<u32>,
+        user: Option<&str>,
+    ) -> (Option<u32>, Option<u32>) {
+        if let Some(raw) = user.map(str::trim).filter(|u| !u.is_empty()) {
+            // Split an optional `user:group` suffix.
+            let (uname, gpart) = match raw.split_once(':') {
+                Some((u, g)) => (u, Some(g)),
+                None => (raw, None),
+            };
+            // Resolve the user half: numeric stays numeric, otherwise look up
+            // /etc/passwd for the uid + primary gid.
+            let (ru, primary_gid) = if let Ok(n) = uname.parse::<u32>() {
+                (Some(n), None)
+            } else {
+                lookup_passwd(uname).map_or((None, None), |(u, g)| (Some(u), Some(g)))
+            };
+            // Resolve the group half if provided (numeric or /etc/group name).
+            let rg = gpart.and_then(|g| {
+                g.parse::<u32>()
+                    .ok()
+                    .or_else(|| lookup_group(g))
+                    .or_else(|| {
+                        eprintln!("zlayer-vzagent: warning: unknown exec group {g:?}");
+                        None
+                    })
+            });
+            // Prefer an explicit group, else the passwd primary group, else the
+            // uid itself (mirrors Docker for a bare numeric user).
+            let final_gid = rg.or(primary_gid).or(ru);
+            if ru.is_some() {
+                return (ru, final_gid);
+            }
+            eprintln!(
+                "zlayer-vzagent: warning: could not resolve exec user {raw:?}; running as agent uid"
+            );
+        }
+        // No name: numeric path. A bare numeric uid implies gid == uid.
+        let g = gid.or(uid);
+        (uid, g)
+    }
+
+    /// Look up a user NAME in the container's `/etc/passwd`, returning its
+    /// `(uid, primary_gid)`. Best-effort: returns `None` if the file is missing,
+    /// unreadable, or has no matching entry.
+    fn lookup_passwd(name: &str) -> Option<(u32, u32)> {
+        let content = fs::read_to_string("/etc/passwd").ok()?;
+        for line in content.lines() {
+            // name:passwd:uid:gid:gecos:home:shell
+            let mut f = line.splitn(7, ':');
+            let entry_name = f.next()?;
+            if entry_name != name {
+                continue;
+            }
+            let _passwd = f.next()?;
+            let uid = f.next()?.parse::<u32>().ok()?;
+            let gid = f.next()?.parse::<u32>().ok()?;
+            return Some((uid, gid));
+        }
+        None
+    }
+
+    /// Look up the `(name, home)` for a uid in the container's `/etc/passwd`.
+    /// Best-effort: returns `None` if the file is missing/unreadable or no entry
+    /// matches. Used to set `HOME`/`USER` for a `docker exec --user` so tools
+    /// that read `$HOME` (e.g. `forgejo admin`) behave as the target user.
+    fn lookup_user_by_uid(uid: u32) -> Option<(String, String)> {
+        let content = fs::read_to_string("/etc/passwd").ok()?;
+        for line in content.lines() {
+            // name:passwd:uid:gid:gecos:home:shell
+            let fields: Vec<&str> = line.splitn(7, ':').collect();
+            if fields.len() < 6 {
+                continue;
+            }
+            if fields[2].parse::<u32>().ok() == Some(uid) {
+                return Some((fields[0].to_string(), fields[5].to_string()));
+            }
+        }
+        None
+    }
+
+    /// Look up a group NAME in the container's `/etc/group`, returning its gid.
+    /// Best-effort, same failure semantics as [`lookup_passwd`].
+    fn lookup_group(name: &str) -> Option<u32> {
+        let content = fs::read_to_string("/etc/group").ok()?;
+        for line in content.lines() {
+            // name:passwd:gid:members
+            let mut f = line.splitn(4, ':');
+            let entry_name = f.next()?;
+            if entry_name != name {
+                continue;
+            }
+            let _passwd = f.next()?;
+            return f.next()?.parse::<u32>().ok();
+        }
+        None
+    }
+
+    fn spawn_exec(
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&str>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        user: Option<&str>,
+    ) -> Result<Child> {
         let program = argv.first().ok_or_else(|| err("Exec: empty argv"))?;
         let mut cmd = Command::new(program);
         cmd.args(&argv[1..]);
@@ -1156,6 +1278,62 @@ mod linux {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // Working directory (Docker `-w`). The agent has pivoted into the
+        // container root, so a relative/absolute path resolves against the
+        // workload filesystem just like `Run`.
+        if let Some(dir) = resolve_cwd(cwd) {
+            cmd.current_dir(dir);
+        }
+
+        // Resolve the effective uid/gid for `--user`. A NAME (e.g. `git`) is
+        // looked up in the container's /etc/passwd; a numeric uid/gid is used
+        // directly. We resolve in the parent (the agent has post-pivot read
+        // access to /etc/passwd) and apply via a pre-exec setgid/setuid so the
+        // child drops privileges immediately before execve.
+        let (want_user, want_group) = resolve_exec_user(uid, gid, user);
+
+        // When dropping to a specific user, set HOME/USER/LOGNAME to that user's
+        // /etc/passwd entry (matching `docker exec --user`) UNLESS the caller
+        // already provided them via `-e`. Tools like `forgejo admin` read $HOME
+        // and fail hard ("cannot get home directory") if it still points at
+        // root's home after the uid drop.
+        if let Some(u) = want_user {
+            let caller_set_home = env.iter().any(|(k, _)| k == "HOME");
+            if let Some((uname, home)) = lookup_user_by_uid(u) {
+                if !home.is_empty() && !caller_set_home {
+                    cmd.env("HOME", &home);
+                }
+                if !env.iter().any(|(k, _)| k == "USER") {
+                    cmd.env("USER", &uname);
+                }
+                if !env.iter().any(|(k, _)| k == "LOGNAME") {
+                    cmd.env("LOGNAME", &uname);
+                }
+            }
+        }
+
+        if want_user.is_some() || want_group.is_some() {
+            // SAFETY: the closure runs in the forked child between fork and
+            // exec. It only calls async-signal-safe libc functions
+            // (setgid/setuid), in the correct order (group first, then user).
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(move || {
+                    if let Some(g) = want_group {
+                        if libc::setgid(g) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(u) = want_user {
+                        if libc::setuid(u) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let pid = WORKLOAD_PID.load(Ordering::SeqCst);
         if pid > 0 {
@@ -1416,7 +1594,14 @@ mod linux {
                         }
                     }
                 }
-                Msg::Exec { argv, env } => match spawn_exec(&argv, &env) {
+                Msg::Exec {
+                    argv,
+                    env,
+                    cwd,
+                    uid,
+                    gid,
+                    user,
+                } => match spawn_exec(&argv, &env, cwd.as_deref(), uid, gid, user.as_deref()) {
                     Ok(mut child) => {
                         let pid = child.id() as i32;
                         let status_rx = Reaper::global().register(pid);

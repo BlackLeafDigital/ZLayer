@@ -35,7 +35,8 @@ use tokio::net::UnixStream;
 use tracing::{debug, info};
 use zlayer_types::api::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
 use zlayer_types::api::containers::{
-    ContainerExecResponse, ContainerUpdateRequest, ContainerUpdateResponse, CreateContainerRequest,
+    ContainerExecRequest, ContainerExecResponse, ContainerUpdateRequest, ContainerUpdateResponse,
+    CreateContainerRequest,
 };
 use zlayer_types::api::images::{
     CommitContainerRequest, CommitContainerResponse, ImageHistoryEntryDto, ImageInfoDto,
@@ -2549,11 +2550,34 @@ impl DaemonClient {
         id: &str,
         cmd: Vec<String>,
     ) -> Result<ContainerExecResponse> {
+        self.exec_in_container_with_opts(id, cmd, None, None, Vec::new())
+            .await
+    }
+
+    /// Like [`Self::exec_in_container`] but forwards Docker `exec` options:
+    /// `user` (`--user`, `uid` / `uid:gid` / NAME), `working_dir` (`-w`), and
+    /// `env` (`-e KEY=VALUE`). The daemon applies them via the runtime's
+    /// `exec_with_opts` (drop to uid/gid, chdir, inject env).
+    pub async fn exec_in_container_with_opts(
+        &self,
+        id: &str,
+        cmd: Vec<String>,
+        user: Option<String>,
+        working_dir: Option<String>,
+        env: Vec<String>,
+    ) -> Result<ContainerExecResponse> {
         let path = format!("/api/v1/containers/{}/exec_sync", urlencoding(id));
-        let payload = serde_json::json!({ "command": cmd });
-        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
-        Self::check_status(status, &body)?;
-        Self::parse_json(&body)
+        let request = ContainerExecRequest {
+            command: cmd,
+            user,
+            working_dir,
+            env,
+        };
+        let body = serde_json::to_string(&request)
+            .context("Failed to serialize ContainerExecRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
     }
 
     /// Wait for a container to reach a terminal state, Docker-style.

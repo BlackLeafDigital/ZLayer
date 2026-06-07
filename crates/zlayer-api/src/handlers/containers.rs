@@ -136,6 +136,16 @@ pub struct ContainerApiState {
     pub internal_token: Option<String>,
     /// HTTP client reused for cross-node container forwarding.
     pub http_client: reqwest::Client,
+    /// Optional `ServiceManager` handle so the unified container-name resolver
+    /// (and `docker ps`) can see DEPLOYMENT/compose containers — not just
+    /// standalone ones. Compose `up` registers containers in the
+    /// `ServiceManager`, NOT in [`Self::containers`]; without this handle a
+    /// compose `container_name:` (e.g. `forgejo-e2e`) resolves to nothing and
+    /// `docker exec`/`docker ps` 404 / show empty. The runtime is the SAME
+    /// shared instance, so once the resolver recovers a `ContainerId` from the
+    /// manager, `runtime.exec(...)` drives the right container. `None` in
+    /// read-only / test states that have no manager.
+    pub service_manager: Option<Arc<RwLock<zlayer_agent::ServiceManager>>>,
 }
 
 /// Metadata for a standalone container (not managed by a deployment)
@@ -184,6 +194,7 @@ impl ContainerApiState {
             cluster: None,
             internal_token: None,
             http_client: reqwest::Client::new(),
+            service_manager: None,
         }
     }
 
@@ -205,6 +216,7 @@ impl ContainerApiState {
             cluster: None,
             internal_token: None,
             http_client: reqwest::Client::new(),
+            service_manager: None,
         }
     }
 
@@ -230,6 +242,7 @@ impl ContainerApiState {
             cluster: None,
             internal_token: None,
             http_client: reqwest::Client::new(),
+            service_manager: None,
         }
     }
 
@@ -298,6 +311,19 @@ impl ContainerApiState {
     #[must_use]
     pub fn with_compose_storage(mut self, compose_storage: Arc<dyn ComposeProjectStorage>) -> Self {
         self.compose_storage = compose_storage;
+        self
+    }
+
+    /// Attach the daemon's [`ServiceManager`](zlayer_agent::ServiceManager) so
+    /// the unified container-name resolver and `docker ps` can see compose /
+    /// deployment containers (addressed by their `container_name:` label or the
+    /// conventional compose names), not just standalone containers.
+    #[must_use]
+    pub fn with_service_manager(
+        mut self,
+        service_manager: Arc<RwLock<zlayer_agent::ServiceManager>>,
+    ) -> Self {
+        self.service_manager = Some(service_manager);
         self
     }
 
@@ -696,6 +722,26 @@ pub(crate) async fn resolve_container_lookup(
     if let Some(cid) = ContainerId::parse_display(raw) {
         if state.runtime.container_state(&cid).await.is_ok() {
             let storage_key = raw.to_string();
+            return Some(ResolvedContainer {
+                container_id: cid,
+                storage_key,
+            });
+        }
+    }
+
+    // Fall-back 5: DEPLOYMENT / compose containers. These live in the
+    // `ServiceManager`, not the standalone map, so none of the above hit them.
+    // Ask the manager to resolve the raw identifier as a compose
+    // `container_name:` label, a conventional compose name
+    // (`{project}-{service}-{n}` / `{project}_{service}_{n}`), a bare service
+    // name, or a `ContainerId` Display string — and return the live
+    // `ContainerId`. The runtime is shared, so the recovered id drives exec /
+    // logs / inspect directly. This is what makes `docker exec forgejo-e2e ...`
+    // resolve a compose deployment's `container_name`.
+    if let Some(mgr) = state.service_manager.as_ref() {
+        let manager = mgr.read().await;
+        if let Some(cid) = manager.resolve_container_name(raw).await {
+            let storage_key = cid.to_string();
             return Some(ResolvedContainer {
                 container_id: cid,
                 storage_key,
@@ -1757,8 +1803,86 @@ pub async fn list_containers(
             exit_code: reconcile_exit_code(inspect.exit_code, &runtime_state),
         });
     }
+    drop(containers);
+
+    // Append DEPLOYMENT / compose containers from the ServiceManager. These are
+    // not in the standalone `containers` map, so `docker ps` would otherwise
+    // show nothing for a `docker compose up` stack.
+    append_deployment_containers(&state, label_filter.as_ref(), &mut results).await;
 
     Ok(Json(results))
+}
+
+/// Append the daemon's DEPLOYMENT / compose containers (from the
+/// `ServiceManager`) to a `docker ps` result set.
+///
+/// Each [`zlayer_agent::DeploymentContainerView`] is rendered with its
+/// user-facing Docker name (the compose `container_name:`, falling back to the
+/// conventional `{project}-{service}-{replica}` name), image, state, pid, and
+/// published ports, plus the standard `com.docker.compose.*` labels so clients
+/// can correlate it with its project/service. A `None` service manager (tests /
+/// read-only) is a no-op.
+async fn append_deployment_containers(
+    state: &ContainerApiState,
+    label_filter: Option<&(String, String)>,
+    results: &mut Vec<ContainerInfo>,
+) {
+    let Some(mgr) = state.service_manager.as_ref() else {
+        return;
+    };
+    let manager = mgr.read().await;
+    for view in manager.list_container_views().await {
+        // Apply the same label filter to deployment containers.
+        if let Some((key, value)) = label_filter {
+            let cname_matches = key == "com.docker.compose.container_name"
+                && view.container_name.as_deref() == Some(value.as_str());
+            if !cname_matches {
+                continue;
+            }
+        }
+        let hex_id = state
+            .id_map
+            .lookup_container(&view.container_id)
+            .unwrap_or_else(|| {
+                state
+                    .id_map
+                    .register(state.id_map.daemon_uuid(), &view.container_id)
+            });
+        // Docker name: the compose container_name, else the conventional
+        // `{project}-{service}-{replica}` (1-based).
+        let display_name = view.container_name.clone().unwrap_or_else(|| {
+            let dep = view.deployment.as_deref().unwrap_or("");
+            format!("{dep}-{}-{}", view.service, view.container_id.replica + 1)
+        });
+        let mut labels = HashMap::new();
+        if let Some(ref dep) = view.deployment {
+            labels.insert("com.docker.compose.project".to_string(), dep.clone());
+        }
+        labels.insert(
+            "com.docker.compose.service".to_string(),
+            view.service.clone(),
+        );
+        if let Some(ref cn) = view.container_name {
+            labels.insert(
+                "com.docker.compose.container_name".to_string(),
+                cn.clone(),
+            );
+        }
+        results.push(ContainerInfo {
+            id: hex_id,
+            name: Some(display_name),
+            image: view.image,
+            state: view.state,
+            labels,
+            created_at: String::new(),
+            pid: view.pid,
+            ports: view.ports,
+            networks: Vec::new(),
+            ipv4: None,
+            health: None,
+            exit_code: None,
+        });
+    }
 }
 
 /// Get details for a specific container.
@@ -3392,6 +3516,17 @@ pub async fn exec_in_container(
         .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
     let container_id = resolved.container_id;
 
+    // Build the Docker exec options (`--user`, `-w`, `-e`) so the runtime can
+    // drop to the requested uid/gid, chdir, and inject env. Only `command`,
+    // `user`, `working_dir`, and `env` are honoured by the buffered exec path.
+    let exec_opts = zlayer_agent::runtime::ExecOptions {
+        command: request.command.clone(),
+        env: request.env.clone(),
+        working_dir: request.working_dir.clone(),
+        user: request.user.clone(),
+        ..Default::default()
+    };
+
     if query.stream {
         let events = state
             .runtime
@@ -3425,7 +3560,7 @@ pub async fn exec_in_container(
 
     let (exit_code, stdout, stderr) = state
         .runtime
-        .exec(&container_id, &request.command)
+        .exec_with_opts(&container_id, &exec_opts)
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { reason, .. } => {

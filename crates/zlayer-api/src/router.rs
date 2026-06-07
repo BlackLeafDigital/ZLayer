@@ -1767,10 +1767,17 @@ pub fn build_router_with_containers(
     local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
+    let base_router = build_router_with_services(
+        config,
+        storage,
+        Arc::clone(&service_manager),
+        local_node_id,
+    );
 
-    // Create container state (carries the shared event bus)
-    let container_state = ContainerApiState::new(runtime);
+    // Create container state (carries the shared event bus). Attach the
+    // ServiceManager so the unified name resolver + `docker ps` can see compose
+    // / deployment containers, not just standalone ones.
+    let container_state = ContainerApiState::new(runtime).with_service_manager(service_manager);
 
     // Build container + event + exec routes from the same state so all three
     // sides see the same event bus and `ExecInstances`. The state type is

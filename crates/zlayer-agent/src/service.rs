@@ -1090,6 +1090,28 @@ pub struct ContainerInfo {
     pub overlay_ip: Option<String>,
 }
 
+/// A live deployment container enriched for Docker-compat `ps` rows and for
+/// name resolution. Produced by [`ServiceManager::list_container_views`].
+#[derive(Debug, Clone)]
+pub struct DeploymentContainerView {
+    /// Deployment (compose project) name, when known.
+    pub deployment: Option<String>,
+    /// Service name within the deployment.
+    pub service: String,
+    /// Concrete container identity.
+    pub container_id: ContainerId,
+    /// Compose `container_name:` (the user-facing Docker name), when set.
+    pub container_name: Option<String>,
+    /// Image reference the container was created from.
+    pub image: String,
+    /// Lowercased lifecycle state (e.g. `"running"`).
+    pub state: String,
+    /// Process id when running.
+    pub pid: Option<u32>,
+    /// The service's published port mappings.
+    pub ports: Vec<zlayer_spec::PortMapping>,
+}
+
 /// Service manager for multiple services
 pub struct ServiceManager {
     runtime: Arc<dyn Runtime + Send + Sync>,
@@ -2659,6 +2681,103 @@ impl ServiceManager {
         };
 
         self.runtime.exec(&target, cmd).await
+    }
+
+    /// List every live container across all services, enriched with the data a
+    /// Docker `ps` row needs and the data the Docker-name resolver needs.
+    ///
+    /// For each running container this surfaces the deployment name, the service
+    /// name, the concrete [`ContainerId`], the compose `container_name:` label
+    /// (when set, the user-facing Docker name), the real image, the lifecycle
+    /// state, and the service's published port mappings. Used by the unified
+    /// container-name resolver and by `docker ps` so compose deployments show up
+    /// and resolve by their `container_name`.
+    pub async fn list_container_views(&self) -> Vec<DeploymentContainerView> {
+        let deployment = self.deployment_name.clone();
+        let services = self.services.read().await;
+        let mut out = Vec::new();
+        for (service_name, instance) in services.iter() {
+            let container_name = instance
+                .spec
+                .labels
+                .get("com.docker.compose.container_name")
+                .cloned();
+            let ports = instance.spec.port_mappings.clone();
+            for info in instance.container_infos().await {
+                out.push(DeploymentContainerView {
+                    deployment: deployment.clone(),
+                    service: service_name.clone(),
+                    container_id: info.id,
+                    container_name: container_name.clone(),
+                    image: info.image,
+                    state: info.state,
+                    pid: info.pid,
+                    ports: ports.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Resolve a Docker-style container name/id to a live deployment
+    /// [`ContainerId`].
+    ///
+    /// Matching precedence (first hit wins):
+    /// 1. The compose `container_name:` label (e.g. `forgejo-e2e`).
+    /// 2. The conventional compose names `{deployment}-{service}-{replica}` and
+    ///    `{deployment}_{service}_{replica}` (replica is 1-based, mirroring
+    ///    Docker Compose; `ContainerId.replica` is 0-based so we add 1).
+    /// 3. The bare service name (`{service}`), targeting its first replica.
+    /// 4. The [`ContainerId`] `Display` form.
+    ///
+    /// Returns `None` when nothing matches a *running* container.
+    pub async fn resolve_container_name(&self, name: &str) -> Option<ContainerId> {
+        let views = self.list_container_views().await;
+        // 1. explicit container_name label.
+        if let Some(v) = views
+            .iter()
+            .find(|v| v.container_name.as_deref() == Some(name))
+        {
+            return Some(v.container_id.clone());
+        }
+        // 2 & 3. conventional names + bare service name.
+        for v in &views {
+            let dep = v.deployment.as_deref().unwrap_or("");
+            let svc = &v.service;
+            let rep1 = v.container_id.replica + 1;
+            let candidates = [
+                format!("{dep}-{svc}-{rep1}"),
+                format!("{dep}_{svc}_{rep1}"),
+                svc.clone(),
+            ];
+            if candidates.iter().any(|c| c == name) {
+                return Some(v.container_id.clone());
+            }
+        }
+        // 4. ContainerId Display form.
+        for v in &views {
+            if v.container_id.to_string() == name {
+                return Some(v.container_id.clone());
+            }
+        }
+        None
+    }
+
+    /// Execute a command in a specific deployment container (by its concrete
+    /// [`ContainerId`]) honouring Docker `exec` options (`--user`, `-w`, `-e`).
+    ///
+    /// Routes through [`Runtime::exec_with_opts`] so runtimes that support
+    /// dropping to a uid/gid + chdir + env injection (macOS VZ-Linux) apply
+    /// them; others fall back to a plain buffered exec.
+    ///
+    /// # Errors
+    /// Propagates the runtime's exec error.
+    pub async fn exec_in_container_id_with_opts(
+        &self,
+        id: &ContainerId,
+        opts: &crate::runtime::ExecOptions,
+    ) -> Result<(i32, String, String)> {
+        self.runtime.exec_with_opts(id, opts).await
     }
 
     // ==================== Job Management ====================

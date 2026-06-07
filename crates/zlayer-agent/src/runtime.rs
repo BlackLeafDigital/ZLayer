@@ -1167,6 +1167,27 @@ pub trait Runtime: Send + Sync {
     /// Execute command in container
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)>;
 
+    /// Execute a command in a container with Docker `exec` options (`--user`,
+    /// `-w`/`--workdir`, `-e`/`--env`) applied.
+    ///
+    /// The default implementation ignores the user/cwd/env overrides and
+    /// delegates to [`Runtime::exec`], so runtimes that don't (yet) plumb them
+    /// keep working unchanged. Runtimes that can honour them — notably the macOS
+    /// VZ-Linux runtime, which drives the in-guest agent over vsock — override
+    /// this to drop to the requested uid/gid, chdir, and inject env before exec.
+    ///
+    /// `opts.command` is the argv (`command[0]` is the binary); `opts.user`,
+    /// `opts.working_dir`, and `opts.env` carry the Docker overrides. The
+    /// `tty`/`attach_*`/`privileged` fields of [`ExecOptions`] are not consulted
+    /// by this buffered entry point.
+    async fn exec_with_opts(
+        &self,
+        id: &ContainerId,
+        opts: &ExecOptions,
+    ) -> Result<(i32, String, String)> {
+        self.exec(id, &opts.command).await
+    }
+
     /// Execute a command in a container and stream stdout / stderr / exit
     /// events as they are produced.
     ///

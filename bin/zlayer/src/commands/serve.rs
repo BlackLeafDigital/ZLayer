@@ -1958,6 +1958,12 @@ pub(crate) async fn serve_with_external_shutdown(
             )
         })?;
 
+    // Retain a handle to the ServiceManager for the container API state so the
+    // unified container-name resolver + `docker ps` can see compose/deployment
+    // containers. `service_manager` itself is moved into `InternalState` below,
+    // so capture the clone now (it's a cheap `Arc`).
+    let container_service_manager = Arc::clone(&service_manager);
+
     // -----------------------------------------------------------------------
     // Cluster trait construction.
     //
@@ -2778,7 +2784,8 @@ pub(crate) async fn serve_with_external_shutdown(
             .with_standalone_storage(bundle.standalone_containers.clone())
             .with_compose_storage(bundle.compose_projects.clone())
             .with_cluster(cluster_handle.clone())
-            .with_internal_token(internal_token.clone());
+            .with_internal_token(internal_token.clone())
+            .with_service_manager(Arc::clone(&container_service_manager));
 
         // Repopulate the in-memory standalone-container cache from disk so
         // create / list / inspect / delete handlers see records that survived a

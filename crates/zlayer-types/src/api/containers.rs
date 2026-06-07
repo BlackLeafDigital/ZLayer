@@ -543,10 +543,24 @@ fn default_tail() -> usize {
 }
 
 /// Exec request for running a command in a container
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ContainerExecRequest {
     /// Command and arguments to execute
     pub command: Vec<String>,
+    /// Optional `user[:group]` to run the command as (Docker `--user`). A NAME
+    /// (e.g. `git`) is resolved against the container's `/etc/passwd` by the
+    /// runtime; numeric `uid` / `uid:gid` are used directly. `None` keeps the
+    /// container's configured user (root by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Optional working directory inside the container (Docker `-w`/`--workdir`).
+    /// `None` keeps the container's default workdir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Extra environment variables in `KEY=VALUE` form (Docker `-e`/`--env`),
+    /// merged on top of the container's env (later entries win).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 /// Query parameters for the exec endpoint.

@@ -367,6 +367,7 @@ mod tests {
             cluster: None,
             internal_token: None,
             http_client: reqwest::Client::new(),
+            service_manager: None,
         }
     }
 

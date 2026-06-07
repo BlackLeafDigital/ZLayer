@@ -1608,6 +1608,37 @@ fn exec_and_collect(
     }
 }
 
+/// Parse a Docker `--user` value into the wire fields for [`proto::Msg::Exec`].
+///
+/// Accepts:
+/// * `""` / `None` → `(None, None, None)` (keep the guest's identity / root).
+/// * `uid` (numeric) → `(Some(uid), None, None)`; the guest mirrors gid = uid.
+/// * `uid:gid` (both numeric) → `(Some(uid), Some(gid), None)`.
+/// * `name` or `name:group` containing a non-numeric component → deferred to
+///   the guest via `user = Some(raw)`, which resolves it against the
+///   container's `/etc/passwd` / `/etc/group` after pivot. We still surface any
+///   numeric half so a `1000:git` style request keeps the numeric uid.
+fn parse_exec_user(user: Option<&str>) -> (Option<u32>, Option<u32>, Option<String>) {
+    let Some(raw) = user.map(str::trim).filter(|u| !u.is_empty()) else {
+        return (None, None, None);
+    };
+    let (u, g) = match raw.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (raw, None),
+    };
+    let uid = u.parse::<u32>().ok();
+    let gid = g.and_then(|g| g.parse::<u32>().ok());
+    // If either half is a non-numeric name, hand the raw string to the guest so
+    // it can resolve names against the container's passwd/group databases.
+    let needs_name_resolution = uid.is_none() || (g.is_some() && gid.is_none());
+    let user_name = if needs_name_resolution {
+        Some(raw.to_string())
+    } else {
+        None
+    };
+    (uid, gid, user_name)
+}
+
 /// Map a canonical POSIX signal name (as produced by
 /// [`crate::runtime::validate_signal`], e.g. `"SIGTERM"`) to its numeric value
 /// on Linux (the guest is always Linux, so the Linux numbering is authoritative
@@ -2450,9 +2481,21 @@ impl Runtime for VzLinuxRuntime {
     }
 
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
+        let opts = crate::runtime::ExecOptions {
+            command: cmd.to_vec(),
+            ..Default::default()
+        };
+        self.exec_with_opts(id, &opts).await
+    }
+
+    async fn exec_with_opts(
+        &self,
+        id: &ContainerId,
+        opts: &crate::runtime::ExecOptions,
+    ) -> Result<(i32, String, String)> {
         let dir_name = Self::container_dir_name(id);
 
-        if cmd.is_empty() {
+        if opts.command.is_empty() {
             return Err(AgentError::Configuration(
                 "vz-linux: exec requires a non-empty command".to_string(),
             ));
@@ -2462,7 +2505,7 @@ impl Runtime for VzLinuxRuntime {
         // vsock connect on its serial queue) plus the container spec's env to
         // inherit into the exec'd process. The VM must be running with a live
         // agent connection, or there is nothing to exec into.
-        let (live, env) = {
+        let (live, mut env) = {
             let guard = self.containers.read().await;
             let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
                 container: dir_name.clone(),
@@ -2500,9 +2543,30 @@ impl Runtime for VzLinuxRuntime {
             )
         };
 
+        // Merge Docker `-e KEY=VALUE` overrides on top of the container env
+        // (later entries win, so an override replaces an inherited value).
+        for kv in &opts.env {
+            if let Some((k, v)) = kv.split_once('=') {
+                if let Some(slot) = env.iter_mut().find(|(ek, _)| ek == k) {
+                    slot.1 = v.to_string();
+                } else {
+                    env.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+
+        // Resolve `--user` into a numeric uid/gid where possible, deferring a
+        // pure NAME (`git`) to the guest, which can read the container's
+        // /etc/passwd after pivot.
+        let (uid, gid, user) = parse_exec_user(opts.user.as_deref());
+
         let exec_msg = proto::Msg::Exec {
-            argv: cmd.to_vec(),
+            argv: opts.command.clone(),
             env,
+            cwd: opts.working_dir.clone(),
+            uid,
+            gid,
+            user,
         };
 
         // The connect + frame IO is blocking (synchronous `UnixStream`), and
@@ -3288,6 +3352,37 @@ mod tests {
         // Non-numeric names aren't host-resolvable -> fall back to root.
         assert_eq!(parse_user(Some("alice")), (0, 0));
         assert_eq!(parse_user(Some("alice:staff")), (0, 0));
+    }
+
+    #[test]
+    fn parse_exec_user_defers_names_to_guest() {
+        // Empty / none -> keep guest identity.
+        assert_eq!(parse_exec_user(None), (None, None, None));
+        assert_eq!(parse_exec_user(Some("")), (None, None, None));
+        assert_eq!(parse_exec_user(Some("  ")), (None, None, None));
+        // Numeric uid only -> numeric, no name.
+        assert_eq!(parse_exec_user(Some("1000")), (Some(1000), None, None));
+        // Numeric uid:gid -> both numeric, no name.
+        assert_eq!(
+            parse_exec_user(Some("1000:2000")),
+            (Some(1000), Some(2000), None)
+        );
+        // Pure NAME -> deferred to guest verbatim, no numeric halves.
+        assert_eq!(
+            parse_exec_user(Some("git")),
+            (None, None, Some("git".to_string()))
+        );
+        // name:group -> deferred (both names need /etc/passwd + /etc/group).
+        assert_eq!(
+            parse_exec_user(Some("git:git")),
+            (None, None, Some("git:git".to_string()))
+        );
+        // numeric uid : NAME group -> uid kept numeric, raw deferred so the
+        // guest resolves the group name.
+        assert_eq!(
+            parse_exec_user(Some("1000:staff")),
+            (Some(1000), None, Some("1000:staff".to_string()))
+        );
     }
 
     #[test]

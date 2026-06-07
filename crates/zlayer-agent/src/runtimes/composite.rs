@@ -946,6 +946,19 @@ impl Runtime for CompositeRuntime {
         rt.exec(id, cmd).await
     }
 
+    async fn exec_with_opts(
+        &self,
+        id: &ContainerId,
+        opts: &crate::runtime::ExecOptions,
+    ) -> Result<(i32, String, String)> {
+        // Forward to the resolved backend's `exec_with_opts` so Docker exec
+        // options (`--user`, `-w`, `-e`) reach the runtime that actually owns
+        // the container. Without this override the trait default would call
+        // `self.exec(opts.command)` and silently drop user/cwd/env.
+        let rt = self.lookup(id).await?;
+        rt.exec_with_opts(id, opts).await
+    }
+
     async fn exec_stream(&self, id: &ContainerId, cmd: &[String]) -> Result<ExecEventStream> {
         let rt = self.lookup(id).await?;
         rt.exec_stream(id, cmd).await

@@ -521,10 +521,11 @@ pub async fn handle_rm(args: RmArgs) -> anyhow::Result<()> {
 /// back to the caller. Exits the process with the command's exit code on
 /// non-zero.
 ///
-/// Note: the daemon's container exec endpoint is non-interactive. `-i`,
-/// `-t`, `-u`, `-e`, and `-w` flags are parsed for Docker CLI compatibility
-/// but not forwarded to the daemon (which runs the command to completion
-/// and buffers output).
+/// Note: the daemon's container exec endpoint is non-interactive, so `-i` and
+/// `-t` are parsed for Docker CLI compatibility but ignored (the command runs
+/// to completion and its output is buffered). `-u`/`--user`, `-e`/`--env`, and
+/// `-w`/`--workdir` ARE forwarded to the daemon and applied by the runtime
+/// (drop to uid/gid, inject env, chdir before exec).
 ///
 /// # Errors
 ///
@@ -542,16 +543,19 @@ pub async fn handle_exec(args: ExecArgs) -> anyhow::Result<()> {
             "warning: -i/-t are not yet supported for container exec; running non-interactively"
         );
     }
-    if args.user.is_some() || !args.env.is_empty() || args.workdir.is_some() {
-        eprintln!("warning: -u/-e/-w are not yet supported for container exec; ignoring");
-    }
 
     let client = DaemonClient::connect_to(default_socket_path())
         .await
         .context("Failed to connect to zlayer daemon")?;
 
     let resp = client
-        .exec_in_container(&args.container, args.command.clone())
+        .exec_in_container_with_opts(
+            &args.container,
+            args.command.clone(),
+            args.user.clone(),
+            args.workdir.clone(),
+            args.env.clone(),
+        )
         .await
         .with_context(|| format!("Failed to exec in container '{}'", args.container))?;
 

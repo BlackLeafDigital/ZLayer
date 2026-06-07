@@ -64,6 +64,21 @@ pub enum Msg {
         argv: Vec<String>,
         /// Environment as `(KEY, VALUE)` pairs.
         env: Vec<(String, String)>,
+        /// Working directory inside the container, if any (Docker `-w`). When
+        /// `None`, the exec'd process inherits the agent's cwd (`/`).
+        cwd: Option<String>,
+        /// Numeric user id to drop to before exec (Docker `--user` resolved to a
+        /// uid by the host). `None` keeps the agent's uid (root).
+        uid: Option<u32>,
+        /// Numeric group id to drop to before exec. `None` keeps the agent's
+        /// gid. When `uid` is `Some` but `gid` is `None`, the guest resolves the
+        /// user's primary group (or falls back to the uid).
+        gid: Option<u32>,
+        /// Raw `--user` value as a NAME (e.g. `git`) for the guest to resolve
+        /// against the container's `/etc/passwd` after pivot. `None` when the
+        /// host already resolved a numeric uid/gid. When `Some`, the guest looks
+        /// the name up and uses its uid/gid (overriding `uid`/`gid`).
+        user: Option<String>,
     },
     /// Host → guest: deliver a signal to the workload process.
     Signal {
@@ -364,6 +379,19 @@ mod tests {
             Msg::Exec {
                 argv: vec!["/bin/ps".into(), "aux".into()],
                 env: vec![("TERM".into(), "xterm".into())],
+                cwd: Some("/srv".into()),
+                uid: Some(1000),
+                gid: Some(1000),
+                user: None,
+            },
+            // Exec addressed by user NAME, no numeric uid/gid, no cwd.
+            Msg::Exec {
+                argv: vec!["/bin/sh".into(), "-c".into(), "id".into()],
+                env: vec![],
+                cwd: None,
+                uid: None,
+                gid: None,
+                user: Some("git".into()),
             },
             Msg::Signal { signum: 15 },
             Msg::Signal { signum: 9 },
