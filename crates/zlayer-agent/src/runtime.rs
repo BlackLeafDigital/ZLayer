@@ -1093,6 +1093,25 @@ pub enum LoadProgress {
 /// [`Runtime::load_images`].
 pub type LoadProgressStream = Pin<Box<dyn Stream<Item = Result<LoadProgress>> + Send + 'static>>;
 
+/// How a runtime joins a container to the cross-node `WireGuard` overlay.
+///
+/// The overlay can be attached three ways depending on whether the container is
+/// a host process, a Windows compute system, or a full VM:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAttachKind {
+    /// Linux host process: overlayd enters `/proc/<pid>/ns/net` and plumbs a
+    /// veth into the container's network namespace (the default).
+    HostNetns,
+    /// Windows: the HCN endpoint + namespace were created at container-create
+    /// time; the agent only registers the assigned IP.
+    HostIp,
+    /// A VM guest with no host-visible netns/PID (macOS VZ-Linux): overlayd
+    /// allocates the overlay identity and the agent pushes it into the guest
+    /// over vsock, where a kernel `WireGuard` device is brought up. See
+    /// [`Runtime::push_overlay_config`].
+    InGuestVsock,
+}
+
 /// Abstract container runtime trait
 ///
 /// This trait abstracts over different container runtimes (containerd, CRI-O, etc.)
@@ -1301,6 +1320,37 @@ pub trait Runtime: Send + Sync {
     ///
     /// Used for overlay network attachment and process management.
     async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>>;
+
+    /// How this runtime joins a container to the cross-node overlay network.
+    ///
+    /// Defaults to [`OverlayAttachKind::HostNetns`] (the Linux veth-by-PID path).
+    /// VM runtimes with no host netns (macOS VZ-Linux) override this to
+    /// [`OverlayAttachKind::InGuestVsock`], which makes the service layer push a
+    /// host-allocated overlay config into the guest via [`push_overlay_config`]
+    /// instead of attaching a veth by PID.
+    ///
+    /// [`push_overlay_config`]: Runtime::push_overlay_config
+    fn overlay_attach_kind(&self) -> OverlayAttachKind {
+        OverlayAttachKind::HostNetns
+    }
+
+    /// Push a host-allocated overlay (`WireGuard`) config into a guest that manages
+    /// its own overlay interface ([`OverlayAttachKind::InGuestVsock`]).
+    ///
+    /// The service layer obtains `config` from overlayd (which allocated the
+    /// address + keypair and registered the public key in the mesh) and calls
+    /// this so the runtime can deliver it to the guest (over vsock) and bring up
+    /// the in-guest interface. Runtimes that attach by netns/PID never call this
+    /// and use the default, which errors.
+    async fn push_overlay_config(
+        &self,
+        _id: &ContainerId,
+        _config: &zlayer_types::overlayd::GuestOverlayConfig,
+    ) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "push_overlay_config is not supported by this runtime".to_string(),
+        ))
+    }
 
     /// Get the IP address of a container
     ///

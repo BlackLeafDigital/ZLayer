@@ -47,8 +47,8 @@ use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{
     ContainerId, ContainerInspectDetails, ContainerState, ExecEventStream, ImageInfo, LogChannel,
-    LogChunk, LogsStream, LogsStreamOptions, PruneResult, Runtime, StatsSample, StatsStream,
-    WaitCondition, WaitOutcome,
+    LogChunk, LogsStream, LogsStreamOptions, OverlayAttachKind, PruneResult, Runtime, StatsSample,
+    StatsStream, WaitCondition, WaitOutcome,
 };
 
 /// Which underlying runtime a given container was dispatched to.
@@ -1113,6 +1113,28 @@ impl Runtime for CompositeRuntime {
     async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
         let rt = self.lookup(id).await?;
         rt.get_container_pid(id).await
+    }
+
+    fn overlay_attach_kind(&self) -> OverlayAttachKind {
+        // Linux workloads on macOS execute in the VZ-Linux delegate, which joins
+        // the overlay from inside the guest (`InGuestVsock`). Defer to it when
+        // present so the service layer takes the guest-managed attach path and
+        // calls `push_overlay_config` (routed per-container below); otherwise use
+        // the primary's kind. Non-VZ containers route to a runtime whose
+        // `push_overlay_config` is unsupported and degrade gracefully.
+        self.vz_linux.as_ref().map_or_else(
+            || self.primary.overlay_attach_kind(),
+            |vz| vz.overlay_attach_kind(),
+        )
+    }
+
+    async fn push_overlay_config(
+        &self,
+        id: &ContainerId,
+        config: &zlayer_types::overlayd::GuestOverlayConfig,
+    ) -> Result<()> {
+        let rt = self.lookup(id).await?;
+        rt.push_overlay_config(id, config).await
     }
 
     async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>> {

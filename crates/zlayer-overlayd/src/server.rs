@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ipnetwork::IpNetwork;
 use zlayer_overlay::{NatConfig, NatTraversal, OverlayConfig, OverlayTransport, PeerInfo};
 use zlayer_types::overlayd::{
-    AttachHandle, AttachResult, DedicatedServiceStatus, OverlayMode, OverlaydRequest,
-    OverlaydResponse, PeerScope, PeerSpec, PeerStatus, ServiceOverlayInfo, StatusSnapshot,
+    AttachHandle, AttachResult, DedicatedServiceStatus, GuestOverlayConfig, OverlayMode,
+    OverlaydRequest, OverlaydResponse, PeerScope, PeerSpec, PeerStatus, ServiceOverlayInfo,
+    StatusSnapshot,
 };
 
 use crate::error::OverlaydError;
@@ -121,6 +122,23 @@ struct AttachInfo {
     global_ip: Option<IpAddr>,
     /// True iff the container also attached to the global overlay (eth1).
     joined_global: bool,
+}
+
+/// Tracking info recorded by [`OverlaydServer::attach_container_guest`] for a
+/// guest-managed attach. Platform-agnostic (no netns/veth/HCN): the guest owns
+/// its own `WireGuard` device; the host only allocated the address + registered
+/// the guest's public key as a global peer.
+#[derive(Debug, Clone)]
+struct GuestAttachInfo {
+    /// Overlay IP allocated for the guest (released on detach).
+    overlay_ip: IpAddr,
+    /// Base64 public key registered on the global transport for the guest
+    /// (removed on detach).
+    public_key: String,
+    /// Service whose bridge pool owns `overlay_ip` (Linux service-bridge path);
+    /// `None` when drawn from the node slice. Mirrors `AttachInfo::service_name`
+    /// so detach returns the IP to the right pool.
+    service_name: Option<String>,
 }
 
 /// Per-service Linux bridge state. One bridge per service per node; containers
@@ -224,6 +242,17 @@ pub struct OverlaydServer {
     /// Per-PID tracking of overlay attachments on Linux.
     #[cfg(target_os = "linux")]
     attached: HashMap<u32, AttachInfo>,
+    /// Peers installed on the GLOBAL transport via `AddPeer { Global }`, keyed by
+    /// base64 public key. Tracked here (in wire-safe [`PeerSpec`] form, with the
+    /// keys kept base64 — the boringtun UAPI dump only exposes hex keys) so a
+    /// guest-managed attach can hand the guest the exact peer set the host's own
+    /// global device carries. Platform-agnostic: the guest path runs on macOS.
+    global_peers: HashMap<String, PeerSpec>,
+    /// Guest-managed overlay attachments, keyed by the opaque container `id` from
+    /// [`AttachHandle::GuestManaged`]. Records the allocated overlay IP and the
+    /// generated public key registered in the mesh so `DetachContainer` can
+    /// release the IP and remove the peer.
+    guest_attachments: HashMap<String, GuestAttachInfo>,
     /// Overlay DNS server listen address, if one was bootstrapped.
     dns_server_addr: Option<SocketAddr>,
     /// DNS domain for overlay service discovery.
@@ -294,6 +323,8 @@ impl OverlaydServer {
             service_ip_allocators: HashMap::new(),
             #[cfg(target_os = "linux")]
             attached: HashMap::new(),
+            global_peers: HashMap::new(),
+            guest_attachments: HashMap::new(),
             dns_server_addr: None,
             dns_domain: None,
             dns_records: HashMap::new(),
@@ -401,27 +432,60 @@ impl OverlaydServer {
                 dns_server,
                 dns_domain,
             } => {
-                let result = self
-                    .attach_container(handle, &service, join_global, dns_server, dns_domain)
-                    .await?;
-                Ok(OverlaydResponse::Attached(result))
+                // A guest-managed attach takes a wholly separate path: it cannot
+                // build a veth/HCN endpoint (the target is a VM, not a host
+                // process), so it allocates the overlay identity + peer set and
+                // returns it as `GuestConfig`. PID/HCN handles keep the existing
+                // veth/HCN attach and return `Attached`.
+                if let AttachHandle::GuestManaged { id } = handle {
+                    // Record the overlay DNS resolver/zone the daemon staged for
+                    // this node so the guest config can fall back to them (same
+                    // bookkeeping `attach_container` does for the other handles).
+                    if let Some(server) = dns_server {
+                        self.dns_server_addr = Some(SocketAddr::new(server, 53));
+                    }
+                    if dns_domain.is_some() {
+                        self.dns_domain.clone_from(&dns_domain);
+                    }
+                    let config = self
+                        .attach_container_guest(&id, &service, join_global, dns_server, dns_domain)
+                        .await?;
+                    Ok(OverlaydResponse::GuestConfig(config))
+                } else {
+                    let result = self
+                        .attach_container(handle, &service, join_global, dns_server, dns_domain)
+                        .await?;
+                    Ok(OverlaydResponse::Attached(result))
+                }
             }
             OverlaydRequest::DetachContainer { handle } => {
-                self.detach_container(handle).await?;
+                if let AttachHandle::GuestManaged { id } = handle {
+                    self.detach_container_guest(&id).await?;
+                } else {
+                    self.detach_container(handle).await?;
+                }
                 Ok(OverlaydResponse::Ok)
             }
             // `scope` selects the target device: `Global` (default) = the single
             // cluster transport; `Service { service }` = that service's
             // dedicated per-service transport.
             OverlaydRequest::AddPeer { peer, scope } => {
-                let peer = peer_spec_to_info(&peer)?;
+                let info = peer_spec_to_info(&peer)?;
                 let transport = self.transport_for_scope(&scope)?;
-                Self::add_peer_on(transport, &peer).await?;
+                Self::add_peer_on(transport, &info).await?;
+                // Mirror Global peers into `global_peers` so a guest-managed
+                // attach can reproduce the host's global peer set for the guest.
+                if matches!(scope, PeerScope::Global) {
+                    self.global_peers.insert(peer.public_key.clone(), peer);
+                }
                 Ok(OverlaydResponse::Ok)
             }
             OverlaydRequest::RemovePeer { pubkey, scope } => {
                 let transport = self.transport_for_scope(&scope)?;
                 Self::remove_peer_on(transport, &pubkey).await?;
+                if matches!(scope, PeerScope::Global) {
+                    self.global_peers.remove(&pubkey);
+                }
                 Ok(OverlaydResponse::Ok)
             }
             OverlaydRequest::AddAllowedIp {
@@ -1237,6 +1301,10 @@ impl OverlaydServer {
                 self.attach_container_windows(&container_id, service, ip, dns_server, dns_domain)
                     .await
             }
+            AttachHandle::GuestManaged { .. } => Err(OverlaydError::Other(
+                "guest-managed attach must go through attach_container_guest, not attach_container"
+                    .to_string(),
+            )),
         }
     }
 
@@ -1251,7 +1319,250 @@ impl OverlaydServer {
             AttachHandle::WindowsContainer { container_id, .. } => {
                 self.detach_container_windows(&container_id).await
             }
+            AttachHandle::GuestManaged { .. } => Err(OverlaydError::Other(
+                "guest-managed detach must go through detach_container_guest, not detach_container"
+                    .to_string(),
+            )),
         }
+    }
+
+    // -- container attach (guest-managed) -----------------------------------
+
+    /// Guest-managed overlay attach: allocate the overlay identity for a VM guest
+    /// that brings up its own kernel `WireGuard` device.
+    ///
+    /// overlayd cannot enter the guest's network namespace (it is a VM, not a
+    /// host process), so instead of a veth/HCN endpoint it:
+    /// 1. allocates the overlay IP from the SAME pool the Linux attach uses (the
+    ///    per-service bridge pool when one exists, otherwise the node slice) so
+    ///    guest addresses never collide with container addresses;
+    /// 2. generates a fresh `WireGuard` keypair for the guest;
+    /// 3. builds the peer set the guest must configure — every GLOBAL peer the
+    ///    host already knows, plus THIS node itself (so the guest can reach the
+    ///    host node over the overlay; carries a keepalive so the guest keeps its
+    ///    NAT mapping open from behind VZ NAT);
+    /// 4. registers the generated public key as a GLOBAL peer (host route to the
+    ///    guest, roaming endpoint learned from the guest's keepalive) so remote
+    ///    nodes and this node route to it;
+    /// 5. records the attachment keyed by `id` so `DetachContainer` can release
+    ///    the IP and remove the peer.
+    ///
+    /// Platform-agnostic: pure IPAM + keygen + peer bookkeeping (no netns/veth/
+    /// HCN), so it compiles and runs on macOS (where the overlayd serving a VZ
+    /// host lives) as well as Linux.
+    ///
+    /// # Errors
+    /// Returns an error if the global overlay is not set up, the IP pool is
+    /// exhausted, key generation fails, or registering the guest peer fails.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn attach_container_guest(
+        &mut self,
+        id: &str,
+        service: &str,
+        join_global: bool,
+        dns_server: Option<IpAddr>,
+        dns_domain: Option<String>,
+    ) -> Result<GuestOverlayConfig, OverlaydError> {
+        // The global transport must exist: we both register the guest as a peer
+        // on it and advertise this node (its public key + listen port) to the
+        // guest. Resolve both up front so we fail before allocating anything.
+        let node_public_key = self.transport_public_key.clone().ok_or_else(|| {
+            OverlaydError::Other(
+                "guest-managed attach requires the global overlay to be set up first \
+                 (no node WireGuard public key)"
+                    .to_string(),
+            )
+        })?;
+        if self.global_transport.is_none() {
+            return Err(OverlaydError::Other(
+                "guest-managed attach requires the global overlay to be set up first \
+                 (no global transport)"
+                    .to_string(),
+            ));
+        }
+
+        // 1. Allocate the overlay IP from the same pool the Linux attach uses and
+        //    derive the prefix length from that pool's network. On Linux a
+        //    per-service bridge (when present) supplies both the IP and its
+        //    subnet's prefix; otherwise (and on every non-Linux host) the node
+        //    slice / cluster CIDR does.
+        let (overlay_ip, prefix_len, pool_service): (IpAddr, u8, Option<String>) = {
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(bridge) = self.service_bridges.get_mut(service) {
+                    let ip = bridge.ip_allocator.allocate().ok_or_else(|| {
+                        OverlaydError::Overlay(format!(
+                            "service bridge {} subnet {} exhausted",
+                            bridge.name, bridge.subnet
+                        ))
+                    })?;
+                    let prefix = bridge.subnet.prefix_len();
+                    (ip, prefix, Some(service.to_string()))
+                } else {
+                    let ip = self.ip_allocator.allocate()?;
+                    (ip, self.slice_prefix_len(), None)
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = service;
+                let ip = self.ip_allocator.allocate()?;
+                (ip, self.slice_prefix_len(), None)
+            }
+        };
+        // `join_global` is informational for a guest-managed attach: the guest's
+        // single WireGuard device IS its global-overlay endpoint, so there is no
+        // separate eth1 IP to reserve. Touch it so callers stay consistent with
+        // the Linux/Windows handles.
+        let _ = join_global;
+
+        // 2. Generate the guest's WireGuard keypair (reuse the transport's
+        //    native x25519 keygen — never reimplement curve25519 here).
+        let (private_key, public_key) = OverlayTransport::generate_keys().await.map_err(|e| {
+            // Roll back the IP allocation so a keygen failure leaks nothing.
+            self.release_guest_ip(overlay_ip, pool_service.as_deref());
+            OverlaydError::Overlay(format!("failed to generate guest keys: {e}"))
+        })?;
+
+        // 3. Build the peer set: every global peer the host already knows ...
+        let mut peers: Vec<PeerSpec> = self.global_peers.values().cloned().collect();
+        // ... plus THIS node, so the guest can reach the host node over the
+        //     overlay. AllowedIPs covers the cluster CIDR (fall back to this
+        //     node's slice) so the guest routes all overlay traffic via the host
+        //     node's WireGuard endpoint; keepalive keeps the guest's VZ-NAT
+        //     mapping open.
+        let node_allowed = self
+            .cluster_cidr
+            .or(self.slice_cidr)
+            .map_or_else(|| String::from("0.0.0.0/0"), |c| c.to_string());
+        let node_endpoint = self.node_endpoint_for_guest();
+        peers.push(PeerSpec {
+            public_key: node_public_key,
+            endpoint: node_endpoint,
+            allowed_ips: node_allowed,
+            persistent_keepalive_secs: 25,
+        });
+
+        // 4. Register the guest's public key as a GLOBAL peer (host route to the
+        //    guest at <overlay_ip>/32, roaming endpoint learned from keepalive).
+        //    Go through the same internal path `AddPeer { Global }` uses.
+        let host_route = format!(
+            "{}/{}",
+            overlay_ip,
+            if overlay_ip.is_ipv6() { 128 } else { 32 }
+        );
+        let guest_peer = PeerSpec {
+            public_key: public_key.clone(),
+            // Empty/roaming: the guest is behind NAT; boringtun learns its source
+            // endpoint from the guest's first keepalive. `0.0.0.0:0` is the
+            // wire-safe "unset endpoint" sentinel that still parses as a
+            // SocketAddr (peer_spec_to_info requires a parseable endpoint).
+            endpoint: "0.0.0.0:0".to_string(),
+            allowed_ips: host_route,
+            persistent_keepalive_secs: 0,
+        };
+        let guest_peer_info = peer_spec_to_info(&guest_peer)?;
+        {
+            let transport = self.transport_for_scope(&PeerScope::Global)?;
+            if let Err(e) = Self::add_peer_on(transport, &guest_peer_info).await {
+                self.release_guest_ip(overlay_ip, pool_service.as_deref());
+                return Err(e);
+            }
+        }
+        // Track it among the global peers (so a *subsequent* guest attach also
+        // learns about this guest) and record the attachment for detach.
+        self.global_peers
+            .insert(public_key.clone(), guest_peer.clone());
+        self.guest_attachments.insert(
+            id.to_string(),
+            GuestAttachInfo {
+                overlay_ip,
+                public_key: public_key.clone(),
+                service_name: pool_service,
+            },
+        );
+
+        // 5. Return the config the caller ships into the guest.
+        Ok(GuestOverlayConfig {
+            overlay_ip,
+            prefix_len,
+            private_key,
+            public_key,
+            // The guest's device listens on the node's overlay WG port (the
+            // convention every overlay device on this node uses).
+            listen_port: self.overlay_port,
+            peers,
+            dns_server: dns_server.or_else(|| self.dns_server_addr.map(|s| s.ip())),
+            dns_domain: dns_domain.or_else(|| self.dns_domain.clone()),
+        })
+    }
+
+    /// Release a guest-managed attach by `id`: drop the host route + global peer
+    /// and return the allocated IP to its pool. Idempotent.
+    ///
+    /// # Errors
+    /// Returns an error only if removing the peer from the global transport fails
+    /// for a reason other than "peer not found".
+    async fn detach_container_guest(&mut self, id: &str) -> Result<(), OverlaydError> {
+        let Some(info) = self.guest_attachments.remove(id) else {
+            return Ok(());
+        };
+        // Remove the guest's global peer (mirror the RemovePeer { Global } path).
+        self.global_peers.remove(&info.public_key);
+        if let Ok(transport) = self.transport_for_scope(&PeerScope::Global) {
+            if let Err(e) = Self::remove_peer_on(transport, &info.public_key).await {
+                tracing::warn!(
+                    guest = %id,
+                    pubkey = %info.public_key,
+                    error = %e,
+                    "failed to remove guest peer from global transport"
+                );
+            }
+        }
+        // Return the IP to whichever pool it came from.
+        self.release_guest_ip(info.overlay_ip, info.service_name.as_deref());
+        Ok(())
+    }
+
+    /// Release a guest overlay IP back to the pool it was drawn from: the named
+    /// service bridge's allocator (Linux) when `service` is set and the bridge
+    /// still exists, otherwise the node slice allocator.
+    fn release_guest_ip(&mut self, ip: IpAddr, service: Option<&str>) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(svc) = service {
+                if let Some(bridge) = self.service_bridges.get_mut(svc) {
+                    bridge.ip_allocator.release(ip);
+                    return;
+                }
+            }
+        }
+        let _ = service;
+        self.ip_allocator.release(ip);
+    }
+
+    /// Prefix length of the address pool guest IPs are drawn from when not using
+    /// a per-service bridge: the node slice if assigned, else the cluster CIDR.
+    fn slice_prefix_len(&self) -> u8 {
+        self.slice_cidr.or(self.cluster_cidr).map_or(
+            if self.node_ip.is_some_and(|ip| ip.is_ipv6()) {
+                64
+            } else {
+                24
+            },
+            |c| c.prefix(),
+        )
+    }
+
+    /// Reachable `WireGuard` endpoint for THIS node, advertised to a guest as a
+    /// peer. overlayd has no public reflexive address at this layer, so it uses
+    /// the node's overlay-listen identity (`node_ip:overlay_port`); the caller
+    /// (the VZ runtime that ships the config into the guest) rewrites it to the
+    /// concrete VZ-NAT gateway endpoint the guest can dial. Falls back to the
+    /// unspecified address when no node IP is assigned yet.
+    fn node_endpoint_for_guest(&self) -> String {
+        let ip = self.node_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        SocketAddr::new(ip, self.overlay_port).to_string()
     }
 
     /// Linux veth/netns attach. On non-Linux this returns the node's overlay IP
@@ -2784,5 +3095,136 @@ latest_handshake=0
             matches!(resp, OverlaydResponse::Ok),
             "service-scoped add_peer should land on the dedicated device, got {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn guest_attach_requires_global_overlay() {
+        // Without a global overlay (no node public key / transport) a
+        // guest-managed attach must error rather than allocate anything.
+        let mut server = test_server();
+        let resp = server
+            .handle(OverlaydRequest::AttachContainer {
+                handle: AttachHandle::GuestManaged {
+                    id: "vm-1".to_string(),
+                },
+                service: "web".to_string(),
+                join_global: true,
+                dns_server: None,
+                dns_domain: None,
+            })
+            .await;
+        match resp {
+            OverlaydResponse::Err { message } => {
+                assert!(
+                    message.contains("global overlay to be set up"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected Err response, got {other:?}"),
+        }
+        // Nothing was recorded.
+        assert!(server.guest_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detach_unknown_guest_is_idempotent() {
+        let mut server = test_server();
+        // No such guest -> Ok (idempotent), no panic.
+        server
+            .detach_container_guest("never-attached")
+            .await
+            .expect("detach of unknown guest is a no-op");
+    }
+
+    /// Full guest-managed attach/detach round-trip. Needs a real TUN device (the
+    /// global overlay must be live so the guest peer can be installed), so it is
+    /// ignored by default and only runs on a privileged Linux host — mirrors the
+    /// crate's other privileged overlay e2e tests.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN; run on a privileged Linux host"]
+    async fn guest_attach_allocates_config_and_detach_releases() {
+        let mut server = test_server();
+        server
+            .setup_global_overlay(
+                "dep".to_string(),
+                "i0".to_string(),
+                "10.200.0.0/16",
+                Some("10.200.0.0/28"),
+                zlayer_core::DEFAULT_WG_PORT,
+                false,
+            )
+            .await
+            .expect("global overlay up");
+
+        // Seed a global peer so the guest config carries it through.
+        let (_p, other_pub) = OverlayTransport::generate_keys().await.unwrap();
+        let add = server
+            .handle(OverlaydRequest::AddPeer {
+                peer: PeerSpec {
+                    public_key: other_pub.clone(),
+                    endpoint: "9.9.9.9:51820".to_string(),
+                    allowed_ips: "10.200.1.0/28".to_string(),
+                    persistent_keepalive_secs: 25,
+                },
+                scope: PeerScope::Global,
+            })
+            .await;
+        assert!(
+            matches!(add, OverlaydResponse::Ok),
+            "seed peer add: {add:?}"
+        );
+
+        let resp = server
+            .handle(OverlaydRequest::AttachContainer {
+                handle: AttachHandle::GuestManaged {
+                    id: "vm-1".to_string(),
+                },
+                service: "web".to_string(),
+                join_global: true,
+                dns_server: Some("10.200.0.1".parse().unwrap()),
+                dns_domain: Some("overlay".to_string()),
+            })
+            .await;
+        let config = match resp {
+            OverlaydResponse::GuestConfig(c) => c,
+            other => panic!("expected GuestConfig, got {other:?}"),
+        };
+        assert!(!config.private_key.is_empty());
+        assert!(!config.public_key.is_empty());
+        assert_ne!(config.private_key, config.public_key);
+        assert_eq!(config.listen_port, server.overlay_port);
+        assert_eq!(config.dns_server, Some("10.200.0.1".parse().unwrap()));
+        // Peers = the seeded global peer + this node (self) + nothing else.
+        assert!(
+            config.peers.iter().any(|p| p.public_key == other_pub),
+            "guest must learn the seeded global peer"
+        );
+        assert!(
+            config
+                .peers
+                .iter()
+                .any(|p| Some(&p.public_key) == server.transport_public_key.as_ref()),
+            "guest must learn THIS node as a peer"
+        );
+        // The guest's own key is registered as a global peer (host route).
+        assert!(server.global_peers.contains_key(&config.public_key));
+        let info = server
+            .guest_attachments
+            .get("vm-1")
+            .expect("attachment recorded");
+        assert_eq!(info.overlay_ip, config.overlay_ip);
+
+        // Detach releases the peer + IP.
+        let det = server
+            .handle(OverlaydRequest::DetachContainer {
+                handle: AttachHandle::GuestManaged {
+                    id: "vm-1".to_string(),
+                },
+            })
+            .await;
+        assert!(matches!(det, OverlaydResponse::Ok), "detach: {det:?}");
+        assert!(!server.guest_attachments.contains_key("vm-1"));
+        assert!(!server.global_peers.contains_key(&config.public_key));
     }
 }

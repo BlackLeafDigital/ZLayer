@@ -136,6 +136,25 @@ build_kernel() {
   cp "${DEFCONFIG}" "${src_dir}/.config"
   make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
 
+  # Guard against silent `olddefconfig` drops. A symbol whose Kconfig deps are
+  # unmet (e.g. CONFIG_VIRTIO_NET when CONFIG_NETDEVICES is off — NETDEVICES is
+  # `default y if UML`, i.e. n on arm64) is silently removed, producing a kernel
+  # that boots but is missing a whole subsystem (this exact case shipped a guest
+  # with no NIC). Assert every load-bearing symbol survived as `=y`.
+  log "verifying required kernel symbols survived olddefconfig"
+  local required=(
+    CONFIG_NETDEVICES CONFIG_NET_CORE CONFIG_VIRTIO_NET CONFIG_WIREGUARD
+    CONFIG_VIRTIO_FS CONFIG_VIRTIO_VSOCKETS CONFIG_VIRTIO_BLK
+    CONFIG_OVERLAY_FS CONFIG_TMPFS
+  )
+  local missing=()
+  for sym in "${required[@]}"; do
+    grep -q "^${sym}=y$" "${src_dir}/.config" || missing+=("${sym}")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "olddefconfig dropped required symbol(s): ${missing[*]} — they are not =y in ${src_dir}/.config. Check their Kconfig deps in the kernel source and pin the missing parent symbol in kernel-arm64.defconfig."
+  fi
+
   log "building kernel Image (-j${JOBS})"
   make -C "${src_dir}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" -j"${JOBS}" Image
 

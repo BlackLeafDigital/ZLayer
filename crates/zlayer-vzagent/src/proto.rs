@@ -122,6 +122,49 @@ pub enum Msg {
     Stdin(Vec<u8>),
     /// Host → guest: stdin reached EOF; the guest closes the workload's stdin.
     StdinEof,
+    /// Host → guest: bring up the cross-node `WireGuard` overlay interface
+    /// (`zl-overlay0`) inside the guest and join the mesh.
+    ///
+    /// A VM has no host-visible netns/PID, so the host can't attach an overlay
+    /// veth by PID the way it does for Linux containers. Instead the host's
+    /// overlay daemon allocates this container's overlay identity (keypair +
+    /// address + the current peer set) and ships it here; the guest configures a
+    /// kernel `WireGuard` device itself. Keys are base64 (`WireGuard`/x25519). The
+    /// host generated the keypair and has already registered the matching public
+    /// key in the mesh, so peers route to this guest. `persistent_keepalive` on
+    /// each peer keeps the guest's NAT mapping open (the guest is behind VZ NAT).
+    OverlayConfig {
+        /// The guest's assigned overlay address (e.g. `10.42.0.7`).
+        overlay_ip: String,
+        /// Prefix length of the overlay network (for the interface address +
+        /// the on-link route), e.g. `16`.
+        prefix_len: u8,
+        /// Base64 `WireGuard` private key for the guest's overlay endpoint.
+        private_key: String,
+        /// UDP port the guest's `WireGuard` device listens on.
+        listen_port: u16,
+        /// The peers the guest should configure (other nodes/containers).
+        peers: Vec<WgPeer>,
+        /// Optional overlay DNS resolver IP to install for the container.
+        dns_server: Option<String>,
+        /// Optional overlay DNS search domain.
+        dns_domain: Option<String>,
+    },
+}
+
+/// A single `WireGuard` peer for [`Msg::OverlayConfig`]. Mirrors the host-side
+/// `zlayer_types::overlayd::PeerSpec` so the guest can apply it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgPeer {
+    /// Base64 `WireGuard` public key of the peer.
+    pub public_key: String,
+    /// `host:port` endpoint to send to. Empty string means "roaming"
+    /// (no fixed endpoint; learned from the peer's traffic).
+    pub endpoint: String,
+    /// Comma-separated CIDR list routed to this peer (e.g. `10.42.0.0/16`).
+    pub allowed_ips: String,
+    /// Persistent-keepalive interval in seconds (`0` disables it).
+    pub persistent_keepalive_secs: u64,
 }
 
 impl Msg {
@@ -141,6 +184,7 @@ impl Msg {
             Msg::Mount { .. } => 10,
             Msg::Stdin(_) => 11,
             Msg::StdinEof => 12,
+            Msg::OverlayConfig { .. } => 13,
         }
     }
 }
@@ -238,7 +282,7 @@ pub fn decode(body: &[u8]) -> Result<Msg> {
     let (&tag, payload) = body.split_first().ok_or(ProtoError::EmptyFrame)?;
     // Validate the tag up front so we surface a clear error instead of letting
     // postcard choke on a bad enum discriminant.
-    if !(1..=12).contains(&tag) {
+    if !(1..=13).contains(&tag) {
         return Err(ProtoError::UnknownTag(tag));
     }
     let msg: Msg = postcard::from_bytes(payload)?;
@@ -348,6 +392,40 @@ mod tests {
             Msg::Stdin(b"echo hi\n".to_vec()),
             Msg::Stdin(Vec::new()), // empty chunk
             Msg::StdinEof,
+            Msg::OverlayConfig {
+                overlay_ip: "10.42.0.7".into(),
+                prefix_len: 16,
+                private_key: "aGVsbG8gd29ybGQgcHJpdmF0ZSBrZXkgYmFzZTY0AA==".into(),
+                listen_port: 51820,
+                peers: vec![
+                    WgPeer {
+                        public_key: "cGVlciBwdWJsaWMga2V5IGJhc2U2NCBnb2VzIGhlcmU=".into(),
+                        endpoint: "203.0.113.5:51820".into(),
+                        allowed_ips: "10.42.0.0/16".into(),
+                        persistent_keepalive_secs: 25,
+                    },
+                    // Roaming peer: empty endpoint, no keepalive.
+                    WgPeer {
+                        public_key: "Um9hbWluZyBwZWVyIHB1YmtleSBiYXNlNjQgaGVyZQ==".into(),
+                        endpoint: String::new(),
+                        allowed_ips: "10.42.0.9/32".into(),
+                        persistent_keepalive_secs: 0,
+                    },
+                ],
+                dns_server: Some("10.42.0.1".into()),
+                dns_domain: Some("zlayer.local".into()),
+            },
+            // OverlayConfig with no peers / no DNS exercises the empty-Vec +
+            // Option::None paths.
+            Msg::OverlayConfig {
+                overlay_ip: "10.42.0.8".into(),
+                prefix_len: 24,
+                private_key: "YW5vdGhlciBwcml2YXRlIGtleSBpbiBiYXNlNjQgZm9ybQ==".into(),
+                listen_port: 0,
+                peers: vec![],
+                dns_server: None,
+                dns_domain: None,
+            },
         ]
     }
 

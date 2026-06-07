@@ -421,28 +421,78 @@ impl ServiceInstance {
                     };
                     #[cfg(not(target_os = "windows"))]
                     let attach_result: Option<std::net::IpAddr> = {
-                        if let Some(pid) = container_pid {
-                            match overlay_guard
-                                .attach_container(pid, &self.service_name, true)
-                                .await
-                            {
-                                Ok(ip) => Some(ip),
-                                Err(e) => {
-                                    tracing::warn!(
+                        match self.runtime.overlay_attach_kind() {
+                            // VM guest (macOS VZ-Linux): no host netns/PID, so
+                            // overlayd allocates the overlay identity and we push
+                            // it into the guest over vsock, where it brings up its
+                            // own kernel WireGuard device.
+                            crate::runtime::OverlayAttachKind::InGuestVsock => {
+                                let cid = id.to_string();
+                                match overlay_guard
+                                    .attach_container_guest(&cid, &self.service_name, true)
+                                    .await
+                                {
+                                    Ok(cfg) => {
+                                        let ip = cfg.overlay_ip;
+                                        match self.runtime.push_overlay_config(&id, &cfg).await {
+                                            Ok(()) => Some(ip),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    container = %id,
+                                                    error = %e,
+                                                    "failed to push overlay config into guest; rolling back allocation"
+                                                );
+                                                // Don't leak the overlayd IP/peer.
+                                                if let Err(de) =
+                                                    overlay_guard.detach_container_guest(&cid).await
+                                                {
+                                                    tracing::warn!(
+                                                        container = %id,
+                                                        error = %de,
+                                                        "failed to roll back guest overlay allocation"
+                                                    );
+                                                }
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            container = %id,
+                                            error = %e,
+                                            "failed to allocate guest overlay config from overlayd"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            // Host-process runtimes (Linux youki): plumb a veth
+                            // into the container's netns by PID.
+                            _ => {
+                                if let Some(pid) = container_pid {
+                                    match overlay_guard
+                                        .attach_container(pid, &self.service_name, true)
+                                        .await
+                                    {
+                                        Ok(ip) => Some(ip),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                container = %id,
+                                                error = %e,
+                                                "failed to attach container to overlay network"
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    // No PID available (e.g. WASM runtime) - skip overlay attachment
+                                    tracing::debug!(
                                         container = %id,
-                                        error = %e,
-                                        "failed to attach container to overlay network"
+                                        "skipping overlay attachment - no PID available"
                                     );
                                     None
                                 }
                             }
-                        } else {
-                            // No PID available (e.g. WASM runtime) - skip overlay attachment
-                            tracing::debug!(
-                                container = %id,
-                                "skipping overlay attachment - no PID available"
-                            );
-                            None
                         }
                     };
 
@@ -869,30 +919,48 @@ impl ServiceInstance {
                     // (`start_periodic_orphan_sweep`) catches anything we
                     // missed.
                     if let Some(overlay) = &self.overlay_manager {
-                        match self.runtime.get_container_pid(&id).await {
-                            Ok(Some(pid)) => {
-                                let overlay_guard = overlay.read().await;
-                                if let Err(e) = overlay_guard.detach_container(pid).await {
-                                    tracing::warn!(
-                                        container = %id,
-                                        pid,
-                                        error = %e,
-                                        "overlay detach_container failed; relying on orphan sweep"
-                                    );
-                                }
-                            }
-                            Ok(None) => {
-                                tracing::debug!(
-                                    container = %id,
-                                    "no PID available for overlay detach (already exited or non-Linux runtime)"
-                                );
-                            }
-                            Err(e) => {
+                        // VM guests have no host veth/PID — release the overlayd
+                        // allocation (IP + registered mesh peer) by container id
+                        // instead of by PID.
+                        if self.runtime.overlay_attach_kind()
+                            == crate::runtime::OverlayAttachKind::InGuestVsock
+                        {
+                            let overlay_guard = overlay.read().await;
+                            if let Err(e) =
+                                overlay_guard.detach_container_guest(&id.to_string()).await
+                            {
                                 tracing::warn!(
                                     container = %id,
                                     error = %e,
-                                    "failed to query container PID for overlay detach"
+                                    "overlay detach_container_guest failed; relying on orphan sweep"
                                 );
+                            }
+                        } else {
+                            match self.runtime.get_container_pid(&id).await {
+                                Ok(Some(pid)) => {
+                                    let overlay_guard = overlay.read().await;
+                                    if let Err(e) = overlay_guard.detach_container(pid).await {
+                                        tracing::warn!(
+                                            container = %id,
+                                            pid,
+                                            error = %e,
+                                            "overlay detach_container failed; relying on orphan sweep"
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        container = %id,
+                                        "no PID available for overlay detach (already exited or non-Linux runtime)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        container = %id,
+                                        error = %e,
+                                        "failed to query container PID for overlay detach"
+                                    );
+                                }
                             }
                         }
                     }

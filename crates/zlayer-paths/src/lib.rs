@@ -504,7 +504,7 @@ impl ZLayerDirs {
         Ok(zlayer_types::ScratchFile::from_named(nf))
     }
 
-    /// Data-dir-aware WireGuard UAPI socket directory.
+    /// Data-dir-aware `WireGuard` UAPI socket directory.
     ///
     /// When `data_dir == Self::default_data_dir()`, returns
     /// `/var/run/wireguard` (FHS default — also where `wg(8)` looks).

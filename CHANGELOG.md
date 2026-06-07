@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.58.0 - 2026-06-07
+
+### Fixed
+- **macOS VZ-Linux guest had NO network (only `lo`).** Root cause: `images/vz-linux/kernel-arm64.defconfig` set `CONFIG_VIRTIO_NET=y` but omitted `CONFIG_NETDEVICES=y`. `NETDEVICES` is `default y if UML` (→ `n` on arm64) and `VIRTIO_NET`/`NET_CORE`/`WIREGUARD` live inside its `if NETDEVICES` block, so `make olddefconfig` silently dropped the NIC driver — the guest booted with no `eth0`. Added `CONFIG_NETDEVICES=y` (+ `CONFIG_WIREGUARD=y` for the overlay), plus a `build.sh` post-`olddefconfig` guard that fails the build if any load-bearing symbol (`NETDEVICES`/`VIRTIO_NET`/`VIRTIO_FS`/`VIRTIO_VSOCKETS`/`VIRTIO_BLK`/`WIREGUARD`/`OVERLAY_FS`/`TMPFS`/`NET_CORE`) isn't `=y`. With the NIC present the guest now DHCPs a `192.168.64.x` NAT lease (outbound + host↔guest work). Also: `wait_for_eth` now selects the ARPHRD_ETHER device instead of the kernel's auto-created `sit0` tunnel; `get_container_ip` resolves the real NAT lease (overlay IP → NAT lease → loopback). (`images/vz-linux/{kernel-arm64.defconfig,build.sh}`, `crates/zlayer-vzagent/src/main.rs`, `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+
+### Added
+- **Cross-node WireGuard overlay is now injected into macOS VZ-Linux guests** (previously skipped — a VM has no host PID/netns for the veth-by-PID attach). New `Runtime::overlay_attach_kind()` (`HostNetns`/`HostIp`/`InGuestVsock`) + `Runtime::push_overlay_config()`; `CompositeRuntime` forwards both to its VZ-Linux delegate; VZ `get_container_pid` returns a stable pseudo-PID so PID-gated bookkeeping runs. overlayd gained `AttachHandle::GuestManaged` → `OverlaydResponse::GuestConfig(GuestOverlayConfig)`, which allocates the overlay IP + WireGuard keypair + peer set and registers the guest's public key in the mesh. The host ships it as `proto::Msg::OverlayConfig` (tag 13) over a fresh vsock control connection (reliably: half-close + drain to EOF), and the in-guest agent brings up a **kernel WireGuard** `zl-overlay0` via netlink. (`crates/zlayer-agent/src/{runtime.rs,service.rs,overlay_manager.rs,runtimes/{macos_vz_linux,composite}.rs}`, `crates/zlayer-overlayd/src/server.rs`, `crates/zlayer-types/src/overlayd.rs`, `crates/zlayer-vzagent/src/{proto.rs,main.rs,linux/overlay.rs}`)
+
+### Changed
+- **VZ-Linux boot latency trimmed** (~12.9s → ~6.6s): the guest agent now brings up networking on a background thread overlapping rootfs assembly (joined before `pivot_root`), and the `NETDEVICES` fix lets DHCP succeed in ~1s instead of udhcpc timing out. (`crates/zlayer-vzagent/src/main.rs`)
+
 ## 0.57.0 - 2026-06-06
 
 ### Changed

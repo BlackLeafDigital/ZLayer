@@ -80,8 +80,8 @@
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{
-    ContainerId, ContainerState, LogChannel, LogChunk, LogsStream, LogsStreamOptions, Runtime,
-    StatsSample, StatsStream,
+    ContainerId, ContainerState, LogChannel, LogChunk, LogsStream, LogsStreamOptions,
+    OverlayAttachKind, Runtime, StatsSample, StatsStream,
 };
 use crate::runtimes::macos_vz_shared::{
     self, clamp_cpu_count, clamp_memory_bytes, clone_or_copy, file_url, read_vm_state,
@@ -226,6 +226,12 @@ pub(crate) struct VzLinuxContainer {
     /// it emits a final `Msg::StdinEof`. `None` before `start_container` wires
     /// the channel (and after `close_stdin` clears it).
     stdin_tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// The container's overlay (`WireGuard`) address inside the cross-node mesh,
+    /// set once `attach_overlay` has pushed a `Msg::OverlayConfig` into the guest
+    /// and the in-guest `zl-overlay0` interface is up. `get_container_ip` prefers
+    /// this over the NAT lease so service-mesh routing/DNS uses the overlay IP.
+    /// `None` until the overlay is attached (or when the runtime has no overlay).
+    overlay_ip: Option<IpAddr>,
 }
 
 /// A spawned host-port forwarder for a published container port.
@@ -319,6 +325,24 @@ impl VzLinuxRuntime {
     /// `"{service}-{replica}"` — the per-container directory / map key.
     fn container_dir_name(id: &ContainerId) -> String {
         format!("{}-{}", id.service, id.replica)
+    }
+
+    /// A stable, nonzero pseudo-PID for a VZ container.
+    ///
+    /// A VM has no host-visible PID, but the overlay-attach contract wants a
+    /// `Some(pid)` so PID-gated bookkeeping runs (see [`get_container_pid`]). We
+    /// hash the container id into the high half of the u32 space (bit 31 set) so
+    /// it can never collide with a real low host PID, and force it nonzero.
+    ///
+    /// [`get_container_pid`]: Runtime::get_container_pid
+    fn pseudo_pid(id: &ContainerId) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        id.service.hash(&mut h);
+        id.replica.hash(&mut h);
+        // Take the low 31 bits (always fits in u32, so try_from can't fail),
+        // then set the top bit so it's high-half + guaranteed nonzero.
+        u32::try_from(h.finish() & 0x7fff_ffff).unwrap_or(0) | 0x8000_0000
     }
 
     /// `{data_dir}/vz/linux` — the runtime's base directory.
@@ -1516,6 +1540,46 @@ fn signal_agent(live: &LiveVm, signum: i32) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Open a fresh vsock control connection and send a single
+/// [`proto::Msg::OverlayConfig`] frame so the guest brings up its in-guest
+/// `WireGuard` overlay interface (`zl-overlay0`).
+///
+/// Unlike [`signal_agent`] (which can write-and-drop because a missed signal is
+/// retried), this keeps the connection open until the guest has read AND
+/// processed the frame: after writing, we half-close our write end and read to
+/// EOF. The guest's control loop reads the `OverlayConfig`, applies it, then its
+/// next read sees our EOF, breaks, and closes — which unblocks our read. This
+/// avoids racing the connection close against the guest's accept/read: a bare
+/// write+drop sent immediately after `Run` can drop the queued frame if the
+/// guest hasn't accepted the connection yet. A read timeout bounds the wait so a
+/// misbehaving guest can't wedge the (blocking) caller task. Any reply frame the
+/// guest sends back (e.g. a `Msg::Error` on apply failure) is drained here.
+fn push_overlay_agent(live: &LiveVm, msg: &proto::Msg) -> std::result::Result<bool, String> {
+    use std::io::Read as _;
+    let mut stream = connect_vsock(live)?;
+    proto::write_frame(&mut stream, msg).map_err(|e| format!("send OverlayConfig failed: {e}"))?;
+    // Bound the post-write wait; the guest typically closes within a few hundred
+    // ms (read frame -> apply -> next read hits EOF -> close). Returns whether we
+    // observed the guest close the connection (EOF) — i.e. it actually consumed
+    // the frame — vs. a timeout/reset (the frame may not have been processed).
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut sink = [0u8; 256];
+    let mut saw_eof = false;
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => {
+                // Guest closed: it finished reading + applying.
+                saw_eof = true;
+                break;
+            }
+            Ok(_) => {}      // drain any reply frame bytes, keep reading
+            Err(_) => break, // timeout / reset: don't wedge the caller
+        }
+    }
+    Ok(saw_eof)
+}
+
 /// Resolve the authoritative terminal [`ContainerState`] from a workload's
 /// captured outcome, given an optional `fallback` for when nothing terminal has
 /// been recorded yet (e.g. the live VM's reconciled state, or a forced-stop
@@ -1826,6 +1890,7 @@ impl Runtime for VzLinuxRuntime {
             cleanup_task: None,
             port_forwards: Vec::new(),
             stdin_tx: None,
+            overlay_ip: None,
         };
 
         self.containers.write().await.insert(dir_name, container);
@@ -2581,28 +2646,129 @@ impl Runtime for VzLinuxRuntime {
         Ok(Box::pin(stream::iter(initial).chain(follow)))
     }
 
-    async fn get_container_pid(&self, _id: &ContainerId) -> Result<Option<u32>> {
-        // A VM has no host-visible container PID.
-        Ok(None)
+    async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
+        // A VM has no host-visible container PID. Per the overlay-attach contract
+        // we report a stable, nonzero *pseudo*-PID derived from the container id
+        // (`use the containerID as the process ID`) so PID-gated bookkeeping —
+        // the service layer's liveness check and overlay-attach gate — proceeds
+        // instead of short-circuiting at "PID unavailable". The pseudo-PID is
+        // never used as a real host PID: VZ overlay attach goes through
+        // `push_overlay_config` (`OverlayAttachKind::InGuestVsock`), not
+        // netns-by-PID. Returns `None` when the VM is not live (mirrors a stopped
+        // container having no PID).
+        let dir_name = Self::container_dir_name(id);
+        let guard = self.containers.read().await;
+        match guard.get(&dir_name) {
+            Some(c) if c.live.is_some() => Ok(Some(Self::pseudo_pid(id))),
+            _ => Ok(None),
+        }
+    }
+
+    fn overlay_attach_kind(&self) -> OverlayAttachKind {
+        // A VZ guest is a VM with no host netns/PID: the host can't plumb a veth
+        // by PID. The service layer instead asks overlayd for a guest-managed
+        // config and pushes it into the guest over vsock (`push_overlay_config`).
+        OverlayAttachKind::InGuestVsock
+    }
+
+    async fn push_overlay_config(
+        &self,
+        id: &ContainerId,
+        config: &zlayer_types::overlayd::GuestOverlayConfig,
+    ) -> Result<()> {
+        let dir_name = Self::container_dir_name(id);
+
+        // Build the wire message from the host-allocated overlay identity.
+        let msg = proto::Msg::OverlayConfig {
+            overlay_ip: config.overlay_ip.to_string(),
+            prefix_len: config.prefix_len,
+            private_key: config.private_key.clone(),
+            listen_port: config.listen_port,
+            peers: config
+                .peers
+                .iter()
+                .map(|p| proto::WgPeer {
+                    public_key: p.public_key.clone(),
+                    endpoint: p.endpoint.clone(),
+                    allowed_ips: p.allowed_ips.clone(),
+                    persistent_keepalive_secs: p.persistent_keepalive_secs,
+                })
+                .collect(),
+            dns_server: config.dns_server.map(|ip| ip.to_string()),
+            dns_domain: config.dns_domain.clone(),
+        };
+
+        // Snapshot a queue-handle clone of the live VM (the container must be
+        // running to receive the config).
+        let live = {
+            let guard = self.containers.read().await;
+            let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
+                container: dir_name.clone(),
+                reason: "not found".to_string(),
+            })?;
+            c.live.as_ref().map(|l| LiveVm {
+                queue: l.queue.clone(),
+                vm: Arc::clone(&l.vm),
+            })
+        };
+        let Some(live) = live else {
+            return Err(AgentError::Network(format!(
+                "cannot push overlay config to {dir_name}: VM is not live"
+            )));
+        };
+
+        // The vsock connect + frame write are synchronous; run them off-runtime.
+        let saw_eof = tokio::task::spawn_blocking(move || push_overlay_agent(&live, &msg))
+            .await
+            .map_err(|e| AgentError::Network(format!("overlay push task join failed: {e}")))?
+            .map_err(AgentError::Network)?;
+        tracing::info!(
+            container = %dir_name,
+            guest_acked = saw_eof,
+            "pushed OverlayConfig to guest over vsock"
+        );
+
+        // Record the overlay IP so `get_container_ip` reports it (mesh routing /
+        // DNS prefer the overlay address over the NAT lease).
+        if let Some(c) = self.containers.write().await.get_mut(&dir_name) {
+            c.overlay_ip = Some(config.overlay_ip);
+        }
+        Ok(())
     }
 
     async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>> {
         use std::net::Ipv4Addr;
         let dir_name = Self::container_dir_name(id);
-        // Reachability to a VZ-Linux guest is NOT via a guest NAT IP: on this
-        // macOS, Virtualization.framework's NAT never establishes a usable
-        // vmnet/DHCP lease for our process, so the guest never gets one we can
-        // route to. Instead each published port is reachable through a host
-        // loopback forwarder that tunnels the connection over vsock into the
-        // guest (see `run_port_forward`). So while the VM is live we report
-        // loopback — that is the address callers (service.rs/proxy_manager.rs)
-        // can actually reach the workload on. `Ok(None)` when not running or for
-        // an unknown container.
-        let guard = self.containers.read().await;
-        match guard.get(&dir_name) {
-            Some(c) if c.live.is_some() => Ok(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
-            _ => Ok(None),
+        // Resolution order for a live VZ-Linux guest:
+        //   1. The overlay (`WireGuard`) IP, once `attach_overlay` has brought up
+        //      `zl-overlay0` in the guest — this is the cross-node mesh address
+        //      callers should prefer for service routing/DNS.
+        //   2. The guest's NAT lease (`192.168.64.x`). The host's NAT DHCP server
+        //      writes the lease to `/var/db/dhcpd_leases` keyed by the per-VM MAC
+        //      once the guest's virtio-net device DHCPs (the in-guest agent runs
+        //      udhcpc); we resolve it via `current_guest_ip`. The NAT subnet is
+        //      directly host-reachable, so `guest_ip:port` works with no proxy.
+        //   3. Loopback fallback — for environments where no lease appears, each
+        //      published port is still reachable through the host loopback
+        //      forwarder that tunnels over vsock (see `PortForward`).
+        // `Ok(None)` when not running or for an unknown container.
+        let mac = {
+            let guard = self.containers.read().await;
+            match guard.get(&dir_name) {
+                Some(c) if c.live.is_some() => {
+                    if let Some(ip) = c.overlay_ip {
+                        return Ok(Some(ip));
+                    }
+                    c.mac.clone()
+                }
+                _ => return Ok(None),
+            }
+        };
+        // Lock released before the (async) lease read.
+        if let Some(ip) = macos_vz_shared::current_guest_ip(&mac).await {
+            return Ok(Some(ip));
         }
+        Ok(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
     }
 
     async fn port_mappings_container(

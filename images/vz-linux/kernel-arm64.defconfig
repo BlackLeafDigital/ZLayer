@@ -76,6 +76,13 @@ CONFIG_EXT4_FS=y
 CONFIG_EXT4_USE_FOR_EXT2=y
 
 # --- Networking core + kernel-level DHCP (ip=dhcp) --------------------------
+# CONFIG_NETDEVICES is `default y if UML` in drivers/net/Kconfig — i.e. it
+# defaults to *n* on arm64. CONFIG_VIRTIO_NET, CONFIG_NET_CORE and
+# CONFIG_WIREGUARD all live inside the `if NETDEVICES` block, so without this
+# pinned =y `make olddefconfig` SILENTLY DROPS them and the guest boots with no
+# NIC (only `lo`). This single missing line was the root cause of VZ guests
+# having no network. The build.sh post-olddefconfig guard asserts it stuck.
+CONFIG_NETDEVICES=y
 CONFIG_NET=y
 CONFIG_INET=y
 CONFIG_PACKET=y
@@ -84,6 +91,11 @@ CONFIG_IP_PNP=y
 CONFIG_IP_PNP_DHCP=y
 CONFIG_IP_PNP_BOOTP=y
 CONFIG_NET_CORE=y
+
+# --- WireGuard (in-guest overlay netdev; configured over vsock by vzagent) ---
+# Also gated by NETDEVICES. Depends on NET && INET; its crypto libs
+# (curve25519 / chacha20poly1305) are auto-`select`ed by olddefconfig.
+CONFIG_WIREGUARD=y
 
 # --- Namespaces (container isolation) ---------------------------------------
 CONFIG_NAMESPACES=y

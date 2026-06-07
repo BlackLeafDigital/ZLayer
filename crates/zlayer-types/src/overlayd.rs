@@ -75,6 +75,16 @@ pub enum AttachHandle {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ip: Option<IpAddr>,
     },
+    /// A guest that manages its own overlay interface (the macOS VZ-Linux VM
+    /// runtime). overlayd cannot enter the guest's netns (it is a VM, not a host
+    /// process), so instead of building a veth it **allocates the overlay
+    /// identity** — keypair, address, and the current peer set — registers the
+    /// generated public key in the mesh, and returns it as
+    /// [`OverlaydResponse::GuestConfig`]. The caller ships that config into the
+    /// guest (over vsock) where a kernel `WireGuard` device is brought up. `id` is
+    /// the opaque container id used to scope the allocation + the registered
+    /// peer so `DetachContainer` can release it.
+    GuestManaged { id: String },
 }
 
 /// A request from the main daemon to overlayd.
@@ -181,6 +191,10 @@ pub enum OverlaydResponse {
     Ip { ip: IpAddr },
     /// A completed container attach.
     Attached(AttachResult),
+    /// The overlay identity for a guest-managed attach
+    /// ([`AttachHandle::GuestManaged`]): the keypair, allocated address, and the
+    /// peer set the guest should configure on its own `WireGuard` device.
+    GuestConfig(GuestOverlayConfig),
     /// The interface/bridge/network name created (`SetupServiceOverlay`,
     /// `SetupGlobalOverlay`).
     BridgeName { name: String },
@@ -221,6 +235,36 @@ pub struct AttachResult {
     /// the compute-system document. `None` on Linux (no HCN namespace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_guid: Option<String>,
+}
+
+/// Overlay identity returned for a guest-managed attach
+/// ([`AttachHandle::GuestManaged`] → [`OverlaydResponse::GuestConfig`]).
+///
+/// The host allocated the address from the node slice, generated the keypair,
+/// and registered `public_key` in the mesh (so peers route to the guest). The
+/// caller ships everything except `public_key` into the guest; `public_key` is
+/// echoed back so the caller can record/deregister the peer it represents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestOverlayConfig {
+    /// The guest's allocated overlay address.
+    pub overlay_ip: IpAddr,
+    /// Prefix length of the overlay network (interface address + on-link route).
+    pub prefix_len: u8,
+    /// Base64 `WireGuard` private key for the guest's overlay endpoint.
+    pub private_key: String,
+    /// Base64 `WireGuard` public key matching `private_key` (registered in the
+    /// mesh by overlayd; echoed for the caller's bookkeeping).
+    pub public_key: String,
+    /// UDP port the guest's `WireGuard` device should listen on.
+    pub listen_port: u16,
+    /// The peers the guest should configure (other nodes/containers).
+    pub peers: Vec<PeerSpec>,
+    /// Overlay DNS resolver IP for the container, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_server: Option<IpAddr>,
+    /// Overlay DNS search domain, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_domain: Option<String>,
 }
 
 /// Which overlay device a peer / `AllowedIP` op targets. `Global` (default, and

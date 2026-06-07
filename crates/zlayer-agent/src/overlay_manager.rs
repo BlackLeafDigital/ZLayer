@@ -564,6 +564,60 @@ impl OverlayManager {
         }
     }
 
+    /// Attach a guest-managed container (a VM with no host netns/PID) to the
+    /// overlay by asking overlayd to allocate the overlay identity (keypair +
+    /// address + the current peer set) and register the generated public key in
+    /// the mesh. The caller ships the returned [`GuestOverlayConfig`] into the
+    /// guest (over vsock) where it brings up its own `WireGuard` device.
+    ///
+    /// `id` is the opaque container id used to scope the allocation so a later
+    /// [`detach_container_guest`](OverlayManager::detach_container_guest) can
+    /// release the address + remove the peer.
+    ///
+    /// # Errors
+    /// Returns an error if overlayd cannot allocate/register the guest.
+    pub async fn attach_container_guest(
+        &self,
+        id: &str,
+        service_name: &str,
+        join_global: bool,
+    ) -> Result<zlayer_types::overlayd::GuestOverlayConfig, AgentError> {
+        let resp = self
+            .call(OverlaydRequest::AttachContainer {
+                handle: AttachHandle::GuestManaged { id: id.to_string() },
+                service: service_name.to_string(),
+                join_global,
+                dns_server: self.dns_server_addr.map(|sa| sa.ip()),
+                dns_domain: self.dns_domain.clone(),
+            })
+            .await?;
+        match resp {
+            OverlaydResponse::GuestConfig(cfg) => Ok(cfg),
+            other => Err(AgentError::Network(format!(
+                "overlayd AttachContainer(GuestManaged) returned unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Detach a guest-managed container: release its overlay IP and remove its
+    /// registered mesh peer.
+    ///
+    /// # Errors
+    /// Returns an error if overlayd cannot detach the container.
+    pub async fn detach_container_guest(&self, id: &str) -> Result<(), AgentError> {
+        let resp = self
+            .call(OverlaydRequest::DetachContainer {
+                handle: AttachHandle::GuestManaged { id: id.to_string() },
+            })
+            .await?;
+        match resp {
+            OverlaydResponse::Ok => Ok(()),
+            other => Err(AgentError::Network(format!(
+                "overlayd DetachContainer(GuestManaged) returned unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     /// Register a Windows HCN container with overlayd and return its overlay IP
     /// plus the overlayd-created namespace GUID.
     ///

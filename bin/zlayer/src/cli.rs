@@ -1539,7 +1539,7 @@ pub(crate) enum DaemonAction {
     ///
     /// The rootless macOS install re-execs this under `sudo` ONLY when the
     /// overlay binary or its plist actually changed, so registering the overlay
-    /// (which owns a system-level WireGuard/utun adapter) is the single
+    /// (which owns a system-level `WireGuard`/utun adapter) is the single
     /// privileged step of an otherwise user-owned install. Not intended for
     /// direct use.
     #[command(name = "_install-overlayd", hide = true)]

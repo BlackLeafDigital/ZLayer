@@ -78,6 +78,11 @@ mod linux {
 
     use zlayer_vzagent::proto::{self, Msg};
 
+    // The in-guest WireGuard overlay bring-up (`Msg::OverlayConfig`). Lives in
+    // its own module but uses this module's `Error`/`err`/`Result` helpers.
+    #[path = "overlay.rs"]
+    mod overlay;
+
     /// vsock address-family constant (Linux `AF_VSOCK`).
     const AF_VSOCK: libc::c_int = 40;
     /// "any CID" wildcard for binding a vsock listener.
@@ -478,17 +483,32 @@ mod linux {
         Ok(())
     }
 
-    /// Wait up to `timeout` for the first non-loopback network interface to
-    /// appear in `/sys/class/net`, returning its name. virtio-net is probed
-    /// asynchronously, so the NIC may not exist the instant PID 1 runs.
+    /// Wait up to `timeout` for the guest's *ethernet* NIC (the virtio-net
+    /// device) to appear in `/sys/class/net`, returning its name. virtio-net is
+    /// probed asynchronously, so the NIC may not exist the instant PID 1 runs.
+    ///
+    /// We must NOT just grab the first non-loopback interface: the kernel
+    /// auto-creates an IPv6-in-IPv4 tunnel `sit0` (ARPHRD_SIT) as soon as the
+    /// `sit` module is present, and directory order is unspecified, so a naive
+    /// scan can pick `sit0` and run DHCP on the wrong (useless) interface while
+    /// the real `eth0` stays down. Filter on `/sys/class/net/<if>/type ==
+    /// ARPHRD_ETHER (1)`, which selects virtio-net and excludes `lo` (772),
+    /// `sit0` (776), and other tunnels.
     fn wait_for_eth(timeout: std::time::Duration) -> Option<String> {
+        const ARPHRD_ETHER: &str = "1";
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Ok(entries) = fs::read_dir("/sys/class/net") {
                 for e in entries.flatten() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    if name != "lo" {
-                        return Some(name);
+                    if name == "lo" {
+                        continue;
+                    }
+                    // Only consider real ethernet links (virtio-net is ETHER).
+                    let type_path = format!("/sys/class/net/{name}/type");
+                    match fs::read_to_string(&type_path) {
+                        Ok(t) if t.trim() == ARPHRD_ETHER => return Some(name),
+                        _ => continue,
                     }
                 }
             }
@@ -1102,7 +1122,10 @@ mod linux {
                 // Host closed before sending anything: nothing to do.
                 Ok(())
             }
-            Err(e) => Err(Error::from(e)),
+            Err(e) => {
+                eprintln!("zlayer-vzagent: control conn read_frame error: {e}");
+                Err(Error::from(e))
+            }
         }
     }
 
@@ -1266,6 +1289,42 @@ mod linux {
                 Msg::StdinEof => {
                     close_workload_stdin();
                 }
+                Msg::OverlayConfig {
+                    overlay_ip,
+                    prefix_len,
+                    private_key,
+                    listen_port,
+                    peers,
+                    dns_server,
+                    dns_domain,
+                } => {
+                    // Stand up the in-guest kernel WireGuard overlay
+                    // (`zl-overlay0`) and join the mesh. Like `bring_up_network`,
+                    // a failure here is reported to the host but never aborts the
+                    // agent: a workload that doesn't use the overlay is
+                    // unaffected, and PID 1 must stay alive.
+                    if let Err(e) = overlay::apply_overlay_config(
+                        &overlay_ip,
+                        prefix_len,
+                        &private_key,
+                        listen_port,
+                        &peers,
+                        dns_server.as_deref(),
+                        dns_domain.as_deref(),
+                    ) {
+                        eprintln!("zlayer-vzagent: overlay bring-up failed: {e}");
+                        let _ = tx.send(Msg::Error {
+                            message: format!("OverlayConfig failed: {e}"),
+                        });
+                    } else {
+                        eprintln!(
+                            "zlayer-vzagent: overlay {} up on {} ({} peer(s))",
+                            overlay_ip,
+                            overlay::OVERLAY_IFNAME,
+                            peers.len()
+                        );
+                    }
+                }
                 // Guest→host-only messages are never expected from the host;
                 // reply with an error rather than silently dropping them.
                 other => {
@@ -1295,8 +1354,26 @@ mod linux {
         }
 
         mount_core_filesystems()?;
+
+        // Bring up the guest NIC + DHCP concurrently with assembling the
+        // container root, to overlap the DHCP round-trip with the virtiofs /
+        // overlay mounts. It MUST finish before `pivot_into_newroot`: it relies
+        // on the initramfs busybox/udhcpc and writes into the initramfs `/etc`,
+        // both of which the pivot swaps away — so we join it before pivoting.
+        // `bring_up_network` only reads `/sys/class/net` and operates on the NIC
+        // + sockets, which don't overlap the `/newroot` mounts `assemble_*` does.
+        let net_thread = thread::Builder::new()
+            .name("vzagent-net".into())
+            .spawn(|| {
+                if let Err(e) = bring_up_network() {
+                    eprintln!("zlayer-vzagent: network bring-up failed: {e}");
+                }
+            })
+            .map_err(|e| err(format!("spawn net thread: {e}")))?;
         assemble_container_root()?;
-        bring_up_network()?;
+        // Join before pivot (see above). A panicked net thread is non-fatal —
+        // networking is best-effort, exactly as the inline path was.
+        let _ = net_thread.join();
         pivot_into_newroot()?;
 
         // Initialize the global reaper registry and start the SINGLE dedicated
