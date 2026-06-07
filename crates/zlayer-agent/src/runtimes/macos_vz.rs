@@ -782,7 +782,9 @@ impl Runtime for VzRuntime {
         // appending output to the console log. Failures here don't fail start —
         // the VM is up; the entrypoint is the workload.
         let containers = Arc::clone(&self.containers);
-        let entry = resolve_entrypoint(&spec);
+        // macOS-guest VMs run a macOS bundle, not an OCI image, so there is no
+        // image config to merge — pass `None` (spec command / `true` fallback).
+        let entry = resolve_entrypoint(&spec, None);
         let user = ssh_user(&spec);
         let dir_bg = dir_name.clone();
         tokio::spawn(async move {
@@ -1130,7 +1132,7 @@ mod tests {
     #[test]
     fn resolve_entrypoint_falls_back_to_true() {
         let spec = ServiceSpec::minimal("svc", "ghcr.io/x/macos:latest");
-        assert_eq!(resolve_entrypoint(&spec), vec!["true".to_string()]);
+        assert_eq!(resolve_entrypoint(&spec, None), vec!["true".to_string()]);
     }
 
     /// Full create -> start -> exec -> stop against a real macOS guest.

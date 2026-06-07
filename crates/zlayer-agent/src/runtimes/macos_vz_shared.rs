@@ -25,6 +25,7 @@ use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_virtualization::{
     VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
+use zlayer_registry::ImageConfig;
 use zlayer_spec::ServiceSpec;
 
 // ---------------------------------------------------------------------------
@@ -122,24 +123,130 @@ pub(crate) fn spec_memory_mib(spec: &ServiceSpec, default: u32, floor: u32) -> u
         .max(floor)
 }
 
-/// Resolve the entrypoint command from a [`ServiceSpec`]. Falls back to a no-op
-/// `true` so a bare image still "runs".
-pub(crate) fn resolve_entrypoint(spec: &ServiceSpec) -> Vec<String> {
-    if let Some(ep) = &spec.command.entrypoint {
-        if !ep.is_empty() {
-            let mut out = ep.clone();
-            if let Some(args) = &spec.command.args {
-                out.extend(args.iter().cloned());
+/// Resolve the effective container command (`argv`) by merging the spec's
+/// command overrides with the OCI **image config** (`Entrypoint`/`Cmd`), per
+/// Docker/OCI semantics. Falls back to a no-op `true` only when neither the
+/// spec nor the image supplies any command (so a bare, configless image still
+/// "runs" rather than failing to exec).
+///
+/// Resolution rules (matching `docker run` / the OCI runtime spec):
+/// - spec **entrypoint** set (non-empty):
+///   - argv = spec entrypoint + (spec args if set, else the image's `Cmd`).
+/// - spec **entrypoint** NOT set:
+///   - spec args set (non-empty): argv = image `Entrypoint` (if any) + spec args.
+///   - spec args NOT set:          argv = image `Entrypoint` + image `Cmd`.
+/// - If the merged result is still empty, fall back to `["true"]`.
+pub(crate) fn resolve_entrypoint(spec: &ServiceSpec, image: Option<&ImageConfig>) -> Vec<String> {
+    let image_entrypoint = image.and_then(|c| c.entrypoint.clone()).unwrap_or_default();
+    let image_cmd = image.and_then(|c| c.cmd.clone()).unwrap_or_default();
+
+    let mut argv: Vec<String> = Vec::new();
+
+    if let Some(ep) = spec.command.entrypoint.as_ref().filter(|e| !e.is_empty()) {
+        // Spec overrides the entrypoint; args come from the spec if given, else
+        // the image's default Cmd (Docker resets Cmd only when the IMAGE's
+        // entrypoint changes — a spec entrypoint override keeps image Cmd).
+        argv.extend(ep.iter().cloned());
+        match spec.command.args.as_ref() {
+            Some(cmd_args) => argv.extend(cmd_args.iter().cloned()),
+            None => argv.extend(image_cmd),
+        }
+    } else if let Some(cmd_args) = spec.command.args.as_ref().filter(|a| !a.is_empty()) {
+        // Spec supplies only args (== Docker CMD override): they are appended to
+        // the image's Entrypoint (if the image has one).
+        argv.extend(image_entrypoint);
+        argv.extend(cmd_args.iter().cloned());
+    } else {
+        // No spec command at all: use the image defaults verbatim.
+        argv.extend(image_entrypoint);
+        argv.extend(image_cmd);
+    }
+
+    if argv.is_empty() {
+        return vec!["true".to_string()];
+    }
+    argv
+}
+
+/// Merge the workload environment: the OCI image config's `Env` list provides
+/// the base (`PATH`, image-specific vars postgres/forgejo rely on), with the
+/// spec's environment layered ON TOP (spec/compose values win for the same key).
+/// Returns `(KEY, VALUE)` pairs in a stable order: image vars first (in image
+/// order, minus any the spec overrides), then spec vars (in spec order).
+pub(crate) fn merge_env(spec: &ServiceSpec, image: Option<&ImageConfig>) -> Vec<(String, String)> {
+    // Spec env keys win — collect them first so we can skip image vars they shadow.
+    let spec_keys: std::collections::HashSet<&str> =
+        spec.env.keys().map(String::as_str).collect();
+
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    if let Some(img_env) = image.and_then(|c| c.env.as_ref()) {
+        for entry in img_env {
+            // Image env entries are `KEY=VALUE`; a value may itself contain `=`.
+            let (key, value) = match entry.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (entry.clone(), String::new()),
+            };
+            if !spec_keys.contains(key.as_str()) {
+                out.push((key, value));
             }
-            return out;
         }
     }
-    if let Some(args) = &spec.command.args {
-        if !args.is_empty() {
-            return args.clone();
-        }
+
+    for (k, v) in &spec.env {
+        out.push((k.clone(), v.clone()));
     }
-    vec!["true".to_string()]
+
+    out
+}
+
+/// Resolve the workload working directory: the spec's workdir wins; otherwise
+/// the image config's `WorkingDir` (when non-empty); otherwise `None` (the guest
+/// agent defaults to `/`).
+pub(crate) fn resolve_workdir(spec: &ServiceSpec, image: Option<&ImageConfig>) -> Option<String> {
+    if let Some(w) = spec.command.workdir.as_ref().filter(|w| !w.is_empty()) {
+        return Some(w.clone());
+    }
+    image
+        .and_then(|c| c.working_dir.as_ref())
+        .filter(|w| !w.is_empty())
+        .cloned()
+}
+
+/// Resolve the workload `(uid, gid)`: the spec's `user` wins; otherwise the
+/// image config's `User`. Both are parsed by [`parse_user`] which honours numeric
+/// `uid` / `uid:gid` and falls back to `0:0` for names it cannot resolve on the
+/// host (the guest carries its own `/etc/passwd`). A non-root NUMERIC image user
+/// is therefore preserved; a NAME-form image user (e.g. `postgres`) currently
+/// degrades to `0:0` — documented limitation, not a silent drop of the field.
+pub(crate) fn resolve_user(spec: &ServiceSpec, image: Option<&ImageConfig>) -> (u32, u32) {
+    let chosen = spec
+        .user
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            image
+                .and_then(|c| c.user.as_deref())
+                .filter(|u| !u.is_empty())
+        });
+    parse_user(chosen)
+}
+
+/// Parse a Docker-style user value (`"uid"` or `"uid:gid"`) into a `(uid, gid)`
+/// pair, defaulting to `(0, 0)`. Non-numeric NAME forms are not resolvable on the
+/// host (the guest owns its passwd db), so only numeric ids are honoured; a name
+/// falls back to root.
+pub(crate) fn parse_user(user: Option<&str>) -> (u32, u32) {
+    let Some(user) = user else {
+        return (0, 0);
+    };
+    let mut parts = user.splitn(2, ':');
+    let uid = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let gid = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(uid);
+    (uid, gid)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +464,126 @@ mod tests {
     #[test]
     fn resolve_entrypoint_falls_back_to_true() {
         let spec = ServiceSpec::minimal("svc", "docker.io/library/alpine:3.19");
-        assert_eq!(resolve_entrypoint(&spec), vec!["true".to_string()]);
+        // No spec command AND no image config -> the no-op `true` fallback.
+        assert_eq!(resolve_entrypoint(&spec, None), vec!["true".to_string()]);
+    }
+
+    fn cfg() -> ImageConfig {
+        ImageConfig {
+            entrypoint: Some(vec!["docker-entrypoint.sh".to_string()]),
+            cmd: Some(vec!["postgres".to_string()]),
+            env: Some(vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/bin".to_string(),
+                "PG_MAJOR=16".to_string(),
+            ]),
+            working_dir: Some("/var/lib/postgresql".to_string()),
+            user: Some("70:70".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_entrypoint_uses_image_entrypoint_and_cmd() {
+        // No spec command -> image Entrypoint + image Cmd (the postgres case).
+        let spec = ServiceSpec::minimal("svc", "docker.io/library/postgres:16-alpine");
+        assert_eq!(
+            resolve_entrypoint(&spec, Some(&cfg())),
+            vec!["docker-entrypoint.sh".to_string(), "postgres".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_entrypoint_spec_args_append_to_image_entrypoint() {
+        // Spec args only (Docker CMD override) -> image Entrypoint + spec args.
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        spec.command.args = Some(vec!["-c".to_string(), "max_connections=200".to_string()]);
+        assert_eq!(
+            resolve_entrypoint(&spec, Some(&cfg())),
+            vec![
+                "docker-entrypoint.sh".to_string(),
+                "-c".to_string(),
+                "max_connections=200".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_entrypoint_spec_entrypoint_uses_image_cmd_when_no_args() {
+        // Spec entrypoint override, no spec args -> spec entrypoint + image Cmd.
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        spec.command.entrypoint = Some(vec!["/custom".to_string()]);
+        assert_eq!(
+            resolve_entrypoint(&spec, Some(&cfg())),
+            vec!["/custom".to_string(), "postgres".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_entrypoint_spec_entrypoint_and_args_override_both() {
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        spec.command.entrypoint = Some(vec!["/bin/sh".to_string()]);
+        spec.command.args = Some(vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(
+            resolve_entrypoint(&spec, Some(&cfg())),
+            vec!["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_env_layers_image_under_spec() {
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        spec.env.insert("PG_MAJOR".to_string(), "override".to_string());
+        spec.env
+            .insert("POSTGRES_PASSWORD".to_string(), "x".to_string());
+        let merged = merge_env(&spec, Some(&cfg()));
+        // PATH from image survives (postgres needs it); PG_MAJOR is overridden by
+        // the spec; the spec's POSTGRES_PASSWORD is present.
+        assert!(merged.contains(&(
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/usr/bin".to_string()
+        )));
+        assert!(merged.contains(&("PG_MAJOR".to_string(), "override".to_string())));
+        assert!(merged.contains(&("POSTGRES_PASSWORD".to_string(), "x".to_string())));
+        // The image's PG_MAJOR=16 must NOT also be present (spec shadowed it).
+        assert!(!merged.contains(&("PG_MAJOR".to_string(), "16".to_string())));
+        // Exactly one PG_MAJOR entry.
+        assert_eq!(merged.iter().filter(|(k, _)| k == "PG_MAJOR").count(), 1);
+    }
+
+    #[test]
+    fn resolve_workdir_prefers_spec_then_image() {
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        assert_eq!(
+            resolve_workdir(&spec, Some(&cfg())),
+            Some("/var/lib/postgresql".to_string())
+        );
+        spec.command.workdir = Some("/app".to_string());
+        assert_eq!(resolve_workdir(&spec, Some(&cfg())), Some("/app".to_string()));
+        // No spec workdir AND no image config -> None (guest defaults to /).
+        let bare = ServiceSpec::minimal("svc", "img");
+        assert_eq!(resolve_workdir(&bare, None), None);
+    }
+
+    #[test]
+    fn resolve_user_numeric_from_image_and_spec_override() {
+        let mut spec = ServiceSpec::minimal("svc", "img");
+        // Numeric image user resolved.
+        assert_eq!(resolve_user(&spec, Some(&cfg())), (70, 70));
+        // Spec wins.
+        spec.user = Some("1000:1001".to_string());
+        assert_eq!(resolve_user(&spec, Some(&cfg())), (1000, 1001));
+        // No user anywhere -> root.
+        let bare = ServiceSpec::minimal("svc", "img");
+        assert_eq!(resolve_user(&bare, None), (0, 0));
+    }
+
+    #[test]
+    fn parse_user_name_falls_back_to_root() {
+        // A NAME-form user (e.g. image User "postgres") degrades to root rather
+        // than being silently dropped into an undefined uid.
+        assert_eq!(parse_user(Some("postgres")), (0, 0));
+        assert_eq!(parse_user(Some("1000")), (1000, 1000));
+        assert_eq!(parse_user(Some("1000:2000")), (1000, 2000));
     }
 
     #[test]

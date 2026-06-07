@@ -1424,24 +1424,31 @@ impl OverlaydServer {
             OverlaydError::Overlay(format!("failed to generate guest keys: {e}"))
         })?;
 
-        // 3. Build the peer set: every global peer the host already knows ...
-        let mut peers: Vec<PeerSpec> = self.global_peers.values().cloned().collect();
-        // ... plus THIS node, so the guest can reach the host node over the
-        //     overlay. AllowedIPs covers the cluster CIDR (fall back to this
-        //     node's slice) so the guest routes all overlay traffic via the host
-        //     node's WireGuard endpoint; keepalive keeps the guest's VZ-NAT
-        //     mapping open.
+        // 3. Build the peer set. A VZ guest is behind the host's NAT and can only
+        //    reach the LOCAL node (via its NAT gateway) — it cannot dial other
+        //    nodes' or sibling guests' endpoints directly. So it gets exactly ONE
+        //    peer: this node, with AllowedIPs covering the whole cluster CIDR.
+        //    ALL overlay traffic (including to sibling containers and remote
+        //    nodes) routes through this node, which forwards/hairpins it (the
+        //    node already holds a /32 peer for every container — step 4 — and the
+        //    real inter-node peers). We deliberately do NOT add the per-guest /32
+        //    peers here: a /32 with no reachable endpoint would win longest-prefix
+        //    routing and black-hole sibling traffic. The endpoint returned here is
+        //    the node's overlay IP as a placeholder; the VZ runtime rewrites it to
+        //    the guest's NAT gateway (the only host address the guest can reach)
+        //    before delivering the config. Keepalive holds the guest's NAT mapping
+        //    open so the node can reach back.
         let node_allowed = self
             .cluster_cidr
             .or(self.slice_cidr)
             .map_or_else(|| String::from("0.0.0.0/0"), |c| c.to_string());
         let node_endpoint = self.node_endpoint_for_guest();
-        peers.push(PeerSpec {
+        let peers: Vec<PeerSpec> = vec![PeerSpec {
             public_key: node_public_key,
             endpoint: node_endpoint,
             allowed_ips: node_allowed,
             persistent_keepalive_secs: 25,
-        });
+        }];
 
         // 4. Register the guest's public key as a GLOBAL peer (host route to the
         //    guest at <overlay_ip>/32, roaming endpoint learned from keepalive).

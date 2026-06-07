@@ -31,7 +31,9 @@ use zlayer_client::{default_socket_path, DaemonClient};
 use crate::compose::env_source::collect_env_sources;
 use crate::compose::interpolate::interpolate_yaml_value;
 use crate::compose::profiles::{filter_services_by_profile, select_active_profiles};
-use crate::compose::{compose_to_deployment, parse_compose_with_layers, ComposeFile};
+use crate::compose::{
+    compose_to_deployment, merge_compose_files_to_value, resolve_extends, ComposeFile,
+};
 #[cfg(test)]
 use zlayer_paths::ZLayerDirs;
 
@@ -755,26 +757,6 @@ fn derive_project_name(
     "compose".to_string()
 }
 
-/// Build a [`ComposeFile`] from its raw merged YAML form by:
-/// 1. Re-serialising the merged file to a `serde_yaml::Value`.
-/// 2. Interpolating `${VAR...}` expressions against the layered env sources.
-/// 3. Deserialising the result back into [`ComposeFile`].
-///
-/// The two-step (`Value` -> interpolated -> `ComposeFile`) dance is needed
-/// because interpolation must run on raw strings *before* the typed
-/// deserializers (e.g. `deserialize_ports`) try to parse them — `${PORT}`
-/// would otherwise be rejected as an invalid port spec.
-fn interpolate_compose(
-    compose: &ComposeFile,
-    env: &HashMap<String, String>,
-) -> anyhow::Result<ComposeFile> {
-    let mut value = serde_yaml::to_value(compose)
-        .context("failed to project ComposeFile back to YAML for interpolation")?;
-    interpolate_yaml_value(&mut value, env).context("failed to interpolate compose variables")?;
-    serde_yaml::from_value::<ComposeFile>(value)
-        .context("failed to re-deserialize interpolated compose")
-}
-
 /// Apply a `--profile` filter to the in-place service map.
 fn apply_profile_filter(
     compose: &mut ComposeFile,
@@ -811,15 +793,27 @@ pub fn load_project(ctx: &ComposeContextArgs) -> anyhow::Result<LoadedProject> {
     let env = collect_env_sources(&project_dir, &ctx.env_files)
         .context("failed to collect env sources")?;
 
-    // 1. Merge files.
-    let merged = parse_compose_with_layers(&files)
+    // 1. Merge files into a single RAW YAML value (no typed deserialization yet).
+    let base = files.first().and_then(|p| p.parent());
+    let mut value = merge_compose_files_to_value(&files)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
         .with_context(|| format!("failed to merge compose files: {files:?}"))?;
 
-    // 2. Interpolate ${VAR...}.
-    let interpolated = interpolate_compose(&merged, &env)?;
+    // 2. Interpolate ${VAR...} on the raw value, BEFORE the typed deserializers
+    //    run. This is load-bearing: the short-port parser splits on `:`, so an
+    //    un-interpolated `${PORT:-3080}:3000` would be truncated at the `:` in
+    //    `:-`, leaving a brace-less `${PORT` that fails interpolation.
+    interpolate_yaml_value(&mut value, &env)
+        .context("failed to interpolate compose variables")?;
 
-    // 3. Apply --profile filter.
-    let mut compose = interpolated;
+    // 3. Deserialize into the typed ComposeFile, then resolve `extends:`.
+    let mut compose: ComposeFile =
+        serde_yaml::from_value(value).context("failed to parse interpolated compose file")?;
+    resolve_extends(&mut compose, base)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .context("failed to resolve compose extends")?;
+
+    // 4. Apply --profile filter.
     apply_profile_filter(&mut compose, &env, &ctx.profiles);
 
     // 4. Resolve final project name.

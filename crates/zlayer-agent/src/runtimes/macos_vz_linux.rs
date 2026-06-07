@@ -193,6 +193,12 @@ pub(crate) struct VzLinuxContainer {
     mac: String,
     /// The original service spec.
     spec: ServiceSpec,
+    /// The OCI image config (`Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User`) read
+    /// from the `image-config.json` sidecar written at pull time. Merged with the
+    /// spec by [`build_run_message`] so an image's default command/env/workdir/
+    /// user actually take effect. `None` when the sidecar is absent (e.g. an old
+    /// pull predating the sidecar) — the spec-only path then applies.
+    image_config: Option<zlayer_registry::ImageConfig>,
     /// vCPUs the VM is configured with (stats reporting).
     vcpus: u32,
     /// RAM (MiB) the VM is configured with (stats reporting).
@@ -390,6 +396,43 @@ impl VzLinuxRuntime {
     #[allow(dead_code)]
     fn cache_dir(&self) -> PathBuf {
         self.linux_dir().join("cache")
+    }
+
+    /// Backfill the `image-config.json` sidecar for an ALREADY-present image.
+    ///
+    /// `pull_image_with_policy` writes the sidecar on a fresh pull, but an
+    /// `IfNotPresent`/`Never` pull short-circuits when the rootfs already exists
+    /// — so an image extracted before this fix shipped (or by a path that didn't
+    /// write the sidecar) would never gain it, and `create_container` would fall
+    /// back to running `/bin/true`. This ensures the sidecar exists for the
+    /// resolved `rootfs` (its parent dir): if already present, it's a no-op;
+    /// otherwise it fetches the OCI config (the config blob is typically already
+    /// in the local `blobs.redb` from the original pull, so this is offline) and
+    /// writes it. Best-effort — failures are logged inside the writer.
+    async fn ensure_image_config_sidecar(
+        &self,
+        image: &str,
+        rootfs: &std::path::Path,
+        auth: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
+    ) {
+        let Some(image_dir) = rootfs.parent() else {
+            return;
+        };
+        if image_dir.join("image-config.json").exists() {
+            return;
+        }
+        let cache_path = self.images_dir().join("blobs.redb");
+        let Ok(blob_cache) = zlayer_registry::CacheType::persistent_at(&cache_path)
+            .build()
+            .await
+        else {
+            tracing::debug!(image = %image, "vz-linux: sidecar backfill skipped (blob cache open failed)");
+            return;
+        };
+        let puller = zlayer_registry::ImagePuller::from_env_for_runtime(blob_cache, source).await;
+        let pull_auth = zlayer_registry::spec_auth_to_oci(auth);
+        write_image_config_sidecar(&puller, image, &pull_auth, image_dir).await;
     }
 
     /// `{data_dir}/vz/linux/kernel` — guest kernel + initramfs cache.
@@ -756,6 +799,82 @@ fn rootfs_is_populated(rootfs_dir: &std::path::Path) -> bool {
     std::fs::read_dir(rootfs_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// Pull the OCI image config and persist its runtime defaults
+/// (Entrypoint/Cmd/Env/WorkingDir/User) as an `image-config.json` sidecar in
+/// `image_dir` (the parent of the extracted `rootfs`).
+///
+/// `create_container` later reads this sidecar (via
+/// [`read_image_config_sidecar`]) so [`build_run_message`] can apply the image's
+/// DEFAULT command/env without a network round-trip. WITHOUT this the VZ guest
+/// only ever saw the spec's command and fell back to `/bin/true` for
+/// image-default images (postgres/forgejo), exiting instantly with no output.
+///
+/// Best-effort: a config-pull/serialize/write failure is logged, not fatal — the
+/// layers are already extracted; the cost is only that the image defaults won't
+/// apply on run (the spec command, if any, still does).
+async fn write_image_config_sidecar(
+    puller: &zlayer_registry::ImagePuller,
+    image: &str,
+    auth: &zlayer_registry::RegistryAuth,
+    image_dir: &std::path::Path,
+) {
+    let config = match puller.pull_image_config(image, auth).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                image = %image,
+                error = %e,
+                "vz-linux: failed to fetch OCI config blob; the image-default \
+                 command/env will not apply (dispatch uses its macOS default OS hint)",
+            );
+            return;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&config) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(image = %image, error = %e, "vz-linux: failed to serialize image config sidecar");
+            return;
+        }
+    };
+    let sidecar = image_dir.join("image-config.json");
+    if let Err(e) = tokio::fs::write(&sidecar, json).await {
+        tracing::warn!(
+            image = %image,
+            error = %e,
+            "vz-linux: failed to write image-config.json sidecar; image-default command/env will not apply on run",
+        );
+    }
+}
+
+/// Read the `image-config.json` sidecar that [`write_image_config_sidecar`]
+/// writes next to a pulled image's rootfs, given that `…/rootfs` directory.
+///
+/// The sidecar lives at `{image_dir}/image-config.json` (the parent of the
+/// `rootfs` dir). Returns the parsed [`zlayer_registry::ImageConfig`] so
+/// [`build_run_message`] can apply the image's default Entrypoint/Cmd/Env/
+/// WorkingDir/User. Returns `None` when the sidecar is absent (e.g. a pull that
+/// predates the sidecar) or unparseable — the caller then runs the spec-only
+/// path. A missing/unparseable sidecar is logged at debug, not fatal.
+fn read_image_config_sidecar(
+    rootfs_dir: &std::path::Path,
+) -> Option<zlayer_registry::ImageConfig> {
+    let sidecar = rootfs_dir.parent()?.join("image-config.json");
+    let bytes = std::fs::read(&sidecar).ok()?;
+    match serde_json::from_slice::<zlayer_registry::ImageConfig>(&bytes) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::debug!(
+                sidecar = %sidecar.display(),
+                error = %e,
+                "vz-linux: failed to parse image-config.json sidecar; \
+                 image-default command/env will not apply",
+            );
+            None
+        }
+    }
+}
+
 /// Default Linux-guest kernel command line.
 ///
 /// `console=hvc0` routes the kernel console to the virtio serial port wired to
@@ -1010,21 +1129,29 @@ pub(crate) fn build_config_linux(
 // vsock connect + workload Run/drain (Phase 4)
 // ---------------------------------------------------------------------------
 
-/// Build the `Run` control message from a [`ServiceSpec`].
+/// Build the `Run` control message by merging a [`ServiceSpec`] with the OCI
+/// **image config** (`image`), per Docker/OCI semantics.
 ///
-/// `argv` is the resolved entrypoint (entrypoint + args, falling back to
-/// `["true"]`), `env` is the spec's environment as `(KEY, VALUE)` pairs, `cwd`
-/// is the command workdir, and `uid`/`gid` are parsed from `spec.user`
-/// (`"uid"` or `"uid:gid"`), defaulting to `0:0` (root).
-pub(crate) fn build_run_message(spec: &ServiceSpec) -> proto::Msg {
-    let argv = macos_vz_shared::resolve_entrypoint(spec);
-    let env: Vec<(String, String)> = spec
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let cwd = spec.command.workdir.clone();
-    let (uid, gid) = parse_user(spec.user.as_deref());
+/// - `argv` is the effective entrypoint+cmd resolved by
+///   [`macos_vz_shared::resolve_entrypoint`]: spec overrides win, otherwise the
+///   image's `Entrypoint`+`Cmd` are used (falling back to `["true"]` only when
+///   neither side supplies a command). This is the fix for images like
+///   `postgres:16-alpine`/`forgejo` that rely on their image ENTRYPOINT/CMD —
+///   previously they ran `/bin/true` and exited instantly.
+/// - `env` merges the image config's `Env` (PATH etc.) UNDER the spec's env
+///   (spec/compose values win for the same key) via
+///   [`macos_vz_shared::merge_env`].
+/// - `cwd` is the spec workdir, falling back to the image's `WorkingDir`.
+/// - `uid`/`gid` come from the spec's `user`, falling back to the image's
+///   `User` (numeric `uid`/`uid:gid` honoured; a NAME form degrades to `0:0`).
+pub(crate) fn build_run_message(
+    spec: &ServiceSpec,
+    image: Option<&zlayer_registry::ImageConfig>,
+) -> proto::Msg {
+    let argv = macos_vz_shared::resolve_entrypoint(spec, image);
+    let env = macos_vz_shared::merge_env(spec, image);
+    let cwd = macos_vz_shared::resolve_workdir(spec, image);
+    let (uid, gid) = macos_vz_shared::resolve_user(spec, image);
     proto::Msg::Run {
         argv,
         env,
@@ -1063,26 +1190,6 @@ pub(crate) fn derive_bind_mounts(spec: &ServiceSpec) -> Vec<BindMount> {
             readonly,
         })
         .collect()
-}
-
-/// Parse a Docker-style `--user` value (`"uid"` or `"uid:gid"`) into a
-/// `(uid, gid)` pair, defaulting to `(0, 0)`. Non-numeric names are not
-/// resolvable on the host (the guest has its own passwd db), so we only honour
-/// numeric ids and otherwise fall back to root.
-fn parse_user(user: Option<&str>) -> (u32, u32) {
-    let Some(user) = user else {
-        return (0, 0);
-    };
-    let mut parts = user.splitn(2, ':');
-    let uid = parts
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    let gid = parts
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(uid);
-    (uid, gid)
 }
 
 /// Connect to the guest agent's vsock control port, returning an owned,
@@ -1580,6 +1687,33 @@ fn push_overlay_agent(live: &LiveVm, msg: &proto::Msg) -> std::result::Result<bo
     Ok(saw_eof)
 }
 
+/// Derive the VZ NAT gateway for a guest from its leased address: the `.1` of
+/// its IPv4 `/24`. VZ NAT is a `192.168.64.0/24` with the host at `.1`, but
+/// deriving it from the lease keeps us correct if the subnet ever differs. IPv6
+/// (not used by VZ NAT) falls back to the standard gateway string.
+fn nat_gateway_for(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.1", o[0], o[1], o[2])
+        }
+        IpAddr::V6(_) => "192.168.64.1".to_string(),
+    }
+}
+
+/// Rewrite the host portion of a `host:port` `WireGuard` endpoint to `gateway`,
+/// preserving the port. An empty endpoint (a roaming peer) is left as-is, and an
+/// unparseable endpoint is returned unchanged.
+fn rewrite_endpoint_host(endpoint: &str, gateway: &str) -> String {
+    if endpoint.is_empty() {
+        return String::new();
+    }
+    match endpoint.rsplit_once(':') {
+        Some((_host, port)) => format!("{gateway}:{port}"),
+        None => endpoint.to_string(),
+    }
+}
+
 /// Resolve the authoritative terminal [`ContainerState`] from a workload's
 /// captured outcome, given an optional `fallback` for when nothing terminal has
 /// been recorded yet (e.g. the live VM's reconciled state, or a forced-stop
@@ -1681,12 +1815,16 @@ impl Runtime for VzLinuxRuntime {
                         rootfs = %existing.display(),
                         "vz-linux image already present; skipping pull"
                     );
+                    self.ensure_image_config_sidecar(image, &existing, auth, source)
+                        .await;
                     self.image_rootfs.write().await.insert(safe_name, existing);
                     return Ok(());
                 }
             }
             zlayer_spec::PullPolicy::Never => {
                 if let Some(existing) = self.resolve_existing_rootfs(image) {
+                    self.ensure_image_config_sidecar(image, &existing, auth, source)
+                        .await;
                     self.image_rootfs.write().await.insert(safe_name, existing);
                     return Ok(());
                 }
@@ -1747,14 +1885,7 @@ impl Runtime for VzLinuxRuntime {
         // unknown and fall the image through to the Seatbelt sandbox (exit 127).
         // Non-fatal: the layers are already extracted, so a config-blob miss only
         // costs us the local OS hint (dispatch still has its VZ-Linux default).
-        if let Err(e) = puller.pull_image_config(image, &pull_auth).await {
-            tracing::debug!(
-                image = %image,
-                error = %e,
-                "vz-linux: failed to cache OCI config blob for local OS inspection; \
-                 dispatch will rely on its macOS default",
-            );
-        }
+        write_image_config_sidecar(&puller, image, &pull_auth, &image_dir).await;
 
         tracing::info!(
             image = %image,
@@ -1838,6 +1969,21 @@ impl Runtime for VzLinuxRuntime {
             });
         }
 
+        // Read the OCI image config (Entrypoint/Cmd/Env/WorkingDir/User) from the
+        // `image-config.json` sidecar written next to this rootfs at pull time.
+        // This is what lets `build_run_message` apply an image's DEFAULT command
+        // (postgres/forgejo etc.) instead of falling back to `/bin/true`.
+        let image_config = read_image_config_sidecar(&image_rootfs);
+        if image_config.is_none() {
+            tracing::warn!(
+                container = %dir_name,
+                image = %image_name,
+                "vz-linux: no image-config.json sidecar found for image; the image's \
+                 default ENTRYPOINT/CMD/ENV/WORKDIR/USER will NOT apply (re-pull the \
+                 image to generate the sidecar). The spec command still runs.",
+            );
+        }
+
         std::fs::create_dir_all(&state_dir).map_err(|e| AgentError::CreateFailed {
             id: dir_name.clone(),
             reason: format!("create state dir: {e}"),
@@ -1881,6 +2027,7 @@ impl Runtime for VzLinuxRuntime {
             console_log,
             mac,
             spec: spec.clone(),
+            image_config,
             vcpus,
             ram_mib,
             started_at: None,
@@ -2007,7 +2154,7 @@ impl Runtime for VzLinuxRuntime {
             c.state = ContainerState::Running;
             c.started_at = Some(Instant::now());
             (
-                build_run_message(&c.spec),
+                build_run_message(&c.spec, c.image_config.as_ref()),
                 derive_bind_mounts(&c.spec),
                 Arc::clone(&c.outcome),
                 c.console_log.clone(),
@@ -2678,6 +2825,37 @@ impl Runtime for VzLinuxRuntime {
     ) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
+        // Snapshot a queue-handle clone of the live VM + the per-VM MAC (the
+        // container must be running to receive the config).
+        let (live, mac) = {
+            let guard = self.containers.read().await;
+            let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
+                container: dir_name.clone(),
+                reason: "not found".to_string(),
+            })?;
+            let live = c.live.as_ref().map(|l| LiveVm {
+                queue: l.queue.clone(),
+                vm: Arc::clone(&l.vm),
+            });
+            (live, c.mac.clone())
+        };
+        let Some(live) = live else {
+            return Err(AgentError::Network(format!(
+                "cannot push overlay config to {dir_name}: VM is not live"
+            )));
+        };
+
+        // The overlayd-advertised peer endpoint is the NODE's *overlay* IP, which
+        // is only reachable THROUGH the overlay (circular) — a VZ guest behind NAT
+        // can't use it as a WireGuard underlay. The only host address the guest
+        // can reach is its NAT gateway. Resolve it from the guest's lease (the
+        // `.1` of its NAT /24), falling back to the VZ default `192.168.64.1`, and
+        // rewrite each peer's endpoint host to it (keeping the port). Roaming
+        // peers (empty endpoint) are left untouched.
+        let gateway = macos_vz_shared::current_guest_ip(&mac)
+            .await
+            .map_or_else(|| "192.168.64.1".to_string(), nat_gateway_for);
+
         // Build the wire message from the host-allocated overlay identity.
         let msg = proto::Msg::OverlayConfig {
             overlay_ip: config.overlay_ip.to_string(),
@@ -2689,32 +2867,13 @@ impl Runtime for VzLinuxRuntime {
                 .iter()
                 .map(|p| proto::WgPeer {
                     public_key: p.public_key.clone(),
-                    endpoint: p.endpoint.clone(),
+                    endpoint: rewrite_endpoint_host(&p.endpoint, &gateway),
                     allowed_ips: p.allowed_ips.clone(),
                     persistent_keepalive_secs: p.persistent_keepalive_secs,
                 })
                 .collect(),
             dns_server: config.dns_server.map(|ip| ip.to_string()),
             dns_domain: config.dns_domain.clone(),
-        };
-
-        // Snapshot a queue-handle clone of the live VM (the container must be
-        // running to receive the config).
-        let live = {
-            let guard = self.containers.read().await;
-            let c = guard.get(&dir_name).ok_or_else(|| AgentError::NotFound {
-                container: dir_name.clone(),
-                reason: "not found".to_string(),
-            })?;
-            c.live.as_ref().map(|l| LiveVm {
-                queue: l.queue.clone(),
-                vm: Arc::clone(&l.vm),
-            })
-        };
-        let Some(live) = live else {
-            return Err(AgentError::Network(format!(
-                "cannot push overlay config to {dir_name}: VM is not live"
-            )));
         };
 
         // The vsock connect + frame write are synchronous; run them off-runtime.
@@ -3120,6 +3279,7 @@ mod tests {
 
     #[test]
     fn parse_user_handles_uid_gid_forms() {
+        use macos_vz_shared::parse_user;
         assert_eq!(parse_user(None), (0, 0));
         assert_eq!(parse_user(Some("")), (0, 0));
         // uid only -> gid defaults to uid.
@@ -3169,7 +3329,7 @@ mod tests {
         spec.env.insert("FOO".to_string(), "bar".to_string());
         spec.user = Some("1000:1000".to_string());
 
-        match build_run_message(&spec) {
+        match build_run_message(&spec, None) {
             proto::Msg::Run {
                 argv,
                 env,
@@ -3375,10 +3535,46 @@ mod tests {
     fn build_run_message_defaults_to_root_and_true() {
         // A bare spec: no entrypoint/args -> `true`, no user -> root.
         let spec = ServiceSpec::minimal("svc", "docker.io/library/alpine:latest");
-        match build_run_message(&spec) {
+        match build_run_message(&spec, None) {
             proto::Msg::Run { argv, uid, gid, .. } => {
                 assert_eq!(argv, vec!["true".to_string()]);
                 assert_eq!((uid, gid), (0, 0));
+            }
+            other => panic!("expected Msg::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_run_message_applies_image_entrypoint_and_env() {
+        // The core fix: a spec with NO command picks up the image's default
+        // Entrypoint+Cmd and Env (the postgres/forgejo case) instead of `true`.
+        let spec = ServiceSpec::minimal("svc", "docker.io/library/postgres:16-alpine");
+        let image = zlayer_registry::ImageConfig {
+            entrypoint: Some(vec!["docker-entrypoint.sh".to_string()]),
+            cmd: Some(vec!["postgres".to_string()]),
+            env: Some(vec!["PATH=/usr/local/bin:/usr/bin".to_string()]),
+            working_dir: Some("/var/lib/postgresql".to_string()),
+            user: Some("70:70".to_string()),
+            ..Default::default()
+        };
+        match build_run_message(&spec, Some(&image)) {
+            proto::Msg::Run {
+                argv,
+                env,
+                cwd,
+                uid,
+                gid,
+            } => {
+                assert_eq!(
+                    argv,
+                    vec!["docker-entrypoint.sh".to_string(), "postgres".to_string()]
+                );
+                assert!(env.contains(&(
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin".to_string()
+                )));
+                assert_eq!(cwd, Some("/var/lib/postgresql".to_string()));
+                assert_eq!((uid, gid), (70, 70));
             }
             other => panic!("expected Msg::Run, got {other:?}"),
         }
