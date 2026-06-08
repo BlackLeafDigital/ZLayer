@@ -245,6 +245,7 @@ zlayer-scheduler = { version = "0.0.0-dev", path = "crates/zlayer-scheduler" }
 zlayer-tunnel = { version = "0.0.0-dev", path = "crates/zlayer-tunnel" }
 zlayer-tui = { version = "0.0.0-dev", path = "crates/zlayer-tui" }
 zlayer-consensus = { version = "0.0.0-dev", path = "crates/zlayer-consensus" }
+zlayer-cluster-rpc = { version = "0.0.0-dev", path = "crates/zlayer-cluster-rpc" }
 zlayer-agent = { version = "0.0.0-dev", path = "crates/zlayer-agent" }
 zlayer-docker = { version = "0.0.0-dev", path = "crates/zlayer-docker" }
 zlayer-api = { version = "0.0.0-dev", path = "crates/zlayer-api" }

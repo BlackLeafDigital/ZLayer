@@ -122,7 +122,7 @@ hyper = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
 sha2 = { workspace = true, optional = true }
 zlayer-paths.workspace = true
-zlayer-cluster-rpc = { version = "0.0.0-dev", path = "../zlayer-cluster-rpc" }
+zlayer-cluster-rpc.workspace = true
 rcgen.workspace = true
 tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "transport"] }
 prost-types = "0.14.3"
