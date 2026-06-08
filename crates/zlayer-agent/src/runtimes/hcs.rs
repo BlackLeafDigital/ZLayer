@@ -3987,6 +3987,103 @@ impl Runtime for HcsRuntime {
         let sink: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
         self.spawn_exit_watcher(hcs_id.clone(), *system.raw(), sink.clone());
 
+        // 6b. Hyper-V: launch the workload (init) process INSIDE the hosted
+        //     container over the GCS bridge, and spawn a detached waiter that
+        //     records its exit code into `sink` (which `container_state` reads).
+        //     The host exit-watcher armed above only observes the UVM compute
+        //     system; the workload runs in the guest container, so its lifecycle
+        //     is tracked via the bridge `ExecuteProcess`/`WaitForProcess` RPCs.
+        //     Process isolation runs the image entrypoint inside its own compute
+        //     system (no bridge) and is unaffected (`hyperv_state.bridge` None).
+        #[cfg(feature = "hcs-runtime")]
+        if let Some(bridge) = hyperv_state.bridge.clone() {
+            use zlayer_gcs::frame::RpcMessageType;
+            use zlayer_gcs::protocol::{
+                ExecuteProcessRequest, ExecuteProcessResponse, ExecuteProcessSettings,
+                RequestBase as GcsRequestBase, WaitForProcessRequest, WaitForProcessResponse,
+            };
+            // Command line = entrypoint + args; working dir from the spec.
+            let mut argv: Vec<String> = spec.command.entrypoint.clone().unwrap_or_default();
+            argv.extend(spec.command.args.clone().unwrap_or_default());
+            let command_line = argv.join(" ");
+            let mut pp = serde_json::json!({
+                "CommandLine": command_line.clone(),
+                "CreateStdInPipe": false,
+                "CreateStdOutPipe": false,
+                "CreateStdErrPipe": false,
+            });
+            if let Some(wd) = spec.command.workdir.clone().filter(|w| !w.is_empty()) {
+                pp["WorkingDirectory"] = serde_json::Value::String(wd);
+            }
+            // `ProcessParameters` is an `AnyInString` (DOUBLE-ENCODED JSON
+            // string) on the wire — the guest rejects a nested object at `$`.
+            // Encode the params object to a JSON string. Mirrors hcsshim's
+            // `prot.ExecuteProcessSettings.ProcessParameters AnyInString`.
+            let process_parameters =
+                serde_json::Value::String(serde_json::to_string(&pp).map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("Hyper-V init process: serialize ProcessParameters: {e}"),
+                    }
+                })?);
+            tracing::info!(hcs_id = %hcs_id, command_line = %command_line, "Hyper-V: launching workload init process over GCS bridge");
+            let exec_req = ExecuteProcessRequest {
+                base: GcsRequestBase {
+                    activity_id: uuid::Uuid::new_v4(),
+                    container_id: hcs_id.clone(),
+                },
+                settings: ExecuteProcessSettings {
+                    process_parameters,
+                    stdio_relay_settings: None,
+                },
+            };
+            let exec_resp: ExecuteProcessResponse = bridge
+                .send_rpc_json(RpcMessageType::ExecuteProcess, &exec_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!("Hyper-V init process ExecuteProcess: {e}"),
+                })?;
+            if exec_resp.base.result != 0 {
+                let hr = u32::from_ne_bytes(exec_resp.base.result.to_ne_bytes());
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!(
+                        "Hyper-V init process ExecuteProcess returned HRESULT 0x{hr:08x}: {}",
+                        exec_resp.base.error_message
+                    ),
+                });
+            }
+            let pid = exec_resp.process_id;
+            // Detached waiter: record the workload's exit code when it exits.
+            let wait_bridge = bridge.clone();
+            let wait_sink = sink.clone();
+            let wait_hcs_id = hcs_id.clone();
+            tokio::spawn(async move {
+                let wait_req = WaitForProcessRequest {
+                    base: GcsRequestBase {
+                        activity_id: uuid::Uuid::new_v4(),
+                        container_id: wait_hcs_id.clone(),
+                    },
+                    process_id: pid,
+                    timeout_in_ms: u32::MAX,
+                };
+                let res: zlayer_gcs::error::GcsResult<WaitForProcessResponse> = wait_bridge
+                    .send_rpc_json(RpcMessageType::WaitForProcess, &wait_req)
+                    .await;
+                match res {
+                    Ok(resp) => {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let code = resp.exit_code as i32;
+                        *wait_sink.write().await = Some(code);
+                    }
+                    Err(e) => {
+                        tracing::warn!(hcs_id = %wait_hcs_id, error = %e, "Hyper-V init-process WaitForProcess failed; container exit code unobserved");
+                    }
+                }
+            });
+        }
+
         // 7. Register the entry.
         //
         // Disarm the parent-layer activation guard and transfer its path list
