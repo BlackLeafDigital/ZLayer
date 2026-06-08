@@ -3650,6 +3650,176 @@ impl ApplyServiceId for HcsDoc {
 // Runtime impl
 // ---------------------------------------------------------------------------
 
+// Inherent Hyper-V-only helpers for [`HcsRuntime`]. Kept out of the
+// [`Runtime`] trait impl below because a trait impl may not host non-trait
+// methods; `exec` (in the trait impl) dispatches here for isolated containers.
+#[cfg(feature = "hcs-runtime")]
+impl HcsRuntime {
+    /// Hyper-V exec: run `cmd` inside the hosted container over the GCS bridge.
+    ///
+    /// The host `HcsCreateProcess` cannot create a process in a *hosted*
+    /// container (it would target the UVM compute system and return
+    /// `ERROR_NOT_SUPPORTED`), so isolated containers route exec through the
+    /// in-guest GCS via the `RpcExecuteProcess` / `RpcWaitForProcess` RPCs —
+    /// the same bridge the init process is launched over in `create_container`.
+    ///
+    /// stdout/stderr are captured by binding two host-side hvsock listeners
+    /// (one per stream) BEFORE sending `ExecuteProcess`; the guest dials OUT to
+    /// them once the process starts (same direction as the log-forward relay).
+    /// Each listener is drained to EOF; the `WaitForProcess` RPC yields the
+    /// authoritative exit code.
+    #[allow(clippy::too_many_lines)]
+    async fn exec_hyperv(
+        hcs_id: &str,
+        id: &ContainerId,
+        cmd: &[String],
+        bridge: &zlayer_gcs::bridge::GcsBridge,
+        uvm_runtime_id: windows::core::GUID,
+        log_buffer: &Arc<RwLock<Vec<LogEntry>>>,
+    ) -> Result<(i32, String, String)> {
+        use zlayer_gcs::frame::RpcMessageType;
+        use zlayer_gcs::protocol::{
+            ExecuteProcessRequest, ExecuteProcessResponse, ExecuteProcessSettings,
+            RequestBase as GcsRequestBase, StdioRelaySettings, WaitForProcessRequest,
+            WaitForProcessResponse,
+        };
+        use zlayer_gcs::transport::HvSockListener;
+
+        // Fresh hvsock service GUIDs for the stdout + stderr relay. The guest
+        // dials OUT to these after the process starts, so the host MUST be
+        // listening before the `ExecuteProcess` RPC is sent. `GUID::from_u128`
+        // on the uuid's u128 is byte-correct (established elsewhere).
+        let stdout_uuid = uuid::Uuid::new_v4();
+        let stderr_uuid = uuid::Uuid::new_v4();
+        let stdout_listener = HvSockListener::bind(
+            uvm_runtime_id,
+            windows::core::GUID::from_u128(stdout_uuid.as_u128()),
+        )
+        .await
+        .map_err(|e| AgentError::Internal(format!("Hyper-V exec: bind stdout hvsock: {e}")))?;
+        let stderr_listener = HvSockListener::bind(
+            uvm_runtime_id,
+            windows::core::GUID::from_u128(stderr_uuid.as_u128()),
+        )
+        .await
+        .map_err(|e| AgentError::Internal(format!("Hyper-V exec: bind stderr hvsock: {e}")))?;
+
+        // `ProcessParameters` is an `AnyInString` (DOUBLE-ENCODED JSON string)
+        // on the wire — the guest rejects a nested object at `$`. Mirrors the
+        // init-process launch in `create_container`.
+        let pp = serde_json::json!({
+            "CommandLine": cmd.join(" "),
+            "CreateStdInPipe": false,
+            "CreateStdOutPipe": true,
+            "CreateStdErrPipe": true,
+            "EmulateConsole": false,
+        });
+        let process_parameters =
+            serde_json::Value::String(serde_json::to_string(&pp).map_err(|e| {
+                AgentError::Internal(format!("Hyper-V exec: serialize ProcessParameters: {e}"))
+            })?);
+
+        let exec_req = ExecuteProcessRequest {
+            base: GcsRequestBase {
+                activity_id: uuid::Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            settings: ExecuteProcessSettings {
+                process_parameters,
+                stdio_relay_settings: Some(StdioRelaySettings {
+                    stdin_pipe: None,
+                    stdout_pipe: Some(stdout_uuid),
+                    stderr_pipe: Some(stderr_uuid),
+                }),
+            },
+        };
+        let exec_resp: ExecuteProcessResponse = bridge
+            .send_rpc_json(RpcMessageType::ExecuteProcess, &exec_req)
+            .await
+            .map_err(|e| AgentError::Internal(format!("Hyper-V exec ExecuteProcess: {e}")))?;
+        if exec_resp.base.result != 0 {
+            let hr = u32::from_ne_bytes(exec_resp.base.result.to_ne_bytes());
+            return Err(AgentError::Internal(format!(
+                "Hyper-V exec ExecuteProcess returned HRESULT 0x{hr:08x}: {}",
+                exec_resp.base.error_message
+            )));
+        }
+        let pid = exec_resp.process_id;
+
+        // Accept + drain both relay listeners to EOF concurrently. Wrap each
+        // accept in a timeout so a process that writes only one stream does not
+        // hang waiting for the other to dial back (`read_some` returns
+        // `Ok(vec![])` at EOF).
+        let drain = |listener: HvSockListener| async move {
+            // Accept errored or timed out: treat as "no output on this stream"
+            // rather than failing the whole exec.
+            let Ok(Ok(stream)) =
+                tokio::time::timeout(Duration::from_secs(120), listener.accept()).await
+            else {
+                return Vec::<u8>::new();
+            };
+            let mut bytes = Vec::new();
+            loop {
+                match stream.read_some(64 * 1024).await {
+                    Ok(chunk) if chunk.is_empty() => break,
+                    Ok(chunk) => bytes.extend(chunk),
+                    Err(_) => break,
+                }
+            }
+            bytes
+        };
+        let (stdout_bytes, stderr_bytes) =
+            tokio::join!(drain(stdout_listener), drain(stderr_listener));
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+        // Authoritative exit code via `WaitForProcess`.
+        let wait_req = WaitForProcessRequest {
+            base: GcsRequestBase {
+                activity_id: uuid::Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            process_id: pid,
+            timeout_in_ms: u32::MAX,
+        };
+        let wait_resp: WaitForProcessResponse = bridge
+            .send_rpc_json(RpcMessageType::WaitForProcess, &wait_req)
+            .await
+            .map_err(|e| AgentError::Internal(format!("Hyper-V exec WaitForProcess: {e}")))?;
+        #[allow(clippy::cast_possible_wrap)]
+        let exit_code = wait_resp.exit_code as i32;
+
+        // Append captured output to the container log buffer (mirror host path).
+        {
+            let now = chrono::Utc::now();
+            let source = LogSource::Container(id.to_string());
+            let mut buf = log_buffer.write().await;
+            for line in stdout.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+            for line in stderr.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+        }
+
+        Ok((exit_code, stdout, stderr))
+    }
+}
+
 #[async_trait]
 impl Runtime for HcsRuntime {
     #[instrument(skip(self), fields(otel.name = "image.pull", container.image.name = %image))]
@@ -4330,7 +4500,12 @@ impl Runtime for HcsRuntime {
             ));
         }
         let hcs_id = Self::hcs_id(id);
-        let (system_handle, log_buffer) = {
+        // Acquire the read lock once. Always extract the host system handle +
+        // log buffer (needed by the Process-isolation path below); when the
+        // `hcs-runtime` feature is on, also extract the Hyper-V routing handles
+        // (the in-guest GCS bridge + the UVM runtime id) so an isolated
+        // container's exec can be routed over the bridge instead.
+        let (system_handle, log_buffer, hyperv) = {
             let containers = self.containers.read().await;
             let entry = containers
                 .get(&hcs_id)
@@ -4338,11 +4513,43 @@ impl Runtime for HcsRuntime {
                     container: hcs_id.clone(),
                     reason: "no HCS entry for container".to_string(),
                 })?;
+            // `entry.gcs` is `Some` only for Hyper-V isolation. Extract the
+            // bridge + UVM runtime id so exec can be bridge-routed.
+            #[cfg(feature = "hcs-runtime")]
+            let hyperv = match entry.gcs.clone() {
+                Some(bridge) => {
+                    let uvm_runtime_id =
+                        entry.uvm.as_ref().map(Uvm::runtime_id).ok_or_else(|| {
+                            AgentError::Internal(
+                                "Hyper-V exec: container has a GCS bridge but no UVM runtime id"
+                                    .to_string(),
+                            )
+                        })?;
+                    Some((bridge, uvm_runtime_id))
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "hcs-runtime"))]
+            let hyperv: Option<()> = None;
             // `entry.system.raw()` returns `SendHandle<HCS_SYSTEM>` so the
             // handle can cross into the blocking thread below. See
             // `zlayer_hcs::handle::SendHandle`.
-            (entry.system.raw(), entry.log_buffer.clone())
+            (entry.system.raw(), entry.log_buffer.clone(), hyperv)
         };
+
+        // Hyper-V isolation: the host `HcsCreateProcess` targets the UVM
+        // compute system, not the hosted container, so it returns
+        // `0x80070032` (`ERROR_NOT_SUPPORTED`). Route exec over the GCS bridge
+        // instead, capturing stdout/stderr via host-side hvsock stdio-relay
+        // listeners the guest dials back into.
+        #[cfg(feature = "hcs-runtime")]
+        if let Some((bridge, uvm_runtime_id)) = hyperv {
+            return Self::exec_hyperv(&hcs_id, id, cmd, &bridge, uvm_runtime_id, &log_buffer).await;
+        }
+        // Consume `hyperv` on builds without the `hcs-runtime` feature (where it
+        // is always `None`) so the binding is never flagged as unused.
+        #[cfg(not(feature = "hcs-runtime"))]
+        let _ = &hyperv;
 
         let command_line = cmd.join(" ");
         let params = ProcessParameters {

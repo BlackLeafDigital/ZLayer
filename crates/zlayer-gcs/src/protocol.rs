@@ -244,11 +244,16 @@ pub struct ExecuteProcessSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StdioRelaySettings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // hcsshim's `ExecuteProcessStdioRelaySettings` serializes these as the
+    // bare `StdIn` / `StdOut` / `StdErr` (each `json:",omitempty"`), NOT
+    // `StdInPipe` / `StdOutPipe` / `StdErrPipe`. The inbox guest GCS uses a
+    // strict unmarshaller, so the relay GUIDs must land under the exact field
+    // names or the guest never dials back to the host stdio listeners.
+    #[serde(rename = "StdIn", default, skip_serializing_if = "Option::is_none")]
     pub stdin_pipe: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "StdOut", default, skip_serializing_if = "Option::is_none")]
     pub stdout_pipe: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "StdErr", default, skip_serializing_if = "Option::is_none")]
     pub stderr_pipe: Option<Uuid>,
 }
 
