@@ -207,11 +207,16 @@ jobs:
   #
   # cross-rs (https://github.com/cross-rs/cross) is a Cargo-based
   # cross-compiler driver. For --target x86_64-unknown-linux-musl it spawns
-  # the cross/x86_64-unknown-linux-musl docker image, which already has musl
-  # libc + libseccomp + openssl + lzma + bzip2 + zstd cross-linked, so we
-  # get a portable static binary without juggling apt cross packages on the
-  # runner. We do NOT run this job inside a container — cross needs to spawn
-  # its own docker images, so the host must be a plain runner with docker.
+  # the cross/x86_64-unknown-linux-musl docker image, which carries musl libc
+  # + a musl cross-toolchain. The image does NOT ship libseccomp (the dep
+  # libcontainer/youki needs) for the musl sysroot — Ubuntu's libseccomp-dev
+  # is glibc-flavored. Cross.toml's [target.x86_64-unknown-linux-musl]
+  # pre-build builds libseccomp from source against x86_64-linux-musl-gcc and
+  # installs it into the musl prefix so pkg-config + the linker pick it up.
+  # All install activity happens INSIDE the cross-rs container — the host
+  # GitRunner gets nothing apt-installed. We do NOT run this job inside a
+  # container — cross needs to spawn its own docker images, so the host must
+  # be a plain runner with docker.
   build-linux-amd64-musl:
     needs: [check-existing]
     if: needs.check-existing.outputs.need_build == 'true'

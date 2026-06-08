@@ -25,13 +25,24 @@ pre-build = [
     "apt-get install -y libseccomp-dev protobuf-compiler",
 ]
 
-# Target-specific configuration for x86_64 musl (static) Linux.
-# build-linux-amd64-musl runs `cross build` inside the
-# cross/x86_64-unknown-linux-musl image, which lacks protoc; zlayer-cluster-rpc
-# and zlayer-builder need it for tonic/prost codegen. libseccomp/openssl are
-# already cross-linked in the cross musl image, so only protoc is added here.
+# Static-musl x86_64 Linux. The cross-rs musl image ships a musl cross-toolchain
+# at /usr/local/x86_64-linux-musl/ but no musl-flavored libseccomp; Ubuntu's
+# `libseccomp-dev` package is glibc-only and won't satisfy linkage against the
+# musl sysroot. Build libseccomp from source against `x86_64-linux-musl-gcc`
+# and install into the cross-rs musl prefix so pkg-config (which libseccomp-sys
+# invokes at build time) and the linker both find -lseccomp. protobuf-compiler
+# is bundled in the apt-get install line below for tonic/prost codegen in
+# zlayer-cluster-rpc + zlayer-builder build.rs (was the earlier protoc-only
+# fix from b25320f4 — superseded here by the libseccomp build that strictly
+# subsumes it).
+#
+# libseccomp version: bumped via `gh release list -R seccomp/libseccomp --limit 1`
+# at edit time. Latest stable = v2.6.0 (2025-01-24).
 [target.x86_64-unknown-linux-musl]
 pre-build = [
     "apt-get update",
-    "apt-get install -y protobuf-compiler",
+    "apt-get install -y --no-install-recommends gperf wget xz-utils ca-certificates pkg-config protobuf-compiler make",
+    "wget -q https://github.com/seccomp/libseccomp/releases/download/v2.6.0/libseccomp-2.6.0.tar.gz",
+    "tar xf libseccomp-2.6.0.tar.gz",
+    "cd libseccomp-2.6.0 && CC=x86_64-linux-musl-gcc ./configure --host=x86_64-linux-musl --prefix=/usr/local/x86_64-linux-musl --disable-shared --enable-static && make -j$(nproc) && make install",
 ]
