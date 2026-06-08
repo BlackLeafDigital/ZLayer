@@ -275,13 +275,31 @@ impl BackupStreamWriter {
     ///
     /// Returns the OS error from `CreateFileW` if the target can't be opened.
     pub fn create(path: &Path) -> io::Result<Self> {
+        // CRITICAL: `BackupWrite` applies the `BACKUP_SECURITY_DATA` stream
+        // (owner + DACL + SACL) ONLY for the access rights the handle was
+        // opened with. Plain `GENERIC_WRITE` lacks `WRITE_DAC`/`WRITE_OWNER`/
+        // `ACCESS_SYSTEM_SECURITY`, so the kernel SILENTLY DROPS the security
+        // descriptor and the materialized file inherits the host directory's
+        // ACL instead of the image's. That ACL omits the BUILTIN\Users (BU) /
+        // ALL APPLICATION PACKAGES (AC) read+execute grants that in-guest
+        // services running as LocalService (e.g. `mpssvc`, the Windows
+        // Firewall) need to load their DLLs — so `mpssvc` fails to start, the
+        // SCM-gated `gcs` service that depends on it never starts, and the UVM
+        // never dials the host GCS bridge (the "never-dial" bug). Request the
+        // security-bearing rights explicitly; the already-enabled
+        // `SeRestorePrivilege` + `FILE_FLAG_BACKUP_SEMANTICS` let `CreateFileW`
+        // grant them. Mirrors hcsshim's `safefile` open flags for layer writes.
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
+        const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
         // `to_extended_wide` adds the `\\?\` prefix so we can open paths
         // longer than MAX_PATH (260 chars) — see the helper's doc comment.
         let wide = to_extended_wide(path)?;
+        let desired_access = GENERIC_WRITE.0 | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
         let handle = unsafe {
             CreateFileW(
                 PCWSTR::from_raw(wide.as_ptr()),
-                GENERIC_WRITE.0,
+                desired_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -333,8 +351,17 @@ impl Write for BackupStreamWriter {
                 self.handle,
                 buf,
                 &mut bytes_written,
-                false,
-                false,
+                false, // bAbort
+                // bProcessSecurity MUST be TRUE for the kernel to apply the
+                // `BACKUP_SECURITY_DATA` stream (owner + DACL + SACL) to the
+                // file. With FALSE the security stream is parsed but its ACL is
+                // DISCARDED — the file keeps the host directory's inherited ACL,
+                // which omits the BUILTIN\Users / ALL APPLICATION PACKAGES read
+                // grants that in-guest services running as LocalService (e.g.
+                // `mpssvc`) need to load their DLLs. Pairs with the
+                // WRITE_DAC/WRITE_OWNER/ACCESS_SYSTEM_SECURITY handle rights in
+                // `create` — both are required, neither alone applies the SD.
+                true, // bProcessSecurity
                 &mut self.context,
             )
         }

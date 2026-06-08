@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.59.0 - 2026-06-08
+
+### Fixed
+- **Windows Hyper-V containers: the in-guest GCS never dialed the host bridge ("never-dial"), which blocked all Hyper-V-isolated containers across many prior sessions.** Root cause was in the OCI Windows layer unpacker: `BackupStreamWriter` opened base-layer files with only `GENERIC_WRITE` and called `BackupWrite` with `bProcessSecurity=false`, so the kernel SILENTLY DROPPED each file's `BACKUP_SECURITY_DATA` (owner + DACL) record — every base-layer file (and the UVM hardlinks to them) inherited the host directory's ACL instead of the image's. That inherited ACL omits the `BUILTIN\Users` / `ALL APPLICATION PACKAGES` read+execute grants that services running as `LocalService` need, so `mpssvc` (Windows Firewall) could not read `mpssvc.dll`, failed to start, and the SCM-gated `gcs` service (which depends on `mpssvc`) never started → the guest never dialed the host GCS bridge. Fix: open the backup-write handle with `WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY` AND pass `bProcessSecurity=true` (BOTH are required; `SeRestorePrivilege` is already enabled), mirroring hcsshim's `safefile` open flags, so the image's security descriptors are actually stamped onto the materialized files. With this fix the guest dials and cold-start `NegotiateProtocol`/`Create`/`Start` all succeed on the stock inbox `gcs` dependency chain. (`crates/zlayer-agent/src/windows/layer.rs`)
+- **Windows Hyper-V `configureHvSocketForGCS` was rejected by the guest with `C037010D` (HCS_E_INVALID_JSON).** The external-GCS HvSocket setup wrapped the modification in an extra `GuestRequest` level (`Request: {GuestRequest: {RequestType, ResourceType, Settings}}`). hcsshim's `uvm.modify` unwraps `doc.GuestRequest` and sends the inner object directly via `gc.Modify` (internal/uvm/modify.go); the extra nesting made the guest mis-type `Settings`, fail to marshal the `HvSocketAddress`, and reject `$.ParentAddress`/`$.LocalAddress`. Send the modification directly as the bridge `Request`. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+
+### Changed
+- **Windows Hyper-V: restored the stock inbox `gcs` `DependOnService` chain (dropped the `condrv`+`hvsocketcontrol` strip).** The strip was a workaround for the never-dial that merely traded it for a cold-start Create fault (gcs ran before the firewall/network substrate it needs); with the security-descriptor unpacker fix the stock chain works correctly. The strip is retained as an opt-in debug A/B via `ZLAYER_GCS_STRIP_DEPS=1`. Also added a `ZLAYER_GCS_ACCEPT_TIMEOUT_SECS` knob to hold a UVM open long enough to attach a kernel debugger during diagnosis. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+
 ## 0.58.0 - 2026-06-07
 
 ### Fixed

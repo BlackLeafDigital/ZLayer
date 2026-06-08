@@ -1721,7 +1721,16 @@ impl HcsRuntime {
                  cold-start Create will fall back to the UTC TimeZoneInformation constant"
             );
         }
-        let accept_fut = pending_bridge.accept(std::time::Duration::from_secs(120), host_tz);
+        // Accept window. Default 120s mirrors hcsshim's GCSConnectionTimeout.
+        // Overridable via ZLAYER_GCS_ACCEPT_TIMEOUT_SECS so a KD/diagnostic run
+        // can hold the UVM alive long enough to attach a kernel debugger and
+        // inspect the in-guest service-start state without racing teardown.
+        let accept_secs = std::env::var("ZLAYER_GCS_ACCEPT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+        let accept_fut =
+            pending_bridge.accept(std::time::Duration::from_secs(accept_secs), host_tz);
         tokio::pin!(accept_fut);
         let mut state_poll = tokio::time::interval(std::time::Duration::from_secs(5));
         let bridge = loop {
@@ -1910,16 +1919,22 @@ impl HcsRuntime {
                 activity_id: Uuid::new_v4(),
                 container_id: NULL_GUID_STR.to_string(),
             },
+            // The bridge `Request` field must carry the guest modification
+            // DIRECTLY — `{RequestType, ResourceType, Settings}` — NOT wrapped
+            // in another `GuestRequest`. hcsshim's `uvm.modify` unwraps
+            // `doc.GuestRequest` and sends exactly that via `gc.Modify`
+            // (internal/uvm/modify.go). An extra `GuestRequest` nesting made
+            // the guest mis-type `Settings`, so it failed to marshal the
+            // `HvSocketAddress` and rejected `$.ParentAddress`/`$.LocalAddress`
+            // with C037010D.
             request: serde_json::json!({
-                "GuestRequest": {
-                    "ResourceType": "HvSocket",
-                    "RequestType": "Update",
-                    "Settings": {
-                        "LocalAddress": format_guid_bare(uvm.runtime_id()),
-                        "ParentAddress": format_guid_bare(
-                            zlayer_gcs::transport::WINDOWS_GCS_HV_HOST_ID
-                        ),
-                    }
+                "ResourceType": "HvSocket",
+                "RequestType": "Update",
+                "Settings": {
+                    "LocalAddress": format_guid_bare(uvm.runtime_id()),
+                    "ParentAddress": format_guid_bare(
+                        zlayer_gcs::transport::WINDOWS_GCS_HV_HOST_ID
+                    ),
                 }
             }),
         };
@@ -2536,7 +2551,7 @@ fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
 ///
 /// This is the on-box ergonomic counterpart to the offline-VHDX recipe: the
 /// scratch is a differencing disk, but it mounts coherently on the SAME box
-/// that wrote it because the parent (the UtilityVM base) is local. We mount
+/// that wrote it because the parent (the `UtilityVM` base) is local. We mount
 /// read-only and never alter the disk, so re-running the offline recipe later
 /// still works.
 #[cfg(all(feature = "hcs-runtime", feature = "windows-debug"))]
@@ -2630,23 +2645,22 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
         },
     ];
 
-    // gcs `DependOnService` override (handoff 2026-05-31 §4). Strip
-    // `mpssvc`/`netsetupsvc` from gcs's SCM dependency chain so the GCS service
-    // starts in a UVM that has NO virtual NIC. This is the ONE thing we do that
-    // hcsshim never does (hcsshim ships the unmodified inbox UVM). It fixed the
-    // never-dial bug but the cold-start `RpcCreate` handler then faults — so the
-    // override may have MASKED the real never-dial cause rather than fixing it.
-    // A/B toggle: set `ZLAYER_GCS_STOCK_DEPS=1` to OMIT the override and use the
-    // inbox gcs's stock dependency chain (hcsshim parity) — used to test whether
-    // the strip itself is the Create-fault culprit. Encoded as REG_MULTI_SZ
-    // (UTF-16LE, base64).
-    let stock_deps = std::env::var("ZLAYER_GCS_STOCK_DEPS").as_deref() == Ok("1");
-    if stock_deps {
+    // gcs `DependOnService`: keep the STOCK inbox chain (condrv,
+    // hvsocketcontrol, mpssvc, netsetupsvc) — hcsshim parity. The inbox gcs
+    // depends on mpssvc (firewall) / netsetupsvc, which now reach Running
+    // because the layer unpacker applies the image's per-file security
+    // descriptors (so LocalService can read `mpssvc.dll` — see
+    // `windows::layer::BackupStreamWriter`). The historical strip to
+    // condrv+hvsocketcontrol was a workaround for the never-dial that traded it
+    // for a cold-start Create fault (gcs ran without the firewall/network
+    // substrate its Create handler needs); it is no longer needed and is
+    // retained only as an opt-in debug A/B via `ZLAYER_GCS_STRIP_DEPS=1`. The
+    // strip is REG_MULTI_SZ (UTF-16LE, base64).
+    if std::env::var("ZLAYER_GCS_STRIP_DEPS").as_deref() == Ok("1") {
         tracing::warn!(
-            "ZLAYER_GCS_STOCK_DEPS=1 — omitting the gcs DependOnService override; \
-             using the inbox gcs stock dependency chain (hcsshim parity)"
+            "ZLAYER_GCS_STRIP_DEPS=1 — stripping gcs DependOnService to \
+             condrv+hvsocketcontrol (debug A/B; not the normal path)"
         );
-    } else {
         values.push(RegistryValue {
             key: Some(RegistryKey {
                 hive: Some(RegistryHive::System),
@@ -2782,7 +2796,7 @@ fn build_uvm_registry_changes() -> Vec<RegistryValue> {
 
 /// (`windows-debug` only) Offline registry changes that arm Windows Error
 /// Reporting so that, if `vmcomputeagent.exe` (the in-guest GCS host process)
-/// fully crashes during the cold-start `RpcCreate`/HvSocket handshake, a full
+/// fully crashes during the cold-start `RpcCreate`/`HvSocket` handshake, a full
 /// crash dump lands on the guest's writable scratch volume (`C:\`) where the
 /// operator can read it offline after the failed UVM is terminated and the
 /// scratch VHDX is mounted host-side.
@@ -3042,7 +3056,12 @@ fn build_virtual_machine_doc(
                             r"\\.\pipe\zlayer-uvm-{}-com1",
                             format_guid_bare(uvm.runtime_id())
                         ),
-                        optimize_for_debugger: false,
+                        // When KD is enabled (windows-debug + ZLAYER_GCS_KD=1),
+                        // ask HCS to set up the COM1 named pipe with
+                        // debugger-friendly semantics so a `kd`/`windbg` client
+                        // can sync over it (a plain pipe stalls in the
+                        // "Refreshing KD connection" resync loop).
+                        optimize_for_debugger: std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1"),
                     },
                 );
                 m
