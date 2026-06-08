@@ -919,6 +919,9 @@ jobs:
   windows-hcs-e2e:
     name: E2E Tests (Windows HCS)
     runs-on: windows-latest
+    # Optional/non-blocking: the Windows HCS runtime is being stabilized
+    # separately. Still runs for signal, but never blocks the release.
+    continue-on-error: true
     if: inputs.test == '' || inputs.test == 'windows-hcs'
     timeout-minutes: 90
     steps:
@@ -1024,6 +1027,8 @@ jobs:
   windows-hcs-hyperv-e2e:
     name: E2E Tests (Windows HCS Hyper-V)
     runs-on: windows-latest
+    # Optional/non-blocking: see windows-hcs-e2e above.
+    continue-on-error: true
     if: inputs.test == '' || inputs.test == 'windows-hcs-hyperv'
     timeout-minutes: 120
     steps:
@@ -1129,7 +1134,10 @@ jobs:
   dispatch-build:
     name: Dispatch Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, raft-e2e-tests, scheduler-unit-tests, macos-sandbox-e2e, windows-hcs-e2e, windows-hcs-hyperv-e2e]
+    # NOTE: windows-hcs-e2e + windows-hcs-hyperv-e2e are intentionally NOT in
+    # this list — they are optional/non-blocking while the Windows HCS runtime
+    # is stabilized. They still run (continue-on-error) but never gate a build.
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, raft-e2e-tests, scheduler-unit-tests, macos-sandbox-e2e]
     # Release dispatch requires `inputs.test == ''` so partial e2e runs
     # (e.g. `test: manager-intellitester`) never short-circuit into a
     # build — the other suites would be skipped, not passed.

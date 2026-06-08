@@ -21,7 +21,7 @@
    verified** (the mac can't cross-compile: `ring`/`aws-lc-sys` need the Windows SDK C headers). FIRST
    on the box: `cargo test --features hcs-runtime,wsl,windows-debug --package zlayer-agent --test
    windows_hcs_hyperv_e2e … -- --ignored --nocapture` and fix any windows-only compile errors in the
-   bundled instrumentation. Run command + remaining steps unchanged from NEXT ACTION / §4 of `HANDOFF.md`.
+   bundled instrumentation.
 
 2. **The "daemon never starts / deadlock" fix this session does NOT affect Windows.** A stderr-capture
    deadlock (`51383c54` console→stderr colliding with `serve`'s fd-2 `install_stderr_redirect_to_tracing`)
@@ -36,8 +36,8 @@
    SCM `LocalSystem` service via `ServiceManager::create_service`) currently always elevates (UAC
    `runas`). INVESTIGATE whether a **per-user** Windows service / scheduled-task is feasible so the main
    daemon installs without admin, elevating only for the overlay (HNS/HCN adapter) change-gate or a
-   user-opted system service. This work lives with the **install/privilege track** (see
-   `MAC_TODO.md` → TRACK A, which owns all three OS `install()` arms in the shared daemon.rs) — the
+   user-opted system service. This work lives with the **install/privilege track** (which owns all
+   three OS `install()` arms in the shared daemon.rs) — the
    Windows agent should coordinate the Windows SCM specifics there, not duplicate it. If a per-user
    Windows service is genuinely infeasible, surface that as the concrete blocker (don't fake it).
 
@@ -84,7 +84,7 @@ Tools installed; `ZLAYER_GCS_KD` toggle wired) only if the exit code is ambiguou
 
 **Box workflow:** edit on the box, `cargo build/test --features hcs-runtime,wsl,windows-debug`,
 commit, `git push` (origin is Forgejo, credentialed). Push to `dev` with `[np] [fast]` for minimum
-CI (no `[skip ci]` — it does nothing). Mirror shared-crate changes into `zlayer-zql` per the standing rule.
+CI (no `[skip ci]` — it does nothing).
 
 ---
 
@@ -570,19 +570,9 @@ These are mutually exclusive in terms of next-iteration scope. Pick the cheapest
 
 Once a Windows container actually starts via `windows_hcs_hyperv_e2e`:
 
-1. **Refresh the zql hcs.rs override** (currently the only entry in `scripts/zql/.drift-allowlist`):
-   ```
-   cd ~/github/zlayer-zql                                # branch: zdb
-   uv run scripts/zql/regenerate.py --source ~/github/ZLayer
-   # confirm: OVERRIDE DRIFT: 0 drifted
-   ```
-   If `hcs.rs` still drifts after the fix lands, run a rust-expert agent over JUST that file with `crates/zlayer-agent/src/runtimes/hcs.rs` + its `.baselines/` sibling. Same shape as the Wave 1/2/3 refreshes that landed 2026-05-31.
+1. **Update CHANGELOG.md** under `[Unreleased]` with whatever the fix turned out to be. Concrete, not vague.
 
-2. **Remove `crates/zlayer-agent/src/runtimes/hcs.rs` from `scripts/zql/.drift-allowlist`**. The CI gate at `scripts/zql/overlay/.forgejo/workflows/regen-from-dev.yml` will then enforce no drift on hcs.rs going forward.
-
-3. **Update CHANGELOG.md** under `[Unreleased]` with whatever the fix turned out to be. Concrete, not vague.
-
-4. **Workspace checks** (entire workspace, never `-p <crate>`):
+2. **Workspace checks** (entire workspace, never `-p <crate>`):
    ```
    cd ~/github/ZLayer
    cargo fmt --all
@@ -591,12 +581,12 @@ Once a Windows container actually starts via `windows_hcs_hyperv_e2e`:
    cargo build --workspace
    ```
 
-5. **Single-line commit**, no body, no Co-Authored-By:
+3. **Single-line commit**, no body, no Co-Authored-By:
    ```
    git commit -m "fix(hcs): <concrete one-liner about what made the guest dial>"
    ```
 
-6. **Do not push** unless explicitly asked.
+4. **Do not push** unless explicitly asked.
 
 ---
 
@@ -612,7 +602,6 @@ Once a Windows container actually starts via `windows_hcs_hyperv_e2e`:
 - **Don't push without asking.**
 - **Foreground agents only**, model `opus`, one small task each, verify after every one. Never `run_in_background=true`.
 - **/tmp is RAM** (tmpfs). Sockets there fine; state, databases, caches, rootfs — never. Default report-dir is `~/.cache/zlayer-debug/` for a reason.
-- **zlayer-zql lives on branch `zdb`** of the same Forgejo repo. Push with `git push origin zdb`, not `dev`. Files under `scripts/zql/overrides/...` are STICKY — editing only the generated copy gets wiped on next regen.
 - **Never defer / "out of scope."** Finish the whole task or stop and state the concrete blocker.
 
 ---
@@ -621,8 +610,7 @@ Once a Windows container actually starts via `windows_hcs_hyperv_e2e`:
 
 | Component | Status |
 |---|---|
-| ZLayer `dev` | green (fmt/clippy/test/build all pass workspace-wide). Latest commit on origin/dev: `e85587ce feat: Track A edge_cache API + Track B unpacker hardlink + Hyper-V Phase G doc compliance + COM-pipe scaffolding`. Mac may have local commits `a80d22d3` / `f16477f0` / `0b180574` (install-dev for mac) ahead of origin/dev. |
-| zlayer-zql `zdb` | green. Latest commit on origin/zdb: `4e18a5cc fix(zql): clippy doc-markdown + format-collect + large_futures + compose project-prefixed build tags`. CI drift gate landed; `hcs.rs` is the one allowed drift. |
+| ZLayer `dev` | green (fmt/clippy/test/build all pass workspace-wide). |
 | BlackLeafDocs `main` | up to date. `gcs-bridge-and-0xEF.md` §6 has the full 2026-05-31 investigation log. |
 | Hyper-V Windows containers (Part B) | **Not working.** Negotiate succeeds; guest never dials post-Negotiate. See §2 of this doc. |
 | Process-isolated Windows containers + HCN overlay (Part A) | **Working.** 5/5 tests, real IP `10.220.99.2`, runs twice cleanly. |

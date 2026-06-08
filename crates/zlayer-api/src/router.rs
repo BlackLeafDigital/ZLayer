@@ -1259,8 +1259,8 @@ pub fn build_node_routes(node_state: NodeApiState) -> Router<()> {
 
 /// Build routes for the edge-cache eligibility API.
 ///
-/// The three endpoints expose the surface upstream callers (notably
-/// Zatabase's `zql_cluster::ClusterManager`) need to mark `ZLayer` nodes
+/// The three endpoints expose the surface upstream callers (the consuming
+/// cluster manager) need to mark `ZLayer` nodes
 /// eligible for edge caching:
 ///
 /// - `POST   /api/v1/nodes/{node_id}/edge-cache`

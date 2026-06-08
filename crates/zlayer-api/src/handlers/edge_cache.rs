@@ -7,8 +7,8 @@
 //! - `DELETE /api/v1/nodes/{node_id}/edge-cache`        — disable
 //! - `GET    /api/v1/nodes/{node_id}/edge-cache/stats`  — placeholder stats
 //!
-//! Designed for upstream control-plane callers (notably Zatabase's
-//! `zql_cluster::ClusterManager`) that need to mark `ZLayer` nodes
+//! Designed for upstream control-plane callers (the consuming cluster
+//! manager) that need to mark `ZLayer` nodes
 //! eligible for edge caching. The actual cache fill/eviction subsystem is
 //! out of scope here — these endpoints only twiddle eligibility state and
 //! its gossip-label broadcast.

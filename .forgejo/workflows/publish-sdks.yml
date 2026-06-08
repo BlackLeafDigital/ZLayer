@@ -704,7 +704,6 @@ jobs:
         run: |
           set -euo pipefail
           TAG="clients/zlayer-sdk/go/v${{ inputs.version }}"
-          case "$TAG" in *zdb*|*ZDB*) echo "refusing: tag matches zdb"; exit 1 ;; esac
           git remote remove github 2>/dev/null || true
           git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
           git push github "refs/tags/${TAG}:refs/tags/${TAG}"
@@ -793,7 +792,6 @@ jobs:
         run: |
           set -euo pipefail
           TAG="clients/go/v${{ inputs.version }}"
-          case "$TAG" in *zdb*|*ZDB*) echo "refusing: tag matches zdb"; exit 1 ;; esac
           git remote remove github 2>/dev/null || true
           git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
           git push github "refs/tags/${TAG}:refs/tags/${TAG}"

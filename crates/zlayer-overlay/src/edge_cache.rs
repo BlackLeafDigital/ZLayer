@@ -1,8 +1,8 @@
 //! Edge-cache eligibility registry.
 //!
 //! Tracks which nodes have been registered as eligible for edge caching by
-//! the upstream control plane (e.g. Zatabase's
-//! `zql_cluster::ClusterManager`). Propagates the eligibility decision via
+//! the upstream control plane (the consuming cluster manager).
+//! Propagates the eligibility decision via
 //! the gossip-label mechanism in [`crate::gossip`] so peer nodes can route
 //! cache-bearing traffic to eligible nodes by inspecting their advertised
 //! [`gossip::PeerInfo::labels`](crate::gossip::PeerInfo).

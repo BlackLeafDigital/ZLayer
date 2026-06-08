@@ -287,11 +287,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
-          # Defense in depth: refuse if the tree contains anything zdb-shaped.
-          if git ls-tree -r --name-only HEAD | grep -Eq '(^|/)(zdb|z-db)($|/)'; then
-            echo "refusing to push: tree contains zdb paths"
-            exit 1
-          fi
           git remote remove github 2>/dev/null || true
           git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
           git push github "refs/heads/main:refs/heads/main"
@@ -312,7 +307,6 @@ jobs:
             rust-sdk-v[0-9]*|py-sdk-v[0-9]*|ts-sdk-v[0-9]*|go-sdk-v[0-9]*|c-sdk-v[0-9]*) ;;
             *) echo "tag '$TRIGGERING_TAG' not on allowlist — skipping GitHub tag push"; exit 0 ;;
           esac
-          case "$TRIGGERING_TAG" in *zdb*|*ZDB*) echo "refusing: zdb tag"; exit 1 ;; esac
           # Tag was just cut by create-forgejo-release; pull it locally.
           git fetch origin --tags
           # `github` remote was added by the previous step.

@@ -25,7 +25,6 @@ verifying-key fetch isn't trivially MitM-able. Subsequent waves:
 - Wave 10: privileged-container E2E coverage.
 - Wave 11: HS256 retirement path; fresh installs from this point drop
   `{data_dir}/join_secret` entirely.
-- Wave 12: backport to zlayer-zql.
 
 ## Consequences
 
@@ -43,5 +42,4 @@ verifying-key fetch isn't trivially MitM-able. Subsequent waves:
 
 ## References
 
-- Original TODO: TODO_PGP.md (will be removed after Wave 11 ships).
 - Full wave plan: see plan file above.

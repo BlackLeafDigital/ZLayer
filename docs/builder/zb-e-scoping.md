@@ -6,7 +6,7 @@
 
 - **Substrate: Virtualization.framework via `objc2-virtualization 0.3.2`** with an in-repo thin safe wrapper.
 - **Tactical bridge**: keep `crates/zlayer-agent/src/runtimes/macos_vm.rs` libkrun lifecycle code in place while the VZ wrapper proves out via `MACOS_BUILDER_VM_SUBSTRATE=libkrun` fallback env var; after ~2 weeks of green VZ operation, rip libkrun lifecycle out in a separate cleanup pass.
-- **Step plan**: see the master `ZLAYER_BUILDER.md` ZB-E section for the 14 agent-sized tasks. The libkrun-based 12-step plan in Section B below is superseded.
+- **Step plan**: the 14 agent-sized tasks for the VZ-based path supersede the libkrun-based 12-step plan in Section B below.
 
 ---
 
@@ -101,7 +101,7 @@ Recommendation, ranked:
 
 # Section B — Original libkrun-based ZB-E scoping (SUPERSEDED for substrate; VM-lifecycle detail still applicable)
 
-> The substrate decision has moved to Virtualization.framework (Section A). The libkrun symbol additions in step 1 are obsolete; the rest of the lifecycle, file-transfer, and agent-binary design is substrate-agnostic and informs the VZ-based plan in `ZLAYER_BUILDER.md` ZB-E.
+> The substrate decision has moved to Virtualization.framework (Section A). The libkrun symbol additions in step 1 are obsolete; the rest of the lifecycle, file-transfer, and agent-binary design is substrate-agnostic and informs the VZ-based plan in Section A.
 
 
 > Naming caveat: the CHANGELOG already uses "Phase E" for the Windows HCN-overlay work (`CHANGELOG.md:1242`) and "Phase F" for the composite Windows runtime (`CHANGELOG.md:1238`). This scoping document inherits the letter from the user's brief; before merge we should rename to something unambiguous (e.g. **Phase M-macOS-VM-Builder** or **Phase OCI-2-macOS**) to avoid collision with the shipped phases. Flagged as an open question below.

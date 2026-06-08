@@ -1,8 +1,8 @@
 //! Edge-cache eligibility API DTOs.
 //!
 //! Wire types for the edge-cache eligibility endpoints exposed by
-//! `zlayer-api` and consumed by upstream control-plane callers (notably
-//! Zatabase's `zql_cluster::ClusterManager`). The host-side cache fill,
+//! `zlayer-api` and consumed by upstream control-plane callers (the
+//! consuming cluster manager). The host-side cache fill,
 //! eviction, hit-counting subsystem is out of scope here — these types
 //! describe only the API surface used to mark a node eligible or
 //! ineligible for edge caching and to read placeholder hit/miss counters.
