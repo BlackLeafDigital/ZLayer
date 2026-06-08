@@ -2061,19 +2061,49 @@ impl HcsRuntime {
         let guest_vsmb_paths: Vec<String> = (0..parent_layers.len())
             .map(|n| format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{n}"))
             .collect();
-        // Placeholder guest scratch mount + WCIFS root — freshly-allocated
-        // GUID per create. Real values come from the in-guest mount
-        // responses (see TODO above); a UUID v5 derivation from `hcs_id`
-        // would be nicer for byte-stability across restarts but the `uuid`
-        // workspace dep is configured `features = ["v4", "serde"]` only
-        // and we are not permitted to hand-edit `Cargo.toml`. Random per
-        // create yields a well-formed document just the same and is
-        // harmless under the placeholder regime — the value gets
-        // overwritten by the real mount path once B4.3 wires the round
-        // trip with the in-guest `MountVSMB` / `AttachSCSI` responses.
-        let placeholder_volume_guid = Uuid::new_v4();
-        let guest_scratch_path = format!(r"\\?\Volume{{{placeholder_volume_guid}}}\");
-        let guest_root_path = guest_scratch_path.clone();
+        // Step 6.5: mount the SCSI-attached scratch INSIDE the guest at a
+        // host-chosen path, then use that path as the container root. hcsshim's
+        // SCSI mount manager picks the guest path host-side as
+        // `fmt.Sprintf(WCOWGlobalScsiMountPrefixFmt, index)`
+        // (`c:\mounts\scsi\m%d`, internal/guestpath) and sends a guest-routed
+        // `MappedVirtualDisk` modify (`{ContainerPath, Lun}`) to mount the disk
+        // there; `CombineLayersWCOW` then passes that SAME path as
+        // `ContainerRootPath`. WCOW has no separate `ScratchPath` — the scratch
+        // IS the writable container root, with the read-only layers overlaid
+        // via WCIFS on top. One container per UVM ⇒ the lone scratch is mount
+        // index 0. (Without this guest mount the path does not exist and
+        // CombineLayersWCOW fails with `0x80070003`.)
+        let guest_root_path = r"c:\mounts\scsi\m0".to_string();
+        tracing::info!(hcs_id = %hcs_id, scratch_mount = %guest_root_path, "Hyper-V step 6.5: GCS MappedVirtualDisk (mount scratch in guest)");
+        step_log!("6.5: GCS MappedVirtualDisk (mount scratch in guest) at {guest_root_path}");
+        let mount_scratch_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            request: serde_json::json!({
+                "ResourceType": "MappedVirtualDisk",
+                "RequestType": "Add",
+                "Settings": { "ContainerPath": guest_root_path, "Lun": 1 },
+            }),
+        };
+        let mount_scratch_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &mount_scratch_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 6.5: GCS MappedVirtualDisk (mount scratch): {e}"),
+            })?;
+        if mount_scratch_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(mount_scratch_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 6.5: MappedVirtualDisk (scratch) returned HRESULT 0x{hresult_u32:08x}: {}",
+                    mount_scratch_resp.error_message,
+                ),
+            });
+        }
 
         tracing::info!(
             hcs_id = %hcs_id,
@@ -2101,6 +2131,10 @@ impl HcsRuntime {
             request: serde_json::json!({
                 "ResourceType": "CombinedLayers",
                 "RequestType": "Add",
+                // WCOW `CombinedLayers` has NO `ScratchPath` (LCOW-only) and
+                // omits `FilterType` (WCIFS is the default). `ContainerRootPath`
+                // is the in-guest scratch mount from step 6.5; `Layers` are the
+                // read-only VSMB shares as `{Id, Path}` objects.
                 "Settings": {
                     "ContainerRootPath": guest_root_path,
                     "Layers": parent_layers
@@ -2108,7 +2142,6 @@ impl HcsRuntime {
                         .zip(guest_vsmb_paths.iter())
                         .map(|(orig, gp)| serde_json::json!({ "Id": orig.id, "Path": gp }))
                         .collect::<Vec<_>>(),
-                    "ScratchPath": guest_scratch_path,
                 },
             }),
         };
@@ -2272,11 +2305,22 @@ impl HcsRuntime {
         // ----------------------------------------------------------------
         tracing::info!(hcs_id = %hcs_id, "Hyper-V step 9: GCS RpcCreate (hosted container)");
         step_log!("9: GCS RpcCreate (hosted container)");
-        let create_settings =
+        // The GCS RpcCreate config for a hosted container is a
+        // `hcsschema.HostedSystem` — `{SchemaVersion:{2,1}, Container:{...}}` —
+        // NOT a bare `Container`. Without the `SchemaVersion` wrapper the guest
+        // parses the body against an older schema and rejects the v2 fields
+        // (`$.HostName`/`$.Processor`/`$.Path` → C037010D). Mirrors hcsshim's
+        // `internal/hcsoci/create.go` (`HostedSystem{SchemaVersion:
+        // schemaversion.SchemaV21(), Container: v2}`).
+        let container_value =
             serde_json::to_value(&hosted_doc).map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
                 reason: format!("Hyper-V step 9: serialize hosted-container body: {e}"),
             })?;
+        let create_settings = serde_json::json!({
+            "SchemaVersion": { "Major": 2, "Minor": 1 },
+            "Container": container_value,
+        });
         let create_req = CreateRequest {
             base: RequestBase {
                 activity_id: Uuid::new_v4(),
@@ -3184,7 +3228,12 @@ fn build_virtual_machine_doc(
 // HCS schema's `Container.Processor` field is `Option<ContainerProcessor>`
 // and callers assign the return value directly into it; collapsing to a bare
 // `ContainerProcessor` would force every caller to re-wrap.
-#[allow(clippy::unnecessary_wraps)]
+// dead_code: per-container CPU/memory limits are not set on the Hyper-V hosted
+// container body (those are UVM-level — they size the UVM in
+// `build_virtual_machine_doc`, currently fixed at the UVM defaults). Retained
+// for the follow-up that wires spec resources into UVM sizing / process
+// isolation.
+#[allow(clippy::unnecessary_wraps, dead_code)]
 fn build_container_processor(spec: &ServiceSpec) -> Option<ContainerProcessor> {
     Some(
         spec.resources
@@ -3209,6 +3258,8 @@ fn build_container_processor(spec: &ServiceSpec) -> Option<ContainerProcessor> {
 
 /// Shared `Container.Memory` constructor. Returns `None` when the spec sets no
 /// memory limit; HCS treats absence as "no memory constraint."
+// dead_code: see note on `build_container_processor` — UVM-level for Hyper-V.
+#[allow(dead_code)]
 fn build_container_memory(spec: &ServiceSpec) -> Option<ContainerMemory> {
     spec.resources.memory.as_ref().and_then(|mem_str| {
         crate::bundle::parse_memory_string(mem_str)
@@ -3271,14 +3322,12 @@ fn build_uvm_only_doc(
 /// the legacy single-doc path.
 #[allow(dead_code)] // B4.2 will wire this into create_container.
 fn build_hosted_container_doc(
-    spec: &ServiceSpec,
+    _spec: &ServiceSpec,
     guest_layers: Vec<zlayer_hcs::schema::Layer>,
     guest_root_volume: String,
     namespace_id: Option<String>,
-    hcs_id: &str,
+    _hcs_id: &str,
 ) -> HcsContainer {
-    let processor = build_container_processor(spec);
-    let memory = build_container_memory(spec);
     let storage = HcsStorage {
         layers: guest_layers,
         path: Some(guest_root_volume),
@@ -3289,18 +3338,21 @@ fn build_hosted_container_doc(
         namespace: Some(ns),
         network_shared_container_name: None,
     });
-    let hostname_source = spec.hostname.as_deref().unwrap_or(hcs_id);
-    let guest_os = Some(HcsGuestOs {
-        host_name: Some(netbios_hostname(hostname_source)),
-    });
+    // The GCS-forwarded HOSTED container config is MINIMAL: for Hyper-V
+    // isolation the CPU/memory limits and hostname belong to the UVM (set in
+    // the UVM create doc), not the hosted container, and the guest's hosted
+    // schema rejects them as unknown properties (`$.HostName`, `$.Processor`
+    // → C037010D). Send only `Storage` (the combined WCIFS root + layers) and
+    // `Networking` (the HCN namespace). `Processor`/`Memory`/`GuestOs` are
+    // intentionally omitted.
     HcsContainer {
-        guest_os,
+        guest_os: None,
         storage: Some(storage),
         networking,
         mapped_directories: Vec::new(),
         mapped_pipes: Vec::new(),
-        processor,
-        memory,
+        processor: None,
+        memory: None,
     }
 }
 
@@ -3978,6 +4030,17 @@ impl Runtime for HcsRuntime {
                 container: hcs_id.clone(),
                 reason: "no HCS entry for container".to_string(),
             })?;
+        // Hyper-V isolation: the workload container is RpcCreate'd AND
+        // RpcStart'd over the GCS bridge during `create_container` (steps
+        // 9/10), and `entry.system` here is the UVM compute system, which is
+        // already Running. Re-running `HcsStartComputeSystem` on the running
+        // UVM returns `0x80370105` (HCS_E_INVALID_STATE), so for Hyper-V the
+        // workload is already started — `start_container` is a no-op. (Process
+        // isolation builds the compute system without starting it, so it still
+        // needs the host start below.)
+        if entry.uvm.is_some() {
+            return Ok(());
+        }
         entry
             .system
             .start("")
