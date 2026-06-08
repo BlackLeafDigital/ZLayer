@@ -30,7 +30,7 @@ tracing.workspace = true
 zstd = "0.13.3"
 zlayer-paths.workspace = true
 zlayer-spec.workspace = true
-zlayer-types = { version = "0.0.0-dev", path = "../zlayer-types" }
+zlayer-types.workspace = true
 
 [dev-dependencies]
 serial_test = "3"

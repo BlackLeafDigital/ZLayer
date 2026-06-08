@@ -64,7 +64,7 @@ zlayer-cluster-rpc.workspace = true
 time.workspace = true
 tonic = "0.14.5"
 prost-types = "0.14.3"
-zlayer-overlay = { version = "0.0.0-dev", path = "../zlayer-overlay" }
+zlayer-overlay.workspace = true
 
 # Testing utilities
 [dev-dependencies]

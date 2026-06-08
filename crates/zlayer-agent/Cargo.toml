@@ -128,9 +128,9 @@ tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "trans
 prost-types = "0.14.3"
 base64.workspace = true
 ipnet.workspace = true
-zlayer-gcs = { version = "0.0.0-dev", path = "../zlayer-gcs", optional = true }
-zlayer-overlayd = { version = "0.0.0-dev", path = "../zlayer-overlayd" }
-zlayer-vzagent = { version = "0.0.0-dev", path = "../zlayer-vzagent" }
+zlayer-gcs = { workspace = true, optional = true }
+zlayer-overlayd.workspace = true
+zlayer-vzagent.workspace = true
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 # Consuming the patched fork via `zlayer-libcontainer` published from

@@ -14,7 +14,7 @@ serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "transport", "router"] }
 tonic-prost = "0.14.5"
-zlayer-types = { version = "0.0.0-dev", path = "../zlayer-types" }
+zlayer-types.workspace = true
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # Shared contract (SecretScope / Secret / SecretsError / SecretsClient).
-secrets-client-api = { version = "0.0.0-dev", path = "../secrets-client-api" }
+secrets-client-api.workspace = true
 
 async-trait = { workspace = true }
 reqwest = { workspace = true }
