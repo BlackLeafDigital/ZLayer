@@ -184,6 +184,48 @@ pub fn create(layer_path: &Path, parent_chain: &LayerChain) -> io::Result<Writab
     })
 }
 
+/// Build a fresh writable scratch layer over `parent_chain` WITHOUT
+/// host-activating it — for Hyper-V isolation, where the sandbox VHDX is
+/// SCSI-attached to the UVM (and formatted/mounted IN the guest), not mounted
+/// on the host.
+///
+/// This runs ONLY `CreateSandboxLayer` (which scaffolds the layer dir and fully
+/// formats `sandbox.vhdx`). It deliberately skips `ActivateLayer`/`PrepareLayer`
+/// so the host does not open/lock the VHDX — a host-activated VHDX cannot be
+/// attached to the UVM via SCSI (`HcsModifyComputeSystem` returns
+/// `0x80070020` `ERROR_SHARING_VIOLATION`). The returned layer therefore has an
+/// EMPTY `vhd_mount_path()` (there is no host mount); the container root volume
+/// is established in-guest by `CombineLayersWCOW`.
+///
+/// Requires `SeBackupPrivilege` + `SeRestorePrivilege` (see
+/// [`crate::windows::layer::enable_backup_restore_privileges`]).
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] on any HCS or filesystem failure. On error, the
+/// partially-initialized layer directory is best-effort torn down.
+pub fn create_unactivated(
+    layer_path: &Path,
+    parent_chain: &LayerChain,
+) -> io::Result<WritableLayer> {
+    std::fs::create_dir_all(layer_path)?;
+
+    // `CreateSandboxLayer` scaffolds the layer dir AND fully formats the
+    // backing sandbox.vhdx — that is all the Hyper-V path needs on the host.
+    if let Err(e) = wclayer::create_sandbox_layer(layer_path, parent_chain) {
+        cleanup_best_effort(layer_path, false, false);
+        return Err(e);
+    }
+
+    Ok(WritableLayer {
+        layer_path: layer_path.to_path_buf(),
+        mount_path: String::new(),
+        prepared: false,
+        activated: false,
+        needs_destroy: true,
+    })
+}
+
 /// Best-effort teardown used when `create` fails partway through. Never
 /// panics; emits warnings on failure.
 ///

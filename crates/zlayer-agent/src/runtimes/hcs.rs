@@ -2089,23 +2089,46 @@ impl HcsRuntime {
                 // convention for "this UVM".
                 container_id: NULL_GUID_STR.to_string(),
             },
+            // Guest-routed modify: `ResourceType` (NOT a host `ResourcePath`).
+            // hcsshim uses `guestresource.ResourceTypeCombinedLayers`
+            // ("CombinedLayers") with Settings = CombinedLayers{ContainerRootPath,
+            // Layers, ScratchPath}. A `ResourcePath` here is rejected with
+            // `$.ResourcePath` C037010D (same class as the step-4b GuestRequest
+            // bug). `Layers` is an array of Layer OBJECTS (`{Id, Path}`), NOT
+            // bare path strings — `WCOWCombinedLayers.Layers` is
+            // `[]hcsschema.Layer`; sending strings makes the guest reject the
+            // whole Settings at `$`.
             request: serde_json::json!({
-                "ResourcePath": "Container/WCOWLayerPaths",
+                "ResourceType": "CombinedLayers",
                 "RequestType": "Add",
                 "Settings": {
                     "ContainerRootPath": guest_root_path,
-                    "Layers": guest_vsmb_paths,
+                    "Layers": parent_layers
+                        .iter()
+                        .zip(guest_vsmb_paths.iter())
+                        .map(|(orig, gp)| serde_json::json!({ "Id": orig.id, "Path": gp }))
+                        .collect::<Vec<_>>(),
                     "ScratchPath": guest_scratch_path,
                 },
             }),
         };
-        let _combine_resp: ModifySettingsResponse = bridge
+        let combine_resp: ModifySettingsResponse = bridge
             .send_rpc_json(RpcMessageType::ModifySettings, &combine_req)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
                 reason: format!("Hyper-V step 7: GCS ModifySettings (CombineLayersWCOW): {e}"),
             })?;
+        if combine_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(combine_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 7: CombineLayersWCOW returned HRESULT 0x{hresult_u32:08x}: {}",
+                    combine_resp.error_message,
+                ),
+            });
+        }
 
         // ----------------------------------------------------------------
         // Step 7.5: surface the host-side HCN endpoint inside the UVM's
@@ -2261,13 +2284,23 @@ impl HcsRuntime {
             },
             container_config: zlayer_gcs::protocol::AnyInString::new(create_settings),
         };
-        let _create_resp: CreateResponse = bridge
+        let create_resp: CreateResponse = bridge
             .send_rpc_json(RpcMessageType::Create, &create_req)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
                 reason: format!("Hyper-V step 9: GCS RpcCreate: {e}"),
             })?;
+        if create_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(create_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 9: GCS RpcCreate returned HRESULT 0x{hresult_u32:08x}: {}",
+                    create_resp.error_message,
+                ),
+            });
+        }
 
         // ----------------------------------------------------------------
         // Step 10: RpcStart the hosted container.
@@ -2280,13 +2313,23 @@ impl HcsRuntime {
                 container_id: hcs_id.to_string(),
             },
         };
-        let _start_resp: StartResponse = bridge
+        let start_resp: StartResponse = bridge
             .send_rpc_json(RpcMessageType::Start, &start_req)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
                 reason: format!("Hyper-V step 10: GCS RpcStart: {e}"),
             })?;
+        if start_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(start_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 10: GCS RpcStart returned HRESULT 0x{hresult_u32:08x}: {}",
+                    start_resp.error_message,
+                ),
+            });
+        }
 
         // ----------------------------------------------------------------
         // Step 11: hand back the UVM ComputeSystem + the live bridge.
@@ -3636,16 +3679,28 @@ impl Runtime for HcsRuntime {
             ParentLayerActivationGuard::new(activated)
         };
 
+        // Resolve isolation early — it selects how the scratch is built.
+        // Hyper-V needs an UN-activated sandbox VHDX (SCSI-attached to the UVM
+        // and formatted/mounted in-guest); a host-`ActivateLayer`'d VHDX can't
+        // be attached to the UVM (`0x80070020` sharing violation). Process
+        // isolation host-activates the scratch as before. See
+        // [`decide_isolation`].
+        let image_os_version = self.resolve_image_os_version(&image_name).await;
+        let isolation = resolve_isolation_for_image(spec.isolation, image_os_version.as_deref());
+
         // 2. Build a scratch layer for this container.
         let scratch_dir = self.scratch_dir(&hcs_id);
         // Convert the HCS-ordered parent list into the wclayer LayerChain
         // expected by `scratch::create`.
         let chain = crate::windows::wclayer::LayerChain::new(parent_layers.clone());
-        let scratch_layer =
-            scratch::create(&scratch_dir, &chain).map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.clone(),
-                reason: format!("scratch layer create: {e}"),
-            })?;
+        let scratch_layer = match isolation {
+            IsolationMode::Hyperv => scratch::create_unactivated(&scratch_dir, &chain),
+            IsolationMode::Process => scratch::create(&scratch_dir, &chain),
+        }
+        .map_err(|e| AgentError::CreateFailed {
+            id: hcs_id.clone(),
+            reason: format!("scratch layer create: {e}"),
+        })?;
 
         // 3. Attach the container to the daemon's HCN Transparent overlay
         //    network. If HCN is unavailable (e.g. non-admin daemon on a dev
@@ -3740,14 +3795,9 @@ impl Runtime for HcsRuntime {
             .as_ref()
             .map(|a| vec![a.namespace_guid.clone()])
             .unwrap_or_default();
-        // Resolve the spec-side isolation choice (which may be `Auto` or
-        // absent) to the concrete runtime-internal isolation mode using the
-        // image's builder-asserted `os.version` and the host's Windows
-        // build. Explicit `Process` / `Hyperv` from the spec bypass the
-        // matrix and flow through directly. See [`decide_isolation`].
-        let image_os_version = self.resolve_image_os_version(&image_name).await;
-        let isolation = resolve_isolation_for_image(spec.isolation, image_os_version.as_deref());
-
+        // (Isolation was resolved above, before the scratch was built, because
+        // it selects the scratch-creation path.)
+        //
         // For Hyper-V isolation, provision the utility VM BEFORE building the
         // compute-system doc so the doc can reference the UVM's scratch VHDX,
         // boot files, and per-layer VirtualSMB shares. The UVM's `Drop` impl
