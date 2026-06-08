@@ -490,6 +490,84 @@ fn expand_zimage_vars(content: &str, vars: &std::collections::HashMap<String, St
     result
 }
 
+/// Discover a `ZImagefile` in the build context directory.
+///
+/// Resolution order matches user intuition:
+///
+/// 1. **Literal `ZImagefile`** in the context root — by far the most common
+///    layout (e.g. a one-image repo whose build file is just `ZImagefile`).
+/// 2. **Any `ZImagefile.<suffix>`** glob — the convention this repo itself
+///    uses (`ZImagefile.zlayer-node`, `ZImagefile.zlayer-manager`, …). If
+///    exactly one match exists, use it.
+/// 3. **Zero matches** → return `Ok(None)` so the caller falls through to the
+///    Dockerfile path.
+/// 4. **Multiple `ZImagefile.<suffix>` matches and no literal `ZImagefile`**
+///    → ambiguous; return an error telling the user to pick one with
+///    `-z <path>`. We don't silently pick "the first one" because that's a
+///    correctness landmine — a repo with `ZImagefile.prod` and
+///    `ZImagefile.dev` would otherwise build whichever entry the filesystem
+///    listed first.
+///
+/// The lookup is sync (a single `read_dir`) and doesn't follow symlinks
+/// beyond the standard `DirEntry::file_type()` semantics. Errors reading the
+/// directory propagate so the caller can attach a `BuildError::ContextRead`.
+fn find_context_zimagefile(context: &Path) -> std::io::Result<Option<PathBuf>> {
+    // (1) Literal `ZImagefile` wins outright.
+    let literal = context.join("ZImagefile");
+    if literal.exists() {
+        return Ok(Some(literal));
+    }
+
+    // (2) Scan for `ZImagefile.<suffix>` entries. We treat any non-empty
+    // suffix as a candidate; the suffix is opaque to the builder (it's just
+    // a disambiguator, like `Dockerfile.prod`).
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let entries = match std::fs::read_dir(context) {
+        Ok(e) => e,
+        // Context dir doesn't exist / not readable: caller will surface a
+        // proper error elsewhere. Returning Ok(None) keeps this helper
+        // narrow.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if let Some(rest) = name_str.strip_prefix("ZImagefile.") {
+            if !rest.is_empty() {
+                matches.push(entry.path());
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.pop().expect("len == 1"))),
+        _ => {
+            matches.sort();
+            let names: Vec<String> = matches
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "multiple ZImagefile candidates in {}: {} — pass `-z <path>` to pick one",
+                    context.display(),
+                    names.join(", "),
+                ),
+            ))
+        }
+    }
+}
+
 /// Image builder - orchestrates the full build process
 ///
 /// `ImageBuilder` provides a fluent API for configuring and executing
@@ -1736,10 +1814,15 @@ impl ImageBuilder {
         // Peek at the ZImagefile (if the caller pointed us at one, or if one
         // lives in the context dir). We only inspect the OS-related fields so
         // a malformed ZImagefile body defers its error to `get_build_output`.
-        let zimage_path = self.options.zimagefile.clone().or_else(|| {
-            let candidate = self.context.join("ZImagefile");
-            candidate.exists().then_some(candidate)
-        });
+        // Auto-detection accepts both a literal `ZImagefile` and any
+        // `ZImagefile.<suffix>`. Read errors / ambiguity here are non-fatal
+        // for OS peeking — `get_build_output` will surface them with a
+        // proper `BuildError::ContextRead`.
+        let zimage_path = self
+            .options
+            .zimagefile
+            .clone()
+            .or_else(|| find_context_zimagefile(&self.context).ok().flatten());
 
         let Some(path) = zimage_path else {
             // No ZImagefile — Dockerfile / runtime template paths have no OS
@@ -1831,9 +1914,18 @@ impl ImageBuilder {
             return self.handle_zimage(&zimage).await;
         }
 
-        // (c) Auto-detect ZImagefile in context directory.
-        let auto_zimage_path = self.context.join("ZImagefile");
-        if auto_zimage_path.exists() {
+        // (c) Auto-detect ZImagefile in context directory. Accepts both a
+        // literal `ZImagefile` and any `ZImagefile.<suffix>` (the convention
+        // ZLayer itself uses: `ZImagefile.zlayer-node`,
+        // `ZImagefile.zlayer-manager`, etc.). Ambiguity (multiple
+        // `ZImagefile.<suffix>` entries with no literal tiebreaker) is a
+        // hard error — the user must pass `-z <path>` to disambiguate.
+        let auto_zimage_path =
+            find_context_zimagefile(&self.context).map_err(|e| BuildError::ContextRead {
+                path: self.context.clone(),
+                source: e,
+            })?;
+        if let Some(auto_zimage_path) = auto_zimage_path {
             debug!(
                 "Found ZImagefile in context: {}",
                 auto_zimage_path.display()
@@ -2466,6 +2558,66 @@ mod tests {
         let vars = std::collections::HashMap::new();
         let content = "base: mcr.microsoft.com/windows/servercore:${LTSC}\n";
         assert_eq!(expand_zimage_vars(content, &vars), content);
+    }
+
+    #[test]
+    fn find_context_zimagefile_prefers_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both a literal `ZImagefile` AND a `.suffix` variant exist — the
+        // literal wins outright per the documented resolution order.
+        std::fs::write(dir.path().join("ZImagefile"), "base: alpine\n").unwrap();
+        std::fs::write(dir.path().join("ZImagefile.prod"), "base: alpine\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, Some(dir.path().join("ZImagefile")));
+    }
+
+    #[test]
+    fn find_context_zimagefile_picks_unique_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only one `ZImagefile.<suffix>` and no literal — auto-detect
+        // returns it. This is the common multi-image-repo convention
+        // (e.g. `ZImagefile.zataserver`).
+        std::fs::write(dir.path().join("ZImagefile.zataserver"), "base: rust\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, Some(dir.path().join("ZImagefile.zataserver")));
+    }
+
+    #[test]
+    fn find_context_zimagefile_none_when_only_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_context_zimagefile_ambiguous_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two `.suffix` variants and NO literal `ZImagefile` to break the
+        // tie — silently picking either one is a footgun, so this MUST
+        // surface as an error pointing the user at `-z <path>`.
+        std::fs::write(dir.path().join("ZImagefile.prod"), "base: alpine\n").unwrap();
+        std::fs::write(dir.path().join("ZImagefile.dev"), "base: alpine\n").unwrap();
+        let err = find_context_zimagefile(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple ZImagefile candidates"),
+            "error must explain ambiguity, got: {msg}"
+        );
+        assert!(msg.contains("ZImagefile.dev"));
+        assert!(msg.contains("ZImagefile.prod"));
+        assert!(msg.contains("-z"));
+    }
+
+    #[test]
+    fn find_context_zimagefile_ignores_empty_suffix() {
+        // A file named literally `ZImagefile.` (with a trailing dot and no
+        // suffix) is a weird edge case but it shouldn't be picked up as a
+        // candidate — the helper requires a non-empty suffix.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ZImagefile."), "junk\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]

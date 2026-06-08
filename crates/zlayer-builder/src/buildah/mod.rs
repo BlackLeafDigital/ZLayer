@@ -310,7 +310,31 @@ impl BuildahCommand {
         shell: impl IntoIterator<Item = impl AsRef<str>>,
         command: &str,
     ) -> Self {
-        let mut cmd = Self::new("run").arg(container).arg("--");
+        Self::run_shell_custom_with_net(container, shell, command, None)
+    }
+
+    /// Run a command in the container (shell form) using an explicit shell,
+    /// optionally pinning the network mode.
+    ///
+    /// `buildah run [--net=<mode>] <container> -- <shell...> <command>`
+    ///
+    /// See [`Self::run_exec_with_net`] for the meaning of `net`.
+    #[must_use]
+    pub fn run_shell_custom_with_net(
+        container: &str,
+        shell: impl IntoIterator<Item = impl AsRef<str>>,
+        command: &str,
+        net: Option<RunNetwork>,
+    ) -> Self {
+        let mut cmd = Self::new("run");
+        if let Some(mode) = net {
+            match mode {
+                RunNetwork::Host => cmd = cmd.arg("--net=host"),
+                RunNetwork::None => cmd = cmd.arg("--net=none"),
+                RunNetwork::Default => {}
+            }
+        }
+        cmd = cmd.arg(container).arg("--");
         for s in shell {
             cmd = cmd.arg(s.as_ref().to_string());
         }
@@ -331,7 +355,32 @@ impl BuildahCommand {
     /// `buildah run <container> -- <args...>`
     #[must_use]
     pub fn run_exec(container: &str, args: &[String]) -> Self {
-        let mut cmd = Self::new("run").arg(container).arg("--");
+        Self::run_exec_with_net(container, args, None)
+    }
+
+    /// Run a command in the container (exec form), optionally pinning the
+    /// network mode.
+    ///
+    /// `buildah run [--net=<mode>] <container> -- <args...>`
+    ///
+    /// The `--net=<mode>` flag MUST precede the container ID — buildah parses
+    /// flags up to the first positional and then treats the rest as the
+    /// command. When `net` is `None`, no `--net` flag is emitted and buildah
+    /// uses its default rootless networking. Use `Some(RunNetwork::Host)`
+    /// when the translator-level `host_network` override is on, so the
+    /// emitted `buildah run` bypasses CNI/netavark just like the dedicated
+    /// `RUN` instruction path does.
+    #[must_use]
+    pub fn run_exec_with_net(container: &str, args: &[String], net: Option<RunNetwork>) -> Self {
+        let mut cmd = Self::new("run");
+        if let Some(mode) = net {
+            match mode {
+                RunNetwork::Host => cmd = cmd.arg("--net=host"),
+                RunNetwork::None => cmd = cmd.arg("--net=none"),
+                RunNetwork::Default => {}
+            }
+        }
+        cmd = cmd.arg(container).arg("--");
         for arg in args {
             cmd = cmd.arg(arg);
         }
@@ -1048,12 +1097,21 @@ impl DockerfileTranslator {
     /// directory exists, so we guard with `if not exist` to stay idempotent
     /// across repeated WORKDIR instructions in the same Dockerfile.
     fn translate_workdir(&self, container: &str, dir: &str) -> Vec<BuildahCommand> {
+        // Mirror `Instruction::Run`: when the translator was constructed with
+        // `with_host_network(true)`, every emitted `buildah run` MUST carry
+        // `--net=host` so the build bypasses buildah's rootless CNI/netavark
+        // plumbing entirely. Without this, a WORKDIR — which runs `mkdir -p`
+        // through `buildah run` — gets routed through netavark even though
+        // the user opted out, and dies on the first instruction of the first
+        // stage when the host's netavark config is broken.
+        let net = self.host_network.then_some(RunNetwork::Host);
         match self.target_os {
             ImageOs::Linux => {
                 vec![
-                    BuildahCommand::run_exec(
+                    BuildahCommand::run_exec_with_net(
                         container,
                         &["mkdir".to_string(), "-p".to_string(), dir.to_string()],
+                        net,
                     ),
                     BuildahCommand::config_workdir(container, dir),
                 ]
@@ -1065,7 +1123,12 @@ impl DockerfileTranslator {
                 // any inner quotes.
                 let guarded = format!(r#"if not exist "{dir}" mkdir "{dir}""#);
                 vec![
-                    BuildahCommand::run_shell_custom(container, WINDOWS_DEFAULT_SHELL, &guarded),
+                    BuildahCommand::run_shell_custom_with_net(
+                        container,
+                        WINDOWS_DEFAULT_SHELL,
+                        &guarded,
+                        net,
+                    ),
                     BuildahCommand::config_workdir(container, dir),
                 ]
             }
@@ -2402,6 +2465,79 @@ mod tests {
         assert_eq!(
             cmds[1].args,
             vec!["config", "--workingdir", "C:\\app", "c1"]
+        );
+    }
+
+    #[test]
+    fn test_translator_workdir_host_network_linux_emits_net_host() {
+        // Regression: when the translator is constructed with
+        // `with_host_network(true)` (i.e. the user passed `--host-network`),
+        // WORKDIR's `mkdir -p` MUST carry `--net=host` just like every
+        // RUN does. Before the fix, only `Instruction::Run` consulted
+        // `self.host_network`, so a `WORKDIR /app` would route through
+        // buildah's default rootless networking → netavark → die on the
+        // very first instruction of stage 1 if the host's netavark
+        // config was broken.
+        let mut t = DockerfileTranslator::new(ImageOs::Linux).with_host_network(true);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0].args,
+            vec!["run", "--net=host", "c1", "--", "mkdir", "-p", "/app"],
+            "WORKDIR mkdir with host_network=true must emit --net=host BEFORE the container ID",
+        );
+        // The `config --workingdir` metadata write is unaffected by
+        // host_network — `buildah config` doesn't run a container.
+        assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_no_host_network_omits_net_flag() {
+        // Pin the default-path behavior: without `--host-network`,
+        // WORKDIR's mkdir must NOT carry any `--net` flag. Mirrors the
+        // existing `test_translator_workdir_linux` but makes the
+        // host_network=false branch explicit so a future refactor that
+        // accidentally always emits `--net=host` is caught immediately.
+        let mut t = DockerfileTranslator::new(ImageOs::Linux).with_host_network(false);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            !cmds[0].args.iter().any(|a| a.starts_with("--net")),
+            "WORKDIR with host_network=false must NOT emit any --net flag, got: {:?}",
+            cmds[0].args
+        );
+        assert_eq!(cmds[0].args, vec!["run", "c1", "--", "mkdir", "-p", "/app"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_host_network_windows_emits_net_host() {
+        // Symmetric coverage for the Windows guarded-mkdir path. Windows
+        // builds dispatch through the HCS backend in practice (not buildah),
+        // so this is belt-and-suspenders: if someone ever wires the buildah
+        // translator into a Windows build, host_network must still be
+        // honored on the guarded `if not exist ... mkdir` invocation.
+        let mut t = DockerfileTranslator::new(ImageOs::Windows).with_host_network(true);
+        let cmds = t.translate("c1", &Instruction::Workdir("C:\\app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        let net_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("expected --net=host on Windows WORKDIR with host_network=true");
+        let container_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "c1")
+            .expect("container ID present");
+        let sep_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("`--` separator present");
+        assert!(
+            net_idx < container_idx && container_idx < sep_idx,
+            "argument order must be: run --net=host <container> -- ... (got {:?})",
+            cmds[0].args
         );
     }
 
