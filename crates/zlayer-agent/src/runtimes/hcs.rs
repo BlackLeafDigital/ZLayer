@@ -1963,21 +1963,23 @@ impl HcsRuntime {
         //         index 0 (there is no longer a writable debug share occupying
         //         index 0 — guest diagnostics use GCS log forwarding instead).
         // ----------------------------------------------------------------
-        let vsmb_base_idx = 0usize;
         tracing::info!(
             hcs_id = %hcs_id,
             layer_count = parent_layers.len(),
-            vsmb_base_idx,
             "Hyper-V step 5: hot-attach per-layer VSMB shares"
         );
         step_log!(
-            "5: hot-attach per-layer VSMB shares ({} layers, base_idx={vsmb_base_idx})",
+            "5: hot-attach per-layer VSMB shares ({} layers)",
             parent_layers.len()
         );
-        for (offset, layer) in parent_layers.iter().enumerate() {
-            let idx = vsmb_base_idx + offset;
+        for (i, layer) in parent_layers.iter().enumerate() {
+            // Share NAME is `sN` (matching hcsshim's vsmb naming) and is the
+            // component the guest uses in the VSMB path
+            // `\\?\VMSMB\VSMB-{guid}\sN` — so the Step 6 guest paths below MUST
+            // use the same `sN`. (The host-side share name is just an
+            // identifier; what matters is host name == guest path component.)
             let share = VirtualSmbShare {
-                name: layer.id.clone(),
+                name: format!("s{i}"),
                 path: layer.path.clone(),
                 options: Some(VirtualSmbShareOptions {
                     read_only: true,
@@ -1989,11 +1991,11 @@ impl HcsRuntime {
                 ..Default::default()
             };
             uvm_system
-                .add_vsmb(idx, &share)
+                .add_vsmb(&share)
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: hcs_id.to_string(),
-                    reason: format!("Hyper-V step 5: add_vsmb({idx}, {}): {e}", layer.id,),
+                    reason: format!("Hyper-V step 5: add_vsmb(s{i} -> {}): {e}", layer.id),
                 })?;
         }
 
@@ -2006,18 +2008,28 @@ impl HcsRuntime {
             "Hyper-V step 6: hot-attach scratch VHDX on SCSI LUN 1"
         );
         step_log!("6: hot-attach scratch VHDX on SCSI LUN 1");
-        let scratch_vhd = scratch_layer.vhd_mount_path().to_string();
+        // A SCSI `VirtualDisk` attachment takes the backing `.vhdx` FILE path,
+        // not the host volume-GUID mount path (`vhd_mount_path()`, which is the
+        // container ROOT path in the create doc). The sandbox VHDX lives in the
+        // writable layer dir.
+        let scratch_vhd = scratch_layer
+            .layer_path()
+            .join("sandbox.vhdx")
+            .to_string_lossy()
+            .into_owned();
         let scratch_attachment = ScsiAttachment {
             path: scratch_vhd.clone(),
             r#type: "VirtualDisk".to_string(),
             read_only: Some(false),
         };
         uvm_system
-            .add_scsi(0, 1, &scratch_attachment)
+            .add_scsi(PRIMARY_SCSI_CTRL_GUID, 1, &scratch_attachment)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: hcs_id.to_string(),
-                reason: format!("Hyper-V step 6: add_scsi(0, 1, {scratch_vhd}): {e}"),
+                reason: format!(
+                    "Hyper-V step 6: add_scsi({PRIMARY_SCSI_CTRL_GUID}, 1, {scratch_vhd}): {e}"
+                ),
             })?;
 
         // ----------------------------------------------------------------
@@ -2043,15 +2055,11 @@ impl HcsRuntime {
         // hcsshim's well-known VSMB controller GUID — same across all
         // hcsshim builds; lives in `internal/uvm/vsmb.go`.
         let vsmb_controller_guid = "{dcc079ae-60ba-4d07-847c-3493609c0870}";
-        // Guest-side VSMB path index `sN` is the host-side VSMB share index
-        // used at attach time, so it must include `vsmb_base_idx` (1 under
-        // windows-debug, where index 0 is the writable zlayer-debug share; 0
-        // otherwise) to stay aligned with the Step 5 hot-attach indices.
+        // Guest-side VSMB path component `sN` must match the share NAME set at
+        // Step 5 hot-attach (`s{i}`). There is no writable debug share occupying
+        // index 0, so the first parent layer is `s0`.
         let guest_vsmb_paths: Vec<String> = (0..parent_layers.len())
-            .map(|n| {
-                let idx = vsmb_base_idx + n;
-                format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{idx}")
-            })
+            .map(|n| format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{n}"))
             .collect();
         // Placeholder guest scratch mount + WCIFS root — freshly-allocated
         // GUID per create. Real values come from the in-guest mount

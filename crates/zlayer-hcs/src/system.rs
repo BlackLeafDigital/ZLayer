@@ -292,15 +292,16 @@ impl ComputeSystem {
     }
 
     /// Convenience: hot-add a `VirtualSMB` share to a running VM.
-    /// `share_index` is the index under
-    /// `"VirtualMachine/Devices/VirtualSmb/Shares"` (zero-based).
-    pub async fn add_vsmb(
-        &self,
-        share_index: usize,
-        share: &crate::schema::VirtualSmbShare,
-    ) -> HcsResult<()> {
+    ///
+    /// The resource path is the share COLLECTION
+    /// (`"VirtualMachine/Devices/VirtualSmb/Shares"`), NOT an indexed element:
+    /// HCS keys VSMB shares by their `Name`, so an `Add` targets the collection
+    /// and HCS appends. Including a trailing `/<index>` makes the modify fail
+    /// with `0x80070057` (`E_INVALIDARG`). Mirrors hcsshim's
+    /// `resourcepaths.VSMBShareResourcePath`.
+    pub async fn add_vsmb(&self, share: &crate::schema::VirtualSmbShare) -> HcsResult<()> {
         let req = crate::schema::ModifySettingRequest {
-            resource_path: format!("VirtualMachine/Devices/VirtualSmb/Shares/{share_index}"),
+            resource_path: "VirtualMachine/Devices/VirtualSmb/Shares".to_string(),
             request_type: crate::schema::ModifyRequestType::Add,
             settings: Some(serde_json::to_value(share)?),
             guest_request: None,
@@ -309,18 +310,21 @@ impl ComputeSystem {
     }
 
     /// Convenience: hot-add a SCSI attachment to a running VM.
-    /// `controller_index` is the SCSI controller ordinal (typically `0` for
-    /// the primary controller); `lun` is the LUN under that controller.
-    /// hcsshim renders the resource path with numeric indices, not GUIDs.
+    /// `controller_guid` is the SCSI controller's GUID key — the SAME string the
+    /// create-time doc keys `Devices.Scsi` by. HCS resolves the controller by
+    /// that key, NOT a bare ordinal, so a numeric index yields
+    /// `ERROR_NOT_FOUND` (`0x80070490`). `lun` is the LUN under that controller.
+    /// Matches hcsshim's `resourcepaths.SCSIResourceFormat` (controller GUID +
+    /// LUN).
     pub async fn add_scsi(
         &self,
-        controller_index: usize,
+        controller_guid: &str,
         lun: usize,
         attachment: &crate::schema::ScsiAttachment,
     ) -> HcsResult<()> {
         let req = crate::schema::ModifySettingRequest {
             resource_path: format!(
-                "VirtualMachine/Devices/Scsi/{controller_index}/Attachments/{lun}"
+                "VirtualMachine/Devices/Scsi/{controller_guid}/Attachments/{lun}"
             ),
             request_type: crate::schema::ModifyRequestType::Add,
             settings: Some(serde_json::to_value(attachment)?),
