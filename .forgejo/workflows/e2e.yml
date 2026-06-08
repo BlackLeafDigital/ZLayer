@@ -989,9 +989,9 @@ jobs:
       - name: Run Windows HCS E2E tests
         if: steps.check.outputs.completed != 'true'
         run: |
-          cargo test --package zlayer-agent --test windows_hcs_e2e -- --ignored --nocapture
-          cargo test --package zlayer-agent --test windows_overlay_e2e -- --ignored --nocapture
-          cargo test --package zlayer-agent --test windows_cluster_join_e2e -- --ignored --nocapture
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_hcs_e2e -- --ignored --nocapture
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_overlay_e2e -- --ignored --nocapture
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_cluster_join_e2e -- --ignored --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
@@ -1093,7 +1093,7 @@ jobs:
 
       - name: Run Windows HCS Hyper-V E2E tests
         if: steps.check.outputs.completed != 'true'
-        run: cargo test --package zlayer-agent --test windows_hcs_hyperv_e2e -- --ignored --test-threads=1 --nocapture
+        run: cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_hcs_hyperv_e2e -- --ignored --test-threads=1 --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
