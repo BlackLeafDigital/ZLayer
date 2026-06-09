@@ -80,7 +80,7 @@ pub fn Navbar() -> impl IntoView {
         <nav class="navbar">
             <div class="container navbar-content">
                 <A href="/" attr:class="navbar-logo">
-                    {icons::container_icon("28")}
+                    <img src="/zlayer_logo.png" alt="ZLayer" class="navbar-logo-img" />
                     <span>"ZLayer"</span>
                 </A>
 

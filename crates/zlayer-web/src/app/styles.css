@@ -170,7 +170,15 @@ body {
     color: var(--accent-primary);
 }
 
-.navbar-logo:hover .icon {
+.navbar-logo-img {
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
+    display: block;
+}
+
+.navbar-logo:hover .icon,
+.navbar-logo:hover .navbar-logo-img {
     transform: scale(1.1);
     transition: transform 0.2s ease;
 }
