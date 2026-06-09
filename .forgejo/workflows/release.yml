@@ -269,13 +269,24 @@ jobs:
             echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge dev into main
+      - name: Set main to the release-tag commit (selective)
         if: steps.check.outputs.completed != 'true'
+        env:
+          TAG: ${{ steps.tagname.outputs.tag }}
         run: |
-          git checkout main
-          # Use -X theirs to prefer dev changes on conflicts
-          git merge origin/dev --no-ff -X theirs -m "Merge dev into main for release ${{ steps.tagname.outputs.tag }}"
-          git push origin main
+          set -euo pipefail
+          # Selective release: point main at the commit `create-forgejo-release`
+          # cut for this tag, instead of dragging every dev commit between
+          # releases (WIP, handoff notes, scratch files) onto public main and
+          # then mirroring that to github.com. main = exactly what shipped.
+          # `create-forgejo-release` is in this job's `needs:` so the tag
+          # exists locally after `fetch --tags`.
+          git fetch origin --tags
+          git checkout -B main "refs/tags/${TAG}"
+          # Force-with-lease tolerates the first release on a fresh main; the
+          # repo's working contract is that main is auto-updated by this job
+          # only — no human commits directly to main.
+          git push origin main --force-with-lease
 
       # Forgejo→GitHub push mirror is disabled so proprietary refs can't leak.
       # The workflow now owns every byte that lands on github.com. Each push
@@ -289,7 +300,13 @@ jobs:
           set -euo pipefail
           git remote remove github 2>/dev/null || true
           git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
-          git push github "refs/heads/main:refs/heads/main"
+          # --force-with-lease pairs with the selective main-reset above:
+          # GitHub's main moves to whichever tag commit we just published.
+          # Need to fetch GitHub's current main first so the lease can be
+          # computed (lease without a known remote-tracking ref is a no-op
+          # on git ≥ 2.30 and trips a runtime error otherwise).
+          git fetch github main || true
+          git push github "refs/heads/main:refs/heads/main" --force-with-lease=refs/heads/main
 
       - name: Push release tag to GitHub
         if: steps.check.outputs.completed != 'true'

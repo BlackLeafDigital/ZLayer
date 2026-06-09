@@ -338,11 +338,10 @@ jobs:
   # ===========================================
   raft-e2e-tests:
     name: E2E Tests (Raft)
-    # Pin to the NVIDIA/GPU runners (privileged → writable cgroups) so the
-    # cluster_scaling / cluster_upgrade suites can create workload containers;
-    # the plain ubuntu-latest pool includes a runner that doesn't reliably grant
-    # privilege.
-    runs-on: nvidia
+    # The Forgejo twin pins to the self-hosted `nvidia` label for privileged
+    # cgroups; GitHub Actions has no such runner pool, so use the stock
+    # ubuntu-latest hosted runner here.
+    runs-on: ubuntu-latest
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
