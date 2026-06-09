@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "In-guest PID1 agent and vsock wire protocol for the macOS Apple-Virtualization Linux runtime used by zlayer-agent."
+description = "Apple-Virtualization Linux-guest runtime support for ZLayer on macOS. Ships the in-guest PID1 agent (Linux-only binary) that boots inside a VZLinuxBootLoader VM to run OCI Linux containers on Apple Silicon, plus the cross-platform virtio-vsock wire protocol module that the host (zlayer-agent) imports to talk to it — so the same encoder/decoder builds on macOS and Linux."
 
 [lib]
 name = "zlayer_vzagent"

@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Tonic/prost-generated gRPC types for the ZLayer cluster control plane (Raft + scheduler)."
+description = "gRPC client stubs, server traits, and prost message types for the ZLayer worker ↔ control-plane RPC surface (registration, server-streamed assignment delivery, bidirectional status heartbeats, and out-of-band command dispatch). mTLS-authenticated everywhere except the JWT-bootstrapped Register call. Generated from cluster.proto via tonic-prost-build."
 
 [dependencies]
 prost = "0.14.3"

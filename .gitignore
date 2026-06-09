@@ -21,6 +21,8 @@ target/
 #.idea/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+CLAUDE.md
+HANDOFF_*.md
 TODO_DELME.md
 __pycache__
 crates/zlayer-manager/node_modules
