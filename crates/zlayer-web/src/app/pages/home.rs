@@ -127,7 +127,7 @@ services:
                             <div class="install-card">
                                 <h3 class="install-platform">"Linux / macOS"</h3>
                                 <CodeBlock
-                                    code="curl -fsSL https://zlayer.dev/install.sh | bash"
+                                    code="curl -fsSL https://zlayer.dev/install | sh"
                                     title=Some("Linux / macOS")
                                     language="bash"
                                 />
@@ -135,9 +135,17 @@ services:
                             <div class="install-card">
                                 <h3 class="install-platform">"Windows (PowerShell)"</h3>
                                 <CodeBlock
-                                    code="irm https://zlayer.dev/install.ps1 | iex"
+                                    code="irm https://zlayer.dev/install | iex"
                                     title=Some("Windows (PowerShell)")
                                     language="powershell"
+                                />
+                            </div>
+                            <div class="install-card">
+                                <h3 class="install-platform">"Python"</h3>
+                                <CodeBlock
+                                    code="curl -fsSL https://zlayer.dev/install.py | python3"
+                                    title=Some("Python")
+                                    language="bash"
                                 />
                             </div>
                             <div class="install-card">
@@ -148,17 +156,15 @@ services:
                                     language="bash"
                                 />
                             </div>
-                            <div class="install-card">
-                                <h3 class="install-platform">"Python installer"</h3>
-                                <CodeBlock
-                                    code="curl -sSL https://zlayer.dev/install.py | python3"
-                                    title=Some("Python installer")
-                                    language="bash"
-                                />
-                            </div>
                         </div>
                         <p class="install-verify">
-                            "After install, run "<code>"zlayer --version"</code>" to verify."
+                            "After install, run "<code>"zlayer --version"</code>" to verify. "
+                            "Need a specific build? Hit "
+                            <code>"/latest-linux-amd64"</code>", "
+                            <code>"/latest-linux-arm64"</code>", "
+                            <code>"/latest-macos-silicon"</code>", "
+                            <code>"/latest-macos-intel"</code>", or "
+                            <code>"/latest-windows"</code>" — each 302s to the matching asset on the newest GitHub release."
                         </p>
                     </div>
                 </section>
