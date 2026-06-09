@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "In-guest PID1 agent and vsock wire protocol for the macOS Apple-Virtualization Linux runtime used by zlayer-agent."
 
 [lib]
 name = "zlayer_vzagent"

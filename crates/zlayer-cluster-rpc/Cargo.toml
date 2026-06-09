@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "Tonic/prost-generated gRPC types for the ZLayer cluster control plane (Raft + scheduler)."
 
 [dependencies]
 prost = "0.14.3"

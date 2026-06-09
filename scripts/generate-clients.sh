@@ -109,8 +109,21 @@ generate_go() {
     cat > "$CLIENTS_DIR/go/go.mod" << 'EOF'
 module github.com/BlackLeafDigital/ZLayer/clients/go
 
-go 1.21
+go 1.23
 EOF
+
+    # The OpenAPI Generator's Go template leaves `github.com/GIT_USER_ID/GIT_REPO_ID/zlayer`
+    # placeholders in test/*.go and docs/*.md even when `gitUserId`/`gitRepoId` are passed
+    # (because gitRepoId here contains a slash). Normalize both placeholder forms and the
+    # `…/clients/go/zlayer` alias to the real module path.
+    find "$CLIENTS_DIR/go" -type f \( -name '*.go' -o -name '*.md' \) -exec sed -i \
+        -e 's|github.com/GIT_USER_ID/GIT_REPO_ID/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
+        -e 's|github.com/BlackLeafDigital/ZLayer/clients/go/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
+        {} +
+
+    # Drop go.sum if any (we regenerate it in CI / on consumer side via `go mod tidy`).
+    rm -f "$CLIENTS_DIR/go/go.sum"
+
     info "Go client generated at $CLIENTS_DIR/go"
 }
 

@@ -71,7 +71,11 @@ jobs:
       - name: Install system deps (yum, inside manylinux)
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler pkg-config openssl-devel libseccomp-devel clang-devel'
+          # `protobuf-devel` ships /usr/include/google/protobuf/*.proto, which
+          # tonic-prost-build needs when cluster.proto does
+          # `import "google/protobuf/timestamp.proto"`. The bare
+          # `protobuf-compiler` package only installs the protoc binary.
+          packages: 'protobuf-compiler protobuf-devel pkg-config openssl-devel libseccomp-devel clang-devel'
           cross-platform: 'true'
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
@@ -121,7 +125,9 @@ jobs:
       - name: Install system deps (yum, inside manylinux)
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler pkg-config openssl-devel libseccomp-devel clang-devel'
+          # See comment on the x86_64 job above — `protobuf-devel` provides
+          # the well-known .proto headers tonic-prost-build needs.
+          packages: 'protobuf-compiler protobuf-devel pkg-config openssl-devel libseccomp-devel clang-devel'
           cross-platform: 'true'
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
@@ -760,9 +766,16 @@ jobs:
           set -euo pipefail
           VER='${{ inputs.version }}'
           # Limit substitution to the openapi-go tree so we never touch unrelated
-          # `0.0.0-dev` strings elsewhere in the repo.
-          find clients/go -type f \( -name '*.go' -o -name '*.md' \) \
-            -exec sed -i "s|0\.0\.0-dev|${VER}|g" {} +
+          # `0.0.0-dev` strings elsewhere in the repo. Also normalize any
+          # leftover OpenAPI Generator placeholders — `gitUserId`/`gitRepoId`
+          # additional-properties don't fully substitute into test/*.go and
+          # docs/*.md when gitRepoId contains a slash; fix them here so the
+          # publish never depends on hand-editing after a regen.
+          find clients/go -type f \( -name '*.go' -o -name '*.md' \) -exec sed -i \
+            -e "s|0\\.0\\.0-dev|${VER}|g" \
+            -e 's|github.com/GIT_USER_ID/GIT_REPO_ID/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
+            -e 's|github.com/BlackLeafDigital/ZLayer/clients/go/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
+            {} +
           # Sanity: confirm the stamp actually landed in UserAgent.
           grep -q "OpenAPI-Generator/${VER}/go" clients/go/configuration.go
           # Build to catch any syntax fallout from the substitution.

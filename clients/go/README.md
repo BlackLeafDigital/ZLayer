@@ -16,7 +16,7 @@ For more information, please visit [https://zlayer.dev](https://zlayer.dev)
 Import the package in a go file in your project and run `go mod tidy`:
 
 ```go
-import zlayer "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
+import zlayer "github.com/BlackLeafDigital/ZLayer/clients/go"
 ```
 
 To use a proxy, set the environment variable `HTTP_PROXY`:
