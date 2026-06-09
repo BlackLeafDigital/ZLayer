@@ -712,7 +712,10 @@ jobs:
           # is a top-level list of dicts; the entry we want has
           # `flavor: alpine-minirootfs` (verified live before commit).
           # We need: version (e.g. 3.23.4), branch (e.g. v3.23), file.
-          eval "$(python3 - <<'PY'
+          # Pin /usr/bin/python3 — MiniBeast has Linuxbrew python3 first on
+          # PATH, which does NOT see apt-installed python3-yaml at
+          # /usr/lib/python3/dist-packages/yaml.
+          eval "$(/usr/bin/python3 - <<'PY'
           import sys, yaml
           with open("latest-releases.yaml") as f:
               data = yaml.safe_load(f)
