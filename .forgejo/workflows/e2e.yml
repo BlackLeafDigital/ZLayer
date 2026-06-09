@@ -315,7 +315,9 @@ jobs:
     container:
       image: node:20-bullseye
       options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
-    if: inputs.test == '' || inputs.test == 'manager-unit'
+    # Temporarily disabled: same throwaway-daemon hang as
+    # manager-intellitester-tests. Still selectable via the dropdown.
+    if: inputs.test == 'manager-unit'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -181,7 +181,9 @@ jobs:
   manager-tests:
     name: E2E Tests (Manager)
     runs-on: ubuntu-latest
-    if: inputs.test == '' || inputs.test == 'manager-unit'
+    # Temporarily disabled: same throwaway-daemon hang as
+    # manager-intellitester-tests. Still selectable via the dropdown.
+    if: inputs.test == 'manager-unit'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
