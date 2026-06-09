@@ -19,7 +19,7 @@ import (
 // checks if the StoredPermission type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &StoredPermission{}
 
-// StoredPermission A stored permission grant binding a subject (user or group) to a resource with a specific access level.
+// StoredPermission A stored permission grant binding a subject (user or group) to a resource with a specific access level.  Canonical `resource_kind` strings (kept here for grep-ability): - `\"environment\"` — a `StoredEnvironment` row. - `\"deployment\"` — a `StoredDeployment` row. - `\"project\"` — a `StoredProject` row. - `\"secret\"` — a row in the secrets store (`{scope}:{name}` keyed). - `\"node\"` — a cluster member identified by `NodeIdentity::node_id`.
 type StoredPermission struct {
 	// When the permission was created.
 	CreatedAt string `json:"created_at"`

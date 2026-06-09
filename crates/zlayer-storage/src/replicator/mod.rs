@@ -36,7 +36,7 @@
 //!         db_path: "/var/lib/myapp/data.db".into(),
 //!         s3_bucket: "my-bucket".to_string(),
 //!         s3_prefix: "sqlite-backups/myapp/".to_string(),
-//!         cache_dir: "/tmp/zlayer-replicator/cache".into(),
+//!         cache_dir: "/var/lib/zlayer/sqlite-replicator/cache".into(),
 //!         max_cache_size: 100 * 1024 * 1024, // 100MB
 //!         auto_restore: true,
 //!         snapshot_interval_secs: 3600, // 1 hour

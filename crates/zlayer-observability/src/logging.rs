@@ -57,6 +57,15 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
     // We need separate branches because of tracing-subscriber's complex type system
     match (config.format, file_writer) {
         (LogFormat::Pretty, Some(file_writer)) => {
+            // Daemon path (file logging present == `zlayer serve`). The console
+            // layer writes to STDOUT, NOT stderr: `serve` installs a stderr->tracing
+            // redirect (`install_stderr_redirect_to_tracing`) that dup2's fd 2 onto a
+            // pipe whose reader re-emits each line as a `tracing::error!`. If the
+            // console layer also wrote to fd 2, every event would loop back through
+            // that pipe and deadlock on the global stderr mutex once the pipe fills.
+            // Keeping the daemon console on stdout (fd 1) keeps it disjoint from the
+            // fd-2 capture. The CLI (`None`) arms below stay on stderr so command
+            // stdout (e.g. `ps --format json`) is clean.
             let console_layer = fmt::layer()
                 .with_writer(io::stdout)
                 .with_target(config.include_target)
@@ -82,7 +91,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Pretty, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -95,6 +104,8 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
                 .init();
         }
         (LogFormat::Json, Some(file_writer)) => {
+            // Daemon path: console on STDOUT to stay disjoint from the fd-2
+            // stderr->tracing capture (see the Pretty/Some arm for the full why).
             let console_layer = fmt::layer()
                 .with_writer(io::stdout)
                 .with_target(config.include_target)
@@ -120,7 +131,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Json, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)
@@ -133,6 +144,8 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
                 .init();
         }
         (LogFormat::Compact, Some(file_writer)) => {
+            // Daemon path: console on STDOUT to stay disjoint from the fd-2
+            // stderr->tracing capture (see the Pretty/Some arm for the full why).
             let console_layer = fmt::layer()
                 .with_writer(io::stdout)
                 .with_target(config.include_target)
@@ -158,7 +171,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
         }
         (LogFormat::Compact, None) => {
             let console_layer = fmt::layer()
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .with_target(config.include_target)
                 .with_file(config.include_location)
                 .with_line_number(config.include_location)

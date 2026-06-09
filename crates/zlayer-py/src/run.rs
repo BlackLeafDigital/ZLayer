@@ -85,10 +85,7 @@ pub fn run<'py>(
         // Create the runtime (mock for now, will be configurable later)
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
 
-        let id = ContainerId {
-            service: container_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(container_name.clone(), 1);
 
         // Create the container wrapper
         let container = Container::new(id.clone(), spec.clone(), runtime.clone());

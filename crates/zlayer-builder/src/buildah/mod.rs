@@ -26,6 +26,10 @@ mod executor;
 mod install;
 
 pub use executor::*;
+#[cfg(unix)]
+pub use install::buildd as buildd_install;
+#[cfg(unix)]
+pub use install::buildd::{ensure_buildd_sidecar, InstallOutcome as SidecarInstallOutcome};
 pub use install::{
     current_platform, install_instructions, is_platform_supported, BuildahInstallation,
     BuildahInstaller, InstallError,
@@ -34,7 +38,7 @@ pub use install::{
 use crate::backend::ImageOs;
 use crate::dockerfile::{
     AddInstruction, CopyInstruction, EnvInstruction, ExposeInstruction, HealthcheckInstruction,
-    Instruction, RunInstruction, ShellOrExec,
+    Instruction, RunInstruction, RunNetwork, ShellOrExec,
 };
 
 use std::collections::HashMap;
@@ -306,7 +310,31 @@ impl BuildahCommand {
         shell: impl IntoIterator<Item = impl AsRef<str>>,
         command: &str,
     ) -> Self {
-        let mut cmd = Self::new("run").arg(container).arg("--");
+        Self::run_shell_custom_with_net(container, shell, command, None)
+    }
+
+    /// Run a command in the container (shell form) using an explicit shell,
+    /// optionally pinning the network mode.
+    ///
+    /// `buildah run [--net=<mode>] <container> -- <shell...> <command>`
+    ///
+    /// See [`Self::run_exec_with_net`] for the meaning of `net`.
+    #[must_use]
+    pub fn run_shell_custom_with_net(
+        container: &str,
+        shell: impl IntoIterator<Item = impl AsRef<str>>,
+        command: &str,
+        net: Option<RunNetwork>,
+    ) -> Self {
+        let mut cmd = Self::new("run");
+        if let Some(mode) = net {
+            match mode {
+                RunNetwork::Host => cmd = cmd.arg("--net=host"),
+                RunNetwork::None => cmd = cmd.arg("--net=none"),
+                RunNetwork::Default => {}
+            }
+        }
+        cmd = cmd.arg(container).arg("--");
         for s in shell {
             cmd = cmd.arg(s.as_ref().to_string());
         }
@@ -327,7 +355,32 @@ impl BuildahCommand {
     /// `buildah run <container> -- <args...>`
     #[must_use]
     pub fn run_exec(container: &str, args: &[String]) -> Self {
-        let mut cmd = Self::new("run").arg(container).arg("--");
+        Self::run_exec_with_net(container, args, None)
+    }
+
+    /// Run a command in the container (exec form), optionally pinning the
+    /// network mode.
+    ///
+    /// `buildah run [--net=<mode>] <container> -- <args...>`
+    ///
+    /// The `--net=<mode>` flag MUST precede the container ID — buildah parses
+    /// flags up to the first positional and then treats the rest as the
+    /// command. When `net` is `None`, no `--net` flag is emitted and buildah
+    /// uses its default rootless networking. Use `Some(RunNetwork::Host)`
+    /// when the translator-level `host_network` override is on, so the
+    /// emitted `buildah run` bypasses CNI/netavark just like the dedicated
+    /// `RUN` instruction path does.
+    #[must_use]
+    pub fn run_exec_with_net(container: &str, args: &[String], net: Option<RunNetwork>) -> Self {
+        let mut cmd = Self::new("run");
+        if let Some(mode) = net {
+            match mode {
+                RunNetwork::Host => cmd = cmd.arg("--net=host"),
+                RunNetwork::None => cmd = cmd.arg("--net=none"),
+                RunNetwork::Default => {}
+            }
+        }
+        cmd = cmd.arg(container).arg("--");
         for arg in args {
             cmd = cmd.arg(arg);
         }
@@ -373,6 +426,37 @@ impl BuildahCommand {
         // Add --mount arguments BEFORE the container ID
         for mount in &run.mounts {
             cmd = cmd.arg(format!("--mount={}", mount.to_buildah_arg()));
+        }
+
+        // Add transient --env=K=V flags BEFORE the container ID. Sort by key
+        // for deterministic ordering (HashMap iteration is non-deterministic).
+        // These are scoped to this single `buildah run` invocation and are
+        // intentionally NOT persisted into the image config.
+        let mut env_keys: Vec<&String> = run.env.keys().collect();
+        env_keys.sort();
+        for key in env_keys {
+            if let Some(value) = run.env.get(key) {
+                cmd = cmd.arg(format!("--env={key}={value}"));
+            }
+        }
+
+        // Add --net=<value> BEFORE the container ID when a network mode is set.
+        // `RunNetwork::Default` is omitted (buildah's default is `private`),
+        // matching Docker's BuildKit semantics where `--network` is only
+        // emitted when the user opts out of the default. `--net` is the
+        // canonical buildah spelling per the man page (both `--net` and
+        // `--network` work, but `--net` is shorter and matches buildah's
+        // own help output).
+        if let Some(net) = run.network {
+            match net {
+                RunNetwork::Host => {
+                    cmd = cmd.arg("--net=host");
+                }
+                RunNetwork::None => {
+                    cmd = cmd.arg("--net=none");
+                }
+                RunNetwork::Default => {}
+            }
         }
 
         // Now add container and the command
@@ -826,6 +910,12 @@ pub struct DockerfileTranslator {
     /// Most recent `SHELL` instruction override, if any. When `None` the
     /// translator falls back to [`default_shell_for`] for the target OS.
     shell_override: Option<Vec<String>>,
+    /// When `true`, every emitted `buildah run` for a `RUN` instruction will
+    /// carry `--net=host` regardless of any per-instruction `network` value.
+    /// Mirrors Docker's `docker build --network=host` flag and bypasses
+    /// buildah's CNI/netavark plumbing entirely (the container shares the
+    /// host's network namespace).
+    host_network: bool,
 }
 
 impl DockerfileTranslator {
@@ -835,7 +925,22 @@ impl DockerfileTranslator {
         Self {
             target_os,
             shell_override: None,
+            host_network: false,
         }
+    }
+
+    /// Force every translated `RUN` instruction to use host networking.
+    ///
+    /// When `on` is `true`, the translator overrides any per-instruction
+    /// `network` value (including `None`) with [`RunNetwork::Host`] before
+    /// emitting the buildah command. This mirrors the effect of Docker's
+    /// `docker build --network=host` flag and bypasses buildah's CNI /
+    /// netavark plumbing entirely. When `on` is `false` (the default),
+    /// per-instruction `network` values are passed through unchanged.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.host_network = on;
+        self
     }
 
     /// Return the target OS this translator emits commands for.
@@ -873,17 +978,38 @@ impl DockerfileTranslator {
         match instruction {
             Instruction::Run(run) => {
                 let shell = self.active_shell();
-                if run.mounts.is_empty() {
-                    match &run.command {
+                // Apply the translator-level host_network override: when set,
+                // every emitted RUN gets `--net=host` regardless of any
+                // per-instruction network value. We clone only when we
+                // actually need to mutate so the no-override path stays
+                // allocation-free.
+                let effective_run: std::borrow::Cow<'_, RunInstruction> = if self.host_network {
+                    let mut owned = run.clone();
+                    owned.network = Some(RunNetwork::Host);
+                    std::borrow::Cow::Owned(owned)
+                } else {
+                    std::borrow::Cow::Borrowed(run)
+                };
+                let run_ref: &RunInstruction = &effective_run;
+
+                // Route through run_with_mounts_shell whenever mounts, env,
+                // or a network mode are present, since the simple factories
+                // don't emit those pre-container flags.
+                let needs_pre_container_flags = !run_ref.mounts.is_empty()
+                    || !run_ref.env.is_empty()
+                    || run_ref.network.is_some();
+
+                if needs_pre_container_flags {
+                    vec![BuildahCommand::run_with_mounts_shell(
+                        container, run_ref, &shell,
+                    )]
+                } else {
+                    match &run_ref.command {
                         ShellOrExec::Shell(s) => {
                             vec![BuildahCommand::run_shell_custom(container, &shell, s)]
                         }
                         ShellOrExec::Exec(args) => vec![BuildahCommand::run_exec(container, args)],
                     }
-                } else {
-                    vec![BuildahCommand::run_with_mounts_shell(
-                        container, run, &shell,
-                    )]
                 }
             }
 
@@ -971,12 +1097,21 @@ impl DockerfileTranslator {
     /// directory exists, so we guard with `if not exist` to stay idempotent
     /// across repeated WORKDIR instructions in the same Dockerfile.
     fn translate_workdir(&self, container: &str, dir: &str) -> Vec<BuildahCommand> {
+        // Mirror `Instruction::Run`: when the translator was constructed with
+        // `with_host_network(true)`, every emitted `buildah run` MUST carry
+        // `--net=host` so the build bypasses buildah's rootless CNI/netavark
+        // plumbing entirely. Without this, a WORKDIR — which runs `mkdir -p`
+        // through `buildah run` — gets routed through netavark even though
+        // the user opted out, and dies on the first instruction of the first
+        // stage when the host's netavark config is broken.
+        let net = self.host_network.then_some(RunNetwork::Host);
         match self.target_os {
             ImageOs::Linux => {
                 vec![
-                    BuildahCommand::run_exec(
+                    BuildahCommand::run_exec_with_net(
                         container,
                         &["mkdir".to_string(), "-p".to_string(), dir.to_string()],
+                        net,
                     ),
                     BuildahCommand::config_workdir(container, dir),
                 ]
@@ -988,11 +1123,397 @@ impl DockerfileTranslator {
                 // any inner quotes.
                 let guarded = format!(r#"if not exist "{dir}" mkdir "{dir}""#);
                 vec![
-                    BuildahCommand::run_shell_custom(container, WINDOWS_DEFAULT_SHELL, &guarded),
+                    BuildahCommand::run_shell_custom_with_net(
+                        container,
+                        WINDOWS_DEFAULT_SHELL,
+                        &guarded,
+                        net,
+                    ),
                     BuildahCommand::config_workdir(container, dir),
                 ]
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux-package-manager → Chocolatey translation helpers
+//
+// These were originally housed in `crate::windows_builder` and are used to
+// rewrite Linux package-manager invocations (`apt-get install`, `apk add`,
+// `yum/dnf install`) inside `RUN` instructions into a Chocolatey
+// (`choco install -y …`) equivalent when the target OS is Windows. Moving
+// them here lets both the production `HcsBackend` and the in-process
+// `WindowsBuilder` test harness flow through one translator instead of
+// duplicating the logic.
+//
+// The free helpers below are kept `pub(crate)` so the existing
+// `windows_builder` test module (and any other in-crate caller) can keep
+// exercising them directly without going through `DockerfileTranslator`.
+// ---------------------------------------------------------------------------
+
+/// Which Linux package manager an install sub-command was issued against.
+//
+// The whole apt→choco helper surface is gated on `windows || test` so
+// non-Windows production builds don't warn about dead code — every call
+// site lives in either the Windows-only `windows_builder` production
+// path or a `#[cfg(test)]` unit test.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetectedPmKind {
+    /// `apt-get install -y …` or `apt install -y …`.
+    Apt,
+    /// `apk add [--no-cache] …`.
+    Apk,
+    /// `yum install -y …` or `dnf install -y …`.
+    YumOrDnf,
+}
+
+/// One sub-command parsed out of a shell-form RUN string.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShellSubcommand {
+    /// The literal text of a non-install sub-command, kept verbatim.
+    Verbatim(String),
+    /// The literal text of an `apt-get update` / `apk update` /
+    /// `dnf check-update` style sync command. Surfaced as a distinct
+    /// variant so we can elide it (no Chocolatey equivalent) instead of
+    /// passing it through verbatim and breaking the shell.
+    PackageManagerSync,
+    /// A detected install invocation: kind + the package list.
+    Install {
+        kind: DetectedPmKind,
+        packages: Vec<String>,
+    },
+}
+
+/// Detect whether a single shell sub-command is an `apt-get install`,
+/// `apk add`, `yum install`, or `dnf install` invocation. Returns
+/// `Some((kind, packages))` if so. Flag-only arguments (starting with
+/// `-`) are stripped; bare positional args are treated as package names.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn detect_install_in_subcommand(
+    subcommand: &str,
+) -> Option<(DetectedPmKind, Vec<String>)> {
+    let tokens: Vec<&str> = subcommand.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    // Drop `sudo` if present so `sudo apt-get install -y curl` is
+    // recognised the same as the bareword form.
+    let (kind, after_verb_idx) = match tokens[0] {
+        "sudo" if tokens.len() >= 2 => detect_pm_verb(&tokens[1..]).map(|(k, n)| (k, n + 1))?,
+        _ => detect_pm_verb(&tokens)?,
+    };
+    let args = &tokens[after_verb_idx..];
+    let mut packages = Vec::new();
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        packages.push((*arg).to_string());
+    }
+    if packages.is_empty() {
+        return None;
+    }
+    Some((kind, packages))
+}
+
+/// Recognise the `<pm> <verb>` prefix of a sub-command. Returns
+/// `(kind, tokens_consumed)` on success — the caller then walks
+/// `tokens[tokens_consumed..]` for the package list.
+#[cfg(any(target_os = "windows", test))]
+fn detect_pm_verb(tokens: &[&str]) -> Option<(DetectedPmKind, usize)> {
+    match (tokens.first().copied(), tokens.get(1).copied()) {
+        (Some("apt-get" | "apt"), Some("install")) => Some((DetectedPmKind::Apt, 2)),
+        (Some("apk"), Some("add")) => Some((DetectedPmKind::Apk, 2)),
+        (Some("yum" | "dnf"), Some("install")) => Some((DetectedPmKind::YumOrDnf, 2)),
+        _ => None,
+    }
+}
+
+/// Recognise package-manager-sync invocations (`apt-get update`,
+/// `apk update`, `dnf check-update`, etc.) so we can elide them in the
+/// rewritten command — Chocolatey resolves package metadata on every
+/// install and has no separate sync step.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn is_package_manager_sync(subcommand: &str) -> bool {
+    let tokens: Vec<&str> = subcommand.split_whitespace().collect();
+    let stripped: &[&str] = if tokens.first().copied() == Some("sudo") {
+        &tokens[1..]
+    } else {
+        &tokens
+    };
+    matches!(
+        (stripped.first().copied(), stripped.get(1).copied()),
+        (Some("apt-get" | "apt" | "apk"), Some("update"))
+            | (
+                Some("yum" | "dnf"),
+                Some("check-update" | "update" | "makecache")
+            )
+    )
+}
+
+/// Split a shell-form RUN command on `&&` and `;` boundaries, preserving
+/// each sub-command's text. Quoted regions are NOT honoured (Docker
+/// shell-form is itself a string passed to `cmd /c` which doesn't
+/// preserve nested shell quoting either; matching that lenient
+/// behaviour avoids a regex dep and keeps the implementation simple).
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn split_shell_subcommands(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                if !current.trim().is_empty() {
+                    out.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            ';' => {
+                if !current.trim().is_empty() {
+                    out.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out
+}
+
+/// Re-join a list of [`ShellSubcommand`]s back into a single
+/// `cmd /c`-compatible string, eliding sync sub-commands and rewriting
+/// install sub-commands as `choco install -y …`.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn rejoin_subcommands(parts: &[ShellSubcommand]) -> String {
+    let mut emitted: Vec<String> = Vec::new();
+    for part in parts {
+        match part {
+            ShellSubcommand::Verbatim(s) => emitted.push(s.clone()),
+            ShellSubcommand::PackageManagerSync => {
+                // Eliding: no equivalent in Chocolatey.
+            }
+            ShellSubcommand::Install { packages, .. } => {
+                if packages.is_empty() {
+                    continue;
+                }
+                let mut joined = String::from("choco install -y");
+                for pkg in packages {
+                    joined.push(' ');
+                    joined.push_str(pkg);
+                }
+                emitted.push(joined);
+            }
+        }
+    }
+    emitted.join(" && ")
+}
+
+/// Wrap a shell command body in `cmd /c "…"` so HCS's `CreateProcess`
+/// invokes the Windows command interpreter. Embedded double quotes are
+/// backslash-escaped per the NT `CommandLineToArgvW` convention. An
+/// empty body still produces a well-formed (no-op) command.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn wrap_in_cmd(body: &str) -> String {
+    if body.is_empty() {
+        return "cmd /c \"\"".to_string();
+    }
+    let escaped = body.replace('"', "\\\"");
+    format!("cmd /c \"{escaped}\"")
+}
+
+/// Return `true` if `linux_pkg` is the Linux name of the language toolchain
+/// indicated by `toolchain_language`. Used to drop packages that are
+/// already provisioned directly into the rootfs via
+/// `crate::windows_toolchain`, so we don't re-install (a possibly
+/// conflicting) Chocolatey copy on top.
+///
+/// Match is case-insensitive on the toolchain language and exact on the
+/// package name (lower-cased). The mapping mirrors what users typically
+/// write in Linux Dockerfiles for each language:
+///
+/// | toolchain language | matching Linux package names      |
+/// |--------------------|-----------------------------------|
+/// | `go`               | `golang`, `go`                    |
+/// | `node`             | `nodejs`, `node`                  |
+/// | `python`           | `python3`, `python`               |
+/// | `rust`             | `rust`, `rustc`, `cargo`          |
+/// | `deno`             | `deno`                            |
+/// | `bun`              | `bun`                             |
+#[cfg(any(target_os = "windows", test))]
+fn package_matches_toolchain(linux_pkg: &str, toolchain_language: &str) -> bool {
+    let pkg = linux_pkg.to_ascii_lowercase();
+    match toolchain_language.to_ascii_lowercase().as_str() {
+        "go" => matches!(pkg.as_str(), "golang" | "go"),
+        "node" => matches!(pkg.as_str(), "nodejs" | "node"),
+        "python" => matches!(pkg.as_str(), "python3" | "python"),
+        "rust" => matches!(pkg.as_str(), "rust" | "rustc" | "cargo"),
+        "deno" => pkg == "deno",
+        "bun" => pkg == "bun",
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl DockerfileTranslator {
+    /// Translate a `RUN` command (shell- or exec-form) for the
+    /// translator's target OS.
+    ///
+    /// - **Linux**: returns the command verbatim — `(joined_string, [])` —
+    ///   because Linux RUNs are handed straight to `/bin/sh -c` by the
+    ///   buildah backend and need no rewriting.
+    /// - **Windows**: exec-form is passed through (joined with spaces);
+    ///   shell-form is forwarded to [`translate_shell_command`] which
+    ///   detects apt/apk/yum/dnf invocations and rewrites them as
+    ///   `choco install -y …` against the Chocolatey package map for
+    ///   `source_distro`.
+    ///
+    /// If `provisioned_toolchain_language` is `Some(lang)`, any package
+    /// matching that language ([`package_matches_toolchain`]) is **dropped**
+    /// from the install list — the toolchain is already on `PATH` via
+    /// `crate::windows_toolchain` and re-installing via Chocolatey would
+    /// either fail or shadow the provisioned binary.
+    ///
+    /// Returns `(translated_command, skipped_packages)` where
+    /// `skipped_packages` enumerates Linux package names whose Chocolatey
+    /// mapping is the `__skip__` sentinel (no Windows equivalent — the
+    /// caller typically logs them for the user).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::BuildError::ChocoResolutionFailed`] if any
+    /// Linux package detected in the install list has no mapping in the
+    /// Chocolatey package map for `source_distro`. Returns whatever error
+    /// `resolve_chocolatey_packages` surfaces for cache setup failures.
+    pub(crate) async fn translate_run_command(
+        &self,
+        cmd: &ShellOrExec,
+        source_distro: &str,
+        provisioned_toolchain_language: Option<&str>,
+    ) -> Result<(String, Vec<String>), crate::error::BuildError> {
+        match self.target_os {
+            ImageOs::Linux => match cmd {
+                ShellOrExec::Shell(s) => Ok((s.clone(), Vec::new())),
+                ShellOrExec::Exec(args) => Ok((args.join(" "), Vec::new())),
+            },
+            ImageOs::Windows => match cmd {
+                ShellOrExec::Exec(args) => Ok((args.join(" "), Vec::new())),
+                ShellOrExec::Shell(raw) => {
+                    self.translate_shell_command(raw, source_distro, provisioned_toolchain_language)
+                        .await
+                }
+            },
+        }
+    }
+
+    /// Translate a shell-form RUN command. Behaviour matches
+    /// [`Self::translate_run_command`] — Linux returns the input verbatim,
+    /// Windows rewrites Linux package-manager invocations to Chocolatey.
+    ///
+    /// See [`Self::translate_run_command`] for the meaning of
+    /// `provisioned_toolchain_language`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::translate_run_command`].
+    pub(crate) async fn translate_shell_command(
+        &self,
+        raw: &str,
+        source_distro: &str,
+        provisioned_toolchain_language: Option<&str>,
+    ) -> Result<(String, Vec<String>), crate::error::BuildError> {
+        if matches!(self.target_os, ImageOs::Linux) {
+            return Ok((raw.to_string(), Vec::new()));
+        }
+
+        let subcommands = split_shell_subcommands(raw);
+        if subcommands.is_empty() {
+            // Empty RUN — defer to the underlying shell which will be a
+            // no-op. `cmd /c` accepts an empty argument list and exits 0.
+            return Ok((wrap_in_cmd(""), Vec::new()));
+        }
+
+        let mut classified: Vec<ShellSubcommand> = Vec::with_capacity(subcommands.len());
+        let mut all_packages: Vec<String> = Vec::new();
+        for sub in &subcommands {
+            if is_package_manager_sync(sub) {
+                classified.push(ShellSubcommand::PackageManagerSync);
+                continue;
+            }
+            if let Some((kind, mut packages)) = detect_install_in_subcommand(sub) {
+                // Drop packages already covered by the provisioned
+                // toolchain — re-installing via Chocolatey would either
+                // fail (version conflict) or shadow the provisioned
+                // binary that the rest of the build relies on.
+                if let Some(lang) = provisioned_toolchain_language {
+                    packages.retain(|p| !package_matches_toolchain(p, lang));
+                }
+                if packages.is_empty() {
+                    // Every package in this sub-command was the
+                    // toolchain; nothing left to install, so elide the
+                    // sub-command entirely.
+                    continue;
+                }
+                all_packages.extend(packages.iter().cloned());
+                classified.push(ShellSubcommand::Install { kind, packages });
+                continue;
+            }
+            classified.push(ShellSubcommand::Verbatim(sub.clone()));
+        }
+
+        if all_packages.is_empty() {
+            // No install was detected — pass the original shell command
+            // through `cmd /c` unchanged. We re-join from the classified
+            // parts so an `apt-get update`-only RUN still elides correctly.
+            let rejoined = rejoin_subcommands(&classified);
+            return Ok((wrap_in_cmd(&rejoined), Vec::new()));
+        }
+
+        // Bulk-resolve every package across every install sub-command in
+        // one go so duplicate shard fetches are coalesced inside the
+        // resolver.
+        let resolved = crate::windows_image_resolver::resolve_chocolatey_packages(
+            &all_packages,
+            source_distro,
+        )
+        .await?;
+
+        let mut lookup: HashMap<String, (Option<String>, bool)> = HashMap::new();
+        for (linux, choco, skipped) in resolved {
+            lookup.insert(linux, (choco, skipped));
+        }
+
+        let mut skipped_out: Vec<String> = Vec::new();
+        for part in &mut classified {
+            if let ShellSubcommand::Install { kind: _, packages } = part {
+                let mut rewritten: Vec<String> = Vec::new();
+                for pkg in packages.iter() {
+                    match lookup.get(pkg) {
+                        Some((Some(choco), false)) => rewritten.push(choco.clone()),
+                        Some((_, true)) => skipped_out.push(pkg.clone()),
+                        Some((None, false)) | None => {
+                            // No mapping — surface as an error so the user
+                            // gets a precise diagnostic instead of a
+                            // silently-broken image.
+                            return Err(crate::error::BuildError::ChocoResolutionFailed {
+                                package: pkg.clone(),
+                                source_distro: source_distro.to_string(),
+                            });
+                        }
+                    }
+                }
+                *packages = rewritten;
+            }
+        }
+
+        Ok((wrap_in_cmd(&rejoin_subcommands(&classified)), skipped_out))
     }
 }
 
@@ -1166,6 +1687,7 @@ mod tests {
             mounts: vec![],
             network: None,
             security: None,
+            env: HashMap::new(),
         });
 
         let cmds = BuildahCommand::from_instruction("container-1", &instruction);
@@ -1235,6 +1757,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1285,6 +1808,7 @@ mod tests {
             ],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1328,6 +1852,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         });
 
         let cmds = BuildahCommand::from_instruction("container-1", &instruction);
@@ -1359,6 +1884,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmd = BuildahCommand::run_with_mounts("container-1", &run);
@@ -1367,6 +1893,376 @@ mod tests {
         assert!(cmd.args.contains(&"--".to_string()));
         assert!(cmd.args.contains(&"pip".to_string()));
         assert!(cmd.args.contains(&"install".to_string()));
+    }
+
+    #[test]
+    fn test_run_with_mounts_emits_env_flags_sorted() {
+        // RunInstruction with `env` must produce `--env=K=V` args BEFORE the
+        // container ID, sorted by key for determinism. Env is intentionally
+        // scoped to this single buildah-run invocation (not baked into the
+        // image config via `buildah config --env`).
+        let mut env = HashMap::new();
+        env.insert("B".to_string(), "2".to_string());
+        env.insert("A".to_string(), "1".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("env".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        // Confirm both --env flags appear, in sorted (A then B) order.
+        let env_positions: Vec<(usize, &String)> = cmd
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.starts_with("--env="))
+            .collect();
+        assert_eq!(
+            env_positions.len(),
+            2,
+            "expected 2 --env args, got {env_positions:?}"
+        );
+        assert_eq!(env_positions[0].1, "--env=A=1");
+        assert_eq!(env_positions[1].1, "--env=B=2");
+
+        // Both --env flags must come BEFORE the container ID.
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("container ID present");
+        for (idx, _) in &env_positions {
+            assert!(
+                *idx < container_idx,
+                "--env at {idx} must precede container ID at {container_idx}"
+            );
+        }
+
+        // And BEFORE the `--` separator.
+        let sep_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        for (idx, _) in &env_positions {
+            assert!(
+                *idx < sep_idx,
+                "--env at {idx} must precede `--` at {sep_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_translator_routes_env_only_run_through_mounts_path() {
+        // A RunInstruction with env but no mounts must still flow through
+        // run_with_mounts_shell so the --env= flags get emitted. The plain
+        // run_shell / run_exec factories don't know about env.
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo $FOO".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .translate("container-1", &Instruction::Run(run));
+        assert_eq!(cmds.len(), 1);
+
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--env=FOO=bar"),
+            "expected --env=FOO=bar in args: {:?}",
+            cmd.args
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Host-network plumbing
+    //
+    // These tests pin the `--host-network` CLI flag's end-to-end behavior:
+    // a `RunInstruction` with `network: Some(RunNetwork::Host)` MUST emit
+    // `--net=host` BEFORE the container ID on the buildah command, and the
+    // translator-level `with_host_network(true)` MUST force-set host
+    // networking on every RUN regardless of any per-instruction value.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_run_with_mounts_emits_net_host_before_container() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get update".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::Host),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        let net_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("expected --net=host arg");
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("container id present");
+        let sep_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- separator present");
+        assert!(
+            net_idx < container_idx,
+            "--net=host (idx {net_idx}) must precede container ID (idx {container_idx})"
+        );
+        assert!(
+            net_idx < sep_idx,
+            "--net=host (idx {net_idx}) must precede `--` (idx {sep_idx})"
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_emits_net_none() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("hostname".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::None),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=none"),
+            "expected --net=none in args, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_default_network_omits_net_flag() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::Default),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "RunNetwork::Default must NOT emit any --net flag, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_no_network_field_omits_net_flag() {
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "network=None must NOT emit any --net flag, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_forces_net_host_on_run_with_none_network() {
+        // Load-bearing assertion for the `zlayer --host-network` CLI flag:
+        // host_network=true must emit --net=host even when the Dockerfile
+        // RUN does NOT specify a per-instruction --network.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get update".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1, "expected exactly one buildah command");
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "expected --net=host in args (host_network=true should force it even when run.network is None), got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_overrides_per_instruction_network_none() {
+        // `RUN --network=none` + CLI `--host-network` -> host wins.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get install -y curl".to_string()),
+            mounts: vec![],
+            network: Some(crate::dockerfile::RunNetwork::None),
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "host_network=true must override RunNetwork::None, got: {:?}",
+            cmd.args
+        );
+        assert!(
+            !cmd.args.iter().any(|a| a == "--net=none"),
+            "host_network=true must REPLACE (not append to) RunNetwork::None, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_bare_run_through_mounts_path() {
+        // Bare RUN (no mounts, env, or network) must still flow through
+        // run_with_mounts_shell when host_network=true — the simple
+        // factories don't emit --net=host.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo hi".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "bare RUN with host_network=true must emit --net=host, got: {:?}",
+            cmd.args
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_env_only_run_with_net_host() {
+        // env-only RUN + host_network=true must produce BOTH --env=... and
+        // --net=host, both before the container ID.
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo $FOO".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env,
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+
+        let env_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--env=FOO=bar")
+            .expect("--env=FOO=bar present");
+        let net_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("--net=host present");
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "c1")
+            .expect("container id present");
+        assert!(env_idx < container_idx);
+        assert!(net_idx < container_idx);
+    }
+
+    #[test]
+    fn test_translator_host_network_routes_mount_only_run_with_net_host() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("npm install".to_string()),
+            mounts: vec![RunMount::Cache {
+                target: "/root/.npm".to_string(),
+                id: Some("npm-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .translate("c1", &Instruction::Run(run));
+
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a.starts_with("--mount=")),
+            "--mount must be present"
+        );
+        assert!(
+            cmd.args.iter().any(|a| a == "--net=host"),
+            "--net=host must be present alongside --mount when host_network=true"
+        );
+    }
+
+    #[test]
+    fn test_translator_host_network_default_off_does_not_emit_net_flag() {
+        // Sanity: default translator (host_network not set) must not emit
+        // --net=... on a vanilla RUN. We're only adding a flag, never
+        // silently changing existing behavior.
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("true".to_string()),
+            mounts: vec![],
+            network: None,
+            security: None,
+            env: HashMap::new(),
+        };
+
+        let cmds =
+            DockerfileTranslator::new(ImageOs::Linux).translate("c1", &Instruction::Run(run));
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        assert!(
+            !cmd.args.iter().any(|a| a.starts_with("--net")),
+            "default translator (host_network=false) must NOT emit --net flag, got: {:?}",
+            cmd.args
+        );
     }
 
     #[test]
@@ -1573,6 +2469,79 @@ mod tests {
     }
 
     #[test]
+    fn test_translator_workdir_host_network_linux_emits_net_host() {
+        // Regression: when the translator is constructed with
+        // `with_host_network(true)` (i.e. the user passed `--host-network`),
+        // WORKDIR's `mkdir -p` MUST carry `--net=host` just like every
+        // RUN does. Before the fix, only `Instruction::Run` consulted
+        // `self.host_network`, so a `WORKDIR /app` would route through
+        // buildah's default rootless networking → netavark → die on the
+        // very first instruction of stage 1 if the host's netavark
+        // config was broken.
+        let mut t = DockerfileTranslator::new(ImageOs::Linux).with_host_network(true);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0].args,
+            vec!["run", "--net=host", "c1", "--", "mkdir", "-p", "/app"],
+            "WORKDIR mkdir with host_network=true must emit --net=host BEFORE the container ID",
+        );
+        // The `config --workingdir` metadata write is unaffected by
+        // host_network — `buildah config` doesn't run a container.
+        assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_no_host_network_omits_net_flag() {
+        // Pin the default-path behavior: without `--host-network`,
+        // WORKDIR's mkdir must NOT carry any `--net` flag. Mirrors the
+        // existing `test_translator_workdir_linux` but makes the
+        // host_network=false branch explicit so a future refactor that
+        // accidentally always emits `--net=host` is caught immediately.
+        let mut t = DockerfileTranslator::new(ImageOs::Linux).with_host_network(false);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            !cmds[0].args.iter().any(|a| a.starts_with("--net")),
+            "WORKDIR with host_network=false must NOT emit any --net flag, got: {:?}",
+            cmds[0].args
+        );
+        assert_eq!(cmds[0].args, vec!["run", "c1", "--", "mkdir", "-p", "/app"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_host_network_windows_emits_net_host() {
+        // Symmetric coverage for the Windows guarded-mkdir path. Windows
+        // builds dispatch through the HCS backend in practice (not buildah),
+        // so this is belt-and-suspenders: if someone ever wires the buildah
+        // translator into a Windows build, host_network must still be
+        // honored on the guarded `if not exist ... mkdir` invocation.
+        let mut t = DockerfileTranslator::new(ImageOs::Windows).with_host_network(true);
+        let cmds = t.translate("c1", &Instruction::Workdir("C:\\app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        let net_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "--net=host")
+            .expect("expected --net=host on Windows WORKDIR with host_network=true");
+        let container_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "c1")
+            .expect("container ID present");
+        let sep_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .expect("`--` separator present");
+        assert!(
+            net_idx < container_idx && container_idx < sep_idx,
+            "argument order must be: run --net=host <container> -- ... (got {:?})",
+            cmds[0].args
+        );
+    }
+
+    #[test]
     fn test_translator_workdir_windows_path_with_spaces() {
         // Paths containing spaces (e.g. `C:\Program Files\app`) must be quoted
         // for cmd.exe, which is why the mkdir command we emit wraps the path
@@ -1655,6 +2624,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            env: HashMap::new(),
         };
 
         let cmds = t.translate("c1", &Instruction::Run(run));
@@ -1678,5 +2648,349 @@ mod tests {
         assert!(cmds[0].args.iter().any(|a| a == "/S"));
         assert!(cmds[0].args.iter().any(|a| a == "/C"));
         assert!(!cmds[0].args.iter().any(|a| a == "/bin/sh"));
+    }
+
+    // -----------------------------------------------------------------
+    // apt → choco translation (moved from `windows_builder::tests`)
+    // -----------------------------------------------------------------
+
+    use crate::windows_image_resolver::{ChocoMapMetadata, ChocoMapShard};
+
+    /// Tests that mutate `XDG_CACHE_HOME` / `LOCALAPPDATA` must run
+    /// serially or the resolver picks up another test's fixture dir
+    /// because `cargo test` runs unit tests in parallel by default.
+    static CACHE_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Write a single-shard package map under `cache_root` so the
+    /// resolver's disk cache hits without going through the network.
+    fn write_shard_fixture(
+        cache_root: &std::path::Path,
+        distro: &str,
+        shard: &str,
+        mappings: &[(&str, &str)],
+    ) {
+        let fixture = ChocoMapShard {
+            metadata: ChocoMapMetadata {
+                generated_at: "2026-05-21T00:00:00Z".to_string(),
+                source: "chocolatey.org".to_string(),
+                distro: distro.to_string(),
+                shard: shard.to_string(),
+                total_mappings: mappings.len() as u64,
+            },
+            mappings: mappings
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+        let shard_dir = cache_root.join("package-maps-choco-v1").join(distro);
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(
+            shard_dir.join(format!("{shard}.json")),
+            serde_json::to_string(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Override the platform cache dir for the duration of a test by
+    /// pointing `XDG_CACHE_HOME` (Linux/macOS) and `LOCALAPPDATA`
+    /// (Windows) at a fresh tempdir. Returns the mutex guard (so the
+    /// env is held exclusively for the test's lifetime), the tempdir
+    /// (kept alive until drop), and the cache root.
+    fn redirect_cache_dir() -> (
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        // `lock()` may report poisoning if a prior test panicked while
+        // holding it; the env vars themselves are safe to re-set so we
+        // unwrap-or-into-inner to keep the test useful even after a
+        // sibling failure.
+        let guard = CACHE_ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().to_path_buf();
+        // `dirs::cache_dir()` ignores `XDG_CACHE_HOME` on macOS/Windows, so set
+        // the explicit override the resolver honors on every platform. The
+        // XDG/LOCALAPPDATA sets are kept for any other code paths that read the
+        // platform cache dir directly.
+        std::env::set_var("ZLAYER_PACKAGE_MAP_CACHE_DIR", &cache_root);
+        std::env::set_var("XDG_CACHE_HOME", &cache_root);
+        std::env::set_var("LOCALAPPDATA", &cache_root);
+        (guard, tmp, cache_root)
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn detect_apt_install_in_run() {
+        let parts = split_shell_subcommands("apt-get update && apt-get install -y curl git");
+        assert_eq!(parts.len(), 2);
+        assert!(is_package_manager_sync(&parts[0]));
+        let detected = detect_install_in_subcommand(&parts[1])
+            .expect("install sub-command must be recognised");
+        assert_eq!(detected.0, DetectedPmKind::Apt);
+        assert_eq!(detected.1, vec!["curl".to_string(), "git".to_string()]);
+    }
+
+    #[test]
+    fn detect_yum_install_in_run() {
+        let detected = detect_install_in_subcommand("yum install -y httpd")
+            .expect("yum install -y httpd must be recognised");
+        assert_eq!(detected.0, DetectedPmKind::YumOrDnf);
+        assert_eq!(detected.1, vec!["httpd".to_string()]);
+
+        let detected = detect_install_in_subcommand("dnf install -y nginx php-fpm")
+            .expect("dnf install -y must be recognised");
+        assert_eq!(detected.0, DetectedPmKind::YumOrDnf);
+        assert_eq!(detected.1, vec!["nginx".to_string(), "php-fpm".to_string()]);
+    }
+
+    #[test]
+    fn detect_apk_install_in_run() {
+        let detected = detect_install_in_subcommand("apk add --no-cache nodejs npm")
+            .expect("apk add must be recognised");
+        assert_eq!(detected.0, DetectedPmKind::Apk);
+        assert_eq!(detected.1, vec!["nodejs".to_string(), "npm".to_string()]);
+    }
+
+    #[test]
+    fn detect_no_install_returns_none() {
+        assert!(detect_install_in_subcommand("echo hello").is_none());
+        assert!(detect_install_in_subcommand("ls /tmp").is_none());
+        assert!(detect_install_in_subcommand("apt-getinstall -y curl").is_none());
+        assert!(detect_install_in_subcommand("apt-get install -y").is_none());
+        let parts = split_shell_subcommands("echo hello && ls /tmp");
+        assert_eq!(parts.len(), 2);
+        for p in &parts {
+            assert!(detect_install_in_subcommand(p).is_none());
+            assert!(!is_package_manager_sync(p));
+        }
+    }
+
+    #[test]
+    fn split_shell_subcommands_honours_and_and_semicolon() {
+        let parts = split_shell_subcommands("a && b ; c");
+        assert_eq!(
+            parts,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_shell_subcommands_drops_empty_segments() {
+        let parts = split_shell_subcommands(" && a && ; b ;");
+        assert_eq!(parts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn is_package_manager_sync_matches_common_variants() {
+        assert!(is_package_manager_sync("apt-get update"));
+        assert!(is_package_manager_sync("apt update"));
+        assert!(is_package_manager_sync("apk update"));
+        assert!(is_package_manager_sync("yum check-update"));
+        assert!(is_package_manager_sync("dnf makecache"));
+        assert!(is_package_manager_sync("sudo apt-get update"));
+        assert!(!is_package_manager_sync("apt-get install -y curl"));
+        assert!(!is_package_manager_sync("echo hello"));
+    }
+
+    #[test]
+    fn rejoin_emits_choco_install_for_install_subcommand() {
+        let parts = vec![
+            ShellSubcommand::Verbatim("echo before".to_string()),
+            ShellSubcommand::PackageManagerSync,
+            ShellSubcommand::Install {
+                kind: DetectedPmKind::Apt,
+                packages: vec!["curl".to_string(), "git".to_string()],
+            },
+            ShellSubcommand::Verbatim("echo after".to_string()),
+        ];
+        let out = rejoin_subcommands(&parts);
+        assert_eq!(
+            out,
+            "echo before && choco install -y curl git && echo after"
+        );
+    }
+
+    #[test]
+    fn wrap_in_cmd_escapes_embedded_quotes() {
+        let wrapped = wrap_in_cmd(r#"echo "hello""#);
+        assert!(wrapped.starts_with("cmd /c \""));
+        assert!(wrapped.contains(r#"\"hello\""#));
+        assert!(wrapped.ends_with('"'));
+    }
+
+    #[test]
+    fn translate_run_apt_to_choco_with_in_memory_shard() {
+        // Build the shape the resolver writes to disk so the cache-hit
+        // path runs without any network.
+        let (_guard, _tmp, cache_root) = redirect_cache_dir();
+        write_shard_fixture(
+            &cache_root,
+            "debian-12",
+            "c",
+            &[("curl", "curl"), ("linux-headers-generic", "__skip__")],
+        );
+        write_shard_fixture(
+            &cache_root,
+            "debian-12",
+            "l",
+            &[("linux-headers-generic", "__skip__")],
+        );
+
+        let translator = DockerfileTranslator::new(ImageOs::Windows);
+        let (rewritten, skipped) = block_on(translator.translate_shell_command(
+            "apt-get install -y curl linux-headers-generic",
+            "debian-12",
+            None,
+        ))
+        .expect("translate succeeds when every package resolves");
+        assert!(
+            rewritten.contains("choco install -y curl"),
+            "rewritten command must include curl: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("linux-headers-generic"),
+            "skipped package must NOT appear in rewritten command: {rewritten}"
+        );
+        assert_eq!(skipped, vec!["linux-headers-generic".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // Provisioned-toolchain skip behaviour (new in the move to
+    // `DockerfileTranslator`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn translate_shell_command_skips_provisioned_toolchain() {
+        // With a Go toolchain provisioned, an `apt-get install -y golang
+        // git` must drop `golang` from the choco install and only emit
+        // `git`. We seed the `g` shard with a `git → git` mapping so the
+        // resolver hits without network.
+        let (_guard, _tmp, cache_root) = redirect_cache_dir();
+        write_shard_fixture(&cache_root, "debian-12", "g", &[("git", "git")]);
+
+        let translator = DockerfileTranslator::new(ImageOs::Windows);
+        let (rewritten, skipped) = block_on(translator.translate_shell_command(
+            "apt-get install -y golang git",
+            "debian-12",
+            Some("go"),
+        ))
+        .expect("translate succeeds when remaining package resolves");
+        assert!(
+            !rewritten.contains("golang"),
+            "provisioned-toolchain package must NOT appear in choco install: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("choco install -y git"),
+            "non-toolchain package must still be installed: {rewritten}"
+        );
+        assert!(
+            skipped.is_empty(),
+            "toolchain drops are not reported as resolver-skipped: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn translate_shell_command_keeps_unrelated_pkg_with_toolchain() {
+        // With a Go toolchain provisioned, an `apt-get install -y curl`
+        // must still produce `choco install -y curl` — the toolchain
+        // skip is only for packages that match the language.
+        let (_guard, _tmp, cache_root) = redirect_cache_dir();
+        write_shard_fixture(&cache_root, "debian-12", "c", &[("curl", "curl")]);
+
+        let translator = DockerfileTranslator::new(ImageOs::Windows);
+        let (rewritten, skipped) = block_on(translator.translate_shell_command(
+            "apt-get install -y curl",
+            "debian-12",
+            Some("go"),
+        ))
+        .expect("translate succeeds");
+        assert!(
+            rewritten.contains("choco install -y curl"),
+            "curl must still be installed: {rewritten}"
+        );
+        assert!(skipped.is_empty(), "no resolver-skipped: {skipped:?}");
+    }
+
+    #[test]
+    fn translate_run_command_linux_is_passthrough() {
+        // On Linux the translator must pass shell- and exec-form RUNs
+        // through verbatim; no apt→choco rewriting happens because the
+        // Linux backend hands the command straight to `/bin/sh -c`.
+        let translator = DockerfileTranslator::new(ImageOs::Linux);
+        let (shell_out, skipped) = block_on(translator.translate_run_command(
+            &ShellOrExec::Shell("apt-get install -y curl".to_string()),
+            "debian-12",
+            None,
+        ))
+        .expect("Linux passthrough never fails");
+        assert_eq!(shell_out, "apt-get install -y curl");
+        assert!(skipped.is_empty());
+
+        let (exec_out, skipped) = block_on(translator.translate_run_command(
+            &ShellOrExec::Exec(vec!["echo".to_string(), "hi".to_string()]),
+            "debian-12",
+            None,
+        ))
+        .expect("Linux passthrough never fails");
+        assert_eq!(exec_out, "echo hi");
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn translate_run_command_windows_exec_is_passthrough() {
+        // Exec-form on Windows joins with spaces and skips choco
+        // detection — the caller has already chosen the absolute path
+        // to the binary they want to invoke.
+        let translator = DockerfileTranslator::new(ImageOs::Windows);
+        let (out, skipped) = block_on(translator.translate_run_command(
+            &ShellOrExec::Exec(vec![
+                "C:\\app\\bin\\srv.exe".to_string(),
+                "--port".to_string(),
+                "80".to_string(),
+            ]),
+            "debian-12",
+            None,
+        ))
+        .expect("exec-form passthrough never fails");
+        assert_eq!(out, "C:\\app\\bin\\srv.exe --port 80");
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn translate_shell_command_no_toolchain_installs_all() {
+        // With no toolchain provisioned, `apt-get install -y golang git`
+        // installs both packages via Chocolatey. `golang` resolves to
+        // `golang` in the seeded shard (Chocolatey actually ships a
+        // `golang` package, but the precise mapping is irrelevant here —
+        // what matters is that it isn't dropped).
+        let (_guard, _tmp, cache_root) = redirect_cache_dir();
+        write_shard_fixture(
+            &cache_root,
+            "debian-12",
+            "g",
+            &[("golang", "golang"), ("git", "git")],
+        );
+
+        let translator = DockerfileTranslator::new(ImageOs::Windows);
+        let (rewritten, skipped) = block_on(translator.translate_shell_command(
+            "apt-get install -y golang git",
+            "debian-12",
+            None,
+        ))
+        .expect("translate succeeds");
+        assert!(
+            rewritten.contains("choco install -y golang git"),
+            "both packages must be installed: {rewritten}"
+        );
+        assert!(skipped.is_empty(), "no resolver-skipped: {skipped:?}");
     }
 }

@@ -167,6 +167,182 @@ pub enum BuildError {
         /// The operation that was attempted
         operation: String,
     },
+
+    /// A code path that is reserved for a future phase / task and is
+    /// intentionally not yet wired up. Constructed by
+    /// [`BuildError::not_yet_implemented`] so call sites can give a precise
+    /// reason (typically referencing the follow-up task that delivers it,
+    /// e.g. "RUN execution lands in Phase 4 task 4.B").
+    ///
+    /// This is distinct from [`BuildError::NotSupported`], which signals a
+    /// permanent capability gap of the chosen backend; `NotYetImplemented`
+    /// signals "tracked work, coming in a later task — do not silently
+    /// no-op".
+    #[error("not yet implemented: {0}")]
+    NotYetImplemented(String),
+
+    /// A specific RUN step in a Dockerfile failed with a non-zero exit
+    /// code. Carries the step index (0-based, counted across the active
+    /// stage's instruction list), the exit code surfaced by the
+    /// guest process, and a stderr tail to anchor diagnostics.
+    ///
+    /// Distinct from [`BuildError::RunFailed`] in that the latter is
+    /// emitted by the buildah/HCS backends working through the
+    /// `BuildBackend` trait, whereas this variant is emitted by the
+    /// Phase 4 `WindowsBuilder` path which carries a richer per-step
+    /// context (the step index and a stderr tail) than the buildah
+    /// path can produce.
+    #[error("RUN step {step_index} failed with exit code {exit_code}: {stderr_tail}")]
+    RunStepFailed {
+        /// Zero-based step index within the active stage's instruction
+        /// list (the value Phase 4 errors use to anchor a diagnostic).
+        step_index: usize,
+        /// Exit code reported by the guest process.
+        exit_code: i32,
+        /// Last fragment of stderr captured during the RUN step (or a
+        /// synthesised message when pipe capture has not yet been
+        /// wired). Surfaced verbatim in the error display so users get
+        /// the failing command in their build log.
+        stderr_tail: String,
+    },
+
+    /// `HcsExportLayer` / wclayer-side IO failed while capturing the
+    /// post-RUN scratch diff. Distinct from [`BuildError::IoError`] so
+    /// the WCOW builder can surface a layer-export-specific message
+    /// (the underlying failure is almost always either an
+    /// `HcsExportLayer` HRESULT or a tar/gzip walk error).
+    #[error("layer export failed: {source}")]
+    LayerExportFailed {
+        /// Underlying IO error (often wraps an HCS HRESULT).
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Chocolatey resolver could not produce a Windows equivalent for a
+    /// Linux package name encountered in a RUN instruction. The package
+    /// is named so the user can edit the Dockerfile (or contribute the
+    /// mapping to `RepoSources`).
+    #[error(
+        "no Chocolatey mapping for Linux package '{package}' in source distro '{source_distro}'"
+    )]
+    ChocoResolutionFailed {
+        /// The Linux package name that did not resolve.
+        package: String,
+        /// The `RepoSources`-style source distro key that was queried
+        /// (e.g. `"debian-12"`, `"ubuntu-22.04"`).
+        source_distro: String,
+    },
+
+    /// COPY/ADD source path contained a `..` component which is forbidden
+    /// because it would escape the build context. Surfaced before any
+    /// filesystem access so a malicious Dockerfile cannot reach files
+    /// outside the build directory even via a TOCTOU window.
+    #[error("COPY/ADD source path '{src}' contains '..' which is forbidden")]
+    PathTraversal {
+        /// The offending source path as it appeared in the Dockerfile.
+        src: String,
+    },
+
+    /// ADD `<URL> <dest>` failed to download the remote resource. Carries
+    /// the URL for diagnostics; the underlying network/protocol failure is
+    /// chained as the `source` so users get the precise cause (connection
+    /// refused, 404, TLS error, etc.).
+    #[error("ADD failed to fetch '{url}': {source}")]
+    HttpFetchFailed {
+        /// The URL the builder attempted to fetch.
+        url: String,
+        /// Underlying reqwest failure.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// ADD auto-extraction of a tarball failed. Carries the chained IO
+    /// error from the `tar` / `flate2` / `bzip2` / `xz2` pipeline so the
+    /// user can see which entry tripped (path traversal in the archive,
+    /// disk full, etc.).
+    #[error("ADD failed to extract tarball: {source}")]
+    TarExtractFailed {
+        /// Underlying tar/decompressor IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The WCOW builder could not resolve an `os.version` for the emitted
+    /// OCI image config. The Windows runtime refuses to launch a
+    /// container whose `os.version` does not exactly match the host
+    /// kernel's build, so emitting a manifest without one would produce
+    /// an image nothing can run. Surfaces when the base manifest's
+    /// `os.version` is missing AND the user did not pass
+    /// `WindowsBuildConfig::os_version_override`.
+    #[error(
+        "os.version could not be resolved from base manifest or override; \
+         set WindowsBuildConfig::os_version_override or pull a base image \
+         whose manifest carries an os.version field"
+    )]
+    OsVersionUnresolved,
+
+    /// Computing a sha256 digest over a layer blob (or an in-memory
+    /// manifest blob) failed because the underlying IO read failed.
+    /// Carries the chained IO error so callers can see which file
+    /// tripped.
+    #[error("layer digest computation failed: {source}")]
+    LayerDigestComputationFailed {
+        /// Underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// JSON serialisation of the emitted OCI image config or manifest
+    /// blob failed. In practice this only happens if a value carried on
+    /// the [`crate::windows_builder::OciImageConfig`] is itself
+    /// unserialisable, which is a programmer error in this crate.
+    #[error("failed to serialise manifest/image config: {source}")]
+    SerializeManifestFailed {
+        /// Underlying `serde_json` error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Top-level wrapper for any failure during the WCOW
+    /// [`crate::windows_builder::WindowsBuilder::push`] flow. Returned when
+    /// the push could not be completed but the failure is not better
+    /// described by [`BuildError::BlobUploadFailed`] or
+    /// [`BuildError::ManifestPutFailed`] — for example, when reading a
+    /// local layer blob off disk fails before it ever reaches the wire.
+    #[error("push of image {tag:?} failed: {reason}")]
+    PushFailed {
+        /// Target image tag the push was destined for, e.g.
+        /// `"ghcr.io/zorpxinc/zlayer-test:wcow-0.1"`.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
+
+    /// A single layer blob upload PUT/PATCH chain failed. Carries the
+    /// blob's content-addressable digest so the operator can correlate
+    /// against registry-side logs.
+    #[error("failed to upload blob {digest} for tag {tag:?}: {reason}")]
+    BlobUploadFailed {
+        /// `sha256:...` digest of the blob that failed to upload.
+        digest: String,
+        /// Target image tag.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
+
+    /// The final `PUT /v2/<name>/manifests/<tag>` request failed.
+    /// Distinct from [`BuildError::BlobUploadFailed`] because the manifest
+    /// PUT is the last write that makes the push observable from the
+    /// registry — a failure here means the layers and config blob may be
+    /// staged but the image is not yet visible under `tag`.
+    #[error("failed to PUT manifest for tag {tag:?}: {reason}")]
+    ManifestPutFailed {
+        /// Target image tag the manifest PUT targeted.
+        tag: String,
+        /// Human-readable failure reason from the upstream layer.
+        reason: String,
+    },
 }
 
 impl BuildError {
@@ -272,6 +448,13 @@ impl BuildError {
         Self::PipelineError {
             message: message.into(),
         }
+    }
+
+    /// Create a `NotYetImplemented` error. The `msg` should name the
+    /// follow-up task or phase that delivers the missing behavior
+    /// (e.g. `"RUN execution lands in Phase 4 task 4.B"`).
+    pub fn not_yet_implemented(msg: impl Into<String>) -> Self {
+        Self::NotYetImplemented(msg.into())
     }
 }
 

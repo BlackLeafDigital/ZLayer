@@ -270,6 +270,7 @@ mod tests {
             _image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
+            _source: zlayer_spec::SourcePolicy,
         ) -> AgentResult<()> {
             Err(AgentError::Unsupported("pull_image_with_policy".into()))
         }
@@ -363,15 +364,18 @@ mod tests {
             compose_storage: Arc::new(crate::storage::InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(crate::handlers::exec_instances::ExecInstances::new()),
             container_pty_resizers: Arc::new(dashmap::DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
+            service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
     fn make_entry(service: &str, replica: u32) -> StandaloneContainer {
         StandaloneContainer {
-            container_id: ContainerId {
-                service: service.to_string(),
-                replica,
-            },
+            container_id: ContainerId::new(service.to_string(), replica),
             image: format!("registry.example.com/{service}:latest"),
             name: Some(format!("{service}-{replica}")),
             labels: HashMap::new(),
@@ -411,10 +415,7 @@ mod tests {
             "storage row must be deleted"
         );
         // ContainerIdMap empty for that container.
-        let cid = ContainerId {
-            service: "ghost-svc".into(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("ghost-svc", 0);
         assert!(
             state.id_map.lookup_container(&cid).is_none(),
             "id_map must not have a stale registration"

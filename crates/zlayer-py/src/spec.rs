@@ -590,6 +590,7 @@ pub fn create_service_spec(
             expose: zlayer_spec::ExposeType::Internal,
             stream: None,
             tunnel: None,
+            target_role: None,
         });
     }
 
@@ -601,6 +602,7 @@ pub fn create_service_spec(
                 pyo3::exceptions::PyValueError::new_err(format!("invalid image reference: {e}"))
             })?,
             pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources: zlayer_spec::ResourcesSpec::default(),
         env: HashMap::new(),
@@ -629,6 +631,7 @@ pub fn create_service_spec(
         privileged: false,
         node_mode: zlayer_spec::NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: zlayer_spec::ServiceType::default(),
         wasm: None,
         logs: None,
@@ -656,6 +659,10 @@ pub fn create_service_spec(
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        replica_groups: None,
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     };
 
     Ok(ServiceSpec {

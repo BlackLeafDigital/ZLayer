@@ -134,6 +134,29 @@ pub mod macos_sandbox;
 #[cfg(target_os = "macos")]
 pub mod macos_vm;
 
+// Guest-agnostic helpers shared by the macOS Apple-Virtualization runtimes
+// (native-macOS guests via `macos_vz`, Linux guests via `macos_vz_linux`).
+#[cfg(target_os = "macos")]
+pub mod macos_vz_shared;
+
+// Apple-Virtualization (VZ) runtime: ephemeral native-macOS guest VMs. Opt-in
+// only (label `com.zlayer.isolation=vz`); coexists with the Seatbelt sandbox.
+#[cfg(target_os = "macos")]
+pub mod macos_vz;
+
+// Apple-Virtualization Linux-guest runtime: boots real Linux guests on macOS
+// via `Virtualization.framework` (the default Linux path on macOS). Coexists
+// with the libkrun `macos_vm` runtime (reachable via `com.zlayer.isolation=vm`).
+#[cfg(target_os = "macos")]
+pub mod macos_vz_linux;
+
+// Producer for VZ base-image bundles: drives a macOS `.ipsw` restore through
+// `VZMacOSInstaller` to mint a Tart-style bundle (`disk.img`,
+// `hardware-model.bin`, `aux.img`) that `macos_vz` can pull. Used by
+// `zlayer vz build-base`.
+#[cfg(target_os = "macos")]
+pub mod macos_vz_build;
+
 // HCS-backed native Windows container runtime. Compiled only on Windows
 // because it depends on the `zlayer-hcs` crate and the `crate::windows`
 // submodule, both of which are Windows-only.
@@ -158,6 +181,12 @@ pub use macos_sandbox::SandboxRuntime;
 
 #[cfg(target_os = "macos")]
 pub use macos_vm::VmRuntime;
+
+#[cfg(target_os = "macos")]
+pub use macos_vz::VzRuntime;
+
+#[cfg(target_os = "macos")]
+pub use macos_vz_linux::VzLinuxRuntime;
 
 #[cfg(feature = "docker")]
 pub use docker::DockerRuntime;
@@ -394,9 +423,10 @@ pub async fn create_runtime_for_image(
     image: &str,
     registry: Arc<ImagePuller>,
 ) -> Result<Arc<dyn Runtime + Send + Sync>> {
-    // Use anonymous auth for manifest detection
-    // In production, the caller should configure auth on the registry client
-    let auth = zlayer_registry::RegistryAuth::Anonymous;
+    // Resolve registry auth from ~/.docker/config.json (AuthConfig default =
+    // DockerConfig) for manifest detection, so `zlayer login` creds / Docker Hub
+    // auth apply instead of anonymous (and avoid Docker Hub rate-limits).
+    let auth = zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
     tracing::info!(image = %image, "detecting artifact type for runtime selection");
 
@@ -462,7 +492,9 @@ pub async fn detect_image_artifact_type(
     image: &str,
     registry: Arc<ImagePuller>,
 ) -> Result<zlayer_registry::ArtifactType> {
-    let auth = zlayer_registry::RegistryAuth::Anonymous;
+    // Resolve registry auth from ~/.docker/config.json (AuthConfig default =
+    // DockerConfig) so `zlayer login` creds / Docker Hub auth apply.
+    let auth = zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
     let (artifact_type, _manifest, _digest) = registry
         .detect_artifact_type(image, &auth)

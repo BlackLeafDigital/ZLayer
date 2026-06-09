@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package zlayer.cluster.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// ClusterControlPlane — worker ↔ control-plane RPC surface.
+//
+// All RPCs except Register require mTLS with a worker cert issued by the
+// cluster's worker CA. Register accepts a JWT bootstrap token instead.
+// ============================================================================
+service ClusterControlPlane {
+  // Worker registers and receives initial bootstrap (node_id, mTLS cert, TTL).
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Server-streaming: leader pushes assignments as they're computed.
+  // Worker reconnects with last_seen_revision to resume.
+  rpc WatchAssignments(WatchAssignmentsRequest) returns (stream AssignmentEvent);
+
+  // Client-streaming: worker reports container state + lease renewals.
+  // Ack carries the TTL for the next heartbeat (adaptive).
+  rpc ReportStatus(stream StatusReport) returns (stream StatusAck);
+
+  // Out-of-band command channel (drain, restart, evict). Push-style.
+  rpc WatchCommands(WatchCommandsRequest) returns (stream CommandEvent);
+}
+
+// ----------------------------------------------------------------------------
+// Register
+// ----------------------------------------------------------------------------
+message RegisterRequest {
+  // JWT signed by the cluster's join-key.
+  string bootstrap_token = 1;
+  // Optional preferred node id; the leader may override.
+  uint64 desired_node_id = 2;
+  NodeProfile profile = 3;
+  // PKCS#10 CSR in DER encoding. Worker generates its own EC256 keypair locally.
+  bytes csr_der = 4;
+}
+
+message NodeProfile {
+  string os = 1;            // "linux" | "windows" | "macos"
+  string arch = 2;          // "x86_64" | "aarch64"
+  map<string, string> labels = 3;
+  ResourceCaps caps = 4;
+  string version = 5;       // zlayer version string
+}
+
+message ResourceCaps {
+  double cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message RegisterResponse {
+  uint64 node_id = 1;
+  // Worker's signed mTLS cert (DER).
+  bytes signed_cert_der = 2;
+  // Full chain back to the cluster root, in DER.
+  repeated bytes ca_chain_der = 3;
+  uint32 heartbeat_ttl_secs = 4;
+  uint32 heartbeat_grace_secs = 5;
+  // Optional gossip-pool seeds (Phase 4).
+  repeated string gossip_seeds = 6;
+}
+
+// ----------------------------------------------------------------------------
+// WatchAssignments (server-streaming)
+// ----------------------------------------------------------------------------
+message WatchAssignmentsRequest {
+  uint64 node_id = 1;
+  // Resume from this revision; 0 = send full snapshot.
+  uint64 last_seen_revision = 2;
+}
+
+message AssignmentEvent {
+  uint64 revision = 1;
+  google.protobuf.Timestamp ts = 2;
+  oneof event {
+    AssignmentSet set = 3;
+    AssignmentDelete delete = 4;
+    AssignmentDrain drain = 5;
+  }
+}
+
+message AssignmentSet {
+  string service = 1;
+  string role = 2;
+  uint32 index = 3;
+  // Full container spec bytes (serde_json of zlayer_types::spec::ServiceSpec
+  // with the resolved role group). Opaque to gRPC; deserialized by the worker.
+  bytes spec_json = 4;
+}
+
+message AssignmentDelete {
+  string service = 1;
+  string role = 2;
+  uint32 index = 3;
+  // If true, terminate immediately rather than draining gracefully.
+  bool force = 4;
+}
+
+message AssignmentDrain {
+  // Drain ALL containers on this node. Used for `worker-drain` admin op.
+  uint32 grace_secs = 1;
+}
+
+// ----------------------------------------------------------------------------
+// ReportStatus (bidi-streaming)
+// ----------------------------------------------------------------------------
+message StatusReport {
+  uint64 node_id = 1;
+  google.protobuf.Timestamp ts = 2;
+  repeated ContainerStatus containers = 3;
+  NodeResourceUsage resources = 4;
+  // True = this is a full snapshot (sent after reconnect). False = delta.
+  bool full_snapshot = 5;
+}
+
+message ContainerStatus {
+  string service = 1;
+  string role = 2;
+  uint32 index = 3;
+  ContainerPhase phase = 4;
+  // Free-form runtime message: last error, restart count, etc.
+  string message = 5;
+  google.protobuf.Timestamp started_at = 6;
+  uint32 restart_count = 7;
+}
+
+enum ContainerPhase {
+  CONTAINER_PHASE_UNSPECIFIED = 0;
+  CONTAINER_PHASE_PENDING = 1;
+  CONTAINER_PHASE_STARTING = 2;
+  CONTAINER_PHASE_RUNNING = 3;
+  CONTAINER_PHASE_DEGRADED = 4;
+  CONTAINER_PHASE_STOPPING = 5;
+  CONTAINER_PHASE_STOPPED = 6;
+  CONTAINER_PHASE_FAILED = 7;
+}
+
+message NodeResourceUsage {
+  double cpu_used_cores = 1;
+  uint64 memory_used_bytes = 2;
+  uint64 disk_used_bytes = 3;
+}
+
+message StatusAck {
+  // Server-assigned TTL for the worker's next ReportStatus tick. Adaptive:
+  // scales with cluster size per the max_heartbeats_per_second cap.
+  uint32 next_ttl_secs = 1;
+  // Echo of the last accepted ContainerStatus revisions if needed for dedup.
+  uint64 accepted_revision = 2;
+}
+
+// ----------------------------------------------------------------------------
+// WatchCommands (server-streaming)
+// ----------------------------------------------------------------------------
+message WatchCommandsRequest {
+  uint64 node_id = 1;
+}
+
+message CommandEvent {
+  uint64 revision = 1;
+  oneof command {
+    DrainCommand drain = 2;
+    EvictCommand evict = 3;
+    RestartCommand restart = 4;
+  }
+}
+
+message DrainCommand {
+  uint32 grace_secs = 1;
+}
+
+message EvictCommand {
+  string service = 1;
+  string role = 2;
+  uint32 index = 3;
+}
+
+message RestartCommand {
+  string service = 1;
+  string role = 2;
+  uint32 index = 3;
+}

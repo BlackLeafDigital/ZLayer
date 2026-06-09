@@ -35,7 +35,8 @@ use tokio::net::UnixStream;
 use tracing::{debug, info};
 use zlayer_types::api::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
 use zlayer_types::api::containers::{
-    ContainerExecResponse, ContainerUpdateRequest, ContainerUpdateResponse, CreateContainerRequest,
+    ContainerExecRequest, ContainerExecResponse, ContainerUpdateRequest, ContainerUpdateResponse,
+    CreateContainerRequest,
 };
 use zlayer_types::api::images::{
     CommitContainerRequest, CommitContainerResponse, ImageHistoryEntryDto, ImageInfoDto,
@@ -53,8 +54,19 @@ use zlayer_types::storage::{StoredEnvironment, StoredVariable};
 /// On macOS: `~/.zlayer/run/zlayer.sock` (Unix-domain socket path).
 /// On Linux: `/var/run/zlayer.sock` (Unix-domain socket path).
 /// On Windows: `tcp://127.0.0.1:3669` (TCP loopback URL).
+///
+/// When the `ZLAYER_DATA_DIR` environment variable is set, the path is
+/// resolved via [`zlayer_paths::ZLayerDirs::default_socket_path_for`]
+/// for that data dir instead — this lets `zlayer --data-dir /foo`
+/// reach a daemon listening at `/foo/run/zlayer.sock` rather than the
+/// system default. The main binary sets this variable right after
+/// CLI parse, so any in-process `DaemonClient::connect()` call (and
+/// any subprocess inheriting the env) lands on the matching socket.
 #[must_use]
 pub fn default_socket_path() -> String {
+    if let Some(data_dir) = std::env::var_os("ZLAYER_DATA_DIR") {
+        return zlayer_paths::ZLayerDirs::default_socket_path_for(std::path::Path::new(&data_dir));
+    }
     zlayer_paths::ZLayerDirs::default_socket_path()
 }
 
@@ -192,12 +204,19 @@ pub struct WaitContainerResponse {
     /// Container exit code, or `0` when the container exited cleanly. When
     /// the container was killed by signal `N`, this is typically `128 + N`,
     /// matching Docker's convention.
+    ///
+    /// `POST /api/v1/containers/{id}/wait` returns the Docker-shaped body
+    /// (`{"StatusCode": N, "Error": {"Message": ..}}`, `PascalCase`), so we
+    /// accept the `StatusCode` wire name via `alias` (and the snake form too,
+    /// for any caller that emits it). Without the alias serde fails with
+    /// "missing field `status_code`", surfacing as a 500 to Docker clients.
+    #[serde(alias = "StatusCode")]
     pub status_code: i64,
     /// Optional error envelope surfaced when the wait itself failed. Absent
     /// on a normal exit; present when the daemon could not honour the
     /// requested wait condition (for example, the container was removed
     /// before it reached `not-running`).
-    #[serde(default)]
+    #[serde(default, alias = "Error")]
     pub error: Option<WaitContainerError>,
 }
 
@@ -205,6 +224,7 @@ pub struct WaitContainerResponse {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WaitContainerError {
     /// Human-readable description of why the wait failed.
+    #[serde(alias = "Message")]
     pub message: String,
 }
 
@@ -327,12 +347,21 @@ pub struct StatsSample {
 
 /// One progress event emitted by [`DaemonClient::stream_image_pull`].
 ///
-/// Mirrors `zlayer_agent::runtime::PullProgress`. Uses serde's internally-
-/// tagged enum representation (`{"type":"status",...}` vs
-/// `{"type":"done",...}`) so a single NDJSON parser can distinguish the
-/// two variants without out-of-band context.
+/// Mirrors the wire-format `zlayer_types::api::images::PullProgressDto`
+/// emitted by the daemon's `POST /api/v1/images/create` streaming pull
+/// handler. Uses serde's internally-tagged enum representation keyed on
+/// `kind` (`{"kind":"status",...}` vs `{"kind":"done",...}`) so a single
+/// NDJSON parser can distinguish the two variants without out-of-band
+/// context.
+///
+/// **The tag key MUST stay `kind`** to match the bytes the daemon actually
+/// writes (see `PullProgressDto` in `zlayer-types`). A previous revision
+/// tagged this on `type`, which deserialized cleanly in hand-fed unit tests
+/// but silently rejected every real pull event (the parser logged
+/// "skipping malformed NDJSON line" and the Docker-compat `/images/create`
+/// stream produced no progress, breaking `docker pull`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PullProgress {
     /// Progress update for an in-flight layer or stage.
     Status {
@@ -681,6 +710,28 @@ impl DaemonClient {
         Self::connect_to(raw).await
     }
 
+    /// Connect to the daemon associated with the given `data_dir`.
+    ///
+    /// On Unix: resolves the socket path via
+    /// `ZLayerDirs::default_socket_path_for(data_dir)`, then auto-spawns
+    /// the daemon with a matching `--data-dir` if it's not running.
+    /// On Windows: identical behavior to `connect()` since the daemon
+    /// listens on TCP loopback regardless of `data_dir`.
+    #[cfg(unix)]
+    pub async fn connect_for_data_dir(data_dir: &Path) -> Result<Self> {
+        let socket_path = zlayer_paths::ZLayerDirs::default_socket_path_for(data_dir);
+        Self::connect_to_with_data_dir(socket_path, Some(data_dir)).await
+    }
+
+    /// Connect to the daemon associated with the given `data_dir`.
+    ///
+    /// On Windows the daemon listens on TCP loopback regardless of
+    /// `data_dir`, so this is identical to [`connect`](Self::connect).
+    #[cfg(windows)]
+    pub async fn connect_for_data_dir(_data_dir: &std::path::Path) -> Result<Self> {
+        Self::connect().await
+    }
+
     /// Try to connect to a running daemon without auto-starting.
     ///
     /// Returns `Ok(Some(client))` if the daemon is running and healthy,
@@ -718,6 +769,46 @@ impl DaemonClient {
             }
         } else {
             Ok(None)
+        }
+    }
+
+    /// Connect to a daemon at `socket_path`, polling for readiness, and
+    /// **never** falling through to auto-spawn.
+    ///
+    /// Designed for in-daemon callers (e.g. the Docker API socket task) that
+    /// must talk to the SAME daemon they live inside. The naive
+    /// [`connect_to`](Self::connect_to) path would auto-spawn a competing
+    /// daemon child if the UDS isn't ready yet — a guaranteed startup-race
+    /// loss when the API listener hasn't bound its socket yet at task-spawn
+    /// time. This method polls instead, with a hard timeout.
+    ///
+    /// Polling cadence: 50 ms ticks until `socket_path` exists, then a
+    /// single `try_build` (which performs a health probe). Returns an error
+    /// if either the path never appears within `timeout` or the health
+    /// probe never succeeds.
+    #[cfg(unix)]
+    pub async fn connect_to_no_autospawn(
+        socket_path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let deadline = std::time::Instant::now() + timeout;
+        let tick = Duration::from_millis(50);
+
+        loop {
+            if socket_path.exists() {
+                if let Ok(client) = Self::try_build(&socket_path).await {
+                    return Ok(client);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "Daemon UDS at {} did not become ready within {:?}",
+                    socket_path.display(),
+                    timeout
+                );
+            }
+            tokio::time::sleep(tick).await;
         }
     }
 
@@ -845,6 +936,31 @@ impl DaemonClient {
             .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
     }
 
+    /// Like `connect_to` but threads an explicit `data_dir` to the
+    /// auto-spawn helper so the spawned daemon's data directory matches
+    /// the caller's expectation. Used by `connect_for_data_dir`.
+    #[cfg(unix)]
+    async fn connect_to_with_data_dir(
+        socket_path: impl AsRef<Path>,
+        data_dir: Option<&Path>,
+    ) -> Result<Self> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+
+        if socket_path.exists() {
+            if let Ok(client) = Self::try_build(&socket_path).await {
+                return Ok(client);
+            }
+        }
+
+        info!("Daemon not running, auto-starting...");
+        eprintln!("ZLayer daemon not running. Starting...");
+        Self::auto_start_daemon_with_data_dir(&socket_path, data_dir).await?;
+
+        Self::try_build(&socket_path)
+            .await
+            .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
+    }
+
     /// Like [`connect`](Self::connect) but with a custom TCP endpoint.
     ///
     /// Accepts either `tcp://127.0.0.1:3669` or bare `127.0.0.1:3669`.
@@ -922,18 +1038,32 @@ impl DaemonClient {
     /// exponential backoff until the daemon is reachable or we give up.
     #[cfg(unix)]
     async fn auto_start_daemon(socket_path: &Path) -> Result<()> {
+        Self::auto_start_daemon_with_data_dir(socket_path, None).await
+    }
+
+    /// Like `auto_start_daemon` but allows the caller to override the
+    /// child daemon's `--data-dir`. When `data_dir_override` is `None`
+    /// the existing environment-based detection is used.
+    #[cfg(unix)]
+    async fn auto_start_daemon_with_data_dir(
+        socket_path: &Path,
+        data_dir_override: Option<&Path>,
+    ) -> Result<()> {
         let runtime_bin = Self::find_self_binary()?;
 
         debug!(binary = %runtime_bin.display(), "Spawning daemon");
 
         let mut cmd = std::process::Command::new(&runtime_bin);
 
-        // Ensure the child process knows the correct data directory.
-        // If ZLAYER_DATA_DIR is already set in the environment it will be
-        // inherited automatically (clap picks it up via `env = "ZLAYER_DATA_DIR"`).
-        // Otherwise, explicitly pass --data-dir so the child doesn't fall back
-        // to /var/lib/zlayer when $HOME is unavailable (e.g. launchd context).
-        if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
+        // Decide the data directory for the spawned child.
+        // 1. If caller passed an explicit override, use that (always wins).
+        // 2. Else if ZLAYER_DATA_DIR is set in the env, the child inherits it.
+        // 3. Else fall back to ZLayerDirs::detect_data_dir() so the child
+        //    doesn't drift to /var/lib/zlayer when $HOME is unavailable
+        //    (e.g. launchd context).
+        if let Some(dd) = data_dir_override {
+            cmd.arg("--data-dir").arg(dd.as_os_str());
+        } else if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
             let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
             cmd.arg("--data-dir").arg(&data_dir);
         }
@@ -2402,25 +2532,52 @@ impl DaemonClient {
     /// Execute a command inside a standalone container and wait for it to
     /// finish.
     ///
-    /// `POST /api/v1/containers/{id}/exec` with `{"command": [...]}`.
+    /// `POST /api/v1/containers/{id}/exec_sync` with `{"command": [...]}`.
     /// Returns a [`ContainerExecResponse`] with `exit_code`, `stdout`, and
     /// `stderr`.
     ///
-    /// Note: the daemon's container exec endpoint is non-interactive -- it
-    /// runs the command to completion and buffers the output. It does not
-    /// accept `tty` or `interactive` flags. For attached/TTY exec against a
-    /// managed service, use
-    /// [`exec_command`](Self::exec_command) instead.
+    /// Note: this targets the daemon's *buffered* exec endpoint
+    /// (`exec_sync`), which runs the command to completion and returns a
+    /// single JSON `{exit_code, stdout, stderr}` body. The plain
+    /// `/{id}/exec` path is the *interactive* create-exec endpoint and
+    /// returns `{"Id": "<hex>"}` — parsing that as a buffered exec result
+    /// fails with `missing field 'exit_code'`, which is why the buffered
+    /// helper must use the dedicated `exec_sync` route. It does not accept
+    /// `tty` or `interactive` flags. For attached/TTY exec against a managed
+    /// service, use [`exec_command`](Self::exec_command) instead.
     pub async fn exec_in_container(
         &self,
         id: &str,
         cmd: Vec<String>,
     ) -> Result<ContainerExecResponse> {
-        let path = format!("/api/v1/containers/{}/exec", urlencoding(id));
-        let payload = serde_json::json!({ "command": cmd });
-        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
-        Self::check_status(status, &body)?;
-        Self::parse_json(&body)
+        self.exec_in_container_with_opts(id, cmd, None, None, Vec::new())
+            .await
+    }
+
+    /// Like [`Self::exec_in_container`] but forwards Docker `exec` options:
+    /// `user` (`--user`, `uid` / `uid:gid` / NAME), `working_dir` (`-w`), and
+    /// `env` (`-e KEY=VALUE`). The daemon applies them via the runtime's
+    /// `exec_with_opts` (drop to uid/gid, chdir, inject env).
+    pub async fn exec_in_container_with_opts(
+        &self,
+        id: &str,
+        cmd: Vec<String>,
+        user: Option<String>,
+        working_dir: Option<String>,
+        env: Vec<String>,
+    ) -> Result<ContainerExecResponse> {
+        let path = format!("/api/v1/containers/{}/exec_sync", urlencoding(id));
+        let request = ContainerExecRequest {
+            command: cmd,
+            user,
+            working_dir,
+            env,
+        };
+        let body =
+            serde_json::to_string(&request).context("Failed to serialize ContainerExecRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
     }
 
     /// Wait for a container to reach a terminal state, Docker-style.
@@ -2511,6 +2668,36 @@ impl DaemonClient {
     pub async fn unpause_container(&self, id: &str) -> Result<()> {
         let path = format!("/api/v1/containers/{}/unpause", urlencoding(id));
         let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Write a chunk of raw stdin bytes to a running container's main process.
+    ///
+    /// `POST /api/v1/containers/{id}/stdin` with an `application/octet-stream`
+    /// body of the raw bytes. Powers the host→guest direction of an interactive
+    /// (`-it`) session: the CLI's raw-mode terminal reader calls this per chunk.
+    /// Returns `Ok(())` on 204.
+    pub async fn write_container_stdin(&self, id: &str, data: &[u8]) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/stdin", urlencoding(id));
+        let (status, body) = self
+            .post_bytes(
+                &path,
+                "application/octet-stream",
+                Bytes::copy_from_slice(data),
+            )
+            .await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Signal end-of-input (close stdin) for a running container.
+    ///
+    /// `DELETE /api/v1/containers/{id}/stdin`. Powers Ctrl-D / detach for an
+    /// interactive session. Returns `Ok(())` on 204.
+    pub async fn close_container_stdin(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/stdin", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
         Self::check_status(status, &body)?;
         Ok(())
     }
@@ -4809,6 +4996,30 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// List worker-tier workers leased by the local leader.
+    ///
+    /// `GET /api/v1/cluster/workers`. Returns an empty list when this node
+    /// is not running a worker-tier dispatcher (e.g., single-node, raft-only,
+    /// static, or a worker-tier worker-role daemon).
+    pub async fn list_workers(&self) -> Result<Vec<zlayer_types::api::cluster::WorkerSummary>> {
+        let (status, body) = self.get("/api/v1/cluster/workers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Snapshot of peers known via the gossip pool on the local daemon.
+    ///
+    /// `GET /api/v1/cluster/gossip/peers`. Returns an empty list when this
+    /// node has no gossip pool configured (single-node, raft-only, static,
+    /// or a worker-tier server without gossip enabled).
+    pub async fn list_gossip_peers(
+        &self,
+    ) -> Result<Vec<zlayer_types::api::cluster::GossipPeerSummary>> {
+        let (status, body) = self.get("/api/v1/cluster/gossip/peers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
     /// Inspect a single node by id.
     ///
     /// `GET /api/v1/nodes/{id}`. The daemon serves the richer
@@ -4870,6 +5081,165 @@ impl DaemonClient {
         Self::parse_json(&resp)
     }
 
+    /// Trigger a cluster signing-key rotation.
+    ///
+    /// `POST /api/v1/cluster/rotate-signing-key`. The daemon owns the
+    /// leader-vs-worker decision: when this method is invoked on a worker
+    /// node the daemon forwards the request to the current Raft leader; on
+    /// the leader it rotates the on-disk keystore in place. The previously
+    /// active key is moved into a grace window (caller-controlled via
+    /// [`RotateSigningKeyRequest::grace`], default `7d`) where it continues
+    /// to verify in-flight join tokens until expiry.
+    ///
+    /// Wave 5B.4 added the server-side handler; Wave 5B.3 added this client
+    /// wrapper and the matching `zlayer node|cluster rotate-signing-key`
+    /// CLI subcommands so admins can drive the rotation without hand-rolling
+    /// curl invocations.
+    pub async fn cluster_rotate_signing_key(
+        &self,
+        req: &zlayer_types::api::cluster::RotateSigningKeyRequest,
+    ) -> Result<zlayer_types::api::cluster::RotateSigningKeyResponse> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialize RotateSigningKeyRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/rotate-signing-key", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Revoke a previously-issued cluster join token.
+    ///
+    /// `POST /api/v1/cluster/revoke-token` (admin auth required). The
+    /// server hashes the supplied `token_or_hash` to its canonical form
+    /// before proposing a `SecretsRaftOp::RevokeToken`, so every node
+    /// converges on the same revocation set within one Raft commit.
+    ///
+    /// Wave 7.4 added the server-side handler; Wave 7.6 added this
+    /// client wrapper and the matching `zlayer cluster revoke-token`
+    /// CLI subcommand.
+    pub async fn cluster_revoke_token(
+        &self,
+        req: &zlayer_types::api::cluster::RevokeTokenRequest,
+    ) -> Result<zlayer_types::api::cluster::RevokeTokenResponse> {
+        let body = serde_json::to_string(req).context("Failed to serialize RevokeTokenRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/revoke-token", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// List currently-active token revocations.
+    ///
+    /// `GET /api/v1/cluster/revocations` (admin auth required). Returns
+    /// a point-in-time view of the local Raft state machine's
+    /// un-expired revocations; entries auto-prune at apply time.
+    pub async fn cluster_list_revocations(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::RevocationListResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/revocations").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Fetch this cluster's public trust bundle.
+    ///
+    /// `GET /api/v1/cluster/trust-bundle` (unauthenticated by design — the
+    /// data is a public key). Returns the local cluster's CA pubkey +
+    /// `cluster_domain` in a form that can be transported out-of-band to
+    /// a peer cluster and imported there.
+    pub async fn cluster_export_trust_bundle(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::TrustBundle> {
+        let (status, resp) = self.get("/api/v1/cluster/trust-bundle").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Import a foreign cluster's trust bundle.
+    ///
+    /// `POST /api/v1/cluster/trust-imports` (admin auth required). The
+    /// server validates shape, then proposes a Raft op so the import
+    /// is replicated to every node before this method returns.
+    pub async fn cluster_import_trust_bundle(
+        &self,
+        req: &zlayer_types::api::cluster::ImportTrustBundleRequest,
+    ) -> Result<zlayer_types::api::cluster::ImportTrustBundleResponse> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialize ImportTrustBundleRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/trust-imports", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// List currently-trusted foreign-cluster bundles.
+    ///
+    /// `GET /api/v1/cluster/trust-bundles` (admin auth required).
+    /// Returns a point-in-time view of `SecretsState::trusted_bundles`
+    /// on this node — sorted by `cluster_domain` for stability.
+    pub async fn cluster_list_trust_bundles(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::TrustedBundlesResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/trust-bundles").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Remove a previously-imported trust bundle.
+    ///
+    /// `DELETE /api/v1/cluster/trust-imports/{cluster_domain}` (admin
+    /// auth required). Idempotent — removing an unknown domain is a
+    /// no-op success.
+    pub async fn cluster_remove_trust_bundle(&self, cluster_domain: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/cluster/trust-imports/{}",
+            urlencoding(cluster_domain)
+        );
+        let (status, resp) = self.delete(&path).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster JWT algorithm policy (Wave 11C+D)
+    // ------------------------------------------------------------------
+
+    /// Set the cluster JWT algorithm policy.
+    pub async fn cluster_set_jwt_algorithm(
+        &self,
+        algorithm: zlayer_types::api::cluster::JwtAlgorithm,
+    ) -> Result<()> {
+        let req = zlayer_types::api::cluster::SetJwtAlgorithmRequest { algorithm };
+        let body =
+            serde_json::to_string(&req).context("Failed to serialize SetJwtAlgorithmRequest")?;
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/jwt-algorithm", &body)
+            .await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Get the cluster JWT algorithm status.
+    pub async fn cluster_jwt_status(
+        &self,
+    ) -> Result<zlayer_types::api::cluster::JwtStatusResponse> {
+        let (status, resp) = self.get("/api/v1/cluster/jwt-status").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Schedule a cluster-wide wipe of `{data_dir}/join_secret`.
+    pub async fn cluster_wipe_join_secret(&self) -> Result<()> {
+        let (status, resp) = self
+            .post_json("/api/v1/cluster/wipe-join-secret", "")
+            .await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Overlay (typed)
     // ------------------------------------------------------------------
@@ -4885,6 +5255,44 @@ impl DaemonClient {
         &self,
     ) -> Result<zlayer_types::api::overlay::OverlayStatusResponse> {
         let (status, body) = self.get("/api/v1/overlay/status").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Per-service overlay status (P4.5b stub contract).
+    ///
+    /// `GET /api/v1/overlay/services/{name}`. Returns the resolved
+    /// overlay mode and the per-node bridge map. Until P9a lands the
+    /// bridge map is always empty and the mode is always `Shared`; the
+    /// endpoint is wired now so adapter crates (zlayer-docker, manager
+    /// UI, Python SDK) can pin against it day-one.
+    pub async fn get_service_overlay_status(
+        &self,
+        name: &str,
+    ) -> Result<zlayer_types::api::overlay::ServiceOverlayStatus> {
+        let path = format!("/api/v1/overlay/services/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Bridge attachment for a service on a specific node (P4.5b stub).
+    ///
+    /// `GET /api/v1/overlay/services/{service}/bridges/{node_id}`. Until
+    /// P9a populates the bridge map this always responds 404; the
+    /// endpoint contract is fixed now so adapter crates can adopt the
+    /// typed call site without rewrites later.
+    pub async fn get_service_bridge(
+        &self,
+        service: &str,
+        node_id: &str,
+    ) -> Result<zlayer_types::api::overlay::BridgeInfo> {
+        let path = format!(
+            "/api/v1/overlay/services/{}/bridges/{}",
+            urlencoding(service),
+            urlencoding(node_id),
+        );
+        let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
@@ -5077,6 +5485,56 @@ impl DaemonClient {
             urlencoding(deployment),
             urlencoding(service),
         );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Edge-cache eligibility (Track A — upstream control-plane API)
+    // ------------------------------------------------------------------
+
+    /// Mark `node_id` as eligible for edge caching with the supplied
+    /// capacity declaration.
+    ///
+    /// `POST /api/v1/nodes/{node_id}/edge-cache` — returns 204 No Content
+    /// on success.
+    pub async fn enable_edge_cache(
+        &self,
+        node_id: u64,
+        capacity: zlayer_types::api::edge_cache::NodeCapacityDto,
+    ) -> Result<()> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache");
+        let body = serde_json::to_string(&zlayer_types::api::edge_cache::EnableEdgeCacheRequest {
+            capacity,
+        })
+        .context("encode EnableEdgeCacheRequest")?;
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Remove `node_id` from the edge-cache eligibility registry.
+    ///
+    /// `DELETE /api/v1/nodes/{node_id}/edge-cache` — returns 204 No
+    /// Content on success, 404 if the node was not registered.
+    pub async fn disable_edge_cache(&self, node_id: u64) -> Result<()> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache");
+        let (status, resp) = self.delete(&path).await?;
+        Self::check_status(status, &resp)?;
+        Ok(())
+    }
+
+    /// Fetch placeholder edge-cache hit/miss counters for `node_id`.
+    ///
+    /// `GET /api/v1/nodes/{node_id}/edge-cache/stats` — today always
+    /// returns `{hits: 0, misses: 0}` per the documented spec; real
+    /// counters land with the follow-on cache subsystem.
+    pub async fn edge_cache_stats(
+        &self,
+        node_id: u64,
+    ) -> Result<zlayer_types::api::edge_cache::EdgeCacheStatsResponse> {
+        let path = format!("/api/v1/nodes/{node_id}/edge-cache/stats");
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
@@ -5503,6 +5961,51 @@ mod tests {
         assert_eq!(urlencoding("app.web"), "app.web");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_connect_to_no_autospawn_times_out_without_spawning() {
+        // Calling against a non-existent socket path must NEVER auto-spawn
+        // and must return an error within the timeout. The whole point of
+        // this method is to be safe from the in-daemon docker-socket task,
+        // where the naive `connect_to` would recursively spawn a competing
+        // daemon and lose a port-bind race.
+        let tmp = std::env::temp_dir().join(format!(
+            "zlayer-test-no-autospawn-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let start = std::time::Instant::now();
+        let result =
+            DaemonClient::connect_to_no_autospawn(&tmp, std::time::Duration::from_millis(250))
+                .await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("must error when socket is absent"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("did not become ready"),
+            "expected timeout error, got: {err}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "polled for full timeout window"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "did not block far beyond the timeout"
+        );
+        // Most important: the socket file we passed must NOT have been
+        // created by the call — i.e. nothing was spawned that would
+        // bind it.
+        assert!(
+            !tmp.exists(),
+            "no daemon process should have been auto-spawned"
+        );
+    }
+
     #[test]
     fn test_urlencoding_special_chars() {
         assert_eq!(urlencoding("my app"), "my%20app");
@@ -5582,6 +6085,20 @@ mod tests {
         // current_exe() should always succeed in a test runner.
         let result = DaemonClient::find_self_binary();
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_resolves_from_data_dir() {
+        use std::path::PathBuf;
+
+        // Pick a non-system data dir.
+        let tmp = std::env::temp_dir().join("zlayer-client-test-xyz");
+        let resolved = zlayer_paths::ZLayerDirs::default_socket_path_for(&tmp);
+        // On Linux & macOS for a non-system data_dir we expect:
+        //   {tmp}/run/zlayer.sock
+        let expected: PathBuf = tmp.join("run").join("zlayer.sock");
+        assert_eq!(resolved, expected.to_string_lossy());
     }
 
     /// Round-trip the wire shape exercised by [`DaemonClient::create_container`]:
@@ -5948,6 +6465,27 @@ mod tests {
         assert_eq!(err.message, "container removed before reaching not-running");
     }
 
+    #[test]
+    fn wait_container_parses_docker_pascalcase_wire() {
+        // REGRESSION: `POST /api/v1/containers/{id}/wait` returns the
+        // Docker-shaped body `{"StatusCode": N, "Error": {"Message": ..}}`
+        // (PascalCase) — which is what `DaemonClient::wait_container` actually
+        // receives. The prior round-trip test only fed snake_case, so the
+        // missing serde rename went unnoticed and every `docker wait` 500'd
+        // ("missing field `status_code`"). This asserts the real wire shape.
+        let success = br#"{"StatusCode": 0}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(success).expect("Docker-shape wait must parse");
+        assert_eq!(resp.status_code, 0);
+        assert!(resp.error.is_none());
+
+        let nonzero = br#"{"StatusCode": 7, "Error": {"Message": "boom"}}"#;
+        let resp: WaitContainerResponse =
+            DaemonClient::parse_json(nonzero).expect("Docker-shape wait with error must parse");
+        assert_eq!(resp.status_code, 7);
+        assert_eq!(resp.error.expect("error present").message, "boom");
+    }
+
     // ----------------------------------------------------------------------
     // events_stream — URL building + NDJSON parse loop.
     //
@@ -6265,17 +6803,19 @@ mod tests {
         use futures_util::StreamExt as _;
 
         // One Status line for an in-flight layer + one terminal Done line.
-        // Verifies the `tag = "type"` enum representation deserializes both
-        // variants from a single NDJSON parser.
+        // Verifies the `tag = "kind"` enum representation deserializes both
+        // variants from a single NDJSON parser. The `kind` key is the wire
+        // shape the daemon actually emits (`PullProgressDto`); feeding it here
+        // is what makes this a real regression test rather than a tautology.
         let body = ChunkedBody::new(vec![
             Bytes::from_static(
-                b"{\"type\":\"status\",\"id\":\"sha256:abc\",\
+                b"{\"kind\":\"status\",\"id\":\"sha256:abc\",\
                   \"status\":\"Downloading\",\
                   \"progress\":\"[==>      ] 1.2MB/4.0MB\",\
                   \"current\":1200000,\"total\":4000000}\n",
             ),
             Bytes::from_static(
-                b"{\"type\":\"done\",\"reference\":\"docker.io/library/alpine:3\",\
+                b"{\"kind\":\"done\",\"reference\":\"docker.io/library/alpine:3\",\
                   \"digest\":\"sha256:deadbeef\"}\n",
             ),
         ]);
@@ -6318,6 +6858,63 @@ mod tests {
         }
 
         assert!(stream.next().await.is_none(), "stream ends on EOF");
+    }
+
+    /// Regression guard for the pull-progress wire contract: the bytes the
+    /// daemon serializes (`zlayer_types::api::images::PullProgressDto`) MUST
+    /// deserialize into the client-side [`PullProgress`]. A mismatch in the
+    /// serde tag key (`kind` vs `type`) silently breaks `docker pull`, because
+    /// the Docker-compat `/images/create` stream then emits no progress lines.
+    /// Serializing the canonical DTO and round-tripping it through the client
+    /// type catches that drift without a running daemon.
+    #[test]
+    fn pull_progress_wire_compatible_with_dto() {
+        use zlayer_types::api::images::PullProgressDto;
+
+        let status_dto = PullProgressDto::Status {
+            id: Some("sha256:abc".to_string()),
+            status: "Downloading".to_string(),
+            progress: Some("[==>   ] 1MB/4MB".to_string()),
+            current: Some(1_000_000),
+            total: Some(4_000_000),
+        };
+        let bytes = serde_json::to_vec(&status_dto).expect("dto serializes");
+        // The wire byte stream must be keyed on `kind`, never `type`.
+        let raw = String::from_utf8(bytes.clone()).expect("utf8");
+        assert!(
+            raw.contains("\"kind\":\"status\""),
+            "DTO must serialize with the `kind` tag key, got: {raw}"
+        );
+        match serde_json::from_slice::<PullProgress>(&bytes).expect("client type parses DTO bytes")
+        {
+            PullProgress::Status {
+                id,
+                status,
+                current,
+                total,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("sha256:abc"));
+                assert_eq!(status, "Downloading");
+                assert_eq!(current, Some(1_000_000));
+                assert_eq!(total, Some(4_000_000));
+            }
+            PullProgress::Done { .. } => panic!("expected Status, got Done"),
+        }
+
+        let done_dto = PullProgressDto::Done {
+            reference: "docker.io/library/alpine:latest".to_string(),
+            digest: Some("sha256:deadbeef".to_string()),
+        };
+        let bytes = serde_json::to_vec(&done_dto).expect("dto serializes");
+        match serde_json::from_slice::<PullProgress>(&bytes).expect("client type parses DTO bytes")
+        {
+            PullProgress::Done { reference, digest } => {
+                assert_eq!(reference, "docker.io/library/alpine:latest");
+                assert_eq!(digest.as_deref(), Some("sha256:deadbeef"));
+            }
+            PullProgress::Status { .. } => panic!("expected Done, got Status"),
+        }
     }
 
     // ----------------------------------------------------------------------

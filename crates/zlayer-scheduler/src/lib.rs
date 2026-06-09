@@ -22,6 +22,7 @@
 //! ```
 
 pub mod autoscaler;
+pub mod cluster;
 pub mod error;
 pub mod handlers;
 pub mod metrics;
@@ -30,6 +31,9 @@ pub mod raft;
 pub mod raft_network;
 pub mod raft_service;
 pub mod raft_storage;
+pub mod worker_dispatcher;
+
+pub use worker_dispatcher::{WorkerDispatcherImpl, WorkerDispatcherService};
 
 pub use autoscaler::{
     Autoscaler, EmaCalculator, ScalingDecision, DEFAULT_COOLDOWN, DEFAULT_EMA_ALPHA,
@@ -40,8 +44,9 @@ pub use metrics::{
     ServiceMetrics,
 };
 pub use placement::{
-    can_place_on_node, place_service_replicas, validate_placement_feasibility, ContainerId,
-    NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
+    can_place_on_node, place_service_replicas, place_single_container,
+    validate_placement_feasibility, ContainerId, NodeResources, NodeState, PlacementDecision,
+    PlacementReason, PlacementState,
 };
 pub use raft::{
     force_leader_marker_path, load_and_clear_force_leader_state, save_force_leader_state,
@@ -335,14 +340,15 @@ impl Scheduler {
                 "Sending scaling request to agent"
             );
 
+            let mut scale_req = zlayer_types::cluster::InternalScaleRequest::new(service, replicas);
+            if let Some(spec) = self.service_specs.read().await.get(service).cloned() {
+                scale_req = scale_req.with_spec(spec);
+            }
             let response = self
                 .http_client
                 .post(&url)
                 .header("X-ZLayer-Internal-Token", &self.internal_token)
-                .json(&serde_json::json!({
-                    "service": service,
-                    "replicas": replicas
-                }))
+                .json(&scale_req)
                 .send()
                 .await
                 .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
@@ -378,36 +384,7 @@ impl Scheduler {
             None => return vec![],
         };
 
-        cluster
-            .nodes
-            .values()
-            .filter(|n| n.status == "ready")
-            .map(|n| {
-                let mut resources = placement::NodeResources::new(n.cpu_total, n.memory_total);
-                resources.cpu_used = n.cpu_used;
-                resources.memory_used = n.memory_used;
-                // Map GPU info from the Raft node info
-                #[allow(clippy::cast_possible_truncation)]
-                let gpu_count = n.gpus.len() as u32;
-                resources.gpu_total = gpu_count;
-                resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
-                resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
-                resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
-                if let Some(first_gpu) = n.gpus.first() {
-                    resources.gpu_vendor.clone_from(&first_gpu.vendor);
-                }
-
-                placement::NodeState {
-                    id: n.node_id,
-                    address: n.advertise_addr.clone(),
-                    labels: std::collections::HashMap::new(),
-                    resources,
-                    healthy: true,
-                    os: n.os,
-                    arch: n.arch,
-                }
-            })
-            .collect()
+        cluster_nodes_to_node_states(&cluster.nodes)
     }
 
     /// Compute where to place service replicas across available nodes.
@@ -425,67 +402,13 @@ impl Scheduler {
         placement_state: &mut placement::PlacementState,
         spec: Option<&ServiceSpec>,
     ) -> HashMap<NodeId, Vec<placement::ContainerId>> {
-        // Build a default ServiceSpec if none provided, using Shared mode
-        let default_spec = ServiceSpec {
-            rtype: zlayer_spec::ResourceType::Service,
-            schedule: None,
-            image: zlayer_spec::ImageSpec {
-                name: "unknown:latest".parse().expect("valid image reference"),
-                pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
-            },
-            resources: zlayer_spec::ResourcesSpec::default(),
-            env: HashMap::default(),
-            command: zlayer_spec::CommandSpec::default(),
-            network: zlayer_spec::ServiceNetworkSpec::default(),
-            endpoints: vec![],
-            scale: zlayer_spec::ScaleSpec::default(),
-            depends: vec![],
-            health: zlayer_spec::HealthSpec {
-                start_grace: None,
-                interval: None,
-                timeout: None,
-                retries: 3,
-                check: zlayer_spec::HealthCheck::Tcp { port: 0 },
-            },
-            init: zlayer_spec::InitSpec::default(),
-            errors: zlayer_spec::ErrorsSpec::default(),
-            lifecycle: zlayer_spec::LifecycleSpec::default(),
-            devices: vec![],
-            storage: vec![],
-            port_mappings: vec![],
-            capabilities: vec![],
-            cap_drop: vec![],
-            privileged: false,
-            node_mode: zlayer_spec::NodeMode::Shared,
-            node_selector: None,
-            service_type: zlayer_spec::ServiceType::default(),
-            wasm: None,
-            logs: None,
-            host_network: false,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            platform: None,
-            labels: HashMap::new(),
-            user: None,
-            stop_signal: None,
-            stop_grace_period: None,
-            sysctls: HashMap::new(),
-            ulimits: HashMap::new(),
-            security_opt: Vec::new(),
-            pid_mode: None,
-            ipc_mode: None,
-            network_mode: zlayer_spec::NetworkMode::default(),
-            extra_groups: Vec::new(),
-            read_only_root_fs: false,
-            init_container: None,
-            tty: false,
-            stdin_open: false,
-            userns_mode: None,
-            cgroup_parent: None,
-            expose: Vec::new(),
-        };
+        // Build a default ServiceSpec if none provided. The default `node_mode`
+        // is already `NodeMode::Shared` and the default image placeholder
+        // (`scratch:latest`) is fine here since this fallback only fires when
+        // the caller had no spec to give us — placement decisions made off
+        // this default are tagged with the synthetic image only for the
+        // duration of the scheduling pass.
+        let default_spec = ServiceSpec::default();
 
         let effective_spec = spec.unwrap_or(&default_spec);
 
@@ -554,6 +477,12 @@ impl Scheduler {
         // the placement algorithm will filter by `NodeState.os` automatically.
         let mut rerouted_nodes: Vec<(NodeId, String, String)> = Vec::new();
 
+        // Propagate the current spec to every target node so it can register
+        // (first deploy on a fresh worker) or update (image change → rolling
+        // recreate) the service before scaling. Without this, workers scale
+        // from a stale cached spec and never pick up a new image.
+        let dispatch_spec = self.service_specs.read().await.get(service_name).cloned();
+
         for (node_id, containers) in node_assignments {
             let Some(node_info) = cluster.nodes.get(node_id) else {
                 warn!(
@@ -598,14 +527,16 @@ impl Scheduler {
             // Skip HTTP calls during tests
             #[cfg(not(feature = "test-skip-http"))]
             {
+                let mut scale_req =
+                    zlayer_types::cluster::InternalScaleRequest::new(service_name, replicas);
+                if let Some(spec) = dispatch_spec.clone() {
+                    scale_req = scale_req.with_spec(spec);
+                }
                 match self
                     .http_client
                     .post(&url)
                     .header("X-ZLayer-Internal-Token", &self.internal_token)
-                    .json(&serde_json::json!({
-                        "service": service_name,
-                        "replicas": replicas,
-                    }))
+                    .json(&scale_req)
                     .timeout(Duration::from_secs(30))
                     .send()
                     .await
@@ -1199,6 +1130,48 @@ impl Scheduler {
     }
 }
 
+/// Map a Raft node registry into placement-ready `NodeState`s.
+///
+/// Filters to only nodes with `status == "ready"` — `draining` and `dead`
+/// nodes are excluded so the placement algorithm never schedules new work
+/// onto them. See README §"Node Status" (lines 425-433) for the contract.
+///
+/// Extracted from [`Scheduler::build_node_states`] so unit tests can verify
+/// the filter without standing up a full Raft stack.
+pub(crate) fn cluster_nodes_to_node_states(
+    nodes: &HashMap<NodeId, NodeInfo>,
+) -> Vec<placement::NodeState> {
+    nodes
+        .values()
+        .filter(|n| n.status == "ready")
+        .map(|n| {
+            let mut resources = placement::NodeResources::new(n.cpu_total, n.memory_total);
+            resources.cpu_used = n.cpu_used;
+            resources.memory_used = n.memory_used;
+            // Map GPU info from the Raft node info
+            #[allow(clippy::cast_possible_truncation)]
+            let gpu_count = n.gpus.len() as u32;
+            resources.gpu_total = gpu_count;
+            resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
+            resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
+            resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
+            if let Some(first_gpu) = n.gpus.first() {
+                resources.gpu_vendor.clone_from(&first_gpu.vendor);
+            }
+
+            placement::NodeState {
+                id: n.node_id,
+                address: n.advertise_addr.clone(),
+                labels: n.labels.clone(),
+                resources,
+                healthy: true,
+                os: n.os,
+                arch: n.arch,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1280,91 @@ mod tests {
         assert!(
             matches!(err, SchedulerError::NotLeader),
             "Expected NotLeader, got: {err:?}"
+        );
+    }
+
+    /// Helper: build a minimal `NodeInfo` with a given id and status.
+    /// All other fields are zeroed/empty defaults — only `status` and
+    /// `node_id` matter for the placement filter contract.
+    fn make_node(node_id: NodeId, status: &str) -> NodeInfo {
+        NodeInfo {
+            node_id,
+            address: String::new(),
+            registered_at: 0,
+            last_heartbeat: 0,
+            gpus: vec![],
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 0.0,
+            memory_total: 0,
+            disk_total: 0,
+            cpu_used: 0.0,
+            memory_used: 0,
+            disk_used: 0,
+            gpu_utilization: vec![],
+            status: status.to_string(),
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+            labels: std::collections::HashMap::new(),
+        }
+    }
+
+    /// `build_node_states` (via `cluster_nodes_to_node_states`) must drop
+    /// nodes whose status is not "ready". This guards the README §"Node
+    /// Status" contract (lines 425-433): `draining` and `dead` nodes are
+    /// excluded from placement so new replicas are never scheduled onto
+    /// them. If someone "fixes" the filter to allow draining nodes, this
+    /// test fails and the contract is preserved.
+    #[tokio::test]
+    async fn build_node_states_excludes_non_ready() {
+        let mut nodes: HashMap<NodeId, NodeInfo> = HashMap::new();
+        nodes.insert(1, make_node(1, "ready"));
+        nodes.insert(2, make_node(2, "draining"));
+        nodes.insert(3, make_node(3, "dead"));
+
+        let states = cluster_nodes_to_node_states(&nodes);
+
+        assert_eq!(
+            states.len(),
+            1,
+            "expected exactly one ready node in placement set, got {}: {:?}",
+            states.len(),
+            states.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            states[0].id, 1,
+            "expected node 1 (ready) to be the only included node"
+        );
+    }
+
+    /// Node labels recorded at registration must survive the conversion into
+    /// the placement `NodeState` so `NodeSelector` matching actually works.
+    /// Guards against the prior bug where the conversion hardcoded an empty
+    /// label map, making label-based placement a silent no-op cluster-wide.
+    #[tokio::test]
+    async fn build_node_states_carries_labels() {
+        let mut info = make_node(1, "ready");
+        info.labels
+            .insert("zone".to_string(), "us-east".to_string());
+        info.labels.insert("tier".to_string(), "edge".to_string());
+        let mut nodes: HashMap<NodeId, NodeInfo> = HashMap::new();
+        nodes.insert(1, info);
+
+        let states = cluster_nodes_to_node_states(&nodes);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].labels.get("zone").map(String::as_str),
+            Some("us-east")
+        );
+        assert_eq!(
+            states[0].labels.get("tier").map(String::as_str),
+            Some("edge")
         );
     }
 }

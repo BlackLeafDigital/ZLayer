@@ -250,6 +250,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
+    use zlayer_paths::ZLayerDirs;
 
     /// Serialise tests that mutate the process environment.
     fn env_lock() -> &'static Mutex<()> {
@@ -391,7 +392,9 @@ QUOTE="say \"hi\""
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-priority-process-overrides-env-file-")
+            .unwrap();
         let env_file = dir.path().join("custom.env");
         let mut f = std::fs::File::create(&env_file).unwrap();
         writeln!(f, "ZLAYER_TEST_PRIORITY_VAR=from_file").unwrap();
@@ -421,7 +424,9 @@ QUOTE="say \"hi\""
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-priority-env-file-overrides-dotenv-")
+            .unwrap();
 
         let dotenv = dir.path().join(".env");
         let mut f = std::fs::File::create(&dotenv).unwrap();
@@ -455,7 +460,9 @@ QUOTE="say \"hi\""
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-priority-later-env-file-overrides-earlier-")
+            .unwrap();
         let a = dir.path().join("a.env");
         let b = dir.path().join("b.env");
         std::fs::write(&a, "ZLAYER_TEST_ORDER_VAR=from_a\nONLY_A=yes\n").unwrap();
@@ -478,7 +485,9 @@ QUOTE="say \"hi\""
 
     #[test]
     fn collect_dotenv_optional() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-dotenv-optional-")
+            .unwrap();
         // No .env, no env files — should succeed and just return process env.
         let env = collect_env_sources(dir.path(), &[]).unwrap();
         // Spot-check that PATH (essentially always present) made it through.
@@ -489,7 +498,9 @@ QUOTE="say \"hi\""
 
     #[test]
     fn collect_missing_explicit_env_file_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-missing-explicit-env-file-errors-")
+            .unwrap();
         let missing = dir.path().join("nope.env");
         let err = collect_env_sources(dir.path(), std::slice::from_ref(&missing)).unwrap_err();
         match err {
@@ -500,7 +511,9 @@ QUOTE="say \"hi\""
 
     #[test]
     fn collect_parse_error_carries_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("collect-parse-error-carries-path-")
+            .unwrap();
         let bad = dir.path().join("bad.env");
         std::fs::write(&bad, "this is not valid\n").unwrap();
         let err = collect_env_sources(dir.path(), std::slice::from_ref(&bad)).unwrap_err();

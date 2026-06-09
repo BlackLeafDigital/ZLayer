@@ -214,6 +214,7 @@ impl GitPoller {
 mod tests {
     use super::*;
     use crate::storage::InMemoryProjectStore;
+    use zlayer_paths::ZLayerDirs;
 
     #[tokio::test]
     async fn poller_skips_projects_without_interval() {
@@ -225,7 +226,9 @@ mod tests {
         let poller = Arc::new(GitPoller::new(
             store,
             None,
-            std::env::temp_dir().join("zlayer-poller-test"),
+            ZLayerDirs::system_default()
+                .tmp()
+                .join("zlayer-poller-test"),
         ));
 
         let mut last_poll = std::collections::HashMap::new();
@@ -247,7 +250,9 @@ mod tests {
         let poller = Arc::new(GitPoller::new(
             store,
             None,
-            std::env::temp_dir().join("zlayer-poller-test-2"),
+            ZLayerDirs::system_default()
+                .tmp()
+                .join("zlayer-poller-test-2"),
         ));
 
         let mut last_poll = std::collections::HashMap::new();

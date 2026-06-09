@@ -100,40 +100,49 @@ where
         parts: &mut Parts,
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
-        // Try Bearer first (API clients).
-        if let Ok(user) = AuthUser::from_request_parts(parts, state).await {
+        // Cookie wins over bearer when both are present. The UDS auto-bearer
+        // middleware injects a `local-admin` Bearer on every Unix-socket
+        // request, so a logged-in user's `zlayer_session` cookie would
+        // otherwise be ignored whenever the manager talks to the daemon
+        // over the socket — `/auth/me` would then resolve the synthetic
+        // `local-admin` subject (which doesn't exist in the user table)
+        // and return "User no longer exists", bouncing the user back to
+        // login. Cookie-first auth lets the user's real session drive
+        // their own requests; bearer remains the fallback for CLI /
+        // service callers that don't carry a cookie.
+        if let Ok(session) = SessionAuthUser::from_request_parts(parts, state).await {
             tracing::warn!(
-                actor_path = "bearer",
-                sub_prefix = %user.claims.sub.chars().take(8).collect::<String>(),
-                "AuthActor: resolved via bearer token",
+                actor_path = "cookie",
+                sub_prefix = %session.claims.sub.chars().take(8).collect::<String>(),
+                "AuthActor: resolved via session cookie",
             );
             return Ok(AuthActor {
-                user_id: user.claims.sub,
-                roles: user.claims.roles,
-                email: user.claims.email,
+                user_id: session.claims.sub,
+                roles: session.claims.roles,
+                email: session.claims.email,
             });
         }
-        // Fall back to session cookie (browser).
-        let session = match SessionAuthUser::from_request_parts(parts, state).await {
-            Ok(s) => s,
+        // Fall back to Bearer (CLI clients, service-only paths).
+        let user = match AuthUser::from_request_parts(parts, state).await {
+            Ok(u) => u,
             Err(e) => {
                 tracing::warn!(
                     actor_path = "none",
                     error = %e,
-                    "AuthActor: neither bearer nor cookie produced an authenticated user",
+                    "AuthActor: neither cookie nor bearer produced an authenticated user",
                 );
                 return Err(e);
             }
         };
         tracing::warn!(
-            actor_path = "cookie",
-            sub_prefix = %session.claims.sub.chars().take(8).collect::<String>(),
-            "AuthActor: resolved via session cookie",
+            actor_path = "bearer",
+            sub_prefix = %user.claims.sub.chars().take(8).collect::<String>(),
+            "AuthActor: resolved via bearer token",
         );
         Ok(AuthActor {
-            user_id: session.claims.sub,
-            roles: session.claims.roles,
-            email: session.claims.email,
+            user_id: user.claims.sub,
+            roles: user.claims.roles,
+            email: user.claims.email,
         })
     }
 }
@@ -323,21 +332,21 @@ pub async fn update_user(
 }
 
 /// Delete a user. Admin only. Callers cannot delete their own account.
+/// Idempotent — returns 204 whether the user existed or not.
 ///
 /// # Errors
 ///
 /// Returns [`ApiError::Forbidden`] when the caller is not an admin,
-/// [`ApiError::BadRequest`] when an admin tries to delete themselves,
-/// [`ApiError::NotFound`] when the user does not exist, or
+/// [`ApiError::BadRequest`] when an admin tries to delete themselves, or
 /// [`ApiError::Internal`] if a backing store fails.
 #[utoipa::path(
     delete,
     path = "/api/v1/users/{id}",
     params(("id" = String, Path, description = "User id")),
     responses(
-        (status = 204, description = "Deleted"),
+        (status = 204, description = "Deleted (or already absent)"),
+        (status = 400, description = "Cannot delete your own account"),
         (status = 403, description = "Admin role required"),
-        (status = 404, description = "Not found"),
     ),
     tag = "Users"
 )]

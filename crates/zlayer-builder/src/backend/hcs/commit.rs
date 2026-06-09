@@ -1,42 +1,41 @@
-//! OCI manifest + config writer for the HCS builder.
+//! OCI manifest + config builder helpers for the HCS builder.
 //!
-//! Produces an OCI Image Layout directory on disk:
-//!
-//! ```text
-//! oci/
-//! |-- blobs/
-//! |   `-- sha256/
-//! |       |-- <config-digest>     # image config JSON
-//! |       |-- <base-layer-N>      # every base layer blob, verbatim
-//! |       `-- <diff-layer-digest> # the new layer produced by this build
-//! |-- oci-layout                  # OCI Image Layout marker
-//! |-- index.json                  # points at the manifest
-//! `-- manifest.json               # (also stored under blobs/sha256/<digest>)
-//! ```
-//!
-//! Reuses [`zlayer_registry::oci_export::OciManifest`], `OciDescriptor`,
-//! `OciIndex`, and `OciLayout` so we don't duplicate the struct definitions
-//! that already ship in that crate. The only bits we don't reuse are the
-//! full [`zlayer_registry::oci_export::export_image`] entry point (which
-//! expects manifests that already exist in a local registry — we're writing
-//! one from scratch) and a dedicated Windows-aware image-config builder
-//! (which lives in this file because it's builder-specific state, not a
-//! registry concept).
+//! The real per-instruction build / commit / push path is now owned by
+//! [`crate::windows_builder::WindowsBuilder::build_image_for_backend`]; this
+//! module retains only the pure JSON-serialization helpers that the
+//! `tests/hcs_backend_e2e.rs` integration test exercises directly
+//! (`ImageConfigBuilder`, `build_image_config_bytes`, `build_manifest_bytes`,
+//! and the OCI media-type constants).
 
 #![cfg(target_os = "windows")]
 
 use std::collections::BTreeMap;
-use std::io;
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use zlayer_registry::image_config::{ImageConfig, ImageHealthcheck};
-use zlayer_registry::oci_export::{OciDescriptor, OciIndex, OciLayout, OciManifest, OciPlatform};
+use zlayer_registry::oci_export::{OciDescriptor, OciManifest};
 
 use crate::dockerfile::{HealthcheckInstruction, ShellOrExec};
 
-use super::scratch::BaseLayerBlob;
+/// One pre-existing base layer blob, recorded for inclusion in the final
+/// OCI manifest.
+///
+/// Inlined from the (now-deleted) `super::scratch` module so that
+/// [`build_manifest_bytes`] still has a typed descriptor for base layers
+/// without dragging the rest of the base-chain materialisation code into
+/// the dead-shim build path.
+#[derive(Debug, Clone)]
+pub struct BaseLayerBlob {
+    /// Media type (`application/vnd.docker.image.rootfs.foreign.diff.tar.gzip`
+    /// or `application/vnd.oci.image.layer.v1.tar+gzip` depending on source).
+    pub media_type: String,
+    /// Content-addressable digest of the compressed blob (`sha256:...`).
+    pub digest: String,
+    /// Compressed blob bytes. Required in the manifest unchanged.
+    pub bytes: Vec<u8>,
+    /// Optional `urls[]` (non-empty for MCR foreign layers).
+    pub urls: Vec<String>,
+}
 
 /// OCI image-config media type. Public so tests and the backend module can
 /// reference the exact string without retyping it.
@@ -396,163 +395,13 @@ pub fn build_manifest_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// Write everything to disk
+// (Removed) Write-to-disk helpers
 // ---------------------------------------------------------------------------
-
-/// Aggregate return value from [`write_oci_artifacts`].
-#[derive(Debug, Clone)]
-pub struct BuildCommitArtifacts {
-    /// `sha256:...` digest of the written manifest.
-    pub manifest_digest: String,
-    /// Path to the manifest JSON file on disk.
-    pub manifest_path: PathBuf,
-    /// Path to the index.json pointing at the manifest.
-    pub index_path: PathBuf,
-    /// Root of the OCI layout that was written.
-    pub layout_root: PathBuf,
-    /// Total number of layers in the final manifest.
-    pub layer_count: usize,
-    /// Total size in bytes of the layout (manifest + config + every layer blob).
-    pub total_size: u64,
-}
-
-/// Write an OCI Image Layout directory under `out_dir` containing the new
-/// build's manifest, config, and all referenced layer blobs.
-///
-/// # Errors
-///
-/// Returns [`io::Error`] on filesystem failures. JSON serialization errors
-/// (which shouldn't occur given the types involved) are wrapped via
-/// [`io::Error::other`].
-pub fn write_oci_artifacts(
-    out_dir: &Path,
-    config: &ImageConfigBuilder,
-    base_layers: &[BaseLayerBlob],
-    new_layer: &super::layer::CapturedLayer,
-) -> io::Result<BuildCommitArtifacts> {
-    std::fs::create_dir_all(out_dir)?;
-
-    let blobs_dir = out_dir.join("blobs").join("sha256");
-    std::fs::create_dir_all(&blobs_dir)?;
-
-    // Compute the base-layer diff_ids by hashing the *uncompressed* tar
-    // payload. For the most common case (`+gzip` media type) that means
-    // decompressing the compressed blob on the fly; for raw `tar`
-    // descriptors the compressed bytes ARE the uncompressed payload.
-    let base_diff_ids = compute_base_diff_ids(base_layers)?;
-
-    // 1. Image config blob.
-    let config_bytes = build_image_config_bytes(config, &base_diff_ids, &new_layer.diff_id)
-        .map_err(|e| io::Error::other(format!("serialize image config: {e}")))?;
-    let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
-    write_blob(&blobs_dir, &config_digest, &config_bytes)?;
-
-    // 2. Each base layer (verbatim).
-    let mut total_size: u64 = config_bytes.len() as u64;
-    for layer in base_layers {
-        write_blob(&blobs_dir, &layer.digest, &layer.bytes)?;
-        total_size = total_size.saturating_add(layer.bytes.len() as u64);
-    }
-
-    // 3. New diff layer.
-    write_blob(&blobs_dir, &new_layer.digest, &new_layer.bytes)?;
-    total_size = total_size.saturating_add(new_layer.size);
-
-    // 4. Manifest JSON.
-    let manifest_bytes = build_manifest_bytes(
-        &config_digest,
-        config_bytes.len() as u64,
-        base_layers,
-        &new_layer.digest,
-        new_layer.size,
-    )
-    .map_err(|e| io::Error::other(format!("serialize manifest: {e}")))?;
-    let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes)));
-    write_blob(&blobs_dir, &manifest_digest, &manifest_bytes)?;
-    total_size = total_size.saturating_add(manifest_bytes.len() as u64);
-
-    // Also drop a friendly manifest.json alongside the layout root so tools
-    // that don't grok content-addressable blobs can find it easily.
-    let manifest_path = out_dir.join("manifest.json");
-    std::fs::write(&manifest_path, &manifest_bytes)?;
-
-    // 5. oci-layout marker.
-    let layout = OciLayout::default();
-    let layout_json = serde_json::to_vec_pretty(&layout)
-        .map_err(|e| io::Error::other(format!("serialize oci-layout: {e}")))?;
-    std::fs::write(out_dir.join("oci-layout"), layout_json)?;
-
-    // 6. index.json — one entry pointing at the manifest.
-    let index = OciIndex::new(OciDescriptor {
-        media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
-        digest: manifest_digest.clone(),
-        size: manifest_bytes.len() as u64,
-        urls: None,
-        annotations: None,
-        platform: Some(OciPlatform {
-            architecture: config.architecture.clone(),
-            os: config.os.clone(),
-            os_version: config.os_version.clone(),
-            os_features: None,
-            variant: None,
-        }),
-    });
-    let index_json = serde_json::to_vec_pretty(&index)
-        .map_err(|e| io::Error::other(format!("serialize index.json: {e}")))?;
-    let index_path = out_dir.join("index.json");
-    std::fs::write(&index_path, index_json)?;
-
-    let layer_count = base_layers.len() + 1;
-
-    Ok(BuildCommitArtifacts {
-        manifest_digest,
-        manifest_path,
-        index_path,
-        layout_root: out_dir.to_path_buf(),
-        layer_count,
-        total_size,
-    })
-}
-
-/// Compute the `diff_id` (uncompressed-tar SHA-256) for each base layer.
-///
-/// For `+gzip` media types the blob is gzip-decoded first; for `+zstd` it
-/// goes through zstd; raw `tar` media types are hashed as-is.
-fn compute_base_diff_ids(layers: &[BaseLayerBlob]) -> io::Result<Vec<String>> {
-    layers
-        .iter()
-        .map(|layer| {
-            let mt = layer.media_type.to_ascii_lowercase();
-            let uncompressed = if mt.ends_with("+gzip") || mt.ends_with(".tar.gzip") {
-                gzip_decode(&layer.bytes)?
-            } else {
-                layer.bytes.clone()
-            };
-            Ok(format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(&uncompressed))
-            ))
-        })
-        .collect()
-}
-
-/// Gzip-decompress a buffer. Tiny helper so the caller doesn't have to
-/// open-code it.
-fn gzip_decode(bytes: &[u8]) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut decoder = flate2::read::GzDecoder::new(bytes);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
-    Ok(out)
-}
-
-/// Write a blob to `<blobs_dir>/<hex-hash>` from a `sha256:<hex>` digest.
-fn write_blob(blobs_dir: &Path, digest: &str, bytes: &[u8]) -> io::Result<()> {
-    let hash = digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| io::Error::other(format!("digest missing sha256: prefix: {digest}")))?;
-    std::fs::write(blobs_dir.join(hash), bytes)
-}
+//
+// `write_oci_artifacts`, `BuildCommitArtifacts`, `compute_base_diff_ids`,
+// `gzip_decode`, and `write_blob` previously lived here. The real builder
+// (`crate::windows_builder::WindowsBuilder::build_image_for_backend`) owns
+// the OCI layout writer end-to-end now, so those helpers are gone.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -629,67 +478,6 @@ mod tests {
         let path_entries: Vec<_> = env.iter().filter(|e| e.starts_with("PATH=")).collect();
         assert_eq!(path_entries.len(), 1);
         assert_eq!(path_entries[0], "PATH=/new");
-    }
-
-    #[test]
-    fn write_oci_artifacts_round_trip_reparses() {
-        // Write an artifact set to a tempdir, then re-parse the manifest
-        // and config back via the canonical types to confirm a valid layout.
-        //
-        // The base layer's `media_type` ends in `.tar.gzip`, so
-        // `compute_base_diff_ids` will gzip-decode `base.bytes` to derive
-        // the diff_id. Its bytes must therefore be a valid gzip stream.
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write as _;
-
-        fn gzip_bytes(uncompressed: &[u8]) -> Vec<u8> {
-            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(uncompressed).unwrap();
-            enc.finish().unwrap()
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = demo_config();
-
-        let base_uncompressed = b"fake base bytes";
-        let base_compressed = gzip_bytes(base_uncompressed);
-        let base = BaseLayerBlob {
-            media_type: "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip".to_string(),
-            digest: format!("sha256:{}", hex::encode(Sha256::digest(&base_compressed))),
-            bytes: base_compressed,
-            urls: vec!["https://mcr.microsoft.com/foo".to_string()],
-        };
-
-        let new_uncompressed = b"new layer uncompressed";
-        let new_compressed = gzip_bytes(new_uncompressed);
-        let new_layer = super::super::layer::CapturedLayer {
-            size: new_compressed.len() as u64,
-            digest: format!("sha256:{}", hex::encode(Sha256::digest(&new_compressed))),
-            diff_id: format!("sha256:{}", hex::encode(Sha256::digest(new_uncompressed))),
-            bytes: new_compressed,
-        };
-
-        let artifacts =
-            write_oci_artifacts(tmp.path(), &cfg, std::slice::from_ref(&base), &new_layer).unwrap();
-        assert_eq!(artifacts.layer_count, 2);
-        assert!(artifacts.manifest_digest.starts_with("sha256:"));
-
-        // oci-layout must exist and be parseable.
-        let layout_bytes = std::fs::read(tmp.path().join("oci-layout")).unwrap();
-        let _: OciLayout = serde_json::from_slice(&layout_bytes).unwrap();
-
-        // index.json must exist and point at the manifest with os: windows.
-        let index_bytes = std::fs::read(tmp.path().join("index.json")).unwrap();
-        let index: OciIndex = serde_json::from_slice(&index_bytes).unwrap();
-        assert_eq!(index.manifests.len(), 1);
-        let platform = index.manifests[0].platform.as_ref().unwrap();
-        assert_eq!(platform.os, "windows");
-        assert_eq!(platform.architecture, "amd64");
-
-        // manifest blob must exist at blobs/sha256/<digest>.
-        let hash = artifacts.manifest_digest.strip_prefix("sha256:").unwrap();
-        assert!(tmp.path().join("blobs/sha256").join(hash).exists());
     }
 
     #[test]

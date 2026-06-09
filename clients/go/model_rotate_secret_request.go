@@ -21,6 +21,8 @@ var _ MappedNullable = &RotateSecretRequest{}
 
 // RotateSecretRequest Request body for secret rotation.
 type RotateSecretRequest struct {
+	// Optional per-secret node affinity update. `None` here means \"leave existing affinity unchanged\"; to clear affinity explicitly, pass an empty selector via a separate update endpoint (Phase 2).
+	NodeAffinity NullableNodeAffinity `json:"node_affinity,omitempty"`
 	// The new secret value (will be encrypted at rest).
 	Value string `json:"value"`
 }
@@ -43,6 +45,48 @@ func NewRotateSecretRequest(value string) *RotateSecretRequest {
 func NewRotateSecretRequestWithDefaults() *RotateSecretRequest {
 	this := RotateSecretRequest{}
 	return &this
+}
+
+// GetNodeAffinity returns the NodeAffinity field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *RotateSecretRequest) GetNodeAffinity() NodeAffinity {
+	if o == nil || IsNil(o.NodeAffinity.Get()) {
+		var ret NodeAffinity
+		return ret
+	}
+	return *o.NodeAffinity.Get()
+}
+
+// GetNodeAffinityOk returns a tuple with the NodeAffinity field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *RotateSecretRequest) GetNodeAffinityOk() (*NodeAffinity, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.NodeAffinity.Get(), o.NodeAffinity.IsSet()
+}
+
+// HasNodeAffinity returns a boolean if a field has been set.
+func (o *RotateSecretRequest) HasNodeAffinity() bool {
+	if o != nil && o.NodeAffinity.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetNodeAffinity gets a reference to the given NullableNodeAffinity and assigns it to the NodeAffinity field.
+func (o *RotateSecretRequest) SetNodeAffinity(v NodeAffinity) {
+	o.NodeAffinity.Set(&v)
+}
+// SetNodeAffinityNil sets the value for NodeAffinity to be an explicit nil
+func (o *RotateSecretRequest) SetNodeAffinityNil() {
+	o.NodeAffinity.Set(nil)
+}
+
+// UnsetNodeAffinity ensures that no value is present for NodeAffinity, not even an explicit nil
+func (o *RotateSecretRequest) UnsetNodeAffinity() {
+	o.NodeAffinity.Unset()
 }
 
 // GetValue returns the Value field value
@@ -79,6 +123,9 @@ func (o RotateSecretRequest) MarshalJSON() ([]byte, error) {
 
 func (o RotateSecretRequest) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
+	if o.NodeAffinity.IsSet() {
+		toSerialize["node_affinity"] = o.NodeAffinity.Get()
+	}
 	toSerialize["value"] = o.Value
 	return toSerialize, nil
 }

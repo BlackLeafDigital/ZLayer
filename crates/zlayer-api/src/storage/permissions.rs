@@ -21,6 +21,8 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use super::{PermissionLevel, StorageError, StoredPermission, SubjectKind};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for permission storage backends.
 #[async_trait]
@@ -1141,7 +1143,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_round_trip() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("permissions.db");
 
         let wildcard = make_perm(

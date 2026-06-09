@@ -61,10 +61,7 @@ fn unique_container_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_container_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_container_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for testing
@@ -75,6 +72,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         image: ImageSpec {
             name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         },
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
@@ -82,6 +80,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,
@@ -101,6 +100,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,
@@ -128,6 +128,9 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     }
 }
 
@@ -230,6 +233,7 @@ async fn wait_for_state(
 
 /// Test that we can connect to the Docker daemon
 #[tokio::test]
+#[serial_test::serial]
 async fn test_docker_connection() {
     let Some(_runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -242,6 +246,7 @@ async fn test_docker_connection() {
 
 /// Test pulling an image with default policy (`IfNotPresent`)
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pull_image() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -261,6 +266,7 @@ async fn test_pull_image() {
 
 /// Test that `IfNotPresent` policy skips pulling when image exists
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pull_image_if_not_present() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -277,7 +283,12 @@ async fn test_pull_image_if_not_present() {
 
     let result = tokio::time::timeout(
         SHORT_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::IfNotPresent, None),
+        runtime.pull_image_with_policy(
+            TEST_IMAGE,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        ),
     )
     .await;
 
@@ -300,6 +311,7 @@ async fn test_pull_image_if_not_present() {
 
 /// Test complete container lifecycle: create -> start -> get state -> stop -> remove
 #[tokio::test]
+#[serial_test::serial]
 async fn test_container_lifecycle() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -384,6 +396,7 @@ async fn test_container_lifecycle() {
 
 /// Test container logs retrieval
 #[tokio::test]
+#[serial_test::serial]
 async fn test_container_logs() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -455,6 +468,7 @@ async fn test_container_logs() {
 
 /// Test executing a command inside a running container
 #[tokio::test]
+#[serial_test::serial]
 async fn test_container_exec() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -526,6 +540,7 @@ async fn test_container_exec() {
 
 /// Test getting container resource statistics
 #[tokio::test]
+#[serial_test::serial]
 async fn test_container_stats() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -586,6 +601,7 @@ async fn test_container_stats() {
 
 /// Test waiting for a container to exit with exit code 0
 #[tokio::test]
+#[serial_test::serial]
 async fn test_wait_container_success() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -631,6 +647,7 @@ async fn test_wait_container_success() {
 
 /// Test waiting for a container to exit with non-zero exit code
 #[tokio::test]
+#[serial_test::serial]
 async fn test_wait_container_failure() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -703,6 +720,7 @@ async fn test_wait_container_failure() {
 
 /// Test waiting for a container that runs briefly
 #[tokio::test]
+#[serial_test::serial]
 async fn test_wait_container_timing() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -750,6 +768,7 @@ async fn test_wait_container_timing() {
 
 /// Test that multiple containers can be managed concurrently
 #[tokio::test]
+#[serial_test::serial]
 async fn test_concurrent_containers() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -847,6 +866,7 @@ async fn test_concurrent_containers() {
 
 /// Test that removing a non-existent container succeeds (idempotent)
 #[tokio::test]
+#[serial_test::serial]
 async fn test_remove_nonexistent_container() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -871,6 +891,7 @@ async fn test_remove_nonexistent_container() {
 
 /// Test that getting state of non-existent container returns `NotFound` error
 #[tokio::test]
+#[serial_test::serial]
 async fn test_state_nonexistent_container() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -888,6 +909,7 @@ async fn test_state_nonexistent_container() {
 
 /// Test pull with Never policy (should not pull)
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pull_never_policy() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -899,7 +921,12 @@ async fn test_pull_never_policy() {
 
     println!("Testing Never pull policy with non-existent image");
     let result = runtime
-        .pull_image_with_policy(nonexistent_image, PullPolicy::Never, None)
+        .pull_image_with_policy(
+            nonexistent_image,
+            PullPolicy::Never,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
         .await;
 
     // Never policy should return Ok immediately without pulling
@@ -912,6 +939,7 @@ async fn test_pull_never_policy() {
 
 /// Test pull with Always policy
 #[tokio::test]
+#[serial_test::serial]
 async fn test_pull_always_policy() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");
@@ -921,7 +949,12 @@ async fn test_pull_always_policy() {
     println!("Testing Always pull policy");
     let result = tokio::time::timeout(
         LONG_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::Always, None),
+        runtime.pull_image_with_policy(
+            TEST_IMAGE,
+            PullPolicy::Always,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        ),
     )
     .await;
 
@@ -934,6 +967,7 @@ async fn test_pull_always_policy() {
 
 /// Test container with environment variables
 #[tokio::test]
+#[serial_test::serial]
 async fn test_container_with_env() {
     let Some(runtime) = skip_if_no_docker().await else {
         eprintln!("Skipping test: Docker not available");

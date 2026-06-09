@@ -6,6 +6,7 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Message** | Pointer to **NullableString** | Optional message | [optional] 
 **Replicas** | **int32** | New replica count | 
+**RerouteToOs** | Pointer to **NullableString** | When set, this agent refused the scale because it cannot run the workload&#39;s OS (H-7 &#x60;RouteToPeer&#x60; policy). The value is the OCI-canonical OS string the workload requires (&#x60;linux&#x60; / &#x60;windows&#x60; / &#x60;darwin&#x60;). The scheduler catches this and re-dispatches to a cluster peer whose &#x60;NodeState.os&#x60; matches. | [optional] 
 **Service** | **string** | Service name that was scaled | 
 **Success** | **bool** | Whether the operation succeeded | 
 
@@ -83,6 +84,41 @@ and a boolean to check if the value has been set.
 SetReplicas sets Replicas field to given value.
 
 
+### GetRerouteToOs
+
+`func (o *InternalScaleResponse) GetRerouteToOs() string`
+
+GetRerouteToOs returns the RerouteToOs field if non-nil, zero value otherwise.
+
+### GetRerouteToOsOk
+
+`func (o *InternalScaleResponse) GetRerouteToOsOk() (*string, bool)`
+
+GetRerouteToOsOk returns a tuple with the RerouteToOs field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetRerouteToOs
+
+`func (o *InternalScaleResponse) SetRerouteToOs(v string)`
+
+SetRerouteToOs sets RerouteToOs field to given value.
+
+### HasRerouteToOs
+
+`func (o *InternalScaleResponse) HasRerouteToOs() bool`
+
+HasRerouteToOs returns a boolean if a field has been set.
+
+### SetRerouteToOsNil
+
+`func (o *InternalScaleResponse) SetRerouteToOsNil(b bool)`
+
+ SetRerouteToOsNil sets the value for RerouteToOs to be an explicit nil
+
+### UnsetRerouteToOs
+`func (o *InternalScaleResponse) UnsetRerouteToOs()`
+
+UnsetRerouteToOs ensures that no value is present for RerouteToOs, not even an explicit nil
 ### GetService
 
 `func (o *InternalScaleResponse) GetService() string`

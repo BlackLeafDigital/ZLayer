@@ -1,0 +1,511 @@
+//! Daemon capability survey.
+//!
+//! Probes the runtime environment of the zlayer daemon (root vs. non-root,
+//! host vs. nested in a container, cgroup v2 path, `CAP_NET_ADMIN`, presence
+//! of `/dev/net/tun`, and writability of the cgroup root) and derives a coarse
+//! [`DaemonMode`] from those signals.
+//!
+//! All probes are intentionally cheap and non-destructive — a handful of
+//! syscalls, no allocations of kernel resources (no TUN interfaces, no cgroup
+//! writes). The struct is safe to construct multiple times.
+//!
+//! Non-Linux targets report a fixed degraded survey since the kernel features
+//! these probes target are Linux-only.
+
+use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
+
+/// Coarse classification of the daemon's effective execution environment.
+///
+/// Derived from the boolean fields on [`DaemonCapabilities`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    /// Host-level execution: all caps, can write cgroup root, can create overlay.
+    Full,
+    /// Inside a container: scoped to a sub-cgroup; some caps may be present.
+    NestedAdaptive,
+    /// Missing privileges required for any meaningful container creation.
+    Degraded,
+}
+
+/// Snapshot of the daemon's effective capabilities and execution environment.
+///
+/// Construct via [`DaemonCapabilities::probe`]. Cheap to call repeatedly.
+///
+/// The struct intentionally exposes independent capability bits as separate
+/// booleans rather than collapsing them into an enum — each bit corresponds to
+/// an orthogonal kernel feature (cgroup write, `CAP_NET_ADMIN`, TUN access,
+/// root-ness) and downstream code wants to inspect them independently when
+/// deciding what to gate.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonCapabilities {
+    /// `true` if the process is running as uid 0.
+    pub is_root: bool,
+    /// `true` if the process appears to be inside a container (non-root cgroup
+    /// v2 path).
+    pub is_nested: bool,
+    /// The cgroup v2 path of the current process, if any (e.g.
+    /// `/system.slice/zlayer.service`). `None` on the cgroup root, on
+    /// cgroup-v1-only hosts, on non-Linux, or on read errors.
+    pub cgroup_parent: Option<String>,
+    /// `true` if the cgroup root's `cgroup.subtree_control` has the
+    /// owner-write bit set. Coarse, non-destructive signal — does not
+    /// guarantee an actual write will succeed.
+    pub can_write_cgroup_root: bool,
+    /// `true` if `CAP_NET_ADMIN` is present in the process's *effective* set
+    /// (Linux only).
+    pub has_cap_net_admin: bool,
+    /// `true` if `/dev/net/tun` can be opened r/w in non-blocking mode without
+    /// EACCES/EPERM/ENOENT/ENXIO. The fd is dropped immediately.
+    pub tun_device_available: bool,
+    /// Coarse classification derived from the above fields.
+    pub effective_mode: DaemonMode,
+}
+
+/// Process-wide memoised capability survey. Seeded by the first call to
+/// [`DaemonCapabilities::get`] or [`DaemonCapabilities::seed`].
+static CAPS: OnceLock<DaemonCapabilities> = OnceLock::new();
+
+impl DaemonCapabilities {
+    /// Returns the process-wide capability snapshot, probing on first call.
+    ///
+    /// Subsequent calls return the same memoised instance — capabilities of a
+    /// running daemon do not change at runtime, so re-probing would be wasted
+    /// syscalls and could create the illusion that the daemon's behaviour can
+    /// shift mid-flight.
+    pub fn get() -> &'static Self {
+        CAPS.get_or_init(Self::probe)
+    }
+
+    /// Eagerly seed the memoised survey with an explicit probe result.
+    ///
+    /// Useful at daemon startup to force the probe to happen at a known point
+    /// (so the banner log appears in the expected place). Returns the stored
+    /// instance — if the cache was already seeded, the existing value wins
+    /// and the passed-in `caps` is dropped (probe is pure, so this is fine).
+    ///
+    /// # Panics
+    ///
+    /// In practice this never panics — `OnceLock::set` either stores the
+    /// value or rejects it because the cell is already filled, and in both
+    /// cases the subsequent `get()` returns `Some`. The `expect` exists only
+    /// to satisfy the type system.
+    pub fn seed(caps: Self) -> &'static Self {
+        let _ = CAPS.set(caps);
+        CAPS.get()
+            .expect("CAPS is filled after set or was already filled")
+    }
+
+    /// Probe the running daemon's effective capabilities.
+    ///
+    /// Cheap — a handful of syscalls and no resource allocation. Prefer
+    /// [`DaemonCapabilities::get`] when you want the process-wide memoised
+    /// value; call this directly only when you intentionally want a fresh
+    /// snapshot (e.g. tests).
+    #[must_use]
+    pub fn probe() -> Self {
+        let is_root = zlayer_paths::is_root();
+        let cgroup_parent = current_cgroup_v2_path();
+        let is_nested = cgroup_parent.is_some();
+        let can_write_cgroup_root = probe_can_write_cgroup_root();
+        let has_cap_net_admin = probe_has_cap_net_admin();
+        let tun_device_available = probe_tun_device_available();
+
+        let effective_mode =
+            if !is_nested && can_write_cgroup_root && has_cap_net_admin && tun_device_available {
+                DaemonMode::Full
+            } else if can_write_cgroup_root || cgroup_parent.is_some() {
+                DaemonMode::NestedAdaptive
+            } else {
+                DaemonMode::Degraded
+            };
+
+        Self {
+            is_root,
+            is_nested,
+            cgroup_parent,
+            can_write_cgroup_root,
+            has_cap_net_admin,
+            tun_device_available,
+            effective_mode,
+        }
+    }
+}
+
+/// Pure parser for the contents of `/proc/self/cgroup`.
+///
+/// Finds the cgroup-v2 line (prefix `0::`) and returns the path suffix with
+/// surrounding whitespace trimmed. Returns `None` when:
+/// - the input has no `0::` line (cgroup-v1-only host), or
+/// - the v2 path is exactly `/` (host root — bare-metal, no enclosing cgroup), or
+/// - the input is empty.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_v2_line(content: &str) -> Option<String> {
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() || trimmed == "/" {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Returns the current process's cgroup-v2 path, if any.
+///
+/// On Linux reads `/proc/self/cgroup` and delegates to `parse_cgroup_v2_line`.
+/// On non-Linux always returns `None`. Returns `None` on any read error or
+/// when the process is at the cgroup-v2 root (bare-metal case).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn current_cgroup_v2_path() -> Option<String> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    parse_cgroup_v2_line(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn current_cgroup_v2_path() -> Option<String> {
+    None
+}
+
+/// Pure path computation: given a cgroup-v2 scope reported by
+/// `/proc/self/cgroup`, return the sibling `<scope>/containers` parent that
+/// should be used for new container cgroups.
+///
+/// If `scope` already ends with `/init` (the daemon has already been migrated
+/// into the `init` leaf by a previous call), the `/init` suffix is stripped
+/// and the result anchored at the real scope. This makes
+/// [`ensure_daemon_leaf_and_container_parent`] idempotent.
+#[cfg(target_os = "linux")]
+fn compute_target_parent(scope: &str) -> String {
+    let base = scope.strip_suffix("/init").unwrap_or(scope);
+    let base = base.trim_end_matches('/');
+    format!("{base}/containers")
+}
+
+/// Migrate the current daemon process into a `<scope>/init` sub-cgroup and
+/// return the sibling `<scope>/containers` path as the parent for future
+/// container cgroups. Idempotent — safe to call multiple times.
+///
+/// Returns `None` on non-Linux, when `/proc/self/cgroup` can't be parsed,
+/// when `/sys/fs/cgroup` is read-only, or when the mkdir/PID-write fails.
+/// Callers should fall back to the raw `current_cgroup_v2_path()` value in
+/// those cases (the auto-detect path will surface the underlying error).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn ensure_daemon_leaf_and_container_parent() -> Option<String> {
+    let scope = current_cgroup_v2_path()?;
+    let containers = compute_target_parent(&scope);
+    // Idempotency: if we're already in `<base>/init`, just return the sibling.
+    if scope.ends_with("/init") {
+        let containers_fs = format!("/sys/fs/cgroup{containers}");
+        match std::fs::create_dir_all(&containers_fs) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        return Some(containers);
+    }
+
+    let scope = scope.trim_end_matches('/').to_string();
+    let mount = "/sys/fs/cgroup";
+    let init_dir = format!("{mount}{scope}/init");
+
+    match std::fs::create_dir_all(&init_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+
+    let pid_path = format!("{init_dir}/cgroup.procs");
+    let pid_str = format!("{}", std::process::id());
+    if std::fs::write(&pid_path, &pid_str).is_err() {
+        // Already migrated? Re-check /proc/self/cgroup before giving up.
+        let now = current_cgroup_v2_path()?;
+        if now != format!("{scope}/init") {
+            return None;
+        }
+    }
+
+    // Verify the migration actually moved us into <scope>/init.
+    let after = current_cgroup_v2_path()?;
+    if after != format!("{scope}/init") {
+        return None;
+    }
+
+    let containers_dir = format!("{mount}{containers}");
+    match std::fs::create_dir_all(&containers_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+
+    Some(containers)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn ensure_daemon_leaf_and_container_parent() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn probe_can_write_cgroup_root() -> bool {
+    use std::ffi::CString;
+
+    let Ok(path) = CString::new("/sys/fs/cgroup/cgroup.subtree_control") else {
+        return false;
+    };
+    // SAFETY: access(2) is a read-only syscall that takes a pointer to a
+    // NUL-terminated C string. The kernel does not retain the pointer.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::access(path.as_ptr(), libc::W_OK) };
+    rc == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_can_write_cgroup_root() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_has_cap_net_admin() -> bool {
+    // CAP_NET_ADMIN is bit 12 in the Linux capability bitmask.
+    // We need it in the EFFECTIVE set (`CapEff`), not just the bounding set
+    // (`CapBnd`). A regular user process has full CapBnd by default but empty
+    // CapPrm/CapEff — checking PR_CAPBSET_READ gives a false positive that
+    // makes the daemon think it can create TUN/WG interfaces when it cannot.
+    const CAP_NET_ADMIN_BIT: u64 = 1 << 12;
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            let trimmed = hex.trim();
+            if let Ok(eff) = u64::from_str_radix(trimmed, 16) {
+                return eff & CAP_NET_ADMIN_BIT != 0;
+            }
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_has_cap_net_admin() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn probe_tun_device_available() -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Opening /dev/net/tun without any ioctls is benign and does not allocate
+    // a TUN interface. The fd is dropped immediately when this scope ends.
+    // Any open error — missing device, no perms, kernel module not loaded,
+    // FD exhaustion — means we can't actually use TUN. Treat as unavailable.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/net/tun")
+        .is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_tun_device_available() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_does_not_panic_and_is_nested_agrees_with_cgroup_parent() {
+        let caps = DaemonCapabilities::probe();
+        assert_eq!(caps.is_nested, caps.cgroup_parent.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_has_cap_net_admin_matches_cap_eff() {
+        // Just confirm the probe agrees with what /proc/self/status reports.
+        // The actual capability state depends on how the test is run (regular
+        // user vs root vs setcap'd binary), but the probe MUST agree with the
+        // CapEff line — that's the whole point of the bug fix.
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let cap_eff_line = status
+            .lines()
+            .find(|l| l.starts_with("CapEff:"))
+            .expect("CapEff: present in /proc/self/status");
+        let hex = cap_eff_line.trim_start_matches("CapEff:").trim();
+        let eff: u64 = u64::from_str_radix(hex, 16).unwrap();
+        let expected = (eff & (1u64 << 12)) != 0;
+        assert_eq!(super::probe_has_cap_net_admin(), expected);
+    }
+
+    /// Pure classifier reproducing the logic in `probe()`. Kept in the test
+    /// module so the table below can assert behaviour without depending on
+    /// the host's actual capability state.
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn classify(
+        is_nested: bool,
+        can_write_cgroup_root: bool,
+        has_cap_net_admin: bool,
+        tun_device_available: bool,
+        cgroup_parent_is_some: bool,
+    ) -> DaemonMode {
+        if !is_nested && can_write_cgroup_root && has_cap_net_admin && tun_device_available {
+            DaemonMode::Full
+        } else if can_write_cgroup_root || cgroup_parent_is_some {
+            DaemonMode::NestedAdaptive
+        } else {
+            DaemonMode::Degraded
+        }
+    }
+
+    #[test]
+    fn effective_mode_full_requires_all_four_signals() {
+        // Full: every signal must be set the right way.
+        assert_eq!(
+            classify(false, true, true, true, false),
+            DaemonMode::Full,
+            "all four signals set should be Full"
+        );
+        // Drop any single signal and Full must no longer apply.
+        assert_ne!(classify(true, true, true, true, true), DaemonMode::Full);
+        assert_ne!(classify(false, false, true, true, false), DaemonMode::Full);
+        assert_ne!(classify(false, true, false, true, false), DaemonMode::Full);
+        assert_ne!(classify(false, true, true, false, false), DaemonMode::Full);
+    }
+
+    #[test]
+    fn effective_mode_nested_adaptive_when_writable_or_has_parent() {
+        // Writable root but missing other Full signals → NestedAdaptive.
+        assert_eq!(
+            classify(false, true, false, false, false),
+            DaemonMode::NestedAdaptive
+        );
+        // Nested under a parent cgroup, no other signals → NestedAdaptive.
+        assert_eq!(
+            classify(true, false, false, false, true),
+            DaemonMode::NestedAdaptive
+        );
+    }
+
+    #[test]
+    fn effective_mode_degraded_when_no_writable_path() {
+        // No root write, no parent, nothing usable.
+        assert_eq!(
+            classify(false, false, false, false, false),
+            DaemonMode::Degraded
+        );
+        // is_nested=true but no parent and no root write — still Degraded
+        // (the is_nested signal alone, without a resolved parent, does not
+        // give us a writable cgroup to anchor under).
+        assert_eq!(
+            classify(true, false, false, false, false),
+            DaemonMode::Degraded
+        );
+    }
+
+    #[test]
+    fn serializes_round_trip_via_serde_json() {
+        let caps = DaemonCapabilities::probe();
+        let json = serde_json::to_string(&caps).expect("serialize");
+        let parsed: DaemonCapabilities = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.is_root, caps.is_root);
+        assert_eq!(parsed.is_nested, caps.is_nested);
+        assert_eq!(parsed.cgroup_parent, caps.cgroup_parent);
+        assert_eq!(parsed.can_write_cgroup_root, caps.can_write_cgroup_root);
+        assert_eq!(parsed.has_cap_net_admin, caps.has_cap_net_admin);
+        assert_eq!(parsed.tun_device_available, caps.tun_device_available);
+        assert_eq!(parsed.effective_mode, caps.effective_mode);
+    }
+
+    #[test]
+    fn daemon_mode_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DaemonMode::Full).unwrap(),
+            "\"full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMode::NestedAdaptive).unwrap(),
+            "\"nested_adaptive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DaemonMode::Degraded).unwrap(),
+            "\"degraded\""
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod target_parent {
+        use super::super::compute_target_parent;
+
+        #[test]
+        fn idempotent_when_already_under_init() {
+            // Pre-fix path: scope is the systemd-run scope itself.
+            assert_eq!(
+                compute_target_parent(
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope"
+                ),
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/containers"
+            );
+            // Already migrated: scope ends with /init — strip and re-anchor.
+            assert_eq!(
+                compute_target_parent(
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/init"
+                ),
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p123.scope/containers"
+            );
+            // Trailing slash on either form is harmless.
+            assert_eq!(compute_target_parent("/foo/bar/"), "/foo/bar/containers");
+            assert_eq!(
+                compute_target_parent("/foo/bar/init"),
+                "/foo/bar/containers"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod cgroup_parser {
+        use super::super::parse_cgroup_v2_line;
+
+        #[test]
+        fn parse_cgroup_v2_root_returns_none() {
+            assert_eq!(parse_cgroup_v2_line("0::/\n"), None);
+        }
+
+        #[test]
+        fn parse_cgroup_v2_path_returns_some() {
+            assert_eq!(
+                parse_cgroup_v2_line("0::/system.slice/forgejo-runner.service\n"),
+                Some("/system.slice/forgejo-runner.service".to_string())
+            );
+        }
+
+        #[test]
+        fn parse_cgroup_v2_hybrid_finds_v2_line() {
+            let input = "12:devices:/user.slice\n11:memory:/user.slice\n0::/foo\n";
+            assert_eq!(parse_cgroup_v2_line(input), Some("/foo".to_string()));
+        }
+
+        #[test]
+        fn parse_cgroup_v2_no_newline() {
+            assert_eq!(parse_cgroup_v2_line("0::/bar"), Some("/bar".to_string()));
+        }
+
+        #[test]
+        fn parse_cgroup_v2_missing_returns_none() {
+            assert_eq!(parse_cgroup_v2_line(""), None);
+        }
+    }
+}

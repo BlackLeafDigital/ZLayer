@@ -236,6 +236,7 @@ impl SyncStorage for SqlxSyncStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     // =========================================================================
     // InMemorySyncStore tests
@@ -505,7 +506,9 @@ mod tests {
     async fn test_sqlx_persistent_round_trip() {
         // Survives closing + reopening the database — the whole point of the
         // persistent backend.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("persistent-backend-")
+            .unwrap();
         let db_path = temp_dir.path().join("syncs.db");
 
         let mut sync = StoredSync::new("persist-me", "deployments/");

@@ -42,7 +42,13 @@
 set -uo pipefail
 
 # Auto-detect the MiniWindows host if not overridden.
+# The box's interactive SSH user is `Admin` (the `MiniWindows@` aliases below
+# are kept only as fallbacks for older provisioning). Probed 2026-06-04:
+# only Admin@miniwindows.net.home answered, so it leads the list.
 DEFAULT_WIN_HOSTS=(
+  "Admin@miniwindows.net.home"
+  "Admin@192.168.68.92"
+  "Admin@100.96.69.45"
   "MiniWindows@192.168.68.92"
   "MiniWindows@100.96.69.45"
   "MiniWindows@miniwindows.net.home"
@@ -101,7 +107,7 @@ run_remote_ps() {
   # pyo3-build-config (zlayer-py dep, pulled transitively into --workspace)
   # can find a Python at build time. MiniWindows has uv installed via
   # chocolatey but no system Python on the SSH session PATH.
-  if ssh "$ZLAYER_WIN_HOST" "\$env:PROTOC = 'C:\\ProgramData\\chocolatey\\bin\\protoc.exe'; cd '$REMOTE_WIN_PATH'; uv run --python 3.12 -- $cmd"; then
+  if ssh "$ZLAYER_WIN_HOST" "\$env:Path = 'C:\\Users\\Admin\\.cargo\\bin;' + \$env:Path; \$env:PROTOC = 'C:\\ProgramData\\chocolatey\\bin\\protoc.exe'; cd '$REMOTE_WIN_PATH'; uv run --python 3.12 -- $cmd"; then
     echo "   >> OK: $label"
   else
     local rc=$?

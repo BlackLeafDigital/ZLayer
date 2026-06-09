@@ -1,4 +1,21 @@
-.PHONY: all check test build release clean fmt lint ci docs install
+.PHONY: all check test build release clean fmt lint ci docs install sign-vz
+
+# On macOS, auto-sign the built `zlayer` binary with the
+# `com.apple.security.virtualization` entitlement so the VZ runtime
+# (crates/zlayer-agent/src/runtimes/macos_vz.rs) can create/boot guest VMs.
+# Ad-hoc by default; override the identity with `VZ_SIGN_IDENTITY=...`.
+# A no-op on non-macOS hosts.
+UNAME_S := $(shell uname -s)
+VZ_SIGN_IDENTITY ?= -
+ifeq ($(UNAME_S),Darwin)
+define sign_zlayer
+	@scripts/sign-vz.sh "$(1)" "$(VZ_SIGN_IDENTITY)"
+endef
+else
+define sign_zlayer
+	@:
+endef
+endif
 
 # Default target
 all: check test build
@@ -11,13 +28,19 @@ check:
 test:
 	cargo test --workspace
 
-# Build debug
+# Build debug (auto-signs the binary on macOS for the VZ runtime)
 build:
 	cargo build --workspace
+	$(call sign_zlayer,target/debug/zlayer)
 
-# Build release
+# Build release (auto-signs the binary on macOS for the VZ runtime)
 release:
 	cargo build --release --package zlayer
+	$(call sign_zlayer,target/release/zlayer)
+
+# (Re)sign an existing binary with the virtualization entitlement (macOS).
+sign-vz:
+	$(call sign_zlayer,)
 
 # Clean build artifacts
 clean:
@@ -58,7 +81,7 @@ test-manager:
 # E2E tests requiring root (youki/libcontainer)
 test-e2e:
 	@echo "Cleaning up leftover state..."
-	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	sudo rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E tests with root privileges..."
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
 		cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1
@@ -66,7 +89,7 @@ test-e2e:
 # Run specific E2E test (usage: make test-e2e-single TEST=test_cleanup_state_directory)
 test-e2e-single:
 	@echo "Cleaning up leftover state..."
-	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	sudo rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E test: $(TEST)"
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
 		cargo test --package zlayer-agent --test youki_e2e $(TEST) -- --nocapture
@@ -94,9 +117,9 @@ test-features:
 # macOS Sandbox E2E tests
 test-macos-sandbox:
 	@echo "Setting up macOS sandbox E2E environment..."
-	rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
-	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
-	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+	rm -rf ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test 2>/dev/null || true
+	mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/{data,logs}
+	mkdir -p ${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-sandbox-e2e-test/data/{containers,images}
 	@echo "Running macOS Sandbox E2E tests..."
 	cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture
 

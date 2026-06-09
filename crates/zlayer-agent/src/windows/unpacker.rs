@@ -13,21 +13,28 @@
 //!   stream each blob to disk to cap RAM at large-image boundaries.
 //! - Digest verification re-hashes the raw (compressed) blob bytes; we don't
 //!   independently verify `DiffIDs` on the decompressed tar.
-//! - Tombstones and `Hives/` entries are written as raw byte copies. The
-//!   `Files/` subtree is fed through [`BackupStreamWriter`] because its
-//!   entries are already BackupRead-framed in the wclayer tar.
+//! - Tombstones and `Hives/` entries are written as raw byte copies (hcsshim's
+//!   `BackupFileWriter` interprets framing on the fly and writes only the body
+//!   to disk, so the staging layout on disk is unframed). The `Files/` subtree
+//!   is translated through [`backuptar`] which synthesises the full
+//!   `WIN32_STREAM_ID`-framed records (`BACKUP_DATA`, plus optional
+//!   `BACKUP_SECURITY_DATA` / `BACKUP_REPARSE_DATA` / `BACKUP_EA_DATA` pulled
+//!   from the entry's PAX extensions) that [`BackupStreamWriter`] expects.
 //!
-//! See `hcsshim/internal/wclayer/legacy.go` for the reference flow.
+//! See `hcsshim/internal/wclayer/legacy.go` and `go-winio/backuptar/tar.go`
+//! for the reference flow.
 
 #![cfg(target_os = "windows")]
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use oci_client::secrets::RegistryAuth;
 use zlayer_hcs::schema::Layer;
 
-use crate::windows::layer::{self, BackupStreamWriter};
+use crate::windows::backuptar;
+use crate::windows::layer;
 use crate::windows::wclayer::{self, LayerChain};
 
 /// Layer descriptor passed to the unpacker. Structurally mirrors the subset of
@@ -51,8 +58,8 @@ pub struct ResolvedLayerDescriptor {
 pub struct UnpackedImage {
     /// HCS-ordered parent chain (child-to-parent). The first element is the
     /// topmost image layer; the last is the base OS layer. Safe to hand
-    /// directly to [`wclayer::attach_layer_storage_filter`] or
-    /// [`wclayer::initialize_writable_layer`].
+    /// directly to [`wclayer::create_sandbox_layer`] or
+    /// [`wclayer::prepare_layer`].
     pub chain: LayerChain,
     /// Root directory that holds all the individual `<layer_id>/` folders.
     pub root: PathBuf,
@@ -98,7 +105,7 @@ pub async fn unpack_windows_image(
     // we reverse it into child-to-parent to satisfy HCS.
     let mut chain_so_far: Vec<Layer> = Vec::with_capacity(layers.len());
 
-    for desc in layers {
+    for (layer_idx, desc) in layers.iter().enumerate() {
         let layer_id = new_layer_id();
         let layer_path = dest_root.join(&layer_id);
         std::fs::create_dir_all(&layer_path)?;
@@ -116,17 +123,91 @@ pub async fn unpack_windows_image(
         verify_digest(&bytes, &desc.digest)?;
         let raw = decompress(&bytes, &desc.media_type)?;
 
-        // 4+5. Materialize tar entries via BackupStreamWriter.
-        extract_tar_to_backup_stream(&raw, &layer_path)?;
+        let is_base_layer = chain_so_far.is_empty();
+        if is_base_layer {
+            // hcsshim's `baseLayerWriter` writes real NTFS files directly into
+            // the final layer dir and finalizes via `ProcessBaseLayer` — no
+            // `HcsImportLayer` involved (that's only for `legacyLayerWriter`
+            // staging dirs, i.e. diff layers).
+            extract_tar_as_base_layer(&raw, &layer_path)?;
+            wclayer::process_base_layer(&layer_path).map_err(|e| {
+                io::Error::other(format!(
+                    "ProcessBaseLayer(layer={layer_idx} digest={} dest={}): {e}",
+                    desc.digest,
+                    layer_path.display()
+                ))
+            })?;
 
-        // 6. Build parent chain and call HcsImportLayer.
-        let parent_chain = build_parent_chain(&chain_so_far);
-        wclayer::import_layer(&layer_path, &layer_path, &parent_chain).map_err(|e| {
-            io::Error::other(format!("HcsImportLayer({}): {e}", layer_path.display()))
-        })?;
+            // Materialize UVM artifacts if this layer ships a UtilityVM payload.
+            // nanoserver/servercore base layers ship `UtilityVM\Files\` and need
+            // `ProcessUtilityImage` to produce the `UtilityVM\SystemTemplate*.vhdx`
+            // artifacts the consumer's `Uvm::create` later copies into a per-UVM
+            // sandbox. Sideloaded process-only images without a UVM payload are
+            // skipped silently.
+            let uvm_dir = layer_path.join("UtilityVM");
+            if uvm_dir.join("Files").is_dir() {
+                wclayer::process_utility_vm_image(&uvm_dir).map_err(|e| {
+                    io::Error::other(format!(
+                        "ProcessUtilityVMImage(layer={layer_idx} digest={} dest={}): {e}",
+                        desc.digest,
+                        uvm_dir.display()
+                    ))
+                })?;
+            }
+        } else {
+            // Diff layer: materialize the legacy framed staging format, then
+            // hand it to `HcsImportLayer` (source must differ from dest — see
+            // `wclayer.rs:91-94`).
+            //
+            // Hardlink targets that point at files living in PARENT layers
+            // (every catroot `.cat`, every DriverStore `.inf`/`.sys`/`.dll`,
+            // including `\windows\system32\nanocontainersbridge.dll` —
+            // the in-guest GCS bridge DLL) are resolved here against the
+            // parents in reverse (newest-first) order. The actual link
+            // creation is deferred until after `HcsImportLayer` returns and
+            // the merged view exists at `layer_path` — see the post-import
+            // replay block below. Mirrors hcsshim's
+            // `legacyLayerWriter.AddLink` (target-resolution) +
+            // `legacyLayerWriterWrapper.Close` (post-import replay) split.
+            let staging_path = dest_root.join(format!("{layer_id}.staging"));
+            std::fs::create_dir_all(&staging_path)?;
+            let parent_chain = build_parent_chain(&chain_so_far);
+            let pending_links =
+                extract_tar_as_diff_layer(&raw, &staging_path, parent_chain.0.as_slice())?;
+            wclayer::import_layer(&layer_path, &staging_path, &parent_chain).map_err(|e| {
+                io::Error::other(format!(
+                    "HcsImportLayer(layer={layer_idx} digest={} dest={}): {e}",
+                    desc.digest,
+                    layer_path.display()
+                ))
+            })?;
+            // Post-import hardlink replay. The link target must exist in the
+            // merged destination dir (HcsImportLayer materialises the parent
+            // chain's files into `layer_path` before returning). We log + fail
+            // on missing targets rather than silently degrade, since the
+            // alternative (no link in the destination layer) is precisely the
+            // bug this fix addresses — silent file loss.
+            for link in &pending_links {
+                let dest_link = layer_path.join(&link.link_rel);
+                let dest_target = layer_path.join(&link.target_rel);
+                if let Err(e) = wclayer::link_relative(&layer_path, &dest_target, &dest_link) {
+                    return Err(io::Error::other(format!(
+                        "post-import hard_link({} -> {}) in layer {}: {e} \
+                         (target resolved from {} during tar walk)",
+                        dest_link.display(),
+                        dest_target.display(),
+                        layer_path.display(),
+                        link.target_origin,
+                    )));
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging_path);
+        }
 
+        // HCS keys parent layers by `NameToGuid(basename(path))`, not by the
+        // directory's UUID name. Derive the canonical id so HCS can chain-walk.
         chain_so_far.push(Layer {
-            id: layer_id,
+            id: wclayer::layer_id_for_path(&layer_path)?,
             path: layer_path.to_string_lossy().into_owned(),
         });
     }
@@ -188,41 +269,580 @@ fn verify_digest(bytes: &[u8], expected: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Walk a wclayer-formatted tar and materialize each entry under `layer_path`.
+/// Walk an OCI Windows layer tar and materialize each entry under `layer_path`.
 ///
-/// Directory entries are skipped (their paths are implicit in child entries).
-/// `Files/`-prefixed entries are fed through [`BackupStreamWriter`] because
-/// their payload is already BackupRead-framed in the tar. Everything else
-/// (e.g. `tombstones.txt`, `Hives/`) is written as a raw byte copy.
-fn extract_tar_to_backup_stream(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+/// Three categories of entry get special treatment beyond the plain
+/// `Files/`-vs-other split:
+///
+/// 1. **Directory entries** (`tar::EntryType::Dir`). These MUST be created on
+///    disk — `mcr.microsoft.com/windows/nanoserver` ships thousands of empty
+///    leaf directories (`Files/Windows/INF/`, `Files/Windows/System32/Catroot/`,
+///    registry/UtilityVM scaffolding) that HCS's `NtQueryDirectoryFile` walk
+///    expects to find during `HcsImportLayer`. Silently dropping them yields
+///    `STATUS_OBJECT_NAME_NOT_FOUND` → `ERROR_FILE_NOT_FOUND` (`0x80070002`).
+/// 2. **Hardlink entries** (`tar::EntryType::Link`). We replay them after the
+///    main walk because the tar ordering of `Link` vs. the target it references
+///    is not guaranteed in OCI layers.
+/// 3. **Whiteouts** — basename-prefixed `.wh.<name>` entries (the OCI
+///    overlayfs-style convention). These are NOT extracted as files; instead
+///    we append the target path (sibling with `.wh.` stripped) to
+///    `tombstones.txt`, which is the on-disk whiteout manifest the wclayer
+///    importer consumes. If a raw `tombstones.txt` entry was also present in
+///    the tar we APPEND to (not overwrite) it.
+///
+/// `Files/`-prefixed regular files carry raw file bodies + PAX-encoded NTFS
+/// metadata in the OCI format; we hand them to
+/// [`backuptar::write_oci_entry_to_backup_stream`] which synthesises the
+/// `WIN32_STREAM_ID`-framed records expected by `BackupWrite`. Everything
+/// else (raw `tombstones.txt`, `Hives/*`, `UtilityVM/`) is written as a raw
+/// byte copy via the long-path-aware helper — hcsshim's `BackupFileWriter`
+/// interprets framing on the fly, so the staging-dir layout on disk is
+/// unframed.
+/// A hardlink that could not be materialised during the tar walk because the
+/// link must be created in the IMPORTED layer dir (post-`HcsImportLayer`),
+/// not in the staging dir. Carries the resolved target so the post-import
+/// replay can fail loudly if the merged destination view is missing the file.
+///
+/// Mirrors hcsshim's `pendingLink { Path, Target, TargetRoot }` (see
+/// `internal/wclayer/legacy.go:740-784`). Our `target_origin` is the
+/// human-readable equivalent of hcsshim's `TargetRoot *os.File` handle —
+/// either "current staging dir" (the link target was added in this same
+/// layer) or the parent layer path it was resolved against.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingLink {
+    /// Forward-slash, archive-relative path of the link to create
+    /// (e.g. `Files/Windows/System32/foo.dll`).
+    pub link_rel: PathBuf,
+    /// Forward-slash, archive-relative path of the link target (e.g.
+    /// `Files/Windows/WinSxS/.../foo.dll`). Resolved in the destination
+    /// layer dir (post-import) against `layer_path / target_rel`.
+    pub target_rel: PathBuf,
+    /// Where the target was found during the tar walk. Used in error
+    /// messages to identify the layer the missing file was expected to
+    /// come from.
+    pub target_origin: TargetOrigin,
+}
+
+/// Provenance of a resolved hardlink target.
+#[derive(Debug, Clone)]
+pub(crate) enum TargetOrigin {
+    /// Target was added in the same layer's staging dir before the link
+    /// entry appeared. Post-import the file lives at `layer_path / rel`.
+    CurrentLayer,
+    /// Target was found in a parent layer's `Files/` tree. Post-import the
+    /// file lives at `layer_path / rel` because `HcsImportLayer` merges the
+    /// parent chain into the destination. The inner `PathBuf` records which
+    /// parent layer satisfied the lookup, surfaced verbatim in error
+    /// messages so a missing post-import target can be traced back to the
+    /// parent layer the file was expected to come from.
+    ParentLayer(PathBuf),
+}
+
+impl std::fmt::Display for TargetOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CurrentLayer => f.write_str("current layer's staging dir"),
+            Self::ParentLayer(p) => write!(f, "parent layer {}", p.display()),
+        }
+    }
+}
+
+/// Diff-layer (parent-chain non-empty) tar walk — emits the hcsshim
+/// `legacyLayerWriter` on-disk staging format: `.$wcidirs$` markers,
+/// 4-byte LE `FileAttributes` headers, verbatim `WIN32_STREAM_ID` records,
+/// raw `Hives/*` byte copies, and a `tombstones.txt` whiteout manifest.
+///
+/// Returns a vector of pending hardlinks the caller MUST replay against the
+/// imported layer dir (NOT the staging dir) after `wclayer::import_layer`
+/// returns Ok. Hardlinks whose target lives in a parent layer cannot be
+/// created during extraction (the target file doesn't exist on disk yet —
+/// it only materialises into the destination after `HcsImportLayer` merges
+/// the parent chain). Mirrors hcsshim's `legacyLayerWriter.AddLink` +
+/// `legacyLayerWriterWrapper.Close` split (`internal/wclayer/legacy.go:733`
+/// + `internal/wclayer/importlayer.go:69-122`).
+///
+/// `parents` is the same child-to-parent ordered slice you'd hand to
+/// `wclayer::import_layer`; target resolution walks it in reverse (newest
+/// parent first) when the link's target was not added in this layer.
+#[allow(clippy::too_many_lines)]
+fn extract_tar_as_diff_layer(
+    tar_bytes: &[u8],
+    layer_path: &Path,
+    parents: &[Layer],
+) -> io::Result<Vec<PendingLink>> {
+    use std::collections::HashSet;
+
     let mut archive = tar::Archive::new(tar_bytes);
+    // Hardlink replay queue. Each entry carries (a) the link's archive-relative
+    // path and (b) the resolved target — either in this same layer's staging
+    // dir or in a parent layer's `Files/` tree.
+    let mut pending_links: Vec<PendingLink> = Vec::new();
+    // Track every regular-file (and hardlink) `Files/` entry materialised in
+    // this layer's staging dir. Mirrors hcsshim's `addedFiles map[string]bool`.
+    // Link targets check this set first before falling back to parent layers.
+    let mut added_files: HashSet<String> = HashSet::new();
+    // Whiteout collector: relative target paths (forward-slash, no `.wh.`).
+    let mut pending_tombstones: Vec<String> = Vec::new();
+    // Track raw `tombstones.txt` presence so we APPEND rather than overwrite.
+    let mut raw_tombstones_written = false;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if entry.header().entry_type().is_dir() {
+        let rel_path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+
+        // (1) Directory entries: create the directory (with all ancestors via
+        // the long-path-aware helper) and move on. We deliberately do NOT
+        // skip them anymore.
+        if entry_type.is_dir() {
+            let dest = layer_path.join(&rel_path);
+            create_long_path_dir_all(&dest)?;
+            write_wcidirs_sidecar(&mut entry, &rel_path, &dest)?;
             continue;
         }
-        let rel_path = entry.path()?.into_owned();
-        let dest = layer_path.join(&rel_path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+
+        // (3) Whiteout detection — check basename for `.wh.` prefix. We do
+        // this before path construction so we never materialise a `.wh.*`
+        // file on disk (HCS would otherwise see it as a literal payload).
+        if let Some(basename) = rel_path.file_name().and_then(|s| s.to_str()) {
+            if let Some(stripped) = basename.strip_prefix(".wh.") {
+                // Reconstruct the tombstone target as the sibling path with
+                // `.wh.` stripped, normalised to forward slashes.
+                let sibling: PathBuf = match rel_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.join(stripped),
+                    _ => PathBuf::from(stripped),
+                };
+                let normalised: String = sibling
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+                    .to_string();
+                if !normalised.is_empty() {
+                    pending_tombstones.push(normalised);
+                }
+                continue;
+            }
         }
 
-        // wclayer tar layout:
-        //   Files/...            -> BackupWrite stream bodies
+        let dest = layer_path.join(&rel_path);
+        if let Some(parent) = dest.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+
+        // (2) Hardlink entries: NEVER materialise in the staging dir. They
+        // must be created in the IMPORTED layer dir after `HcsImportLayer`
+        // returns. Here we just resolve the target's provenance — current
+        // layer's staging dir vs a parent layer's `Files/` tree — and queue
+        // it for the post-import replay. Mirrors hcsshim's
+        // `legacyLayerWriter.AddLink` (`internal/wclayer/legacy.go:733-784`).
+        if entry_type == tar::EntryType::Link {
+            let link_target = entry.link_name()?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "tar hardlink entry missing link_name: {}",
+                    rel_path.display()
+                ))
+            })?;
+            let target_rel = link_target.into_owned();
+
+            // Normalise the target for `added_files` lookup. OCI tar uses
+            // forward slashes; `added_files` keys are stored the same way.
+            let target_key = path_to_forward_slash(&target_rel);
+            let link_key = path_to_forward_slash(&rel_path);
+
+            let origin = if added_files.contains(&target_key) {
+                TargetOrigin::CurrentLayer
+            } else {
+                // Walk parents in reverse (newest parent first → base layer
+                // last) mirroring how `legacyLayerWriter.AddLink` iterates
+                // its `parentRoots` slice. The chain is already
+                // child-to-parent ordered (first elem = immediate parent),
+                // so a forward iteration is "newest-first".
+                let mut found: Option<PathBuf> = None;
+                for parent in parents {
+                    let parent_root = PathBuf::from(&parent.path);
+                    let candidate = parent_root.join(&target_rel);
+                    if candidate.exists() {
+                        found = Some(parent_root);
+                        break;
+                    }
+                }
+                match found {
+                    Some(root) => TargetOrigin::ParentLayer(root),
+                    None => {
+                        // Match hcsshim's `AddLink`: a link with an
+                        // unresolvable target is a hard error, not a
+                        // silently-dropped entry. This is the exact bug we
+                        // are fixing — degrading here would mean shipping
+                        // an incomplete layer.
+                        return Err(io::Error::other(format!(
+                            "hardlink {} -> {}: target not found in this \
+                             layer's staging dir nor in any of the {} parent \
+                             layer(s)",
+                            link_key,
+                            target_key,
+                            parents.len(),
+                        )));
+                    }
+                }
+            };
+
+            // Record the link itself as "added" so a subsequent link whose
+            // target is THIS link's path still resolves locally. Matches
+            // hcsshim's `w.addedFiles[name] = true` at the end of
+            // `AddLink`.
+            added_files.insert(link_key.clone());
+            pending_links.push(PendingLink {
+                link_rel: rel_path.clone(),
+                target_rel: target_rel.clone(),
+                target_origin: origin,
+            });
+            continue;
+        }
+
+        // OCI Windows layer tar layout:
+        //   Files/...            -> raw file body + PAX-encoded NTFS metadata
+        //                           (translated to BackupWrite framing)
         //   Hives/...            -> raw NTFS registry hive exports
         //   tombstones.txt       -> plain-text whiteout manifest
         //   UtilityVM/...        -> raw byte copies (Hyper-V UVM scratch)
         let rel_str = rel_path.to_string_lossy();
         let is_files_payload = rel_str.starts_with("Files/") || rel_str.starts_with("Files\\");
         if is_files_payload {
-            let mut writer = BackupStreamWriter::create_new(&dest)?;
-            std::io::copy(&mut entry, &mut writer)?;
+            backuptar::write_oci_entry_to_backup_stream(&mut entry, &dest)?;
+            added_files.insert(path_to_forward_slash(&rel_path));
         } else {
-            let mut f = std::fs::File::create(&dest)?;
+            // Non-`Files/` payloads (`tombstones.txt`, `Hives/*`, `UtilityVM/`)
+            // are raw byte copies. `std::fs::File::create` here would hit
+            // ERROR_PATH_NOT_FOUND (0x80070003) on the deep UtilityVM/WinSxS
+            // paths embedded in nanoserver layers, so we route through the
+            // long-path-aware helper which adds the `\\?\` prefix.
+            let mut f = layer::create_long_path_file(&dest)?;
+            std::io::copy(&mut entry, &mut f)?;
+            if rel_str == "tombstones.txt" || rel_str == "tombstones" {
+                raw_tombstones_written = true;
+            }
+            // UtilityVM files can also be hardlink targets (the in-guest GCS
+            // bridge DLL itself lives under `Files/Windows/System32/`, but
+            // some auxiliary entries live under `UtilityVM/Files/`).
+            // Tracking them in `added_files` keeps the resolution table
+            // complete.
+            added_files.insert(path_to_forward_slash(&rel_path));
+        }
+    }
+
+    // Replay whiteouts into `tombstones.txt`. De-duplicate so a malformed
+    // tar that lists the same `.wh.foo` twice doesn't bloat the manifest.
+    if !pending_tombstones.is_empty() {
+        let tombstones_path = layer_path.join("tombstones.txt");
+        let mut existing: Vec<String> = Vec::new();
+        if raw_tombstones_written && tombstones_path.exists() {
+            // Pull current contents back via the long-path helper to avoid
+            // a `0x80070003` re-read of a deep path. tombstones.txt itself
+            // lives at the layer root so this is mostly defensive.
+            let bytes = std::fs::read(&tombstones_path)?;
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                existing.push(String::from_utf8_lossy(line).trim().to_string());
+            }
+        }
+        let mut seen: HashSet<String> = existing.iter().cloned().collect();
+        let mut all_lines = existing;
+        for line in pending_tombstones {
+            if seen.insert(line.clone()) {
+                all_lines.push(line);
+            }
+        }
+        let body = all_lines.join("\n") + "\n";
+        let mut f = layer::create_long_path_file(&tombstones_path)?;
+        std::io::Write::write_all(&mut f, body.as_bytes())?;
+    }
+
+    Ok(pending_links)
+}
+
+/// Convert an archive-relative `Path` into the forward-slash, no-leading-slash
+/// string form used as the `added_files` lookup key and as the canonical OCI
+/// tar path representation. Matches Go's `filepath.Clean` + `filepath.ToSlash`
+/// pipeline that hcsshim runs over `hdr.Name` / `hdr.Linkname`.
+fn path_to_forward_slash(p: &Path) -> String {
+    p.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+/// Base-layer (parent-chain empty) tar walk — emits the hcsshim
+/// `baseLayerWriter` on-disk format: REAL NTFS directories (no
+/// `.$wcidirs$` markers), real NTFS files with metadata stamped via
+/// `BackupWrite` (no 4-byte attr header, no verbatim framing), and NO
+/// tombstones (`baseLayerWriter.Remove` explicitly rejects them).
+///
+/// Hardlinks are deferred to a replay pass exactly like the diff layer so
+/// out-of-order tar entries still resolve.
+fn extract_tar_as_base_layer(tar_bytes: &[u8], layer_path: &Path) -> io::Result<()> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    let mut pending_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let rel_path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+
+        // Directory entries: materialize a real NTFS directory. No
+        // `.$wcidirs$` sibling marker — baseLayerWriter does not emit one.
+        if entry_type.is_dir() {
+            let dest = layer_path.join(&rel_path);
+            create_long_path_dir_all(&dest)?;
+            continue;
+        }
+
+        // Whiteouts are illegal in base layers — hcsshim's baseLayerWriter
+        // returns `errors.New("base layer cannot have tombstones")`.
+        if let Some(basename) = rel_path.file_name().and_then(|s| s.to_str()) {
+            if basename.starts_with(".wh.") {
+                return Err(io::Error::other(format!(
+                    "base layer cannot have tombstones (got whiteout entry {})",
+                    rel_path.display()
+                )));
+            }
+        }
+
+        let dest = layer_path.join(&rel_path);
+        if let Some(parent) = dest.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+
+        // Defer hardlinks until all primary entries have been materialized.
+        if entry_type == tar::EntryType::Link {
+            let link_target = entry.link_name()?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "tar hardlink entry missing link_name: {}",
+                    rel_path.display()
+                ))
+            })?;
+            pending_links.push((rel_path.clone(), link_target.into_owned()));
+            continue;
+        }
+
+        let rel_str = rel_path.to_string_lossy();
+        let is_files_payload = rel_str.starts_with("Files/")
+            || rel_str.starts_with("Files\\")
+            || rel_str.starts_with("UtilityVM/")
+            || rel_str.starts_with("UtilityVM\\");
+        if is_files_payload {
+            // Real NTFS file: metadata stamped via BackupWrite, no verbatim
+            // framing on disk.
+            backuptar::write_oci_entry_as_base_layer(&mut entry, &dest)?;
+        } else {
+            // `Hives/*` and any auxiliary base-layer files: raw byte copies
+            // through the long-path-aware helper (hcsshim's baseLayerWriter
+            // also raw-copies Hives — they are NTFS registry hive exports,
+            // not BackupStream blobs).
+            let mut f = layer::create_long_path_file(&dest)?;
             std::io::copy(&mut entry, &mut f)?;
         }
     }
+
+    // Replay pending hardlinks now that every primary file is on disk.
+    for (link_rel, target_rel) in pending_links {
+        let link_abs = layer_path.join(&link_rel);
+        let target_abs = layer_path.join(&target_rel);
+        if let Some(parent) = link_abs.parent() {
+            create_long_path_dir_all(parent)?;
+        }
+        if let Err(e) = std::fs::hard_link(&target_abs, &link_abs) {
+            return Err(io::Error::other(format!(
+                "hard_link({} -> {}): {e}",
+                link_abs.display(),
+                target_abs.display()
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// Write the `<dirname>.$wcidirs$` sibling marker that hcsshim's
+/// `legacyLayerWriter.Add` emits for every non-UVM directory. Without it,
+/// `HcsImportLayer`'s NTFS walker returns `0x80070002`. The marker carries
+/// a 4-byte LE `FileAttributes` header, optionally followed by a
+/// `BACKUP_REPARSE_DATA` record when the tar entry has `MSWINDOWS.reparse`.
+fn write_wcidirs_sidecar<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    rel_path: &Path,
+    dest: &Path,
+) -> io::Result<()> {
+    let rel_norm = rel_path.to_string_lossy().replace('\\', "/");
+    let is_uvm =
+        rel_norm == "UtilityVM" || rel_norm == "UtilityVM/" || rel_norm.starts_with("UtilityVM/");
+    if is_uvm {
+        return Ok(());
+    }
+
+    let mut attrs: u32 = 0x0000_0010;
+    let mut reparse: Option<Vec<u8>> = None;
+    if let Some(pax) = entry.pax_extensions()? {
+        let engine = base64::engine::general_purpose::STANDARD;
+        for ext in pax {
+            let ext = ext?;
+            match ext.key().unwrap_or("") {
+                "MSWINDOWS.fileattr" => {
+                    if let Some(parsed) = std::str::from_utf8(ext.value_bytes())
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                    {
+                        attrs = parsed;
+                    }
+                }
+                "MSWINDOWS.reparse" => {
+                    reparse = Some(engine.decode(ext.value_bytes()).map_err(|e| {
+                        io::Error::other(format!("PAX MSWINDOWS.reparse base64 decode: {e}"))
+                    })?);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let dirname = dest.file_name().ok_or_else(|| {
+        io::Error::other(format!(
+            "tar dir entry has no file_name: {}",
+            rel_path.display()
+        ))
+    })?;
+    let mut marker_name = dirname.to_os_string();
+    marker_name.push(".$wcidirs$");
+    let marker_path = match dest.parent() {
+        Some(p) => p.join(&marker_name),
+        None => PathBuf::from(&marker_name),
+    };
+
+    let mut f = layer::create_long_path_file(&marker_path)?;
+    std::io::Write::write_all(&mut f, &attrs.to_le_bytes())?;
+    if let Some(rp) = reparse {
+        backuptar::write_stream_header(&mut f, backuptar::BACKUP_REPARSE_DATA, 0, rp.len() as u64)?;
+        std::io::Write::write_all(&mut f, &rp)?;
+    }
+    Ok(())
+}
+
+/// `std::fs::create_dir_all` analogue that uses the `\\?\`-prefixed long-path
+/// helper so we don't trip `ERROR_PATH_NOT_FOUND` (`0x80070003`) on the deep
+/// `WinSxS`/`Catroot`/`UtilityVM` directories embedded in nanoserver layers.
+///
+/// This walks ancestors top-down and calls a `CreateDirectoryW`-equivalent
+/// for each; we re-use the file helper to materialise a placeholder when the
+/// directory does not yet exist, except we route to the dedicated dir API.
+fn create_long_path_dir_all(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    // Fast path: std handles short paths fine. Try it first; on
+    // `ERROR_PATH_NOT_FOUND` / `ERROR_FILENAME_EXCED_RANGE` fall back.
+    match std::fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Walk ancestors and create them one-by-one through the long-path
+            // helper. We accumulate the components first because `Path` doesn't
+            // give us a top-down ancestor iterator without an extra collect.
+            let mut to_create: Vec<&Path> = dir.ancestors().collect();
+            to_create.reverse();
+            for component in to_create {
+                if component.as_os_str().is_empty() {
+                    continue;
+                }
+                if component.is_dir() {
+                    continue;
+                }
+                layer::create_long_path_dir(component).map_err(|inner| {
+                    io::Error::other(format!(
+                        "create_dir_all fallback for {} (initial {e}): {inner}",
+                        component.display()
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Paths to a Windows image's bundled Utility VM boot artifacts.
+///
+/// Hyper-V-isolated Windows containers boot a UVM whose root filesystem is
+/// the image's own `UtilityVM\Files` tree (surfaced over a VSMB share named
+/// `"os"`) and whose initial scratch VHDX is a copy of the image's
+/// `UtilityVM\SystemTemplate.vhdx`. The UEFI firmware then chain-loads
+/// `\EFI\Microsoft\Boot\bootmgfw.efi` over the `VmbFs` surface.
+///
+/// `locate_uvm_boot_files` resolves the absolute paths for the current
+/// process; the consumer (HCS doc builder, scratch copier) uses them
+/// verbatim — no further path arithmetic required.
+#[derive(Debug, Clone)]
+pub struct UvmBootFiles {
+    /// Absolute path to `<layer>\UtilityVM` (the layer subdir).
+    pub uvm_layer_dir: std::path::PathBuf,
+    /// Absolute path to `<layer>\UtilityVM\Files` — the OS root surfaced
+    /// over the `"os"` VSMB share.
+    pub os_files_dir: std::path::PathBuf,
+    /// Absolute path to `<layer>\UtilityVM\SystemTemplate.vhdx` — the read-only
+    /// template the caller copies to produce a per-UVM `sandbox.vhdx`.
+    pub system_template_vhdx: std::path::PathBuf,
+    /// Guest-relative UEFI boot path (`\EFI\Microsoft\Boot\bootmgfw.efi`).
+    /// Fed verbatim into `Chipset.Uefi.BootThis.DevicePath`.
+    pub boot_rel_path: &'static str,
+}
+
+/// Walk `chain` (child-to-parent — base layer is `.last()`) and return the
+/// first layer that contains a `UtilityVM\Files\EFI\Microsoft\Boot\bootmgfw.efi`
+/// file. Iterates in reverse so the OS base layer is checked first, matching
+/// hcsshim's `internal/uvm/uvmfolder.go::LocateUVMFolder`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::NotFound`] with a descriptive message if no layer
+/// in the chain carries a UVM payload. Daemons should map this to a typed
+/// "Hyper-V isolation unavailable: image has no `UtilityVM` payload" error so
+/// non-Windows images cannot be silently routed into the Hyper-V path.
+pub fn locate_uvm_boot_files(
+    chain: &crate::windows::wclayer::LayerChain,
+) -> std::io::Result<UvmBootFiles> {
+    const BOOT_REL: &str = r"\EFI\Microsoft\Boot\bootmgfw.efi";
+    for layer in chain.0.iter().rev() {
+        let layer_dir = std::path::PathBuf::from(&layer.path);
+        let uvm_dir = layer_dir.join("UtilityVM");
+        let files_dir = uvm_dir.join("Files");
+        let bootmgfw = files_dir
+            .join("EFI")
+            .join("Microsoft")
+            .join("Boot")
+            .join("bootmgfw.efi");
+        if bootmgfw.is_file() {
+            let template = uvm_dir.join("SystemTemplate.vhdx");
+            if !template.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "layer {:?} has UtilityVM\\Files but is missing SystemTemplate.vhdx — \
+                         image's UVM payload is incomplete",
+                        layer.path
+                    ),
+                ));
+            }
+            return Ok(UvmBootFiles {
+                uvm_layer_dir: uvm_dir,
+                os_files_dir: files_dir,
+                system_template_vhdx: template,
+                boot_rel_path: BOOT_REL,
+            });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no layer in chain contains a UtilityVM payload \
+         (image is not a Hyper-V-bootable Windows base image)",
+    ))
 }
 
 // ---------------------------------------------------------------------------

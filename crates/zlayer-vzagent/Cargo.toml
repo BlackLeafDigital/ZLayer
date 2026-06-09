@@ -1,0 +1,53 @@
+[package]
+name = "zlayer-vzagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zlayer_vzagent"
+path = "src/lib.rs"
+
+# The PID1 guest agent binary. Inside the initramfs this binary is installed as
+# `/init` (the kernel's default initramfs entry point). The Linux-only body is
+# cfg-gated so the crate still builds on the macOS host that reuses the `proto`
+# library.
+[[bin]]
+name = "zlayer-vzagent"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+postcard = { version = "1.1.3", features = ["alloc"] }
+rustix = { version = "1.1.4", features = ["process", "fs", "net", "mount", "thread", "system"] }
+serde = { workspace = true, features = ["derive"] }
+
+# Linux-only: the in-guest WireGuard overlay (`Msg::OverlayConfig`) is configured
+# over kernel netlink. These crates are pure-Rust (no C deps) and use synchronous
+# netlink sockets (no tokio/async runtime), so they cross-compile cleanly to the
+# static `aarch64-unknown-linux-musl` target the agent ships as. `netlink-sys`
+# itself only builds on Linux (it speaks the Linux netlink socket ABI), so the
+# whole stack is gated to Linux to keep the macOS host build (which reuses only
+# the `proto` library) green.
+#   * netlink-sys           — raw synchronous AF_NETLINK socket (NETLINK_ROUTE /
+#                             NETLINK_GENERIC), default features (no async).
+#   * netlink-packet-core   — NetlinkMessage framing + NLM_F_* flags.
+#   * netlink-packet-route  — rtnetlink RTM_NEWLINK/NEWADDR/NEWROUTE message
+#                             builders, including InfoKind::Wireguard.
+#   * netlink-packet-generic— generic-netlink (genetlink) framing + the nlctrl
+#                             family resolver used to look up the dynamic
+#                             "wireguard" family id.
+#   * netlink-packet-wireguard — WG_GENL WGDEVICE_*/WGPEER_* attribute encoding
+#                             for WG_CMD_SET_DEVICE.
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-sys = "0.8.8"
+netlink-packet-core = "0.8.1"
+netlink-packet-route = "0.30.0"
+netlink-packet-generic = "0.4.0"
+netlink-packet-wireguard = "0.4.0"
+
+[lints]
+workspace = true

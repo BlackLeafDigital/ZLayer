@@ -28,6 +28,8 @@ use tokio::sync::RwLock;
 
 use super::sqlx_json::{IndexSpec, JsonTable, SqlxJsonStore};
 use super::{StorageError, StoredTask, TaskRun};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for task storage backends.
 #[async_trait]
@@ -606,7 +608,9 @@ mod tests {
     async fn test_sqlx_persistent_round_trip() {
         // Survives closing + reopening the database — both the task blob
         // and its run history must come back intact.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("tasks.db");
 
         let task = make_task("persist-me", "echo persist", Some("proj-x"));

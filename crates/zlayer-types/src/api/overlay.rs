@@ -1,10 +1,46 @@
 //! Overlay network API DTOs.
 //!
-//! Wire types for the overlay network status endpoints. These are the
-//! response shapes consumed by both the daemon and SDK clients.
+//! Wire types for the `/api/v1/overlay/*` HTTP surface, shared between
+//! `zlayer-api` (server) and `zlayer-client` / `zlayer-manager` (clients).
+//! These are the response shapes consumed by both the daemon and SDK
+//! clients.
+//!
+//! See [`crate::overlay`] for the underlying configuration types.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use utoipa::ToSchema;
+
+use crate::overlay::OverlayMode;
+
+/// Where on a specific node a service's overlay terminates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BridgeInfo {
+    /// Linux bridge name (`br-svc-<hash>`), max 15 chars per IFNAMSIZ.
+    pub name: String,
+    /// CIDR of the service subnet assigned to this node.
+    #[schema(value_type = String, example = "10.201.0.0/24")]
+    pub subnet: ipnet::IpNet,
+    /// Gateway IP within the subnet (first usable address); the bridge's
+    /// own L3 address. Containers' default route points here.
+    #[schema(value_type = String, example = "10.201.0.1")]
+    pub gateway: IpAddr,
+    /// Node identifier (stringified to avoid leaking `NodeId` type details
+    /// across crate boundaries).
+    pub node_id: String,
+}
+
+/// Status of a service's overlay across the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ServiceOverlayStatus {
+    pub service: String,
+    /// Mode the daemon resolved for this service (after `resolve`).
+    pub mode: OverlayMode,
+    /// One entry per node where this service has at least one container
+    /// attached. Keys are node IDs as stringified.
+    pub bridges_by_node: HashMap<String, BridgeInfo>,
+}
 
 /// Overlay network status response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

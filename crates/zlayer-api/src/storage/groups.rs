@@ -28,6 +28,8 @@ use tokio::sync::RwLock;
 
 use super::sqlx_json::{IndexSpec, JsonTable, SqlxJsonStore};
 use super::{StorageError, StoredUserGroup};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for user group storage backends.
 #[async_trait]
@@ -784,7 +786,9 @@ mod tests {
     async fn test_sqlx_persistent_round_trip() {
         // Survives closing + reopening the database — the whole point of the
         // persistent backend. Membership rows must round-trip too.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("groups.db");
 
         let group = StoredUserGroup::new("persist-me");

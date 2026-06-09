@@ -14,7 +14,7 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer, ForceLeaderRequest,
-    ForceLeaderResponse, HeartbeatRequest,
+    ForceLeaderResponse, GossipPeerSummary, HeartbeatRequest, WorkerSummary,
 };
 use crate::handlers::container_networks::{
     BridgeNetworkDetails, ConnectBridgeNetworkRequest, CreateBridgeNetworkRequest,
@@ -22,18 +22,20 @@ use crate::handlers::container_networks::{
 };
 use crate::handlers::containers::{
     ContainerChangeEntry, ContainerExecRequest, ContainerExecResponse, ContainerHealthInfo,
-    ContainerInfo, ContainerPortBinding, ContainerPortResponse, ContainerPruneResponse,
-    ContainerResourceLimits, ContainerStatsResponse, ContainerTopResponse, ContainerUpdateRequest,
-    ContainerUpdateResponse, ContainerUpdateRestartPolicy, ContainerWaitDockerError,
-    ContainerWaitDockerResponse, ContainerWaitResponse, CreateContainerRequest, HealthCheckRequest,
-    KillContainerRequest, NetworkAttachmentInfo, NetworkAttachmentRequest, RestartContainerRequest,
-    StopContainerRequest, VolumeMount, VolumeMountType,
+    ContainerInfo, ContainerLogFormat, ContainerPortBinding, ContainerPortResponse,
+    ContainerPruneResponse, ContainerResourceLimits, ContainerStatsResponse, ContainerTopResponse,
+    ContainerUpdateRequest, ContainerUpdateResponse, ContainerUpdateRestartPolicy,
+    ContainerWaitDockerError, ContainerWaitDockerResponse, ContainerWaitResponse,
+    CreateContainerRequest, HealthCheckRequest, KillContainerRequest, NetworkAttachmentInfo,
+    NetworkAttachmentRequest, RestartContainerRequest, StopContainerRequest, VolumeMount,
+    VolumeMountType,
 };
 use crate::handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, GitCredentialKindSchema,
     GitCredentialResponse, RegistryAuthTypeSchema, RegistryCredentialResponse,
 };
 use crate::handlers::cron::{CronJobResponse, CronStatusResponse, TriggerCronResponse};
+use crate::handlers::daemon::{DaemonCapabilitiesResponse, DaemonModeDto};
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::environments::{CreateEnvironmentRequest, UpdateEnvironmentRequest};
 
@@ -58,8 +60,8 @@ use crate::handlers::notifiers::{
     CreateNotifierRequest, TestNotifierResponse, UpdateNotifierRequest,
 };
 use crate::handlers::overlay::{
-    DnsStatusResponse, IpAllocationResponse, NatCandidateDto, NatPeerDto, NatStatusResponse,
-    OverlayStatusResponse, PeerInfo, PeerListResponse,
+    BridgeInfo, DnsStatusResponse, IpAllocationResponse, NatCandidateDto, NatPeerDto,
+    NatStatusResponse, OverlayStatusResponse, PeerInfo, PeerListResponse, ServiceOverlayStatus,
 };
 use crate::handlers::projects::{
     CreateProjectRequest, LinkDeploymentRequest, ProjectPullResponse, UpdateProjectRequest,
@@ -109,7 +111,8 @@ use crate::handlers::build::{
 };
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
-    __path_cluster_list_nodes,
+    __path_cluster_list_gossip_peers, __path_cluster_list_nodes, __path_cluster_list_workers,
+    __path_cluster_set_node_labels, __path_cluster_upgrade, __path_cluster_upgrade_self,
 };
 use crate::handlers::container_networks::{
     __path_connect_container_network, __path_create_container_network,
@@ -118,12 +121,13 @@ use crate::handlers::container_networks::{
 };
 use crate::handlers::containers::{
     __path_archive_get, __path_archive_head, __path_archive_put, __path_changes_container,
-    __path_create_container, __path_delete_container, __path_exec_in_container,
-    __path_get_container, __path_get_container_logs, __path_get_container_stats,
-    __path_kill_container, __path_list_containers, __path_pause_container, __path_port_container,
-    __path_prune_containers, __path_rename_container, __path_restart_container,
-    __path_start_container, __path_stop_container, __path_top_container, __path_unpause_container,
-    __path_update_container, __path_wait_container, __path_wait_container_post,
+    __path_close_container_stdin, __path_create_container, __path_delete_container,
+    __path_exec_in_container, __path_get_container, __path_get_container_logs,
+    __path_get_container_stats, __path_kill_container, __path_list_containers,
+    __path_pause_container, __path_port_container, __path_prune_containers,
+    __path_rename_container, __path_restart_container, __path_start_container,
+    __path_stop_container, __path_top_container, __path_unpause_container, __path_update_container,
+    __path_wait_container, __path_wait_container_post, __path_write_container_stdin,
 };
 use crate::handlers::credentials::{
     __path_create_git_credential, __path_create_registry_credential, __path_delete_git_credential,
@@ -134,9 +138,13 @@ use crate::handlers::cron::{
     __path_disable_cron_job, __path_enable_cron_job, __path_get_cron_job, __path_list_cron_jobs,
     __path_trigger_cron_job,
 };
+use crate::handlers::daemon::__path_get_daemon_capabilities;
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
     __path_get_deployment_spec, __path_list_deployments,
+};
+use crate::handlers::edge_cache::{
+    __path_disable_edge_cache, __path_edge_cache_stats, __path_enable_edge_cache,
 };
 use crate::handlers::environments::{
     __path_create_environment, __path_delete_environment, __path_get_environment,
@@ -152,7 +160,10 @@ use crate::handlers::images::{
     __path_list_images_handler, __path_prune_images_handler, __path_pull_image_handler,
     __path_remove_image_handler, __path_tag_image_handler,
 };
-use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
+use crate::handlers::internal::{
+    __path_get_replicas_internal, __path_internal_raft_trigger_elect,
+    __path_internal_upgrade_start, __path_internal_upgrade_status, __path_scale_service_internal,
+};
 use crate::handlers::jobs::{
     __path_cancel_execution, __path_get_execution_status, __path_list_job_executions,
     __path_trigger_job,
@@ -161,9 +172,7 @@ use crate::handlers::networks::{
     __path_create_network, __path_delete_network, __path_get_network, __path_list_networks,
     __path_update_network,
 };
-use crate::handlers::nodes::{
-    __path_generate_join_token, __path_get_node, __path_list_nodes, __path_update_node_labels,
-};
+use crate::handlers::nodes::{__path_generate_join_token, __path_get_node, __path_list_nodes};
 use crate::handlers::notifiers::{
     __path_create_notifier, __path_delete_notifier, __path_get_notifier, __path_list_notifiers,
     __path_test_notifier, __path_update_notifier,
@@ -171,7 +180,8 @@ use crate::handlers::notifiers::{
 use crate::handlers::oidc::{__path_callback, __path_list_providers, __path_start};
 use crate::handlers::overlay::{
     __path_get_dns_status, __path_get_ip_allocation, __path_get_nat_status,
-    __path_get_overlay_peers, __path_get_overlay_status,
+    __path_get_overlay_peers, __path_get_overlay_status, __path_get_service_bridge,
+    __path_get_service_overlay_status,
 };
 use crate::handlers::permissions::{
     __path_grant_permission, __path_list_permissions, __path_list_permissions_by_resource,
@@ -250,7 +260,7 @@ impl Modify for SecurityAddon {
         title = "ZLayer API",
         description = "Container orchestration API for ZLayer",
         version = "0.1.0",
-        license(name = "MIT OR Apache-2.0"),
+        license(name = "MIT OR Apache-2.0", identifier = "MIT OR Apache-2.0"),
         contact(
             name = "ZLayer",
             url = "https://zlayer.dev"
@@ -313,6 +323,8 @@ impl Modify for SecurityAddon {
         start_container,
         restart_container,
         kill_container,
+        write_container_stdin,
+        close_container_stdin,
         pause_container,
         unpause_container,
         top_container,
@@ -331,6 +343,9 @@ impl Modify for SecurityAddon {
         // Internal (scheduler-to-agent)
         scale_service_internal,
         get_replicas_internal,
+        internal_upgrade_start,
+        internal_upgrade_status,
+        internal_raft_trigger_elect,
         // Secrets
         create_secret,
         rotate_secret,
@@ -419,7 +434,7 @@ impl Modify for SecurityAddon {
         // Nodes
         list_nodes,
         get_node,
-        update_node_labels,
+        cluster_set_node_labels,
         generate_join_token,
         // Overlay
         get_overlay_status,
@@ -427,6 +442,10 @@ impl Modify for SecurityAddon {
         get_ip_allocation,
         get_dns_status,
         get_nat_status,
+        get_service_overlay_status,
+        get_service_bridge,
+        // Daemon
+        get_daemon_capabilities,
         // Tunnels
         create_tunnel,
         list_tunnels,
@@ -435,6 +454,10 @@ impl Modify for SecurityAddon {
         create_node_tunnel,
         remove_node_tunnel,
         create_access_session,
+        // Edge cache (Track A — upstream control-plane eligibility API)
+        enable_edge_cache,
+        disable_edge_cache,
+        edge_cache_stats,
         // Networks
         list_networks,
         get_network,
@@ -456,8 +479,12 @@ impl Modify for SecurityAddon {
         // Cluster
         cluster_join,
         cluster_list_nodes,
+        cluster_list_workers,
+        cluster_list_gossip_peers,
         cluster_heartbeat,
         cluster_force_leader,
+        cluster_upgrade,
+        cluster_upgrade_self,
         // Volumes
         list_volumes,
         create_volume,
@@ -511,9 +538,14 @@ impl Modify for SecurityAddon {
             // Internal schemas
             InternalScaleRequest,
             InternalScaleResponse,
+            crate::handlers::internal::UpgradeStartRequest,
+            crate::handlers::internal::UpgradeStartResponse,
+            crate::handlers::internal::UpgradeJobState,
+            crate::handlers::internal::UpgradeStatus,
             // Container schemas
             CreateContainerRequest,
             ContainerInfo,
+            ContainerLogFormat,
             ContainerResourceLimits,
             VolumeMount,
             VolumeMountType,
@@ -649,6 +681,13 @@ impl Modify for SecurityAddon {
             NatStatusResponse,
             NatCandidateDto,
             NatPeerDto,
+            // Per-service overlay (P4.5b: contract for adapter crates)
+            BridgeInfo,
+            ServiceOverlayStatus,
+            zlayer_types::overlay::OverlayMode,
+            // Daemon capability survey
+            DaemonCapabilitiesResponse,
+            DaemonModeDto,
             // Tunnel schemas
             CreateTunnelRequest,
             CreateTunnelResponse,
@@ -660,6 +699,10 @@ impl Modify for SecurityAddon {
             SuccessResponse,
             CreateAccessSessionRequest,
             CreateAccessSessionResponse,
+            // Edge-cache schemas
+            zlayer_types::api::edge_cache::EnableEdgeCacheRequest,
+            zlayer_types::api::edge_cache::EdgeCacheStatsResponse,
+            zlayer_types::api::edge_cache::NodeCapacityDto,
             // Network schemas
             NetworkSummary,
             // Container bridge / overlay network schemas
@@ -693,9 +736,15 @@ impl Modify for SecurityAddon {
             ClusterJoinResponse,
             ClusterPeer,
             ClusterNodeSummary,
+            WorkerSummary,
+            GossipPeerSummary,
             HeartbeatRequest,
             ForceLeaderRequest,
             ForceLeaderResponse,
+            crate::handlers::cluster::ClusterUpgradeRequest,
+            crate::handlers::cluster::ClusterUpgradeResult,
+            crate::handlers::cluster::ClusterUpgradeSelfRequest,
+            crate::handlers::cluster::UpgradeError,
             // Volume schemas
             VolumeSummary,
             VolumeInfo,
@@ -748,6 +797,7 @@ impl Modify for SecurityAddon {
         (name = "Storage", description = "Storage replication status"),
         (name = "Cron", description = "Cron job listing, triggering, and enable/disable"),
         (name = "Jobs", description = "Job execution triggering, status, and cancellation"),
+        (name = "Daemon", description = "Daemon-level introspection (capability survey)"),
     )
 )]
 pub struct ApiDoc;

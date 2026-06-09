@@ -4,7 +4,6 @@
 //! using reqwest with connection pooling and split timeouts (short for
 //! vote/append, long for snapshots).
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -21,10 +20,12 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, OptionalSend, RaftTypeConfig, Snapshot, SnapshotMeta, Vote};
 use reqwest::Client;
-use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::types::NodeId;
+
+/// Wire protocol version emitted on every Raft RPC and validated by the server.
+pub const RAFT_PROTOCOL_VERSION: &str = "1";
 
 // ---------------------------------------------------------------------------
 // HTTP client
@@ -41,8 +42,8 @@ pub struct RaftHttpClient {
     rpc_client: Client,
     /// Client for snapshot transfers (longer timeout).
     snapshot_client: Client,
-    /// Optional bearer token for Raft RPC authentication.
-    auth_token: Option<String>,
+    /// Precomputed `Authorization: Bearer …` header value.
+    auth_header: Option<reqwest::header::HeaderValue>,
 }
 
 impl RaftHttpClient {
@@ -64,22 +65,35 @@ impl RaftHttpClient {
     ) -> Self {
         let rpc_client = Client::builder()
             .timeout(rpc_timeout)
-            .pool_max_idle_per_host(10)
+            .pool_max_idle_per_host(2)
             .pool_idle_timeout(Duration::from_secs(90))
+            .http2_prior_knowledge()
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .build()
             .expect("Failed to build RPC HTTP client");
 
         let snapshot_client = Client::builder()
             .timeout(snapshot_timeout)
-            .pool_max_idle_per_host(5)
+            .pool_max_idle_per_host(2)
             .pool_idle_timeout(Duration::from_secs(90))
+            .http2_prior_knowledge()
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .build()
             .expect("Failed to build snapshot HTTP client");
+
+        let auth_header = auth_token.map(|token| {
+            let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("valid bearer token");
+            header.set_sensitive(true);
+            header
+        });
 
         Self {
             rpc_client,
             snapshot_client,
-            auth_token,
+            auth_header,
         }
     }
 
@@ -88,7 +102,7 @@ impl RaftHttpClient {
         client: &Client,
         url: &str,
         request: &Req,
-        auth_token: Option<&str>,
+        auth_header: Option<&reqwest::header::HeaderValue>,
     ) -> Result<Resp, String>
     where
         Req: serde::Serialize,
@@ -101,8 +115,10 @@ impl RaftHttpClient {
             .post(url)
             .header("Content-Type", "application/octet-stream");
 
-        if let Some(token) = auth_token {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
+        builder = builder.header("X-ZLayer-Raft-Protocol", RAFT_PROTOCOL_VERSION);
+
+        if let Some(header) = auth_header {
+            builder = builder.header(reqwest::header::AUTHORIZATION, header.clone());
         }
 
         let response = builder.body(body).send().await.map_err(|e| {
@@ -117,6 +133,17 @@ impl RaftHttpClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            if status == reqwest::StatusCode::UPGRADE_REQUIRED {
+                let server_version = response
+                    .headers()
+                    .get("X-ZLayer-Raft-Protocol-Supported")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                return Err(format!(
+                    "protocol version mismatch: server supports {server_version}"
+                ));
+            }
             let text = response.text().await.unwrap_or_default();
             return Err(format!("HTTP {status}: {text}"));
         }
@@ -139,12 +166,21 @@ impl Default for RaftHttpClient {
 // Network factory + connection
 // ---------------------------------------------------------------------------
 
+/// Build the four per-connection URLs for a given peer address.
+fn build_urls(addr: &str) -> [String; 4] {
+    let base = normalize_addr(addr);
+    [
+        format!("{base}/raft/append"),
+        format!("{base}/raft/vote"),
+        format!("{base}/raft/snapshot"),
+        format!("{base}/raft/full-snapshot"),
+    ]
+}
+
 /// Network factory that creates HTTP connections to Raft peers.
 ///
 /// Generic over the `RaftTypeConfig` so any application can use it.
 pub struct HttpNetwork<C: RaftTypeConfig<NodeId = NodeId>> {
-    /// Known peers (for informational purposes / peer management).
-    peers: Arc<RwLock<HashMap<NodeId, String>>>,
     /// Shared HTTP client.
     client: Arc<RaftHttpClient>,
     _phantom: std::marker::PhantomData<C>,
@@ -161,7 +197,6 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> HttpNetwork<C> {
     #[must_use]
     pub fn with_client(client: RaftHttpClient) -> Self {
         Self {
-            peers: Arc::new(RwLock::new(HashMap::new())),
             client: Arc::new(client),
             _phantom: std::marker::PhantomData,
         }
@@ -186,21 +221,6 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> HttpNetwork<C> {
             auth_token,
         ))
     }
-
-    /// Add a peer address.
-    pub async fn add_peer(&self, node_id: NodeId, address: String) {
-        self.peers.write().await.insert(node_id, address);
-    }
-
-    /// Remove a peer.
-    pub async fn remove_peer(&self, node_id: NodeId) {
-        self.peers.write().await.remove(&node_id);
-    }
-
-    /// Get all known peers.
-    pub async fn peers(&self) -> HashMap<NodeId, String> {
-        self.peers.read().await.clone()
-    }
 }
 
 impl<C: RaftTypeConfig<NodeId = NodeId>> Default for HttpNetwork<C> {
@@ -212,7 +232,6 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> Default for HttpNetwork<C> {
 impl<C: RaftTypeConfig<NodeId = NodeId>> Clone for HttpNetwork<C> {
     fn clone(&self) -> Self {
         Self {
-            peers: Arc::clone(&self.peers),
             client: Arc::clone(&self.client),
             _phantom: std::marker::PhantomData,
         }
@@ -229,10 +248,15 @@ where
     type Network = HttpConnection<C>;
 
     async fn new_client(&mut self, _target: NodeId, node: &BasicNode) -> Self::Network {
+        let [append, vote, snapshot, full_snapshot] = build_urls(&node.addr);
         HttpConnection {
-            target_addr: node.addr.clone(),
+            target_addr: Arc::<str>::from(node.addr.as_str()),
             client: Arc::clone(&self.client),
-            auth_token: self.client.auth_token.clone(),
+            auth_header: self.client.auth_header.clone(),
+            append_url: Arc::<str>::from(append.as_str()),
+            vote_url: Arc::<str>::from(vote.as_str()),
+            snapshot_url: Arc::<str>::from(snapshot.as_str()),
+            full_snapshot_url: Arc::<str>::from(full_snapshot.as_str()),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -240,10 +264,14 @@ where
 
 /// A single connection to a Raft peer.
 pub struct HttpConnection<C: RaftTypeConfig<NodeId = NodeId>> {
-    target_addr: String,
+    target_addr: Arc<str>,
     client: Arc<RaftHttpClient>,
-    /// Optional bearer token for authenticating outgoing RPCs.
-    auth_token: Option<String>,
+    /// Precomputed `Authorization` header for outgoing RPCs.
+    auth_header: Option<reqwest::header::HeaderValue>,
+    append_url: Arc<str>,
+    vote_url: Arc<str>,
+    snapshot_url: Arc<str>,
+    full_snapshot_url: Arc<str>,
     _phantom: std::marker::PhantomData<C>,
 }
 
@@ -273,14 +301,13 @@ where
         rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let url = format!("{}/raft/append", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending append_entries RPC");
 
         RaftHttpClient::postcard_post(
             &self.client.rpc_client,
-            &url,
+            &self.append_url,
             &rpc,
-            self.auth_token.as_deref(),
+            self.auth_header.as_ref(),
         )
         .await
         .map_err(to_unreachable)
@@ -294,14 +321,13 @@ where
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let url = format!("{}/raft/snapshot", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending install_snapshot RPC");
 
         RaftHttpClient::postcard_post(
             &self.client.snapshot_client,
-            &url,
+            &self.snapshot_url,
             &rpc,
-            self.auth_token.as_deref(),
+            self.auth_header.as_ref(),
         )
         .await
         .map_err(to_unreachable)
@@ -312,14 +338,13 @@ where
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let url = format!("{}/raft/vote", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending vote RPC");
 
         RaftHttpClient::postcard_post(
             &self.client.rpc_client,
-            &url,
+            &self.vote_url,
             &rpc,
-            self.auth_token.as_deref(),
+            self.auth_header.as_ref(),
         )
         .await
         .map_err(to_unreachable)
@@ -339,7 +364,6 @@ where
             snapshot_data: Vec<u8>,
         }
 
-        let url = format!("{}/raft/full-snapshot", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending full_snapshot RPC");
 
         let snapshot_data = snapshot.snapshot.into_inner();
@@ -352,9 +376,9 @@ where
 
         RaftHttpClient::postcard_post::<FullSnapshotReq, SnapshotResponse<NodeId>>(
             &self.client.snapshot_client,
-            &url,
+            &self.full_snapshot_url,
             &req,
-            self.auth_token.as_deref(),
+            self.auth_header.as_ref(),
         )
         .await
         .map_err(|e| StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e))))
@@ -381,5 +405,19 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let _client = RaftHttpClient::new(Duration::from_secs(3), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_protocol_version_constant() {
+        assert_eq!(RAFT_PROTOCOL_VERSION, "1");
+    }
+
+    #[test]
+    fn test_connection_urls_precomputed() {
+        let [append, vote, snapshot, full_snapshot] = build_urls("10.0.0.1:9000");
+        assert_eq!(append, "http://10.0.0.1:9000/raft/append");
+        assert_eq!(vote, "http://10.0.0.1:9000/raft/vote");
+        assert_eq!(snapshot, "http://10.0.0.1:9000/raft/snapshot");
+        assert_eq!(full_snapshot, "http://10.0.0.1:9000/raft/full-snapshot");
     }
 }

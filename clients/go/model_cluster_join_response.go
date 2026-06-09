@@ -21,8 +21,14 @@ var _ MappedNullable = &ClusterJoinResponse{}
 
 // ClusterJoinResponse Response body for `POST /api/v1/cluster/join`.
 type ClusterJoinResponse struct {
+	// Cluster DEK generation that `wrapped_dek` was sealed under. Lets the joiner detect rotation drift if it re-joins after a revocation rotated the cluster DEK. `None` when `wrapped_dek` is `None`.
+	DekGeneration NullableInt64 `json:"dek_generation,omitempty"`
+	// Cluster-wide HMAC join secret. Returned to authenticated joiners so they can derive the same internal RPC bearer as the leader. `None` on legacy responses from older leaders.
+	JoinSecret NullableString `json:"join_secret,omitempty"`
 	// Assigned node UUID
 	NodeId string `json:"node_id"`
+	// Node JWT minted by the leader for this joiner — `roles: [\"node\"]`, `node_id` set. Used to authenticate inter-node calls separately from any user identity. `None` on legacy responses.
+	NodeJwt NullableString `json:"node_jwt,omitempty"`
 	// Assigned overlay IP for the new node
 	OverlayIp string `json:"overlay_ip"`
 	// Existing peers in the cluster
@@ -31,6 +37,12 @@ type ClusterJoinResponse struct {
 	RaftNodeId int64 `json:"raft_node_id"`
 	// Role assigned to this node: \"voter\" or \"learner\"
 	Role string `json:"role"`
+	// Per-node slice CIDR assigned by the leader (e.g. \"10.200.42.0/28\"). Empty string if the leader is not slice-aware yet.
+	SliceCidr *string `json:"slice_cidr,omitempty"`
+	// Server-side advisory warnings to surface to the operator/CLI.  Examples: \"your token format is deprecated and will be removed in release X.Y\", \"consider rotating the signing key, last rotated N days ago\". Present-but-empty means \"no warnings\"; serialized as `null` (skip-if-none) when there are none.
+	Warnings []string `json:"warnings,omitempty"`
+	// Sealed-box-wrapped copy of the cluster DEK addressed to the joiner's `secrets_pubkey`. The joiner unwraps with its node X25519 private key and holds the DEK in zeroized memory. `None` on legacy responses or when the joiner did not provide a `secrets_pubkey`.
+	WrappedDek []int32 `json:"wrapped_dek,omitempty"`
 }
 
 type _ClusterJoinResponse ClusterJoinResponse
@@ -57,6 +69,90 @@ func NewClusterJoinResponseWithDefaults() *ClusterJoinResponse {
 	return &this
 }
 
+// GetDekGeneration returns the DekGeneration field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinResponse) GetDekGeneration() int64 {
+	if o == nil || IsNil(o.DekGeneration.Get()) {
+		var ret int64
+		return ret
+	}
+	return *o.DekGeneration.Get()
+}
+
+// GetDekGenerationOk returns a tuple with the DekGeneration field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinResponse) GetDekGenerationOk() (*int64, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.DekGeneration.Get(), o.DekGeneration.IsSet()
+}
+
+// HasDekGeneration returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasDekGeneration() bool {
+	if o != nil && o.DekGeneration.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetDekGeneration gets a reference to the given NullableInt64 and assigns it to the DekGeneration field.
+func (o *ClusterJoinResponse) SetDekGeneration(v int64) {
+	o.DekGeneration.Set(&v)
+}
+// SetDekGenerationNil sets the value for DekGeneration to be an explicit nil
+func (o *ClusterJoinResponse) SetDekGenerationNil() {
+	o.DekGeneration.Set(nil)
+}
+
+// UnsetDekGeneration ensures that no value is present for DekGeneration, not even an explicit nil
+func (o *ClusterJoinResponse) UnsetDekGeneration() {
+	o.DekGeneration.Unset()
+}
+
+// GetJoinSecret returns the JoinSecret field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinResponse) GetJoinSecret() string {
+	if o == nil || IsNil(o.JoinSecret.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.JoinSecret.Get()
+}
+
+// GetJoinSecretOk returns a tuple with the JoinSecret field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinResponse) GetJoinSecretOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.JoinSecret.Get(), o.JoinSecret.IsSet()
+}
+
+// HasJoinSecret returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasJoinSecret() bool {
+	if o != nil && o.JoinSecret.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetJoinSecret gets a reference to the given NullableString and assigns it to the JoinSecret field.
+func (o *ClusterJoinResponse) SetJoinSecret(v string) {
+	o.JoinSecret.Set(&v)
+}
+// SetJoinSecretNil sets the value for JoinSecret to be an explicit nil
+func (o *ClusterJoinResponse) SetJoinSecretNil() {
+	o.JoinSecret.Set(nil)
+}
+
+// UnsetJoinSecret ensures that no value is present for JoinSecret, not even an explicit nil
+func (o *ClusterJoinResponse) UnsetJoinSecret() {
+	o.JoinSecret.Unset()
+}
+
 // GetNodeId returns the NodeId field value
 func (o *ClusterJoinResponse) GetNodeId() string {
 	if o == nil {
@@ -79,6 +175,48 @@ func (o *ClusterJoinResponse) GetNodeIdOk() (*string, bool) {
 // SetNodeId sets field value
 func (o *ClusterJoinResponse) SetNodeId(v string) {
 	o.NodeId = v
+}
+
+// GetNodeJwt returns the NodeJwt field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinResponse) GetNodeJwt() string {
+	if o == nil || IsNil(o.NodeJwt.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.NodeJwt.Get()
+}
+
+// GetNodeJwtOk returns a tuple with the NodeJwt field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinResponse) GetNodeJwtOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.NodeJwt.Get(), o.NodeJwt.IsSet()
+}
+
+// HasNodeJwt returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasNodeJwt() bool {
+	if o != nil && o.NodeJwt.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetNodeJwt gets a reference to the given NullableString and assigns it to the NodeJwt field.
+func (o *ClusterJoinResponse) SetNodeJwt(v string) {
+	o.NodeJwt.Set(&v)
+}
+// SetNodeJwtNil sets the value for NodeJwt to be an explicit nil
+func (o *ClusterJoinResponse) SetNodeJwtNil() {
+	o.NodeJwt.Set(nil)
+}
+
+// UnsetNodeJwt ensures that no value is present for NodeJwt, not even an explicit nil
+func (o *ClusterJoinResponse) UnsetNodeJwt() {
+	o.NodeJwt.Unset()
 }
 
 // GetOverlayIp returns the OverlayIp field value
@@ -177,6 +315,104 @@ func (o *ClusterJoinResponse) SetRole(v string) {
 	o.Role = v
 }
 
+// GetSliceCidr returns the SliceCidr field value if set, zero value otherwise.
+func (o *ClusterJoinResponse) GetSliceCidr() string {
+	if o == nil || IsNil(o.SliceCidr) {
+		var ret string
+		return ret
+	}
+	return *o.SliceCidr
+}
+
+// GetSliceCidrOk returns a tuple with the SliceCidr field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ClusterJoinResponse) GetSliceCidrOk() (*string, bool) {
+	if o == nil || IsNil(o.SliceCidr) {
+		return nil, false
+	}
+	return o.SliceCidr, true
+}
+
+// HasSliceCidr returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasSliceCidr() bool {
+	if o != nil && !IsNil(o.SliceCidr) {
+		return true
+	}
+
+	return false
+}
+
+// SetSliceCidr gets a reference to the given string and assigns it to the SliceCidr field.
+func (o *ClusterJoinResponse) SetSliceCidr(v string) {
+	o.SliceCidr = &v
+}
+
+// GetWarnings returns the Warnings field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinResponse) GetWarnings() []string {
+	if o == nil {
+		var ret []string
+		return ret
+	}
+	return o.Warnings
+}
+
+// GetWarningsOk returns a tuple with the Warnings field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinResponse) GetWarningsOk() ([]string, bool) {
+	if o == nil || IsNil(o.Warnings) {
+		return nil, false
+	}
+	return o.Warnings, true
+}
+
+// HasWarnings returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasWarnings() bool {
+	if o != nil && !IsNil(o.Warnings) {
+		return true
+	}
+
+	return false
+}
+
+// SetWarnings gets a reference to the given []string and assigns it to the Warnings field.
+func (o *ClusterJoinResponse) SetWarnings(v []string) {
+	o.Warnings = v
+}
+
+// GetWrappedDek returns the WrappedDek field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinResponse) GetWrappedDek() []int32 {
+	if o == nil {
+		var ret []int32
+		return ret
+	}
+	return o.WrappedDek
+}
+
+// GetWrappedDekOk returns a tuple with the WrappedDek field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinResponse) GetWrappedDekOk() ([]int32, bool) {
+	if o == nil || IsNil(o.WrappedDek) {
+		return nil, false
+	}
+	return o.WrappedDek, true
+}
+
+// HasWrappedDek returns a boolean if a field has been set.
+func (o *ClusterJoinResponse) HasWrappedDek() bool {
+	if o != nil && !IsNil(o.WrappedDek) {
+		return true
+	}
+
+	return false
+}
+
+// SetWrappedDek gets a reference to the given []int32 and assigns it to the WrappedDek field.
+func (o *ClusterJoinResponse) SetWrappedDek(v []int32) {
+	o.WrappedDek = v
+}
+
 func (o ClusterJoinResponse) MarshalJSON() ([]byte, error) {
 	toSerialize,err := o.ToMap()
 	if err != nil {
@@ -187,11 +423,29 @@ func (o ClusterJoinResponse) MarshalJSON() ([]byte, error) {
 
 func (o ClusterJoinResponse) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
+	if o.DekGeneration.IsSet() {
+		toSerialize["dek_generation"] = o.DekGeneration.Get()
+	}
+	if o.JoinSecret.IsSet() {
+		toSerialize["join_secret"] = o.JoinSecret.Get()
+	}
 	toSerialize["node_id"] = o.NodeId
+	if o.NodeJwt.IsSet() {
+		toSerialize["node_jwt"] = o.NodeJwt.Get()
+	}
 	toSerialize["overlay_ip"] = o.OverlayIp
 	toSerialize["peers"] = o.Peers
 	toSerialize["raft_node_id"] = o.RaftNodeId
 	toSerialize["role"] = o.Role
+	if !IsNil(o.SliceCidr) {
+		toSerialize["slice_cidr"] = o.SliceCidr
+	}
+	if o.Warnings != nil {
+		toSerialize["warnings"] = o.Warnings
+	}
+	if o.WrappedDek != nil {
+		toSerialize["wrapped_dek"] = o.WrappedDek
+	}
 	return toSerialize, nil
 }
 

@@ -134,7 +134,11 @@ struct LibKrun {
     set_workdir: KrunSetWorkdir,
     set_exec: KrunSetExec,
     set_gpu_options2: KrunSetGpuOptions2,
-    set_tsi: KrunSetTsi,
+    /// `krun_set_tsi` exists only in the TSI-enabled `libkrun` build, not the
+    /// EFI variant (`libkrun-efi`, shipped by `brew install krunkit`). Optional
+    /// so the runtime still loads with the EFI build; TSI networking is then
+    /// skipped (containers run without TSI socket impersonation).
+    set_tsi: Option<KrunSetTsi>,
     start_enter: KrunStartEnter,
 }
 
@@ -163,20 +167,27 @@ impl LibKrun {
     #[allow(unsafe_code)]
     fn load() -> Result<Self> {
         let lib_paths = [
+            // Plain `libkrun` (older installs).
             "libkrun.dylib",
             "/usr/local/lib/libkrun.dylib",
             "/opt/homebrew/lib/libkrun.dylib",
+            // `krunkit` — the installer ZLayer recommends — ships the EFI
+            // variant (`libkrun-efi.dylib`), which exports the same `krun_*`
+            // C API. Search it too so a stock `brew install krunkit` is found.
+            "libkrun-efi.dylib",
+            "/usr/local/lib/libkrun-efi.dylib",
+            "/opt/homebrew/lib/libkrun-efi.dylib",
         ];
 
         let lib = lib_paths
             .iter()
             .find_map(|path| unsafe { libloading::Library::new(*path).ok() })
             .ok_or_else(|| {
-                AgentError::Configuration(
+                AgentError::Configuration(format!(
                     "libkrun not found. Install via: brew tap slp/krunkit && brew install krunkit\n\
-                     Searched: libkrun.dylib, /usr/local/lib/libkrun.dylib, /opt/homebrew/lib/libkrun.dylib"
-                        .to_string(),
-                )
+                     Searched: {}",
+                    lib_paths.join(", ")
+                ))
             })?;
 
         // Load all required symbols. Each `lib.get()` call returns a reference
@@ -209,9 +220,9 @@ impl LibKrun {
                 *lib.get(b"krun_set_gpu_options2\0").map_err(|e| {
                     AgentError::Configuration(format!("libkrun missing krun_set_gpu_options2: {e}"))
                 })?;
-            let set_tsi: KrunSetTsi = *lib.get(b"krun_set_tsi\0").map_err(|e| {
-                AgentError::Configuration(format!("libkrun missing krun_set_tsi: {e}"))
-            })?;
+            // Optional: only the TSI-enabled libkrun build exports this. The
+            // EFI variant (krunkit) does not — load it best-effort and degrade.
+            let set_tsi: Option<KrunSetTsi> = lib.get(b"krun_set_tsi\0").ok().map(|s| *s);
             let start_enter: KrunStartEnter = *lib.get(b"krun_start_enter\0").map_err(|e| {
                 AgentError::Configuration(format!("libkrun missing krun_start_enter: {e}"))
             })?;
@@ -536,8 +547,13 @@ fn build_env_array(env: &HashMap<String, String>) -> Result<(Vec<CString>, Vec<*
 impl Runtime for VmRuntime {
     /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            zlayer_spec::PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull an image to local storage with a specific policy.
@@ -555,6 +571,7 @@ impl Runtime for VmRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);
@@ -609,7 +626,10 @@ impl Runtime for VmRuntime {
             })?;
 
         let puller = zlayer_registry::ImagePuller::with_cache(blob_cache);
-        let auth = zlayer_registry::RegistryAuth::Anonymous;
+        // Honor ~/.docker/config.json (AuthConfig default = DockerConfig) so
+        // `zlayer login` creds / Docker Hub auth apply instead of anonymous.
+        let auth =
+            zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
         let layers = puller
             .pull_image(image, &auth)
@@ -939,14 +959,23 @@ impl Runtime for VmRuntime {
             );
         }
 
-        // 6. Enable TSI networking
-        let ret = unsafe { (api.set_tsi)(ctx_id) };
-        if ret != 0 {
-            cleanup_on_error(api, ctx_id, gpu_enabled, &self.gpu_in_use);
-            return Err(AgentError::StartFailed {
-                id: dir_name,
-                reason: format!("krun_set_tsi failed with code {ret}"),
-            });
+        // 6. Enable TSI networking — only when this libkrun build provides it.
+        //    The EFI variant (krunkit) lacks `krun_set_tsi`; the container still
+        //    boots and runs, just without TSI socket impersonation.
+        if let Some(set_tsi) = api.set_tsi {
+            let ret = unsafe { set_tsi(ctx_id) };
+            if ret != 0 {
+                cleanup_on_error(api, ctx_id, gpu_enabled, &self.gpu_in_use);
+                return Err(AgentError::StartFailed {
+                    id: dir_name,
+                    reason: format!("krun_set_tsi failed with code {ret}"),
+                });
+            }
+        } else {
+            tracing::warn!(
+                container = %dir_name,
+                "libkrun build lacks TSI (EFI variant); starting container without TSI networking"
+            );
         }
 
         // 7. Set entrypoint command and environment

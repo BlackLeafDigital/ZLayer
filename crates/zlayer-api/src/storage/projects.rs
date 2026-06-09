@@ -16,6 +16,8 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::RwLock;
 
 use super::{StorageError, StoredProject};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for project storage backends.
 #[async_trait]
@@ -864,7 +866,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_storage() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-storage-")
+            .unwrap();
         let db_path = temp_dir.path().join("projects.db");
 
         let project = make_project("persist");

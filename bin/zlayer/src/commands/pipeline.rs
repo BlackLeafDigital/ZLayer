@@ -34,7 +34,11 @@ fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Execute the pipeline build command.
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
 pub async fn cmd_pipeline(
     file: Option<PathBuf>,
     set: Vec<String>,
@@ -43,6 +47,7 @@ pub async fn cmd_pipeline(
     _no_tui: bool,
     only: Option<String>,
     platform: Option<String>,
+    host_network: bool,
 ) -> Result<()> {
     let file = discover_pipeline_file(file)?;
 
@@ -97,7 +102,8 @@ pub async fn cmd_pipeline(
 
     let executor = PipelineExecutor::with_backend(pipeline, base_dir, backend)
         .fail_fast(fail_fast)
-        .push(push);
+        .push(push)
+        .with_host_network(host_network);
 
     let result = executor.run().await?;
 

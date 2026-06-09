@@ -20,16 +20,50 @@ use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData}
 #[cfg(feature = "persistent")]
 use zlayer_consensus::storage::redb_store::{RedbLogStore, RedbSmCache, RedbStateMachine};
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
+use zlayer_overlay::allocator::{ServiceSubnetRegistry, ServiceSubnetRegistrySnapshot};
+use zlayer_overlay::ipnet::IpNet;
 use zlayer_secrets::cluster_dek::ClusterDek;
 use zlayer_secrets::sealed::{RecipientPrivateKey, RecipientPublicKey};
-use zlayer_secrets::{SecretsError, SecretsState};
+use zlayer_secrets::{NodeSideEffects, SecretsError, SecretsState};
 use zlayer_types::api::internal::SecretsRaftOp;
 use zlayer_types::storage::{NodeIdentity, ReplicatedSecret};
 
 use crate::error::{Result, SchedulerError};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Node ID type (u64 for simplicity)
 pub type NodeId = u64;
+
+/// Default cluster CIDR used by [`ClusterState`]'s [`ServiceSubnetRegistry`]
+/// when no operator override has been wired through. Matches the project-wide
+/// default overlay range; can be replaced in a follow-up that surfaces the
+/// value through config without touching the on-disk snapshot shape.
+pub const DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR: &str = "10.200.0.0/16";
+
+/// Default per-`(service, node)` slice prefix the [`ServiceSubnetRegistry`]
+/// carves out of the cluster CIDR. `/28` gives 14 usable host IPs per
+/// service per node, which matches the planning doc ("P7"). The prefix
+/// being configurable is a follow-up.
+pub const DEFAULT_SERVICE_SUBNET_SLICE_PREFIX: u8 = 28;
+
+/// Construct the default [`ServiceSubnetRegistry`] used by
+/// [`ClusterState::default`] / [`ClusterState::new`].
+///
+/// # Panics
+///
+/// Panics if [`DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR`] or
+/// [`DEFAULT_SERVICE_SUBNET_SLICE_PREFIX`] are mutually inconsistent. The
+/// hard-coded defaults are valid by construction (verified by a unit test
+/// below), so this is unreachable in practice.
+#[must_use]
+pub fn default_service_subnet_registry() -> ServiceSubnetRegistry {
+    let cidr: IpNet = DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR
+        .parse()
+        .expect("hard-coded default cluster CIDR is well-formed");
+    ServiceSubnetRegistry::new(cidr, DEFAULT_SERVICE_SUBNET_SLICE_PREFIX)
+        .expect("hard-coded default slice prefix is well-formed for the default CIDR")
+}
 
 // OpenRaft type configuration for ZLayer scheduler.
 // Uses `declare_raft_types!` which automatically provides v2-compatible
@@ -88,6 +122,10 @@ pub enum Request {
         /// Empty string for pre-slice-aware registrations — treated as "no slice".
         #[serde(default)]
         slice_cidr: String,
+        /// Free-form labels advertised by the node's agent for `NodeSelector`
+        /// placement matching. Empty for legacy registrations.
+        #[serde(default)]
+        labels: HashMap<String, String>,
     },
     /// Update node heartbeat with current resource usage
     UpdateNodeHeartbeat {
@@ -118,6 +156,76 @@ pub enum Request {
     /// discriminant does not shift any of the pre-existing variants — older
     /// log entries stay decodable bit-for-bit.
     Secrets(SecretsRaftOp),
+    /// Update a node's membership mode (`full` or `replicate`).
+    UpdateNodeMode { node_id: NodeId, mode: String },
+    /// Grant a new worker lease — emitted when a worker successfully Registers.
+    GrantWorkerLease {
+        node_id: NodeId,
+        holder: String,   // worker's mTLS cn or token-cn
+        acquired_ns: u64, // unix nanos
+        renewed_ns: u64,  // unix nanos (== acquired_ns on first grant)
+        ttl_secs: u32,
+    },
+    /// Renew an existing worker lease — emitted on every successful `ReportStatus`
+    /// ack tick. Only updates `renewed_ns` and `ttl_secs`; the lease stays alive.
+    RenewWorkerLease {
+        node_id: NodeId,
+        renewed_ns: u64,
+        ttl_secs: u32,
+    },
+    /// Expire a worker lease — emitted by the leader's expiry sweep tick when
+    /// `renewed_ns + ttl_secs + grace_secs < now`. Idempotent: removes the
+    /// lease if present, no-op otherwise.
+    ExpireWorkerLease { node_id: NodeId },
+    /// Revoke a worker lease — admin action (e.g. `worker-evict`). Same effect
+    /// as `ExpireWorkerLease` but distinct for audit/log readability.
+    RevokeWorkerLease { node_id: NodeId },
+    /// Leader-side allocation of a per-`(service, node)` subnet from the
+    /// cluster CIDR via the [`ServiceSubnetRegistry`]. All nodes apply the
+    /// same delta so each node's cluster-WG knows which `AllowedIPs` to
+    /// attribute to which remote peer for cross-node service traffic.
+    ///
+    /// Appended at the end of the enum — postcard2 enum discriminants are
+    /// positional/index-based, and pure appends do not shift the
+    /// discriminants of any pre-existing variants, so older log entries
+    /// stay decodable bit-for-bit.
+    ///
+    /// `service_name` is the deployment service name; `node_id` is the
+    /// raft `NodeId` (the registry stores it as a string at the boundary).
+    AssignServiceSubnet {
+        service_name: String,
+        node_id: NodeId,
+    },
+    /// Counterpart to [`Request::AssignServiceSubnet`]: releases the slot
+    /// for `(service_name, node_id)`. Idempotent — no-op if no slot was
+    /// assigned. Also appended at the end of the enum for discriminant
+    /// stability (see [`Request::AssignServiceSubnet`]).
+    ReleaseServiceSubnet {
+        service_name: String,
+        node_id: NodeId,
+    },
+    /// Set / remove labels on a registered node's `NodeInfo`. `set` entries are
+    /// inserted (overwriting any existing value); `remove` keys are deleted.
+    /// Backs `zlayer node label`. Appended at the end of the enum for postcard2
+    /// discriminant stability (see [`Request::AssignServiceSubnet`]).
+    SetNodeLabels {
+        node_id: NodeId,
+        set: HashMap<String, String>,
+        remove: Vec<String>,
+    },
+    /// Publish (insert/overwrite) one node's dedicated-overlay endpoint for one
+    /// service. Each node hosting an [`OverlayMode::Dedicated`] service proposes
+    /// this so the other hosting nodes can peer with its per-service WG
+    /// transport. Keyed by `(node_id, service)`; re-publish overwrites.
+    ///
+    /// Appended at the end of the enum for postcard2 discriminant stability
+    /// (see [`Request::AssignServiceSubnet`]).
+    SetServiceOverlayEndpoint { endpoint: ServiceOverlayEndpoint },
+    /// Counterpart to [`Request::SetServiceOverlayEndpoint`]: removes the
+    /// endpoint published for `(node_id, service)`. Idempotent — no-op if no
+    /// endpoint was published. Appended at the end of the enum for postcard2
+    /// discriminant stability (see [`Request::AssignServiceSubnet`]).
+    RemoveServiceOverlayEndpoint { node_id: NodeId, service: String },
 }
 
 /// Raft response types
@@ -183,12 +291,73 @@ pub struct ScaleEvent {
     pub timestamp: u64,
 }
 
+/// FSM-internal record of a worker lease. Mirrors `zlayer_types::cluster::WorkerLease`
+/// but uses u64 unix-nanos so postcard serialization stays stable across versions.
+///
+/// Converted to/from `zlayer_types::cluster::WorkerLease` at the read boundary
+/// (queries that return leases to callers do the `SystemTime` conversion there).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerLeaseRecord {
+    pub node_id: NodeId,
+    pub holder: String,
+    pub acquired_ns: u64,
+    pub renewed_ns: u64,
+    pub ttl_secs: u32,
+    /// Monotonic revision, incremented on every renew. Lets the leader-side
+    /// dispatcher push updates that include the latest revision the worker
+    /// observed so reconnects can fast-forward.
+    pub revision: u64,
+}
+
+impl WorkerLeaseRecord {
+    /// Returns true if `now_ns >= renewed_ns + (ttl_secs + grace_secs) * 1e9`.
+    #[must_use]
+    pub fn is_expired(&self, now_ns: u64, grace_secs: u32) -> bool {
+        let deadline_ns = self
+            .renewed_ns
+            .saturating_add(u64::from(self.ttl_secs).saturating_mul(1_000_000_000))
+            .saturating_add(u64::from(grace_secs).saturating_mul(1_000_000_000));
+        now_ns >= deadline_ns
+    }
+}
+
+/// One node's dedicated-overlay endpoint for one service (Dedicated mode).
+///
+/// Published per (node, service) when a node hosts a service whose overlay is
+/// configured as [`OverlayMode::Dedicated`]: every hosting node advertises its
+/// per-service `WireGuard` transport (pubkey + endpoint + overlay IP/subnet) so
+/// the other hosting nodes can peer with it directly. Driven through Raft via
+/// [`Request::SetServiceOverlayEndpoint`] / [`Request::RemoveServiceOverlayEndpoint`]
+/// so every replica observes the same (node, service) -> endpoint mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceOverlayEndpoint {
+    pub node_id: NodeId,
+    pub service: String,
+    /// base64 `WireGuard` public key of this node's per-service transport.
+    pub wg_public_key: String,
+    /// host:port, textual (matches `PeerSpec.endpoint` convention).
+    pub endpoint: String,
+    pub overlay_ip: String,
+    pub subnet: String,
+}
+
+impl ServiceOverlayEndpoint {
+    /// Composite map key `"{node_id}/{service}"` used by
+    /// [`ClusterState::service_overlay_endpoints`]. A `String` key keeps the
+    /// map JSON-serializable with no custom serde (JSON object keys must be
+    /// strings), unlike a tuple key.
+    #[must_use]
+    pub fn map_key(node_id: NodeId, service: &str) -> String {
+        format!("{node_id}/{service}")
+    }
+}
+
 /// Cluster state (the Raft state machine application state).
 ///
 /// This is the `S` generic parameter to the storage state machine types.
 /// It only contains application-level fields -- the Raft bookkeeping
 /// (`last_applied_log`, `last_membership`) is managed by the consensus crate.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
     /// Service states
     pub services: HashMap<String, ServiceState>,
@@ -203,6 +372,83 @@ pub struct ClusterState {
     /// cleanly with an empty [`SecretsState`].
     #[serde(default)]
     pub secrets: SecretsState,
+    /// Worker-tier leases (Nomad-style). Keyed by `node_id` of the worker.
+    /// Only populated when the cluster is in `worker-tier` mode; empty in
+    /// single-node / static / pure-raft modes. `#[serde(default)]` keeps old
+    /// snapshots loading cleanly.
+    #[serde(default)]
+    pub worker_leases: HashMap<NodeId, WorkerLeaseRecord>,
+    /// Per-`(service, node)` overlay-subnet assignments. Driven by the
+    /// `AssignServiceSubnet` / `ReleaseServiceSubnet` raft commands so every
+    /// node observes the same (service, node) -> subnet mapping. Used by
+    /// each node's cluster-WG to attribute `AllowedIPs` to the right remote
+    /// peer for cross-node service traffic.
+    ///
+    /// Serialized via [`ServiceSubnetRegistrySnapshot`] (the registry itself
+    /// is not `Serialize`) so the on-disk shape stays deterministic across
+    /// processes. `#[serde(default = ...)]` keeps snapshots written before
+    /// this field existed loading cleanly with an empty registry built from
+    /// the project-wide defaults.
+    #[serde(
+        serialize_with = "serialize_service_subnets",
+        deserialize_with = "deserialize_service_subnets",
+        default = "default_service_subnet_registry"
+    )]
+    pub service_subnets: ServiceSubnetRegistry,
+    /// Per-`(node, service)` dedicated-overlay endpoints. Driven by the
+    /// `SetServiceOverlayEndpoint` / `RemoveServiceOverlayEndpoint` raft
+    /// commands so every node observes the same set of per-service WG
+    /// peers for [`OverlayMode::Dedicated`] services.
+    ///
+    /// Keyed by the composite string [`ServiceOverlayEndpoint::map_key`]
+    /// (`"{node_id}/{service}"`) so the map stays JSON-serializable with no
+    /// custom serde — JSON object keys must be strings, which a tuple key is
+    /// not. `#[serde(default)]` keeps snapshots/log entries written before
+    /// this field existed loading cleanly with an empty map (no version bump,
+    /// no migration).
+    #[serde(default)]
+    pub service_overlay_endpoints: HashMap<String, ServiceOverlayEndpoint>,
+}
+
+impl Default for ClusterState {
+    fn default() -> Self {
+        Self {
+            services: HashMap::new(),
+            nodes: HashMap::new(),
+            scale_events: Vec::new(),
+            secrets: SecretsState::default(),
+            worker_leases: HashMap::new(),
+            service_subnets: default_service_subnet_registry(),
+            service_overlay_endpoints: HashMap::new(),
+        }
+    }
+}
+
+/// Serialize a [`ServiceSubnetRegistry`] through its [`ServiceSubnetRegistrySnapshot`]
+/// shape. The registry itself is not `Serialize`; round-tripping via the
+/// snapshot keeps the on-disk bytes deterministic across processes
+/// (snapshots sort assignments by key) and matches the pattern the snapshot
+/// type was designed for.
+fn serialize_service_subnets<S>(
+    registry: &ServiceSubnetRegistry,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    registry.snapshot().serialize(serializer)
+}
+
+/// Deserialize a [`ServiceSubnetRegistry`] from its [`ServiceSubnetRegistrySnapshot`]
+/// shape. Mirrors [`serialize_service_subnets`].
+fn deserialize_service_subnets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<ServiceSubnetRegistry, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let snapshot = ServiceSubnetRegistrySnapshot::deserialize(deserializer)?;
+    ServiceSubnetRegistry::restore(snapshot).map_err(serde::de::Error::custom)
 }
 
 /// Node information
@@ -270,6 +516,10 @@ pub struct NodeInfo {
     /// Empty string for pre-slice-aware registrations — treated as "no slice".
     #[serde(default)]
     pub slice_cidr: String,
+    /// Free-form labels advertised by this node's agent, used for
+    /// `NodeSelector` placement matching. Empty for legacy registrations.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 fn default_node_status() -> String {
@@ -341,6 +591,9 @@ pub struct AddMemberParams {
     /// Per-node slice of the cluster CIDR assigned by the leader (e.g. "10.200.42.0/28").
     /// Empty string for pre-slice-aware registrations — treated as "no slice".
     pub slice_cidr: String,
+    /// Free-form labels advertised by the joining agent for `NodeSelector`
+    /// placement matching. Empty when the joiner reported none.
+    pub labels: HashMap<String, String>,
 }
 
 impl ClusterState {
@@ -356,6 +609,7 @@ impl ClusterState {
     ///
     /// Panics if the system clock is before the Unix epoch (only relevant for
     /// `RegisterNode` requests).
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
             Request::UpdateServiceState {
@@ -394,6 +648,7 @@ impl ClusterState {
                 os,
                 arch,
                 slice_cidr,
+                labels,
             } => self.apply_register_node(
                 *node_id,
                 address,
@@ -410,6 +665,7 @@ impl ClusterState {
                 *os,
                 *arch,
                 slice_cidr,
+                labels,
             ),
             Request::UpdateNodeHeartbeat {
                 node_id,
@@ -433,6 +689,46 @@ impl ClusterState {
                     node.status.clone_from(status);
                 }
                 Response::Success { data: None }
+            }
+            Request::UpdateNodeMode { node_id, mode } => {
+                if mode != "full" && mode != "replicate" {
+                    return Response::Error {
+                        message: format!(
+                            "Invalid node mode: {mode} (expected \"full\" or \"replicate\")"
+                        ),
+                    };
+                }
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.mode.clone_from(mode);
+                    Response::Success {
+                        data: Some(format!("node {node_id} mode = {mode}")),
+                    }
+                } else {
+                    Response::Error {
+                        message: format!("Node not found: {node_id}"),
+                    }
+                }
+            }
+            Request::SetNodeLabels {
+                node_id,
+                set,
+                remove,
+            } => {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    for (k, v) in set {
+                        node.labels.insert(k.clone(), v.clone());
+                    }
+                    for k in remove {
+                        node.labels.remove(k);
+                    }
+                    Response::Success {
+                        data: Some(format!("node {node_id} labels updated")),
+                    }
+                } else {
+                    Response::Error {
+                        message: format!("Node not found: {node_id}"),
+                    }
+                }
             }
             Request::DeregisterNode { node_id } => {
                 self.nodes.remove(node_id);
@@ -458,6 +754,95 @@ impl ClusterState {
                 }
             }
             Request::Secrets(op) => self.apply_secrets(op),
+            Request::GrantWorkerLease {
+                node_id,
+                holder,
+                acquired_ns,
+                renewed_ns,
+                ttl_secs,
+            } => {
+                // Re-grant (re-register) is OK: overwrite existing record with
+                // fresh acquired_ns. Revision restarts at 1.
+                let record = WorkerLeaseRecord {
+                    node_id: *node_id,
+                    holder: holder.clone(),
+                    acquired_ns: *acquired_ns,
+                    renewed_ns: *renewed_ns,
+                    ttl_secs: *ttl_secs,
+                    revision: 1,
+                };
+                self.worker_leases.insert(*node_id, record);
+                Response::Success { data: None }
+            }
+            Request::RenewWorkerLease {
+                node_id,
+                renewed_ns,
+                ttl_secs,
+            } => {
+                if let Some(lease) = self.worker_leases.get_mut(node_id) {
+                    // Reject monotonic time-travel: never advance renewed_ns
+                    // backwards. Stale acks (out-of-order replay) are no-ops.
+                    if *renewed_ns > lease.renewed_ns {
+                        lease.renewed_ns = *renewed_ns;
+                        lease.ttl_secs = *ttl_secs;
+                        lease.revision = lease.revision.saturating_add(1);
+                    }
+                    Response::Success { data: None }
+                } else {
+                    // Renew without a prior Grant — happens after ExpireWorkerLease
+                    // races with an in-flight renewal. Caller should re-Register.
+                    Response::Error {
+                        message: format!("RenewWorkerLease: no lease for node {node_id}"),
+                    }
+                }
+            }
+            Request::ExpireWorkerLease { node_id } | Request::RevokeWorkerLease { node_id } => {
+                // Idempotent removal. Both variants share apply-logic; the
+                // distinction is only for log audit / metrics.
+                self.worker_leases.remove(node_id);
+                Response::Success { data: None }
+            }
+            Request::AssignServiceSubnet {
+                service_name,
+                node_id,
+            } => {
+                // Stringify the raft NodeId at the boundary — the registry
+                // stores node identifiers as Strings to stay symmetric with
+                // NodeSliceAllocator's interface.
+                let node_key = node_id.to_string();
+                match self.service_subnets.assign(service_name, &node_key) {
+                    Ok(subnet) => Response::Success {
+                        // CIDR is surfaced in the response so the proposer
+                        // (typically the leader's overlay manager) can
+                        // immediately program AllowedIPs without re-reading
+                        // the state machine.
+                        data: Some(subnet.to_string()),
+                    },
+                    Err(e) => Response::Error {
+                        message: format!(
+                            "AssignServiceSubnet failed for service={service_name} node={node_id}: {e}"
+                        ),
+                    },
+                }
+            }
+            Request::ReleaseServiceSubnet {
+                service_name,
+                node_id,
+            } => {
+                let node_key = node_id.to_string();
+                self.service_subnets.release(service_name, &node_key);
+                Response::Success { data: None }
+            }
+            Request::SetServiceOverlayEndpoint { endpoint } => {
+                let key = ServiceOverlayEndpoint::map_key(endpoint.node_id, &endpoint.service);
+                self.service_overlay_endpoints.insert(key, endpoint.clone());
+                Response::Success { data: None }
+            }
+            Request::RemoveServiceOverlayEndpoint { node_id, service } => {
+                let key = ServiceOverlayEndpoint::map_key(*node_id, service);
+                self.service_overlay_endpoints.remove(&key);
+                Response::Success { data: None }
+            }
         }
     }
 
@@ -541,6 +926,7 @@ impl ClusterState {
         os: Option<zlayer_spec::OsKind>,
         arch: Option<zlayer_spec::ArchKind>,
         slice_cidr: &str,
+        labels: &HashMap<String, String>,
     ) -> Response {
         let now = u64::try_from(
             std::time::SystemTime::now()
@@ -575,6 +961,7 @@ impl ClusterState {
                 os,
                 arch,
                 slice_cidr: slice_cidr.to_owned(),
+                labels: labels.clone(),
             },
         );
 
@@ -604,6 +991,28 @@ impl ClusterState {
     pub fn get_scale_events(&self, limit: usize) -> &[ScaleEvent] {
         let start = self.scale_events.len().saturating_sub(limit);
         &self.scale_events[start..]
+    }
+
+    /// Node IDs currently hosting `service`, read from
+    /// [`ServiceState::assigned_nodes`]. Returns an empty `Vec` if the service
+    /// is unknown. Used to determine which nodes should peer with each other
+    /// for a [`OverlayMode::Dedicated`] overlay.
+    #[must_use]
+    pub fn nodes_hosting(&self, service: &str) -> Vec<NodeId> {
+        self.services
+            .get(service)
+            .map(|svc| svc.assigned_nodes.clone())
+            .unwrap_or_default()
+    }
+
+    /// All published dedicated-overlay endpoints for `service`, across every
+    /// hosting node. Order is unspecified (backed by a `HashMap`).
+    #[must_use]
+    pub fn service_overlay_endpoints_for(&self, service: &str) -> Vec<&ServiceOverlayEndpoint> {
+        self.service_overlay_endpoints
+            .values()
+            .filter(|ep| ep.service == service)
+            .collect()
     }
 }
 
@@ -659,6 +1068,32 @@ impl Default for RaftConfig {
 // Raft Coordinator
 // =============================================================================
 
+/// Whether the coordinator just created fresh raft state or loaded
+/// existing state from disk.
+///
+/// Surfaces the "is this a restart?" signal to callers so they can
+/// skip `bootstrap()` on resume — avoiding openraft's internal
+/// `error!("Can not initialize ...")` that would otherwise fire when
+/// bootstrap is invoked on already-initialised state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapState {
+    /// No prior raft state on disk; cluster will be bootstrapped if
+    /// this node is the leader.
+    Fresh,
+    /// Prior raft state was loaded from disk; caller should NOT call
+    /// `bootstrap()`.
+    Resuming,
+}
+
+/// Result of constructing a coordinator: the coordinator itself plus
+/// the bootstrap state observed at construction time.
+pub struct CoordinatorInit {
+    /// The freshly constructed coordinator.
+    pub coordinator: RaftCoordinator,
+    /// Whether on-disk raft state was present at construction time.
+    pub bootstrap_state: BootstrapState,
+}
+
 /// High-level coordinator for Raft consensus
 ///
 /// Wraps `zlayer_consensus::ConsensusNode` and provides a simpler API for:
@@ -708,15 +1143,36 @@ pub enum RotateReason {
     Manual,
 }
 
+/// Post-apply node-effect dispatch for the state-machine apply wrapper.
+///
+/// Pure inspection of the `(Request, Response)` pair: fires the matching
+/// notify on `effects` when an op that requires per-node side action
+/// applies successfully. Exposed as a free function for unit testing —
+/// the actual closure handed to the openraft state machine in
+/// [`RaftCoordinator::with_auth_secrets_and_effects`] is a thin wrapper
+/// around `state.apply(req)` + a call to this helper.
+fn dispatch_node_effects(effects: Option<&NodeSideEffects>, req: &Request, resp: &Response) {
+    if let (Some(effects), Request::Secrets(SecretsRaftOp::WipeJoinSecret)) = (effects, req) {
+        if matches!(resp, Response::Success { .. }) {
+            effects.fire_wipe_join_secret();
+        }
+    }
+}
+
 impl RaftCoordinator {
     /// Create a new Raft coordinator without auth.
+    ///
+    /// Discards [`BootstrapState`]. Use [`Self::with_auth_and_secrets`] directly
+    /// when you need to know whether this is a fresh cluster or a resumption.
     ///
     /// # Errors
     ///
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn new(config: RaftConfig) -> Result<Self> {
-        Self::with_auth_and_secrets(config, None, None, None).await
+        Ok(Self::with_auth_and_secrets(config, None, None, None)
+            .await?
+            .coordinator)
     }
 
     /// Create a new Raft coordinator with an optional bearer token for RPC auth.
@@ -728,12 +1184,17 @@ impl RaftCoordinator {
     /// [`Self::with_auth_and_secrets`] when the daemon also needs to drive
     /// the cluster secrets state machine.
     ///
+    /// Discards [`BootstrapState`]. Use [`Self::with_auth_and_secrets`] directly
+    /// when you need to know whether this is a fresh cluster or a resumption.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data directory cannot be created, or if the
     /// log store, state machine, or consensus node fails to initialize.
     pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
-        Self::with_auth_and_secrets(config, auth_token, None, None).await
+        Ok(Self::with_auth_and_secrets(config, auth_token, None, None)
+            .await?
+            .coordinator)
     }
 
     /// Create a new Raft coordinator with optional auth and optional secrets
@@ -755,7 +1216,28 @@ impl RaftCoordinator {
         auth_token: Option<String>,
         node_priv: Option<RecipientPrivateKey>,
         node_uuid: Option<String>,
-    ) -> Result<Self> {
+    ) -> Result<CoordinatorInit> {
+        Self::with_auth_secrets_and_effects(config, auth_token, node_priv, node_uuid, None).await
+    }
+
+    /// Like [`Self::with_auth_and_secrets`] but additionally accepts a
+    /// [`NodeSideEffects`] handle. The apply wrapper consults this handle
+    /// post-apply: when a `SecretsRaftOp::WipeJoinSecret` op applies
+    /// successfully it calls [`NodeSideEffects::fire_wipe_join_secret`],
+    /// waking the daemon's watcher to delete `{data_dir}/join_secret` on
+    /// this node. `None` keeps the apply path effect-free (used by tests
+    /// and the no-secrets-capability constructor shorthands).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::with_auth_and_secrets`].
+    pub async fn with_auth_secrets_and_effects(
+        config: RaftConfig,
+        auth_token: Option<String>,
+        node_priv: Option<RecipientPrivateKey>,
+        node_uuid: Option<String>,
+        node_effects: Option<Arc<NodeSideEffects>>,
+    ) -> Result<CoordinatorInit> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
             heartbeat_interval_ms: config.heartbeat_interval_ms,
@@ -769,6 +1251,46 @@ impl RaftCoordinator {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| SchedulerError::Raft(format!("Failed to create raft data dir: {e}")))?;
 
+        // Detect whether raft state already exists on disk BEFORE opening
+        // the redb files (since `redb::Database::create` will create the
+        // files if absent, after which existence is no longer a signal).
+        //
+        // The redb crate writes the file header eagerly on `create`, so a
+        // mere presence check is ambiguous; require non-zero length to
+        // distinguish "openraft has actually persisted state" from "we
+        // just opened an empty database in a prior aborted run".
+        #[cfg(feature = "persistent")]
+        let bootstrap_state = {
+            let log_path = config.data_dir.join("raft-log");
+            let sm_path = config.data_dir.join("raft-sm");
+            let has_log = std::fs::metadata(&log_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            let has_sm = std::fs::metadata(&sm_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if has_log || has_sm {
+                BootstrapState::Resuming
+            } else {
+                BootstrapState::Fresh
+            }
+        };
+        #[cfg(not(feature = "persistent"))]
+        let bootstrap_state = BootstrapState::Fresh;
+
+        // Apply wrapper: invokes the pure `ClusterState::apply` then dispatches
+        // node-local side effects (e.g. filesystem delete of `join_secret` after
+        // `WipeJoinSecret`). When `node_effects` is `None` the closure degenerates
+        // to a thin wrapper over `state.apply`, matching the pre-effects behavior.
+        let apply_fn = {
+            let effects = node_effects.clone();
+            move |state: &mut ClusterState, req: &Request| -> Response {
+                let resp = state.apply(req);
+                dispatch_node_effects(effects.as_deref(), req, &resp);
+                resp
+            }
+        };
+
         // Create storage (persistent redb or in-memory depending on feature)
         #[cfg(feature = "persistent")]
         let (log_store, state_machine, sm_data) = {
@@ -777,8 +1299,7 @@ impl RaftCoordinator {
             let log_store = RedbLogStore::<TypeConfig>::new(&log_path)
                 .map_err(|e| SchedulerError::Raft(format!("Failed to open raft log store: {e}")))?;
             let state_machine = RedbStateMachine::<TypeConfig, ClusterState, _>::new(
-                &sm_path,
-                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+                &sm_path, apply_fn,
             )
             .map_err(|e| SchedulerError::Raft(format!("Failed to open raft state machine: {e}")))?;
             let sm_data = state_machine.state();
@@ -787,9 +1308,7 @@ impl RaftCoordinator {
         #[cfg(not(feature = "persistent"))]
         let (log_store, state_machine, sm_data) = {
             let log_store = MemLogStore::<TypeConfig>::default();
-            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
-                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
-            );
+            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(apply_fn);
             let sm_data = state_machine.data();
             (log_store, state_machine, sm_data)
         };
@@ -817,12 +1336,15 @@ impl RaftCoordinator {
             _ => (None, None),
         };
 
-        Ok(Self {
-            node,
-            sm_data,
-            config,
-            node_priv,
-            node_uuid,
+        Ok(CoordinatorInit {
+            coordinator: Self {
+                node,
+                sm_data,
+                config,
+                node_priv,
+                node_uuid,
+            },
+            bootstrap_state,
         })
     }
 
@@ -977,6 +1499,7 @@ impl RaftCoordinator {
             os: params.os,
             arch: params.arch,
             slice_cidr: params.slice_cidr,
+            labels: params.labels,
         })
         .await?;
 
@@ -1504,6 +2027,28 @@ impl RaftCoordinator {
         Ok(())
     }
 
+    /// Trigger an immediate election on this node.
+    ///
+    /// Used by the leader's pre-self-upgrade orchestration: the leader
+    /// picks a healthy follower and asks it to campaign right away,
+    /// instead of waiting for heartbeat-loss to expire after the leader
+    /// drops. Raft safety guarantees that only an up-to-date candidate
+    /// can win, so the worst case is a single failed election round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `Raft::trigger().elect()` call
+    /// reports a fatal coordinator error (shutdown, storage failure).
+    pub async fn trigger_elect(&self) -> Result<()> {
+        self.node
+            .raft()
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("trigger_elect failed: {e}")))?;
+        Ok(())
+    }
+
     /// Get a reference to the underlying Raft instance.
     ///
     /// This is used by the Raft RPC service to forward RPCs to the Raft node.
@@ -1619,6 +2164,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secrets_raft_op_roundtrips_through_postcard() {
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let cases = [
+            SecretsRaftOp::RevokeNode {
+                node_id: "n1".into(),
+            },
+            SecretsRaftOp::WipeJoinSecret,
+            SecretsRaftOp::DeleteSecret {
+                storage_key: "scope:key".into(),
+            },
+        ];
+        for op in &cases {
+            let bytes = postcard2::to_vec(op).expect("encode");
+            let back: SecretsRaftOp = postcard2::from_bytes(&bytes).expect("decode");
+            let _ = format!("{back:?}");
+        }
+    }
+
+    #[test]
     fn test_cluster_state_service_operations() {
         let mut state = ClusterState::new();
 
@@ -1695,6 +2260,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         let node = state.get_node(1).unwrap();
@@ -1702,6 +2268,108 @@ mod tests {
         assert_eq!(node.cpu_total, 8.0);
         assert_eq!(node.memory_total, 16_000_000_000);
         assert_eq!(node.status, "ready");
+    }
+
+    #[test]
+    fn update_node_mode_changes_node_info() {
+        let mut state = ClusterState::new();
+
+        state.apply(&Request::RegisterNode {
+            node_id: 7,
+            address: "10.0.0.7:9000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 4.0,
+            memory_total: 8_000_000_000,
+            disk_total: 100_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+            labels: HashMap::new(),
+        });
+
+        let resp = state.apply(&Request::UpdateNodeMode {
+            node_id: 7,
+            mode: "replicate".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        assert_eq!(state.get_node(7).unwrap().mode, "replicate");
+
+        // Invalid mode rejected, NodeInfo unchanged.
+        let bad = state.apply(&Request::UpdateNodeMode {
+            node_id: 7,
+            mode: "bogus".to_string(),
+        });
+        assert!(matches!(bad, Response::Error { .. }));
+        assert_eq!(state.get_node(7).unwrap().mode, "replicate");
+
+        // Unknown node id surfaces as an error.
+        let missing = state.apply(&Request::UpdateNodeMode {
+            node_id: 999,
+            mode: "full".to_string(),
+        });
+        assert!(matches!(missing, Response::Error { .. }));
+    }
+
+    #[test]
+    fn set_node_labels_inserts_and_removes() {
+        let mut state = ClusterState::new();
+        state.apply(&Request::RegisterNode {
+            node_id: 7,
+            address: "10.0.0.7:9000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
+            cpu_total: 4.0,
+            memory_total: 8_000_000_000,
+            disk_total: 100_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+            os: None,
+            arch: None,
+            slice_cidr: String::new(),
+            labels: HashMap::from([("zone".to_string(), "a".to_string())]),
+        });
+
+        // Insert one, overwrite an existing, then a second apply removes a key.
+        let set = HashMap::from([
+            ("zone".to_string(), "b".to_string()),
+            ("tier".to_string(), "edge".to_string()),
+        ]);
+        let resp = state.apply(&Request::SetNodeLabels {
+            node_id: 7,
+            set,
+            remove: vec![],
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        let labels = &state.get_node(7).unwrap().labels;
+        assert_eq!(labels.get("zone").map(String::as_str), Some("b"));
+        assert_eq!(labels.get("tier").map(String::as_str), Some("edge"));
+
+        let resp = state.apply(&Request::SetNodeLabels {
+            node_id: 7,
+            set: HashMap::new(),
+            remove: vec!["tier".to_string()],
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        let labels = &state.get_node(7).unwrap().labels;
+        assert!(!labels.contains_key("tier"));
+        assert_eq!(labels.get("zone").map(String::as_str), Some("b"));
+
+        // Unknown node id surfaces as an error.
+        let missing = state.apply(&Request::SetNodeLabels {
+            node_id: 999,
+            set: HashMap::new(),
+            remove: vec![],
+        });
+        assert!(matches!(missing, Response::Error { .. }));
     }
 
     #[test]
@@ -1720,7 +2388,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_state_save_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-state-save-load-")
+            .unwrap();
         let mut state = ClusterState::new();
         state.apply(&Request::UpdateServiceState {
             service_name: "test-svc".to_string(),
@@ -1746,6 +2416,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         // Save
@@ -1766,7 +2437,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_state_save_load_ipv6_overlay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-state-save-load-ipv6-overlay-")
+            .unwrap();
         let mut state = ClusterState::new();
         state.apply(&Request::UpdateServiceState {
             service_name: "test-svc-v6".to_string(),
@@ -1792,6 +2465,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         // Save
@@ -1837,6 +2511,7 @@ mod tests {
             os: None,
             arch: None,
             slice_cidr: String::new(),
+            labels: HashMap::new(),
         });
 
         let node = state.get_node(3).unwrap();
@@ -1850,7 +2525,9 @@ mod tests {
 
     #[test]
     fn test_force_leader_no_marker() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-force-leader-no-marker-")
+            .unwrap();
         let result = load_and_clear_force_leader_state(dir.path()).unwrap();
         assert!(result.is_none());
     }
@@ -1951,5 +2628,486 @@ mod tests {
             RotateReason::NodeRevoked { node_id } => assert_eq!(node_id, "revoked-uuid"),
             RotateReason::Scheduled | RotateReason::Manual => panic!("wrong variant"),
         }
+    }
+
+    /// Constructing a coordinator twice in the same data directory must
+    /// report `Fresh` on the first open (no files on disk) and `Resuming`
+    /// on the second open (after `bootstrap()` has persisted state).
+    ///
+    /// This is the signal `daemon.rs` uses to decide whether to call
+    /// `bootstrap()` — the previous `metrics.current_term > 0` probe was
+    /// racy because the freshly constructed `RaftCore` hadn't finished its
+    /// async state-load when the daemon probed it, so we'd incorrectly
+    /// re-bootstrap and trigger openraft's internal
+    /// `error!("Can not initialize ...")` line.
+    #[cfg(feature = "persistent")]
+    #[tokio::test]
+    async fn coordinator_reports_fresh_then_resuming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = RaftConfig {
+            node_id: 1,
+            address: "127.0.0.1:0".to_string(),
+            data_dir: tmp.path().to_path_buf(),
+            ..RaftConfig::default()
+        };
+
+        // First open: no files on disk → Fresh.
+        let init1 = RaftCoordinator::with_auth_and_secrets(config.clone(), None, None, None)
+            .await
+            .expect("first coordinator construction");
+        assert_eq!(init1.bootstrap_state, BootstrapState::Fresh);
+
+        // Trigger a disk write that populates raft-log/raft-sm. Calling
+        // `bootstrap()` writes the initial membership entry.
+        init1
+            .coordinator
+            .bootstrap()
+            .await
+            .expect("bootstrap on fresh coordinator");
+        init1
+            .coordinator
+            .shutdown()
+            .await
+            .expect("shutdown first coordinator");
+        drop(init1);
+        // Give background tasks (raft tick loop, state-machine worker) a beat
+        // to release the redb file lock. Redb releases the OS-level lock when
+        // its last in-process handle drops; the consensus node holds those
+        // handles inside spawned tasks that finish a tick or two after
+        // `shutdown()` returns.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Second open: files exist and are non-empty → Resuming.
+        let init2 = RaftCoordinator::with_auth_and_secrets(config, None, None, None)
+            .await
+            .expect("second coordinator construction");
+        assert_eq!(init2.bootstrap_state, BootstrapState::Resuming);
+        init2.coordinator.shutdown().await.ok();
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_fires_on_successful_wipe_join_secret() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::WipeJoinSecret),
+            &Response::Success { data: None },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s of fire")
+            .expect("waiter task did not panic");
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_does_not_fire_on_error_response() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::WipeJoinSecret),
+            &Response::Error {
+                message: "simulated".into(),
+            },
+        );
+
+        // Notify must NOT have fired — waiter should still be parked.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await;
+        assert!(
+            result.is_err(),
+            "dispatch_node_effects must not fire on Response::Error",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_node_effects_does_not_fire_for_other_ops() {
+        use std::sync::Arc;
+        use zlayer_secrets::NodeSideEffects;
+        use zlayer_types::api::internal::SecretsRaftOp;
+
+        let effects = NodeSideEffects::new();
+        let cloned = Arc::clone(&effects);
+        let waiter = tokio::spawn(async move {
+            cloned.wait_wipe_join_secret().await;
+        });
+        tokio::task::yield_now().await;
+
+        // A different SecretsRaftOp — should not fire.
+        super::dispatch_node_effects(
+            Some(effects.as_ref()),
+            &Request::Secrets(SecretsRaftOp::DeleteSecret {
+                storage_key: "dep:nope".into(),
+            }),
+            &Response::Success { data: None },
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await;
+        assert!(
+            result.is_err(),
+            "dispatch_node_effects must only fire for WipeJoinSecret",
+        );
+    }
+
+    #[test]
+    fn grant_renew_expire_lease_round_trip() {
+        let mut state = ClusterState::new();
+        let now_ns: u64 = 1_700_000_000_000_000_000;
+
+        let resp = state.apply(&Request::GrantWorkerLease {
+            node_id: 42,
+            holder: "worker-cn-1".into(),
+            acquired_ns: now_ns,
+            renewed_ns: now_ns,
+            ttl_secs: 60,
+        });
+        assert!(matches!(resp, Response::Success { .. }));
+        assert!(state.worker_leases.contains_key(&42));
+
+        // Renew advances renewed_ns and increments revision.
+        let later = now_ns + 30_000_000_000;
+        state.apply(&Request::RenewWorkerLease {
+            node_id: 42,
+            renewed_ns: later,
+            ttl_secs: 90,
+        });
+        let l = state.worker_leases.get(&42).expect("present");
+        assert_eq!(l.renewed_ns, later);
+        assert_eq!(l.ttl_secs, 90);
+        assert_eq!(l.revision, 2);
+
+        // Stale renew (renewed_ns < current) is ignored.
+        let stale_renewed_ns = now_ns - 1_000_000_000;
+        state.apply(&Request::RenewWorkerLease {
+            node_id: 42,
+            renewed_ns: stale_renewed_ns,
+            ttl_secs: 10,
+        });
+        let l = state.worker_leases.get(&42).expect("still present");
+        assert_eq!(l.renewed_ns, later); // unchanged
+        assert_eq!(l.ttl_secs, 90); // unchanged
+
+        // Expire removes.
+        state.apply(&Request::ExpireWorkerLease { node_id: 42 });
+        assert!(!state.worker_leases.contains_key(&42));
+
+        // Idempotent expire = no-op.
+        let resp2 = state.apply(&Request::ExpireWorkerLease { node_id: 42 });
+        assert!(matches!(resp2, Response::Success { .. }));
+    }
+
+    #[test]
+    fn worker_lease_is_expired_math() {
+        let rec = WorkerLeaseRecord {
+            node_id: 1,
+            holder: "x".into(),
+            acquired_ns: 1_000_000_000,
+            renewed_ns: 1_000_000_000,
+            ttl_secs: 10,
+            revision: 1,
+        };
+        // 10s TTL + 0 grace; not expired at +5s, expired at +10s.
+        assert!(!rec.is_expired(1_000_000_000 + 5_000_000_000, 0));
+        assert!(rec.is_expired(1_000_000_000 + 10_000_000_000, 0));
+        // With 5s grace: not expired at +10s, expired at +15s.
+        assert!(!rec.is_expired(1_000_000_000 + 10_000_000_000, 5));
+        assert!(rec.is_expired(1_000_000_000 + 15_000_000_000, 5));
+    }
+
+    #[test]
+    fn old_snapshot_without_worker_leases_field_deserializes() {
+        // Simulates a snapshot serialized before worker_leases existed.
+        // serde_json equivalent of legacy ClusterState (no worker_leases key).
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // worker_leases intentionally absent
+            // secrets intentionally absent (has #[serde(default)] already)
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(s.worker_leases.is_empty());
+    }
+
+    // -- ServiceSubnet assignment dispatch ---------------------------------
+
+    #[test]
+    fn default_service_subnet_registry_constants_are_consistent() {
+        // Cheap correctness check for the hard-coded defaults — guards
+        // against a future edit that pairs incompatible constants.
+        let registry = default_service_subnet_registry();
+        assert_eq!(registry.slice_prefix(), DEFAULT_SERVICE_SUBNET_SLICE_PREFIX);
+        assert_eq!(
+            registry.cluster_cidr().to_string(),
+            DEFAULT_SERVICE_SUBNET_CLUSTER_CIDR
+        );
+    }
+
+    #[test]
+    fn assign_and_release_service_subnet_roundtrip() {
+        let mut state = ClusterState::new();
+
+        // Assign: should return Success with the assigned CIDR in `data`,
+        // and the registry should contain the entry.
+        let resp = state.apply(&Request::AssignServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        let assigned_cidr = match resp {
+            Response::Success { data: Some(s) } => s,
+            other => panic!("expected Success with CIDR data, got {other:?}"),
+        };
+        assert_eq!(state.service_subnets.assigned_count(), 1);
+        let in_registry = state
+            .service_subnets
+            .get("api", "7")
+            .expect("registry has the entry");
+        assert_eq!(in_registry.to_string(), assigned_cidr);
+
+        // Release: drops the entry; second release is a no-op.
+        let resp = state.apply(&Request::ReleaseServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert!(state.service_subnets.get("api", "7").is_none());
+        assert_eq!(state.service_subnets.assigned_count(), 0);
+
+        let resp = state.apply(&Request::ReleaseServiceSubnet {
+            service_name: "api".to_string(),
+            node_id: 7,
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+    }
+
+    #[test]
+    fn assign_service_subnet_is_deterministic_across_nodes() {
+        // Two independently-constructed `ClusterState`s (representing two
+        // raft replicas) must converge on the same (service, node) ->
+        // subnet mapping after applying the same sequence of commands —
+        // this is what makes the registry safe to drive through Raft.
+        let mut a = ClusterState::new();
+        let mut b = ClusterState::new();
+
+        let ops = [
+            ("api", 1u64),
+            ("api", 2u64),
+            ("worker", 1u64),
+            ("worker", 3u64),
+            ("scheduler", 42u64),
+        ];
+
+        for (svc, nid) in ops {
+            let ra = a.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            let rb = b.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            match (ra, rb) {
+                (Response::Success { data: Some(ca) }, Response::Success { data: Some(cb) }) => {
+                    assert_eq!(ca, cb, "divergent assignment for ({svc}, {nid})");
+                }
+                other => panic!("expected matching Success responses, got {other:?}"),
+            }
+        }
+
+        // Snapshot comparison — both registries must agree slot-for-slot.
+        let snap_a = a.service_subnets.snapshot();
+        let snap_b = b.service_subnets.snapshot();
+        assert_eq!(snap_a.assignments, snap_b.assignments);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_service_subnets() {
+        let mut state = ClusterState::new();
+
+        for (svc, nid) in [("a", 10u64), ("b", 20u64), ("c", 30u64)] {
+            let resp = state.apply(&Request::AssignServiceSubnet {
+                service_name: svc.to_string(),
+                node_id: nid,
+            });
+            assert!(matches!(resp, Response::Success { data: Some(_) }));
+        }
+        assert_eq!(state.service_subnets.assigned_count(), 3);
+
+        // Serialize the entire ClusterState through serde_json (mirrors the
+        // shape force-leader save/load and openraft snapshots use) and
+        // restore it; the registry must come back with the same entries.
+        let bytes = serde_json::to_vec(&state).expect("serialize ClusterState");
+        let restored: ClusterState = serde_json::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(restored.service_subnets.assigned_count(), 3);
+        for (svc, nid) in [("a", 10u64), ("b", 20u64), ("c", 30u64)] {
+            let nk = nid.to_string();
+            let before = state
+                .service_subnets
+                .get(svc, &nk)
+                .expect("pre-snapshot entry");
+            let after = restored
+                .service_subnets
+                .get(svc, &nk)
+                .expect("post-restore entry");
+            assert_eq!(before, after, "subnet mismatch for ({svc}, {nid})");
+        }
+    }
+
+    #[test]
+    fn old_snapshot_without_service_subnets_field_deserializes() {
+        // Snapshots written before `service_subnets` existed must still
+        // deserialize cleanly — they get an empty registry built from the
+        // project-wide defaults via `#[serde(default = ...)]`.
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // service_subnets, worker_leases, secrets all intentionally
+            // absent — every one is `#[serde(default)]`-style.
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert_eq!(s.service_subnets.assigned_count(), 0);
+        assert_eq!(
+            s.service_subnets.slice_prefix(),
+            DEFAULT_SERVICE_SUBNET_SLICE_PREFIX
+        );
+    }
+
+    // -- ServiceOverlayEndpoint (Dedicated mode) dispatch ------------------
+
+    fn sample_endpoint(node_id: NodeId, service: &str) -> ServiceOverlayEndpoint {
+        ServiceOverlayEndpoint {
+            node_id,
+            service: service.to_string(),
+            wg_public_key: format!("pubkey-{node_id}-{service}"),
+            endpoint: format!("10.0.0.{node_id}:51820"),
+            overlay_ip: format!("10.200.1.{node_id}"),
+            subnet: "10.200.1.0/28".to_string(),
+        }
+    }
+
+    #[test]
+    fn set_and_remove_service_overlay_endpoint_roundtrip() {
+        let mut state = ClusterState::new();
+        let ep = sample_endpoint(7, "api");
+
+        let resp = state.apply(&Request::SetServiceOverlayEndpoint {
+            endpoint: ep.clone(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+
+        let key = ServiceOverlayEndpoint::map_key(7, "api");
+        assert_eq!(state.service_overlay_endpoints.get(&key), Some(&ep));
+        assert_eq!(state.service_overlay_endpoints.len(), 1);
+
+        // Re-publish overwrites in place (same key), not append.
+        let mut ep2 = ep.clone();
+        ep2.endpoint = "10.0.0.7:52000".to_string();
+        let resp = state.apply(&Request::SetServiceOverlayEndpoint {
+            endpoint: ep2.clone(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert_eq!(state.service_overlay_endpoints.len(), 1);
+        assert_eq!(state.service_overlay_endpoints.get(&key), Some(&ep2));
+
+        // Remove drops the entry; a second remove is a no-op.
+        let resp = state.apply(&Request::RemoveServiceOverlayEndpoint {
+            node_id: 7,
+            service: "api".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert!(!state.service_overlay_endpoints.contains_key(&key));
+
+        let resp = state.apply(&Request::RemoveServiceOverlayEndpoint {
+            node_id: 7,
+            service: "api".to_string(),
+        });
+        assert!(matches!(resp, Response::Success { data: None }));
+        assert_eq!(state.service_overlay_endpoints.len(), 0);
+    }
+
+    #[test]
+    fn service_overlay_endpoints_serde_roundtrip() {
+        let mut state = ClusterState::new();
+        for (nid, svc) in [(1u64, "api"), (2, "api"), (3, "worker")] {
+            state.apply(&Request::SetServiceOverlayEndpoint {
+                endpoint: sample_endpoint(nid, svc),
+            });
+        }
+        assert_eq!(state.service_overlay_endpoints.len(), 3);
+
+        let bytes = serde_json::to_vec(&state).expect("serialize ClusterState");
+        let restored: ClusterState = serde_json::from_slice(&bytes).expect("deserialize");
+
+        assert_eq!(
+            restored.service_overlay_endpoints,
+            state.service_overlay_endpoints
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_service_overlay_endpoints_field_deserializes() {
+        // Snapshots written before `service_overlay_endpoints` existed must
+        // still deserialize cleanly — the field is `#[serde(default)]` so it
+        // restores to an empty map with no version bump / migration.
+        let legacy = serde_json::json!({
+            "services": {},
+            "nodes": {},
+            "scale_events": []
+            // service_overlay_endpoints (and friends) intentionally absent.
+        });
+        let s: ClusterState = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(s.service_overlay_endpoints.is_empty());
+    }
+
+    #[test]
+    fn nodes_hosting_reads_assigned_nodes() {
+        let mut state = ClusterState::new();
+
+        // Unknown service -> empty.
+        assert!(state.nodes_hosting("missing").is_empty());
+
+        state.apply(&Request::UpdateServiceState {
+            service_name: "api".to_string(),
+            state: ServiceState {
+                assigned_nodes: vec![3, 1, 4],
+                ..Default::default()
+            },
+        });
+        assert_eq!(state.nodes_hosting("api"), vec![3, 1, 4]);
+
+        // service_overlay_endpoints_for filters by service.
+        for (nid, svc) in [(3u64, "api"), (1, "api"), (4, "worker")] {
+            state.apply(&Request::SetServiceOverlayEndpoint {
+                endpoint: sample_endpoint(nid, svc),
+            });
+        }
+        let mut api_nodes: Vec<NodeId> = state
+            .service_overlay_endpoints_for("api")
+            .into_iter()
+            .map(|ep| ep.node_id)
+            .collect();
+        api_nodes.sort_unstable();
+        assert_eq!(api_nodes, vec![1, 3]);
     }
 }

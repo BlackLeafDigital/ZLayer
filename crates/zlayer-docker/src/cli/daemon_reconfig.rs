@@ -370,8 +370,21 @@ mod macos {
         let domain = if is_system {
             "system".to_string()
         } else {
-            #[allow(unsafe_code)]
-            let uid = unsafe { libc::getuid() };
+            // The per-user daemon lives in the INVOKING user's GUI domain. Under
+            // `sudo` (how `zlayer docker install/uninstall` and `install-dev.sh`
+            // run) the euid is 0, so `getuid()` would yield `gui/0` — a domain
+            // that doesn't exist (`Bootstrap failed: 125: Domain does not
+            // support specified action`), leaving the real `gui/<uid>` daemon
+            // unreconciled. Prefer `$SUDO_UID` when present.
+            let uid = std::env::var("SUDO_UID")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or_else(|| {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        libc::getuid()
+                    }
+                });
             format!("gui/{uid}")
         };
         // bootout may fail if not currently loaded — tolerate.

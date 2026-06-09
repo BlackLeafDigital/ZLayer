@@ -14,8 +14,9 @@ use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::handlers::{reconcile_standalone_containers, start_auto_remove_subscriber};
 use zlayer_api::router::{
     build_cluster_routes, build_container_network_routes, build_container_routes,
-    build_cron_routes, build_event_routes, build_job_routes, build_network_routes,
-    build_node_routes, build_overlay_routes, build_tunnel_routes, build_volume_routes,
+    build_cron_routes, build_edge_cache_routes, build_event_routes, build_job_routes,
+    build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
+    build_volume_routes,
 };
 use zlayer_api::{
     ApiConfig, BridgeNetworkApiState, BuildState, ContainerApiState, CronState, JobState,
@@ -709,9 +710,15 @@ pub(crate) async fn serve(
     host_network: bool,
     data_dir: std::path::PathBuf,
     deployment_name: String,
+    daemon_name: String,
     wg_port: Option<u16>,
     dns_port: Option<u16>,
+    restart_on_exit: bool,
 ) -> Result<()> {
+    // Stash the `--restart-on-exit` flag in a process-global slot so
+    // `serve_with_external_shutdown` (whose public signature is locked by the
+    // Windows Service host in `daemon_service.rs`) picks it up after teardown.
+    set_pending_restart_on_exit(restart_on_exit);
     // Box::pin keeps the top-level future below clippy's `large_futures`
     // threshold — `serve_with_external_shutdown` materialises the whole
     // daemon state on the stack and its future is sizeable.
@@ -723,6 +730,7 @@ pub(crate) async fn serve(
         host_network,
         data_dir,
         deployment_name,
+        daemon_name,
         wg_port,
         dns_port,
         None,
@@ -744,15 +752,18 @@ pub(crate) async fn serve_with_nat_overrides(
     host_network: bool,
     data_dir: std::path::PathBuf,
     deployment_name: String,
+    daemon_name: String,
     wg_port: Option<u16>,
     dns_port: Option<u16>,
     nat_overrides: NatCliOverrides,
+    restart_on_exit: bool,
 ) -> Result<()> {
     // Stash the overrides in a process-global slot so
     // `serve_with_external_shutdown` (which keeps its public signature for
     // back-compat with `daemon_service.rs`) can pick them up alongside the
     // `ZLAYER_NAT_*` env vars.
     set_pending_nat_overrides(nat_overrides);
+    set_pending_restart_on_exit(restart_on_exit);
     Box::pin(serve_with_external_shutdown(
         bind,
         jwt_secret,
@@ -761,11 +772,107 @@ pub(crate) async fn serve_with_nat_overrides(
         host_network,
         data_dir,
         deployment_name,
+        daemon_name,
         wg_port,
         dns_port,
         None,
     ))
     .await
+}
+
+/// CLI overrides for the daemon API listener's TLS configuration.
+///
+/// Resolved inside [`serve_with_external_shutdown`] and translated into a
+/// [`zlayer_api::config::ApiTlsConfig`] that is set on [`ApiConfig::tls`]
+/// before the API listener starts. The three fields encode the three valid
+/// modes:
+///
+/// - `cert = Some, key = Some, acme = false` → [`ApiTlsConfig::Static`].
+/// - `cert = None, key = None, acme = true`  → [`ApiTlsConfig::Managed`],
+///   sharing the proxy's `Arc<CertManager>`.
+/// - `cert = None, key = None, acme = false` → no TLS (plain HTTP).
+///
+/// All other combinations are rejected by clap's `requires` /
+/// `conflicts_with` constraints on `Commands::Serve` (see `cli.rs`), so the
+/// translation logic in [`build_api_tls_config_from_overrides`] uses
+/// `unreachable!` for the unreachable arms.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ApiTlsCliOverrides {
+    /// `--api-tls-cert <PATH>`: PEM-encoded certificate chain to load at
+    /// startup. Mutually exclusive with `acme`. Requires `key`.
+    pub cert: Option<std::path::PathBuf>,
+    /// `--api-tls-key <PATH>`: PEM-encoded private key paired with `cert`.
+    pub key: Option<std::path::PathBuf>,
+    /// `--api-tls-acme`: delegate cert resolution to the proxy's
+    /// `Arc<CertManager>` instead of loading static files.
+    pub acme: bool,
+}
+
+/// Process-global slot for the most recently parsed [`ApiTlsCliOverrides`].
+///
+/// Mirrors the [`PENDING_TUNNEL_OVERRIDES`] / [`PENDING_NAT_OVERRIDES`]
+/// pattern: `main.rs` calls [`set_pending_api_tls_overrides`] before
+/// dispatching to `serve()`, and [`serve_with_external_shutdown`] calls
+/// [`take_pending_api_tls_overrides`] to pick the value back up. Keeping
+/// the overrides in a process-global slot avoids extending
+/// `serve_with_external_shutdown`'s public signature (which the Windows
+/// Service host pins for back-compat).
+static PENDING_API_TLS_OVERRIDES: std::sync::Mutex<Option<ApiTlsCliOverrides>> =
+    std::sync::Mutex::new(None);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_api_tls_overrides(overrides: ApiTlsCliOverrides) {
+    if let Ok(mut slot) = PENDING_API_TLS_OVERRIDES.lock() {
+        *slot = Some(overrides);
+    }
+}
+
+fn take_pending_api_tls_overrides() -> ApiTlsCliOverrides {
+    PENDING_API_TLS_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default()
+}
+
+/// Translate parsed `--api-tls-*` CLI overrides into an [`ApiTlsConfig`].
+///
+/// `cert_manager` is the proxy's `Arc<CertManager>` (always constructed by
+/// `init_daemon`), shared with the `Managed` variant when `--api-tls-acme`
+/// is set so the daemon API serves the same cert pool the reverse proxy
+/// uses for L7 routes.
+///
+/// Clap's `requires` / `conflicts_with` constraints on `Commands::Serve`
+/// guarantee that only three combinations of the three fields are
+/// reachable; all others trip the `unreachable!` arm and indicate a
+/// regression in the CLI definition rather than user input.
+fn build_api_tls_config_from_overrides(
+    overrides: &ApiTlsCliOverrides,
+    cert_manager: &Arc<zlayer_proxy::CertManager>,
+) -> Option<zlayer_api::config::ApiTlsConfig> {
+    match (
+        overrides.cert.clone(),
+        overrides.key.clone(),
+        overrides.acme,
+    ) {
+        (Some(cert_path), Some(key_path), false) => {
+            Some(zlayer_api::config::ApiTlsConfig::Static {
+                cert_path,
+                key_path,
+            })
+        }
+        (None, None, true) => Some(zlayer_api::config::ApiTlsConfig::Managed {
+            cert_manager: Arc::clone(cert_manager),
+        }),
+        (None, None, false) => None,
+        // Clap's `requires`/`conflicts_with` make all other combinations
+        // unreachable. If we ever hit this, the CLI definition has drifted.
+        _ => unreachable!(
+            "clap should have rejected this combination of --api-tls-* flags; \
+             got cert={:?}, key={:?}, acme={}",
+            overrides.cert, overrides.key, overrides.acme,
+        ),
+    }
 }
 
 /// CLI overrides for the daemon-side tunnel server.
@@ -803,6 +910,106 @@ fn take_pending_tunnel_overrides() -> TunnelCliOverrides {
         .ok()
         .and_then(|mut slot| slot.take())
         .unwrap_or_default()
+}
+
+/// Pending `--restart-on-exit` flag.
+///
+/// `serve()` / `serve_with_nat_overrides()` stash this for
+/// `serve_with_external_shutdown()` to pick up — same pattern as the tunnel /
+/// NAT overrides above. Keeping it in a process-global slot avoids changing
+/// `serve_with_external_shutdown`'s public signature (the Windows Service
+/// host in `daemon_service.rs` calls it with the legacy argument list).
+static PENDING_RESTART_ON_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_restart_on_exit(restart: bool) {
+    PENDING_RESTART_ON_EXIT.store(restart, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_restart_on_exit() -> bool {
+    PENDING_RESTART_ON_EXIT.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Pending `--vacuum-secrets` flag (Wave 6, v0.13.0).
+///
+/// When the daemon is launched with `--vacuum-secrets` (or
+/// `ZLAYER_VACUUM_SECRETS=true`), the boot path wipes
+/// `{data_dir}/join_secret` before the HS256 derivation reads it, forcing
+/// the HMAC key to regenerate. Useful when an operator suspects the
+/// symmetric secret has leaked. Ed25519-signed tokens are unaffected.
+///
+/// Stored in a process-global slot so `serve()`/`serve_with_nat_overrides()`
+/// can stash the parsed CLI value before delegating to
+/// `serve_with_external_shutdown()` (whose public signature is pinned by the
+/// Windows Service host in `daemon_service.rs`).
+static PENDING_VACUUM_SECRETS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_vacuum_secrets(vacuum: bool) {
+    PENDING_VACUUM_SECRETS.store(vacuum, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_vacuum_secrets() -> bool {
+    PENDING_VACUUM_SECRETS.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Pending `--secrets-only` flag.
+///
+/// When the daemon is launched with `--secrets-only` (or
+/// `ZLAYER_SECRETS_ONLY=true`), [`serve_with_external_shutdown`] mounts only
+/// the secrets/RBAC router surface (`/health`, `/auth`,
+/// `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`)
+/// and skips every orchestration nest. The HA secrets-store selection
+/// (`select_secrets_store`) is untouched — a clustered node with
+/// `wrapped_dek.bin` still serves through `RaftSecretsStore`.
+///
+/// Stored in a process-global slot so `main.rs` can stash the parsed CLI value
+/// before delegating to `serve()` / `serve_with_nat_overrides()` /
+/// `serve_with_external_shutdown()` (whose public signature is pinned by the
+/// Windows Service host in `daemon_service.rs`).
+static PENDING_SECRETS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_secrets_only(secrets_only: bool) {
+    PENDING_SECRETS_ONLY.store(secrets_only, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn take_pending_secrets_only() -> bool {
+    PENDING_SECRETS_ONLY.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Idempotently delete `{data_dir}/join_secret`.
+///
+/// Used by three call sites: the `--vacuum-secrets` flag at startup, the
+/// boot-time reconcile that consults `SecretsState::join_secret_wiped_at`,
+/// and the long-lived watcher task that drains
+/// [`zlayer_secrets::NodeSideEffects::wait_wipe_join_secret`] (fired by the
+/// Raft apply wrapper). `reason` is included in the log line so operators
+/// can correlate the delete with its trigger.
+async fn wipe_join_secret_file(data_dir: &std::path::Path, reason: &str) -> anyhow::Result<()> {
+    let path = data_dir.join("join_secret");
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                reason,
+                "removed cluster join_secret",
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %path.display(),
+                reason,
+                "join_secret already absent; nothing to remove",
+            );
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// Resolve the tunnel daemon config from CLI overrides + env vars + defaults.
@@ -1161,6 +1368,7 @@ pub(crate) async fn serve_with_external_shutdown(
     host_network: bool,
     data_dir: std::path::PathBuf,
     deployment_name: String,
+    daemon_name: String,
     wg_port: Option<u16>,
     dns_port: Option<u16>,
     external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
@@ -1182,6 +1390,23 @@ pub(crate) async fn serve_with_external_shutdown(
     // Pick up tunnel-server CLI overrides + ZLAYER_TUNNEL_* env vars.
     let tunnel_overrides = take_pending_tunnel_overrides();
     let tunnel_config = build_tunnel_config_from_overrides(&tunnel_overrides);
+
+    // Pick up daemon-API TLS CLI overrides. Translated below into an
+    // `ApiTlsConfig` once `cert_manager` is in scope (`init_daemon` always
+    // constructs one, so the `Managed` ACME path never lacks a backing
+    // resolver and we don't need a no-proxy guard here).
+    let api_tls_overrides = take_pending_api_tls_overrides();
+
+    // Pick up the `--secrets-only` flag (or `ZLAYER_SECRETS_ONLY`). When set,
+    // the router below mounts ONLY the secrets/RBAC surface and skips every
+    // orchestration nest. The daemon's infrastructure (overlay, Raft,
+    // secrets store selection) is still fully initialised by `init_daemon`,
+    // so a clustered secrets-only node serves through `RaftSecretsStore`
+    // exactly as a full node would; only the HTTP surface is trimmed.
+    let secrets_only = take_pending_secrets_only();
+    if secrets_only {
+        info!("Secrets-only mode: mounting secrets/RBAC router surface only");
+    }
     // Resolve the JWT signing secret. Priority is:
     //   1. Explicit `--jwt-secret` flag / `ZLAYER_JWT_SECRET` env var
     //      (clap reads both into the `jwt_secret` parameter).
@@ -1251,8 +1476,10 @@ pub(crate) async fn serve_with_external_shutdown(
     let config = DaemonConfig {
         host_network,
         deployment_name,
+        daemon_name,
         dns_port: resolved_dns_port,
         data_dir,
+        api_port: bind_addr.port(),
         log_dir,
         run_dir,
         s3_storage,
@@ -1279,6 +1506,24 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     let bound_listeners =
         zlayer_api::bind_dual_with_local_auth(bind_addr, socket_path, &jwt_secret_raw).await?;
+
+    // -----------------------------------------------------------------------
+    // 1d. Ensure the standalone overlayd daemon (the overlay-adapter owner) is
+    //     running before init_daemon constructs the OverlayManager — which is
+    //     now a thin overlayd client. Skipped entirely in host-network mode
+    //     (no overlay). On an installed host overlayd is its own OS service and
+    //     this just confirms reachability; in dev it spawns the binary detached.
+    // -----------------------------------------------------------------------
+    if !config.host_network {
+        if let Err(e) =
+            crate::commands::overlayd_supervisor::ensure_overlayd_running(&config.data_dir).await
+        {
+            warn!(
+                error = %e,
+                "overlayd not reachable; overlay networking will be degraded until it is up"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 2. Initialise all daemon infrastructure
@@ -1320,6 +1565,7 @@ pub(crate) async fn serve_with_external_shutdown(
         stream_registry,
         cert_manager,
         log_rotator_handle,
+        keystore_pruner_handle,
         health_checker_handle,
         nat_maintenance_handle,
         node_config,
@@ -1329,12 +1575,37 @@ pub(crate) async fn serve_with_external_shutdown(
         dead_node_detection_handle,
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
+        node_effects,
         replicator,
         job_executor,
         cron_scheduler,
         tunnel: tunnel_handles,
         tunnel_api_state,
+        capabilities: _capabilities,
     } = state;
+
+    // -----------------------------------------------------------------------
+    // 2c. Seed the live OverlayManager with this node's raft id and cluster
+    // WG public key. Both values are needed for the P9a service-overlay
+    // bridge: `setup_service_overlay` uses the raft node id as the
+    // partition key when assigning per-service subnets, and the pubkey is
+    // the local peer key used when extending the cluster transport's
+    // `AllowedIPs`. The manager is already inside `Arc<RwLock<_>>` at this
+    // point (init_daemon wrapped it), so the builder-style
+    // `with_local_node_id` is not callable; we use the post-construction
+    // setter instead, and the async `&self` `set_local_wg_pubkey` over a
+    // read guard.
+    if let Some(om_arc) = overlay.as_ref() {
+        {
+            let mut guard = om_arc.write().await;
+            guard.set_local_node_id(node_config.raft_node_id);
+        }
+        om_arc
+            .read()
+            .await
+            .set_local_wg_pubkey(node_config.wireguard_public_key.clone())
+            .await;
+    }
 
     // -----------------------------------------------------------------------
     // 3. Write daemon metadata JSON
@@ -1360,6 +1631,62 @@ pub(crate) async fn serve_with_external_shutdown(
             )
         })?;
     info!(path = %metadata_path.display(), "Daemon metadata written");
+
+    // -----------------------------------------------------------------------
+    // 3a'. Wave 6 (v0.13.0): `--vacuum-secrets` wipes the cluster
+    // `join_secret` BEFORE the loader runs so the HS256 HMAC key
+    // regenerates on the very next step. Ed25519 signing material (under
+    // `cluster_signing.key`) is intentionally untouched. The flag is
+    // consumed exactly once (the static slot is swapped to false) so a
+    // supervisor-driven respawn after this run does not vacuum a fresh
+    // secret on every restart.
+    // -----------------------------------------------------------------------
+    if take_pending_vacuum_secrets() {
+        wipe_join_secret_file(&config.data_dir, "--vacuum-secrets flag").await?;
+    }
+
+    // -----------------------------------------------------------------------
+    // 3a''. Boot reconcile: if a prior cluster-wide `WipeJoinSecret` Raft op
+    // already applied (state machine has `join_secret_wiped_at = Some(_)`)
+    // and this node still has a local copy (e.g. it restored from a snapshot
+    // where the wipe happened while this node was offline), delete it now
+    // before the HS256 HMAC loader runs. Idempotent; the helper is a no-op
+    // if the file is already absent.
+    //
+    // `_raft` may be `None` if Raft failed to initialize in `init_daemon`;
+    // in that case there is no cluster consensus to consult and we skip
+    // the reconcile entirely.
+    // -----------------------------------------------------------------------
+    if let Some(raft) = _raft.as_ref() {
+        let secrets_state = raft.secrets_state().await;
+        if secrets_state.join_secret_wiped_at.is_some() {
+            wipe_join_secret_file(&config.data_dir, "WipeJoinSecret applied in prior boot").await?;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3a'''. Watcher: drain `NodeSideEffects::wait_wipe_join_secret` and
+    // delete `{data_dir}/join_secret` on each fire. The Raft apply wrapper
+    // in `zlayer_scheduler::raft::ClusterState` calls `fire_wipe_join_secret`
+    // whenever `SecretsRaftOp::WipeJoinSecret` applies successfully, so
+    // this is the live (sub-second) path. The task lives for the daemon's
+    // lifetime; we keep the JoinHandle for shutdown.
+    // -----------------------------------------------------------------------
+    // The watcher is fire-and-forget for the daemon's lifetime; the
+    // `JoinHandle` is dropped immediately and the task runs detached.
+    // Graceful shutdown reaps it via the process exit.
+    {
+        let data_dir = config.data_dir.clone();
+        let effects = std::sync::Arc::clone(&node_effects);
+        std::mem::drop(tokio::spawn(async move {
+            loop {
+                effects.wait_wipe_join_secret().await;
+                if let Err(e) = wipe_join_secret_file(&data_dir, "WipeJoinSecret notify").await {
+                    tracing::error!(error = %e, "join_secret watcher: wipe failed");
+                }
+            }
+        }));
+    }
 
     // -----------------------------------------------------------------------
     // 3b. Generate or load the cluster join secret
@@ -1415,6 +1742,57 @@ pub(crate) async fn serve_with_external_shutdown(
 
         secret
     };
+
+    // Wave 1: Ed25519 signer for signed cluster join tokens.
+    //
+    // We persist the signing seed at {data_dir}/cluster_signing.key (mode 0600).
+    // The public key is exposed via GET /api/v1/cluster/signing-pubkey (Agent 1.3).
+    // HS256 (using join_secret above) and plaintext tokens remain accepted; the
+    // signer is plumbed but no token-format changes happen until Wave 3.
+    let cluster_signer = {
+        let path = config.data_dir.join("cluster_signing.key");
+        let signer = zlayer_secrets::ClusterSigner::load_or_generate(&path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to load or generate cluster signing keypair at {}",
+                    path.display()
+                )
+            })?;
+        info!(
+            kid = %signer.key_id(),
+            public_key_b64 = %signer.public_key_b64(),
+            path = %path.display(),
+            "Loaded cluster signing keypair"
+        );
+        Arc::new(signer)
+    };
+
+    // Wave 9: long-lived cluster CA. Generated once per cluster at
+    // first daemon start; NEVER rotated. Used to issue CaCerts
+    // embedded in v=2 signed join tokens so foreign clusters that
+    // imported this cluster's TrustBundle can validate them.
+    let cluster_ca = {
+        let path = config.data_dir.join("cluster_ca.key");
+        let ca = zlayer_secrets::ClusterCa::load_or_generate(&path)
+            .await
+            .context("loading or generating cluster CA")?;
+        info!(ca_kid = %ca.ca_kid(), path = %path.display(), "loaded cluster CA");
+        Some(std::sync::Arc::new(ca))
+    };
+
+    // Wave 11D: if a prior operator command set the cluster JWT
+    // algorithm to `Eddsa` but `{data_dir}/join_secret` is still
+    // present, surface a warning suggesting the cleanup. This is
+    // BEST-EFFORT — Raft state isn't directly readable here, so we
+    // only check the local file existence and rely on the next
+    // operator interaction to surface the policy.
+    if config.data_dir.join("join_secret").exists() {
+        tracing::info!(
+            "{{data_dir}}/join_secret is present; if you've migrated to EdDSA, run \
+             `zlayer cluster decommission-hs256 --vacuum-secret` to remove it"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // 3b'. Load (or generate + persist) the daemon UUID. This stamps every
@@ -1528,8 +1906,45 @@ pub(crate) async fn serve_with_external_shutdown(
     // -----------------------------------------------------------------------
     // 4. Build the full API router
     // -----------------------------------------------------------------------
+    // Translate the parsed `--api-tls-*` CLI overrides into an
+    // `ApiTlsConfig`. `cert_manager` is the proxy's `Arc<CertManager>`
+    // destructured from `DaemonState` above; sharing it with the daemon
+    // API listener means ACME-managed certs hot-reload uniformly across the
+    // proxy and the API. `init_daemon` unconditionally builds a
+    // `CertManager`, so the ACME path always has a backing resolver here
+    // and no "no-proxy" guard is required.
+    let api_tls = build_api_tls_config_from_overrides(&api_tls_overrides, &cert_manager);
+    match &api_tls {
+        Some(zlayer_api::config::ApiTlsConfig::Static {
+            cert_path,
+            key_path,
+        }) => {
+            info!(
+                cert = %cert_path.display(),
+                key = %key_path.display(),
+                "Daemon API listener will use static TLS",
+            );
+        }
+        Some(zlayer_api::config::ApiTlsConfig::Managed { .. }) => {
+            info!("Daemon API listener will use ACME/CertManager TLS");
+        }
+        None => {
+            info!("Daemon API listener will use plain HTTP (no TLS configured)");
+        }
+    }
+
+    // Capture the concrete `Arc<PersistentSecretsStore>` backing the API-key
+    // `CredentialStore` BEFORE it's moved into `api_config`. The credential
+    // routes (`/api/v1/credentials/*`, nested further below) need this concrete
+    // handle to build the typed Registry/Git credential stores — `CredentialState`
+    // is generic over `Arc<PersistentSecretsStore>`, NOT the `Arc<dyn SecretsStore>`
+    // that `SecretsState` consumes. `CredentialStore::store()` returns the inner
+    // `Arc`, so this is a cheap refcount clone over the same on-disk store.
+    let persistent_secrets_for_creds = credential_store.store().clone();
+
     let api_config = ApiConfig {
         bind: bind_addr,
+        tls: api_tls,
         jwt_secret,
         swagger_enabled: !no_swagger,
         credential_store: Some(credential_store),
@@ -1552,32 +1967,413 @@ pub(crate) async fn serve_with_external_shutdown(
             )
         })?;
 
+    // Retain a handle to the ServiceManager for the container API state so the
+    // unified container-name resolver + `docker ps` can see compose/deployment
+    // containers. `service_manager` itself is moved into `InternalState` below,
+    // so capture the clone now (it's a cheap `Arc`).
+    let container_service_manager = Arc::clone(&service_manager);
+
+    // -----------------------------------------------------------------------
+    // Cluster trait construction.
+    //
+    // Dispatches on `ClusterMode` loaded from `<data_dir>/cluster_mode.yaml`
+    // (defaults to `ClusterMode::SingleNode` when absent). The single-node
+    // shape is preserved as the default to keep developer / single-host
+    // deployments behaving identically without a config file.
+    //
+    // The local-dispatch closure is shared across every variant: it routes a
+    // scale request that targets THIS node back into
+    // `ServiceManager::scale_service_local`, breaking the cycle that would
+    // otherwise form once the manager holds an `Arc<dyn Cluster>` itself.
+    // -----------------------------------------------------------------------
+    let cluster_node_id = _raft.as_ref().map_or(1, |r| r.node_id());
+    let cluster_api_addr: std::net::SocketAddr = api_config.bind;
+
+    // Load the daemon's `ClusterMode` from `<data_dir>/cluster_mode.yaml` if
+    // present. The file is owned by the operator (or `zlayer node init`); a
+    // missing or malformed file falls back to `SingleNode` to keep the
+    // legacy single-host deployment behaviour unchanged.
+    let cluster_mode: zlayer_types::cluster::ClusterMode = {
+        let path = config.data_dir.join("cluster_mode.yaml");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(s) => match serde_yaml::from_str::<zlayer_types::cluster::ClusterMode>(&s) {
+                Ok(m) => {
+                    info!(path = %path.display(), "loaded ClusterMode from disk");
+                    m
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to parse cluster_mode.yaml; falling back to SingleNode"
+                    );
+                    zlayer_types::cluster::ClusterMode::SingleNode
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zlayer_types::cluster::ClusterMode::SingleNode
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to read cluster_mode.yaml; falling back to SingleNode"
+                );
+                zlayer_types::cluster::ClusterMode::SingleNode
+            }
+        }
+    };
+
+    let cluster_local_dispatch = {
+        let sm_weak = Arc::downgrade(&service_manager);
+        move |req: zlayer_scheduler::cluster::InternalScaleRequest| -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), zlayer_scheduler::cluster::ClusterError>,
+                    > + Send,
+            >,
+        > {
+            let sm_weak = sm_weak.clone();
+            Box::pin(async move {
+                let Some(sm) = sm_weak.upgrade() else {
+                    return Err(zlayer_scheduler::cluster::ClusterError::Transport(
+                        "ServiceManager has been dropped".to_string(),
+                    ));
+                };
+                let mgr = sm.read().await;
+                mgr.scale_service_local(&req.service, req.replicas)
+                    .await
+                    .map_err(|e| zlayer_scheduler::cluster::ClusterError::Transport(e.to_string()))
+            })
+        }
+    };
+
+    // Shared HTTP client + token used by Raft / Static cluster fan-out. The
+    // single-node and worker-tier variants don't need them but it's cheap to
+    // build once up front and clone where required.
+    let cluster_http_client = reqwest::Client::new();
+    let cluster_internal_token = daemon_internal_token.clone();
+
+    // Captured from the worker-tier Server arm so the `/api/v1/cluster/workers`
+    // handler in `ClusterApiState` can call `known_workers()` after the match
+    // moves `dispatcher` into the `WorkerTierCluster`. `None` in every other
+    // cluster mode — the handler returns an empty list when this is unset.
+    let mut worker_dispatcher_for_api: Option<
+        std::sync::Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher>,
+    > = None;
+
+    // Captured from the worker-tier Server arm so the
+    // `/api/v1/cluster/gossip/peers` handler can return a snapshot. `None`
+    // in every other cluster mode — the handler returns an empty list when
+    // this is unset.
+    let mut gossip_pool_for_api: Option<std::sync::Arc<zlayer_overlay::gossip::GossipPool>> = None;
+
+    let cluster_handle: std::sync::Arc<dyn zlayer_scheduler::cluster::Cluster> = match cluster_mode
+    {
+        zlayer_types::cluster::ClusterMode::SingleNode => {
+            std::sync::Arc::new(zlayer_scheduler::cluster::SingleNodeCluster::new(
+                cluster_node_id,
+                cluster_api_addr,
+                "linux",
+                cluster_local_dispatch,
+            ))
+        }
+        zlayer_types::cluster::ClusterMode::Raft { .. } => {
+            let Some(raft) = _raft.clone() else {
+                anyhow::bail!(
+                    "ClusterMode::Raft requires raft consensus to have initialized; \
+                     check daemon logs for raft startup errors"
+                );
+            };
+            std::sync::Arc::new(zlayer_scheduler::cluster::RaftCluster::new(
+                cluster_node_id,
+                raft,
+                cluster_http_client.clone(),
+                cluster_internal_token.clone(),
+                cluster_local_dispatch,
+            ))
+        }
+        zlayer_types::cluster::ClusterMode::Static {
+            node_id,
+            peers,
+            heartbeat_interval,
+            failure_threshold,
+        } => {
+            let peer_specs = peers
+                .into_iter()
+                .map(|p| zlayer_scheduler::cluster::StaticPeerSpec {
+                    id: p.id,
+                    api_addr: p.api_addr,
+                    labels: p.labels,
+                    os: p.os,
+                })
+                .collect();
+            let failure_threshold_secs = failure_threshold.as_secs();
+            let static_cluster =
+                std::sync::Arc::new(zlayer_scheduler::cluster::StaticCluster::new(
+                    node_id,
+                    peer_specs,
+                    failure_threshold_secs,
+                    cluster_http_client.clone(),
+                    cluster_internal_token.clone(),
+                    cluster_local_dispatch,
+                ));
+            static_cluster.clone().start_heartbeats(heartbeat_interval);
+            static_cluster
+        }
+        zlayer_types::cluster::ClusterMode::WorkerTier {
+            role: zlayer_types::cluster::WorkerTierRole::Worker,
+            ..
+        } => {
+            anyhow::bail!(
+                "`mode: worker-tier` with `role: worker` must use `zlayer worker` \
+                 (not `zlayer serve`). See `zlayer worker --help`."
+            );
+        }
+        zlayer_types::cluster::ClusterMode::WorkerTier {
+            role: zlayer_types::cluster::WorkerTierRole::Server,
+            worker_grpc_addr,
+            worker_ca_dir,
+            heartbeat_min_ttl,
+            heartbeat_max_ttl,
+            heartbeat_grace,
+            max_heartbeats_per_second,
+            failover_heartbeat_ttl,
+            ..
+        } => {
+            // worker-tier server-role REQUIRES raft consensus.
+            let Some(raft) = _raft.clone() else {
+                anyhow::bail!(
+                    "ClusterMode::WorkerTier server-role requires raft consensus; \
+                     check daemon logs for raft startup errors"
+                );
+            };
+
+            let raft_for_dispatcher = raft.clone();
+            let raft_cluster = std::sync::Arc::new(zlayer_scheduler::cluster::RaftCluster::new(
+                cluster_node_id,
+                raft,
+                cluster_http_client.clone(),
+                cluster_internal_token.clone(),
+                cluster_local_dispatch,
+            ));
+
+            // Worker CA storage. Defaults to `<data_dir>/cluster/` (the same
+            // directory used elsewhere for cluster keypairs).
+            let worker_ca_dir_path = worker_ca_dir
+                .as_deref()
+                .map_or_else(|| config.data_dir.join("cluster"), std::path::PathBuf::from);
+            let worker_ca = std::sync::Arc::new(
+                zlayer_secrets::WorkerCa::load_or_generate(&worker_ca_dir_path).with_context(
+                    || {
+                        format!(
+                            "loading or generating worker CA in {}",
+                            worker_ca_dir_path.display()
+                        )
+                    },
+                )?,
+            );
+
+            // Adaptive-TTL tunables threaded through from `ClusterMode`.
+            let ttl_cfg = zlayer_types::cluster::AdaptiveTtlConfig {
+                min_ttl_secs: u32::try_from(heartbeat_min_ttl.as_secs()).unwrap_or(u32::MAX),
+                max_ttl_secs: u32::try_from(heartbeat_max_ttl.as_secs()).unwrap_or(u32::MAX),
+                grace_secs: u32::try_from(heartbeat_grace.as_secs()).unwrap_or(u32::MAX),
+                max_heartbeats_per_second,
+                failover_ttl_secs: u32::try_from(failover_heartbeat_ttl.as_secs())
+                    .unwrap_or(u32::MAX),
+            };
+
+            // Cluster ID persisted under `<data_dir>/cluster_id`; falls back to
+            // a placeholder when the file is missing (matches the bootstrap
+            // path in `node_helpers::issue_worker_bootstrap_token`).
+            let cluster_id = tokio::fs::read_to_string(config.data_dir.join("cluster_id"))
+                .await
+                .map_or_else(|_| "default-cluster".to_string(), |s| s.trim().to_string());
+
+            // Workers start at id 1_000_000 to avoid collisions with raft
+            // member ids (which start at 1 and are usually < 100).
+            let starting_worker_node_id: u64 = 1_000_000;
+
+            let dispatcher = std::sync::Arc::new(
+                zlayer_scheduler::worker_dispatcher::WorkerDispatcherImpl::new(
+                    raft_for_dispatcher,
+                    cluster_id,
+                    cluster_signer.clone(),
+                    worker_ca,
+                    ttl_cfg,
+                    starting_worker_node_id,
+                ),
+            );
+            let _expiry_handle = dispatcher.start_expiry_sweep();
+
+            // Spawn the worker-facing gRPC server.
+            let grpc_service = dispatcher.clone().into_tonic_service();
+            tokio::spawn(async move {
+                info!(addr = %worker_grpc_addr, "worker-tier gRPC server starting");
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(grpc_service)
+                    .serve(worker_grpc_addr)
+                    .await
+                {
+                    tracing::error!(error = %e, "worker-tier gRPC server exited");
+                }
+            });
+
+            let dispatcher_dyn: std::sync::Arc<dyn zlayer_scheduler::cluster::WorkerDispatcher> =
+                dispatcher;
+
+            // Stash a clone for `ClusterApiState::with_worker_dispatcher` so
+            // `GET /api/v1/cluster/workers` can list known workers without
+            // round-tripping through the `Cluster` trait (which doesn't expose
+            // worker-only state).
+            worker_dispatcher_for_api = Some(dispatcher_dyn.clone());
+
+            // ------------------------------------------------------------
+            // Bring up the chitchat gossip pool so worker peers can
+            // discover each other's WireGuard endpoints without the leader
+            // brokering every update. The pool publishes a minimal
+            // self-info record now (empty wg key + 0.0.0.0:0 endpoint —
+            // worker join logic in a follow-up will fill these in via
+            // `announce_self` once the WG interface is up). Seeds come
+            // from the current Raft membership: every other voter's
+            // advertise_addr paired with the conventional Serf UDP port
+            // 7946. If the membership is empty (single-node bootstrap),
+            // the seed list is empty and joiners discover this node via
+            // the bootstrap token + RegisterResponse path.
+            // ------------------------------------------------------------
+            let gossip_listen: std::net::SocketAddr = "0.0.0.0:7946"
+                .parse()
+                .expect("hardcoded gossip listen addr must parse");
+
+            let gossip_seeds: Vec<std::net::SocketAddr> = {
+                if let Some(raft_for_seeds) = _raft.clone() {
+                    let cluster_state_snapshot = raft_for_seeds.read_state().await;
+                    cluster_state_snapshot
+                        .nodes
+                        .values()
+                        .filter(|n| n.node_id != cluster_node_id)
+                        .filter_map(|n| {
+                            // Use advertise_addr (public IP) + the gossip
+                            // UDP port. Skip nodes that don't yet have an
+                            // advertise_addr (pre-Wave-5 registrations).
+                            if n.advertise_addr.is_empty() {
+                                return None;
+                            }
+                            format!("{}:7946", n.advertise_addr).parse().ok()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let self_info = zlayer_overlay::gossip::PeerInfo {
+                node_id: cluster_node_id,
+                wg_pubkey: String::new(),
+                wg_endpoint: "0.0.0.0:0"
+                    .parse()
+                    .expect("hardcoded placeholder endpoint must parse"),
+                overlay_ip: String::new(),
+                labels: std::collections::HashMap::new(),
+            };
+
+            let gossip_cluster_id = tokio::fs::read_to_string(config.data_dir.join("cluster_id"))
+                .await
+                .map_or_else(|_| "default-cluster".to_string(), |s| s.trim().to_string());
+
+            let gossip_config = zlayer_overlay::gossip::GossipConfig {
+                node_id: cluster_node_id,
+                gossip_listen,
+                seeds: gossip_seeds,
+                cluster_id: gossip_cluster_id,
+                self_info,
+            };
+            match zlayer_overlay::gossip::GossipPool::start(gossip_config).await {
+                Ok(pool) => {
+                    info!(
+                        node_id = cluster_node_id,
+                        listen = %gossip_listen,
+                        "gossip pool started for worker-tier server"
+                    );
+                    gossip_pool_for_api = Some(pool);
+                }
+                Err(e) => {
+                    // Gossip is non-essential at boot: workers can still
+                    // register via gRPC and the leader still drives
+                    // scheduling. Log and continue so a stale 7946 port
+                    // (e.g. left over from a previous daemon) doesn't
+                    // brick the whole control plane.
+                    tracing::warn!(
+                        error = %e,
+                        "failed to start gossip pool; /api/v1/cluster/gossip/peers will return empty"
+                    );
+                }
+            }
+
+            std::sync::Arc::new(zlayer_scheduler::cluster::WorkerTierCluster::server(
+                raft_cluster,
+                dispatcher_dyn,
+            ))
+        }
+    };
+
+    {
+        let mut mgr_guard = service_manager.write().await;
+        #[allow(deprecated)]
+        mgr_guard.set_cluster(cluster_handle.clone());
+    }
+
     // Build deployment state with orchestration wiring so create_deployment
     // actually registers services, sets up overlays, and scales containers.
     // Clone dns_handle so the deployment state keeps one for API handlers while
     // we retain the original for explicit shutdown cleanup.
+    // Use the internal token generated during daemon init so the scheduler
+    // (which already has a copy) and the API InternalState share the same secret.
+    let internal_token = daemon_internal_token;
+
     let deployment_state = zlayer_api::DeploymentState::with_orchestration(
         storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
         Arc::clone(&service_manager),
         overlay.clone(),
         Arc::clone(&proxy),
         dns_handle.clone(),
+    )
+    // Wire the cross-node Dedicated-overlay mesh: the Raft handle drives the
+    // per-service endpoint publish/learn, the internal token authenticates the
+    // peer broadcasts, and advertise_addr builds the published WG endpoint.
+    .with_dedicated_mesh(
+        _raft.clone(),
+        Some(internal_token.clone()),
+        Some(node_config.advertise_addr.clone()),
     );
-
-    // Use the internal token generated during daemon init so the scheduler
-    // (which already has a copy) and the API InternalState share the same secret.
-    let internal_token = daemon_internal_token;
 
     // Build the core router using the orchestration-wired deployment state.
     // This ensures create_deployment actually orchestrates containers.
-    let base_router = zlayer_api::build_router_with_deployment_state(
-        &api_config,
-        deployment_state,
-        service_manager.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-    );
+    // Surface this daemon's Raft node ID on container API responses so the
+    // CLI/UI can show which node owns each container. `None` when Raft failed
+    // to initialize.
+    let local_node_id = _raft.as_ref().map(|r| r.node_id().to_string());
+    // Under `--secrets-only` use the lean base router (only `/health`,
+    // `/auth`, `/api/v1/users`) and skip the orchestration-bearing
+    // deployment/daemon nests of the full base. `deployment_state` and
+    // `service_manager` are still constructed above (they are cheap handles)
+    // but go unused as the router state here — the secrets daemon never
+    // mounts a route that consumes them.
+    let base_router = if secrets_only {
+        zlayer_api::build_router_secrets_only_base(&api_config)
+    } else {
+        zlayer_api::build_router_with_deployment_state(
+            &api_config,
+            deployment_state,
+            service_manager.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            local_node_id,
+        )
+    };
 
     // Add internal routes for scheduler-to-agent communication.
+    // Skipped under `--secrets-only` (scheduler-to-agent is orchestration).
     // Include the overlay interface name so the add-peer endpoint can manage
     // WireGuard peers on this node.
     let overlay_interface = if config.host_network {
@@ -1590,8 +2386,35 @@ pub(crate) async fn serve_with_external_shutdown(
         internal_token.clone(),
         overlay_interface,
     );
+    // Attach the live OverlayManager (when present) so the internal
+    // add-peer endpoint routes through `OverlayManager::add_global_peer`
+    // instead of constructing an ad-hoc `OverlayTransport`. Without this,
+    // peer registrations succeed in-process but never reach the running
+    // WireGuard interface and packets continue to be dropped.
+    let internal_state = if let Some(om) = overlay.as_ref() {
+        internal_state.with_overlay_manager(om.clone())
+    } else {
+        internal_state
+    };
+    // Attach the Raft handle when clustered so the pre-self-upgrade
+    // `trigger-elect` endpoint can nudge this node into campaigning when
+    // the leader steps down for a binary swap.
+    let internal_state = if let Some(raft) = _raft.as_ref() {
+        internal_state.with_raft(raft.clone())
+    } else {
+        internal_state
+    };
     let internal_routes = zlayer_api::build_internal_routes(internal_state);
-    let base_router = base_router.nest("/api/v1/internal", internal_routes);
+    // Mount scheduler-to-agent internal routes only in full mode. Under
+    // `--secrets-only` the daemon runs no scheduler/agent surface, so the
+    // internal nest is skipped (the state is still built above so
+    // `service_manager` is consumed and `internal_token` stays available for
+    // the cluster routes the secrets daemon DOES mount).
+    let base_router = if secrets_only {
+        base_router
+    } else {
+        base_router.nest("/api/v1/internal", internal_routes)
+    };
 
     // Add secrets routes — env-aware so secrets handlers can resolve the
     // environment scope from the bundle's persistent environments store.
@@ -1613,6 +2436,23 @@ pub(crate) async fn serve_with_external_shutdown(
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);
 
+    // Registry/Git credential routes (`zlayer login` writes here). Backed by the
+    // SAME concrete `Arc<PersistentSecretsStore>` as the API-key credential store
+    // (captured above before it was moved into `api_config`), so credentials land
+    // in the daemon's on-disk secrets DB and are visible to image pulls.
+    let credential_state = zlayer_api::CredentialState::new(
+        std::sync::Arc::new(zlayer_secrets::RegistryCredentialStore::new(
+            persistent_secrets_for_creds.clone(),
+        )),
+        std::sync::Arc::new(zlayer_secrets::GitCredentialStore::new(
+            persistent_secrets_for_creds.clone(),
+        )),
+    );
+    router = router.nest(
+        "/api/v1/credentials",
+        zlayer_api::build_credential_routes(credential_state),
+    );
+
     // Add environment routes (CRUD; cascade-safety check against secrets state)
     let environment_routes =
         zlayer_api::build_environment_routes(environments_state, secrets_state);
@@ -1624,59 +2464,68 @@ pub(crate) async fn serve_with_external_shutdown(
     // project's git repo lands in the same place.
     let projects_clone_root = config.data_dir.join("projects");
 
-    // Add project routes (CRUD + deployment linking + pull)
-    let mut project_state = zlayer_api::ProjectState::new(bundle.projects.clone());
-    project_state.clone_root.clone_from(&projects_clone_root);
-    let project_routes = zlayer_api::build_project_routes(project_state);
-    router = router.nest("/api/v1/projects", project_routes);
-
-    // Add sync routes (git-backed resource reconciliation).
-    // Sync apply upserts / deletes `DeploymentSpec` manifests, so it needs a
-    // handle to the persistent deployment store (the same one wired into the
-    // deployment routes above).
-    let sync_state = zlayer_api::SyncState::with_clone_root(
-        bundle.syncs.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-        projects_clone_root.clone(),
-    );
-    let sync_routes = zlayer_api::build_sync_routes(sync_state);
-    router = router.nest("/api/v1/syncs", sync_routes);
-
-    // Add variable routes (plaintext key-value config) — persistent store
-    let variable_state = zlayer_api::VariableState::new(bundle.variables.clone());
-    let variable_routes = zlayer_api::build_variable_routes(variable_state);
-    router = router.nest("/api/v1/variables", variable_routes);
-
-    // Add task routes (named runnable scripts) — persistent store
-    let tasks_state = zlayer_api::TasksState::new(bundle.tasks.clone());
-    let task_routes = zlayer_api::build_task_routes(tasks_state);
-    router = router.nest("/api/v1/tasks", task_routes);
-
     // Build the BuildState up front so it can be shared by both the build
-    // routes (mounted further below) and the workflow state (which needs
-    // the BuildManager for `BuildProject` actions).
+    // routes (mounted further below, full mode only) and the workflow state
+    // (which needs the BuildManager for `BuildProject` actions). Constructed
+    // unconditionally so it stays in scope for the full-mode build-route
+    // nest; under `--secrets-only` it is simply never mounted.
     let build_dir = config.data_dir.join("builds");
     let build_state = BuildState::new(build_dir);
 
-    // Add workflow routes (DAGs of steps composing tasks, builds, deploys, syncs).
-    // WorkflowsState carries every handle the action arms need so they execute
-    // for real (not a placeholder "would execute" string).
-    let workflows_state = zlayer_api::WorkflowsState::new(
-        bundle.workflows.clone(),
-        bundle.tasks.clone(),
-        bundle.projects.clone(),
-        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
-        bundle.syncs.clone(),
-        build_state.manager.clone(),
-        projects_clone_root.clone(),
-    );
-    let workflow_routes = zlayer_api::build_workflow_routes(workflows_state);
-    router = router.nest("/api/v1/workflows", workflow_routes);
+    // ── Orchestration-only resource routes ──────────────────────────────
+    // Projects, syncs, variables, tasks, workflows, and notifiers are all
+    // deploy/build-plane surfaces with no bearing on secrets serving, so the
+    // `--secrets-only` daemon skips them wholesale. Their state construction
+    // is gated too so no handles are built (and no "unused" warnings fire).
+    if !secrets_only {
+        // Add project routes (CRUD + deployment linking + pull)
+        let mut project_state = zlayer_api::ProjectState::new(bundle.projects.clone());
+        project_state.clone_root.clone_from(&projects_clone_root);
+        let project_routes = zlayer_api::build_project_routes(project_state);
+        router = router.nest("/api/v1/projects", project_routes);
 
-    // Add notifier routes (Slack, Discord, webhook, SMTP) — persistent store
-    let notifiers_state = zlayer_api::NotifiersState::new(bundle.notifiers.clone());
-    let notifier_routes = zlayer_api::build_notifier_routes(notifiers_state);
-    router = router.nest("/api/v1/notifiers", notifier_routes);
+        // Add sync routes (git-backed resource reconciliation).
+        // Sync apply upserts / deletes `DeploymentSpec` manifests, so it needs a
+        // handle to the persistent deployment store (the same one wired into the
+        // deployment routes above).
+        let sync_state = zlayer_api::SyncState::with_clone_root(
+            bundle.syncs.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            projects_clone_root.clone(),
+        );
+        let sync_routes = zlayer_api::build_sync_routes(sync_state);
+        router = router.nest("/api/v1/syncs", sync_routes);
+
+        // Add variable routes (plaintext key-value config) — persistent store
+        let variable_state = zlayer_api::VariableState::new(bundle.variables.clone());
+        let variable_routes = zlayer_api::build_variable_routes(variable_state);
+        router = router.nest("/api/v1/variables", variable_routes);
+
+        // Add task routes (named runnable scripts) — persistent store
+        let tasks_state = zlayer_api::TasksState::new(bundle.tasks.clone());
+        let task_routes = zlayer_api::build_task_routes(tasks_state);
+        router = router.nest("/api/v1/tasks", task_routes);
+
+        // Add workflow routes (DAGs of steps composing tasks, builds, deploys, syncs).
+        // WorkflowsState carries every handle the action arms need so they execute
+        // for real (not a placeholder "would execute" string).
+        let workflows_state = zlayer_api::WorkflowsState::new(
+            bundle.workflows.clone(),
+            bundle.tasks.clone(),
+            bundle.projects.clone(),
+            storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+            bundle.syncs.clone(),
+            build_state.manager.clone(),
+            projects_clone_root.clone(),
+        );
+        let workflow_routes = zlayer_api::build_workflow_routes(workflows_state);
+        router = router.nest("/api/v1/workflows", workflow_routes);
+
+        // Add notifier routes (Slack, Discord, webhook, SMTP) — persistent store
+        let notifiers_state = zlayer_api::NotifiersState::new(bundle.notifiers.clone());
+        let notifier_routes = zlayer_api::build_notifier_routes(notifiers_state);
+        router = router.nest("/api/v1/notifiers", notifier_routes);
+    }
 
     // Add group routes (user group CRUD and membership) — persistent store
     let groups_state = zlayer_api::GroupsState::new(bundle.groups.clone());
@@ -1699,62 +2548,82 @@ pub(crate) async fn serve_with_external_shutdown(
         bundle.audit.clone(),
     )));
 
-    // Merge network access-control routes (shares the same policy list as the proxy)
-    let network_state = NetworkApiState {
-        networks: std::sync::Arc::clone(&network_policies),
-    };
-    let network_routes = build_network_routes(network_state);
-    router = router.nest("/api/v1/networks", network_routes);
-
-    // Merge node management routes
-    let node_state = NodeApiState::new();
-    let node_routes = build_node_routes(node_state);
-    router = router.nest("/api/v1/nodes", node_routes);
-
-    // Merge overlay network routes with real overlay manager and DNS references
-    let overlay_state = match (&overlay, &dns) {
-        (Some(om), Some(d)) => OverlayApiState::with_overlay_and_dns(Arc::clone(om), Arc::clone(d)),
-        (Some(om), None) => OverlayApiState::with_overlay(Arc::clone(om)),
-        _ => OverlayApiState::new(),
-    };
-    let overlay_routes = build_overlay_routes(overlay_state);
-    router = router.nest("/api/v1/overlay", overlay_routes);
-
-    // Merge tunnel routes -- reuse the state built in init_daemon so the
-    // daemon-side tunnel server's TokenValidator and the API handler share
-    // the same token map and access manager.
-    let tunnel_routes = build_tunnel_routes(tunnel_api_state);
-    router = router.nest("/api/v1/tunnels", tunnel_routes);
-
-    // Merge proxy status routes
-    let proxy_state = zlayer_api::ProxyApiState {
-        registry: Some(proxy.registry()),
-        load_balancer: Some(proxy.load_balancer()),
-        cert_manager: Some(Arc::clone(&cert_manager)),
-        stream_registry: Some(Arc::clone(&stream_registry)),
-    };
-    let proxy_routes = zlayer_api::build_proxy_routes(proxy_state);
-    router = router.nest("/api/v1/proxy", proxy_routes);
-
-    // Merge storage replication status routes
-    let storage_api_state = match replicator.as_ref() {
-        Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
-        None => zlayer_api::StorageState::new(),
-    };
-    let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
-    router = router.nest("/api/v1/storage", storage_routes);
-
     // Construct the daemon-wide event bus early so all resource states
     // (image, container, network, volume) publish lifecycle events on the
     // same broadcast channel. Subscribers of `GET /api/v1/events` then see
-    // every transition regardless of which handler emitted it.
+    // every transition regardless of which handler emitted it. Built
+    // unconditionally so both the full-mode image nest (below) and the
+    // container/volume nests (further below) share it; under `--secrets-only`
+    // it is simply never subscribed.
     let event_bus = zlayer_api::DaemonEventBus::new();
 
-    // Merge image management routes (list / rm / system prune)
-    let image_state =
-        zlayer_api::ImageState::new(runtime.clone()).with_event_bus(event_bus.clone());
-    let image_routes = zlayer_api::build_image_routes_with_state(image_state);
-    router = router.nest("/api/v1", image_routes);
+    // ── Networking / proxy / storage / image routes ─────────────────────
+    // All orchestration-plane surfaces — skipped under `--secrets-only`. The
+    // cluster routes (built just below) are NOT in this block: the secrets
+    // daemon participates in Raft, so `/api/v1/cluster` is always mounted.
+    if !secrets_only {
+        // Merge network access-control routes (shares the same policy list as the proxy)
+        let network_state = NetworkApiState {
+            networks: std::sync::Arc::clone(&network_policies),
+        };
+        let network_routes = build_network_routes(network_state);
+        router = router.nest("/api/v1/networks", network_routes);
+
+        // Merge node management routes
+        let node_state = NodeApiState::new();
+        let node_routes = build_node_routes(node_state);
+        router = router.nest("/api/v1/nodes", node_routes);
+
+        // Merge overlay network routes with real overlay manager and DNS references
+        let overlay_state = match (&overlay, &dns) {
+            (Some(om), Some(d)) => {
+                OverlayApiState::with_overlay_and_dns(Arc::clone(om), Arc::clone(d))
+            }
+            (Some(om), None) => OverlayApiState::with_overlay(Arc::clone(om)),
+            _ => OverlayApiState::new(),
+        };
+        let overlay_routes = build_overlay_routes(overlay_state);
+        router = router.nest("/api/v1/overlay", overlay_routes);
+
+        // Merge tunnel routes -- reuse the state built in init_daemon so the
+        // daemon-side tunnel server's TokenValidator and the API handler share
+        // the same token map and access manager.
+        let tunnel_routes = build_tunnel_routes(tunnel_api_state);
+        router = router.nest("/api/v1/tunnels", tunnel_routes);
+
+        // Merge edge-cache eligibility routes (Track A — upstream control
+        // plane registers ZLayer nodes as eligible via these three endpoints).
+        // The registry is fresh / standalone — gossip-label broadcast is wired
+        // in a follow-on patch once we thread a GossipPool handle through to
+        // this scope; eligibility tracking already works without gossip.
+        let edge_cache_state = zlayer_api::handlers::EdgeCacheApiState::new();
+        let edge_cache_routes = build_edge_cache_routes(edge_cache_state);
+        router = router.merge(edge_cache_routes);
+
+        // Merge proxy status routes
+        let proxy_state = zlayer_api::ProxyApiState {
+            registry: Some(proxy.registry()),
+            load_balancer: Some(proxy.load_balancer()),
+            cert_manager: Some(Arc::clone(&cert_manager)),
+            stream_registry: Some(Arc::clone(&stream_registry)),
+        };
+        let proxy_routes = zlayer_api::build_proxy_routes(proxy_state);
+        router = router.nest("/api/v1/proxy", proxy_routes);
+
+        // Merge storage replication status routes
+        let storage_api_state = match replicator.as_ref() {
+            Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
+            None => zlayer_api::StorageState::new(),
+        };
+        let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
+        router = router.nest("/api/v1/storage", storage_routes);
+
+        // Merge image management routes (list / rm / system prune)
+        let image_state =
+            zlayer_api::ImageState::new(runtime.clone()).with_event_bus(event_bus.clone());
+        let image_routes = zlayer_api::build_image_routes_with_state(image_state);
+        router = router.nest("/api/v1", image_routes);
+    }
 
     // Merge cluster routes (join, node listing)
     // Initialize CIDR-aware IP allocator for overlay address assignment
@@ -1875,104 +2744,148 @@ pub(crate) async fn serve_with_external_shutdown(
     };
     let slice_allocator = Arc::new(RwLock::new(slice_allocator));
 
-    let cluster_state = ClusterApiState::with_internal_token(
+    let mut cluster_state = ClusterApiState::with_internal_token(
         _raft.clone(),
         Some(join_secret),
         ip_allocator,
         Some(ip_allocator_path),
         slice_allocator,
         Some(slice_allocator_path),
-        internal_token,
+        internal_token.clone(),
         Some(config.data_dir.clone()),
+        Some(cluster_signer.clone()),
     );
+    // Wire the on-disk keystore path so `validate_join_token_ed25519`
+    // (Wave 5A.3) and `cluster_rotate_signing_key` (Wave 5B.4) can look
+    // up signers by `kid` and rotate the keystore on demand.
+    cluster_state.cluster_signing_key_path = Some(config.data_dir.join("cluster_signing.key"));
+    cluster_state.cluster_ca.clone_from(&cluster_ca);
+    cluster_state.cluster_domain = Some(node_config.node_id.clone());
+    if let Some(dispatcher) = worker_dispatcher_for_api {
+        cluster_state = cluster_state.with_worker_dispatcher(dispatcher);
+    }
+    if let Some(pool) = gossip_pool_for_api {
+        cluster_state = cluster_state.with_gossip_pool(pool);
+    }
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
-    // Merge build routes (build_state was created earlier so WorkflowsState
-    // can share the same BuildManager).
-    let build_api_routes = build_routes().with_state(build_state);
-    router = router.nest("/api/v1", build_api_routes);
+    // ── Build / container / volume / job / cron routes ──────────────────
+    // The remaining orchestration surfaces (image build, container
+    // networks, container lifecycle + event stream, volumes, jobs, cron).
+    // All skipped under `--secrets-only`. The `--rm` auto-remove subscriber
+    // is only spawned in full mode, so its abort handle is an `Option` that
+    // stays `None` for a secrets-only daemon.
+    let auto_remove_handle = if secrets_only {
+        // Consume `event_bus` so it isn't flagged unused in secrets-only
+        // builds (full mode threads it into the states below).
+        let _ = &event_bus;
+        None
+    } else {
+        // Merge build routes (build_state was created earlier so WorkflowsState
+        // can share the same BuildManager).
+        let build_api_routes = build_routes().with_state(build_state);
+        router = router.nest("/api/v1", build_api_routes);
 
-    // Build the bridge-network (Docker-style `docker network create`) state.
-    // When the `docker` feature is enabled AND the daemon can connect to a
-    // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
-    // `POST /api/v1/container-networks` actually creates real Docker
-    // networks; otherwise the state stays in metadata-only mode and a
-    // warning is logged the first time a handler would need the runtime.
-    let bridge_network_state = build_bridge_network_state()
-        .await
-        .with_event_bus(event_bus.clone());
-    let container_network_routes = build_container_network_routes(bridge_network_state.clone());
-    router = router.nest("/api/v1/container-networks", container_network_routes);
+        // Build the bridge-network (Docker-style `docker network create`) state.
+        // When the `docker` feature is enabled AND the daemon can connect to a
+        // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
+        // `POST /api/v1/container-networks` actually creates real Docker
+        // networks; otherwise the state stays in metadata-only mode and a
+        // warning is logged the first time a handler would need the runtime.
+        let bridge_network_state = build_bridge_network_state()
+            .await
+            .with_event_bus(event_bus.clone());
+        let container_network_routes = build_container_network_routes(bridge_network_state.clone());
+        router = router.nest("/api/v1/container-networks", container_network_routes);
 
-    // Merge container lifecycle routes. The same `container_state` is used
-    // for the daemon-wide event stream at `/api/v1/events` so lifecycle
-    // handlers and event subscribers share the broadcast bus. The
-    // bridge-network state is threaded in so `CreateContainerRequest.networks`
-    // can attach freshly-created containers to user-defined networks.
-    let container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
-        .with_shared_event_bus(event_bus.clone())
-        .with_bridge_networks(bridge_network_state)
-        .with_standalone_storage(bundle.standalone_containers.clone())
-        .with_compose_storage(bundle.compose_projects.clone());
+        // Merge container lifecycle routes. The same `container_state` is used
+        // for the daemon-wide event stream at `/api/v1/events` so lifecycle
+        // handlers and event subscribers share the broadcast bus. The
+        // bridge-network state is threaded in so `CreateContainerRequest.networks`
+        // can attach freshly-created containers to user-defined networks.
+        let mut container_state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.clone())
+            .with_shared_event_bus(event_bus.clone())
+            .with_bridge_networks(bridge_network_state)
+            .with_standalone_storage(bundle.standalone_containers.clone())
+            .with_compose_storage(bundle.compose_projects.clone())
+            .with_cluster(cluster_handle.clone())
+            .with_internal_token(internal_token.clone())
+            .with_service_manager(Arc::clone(&container_service_manager));
 
-    // Repopulate the in-memory standalone-container cache from disk so
-    // create / list / inspect / delete handlers see records that survived a
-    // daemon restart. A failure here is fatal — running with a half-empty
-    // cache would let a follow-up `delete` succeed at the runtime layer
-    // while a stale row sat in the database.
-    container_state
-        .repopulate_cache_from_storage()
-        .await
-        .context("Failed to repopulate standalone-container cache from storage")?;
-
-    // Reconcile the standalone-container storage against the runtime listing
-    // exactly once at boot. This re-registers ContainerIdMap rows for entries
-    // that survived restart and prunes rows whose runtime bundles have been
-    // removed out-of-band. Failures here are non-fatal — log and continue —
-    // because a transient runtime hiccup at boot must not stop the daemon
-    // from serving (the next reconcile or REST call will re-surface issues).
-    match reconcile_standalone_containers(&container_state).await {
-        Ok(report) => {
-            info!(
-                matched = report.matched,
-                pruned = report.pruned,
-                orphans_seen = report.orphans_seen,
-                "standalone-container reconcile complete",
-            );
+        // Wire the overlay manager + overlay DNS so the container-create handler
+        // can satisfy user-defined network attachments via the encrypted overlay
+        // on hosts with no Docker bridge-network runtime (macOS VZ-Linux). This
+        // is what lets a ZArcRunner job container get a `zl-overlay0` IP and reach
+        // the runner's cache server (e.g. http://10.200.0.1:...), Forgejo, and
+        // sibling containers — instead of 500ing on the missing bridge runtime.
+        if let Some(om) = overlay.as_ref() {
+            container_state = container_state.with_overlay_manager(Arc::clone(om));
         }
-        Err(e) => {
-            warn!(error = %e, "standalone-container reconcile failed; continuing boot");
+        if let Some(d) = dns.as_ref() {
+            container_state = container_state.with_dns_server(Arc::clone(d));
         }
-    }
 
-    // Spawn the daemon-side `--rm` (auto-remove) subscriber. The returned
-    // JoinHandle is held for the lifetime of the daemon — dropping it would
-    // cancel the task and leak `--rm` containers on exit. The handle is
-    // aborted explicitly during the post-shutdown cleanup phase below.
-    let auto_remove_handle = start_auto_remove_subscriber(container_state.clone());
+        // Repopulate the in-memory standalone-container cache from disk so
+        // create / list / inspect / delete handlers see records that survived a
+        // daemon restart. A failure here is fatal — running with a half-empty
+        // cache would let a follow-up `delete` succeed at the runtime layer
+        // while a stale row sat in the database.
+        container_state
+            .repopulate_cache_from_storage()
+            .await
+            .context("Failed to repopulate standalone-container cache from storage")?;
 
-    let container_routes = build_container_routes(container_state.clone());
-    router = router.nest("/api/v1/containers", container_routes);
+        // Reconcile the standalone-container storage against the runtime listing
+        // exactly once at boot. This re-registers ContainerIdMap rows for entries
+        // that survived restart and prunes rows whose runtime bundles have been
+        // removed out-of-band. Failures here are non-fatal — log and continue —
+        // because a transient runtime hiccup at boot must not stop the daemon
+        // from serving (the next reconcile or REST call will re-surface issues).
+        match reconcile_standalone_containers(&container_state).await {
+            Ok(report) => {
+                info!(
+                    matched = report.matched,
+                    pruned = report.pruned,
+                    orphans_seen = report.orphans_seen,
+                    "standalone-container reconcile complete",
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "standalone-container reconcile failed; continuing boot");
+            }
+        }
 
-    let event_routes = build_event_routes(container_state);
-    router = router.nest("/api/v1/events", event_routes);
+        // Spawn the daemon-side `--rm` (auto-remove) subscriber. The returned
+        // JoinHandle is held for the lifetime of the daemon — dropping it would
+        // cancel the task and leak `--rm` containers on exit. The handle is
+        // aborted explicitly during the post-shutdown cleanup phase below.
+        let handle = start_auto_remove_subscriber(container_state.clone());
 
-    // Merge volume management routes
-    let volume_dir = config.data_dir.join("volumes");
-    let volume_state = VolumeApiState::new(volume_dir).with_event_bus(event_bus.clone());
-    let volume_routes = build_volume_routes(volume_state);
-    router = router.nest("/api/v1/volumes", volume_routes);
+        let container_routes = build_container_routes(container_state.clone());
+        router = router.nest("/api/v1/containers", container_routes);
 
-    let job_state = JobState {
-        executor: job_executor,
+        let event_routes = build_event_routes(container_state);
+        router = router.nest("/api/v1/events", event_routes);
+
+        // Merge volume management routes
+        let volume_dir = config.data_dir.join("volumes");
+        let volume_state = VolumeApiState::new(volume_dir).with_event_bus(event_bus.clone());
+        let volume_routes = build_volume_routes(volume_state);
+        router = router.nest("/api/v1/volumes", volume_routes);
+
+        let job_state = JobState {
+            executor: job_executor,
+        };
+        router = router.nest("/api/v1/jobs", build_job_routes(job_state));
+
+        let cron_state = CronState {
+            scheduler: cron_scheduler,
+        };
+        router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
+
+        Some(handle)
     };
-    router = router.nest("/api/v1/jobs", build_job_routes(job_state));
-
-    let cron_state = CronState {
-        scheduler: cron_scheduler,
-    };
-    router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
 
     // Re-apply the auth extension layer AFTER all .nest() calls so that
     // routes added after the base router (containers, jobs, cron, build, etc.)
@@ -2083,10 +2996,13 @@ pub(crate) async fn serve_with_external_shutdown(
     // Stop the standalone `--rm` auto-remove subscriber. It would otherwise
     // exit on its own when the event bus is dropped, but aborting + awaiting
     // here ties its lifetime cleanly to the shutdown path so we don't leave a
-    // task running while later cleanup steps tear down shared state.
-    auto_remove_handle.abort();
-    let _ = auto_remove_handle.await;
-    info!("Auto-remove subscriber stopped");
+    // task running while later cleanup steps tear down shared state. `None`
+    // under `--secrets-only`, where the subscriber is never spawned.
+    if let Some(auto_remove_handle) = auto_remove_handle {
+        auto_remove_handle.abort();
+        let _ = auto_remove_handle.await;
+        info!("Auto-remove subscriber stopped");
+    }
 
     // Stop Raft RPC server
     if let Some(handle) = raft_server_handle {
@@ -2131,6 +3047,13 @@ pub(crate) async fn serve_with_external_shutdown(
     }
     info!("Log rotator stopped");
 
+    // Stop cluster signing keystore pruner (Wave 5A.5)
+    if let Some(handle) = keystore_pruner_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    info!("Cluster signing keystore pruner stopped");
+
     // Stop container supervisor
     supervisor.shutdown();
     if let Some(handle) = supervisor_handle {
@@ -2167,6 +3090,17 @@ pub(crate) async fn serve_with_external_shutdown(
     let _ = tokio::fs::remove_file(&pid_file).await;
 
     info!("Daemon shutdown complete");
+
+    if take_pending_restart_on_exit() {
+        // Per the CLAUDE.md note: there is no in-tree supervisor.
+        // Exit code 75 (EX_TEMPFAIL) signals "transient failure, please retry"
+        // so systemd `Restart=on-failure` (the conventional config) respawns us.
+        // Without a supervisor, this becomes a clean exit that the operator
+        // can re-wrap.
+        tracing::info!("--restart-on-exit set; exiting with code 75 for supervisor respawn");
+        std::process::exit(75);
+    }
+
     Ok(())
 }
 
@@ -2397,17 +3331,22 @@ async fn build_bridge_network_state() -> BridgeNetworkApiState {
 #[cfg(test)]
 mod tests {
     use super::{container_reachable_api_url, read_daemon_metadata};
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn read_daemon_metadata_missing_file_is_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("does-not-exist.json");
         assert!(read_daemon_metadata(&path).is_none());
     }
 
     #[test]
     fn read_daemon_metadata_malformed_is_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(&path, "this is not json {{}").expect("write");
         assert!(read_daemon_metadata(&path).is_none());
@@ -2415,7 +3354,9 @@ mod tests {
 
     #[test]
     fn read_daemon_metadata_valid_returns_pid() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(
             &path,
@@ -2433,7 +3374,9 @@ mod tests {
         // StaleDaemonMeta marks it `#[serde(default)]` to tolerate older
         // formats. Verify that path explicitly so a future tightening of the
         // schema doesn't silently break stale-daemon detection.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let path = tmp.path().join("daemon.json");
         std::fs::write(&path, r#"{"pid":9}"#).expect("write");
         let meta = read_daemon_metadata(&path).expect("parsed");
@@ -2487,7 +3430,9 @@ mod tests {
             WorkflowStep,
         };
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("serve-test-")
+            .expect("tempdir");
         let dir = tmp.path().to_path_buf();
 
         // ---- first run: open bundle, write one record per store ----

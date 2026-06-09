@@ -24,8 +24,11 @@ validator = { workspace = true, features = ["derive"] }
 # Lifted from zlayer-secrets so cross-crate consumers (zlayer-api, zlayer-agent,
 # the CLI) can name secrets data shapes without depending on zlayer-secrets.
 secrecy = { workspace = true }
+tempfile = "3"
 zeroize = { version = "1.7", features = ["derive"] }
 base64 = { workspace = true }
+tracing.workspace = true
+ipnet = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

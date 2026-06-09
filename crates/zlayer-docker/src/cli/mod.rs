@@ -33,6 +33,14 @@ pub mod volume;
 
 use clap::Subcommand;
 
+// Re-export the `run` arg structs at the `cli` module root so external
+// crates (e.g. `bin/zlayer`) can name `zlayer_docker::cli::RunArgs` when
+// constructing a container-run request for the top-level `zlayer run`.
+pub use run::{
+    RunArgs, RunLifecycleArgs, RunMiscArgs, RunNetworkArgs, RunResourcesArgs, RunRuntimeArgs,
+    RunSecurityArgs, RunVolumesArgs,
+};
+
 /// Docker-compatible CLI commands.
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]

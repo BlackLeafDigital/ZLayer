@@ -13,14 +13,10 @@ anyhow.workspace = true
 gix.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
-# tempfile: SSH auth writes a PEM key to a mode-0600 TempDir for the duration
-# of the operation; retained at runtime.
-tempfile = "3"
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile = "3"
+zlayer-paths.workspace = true
+zlayer-types.workspace = true
 
 [lints]
 workspace = true

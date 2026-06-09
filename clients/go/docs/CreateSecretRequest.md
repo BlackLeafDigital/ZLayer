@@ -5,6 +5,7 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Name** | **string** | The name of the secret. | 
+**NodeAffinity** | Pointer to [**NullableNodeAffinity**](NodeAffinity.md) | Optional per-secret node affinity. &#x60;None&#x60; (default) &#x3D; any node may host the decryptable form. When set, only matching nodes receive a wrap of the DEK material for this row, and the API gate filters reads accordingly. Ignored on standalone (non-clustered) daemons. | [optional] 
 **Scope** | Pointer to **NullableString** | Optional explicit scope (legacy form). Mutually exclusive with the &#x60;?environment&#x3D;&#x60; query parameter. | [optional] 
 **Value** | **string** | The secret value (will be encrypted at rest). | 
 
@@ -47,6 +48,41 @@ and a boolean to check if the value has been set.
 SetName sets Name field to given value.
 
 
+### GetNodeAffinity
+
+`func (o *CreateSecretRequest) GetNodeAffinity() NodeAffinity`
+
+GetNodeAffinity returns the NodeAffinity field if non-nil, zero value otherwise.
+
+### GetNodeAffinityOk
+
+`func (o *CreateSecretRequest) GetNodeAffinityOk() (*NodeAffinity, bool)`
+
+GetNodeAffinityOk returns a tuple with the NodeAffinity field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetNodeAffinity
+
+`func (o *CreateSecretRequest) SetNodeAffinity(v NodeAffinity)`
+
+SetNodeAffinity sets NodeAffinity field to given value.
+
+### HasNodeAffinity
+
+`func (o *CreateSecretRequest) HasNodeAffinity() bool`
+
+HasNodeAffinity returns a boolean if a field has been set.
+
+### SetNodeAffinityNil
+
+`func (o *CreateSecretRequest) SetNodeAffinityNil(b bool)`
+
+ SetNodeAffinityNil sets the value for NodeAffinity to be an explicit nil
+
+### UnsetNodeAffinity
+`func (o *CreateSecretRequest) UnsetNodeAffinity()`
+
+UnsetNodeAffinity ensures that no value is present for NodeAffinity, not even an explicit nil
 ### GetScope
 
 `func (o *CreateSecretRequest) GetScope() string`

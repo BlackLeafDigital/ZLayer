@@ -9,7 +9,6 @@
 
 use std::time::{Duration, Instant};
 
-use crate::health::HealthState;
 use crate::service::ServiceManager;
 use zlayer_spec::{DeploymentSpec, Protocol, ScaleSpec};
 
@@ -78,21 +77,20 @@ pub async fn wait_for_stabilization(
                 ScaleSpec::Manual => 0,
             };
 
+            // Cluster-wide: sum running replicas + health across every node the
+            // service is placed on (distributed scaling places replicas on
+            // remote nodes; a leader-local count would read 0 and never
+            // stabilize). Falls back to the local view when not clustered.
+            let node_states = manager.cluster_service_states(name).await;
             #[allow(clippy::cast_possible_truncation)]
-            let running = match manager.service_replica_count(name).await {
-                Ok(count) => count as u32,
-                Err(_) => 0,
+            let running: u32 = node_states.iter().map(|s| s.running).sum();
+            let healthy = if desired == 0 {
+                true // Manual scaling / 0 replicas is trivially healthy.
+            } else {
+                // Every node with replicas must report healthy; nodes running
+                // none are trivially healthy and don't drag the aggregate.
+                node_states.iter().all(|s| s.healthy)
             };
-
-            // Check health states from the manager
-            let health_states = manager.health_states();
-            let states = health_states.read().await;
-            let healthy = match states.get(name) {
-                Some(HealthState::Healthy) => true,
-                _ if desired == 0 => true, // Manual scaling / 0 replicas is trivially healthy
-                _ => false,
-            };
-            drop(states);
 
             let service_ready = running == desired && healthy;
             if !service_ready && desired > 0 {

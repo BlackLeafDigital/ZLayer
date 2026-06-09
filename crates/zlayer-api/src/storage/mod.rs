@@ -159,6 +159,7 @@ mod tests {
                 image: ImageSpec {
                     name: "test:latest".parse().expect("valid image reference"),
                     pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
+                    source_policy: None,
                 },
                 resources: zlayer_spec::ResourcesSpec::default(),
                 env: HashMap::default(),
@@ -166,6 +167,7 @@ mod tests {
                 network: zlayer_spec::ServiceNetworkSpec::default(),
                 endpoints: vec![],
                 scale: zlayer_spec::ScaleSpec::default(),
+                replica_groups: None,
                 depends: vec![],
                 health: zlayer_spec::HealthSpec {
                     start_grace: None,
@@ -185,6 +187,7 @@ mod tests {
                 privileged: false,
                 node_mode: zlayer_spec::NodeMode::default(),
                 node_selector: None,
+                affinity: None,
                 platform: None,
                 service_type: zlayer_spec::ServiceType::default(),
                 wasm: None,
@@ -212,6 +215,9 @@ mod tests {
                 userns_mode: None,
                 cgroup_parent: None,
                 expose: Vec::new(),
+                isolation: None,
+                overlay: None,
+                localhost_reachability: zlayer_spec::LocalhostReachability::default(),
             },
         );
 

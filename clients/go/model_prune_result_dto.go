@@ -19,7 +19,7 @@ import (
 // checks if the PruneResultDto type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &PruneResultDto{}
 
-// PruneResultDto Serializable wrapper for [`PruneResult`].
+// PruneResultDto Serializable wrapper for `zlayer_agent::runtime::PruneResult`.
 type PruneResultDto struct {
 	// Image references or digests that were removed.
 	Deleted []string `json:"deleted"`

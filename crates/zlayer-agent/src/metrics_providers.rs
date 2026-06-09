@@ -108,10 +108,7 @@ impl ContainerStatsProvider for RuntimeStatsProvider {
     /// Get raw container statistics from cgroups
     async fn get_stats(&self, id: &MetricsContainerId) -> Result<RawContainerStats, String> {
         // Convert MetricsContainerId to ContainerId
-        let container_id = ContainerId {
-            service: id.service.clone(),
-            replica: id.replica,
-        };
+        let container_id = ContainerId::new(id.service.clone(), id.replica);
 
         // Get stats from Runtime
         let stats = self

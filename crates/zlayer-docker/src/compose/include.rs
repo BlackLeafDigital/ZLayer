@@ -193,6 +193,7 @@ fn load_one_include(
 mod tests {
     use super::*;
     use std::io::Write;
+    use zlayer_paths::ZLayerDirs;
 
     fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
@@ -203,7 +204,9 @@ mod tests {
 
     #[test]
     fn include_short_form_string_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("include-short-form-string-path-")
+            .unwrap();
         write(
             dir.path(),
             "base.yaml",
@@ -234,7 +237,9 @@ services:
 
     #[test]
     fn include_long_form_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("include-long-form-object-")
+            .unwrap();
         write(
             dir.path(),
             "shared.yaml",
@@ -263,7 +268,9 @@ services:
 
     #[test]
     fn include_main_overrides_included_value() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("include-main-overrides-included-value-")
+            .unwrap();
         write(
             dir.path(),
             "base.yaml",
@@ -308,7 +315,9 @@ services:
 
     #[test]
     fn include_chains_recursively() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("include-chains-recursively-")
+            .unwrap();
         write(
             dir.path(),
             "leaf.yaml",
@@ -350,7 +359,9 @@ services:
 
     #[test]
     fn include_missing_file_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("include-missing-file-errors-")
+            .unwrap();
         let main = write(
             dir.path(),
             "compose.yaml",

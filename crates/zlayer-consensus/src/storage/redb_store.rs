@@ -285,20 +285,32 @@ where
             redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
         })?;
 
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
-        })?;
-        {
-            let mut meta = txn.open_table(META_TABLE).map_err(|e| {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
             })?;
-            meta.insert(META_VOTE, bytes.as_slice()).map_err(|e| {
+            {
+                let mut meta = txn.open_table(META_TABLE).map_err(|e| {
+                    redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
+                })?;
+                meta.insert(META_VOTE, bytes.as_slice()).map_err(|e| {
+                    redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
+                })?;
+            }
+            txn.commit().map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
             })?;
-        }
-        txn.commit().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
-        })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            redb_to_storage_err(
+                openraft::ErrorSubject::Vote,
+                openraft::ErrorVerb::Write,
+                format!("spawn_blocking join: {e}"),
+            )
+        })??;
         Ok(())
     }
 
@@ -329,38 +341,50 @@ where
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
-        {
-            let mut meta = txn.open_table(META_TABLE).map_err(|e| {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
-            match committed {
-                Some(ref id) => {
-                    let bytes = postcard2::to_vec(id).map_err(|e| {
-                        redb_to_storage_err(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Write,
-                            e,
-                        )
-                    })?;
-                    meta.insert(META_COMMITTED, bytes.as_slice()).map_err(|e| {
-                        redb_to_storage_err(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Write,
-                            e,
-                        )
-                    })?;
-                }
-                None => {
-                    let _ = meta.remove(META_COMMITTED);
+            {
+                let mut meta = txn.open_table(META_TABLE).map_err(|e| {
+                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+                })?;
+                match committed {
+                    Some(ref id) => {
+                        let bytes = postcard2::to_vec(id).map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::Logs,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                        meta.insert(META_COMMITTED, bytes.as_slice()).map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::Logs,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                    }
+                    None => {
+                        let _ = meta.remove(META_COMMITTED);
+                    }
                 }
             }
-        }
-        txn.commit().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
+            txn.commit().map_err(|e| {
+                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            redb_to_storage_err(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                format!("spawn_blocking join: {e}"),
+            )
+        })??;
         Ok(())
     }
 
@@ -396,26 +420,48 @@ where
         I: IntoIterator<Item = C::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
-        {
-            let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
+        // Serialize entries up-front so the closure only needs owned bytes.
+        let mut serialized: Vec<(u64, Vec<u8>)> = Vec::new();
+        for entry in entries {
+            let idx = entry.get_log_id().index;
+            let bytes = postcard2::to_vec(&entry).map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
-            for entry in entries {
-                let idx = entry.get_log_id().index;
-                let bytes = postcard2::to_vec(&entry).map_err(|e| {
-                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })?;
-                table.insert(idx, bytes.as_slice()).map_err(|e| {
-                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })?;
-            }
+            serialized.push((idx, bytes));
         }
-        txn.commit().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
+
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
+                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+            {
+                let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
+                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+                })?;
+                for (idx, bytes) in &serialized {
+                    table.insert(*idx, bytes.as_slice()).map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+                }
+            }
+            txn.commit().map_err(|e| {
+                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            redb_to_storage_err(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                format!("spawn_blocking join: {e}"),
+            )
+        })??;
 
         // Signal that data is durable
         callback.log_io_completed(Ok(()));
@@ -423,88 +469,132 @@ where
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
-        {
-            let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
-            // Collect keys >= log_id.index
-            let keys: Vec<u64> = {
-                let mut keys = Vec::new();
-                for item in table.range(log_id.index..).map_err(|e| {
+            {
+                let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })? {
-                    let (k, _) = item.map_err(|e| {
+                })?;
+                // Collect keys >= log_id.index
+                let keys: Vec<u64> = {
+                    let mut keys = Vec::new();
+                    for item in table.range(log_id.index..).map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })? {
+                        let (k, _) = item.map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::Logs,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                        keys.push(k.value());
+                    }
+                    keys
+                };
+                for key in keys {
+                    table.remove(key).map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Logs,
                             openraft::ErrorVerb::Write,
                             e,
                         )
                     })?;
-                    keys.push(k.value());
                 }
-                keys
-            };
-            for key in keys {
-                table.remove(key).map_err(|e| {
-                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })?;
             }
-        }
-        txn.commit().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
+            txn.commit().map_err(|e| {
+                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            redb_to_storage_err(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                format!("spawn_blocking join: {e}"),
+            )
+        })??;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
-        {
-            let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
-            // Collect keys <= log_id.index
-            let keys: Vec<u64> = {
-                let mut keys = Vec::new();
-                for item in table.range(..=log_id.index).map_err(|e| {
+            {
+                let mut table = txn.open_table(LOG_TABLE).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })? {
-                    let (k, _) = item.map_err(|e| {
+                })?;
+                // Collect keys <= log_id.index
+                let keys: Vec<u64> = {
+                    let mut keys = Vec::new();
+                    for item in table.range(..=log_id.index).map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })? {
+                        let (k, _) = item.map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::Logs,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                        keys.push(k.value());
+                    }
+                    keys
+                };
+                for key in keys {
+                    table.remove(key).map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Logs,
                             openraft::ErrorVerb::Write,
                             e,
                         )
                     })?;
-                    keys.push(k.value());
                 }
-                keys
-            };
-            for key in keys {
-                table.remove(key).map_err(|e| {
-                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-                })?;
-            }
 
-            // Persist last_purged
-            let mut meta = txn.open_table(META_TABLE).map_err(|e| {
-                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-            })?;
-            let bytes = postcard2::to_vec(&log_id).map_err(|e| {
-                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-            })?;
-            meta.insert(META_LAST_PURGED, bytes.as_slice())
-                .map_err(|e| {
+                // Persist last_purged
+                let mut meta = txn.open_table(META_TABLE).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
                 })?;
-        }
-        txn.commit().map_err(|e| {
-            redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
-        })?;
+                let bytes = postcard2::to_vec(&log_id).map_err(|e| {
+                    redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+                })?;
+                meta.insert(META_LAST_PURGED, bytes.as_slice())
+                    .map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+            }
+            txn.commit().map_err(|e| {
+                redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            redb_to_storage_err(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                format!("spawn_blocking join: {e}"),
+            )
+        })??;
         Ok(())
     }
 }
@@ -751,43 +841,30 @@ where
         I: IntoIterator<Item = C::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut sm = self.sm.write().await;
-        let mut responses = Vec::new();
+        // Mutate the in-memory cache and prepare owned bytes while holding the
+        // write lock, then drop the lock before doing the blocking redb commit.
+        let (responses, state_bytes, last_applied_bytes, membership_bytes) = {
+            let mut sm = self.sm.write().await;
+            let mut responses = Vec::new();
 
-        for entry in entries {
-            sm.last_applied_log = Some(entry.log_id);
+            for entry in entries {
+                sm.last_applied_log = Some(entry.log_id);
 
-            match entry.payload {
-                EntryPayload::Normal(ref data) => {
-                    let resp = (self.apply_fn)(&mut sm.state, data);
-                    responses.push(resp);
-                }
-                EntryPayload::Membership(ref mem) => {
-                    sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    responses.push(C::R::default());
-                }
-                EntryPayload::Blank => {
-                    responses.push(C::R::default());
+                match entry.payload {
+                    EntryPayload::Normal(ref data) => {
+                        let resp = (self.apply_fn)(&mut sm.state, data);
+                        responses.push(resp);
+                    }
+                    EntryPayload::Membership(ref mem) => {
+                        sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                        responses.push(C::R::default());
+                    }
+                    EntryPayload::Blank => {
+                        responses.push(C::R::default());
+                    }
                 }
             }
-        }
 
-        // Persist state + metadata to redb
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                e,
-            )
-        })?;
-        {
-            let mut sm_table = txn.open_table(SM_TABLE).map_err(|e| {
-                redb_to_storage_err(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
-            })?;
             let state_bytes = postcard2::to_vec(&sm.state).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::StateMachine,
@@ -795,17 +872,17 @@ where
                     e,
                 )
             })?;
-            sm_table
-                .insert(SM_STATE, state_bytes.as_slice())
-                .map_err(|e| {
+            let last_applied_bytes = match sm.last_applied_log {
+                Some(ref id) => Some(postcard2::to_vec(id).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::StateMachine,
                         openraft::ErrorVerb::Write,
                         e,
                     )
-                })?;
-
-            let mut meta_table = txn.open_table(META_TABLE).map_err(|e| {
+                })?),
+                None => None,
+            };
+            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
@@ -813,16 +890,59 @@ where
                 )
             })?;
 
-            if let Some(ref id) = sm.last_applied_log {
-                let bytes = postcard2::to_vec(id).map_err(|e| {
+            (responses, state_bytes, last_applied_bytes, membership_bytes)
+        };
+
+        // Persist state + metadata to redb
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
+                redb_to_storage_err(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
+            {
+                let mut sm_table = txn.open_table(SM_TABLE).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::StateMachine,
                         openraft::ErrorVerb::Write,
                         e,
                     )
                 })?;
+                sm_table
+                    .insert(SM_STATE, state_bytes.as_slice())
+                    .map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::StateMachine,
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+
+                let mut meta_table = txn.open_table(META_TABLE).map_err(|e| {
+                    redb_to_storage_err(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Write,
+                        e,
+                    )
+                })?;
+
+                if let Some(ref bytes) = last_applied_bytes {
+                    meta_table
+                        .insert(META_LAST_APPLIED, bytes.as_slice())
+                        .map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::StateMachine,
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                }
+
                 meta_table
-                    .insert(META_LAST_APPLIED, bytes.as_slice())
+                    .insert(META_LAST_MEMBERSHIP, membership_bytes.as_slice())
                     .map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::StateMachine,
@@ -831,31 +951,23 @@ where
                         )
                     })?;
             }
-
-            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
+            txn.commit().map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
                     e,
                 )
             })?;
-            meta_table
-                .insert(META_LAST_MEMBERSHIP, membership_bytes.as_slice())
-                .map_err(|e| {
-                    redb_to_storage_err(
-                        openraft::ErrorSubject::StateMachine,
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
-                })?;
-        }
-        txn.commit().map_err(|e| {
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
             redb_to_storage_err(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Write,
-                e,
+                format!("spawn_blocking join: {e}"),
             )
-        })?;
+        })??;
 
         Ok(responses)
     }
@@ -887,28 +999,15 @@ where
             )
         })?;
 
-        // Update in-memory cache
-        let mut sm = self.sm.write().await;
-        sm.last_applied_log = meta.last_log_id;
-        sm.last_membership = meta.last_membership.clone();
-        sm.state = state;
+        // Update in-memory cache and prepare owned bytes for the blocking
+        // redb commit; drop the lock before spawning to avoid holding the
+        // tokio RwLock across spawn_blocking.
+        let (state_bytes, last_applied_bytes, membership_bytes, meta_bytes) = {
+            let mut sm = self.sm.write().await;
+            sm.last_applied_log = meta.last_log_id;
+            sm.last_membership = meta.last_membership.clone();
+            sm.state = state;
 
-        // Persist to redb
-        let txn = self.db.begin_write().map_err(|e| {
-            redb_to_storage_err(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                e,
-            )
-        })?;
-        {
-            let mut sm_table = txn.open_table(SM_TABLE).map_err(|e| {
-                redb_to_storage_err(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
-            })?;
             let state_bytes = postcard2::to_vec(&sm.state).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
@@ -916,33 +1015,23 @@ where
                     e,
                 )
             })?;
-            sm_table
-                .insert(SM_STATE, state_bytes.as_slice())
-                .map_err(|e| {
+            let last_applied_bytes = match sm.last_applied_log {
+                Some(ref id) => Some(postcard2::to_vec(id).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Write,
                         e,
                     )
-                })?;
-
-            // Store snapshot data + meta
-            let mut snap_table = txn.open_table(SNAPSHOT_TABLE).map_err(|e| {
+                })?),
+                None => None,
+            };
+            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
                     e,
                 )
             })?;
-            snap_table
-                .insert(SNAPSHOT_CURRENT, data.as_slice())
-                .map_err(|e| {
-                    redb_to_storage_err(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
-                })?;
             let meta_bytes = postcard2::to_vec(meta).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
@@ -950,34 +1039,92 @@ where
                     e,
                 )
             })?;
-            snap_table
-                .insert(SNAPSHOT_META, meta_bytes.as_slice())
-                .map_err(|e| {
-                    redb_to_storage_err(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
-                })?;
 
-            // Persist last_applied and membership
-            let mut meta_table = txn.open_table(META_TABLE).map_err(|e| {
+            (
+                state_bytes,
+                last_applied_bytes,
+                membership_bytes,
+                meta_bytes,
+            )
+        };
+
+        // Persist to redb
+        let db = Arc::clone(&self.db);
+        let last_log_id = meta.last_log_id;
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError<NodeId>> {
+            let txn = db.begin_write().map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
                     e,
                 )
             })?;
-            if let Some(ref id) = sm.last_applied_log {
-                let bytes = postcard2::to_vec(id).map_err(|e| {
+            {
+                let mut sm_table = txn.open_table(SM_TABLE).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Write,
                         e,
                     )
                 })?;
+                sm_table
+                    .insert(SM_STATE, state_bytes.as_slice())
+                    .map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Snapshot(None),
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+
+                // Store snapshot data + meta
+                let mut snap_table = txn.open_table(SNAPSHOT_TABLE).map_err(|e| {
+                    redb_to_storage_err(
+                        openraft::ErrorSubject::Snapshot(None),
+                        openraft::ErrorVerb::Write,
+                        e,
+                    )
+                })?;
+                snap_table
+                    .insert(SNAPSHOT_CURRENT, data.as_slice())
+                    .map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Snapshot(None),
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+                snap_table
+                    .insert(SNAPSHOT_META, meta_bytes.as_slice())
+                    .map_err(|e| {
+                        redb_to_storage_err(
+                            openraft::ErrorSubject::Snapshot(None),
+                            openraft::ErrorVerb::Write,
+                            e,
+                        )
+                    })?;
+
+                // Persist last_applied and membership
+                let mut meta_table = txn.open_table(META_TABLE).map_err(|e| {
+                    redb_to_storage_err(
+                        openraft::ErrorSubject::Snapshot(None),
+                        openraft::ErrorVerb::Write,
+                        e,
+                    )
+                })?;
+                if let Some(ref bytes) = last_applied_bytes {
+                    meta_table
+                        .insert(META_LAST_APPLIED, bytes.as_slice())
+                        .map_err(|e| {
+                            redb_to_storage_err(
+                                openraft::ErrorSubject::Snapshot(None),
+                                openraft::ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                }
                 meta_table
-                    .insert(META_LAST_APPLIED, bytes.as_slice())
+                    .insert(META_LAST_MEMBERSHIP, membership_bytes.as_slice())
                     .map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Snapshot(None),
@@ -986,33 +1133,26 @@ where
                         )
                     })?;
             }
-            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
+            txn.commit().map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
                     e,
                 )
             })?;
-            meta_table
-                .insert(META_LAST_MEMBERSHIP, membership_bytes.as_slice())
-                .map_err(|e| {
-                    redb_to_storage_err(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        e,
-                    )
-                })?;
-        }
-        txn.commit().map_err(|e| {
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
             redb_to_storage_err(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                e,
+                format!("spawn_blocking join: {e}"),
             )
-        })?;
+        })??;
 
         debug!(
-            last_log_id = ?meta.last_log_id,
+            last_log_id = ?last_log_id,
             "Installed snapshot into redb state machine"
         );
 

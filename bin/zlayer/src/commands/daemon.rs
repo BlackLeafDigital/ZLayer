@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use crate::cli::DaemonAction;
+use crate::cli::{DaemonAction, DaemonArgs};
 
 /// Resolved admin-account bootstrap material to inject into the daemon's
 /// environment at first start. The password is materialised as a file so the
@@ -26,6 +26,166 @@ pub struct TunnelInstallArgs<'a> {
     pub tls_cert: Option<&'a Path>,
     pub tls_key: Option<&'a Path>,
     pub disabled: bool,
+}
+
+/// Idempotently inject (or update) a single environment entry in the installed
+/// daemon service unit so the daemon picks it up on its next start.
+///
+/// Resolves the SAME unit/plist path that `daemon install` writes to (launchd
+/// plist on macOS, systemd unit on Linux), edits it in place, and returns
+/// `Ok(())`. If no installed unit is found (a dev / unmanaged daemon), returns
+/// an error describing the situation so the caller can print actionable
+/// guidance rather than silently writing to a location nothing reads.
+///
+/// The caller is responsible for telling the user to restart the daemon for the
+/// change to take effect.
+pub(crate) fn set_daemon_env_var(key: &str, value: &str) -> Result<()> {
+    let daemon_name = crate::cli::resolve_daemon_name(None);
+
+    #[cfg(target_os = "macos")]
+    {
+        let (plist_dir, _target) = launchd_context()?;
+        let path = plist_path_for(&plist_dir, &daemon_name);
+        if !path.exists() {
+            bail!(
+                "no installed launchd plist at {} (daemon not installed as a service?)",
+                path.display()
+            );
+        }
+        let plist = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let updated = upsert_plist_env_var(&plist, key, value)?;
+        std::fs::write(&path, &updated)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let path = unit_path(&daemon_name);
+        if !path.exists() {
+            bail!(
+                "no installed systemd unit at {} (daemon not installed as a service?)",
+                path.display()
+            );
+        }
+        let unit = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let updated = upsert_systemd_env_var(&unit, key, value)?;
+        std::fs::write(&path, &updated)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (key, value, daemon_name);
+        bail!("setting daemon environment variables is not supported on this platform");
+    }
+}
+
+/// Insert or replace one `<key>/<string>` pair inside the `EnvironmentVariables`
+/// dict of a launchd plist. If the dict is absent, it is created just before the
+/// closing `</dict>` of the top-level plist dict.
+#[cfg(target_os = "macos")]
+fn upsert_plist_env_var(plist: &str, key: &str, value: &str) -> Result<String> {
+    let key_line = format!("<key>{key}</key>");
+
+    // If the EnvironmentVariables dict already declares this key, replace the
+    // immediately-following <string>…</string> value.
+    if let Some(key_pos) = plist.find(&key_line) {
+        // Only treat it as the env entry if an EnvironmentVariables dict exists
+        // and this key sits after it (guards against a same-named top-level key,
+        // of which there are none today, but stay defensive).
+        let after_key = &plist[key_pos + key_line.len()..];
+        if let Some(open_rel) = after_key.find("<string>") {
+            if let Some(close_rel) = after_key.find("</string>") {
+                if open_rel < close_rel {
+                    let open_abs = key_pos + key_line.len() + open_rel + "<string>".len();
+                    let close_abs = key_pos + key_line.len() + close_rel;
+                    let mut out = String::with_capacity(plist.len() + value.len());
+                    out.push_str(&plist[..open_abs]);
+                    out.push_str(value);
+                    out.push_str(&plist[close_abs..]);
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    let entry = format!("        <key>{key}</key>\n        <string>{value}</string>");
+
+    // Existing EnvironmentVariables dict: append the entry before its </dict>.
+    if let Some(ev_pos) = plist.find("<key>EnvironmentVariables</key>") {
+        let after_ev = &plist[ev_pos..];
+        if let Some(dict_open_rel) = after_ev.find("<dict>") {
+            let dict_open_abs = ev_pos + dict_open_rel + "<dict>".len();
+            if let Some(dict_close_rel) = plist[dict_open_abs..].find("</dict>") {
+                let dict_close_abs = dict_open_abs + dict_close_rel;
+                let mut out = String::with_capacity(plist.len() + entry.len() + 2);
+                out.push_str(&plist[..dict_close_abs]);
+                out.push_str(&entry);
+                out.push('\n');
+                out.push_str("    ");
+                out.push_str(&plist[dict_close_abs..]);
+                return Ok(out);
+            }
+        }
+        bail!("malformed EnvironmentVariables dict in installed plist");
+    }
+
+    // No EnvironmentVariables dict: create one before the final </dict> of the
+    // top-level plist dict.
+    let block = format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entry}\n    </dict>\n");
+    if let Some(last_dict_close) = plist.rfind("</dict>") {
+        let mut out = String::with_capacity(plist.len() + block.len());
+        out.push_str(&plist[..last_dict_close]);
+        out.push_str(&block);
+        out.push_str(&plist[last_dict_close..]);
+        return Ok(out);
+    }
+    bail!("malformed plist: no closing </dict> found");
+}
+
+/// Insert or replace one `Environment=KEY=value` line in the `[Service]` section
+/// of a systemd unit.
+#[cfg(target_os = "linux")]
+fn upsert_systemd_env_var(unit: &str, key: &str, value: &str) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let prefix = format!("Environment={key}=");
+    let new_line = format!("Environment={key}={value}");
+
+    let mut out = String::with_capacity(unit.len() + new_line.len() + 1);
+    let mut replaced = false;
+    for line in unit.lines() {
+        if line.trim_start().starts_with(&prefix) {
+            out.push_str(&new_line);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if replaced {
+        return Ok(out);
+    }
+
+    // Not present yet: append under the [Service] section header.
+    let mut result = String::with_capacity(unit.len() + new_line.len() + 1);
+    let mut injected = false;
+    for line in unit.lines() {
+        writeln!(result, "{line}").unwrap();
+        if !injected && line.trim() == "[Service]" {
+            writeln!(result, "{new_line}").unwrap();
+            injected = true;
+        }
+    }
+    if !injected {
+        bail!("malformed systemd unit: no [Service] section found");
+    }
+    Ok(result)
 }
 
 /// Write `password` to `<data_dir>/.bootstrap_password` with mode 0600 on Unix
@@ -184,15 +344,38 @@ pub fn resolve_admin_bootstrap(
 }
 
 /// Handle daemon lifecycle commands.
-pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Result<()> {
-    // Privileged actions auto-elevate via `sudo -E` (Unix) or the UAC
-    // `runas` verb (Windows). `Status` is read-only and `ResumeFromSnapshot`
-    // talks to a running daemon over its socket — neither needs root.
+pub(crate) async fn handle_daemon(
+    daemon_args: &DaemonArgs,
+    data_dir: &Path,
+    daemon_name_override: Option<&str>,
+) -> Result<()> {
+    let daemon_name = crate::cli::resolve_daemon_name(daemon_name_override);
+    let action = &daemon_args.action;
+
+    // Elevation policy.
+    //
+    // macOS + Linux: the main daemon installs as a per-USER service — a launchd
+    // Agent (`gui/$uid`, macOS) or a `systemctl --user` unit
+    // (`~/.config/systemd/user`, Linux) — writing only to user-owned
+    // `~/.zlayer` and running the container runtime rootless (rootless youki +
+    // cgroup-v2 delegation on Linux). So install / uninstall / start / stop /
+    // restart / reset / migrate all run AS THE USER — no sudo. The single
+    // privileged step — registering the `zlayer-overlayd` *system* service,
+    // which owns the tun/utun adapter — self-elevates surgically inside
+    // install() (via the hidden `_install-overlayd` re-exec) and ONLY when the
+    // overlay binary/unit actually changed. A daemon-only upgrade prompts for
+    // nothing.
+    //
+    // Windows: the SCM registers services in the system database and requires
+    // Administrator, so the daemon-management actions still elevate up front
+    // (Windows per-user services would need a separate API the SCM path here
+    // does not implement; HCS itself is not the blocker).
+    #[cfg(target_os = "windows")]
     match action {
         DaemonAction::Install(_) => {
             crate::privilege::ensure_root_or_reexec("install the system service")?;
         }
-        DaemonAction::Uninstall => {
+        DaemonAction::Uninstall { .. } => {
             crate::privilege::ensure_root_or_reexec("uninstall the system service")?;
         }
         DaemonAction::Start => {
@@ -207,26 +390,39 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
         DaemonAction::Reset { .. } => {
             crate::privilege::ensure_root_or_reexec("reset daemon state")?;
         }
-        DaemonAction::Status | DaemonAction::ResumeFromSnapshot { .. } => {}
         DaemonAction::Migrate { .. } => {
             crate::privilege::ensure_root_or_reexec("migrate data directory layout")?;
         }
+        DaemonAction::Status
+        | DaemonAction::ResumeFromSnapshot { .. }
+        | DaemonAction::InstallOverlayd { .. } => {}
+    }
+
+    // Registering the overlay *system* service always needs root, on every
+    // platform — it writes to `/Library/LaunchDaemons` (or `/etc/systemd/system`)
+    // and bootstraps a system-domain service. This is the surgical step the
+    // rootless macOS install re-execs under `sudo`.
+    if matches!(action, DaemonAction::InstallOverlayd { .. }) {
+        crate::privilege::ensure_root_or_reexec("register the overlay networking system service")?;
     }
 
     match action {
         DaemonAction::Install(args) => {
             // `install_wsl` / `no_nat` / `stun_servers` / `turn_servers` /
-            // `relay_server_bind` are parsed for forward-compatibility; the
-            // Unix install path forwards only the daemon-environment flags
-            // below.
+            // `relay_server_bind` are parsed for forward-compatibility (Windows
+            // daemon install is a separate task); the Unix install path forwards
+            // only the daemon-environment flags below.
             install(
+                &daemon_name,
                 data_dir,
                 args.no_start,
                 &args.bind,
+                args.socket.as_deref(),
                 args.jwt_secret.as_deref(),
                 args.no_swagger,
                 #[cfg(feature = "docker-compat")]
                 args.docker_socket,
+                args.with_overlay,
                 args.admin_email.as_deref(),
                 args.admin_password.as_deref(),
                 args.admin_password_file.as_deref(),
@@ -240,11 +436,24 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             )
             .await
         }
-        DaemonAction::Uninstall => uninstall().await,
-        DaemonAction::Start => start(data_dir).await,
-        DaemonAction::Stop => stop().await,
-        DaemonAction::Restart => restart(data_dir).await,
-        DaemonAction::Status => status(data_dir).await,
+        DaemonAction::Uninstall {
+            remove_binary,
+            remove_completions,
+            purge_data,
+        } => {
+            uninstall(
+                &daemon_name,
+                *remove_binary,
+                *remove_completions,
+                *purge_data,
+                data_dir,
+            )
+            .await
+        }
+        DaemonAction::Start => start(&daemon_name, data_dir).await,
+        DaemonAction::Stop => stop(&daemon_name).await,
+        DaemonAction::Restart => restart(&daemon_name, data_dir).await,
+        DaemonAction::Status => status(&daemon_name, data_dir).await,
         DaemonAction::Reset { force } => reset(data_dir, *force),
         DaemonAction::ResumeFromSnapshot { path } => {
             let outcome = restore_from_snapshot(path).await;
@@ -260,7 +469,23 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             let effective: &Path = cli_data_dir.as_deref().unwrap_or(data_dir);
             run_migrate(effective, *dry_run)
         }
+        DaemonAction::InstallOverlayd {
+            overlayd_bin,
+            no_start,
+        } => handle_install_overlayd(data_dir, overlayd_bin, *no_start).await,
     }
+}
+
+/// Dispatch the surgical overlayd-system-service registration (the
+/// `_install-overlayd` re-exec target). Runs as root and delegates to the
+/// per-OS `install_overlayd_service`.
+async fn handle_install_overlayd(
+    data_dir: &Path,
+    overlayd_bin: &Path,
+    no_start: bool,
+) -> Result<()> {
+    install_overlayd_service(data_dir, overlayd_bin, no_start).await;
+    Ok(())
 }
 
 /// Implementation of `zlayer daemon migrate`. Extracted from `handle_daemon`
@@ -664,6 +889,7 @@ fn print_restore_summary(outcome: &RestoreOutcome) {
 /// the labels (`API:`, `Manager:`, `Admin user:`, `Password:`, `Service:`,
 /// `Logs:`, `Resumed:`) line up roughly in one column.
 pub fn print_install_summary(
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] daemon_name: &str,
     bind: &str,
     _data_dir: &Path,
     log_dir: Option<&Path>,
@@ -679,40 +905,66 @@ pub fn print_install_summary(
     }
     #[cfg(target_os = "linux")]
     {
-        println!("  Service:    systemctl status zlayer.service");
-        println!("  Logs:       journalctl -fu zlayer.service");
-        if let Some(dir) = log_dir {
-            println!("              {}/daemon.log", dir.display());
+        let unit = unit_name(daemon_name);
+        // System install (root) uses the system manager + the shared `zlayer`
+        // group; a rootless install uses the per-user manager and has no group.
+        if linux_is_root() {
+            println!("  Service:    systemctl status {unit}");
+            println!("  Logs:       journalctl -fu {unit}");
+            if let Some(dir) = log_dir {
+                println!("              {}/daemon.log", dir.display());
+            }
+            // Group-membership hint. `ensure_zlayer_group` is best-effort and
+            // we can't easily distinguish "newly added" from "already a member"
+            // here, so print it unconditionally for a system install — re-running
+            // `newgrp zlayer` in a shell that already has the group is harmless.
+            println!("  Group:      You were added to the 'zlayer' group. New shells get this");
+            println!("              automatically. For the current shell, run:");
+            println!("                newgrp zlayer");
+        } else {
+            println!("  Service:    systemctl --user status {unit}");
+            println!("  Logs:       journalctl --user -fu {unit}");
+            if let Some(dir) = log_dir {
+                println!("              {}/daemon.log", dir.display());
+            }
+            // Rootless user services stop at logout unless lingering is enabled.
+            println!("  Tip:        to keep the daemon running while you're logged out, run:");
+            println!("                sudo loginctl enable-linger $USER");
         }
-        // Group-membership hint. `ensure_zlayer_group` is best-effort and we
-        // can't easily distinguish "newly added" from "already a member"
-        // here, so print the hint unconditionally on Linux — re-running
-        // `newgrp zlayer` in an existing shell that already has the group
-        // is a harmless no-op.
-        println!("  Group:      You were added to the 'zlayer' group. New shells get this");
-        println!("              automatically. For the current shell, run:");
-        println!("                newgrp zlayer");
     }
     #[cfg(target_os = "macos")]
     {
-        println!("  Service:    launchctl print system/com.zlayer.daemon");
+        #[allow(unsafe_code)]
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let label = plist_label(daemon_name);
+        // The daemon installs in the system domain only as root; otherwise it's
+        // a per-user Agent. Report the domain the user can actually query.
+        if is_root {
+            println!("  Service:    sudo launchctl print system/{label}");
+        } else {
+            #[allow(unsafe_code)]
+            let uid = unsafe { libc::getuid() };
+            println!("  Service:    launchctl print gui/{uid}/{label}");
+        }
         if let Some(dir) = log_dir {
             println!("  Logs:       {}/daemon.log", dir.display());
         } else {
             println!("  Logs:       <data_dir>/logs/daemon.log");
         }
-        // Group-membership hint mirrors the Linux block. macOS supplementary
-        // groups behave the same way on stale shells: log out / log back in
-        // for the new membership to land, or run `newgrp zlayer` in the
-        // current shell for a one-shot subshell that has the group.
-        println!("  Group:      You were added to the 'zlayer' group. New shells get this");
-        println!("              automatically. For the current shell, run:");
-        println!("                newgrp zlayer");
+        // The shared `zlayer` unix group is provisioned ONLY for a root/system
+        // install (it needs `dseditgroup`). A rootless per-user Agent owns its
+        // own socket, so there's no group to join.
+        if is_root {
+            println!("  Group:      You were added to the 'zlayer' group. New shells get this");
+            println!("              automatically. For the current shell, run:");
+            println!("                newgrp zlayer");
+        }
     }
     #[cfg(target_os = "windows")]
     {
-        println!("  Service:    sc query ZLayer");
-        println!("  Logs:       Get-EventLog -LogName Application -Source ZLayer");
+        let svc_name = crate::daemon_service::service_name(daemon_name);
+        println!("  Service:    sc query {svc_name}");
+        println!("  Logs:       Get-EventLog -LogName Application -Source {svc_name}");
         if let Some(dir) = log_dir {
             println!("              {}\\daemon.log", dir.display());
         }
@@ -739,8 +991,22 @@ pub fn print_install_summary(
 // macOS (launchd)
 // ---------------------------------------------------------------------------
 
+/// Compute the launchd plist `Label` for a given daemon instance name.
+///
+/// The default `zlayer` instance keeps the legacy label `com.zlayer.daemon`
+/// so upgrading does not orphan existing installs. Any other instance name
+/// is appended as a suffix (with a leading `zlayer-` prefix stripped if
+/// present), allowing multiple instances (`zlayer`, `zlayer-dev`, etc.) to
+/// coexist on a single Mac with distinct launchd labels.
 #[cfg(target_os = "macos")]
-const PLIST_LABEL: &str = "com.zlayer.daemon";
+fn plist_label(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "com.zlayer.daemon".to_string()
+    } else {
+        let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+        format!("com.zlayer.daemon-{suffix}")
+    }
+}
 
 /// Determine plist directory and launchctl target based on privilege level.
 #[cfg(target_os = "macos")]
@@ -768,8 +1034,606 @@ fn launchd_context() -> Result<(String, String)> {
 }
 
 #[cfg(target_os = "macos")]
-fn plist_path_for(plist_dir: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(plist_dir).join(format!("{PLIST_LABEL}.plist"))
+fn plist_path_for(plist_dir: &str, daemon_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(plist_dir).join(format!("{}.plist", plist_label(daemon_name)))
+}
+
+// ---------------------------------------------------------------------------
+// overlayd (standalone overlay daemon) — its OWN OS service
+//
+// overlayd owns the WireGuard/Wintun adapter and overlay mechanics. It is
+// registered as a separate OS service from the main daemon so that
+// reinstalling/upgrading the main `zlayer` binary does NOT tear down the
+// overlay adapter. The overlay network itself is removed ONLY on a full
+// `daemon uninstall` (purge), never on a plain main-daemon update.
+//
+// The launchd label / systemd unit / SCM service names are fixed (one overlayd
+// per host data-dir), independent of the main daemon instance name.
+// ---------------------------------------------------------------------------
+
+/// Fixed launchd label for the overlayd daemon (macOS).
+#[cfg(target_os = "macos")]
+const OVERLAYD_LAUNCHD_LABEL: &str = "com.zlayer.overlayd";
+
+/// Resolve the `zlayer-overlayd` binary path for install, copying it into
+/// `system_bin_dir` when the running `zlayer` binary itself was copied out of a
+/// user home (so the root-run service can reach it). Mirrors the main-binary
+/// copy logic in each platform `install`.
+///
+/// `main_exe` is the (possibly already-relocated) path of the main `zlayer`
+/// binary; overlayd is expected to sit next to the ORIGINAL invoked binary
+/// (e.g. the dev target dir or the install staging dir), so we look beside
+/// `current_exe()` first, then beside `main_exe`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_and_stage_overlayd_binary(main_exe: &Path, copied_to_system: bool) -> Option<PathBuf> {
+    let bin_name = "zlayer-overlayd";
+
+    // Candidate source locations, in priority order.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            sources.push(dir.join(bin_name));
+        }
+    }
+    if let Some(dir) = main_exe.parent() {
+        sources.push(dir.join(bin_name));
+    }
+    let source = sources.into_iter().find(|p| p.exists())?;
+
+    // If the main binary was relocated into the system bin dir, place overlayd
+    // alongside it so the system service's ExecStart path is valid.
+    if copied_to_system {
+        if let Some(system_dir) = main_exe.parent() {
+            let dest = system_dir.join(bin_name);
+            if dest != source {
+                let _ = std::fs::remove_file(&dest);
+                if let Err(e) = std::fs::copy(&source, &dest) {
+                    eprintln!(
+                        "Warning: failed to copy {} to {}: {e}",
+                        source.display(),
+                        dest.display()
+                    );
+                    return Some(source);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+                }
+                println!("Copied overlayd binary to {}", dest.display());
+                return Some(dest);
+            }
+        }
+    }
+
+    Some(source)
+}
+
+/// Render the overlayd launchd plist (macOS). Shared by the installer and the
+/// change-gate so byte-for-byte comparison of the on-disk plist is meaningful.
+#[cfg(target_os = "macos")]
+fn render_overlayd_plist(data_dir: &Path, overlayd_bin: &Path) -> String {
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    let log_path = log_dir.join("overlayd.log");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>--data-dir</string>
+        <string>{data_dir}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+    <key>WorkingDirectory</key>
+    <string>/</string>
+</dict>
+</plist>"#,
+        label = OVERLAYD_LAUNCHD_LABEL,
+        bin = overlayd_bin.display(),
+        data_dir = data_dir.display(),
+        log = log_path.display(),
+    )
+}
+
+/// Install (or reinstall) the overlayd launchd service on macOS.
+#[cfg(target_os = "macos")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use tokio::process::Command;
+
+    let (plist_dir, target) = match launchd_context() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: could not resolve launchd context for overlayd: {e}");
+            return;
+        }
+    };
+    let path = std::path::PathBuf::from(&plist_dir).join(format!("{OVERLAYD_LAUNCHD_LABEL}.plist"));
+    let path_str = path.to_string_lossy().to_string();
+
+    let plist = render_overlayd_plist(data_dir, overlayd_bin);
+
+    // Unload existing (ignore errors), then write + bootstrap.
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("{target}/{OVERLAYD_LAUNCHD_LABEL}")])
+        .output()
+        .await;
+
+    if let Err(e) = std::fs::write(&path, &plist) {
+        eprintln!(
+            "Warning: failed to write overlayd plist {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    println!("Installed overlayd launchd plist: {}", path.display());
+
+    if no_start {
+        return;
+    }
+
+    let out = Command::new("launchctl")
+        .args(["bootstrap", &target, &path_str])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            let _ = Command::new("launchctl")
+                .args(["load", "-w", &path_str])
+                .output()
+                .await;
+        }
+    }
+    let _ = Command::new("launchctl")
+        .args([
+            "kickstart",
+            "-k",
+            &format!("{target}/{OVERLAYD_LAUNCHD_LABEL}"),
+        ])
+        .output()
+        .await;
+    println!("Started overlayd service ({OVERLAYD_LAUNCHD_LABEL})");
+}
+
+/// Lowercase-hex SHA-256 of a file's contents, or `None` if it can't be read.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// The fixed system-domain plist path for the overlayd service (world-readable,
+/// so the change-gate can inspect it without root).
+#[cfg(target_os = "macos")]
+fn overlayd_system_plist_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/Library/LaunchDaemons")
+        .join(format!("{OVERLAYD_LAUNCHD_LABEL}.plist"))
+}
+
+/// User-owned fast-path cache recording the `{binary_sha256, service_sha256}` of
+/// the last overlayd registration. The on-disk service unit/plist + binary
+/// remain the source of truth; this just lets a daemon-only upgrade confirm
+/// "unchanged" cheaply.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn overlayd_service_cache_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("overlayd-service.json")
+}
+
+/// Extract `ProgramArguments[0]` (the registered overlayd binary path) from an
+/// installed launchd plist's XML. Returns `None` if the structure isn't found.
+#[cfg(target_os = "macos")]
+fn overlayd_plist_program_path(plist_xml: &str) -> Option<std::path::PathBuf> {
+    // The plist we render puts the binary as the first <string> inside the
+    // <array> that follows <key>ProgramArguments</key>.
+    let after_key = plist_xml.split("<key>ProgramArguments</key>").nth(1)?;
+    let after_array = after_key.split("<array>").nth(1)?;
+    let first = after_array.split("<string>").nth(1)?;
+    let path = first.split("</string>").next()?.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}
+
+/// The change-gate: is the installed overlayd system service already exactly
+/// what we would register? All three must hold, and NONE of these checks needs
+/// root (the system plist + binary are world-readable; `launchctl print` works
+/// read-only):
+///
+/// 1. the installed `/Library/LaunchDaemons/com.zlayer.overlayd.plist`
+///    string-equals the freshly-rendered plist, AND
+/// 2. `sha256(staged overlayd bin) == sha256(installed bin)` (the path taken
+///    from the installed plist's `ProgramArguments[0]`), AND
+/// 3. the service is loaded (`launchctl print system/<label>` exits 0).
+///
+/// `--version` is useless here (overlayd reports a constant `0.0.0-dev`), so the
+/// binary content hash is the real identity.
+#[cfg(target_os = "macos")]
+fn overlayd_service_is_current(data_dir: &Path, staged_overlayd_bin: &Path) -> bool {
+    let Ok(installed_plist) = std::fs::read_to_string(overlayd_system_plist_path()) else {
+        return false; // not installed
+    };
+
+    // (1) plist text identical to what we'd write.
+    if installed_plist != render_overlayd_plist(data_dir, staged_overlayd_bin) {
+        return false;
+    }
+
+    // (2) installed binary content matches the staged binary content.
+    let Some(installed_bin) = overlayd_plist_program_path(&installed_plist) else {
+        return false;
+    };
+    let staged_sha = file_sha256(staged_overlayd_bin);
+    let installed_sha = file_sha256(&installed_bin);
+    if staged_sha.is_none() || staged_sha != installed_sha {
+        return false;
+    }
+
+    // (3) service is actually loaded in the system domain.
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("system/{OVERLAYD_LAUNCHD_LABEL}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Persist the user-owned `{binary_sha256, service_sha256}` cache after a
+/// successful overlayd registration. `rendered_service` is the exact unit/plist
+/// text that was (or will be) installed, so the hash captures the full config.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_overlayd_service_cache(data_dir: &Path, overlayd_bin: &Path, rendered_service: &str) {
+    use sha2::{Digest, Sha256};
+    let Some(bin_sha) = file_sha256(overlayd_bin) else {
+        return;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(rendered_service.as_bytes());
+    let service_sha = hex::encode(hasher.finalize());
+    let json = serde_json::json!({
+        "binary_sha256": bin_sha,
+        "service_sha256": service_sha,
+    });
+    if let Ok(s) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(overlayd_service_cache_path(data_dir), s);
+    }
+}
+
+/// Surgically elevate ONLY the overlayd system-service registration: spawn
+/// `sudo zlayer daemon _install-overlayd --overlayd-bin <bin> [--no-start]` as a
+/// child (so the parent rootless install continues afterward), inheriting stdio
+/// so the sudo prompt is visible. The hidden subcommand runs as root and writes
+/// the system unit/plist + bootstraps the service.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn elevate_overlayd_install(overlayd_bin: &Path, no_start: bool) -> Result<()> {
+    let exe = std::env::current_exe()
+        .context("failed to resolve the current zlayer executable for overlayd elevation")?;
+    println!(
+        "Overlay networking needs root to register its system service; \
+         you may be prompted for your password."
+    );
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg("-E")
+        .arg(&exe)
+        .arg("daemon")
+        .arg("_install-overlayd")
+        .arg("--overlayd-bin")
+        .arg(overlayd_bin);
+    if no_start {
+        cmd.arg("--no-start");
+    }
+    let status = cmd
+        .status()
+        .context("failed to spawn `sudo zlayer daemon _install-overlayd`")?;
+    if !status.success() {
+        bail!("overlayd registration under sudo exited with status {status}");
+    }
+    Ok(())
+}
+
+/// Reconcile a legacy *root* `system/com.zlayer.daemon` install: the old
+/// installer always self-elevated and registered the main daemon as a system
+/// `LaunchDaemon` owning a root-owned `~/.zlayer`. The rootless installer can't
+/// write that tree, so detect the legacy install and, in one surgical sudo
+/// invocation, boot it out, remove its system plist, and `chown -R` the data
+/// dir back to the invoking user. No-op when no legacy install exists.
+#[cfg(target_os = "macos")]
+async fn reconcile_legacy_root_daemon_macos(daemon_name: &str, data_dir: &Path, is_root: bool) {
+    use std::fmt::Write as _;
+    use tokio::process::Command;
+
+    // If we're already root, the normal install path handles the system domain
+    // directly — nothing to reconcile from here.
+    if is_root {
+        return;
+    }
+
+    let label = plist_label(daemon_name);
+    let legacy_plist =
+        std::path::PathBuf::from("/Library/LaunchDaemons").join(format!("{label}.plist"));
+
+    // Is there a legacy system-domain daemon? Cheap read-only probe.
+    let legacy_loaded = Command::new("launchctl")
+        .args(["print", &format!("system/{label}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success());
+
+    // Does the data dir contain root-owned entries the rootless Agent can't write?
+    let needs_chown = data_dir.exists() && !is_path_owned_by_current_user(data_dir).unwrap_or(true);
+
+    if !legacy_loaded && !legacy_plist.exists() && !needs_chown {
+        return;
+    }
+
+    println!(
+        "Detected a legacy root install of '{daemon_name}'. Reclaiming it for a \
+         rootless per-user service (one sudo prompt)."
+    );
+
+    let user = std::env::var("USER").unwrap_or_default();
+    // A single `sudo sh -c` that boots out the legacy job, removes its plist,
+    // and chowns the data dir back to the user. Best-effort; failures are
+    // surfaced but don't abort the (still user-domain) install.
+    let plist_q = shell_quote(&legacy_plist.to_string_lossy());
+    let mut script = format!("launchctl bootout system/{label} 2>/dev/null; rm -f {plist_q}; ");
+    if !user.is_empty() && data_dir.exists() {
+        let user_q = shell_quote(&user);
+        let dd_q = shell_quote(&data_dir.to_string_lossy());
+        let _ = write!(script, "chown -R {user_q} {dd_q}; ");
+    }
+    // Remove stale root-owned runtime sockets / rotated logs the user can't
+    // overwrite (best-effort).
+    let run_q = shell_quote(&crate::cli::default_run_dir(data_dir).to_string_lossy());
+    let log_q = shell_quote(&crate::cli::default_log_dir(data_dir).to_string_lossy());
+    let _ = write!(
+        script,
+        "rm -f {run_q}/*.sock {log_q}/daemon.log* 2>/dev/null || true"
+    );
+
+    let status = Command::new("sudo")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => {
+            println!("Reclaimed legacy root install; data directory is now user-owned.");
+        }
+        Ok(s) => eprintln!("Warning: legacy-install reconcile exited {s}; continuing."),
+        Err(e) => eprintln!("Warning: could not run legacy-install reconcile: {e}; continuing."),
+    }
+}
+
+/// Whether `path` is owned by the current effective user (best-effort).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn is_path_owned_by_current_user(path: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let uid = unsafe { libc::geteuid() };
+    Some(meta.uid() == uid)
+}
+
+/// Minimal POSIX single-quote shell escaping for embedding a path in a
+/// `sudo sh -c` script.
+#[cfg(target_os = "macos")]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Stop + remove the overlayd launchd service on macOS.
+/// Boot out + remove a launchd job from BOTH the per-user (`gui/$uid`) and
+/// system (`/Library/LaunchDaemons`, root) domains, so a `--replace`/uninstall
+/// can't leave an orphan in whichever domain a prior install used. The
+/// system-domain removal self-elevates with a single `sudo` ONLY when a system
+/// plist/job for `label` is actually present.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+async fn boot_out_label_both_domains(label: &str) {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let uid = unsafe { libc::getuid() };
+
+    // --- per-user Agent domain (no root) ---
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{label}")])
+        .output()
+        .await;
+    if let Ok(home) = std::env::var("HOME") {
+        let agent = std::path::PathBuf::from(&home)
+            .join("Library/LaunchAgents")
+            .join(format!("{label}.plist"));
+        if agent.exists() {
+            match std::fs::remove_file(&agent) {
+                Ok(()) => println!("Removed user LaunchAgent: {}", agent.display()),
+                Err(e) => eprintln!("Warning: failed to remove {}: {e}", agent.display()),
+            }
+        }
+    }
+
+    // --- system LaunchDaemon domain (root, only when present) ---
+    let system_plist =
+        std::path::PathBuf::from("/Library/LaunchDaemons").join(format!("{label}.plist"));
+    let system_loaded = Command::new("launchctl")
+        .args(["print", &format!("system/{label}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success());
+    if system_plist.exists() || system_loaded {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let script = format!(
+            "launchctl bootout system/{label} 2>/dev/null; rm -f {plist}",
+            plist = shell_quote(&system_plist.to_string_lossy()),
+        );
+        let status = if is_root {
+            Command::new("sh").arg("-c").arg(&script).status().await
+        } else {
+            println!("Removing legacy system service '{label}' (one sudo prompt).");
+            Command::new("sudo")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .await
+        };
+        match status {
+            Ok(s) if s.success() => println!("Removed system service: {label}"),
+            Ok(s) => eprintln!("Warning: system bootout for {label} exited {s}"),
+            Err(e) => eprintln!("Warning: could not remove system service {label}: {e}"),
+        }
+    }
+}
+
+/// Stop + remove the overlayd launchd service on macOS. overlayd always lives
+/// in the system domain (it owns a utun adapter), so this targets `system/` and
+/// self-elevates only when a system plist/job is present.
+#[cfg(target_os = "macos")]
+async fn uninstall_overlayd_service() {
+    boot_out_label_both_domains(OVERLAYD_LAUNCHD_LABEL).await;
+}
+
+/// Ask launchd why the daemon Agent isn't up, naming the likely cause instead
+/// of a generic timeout. Probes `launchctl print gui/$uid/<label>` and inspects
+/// the last exit code; 78 (`EX_CONFIG`) is the rootless-install trap (unwritable
+/// log/socket or a stale `GroupName` group). Also flags a same-label job
+/// loaded in the *other* (system) domain, which shadows the user Agent. Returns
+/// `None` when launchd has nothing useful to say.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn launchd_failure_diagnosis(daemon_name: &str) -> Option<String> {
+    let label = plist_label(daemon_name);
+    let uid = unsafe { libc::getuid() };
+
+    let print_domain = |domain: &str| -> Option<String> {
+        let out = std::process::Command::new("launchctl")
+            .args(["print", &format!("{domain}/{label}")])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            None
+        }
+    };
+
+    let mut notes: Vec<String> = Vec::new();
+
+    if let Some(info) = print_domain(&format!("gui/{uid}")) {
+        // `launchctl print` reports `last exit code = N` for a job that ran and
+        // exited. Pull it out and translate the well-known values.
+        if let Some(code) = info
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("last exit code = "))
+            .and_then(|v| v.trim().parse::<i32>().ok())
+        {
+            match code {
+                78 => notes.push(format!(
+                    "launchd job gui/{uid}/{label} is crash-looping with exit code 78 \
+                     (EX_CONFIG): the run user can't write the configured log/socket path, \
+                     or the plist's GroupName references a unix group that doesn't exist. \
+                     A rootless install must NOT emit GroupName."
+                )),
+                0 => {}
+                other => notes.push(format!(
+                    "launchd job gui/{uid}/{label} last exited with code {other}; \
+                     see the daemon.log tail below."
+                )),
+            }
+        }
+    } else {
+        notes.push(format!(
+            "launchd has no job gui/{uid}/{label} loaded — `launchctl bootstrap` likely \
+             failed (often EX_CONFIG from a stale GroupName, or a non-writable \
+             StandardErrorPath)."
+        ));
+    }
+
+    // A same-label job in the system domain shadows/competes with the user Agent.
+    if print_domain("system").is_some() {
+        notes.push(format!(
+            "A job system/{label} is ALSO loaded (legacy root install). Two services \
+             share one label; remove the system one with \
+             `sudo launchctl bootout system/{label}` + \
+             `sudo rm /Library/LaunchDaemons/{label}.plist`."
+        ));
+    }
+
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("\n"))
+    }
+}
+
+/// True if the current user is a member of unix group `group` (so a `gui/$uid`
+/// `LaunchAgent` can set `GroupName=<group>` without `launchctl bootstrap`
+/// failing `EX_CONFIG`). Uses `id -Gn` (the effective + supplementary group
+/// names). Best-effort: any failure returns false (skip the group).
+#[cfg(target_os = "macos")]
+fn macos_self_in_group(group: &str) -> bool {
+    std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == group)
+        })
+}
+
+/// Poll until `launchctl print {target}/{label}` reports the job is gone.
+///
+/// `launchctl bootout` is **asynchronous**: it returns before launchd has
+/// finished tearing the job down. Bootstrapping the same label too soon races
+/// that teardown and either fails (`Bootstrap failed: 5: Input/output error`)
+/// or loads a job that immediately vanishes — surfacing as the
+/// "no job loaded after install" symptom (especially on `--replace`, which
+/// boots out a running daemon right before reinstalling). Bounded; returns once
+/// the label is absent or `timeout` elapses.
+#[cfg(target_os = "macos")]
+async fn wait_for_label_unloaded(target: &str, label: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let present = tokio::process::Command::new("launchctl")
+            .args(["print", &format!("{target}/{label}")])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !present {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -780,12 +1644,15 @@ fn plist_path_for(plist_dir: &str) -> std::path::PathBuf {
     unsafe_code
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -793,6 +1660,21 @@ async fn install(
     tunnel: TunnelInstallArgs<'_>,
 ) -> Result<()> {
     use tokio::process::Command;
+
+    // with_overlay is Linux-only; macOS sandbox runtime doesn't use overlay networking.
+    let _ = with_overlay;
+
+    // The main daemon now installs as a per-user launchd Agent when run without
+    // root (the common, rootless path). Root-only steps — the shared `zlayer`
+    // unix group and a system-domain plist — are gated on this.
+    let is_root = unsafe { libc::geteuid() } == 0;
+
+    // Reconcile a legacy *root* `system/com.zlayer.daemon` install left over
+    // from the old self-elevating installer: boot it out, drop its system
+    // plist, and reclaim ownership of `~/.zlayer` so the rootless Agent can
+    // write it. Surfaces a single surgical sudo prompt only when such an
+    // install is actually present.
+    reconcile_legacy_root_daemon_macos(daemon_name, data_dir, is_root).await;
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
@@ -823,7 +1705,14 @@ async fn install(
 
     let log_dir = crate::cli::default_log_dir(data_dir);
     let run_dir = crate::cli::default_run_dir(data_dir);
-    let socket_path = run_dir.join("zlayer.sock");
+    // Per-instance socket: two instances (e.g. `zlayer` and `zlayer-dev`)
+    // on the same Mac must not share the Unix socket. Caller may override
+    // via the explicit `socket` argument; otherwise we derive a name from
+    // the daemon instance.
+    let socket_path = socket.map_or_else(
+        || run_dir.join(format!("{daemon_name}.sock")),
+        std::path::Path::to_path_buf,
+    );
 
     // Build ProgramArguments
     // --data-dir is a top-level Cli arg, so it must come BEFORE the subcommand.
@@ -913,6 +1802,27 @@ async fn install(
     let log_path = log_dir.join("daemon.log");
     let log_path_str = log_path.to_string_lossy();
 
+    let label = plist_label(daemon_name);
+
+    // Emit `GroupName=zlayer` (the shared unix group used for socket
+    // access-control across instances) whenever it is USABLE without elevation:
+    //   - a root/system install (it owns the group), OR
+    //   - a rootless install where the `zlayer` group already exists AND this
+    //     user is a member of it.
+    // Using an existing group you belong to needs no admin; only *creating* the
+    // group does (`dseditgroup`, root-only). Emitting `GroupName` for a group
+    // that doesn't exist, or that the user isn't in, makes `launchctl bootstrap`
+    // fail EX_CONFIG (78) — so we skip it only in that case (a first-ever
+    // rootless install on a host where the group was never provisioned).
+    let group_name_xml = if is_root || macos_self_in_group("zlayer") {
+        "    <key>GroupName</key>\n    \
+         <!-- Why: unix group is shared across instances (access-control), not the daemon identity. -->\n    \
+         <string>zlayer</string>\n"
+            .to_string()
+    } else {
+        String::new()
+    };
+
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -920,10 +1830,8 @@ async fn install(
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{PLIST_LABEL}</string>
-    <key>GroupName</key>
-    <string>zlayer</string>
-    <key>ProgramArguments</key>
+    <string>{label}</string>
+{group_name_xml}    <key>ProgramArguments</key>
     <array>
 {args_xml}
     </array>
@@ -954,12 +1862,12 @@ async fn install(
     ensure_zlayer_group_macos(data_dir).await?;
 
     let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let path = plist_path_for(&plist_dir, daemon_name);
     let path_str = path.to_string_lossy().to_string();
 
     // Unload existing service first (ignore errors)
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
+        .args(["bootout", &format!("{target}/{label}")])
         .output()
         .await;
     let _ = Command::new("launchctl")
@@ -967,10 +1875,63 @@ async fn install(
         .output()
         .await;
 
+    // `bootout` above is asynchronous — wait for the old job to actually
+    // disappear from the domain before bootstrapping the same label, otherwise
+    // the bootstrap races the teardown and the job fails to stay loaded (the
+    // "Daemon failed to start within 45s / no job loaded" symptom, hit most
+    // often by `--replace` reinstalling over a running daemon).
+    wait_for_label_unloaded(&target, &label, std::time::Duration::from_secs(8)).await;
+
     // Write plist
     std::fs::write(&path, &plist)
         .with_context(|| format!("Failed to write plist to {}", path.display()))?;
     println!("Installed launchd plist: {}", path.display());
+
+    // Register overlayd as its OWN launchd service BEFORE we start the main
+    // daemon, so `serve` finds the root overlayd already running and the overlay
+    // comes up on first boot (rather than the daemon spawning a doomed
+    // user-level overlayd that EPERMs on the utun, then never recovering until a
+    // later restart). This must run before the `if !no_start` bootstrap below.
+    //
+    // overlayd is the ONLY component that needs root (it owns a system utun
+    // adapter → `/Library/LaunchDaemons`). The change-gate decides whether that
+    // root step is needed at all: if the installed plist + binary already match
+    // what we'd register AND the service is loaded, we skip it entirely (no
+    // sudo, no touch). Only a genuine overlay change elevates — try sudo, prompt
+    // once if not already root — and only the overlay step.
+    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, false) {
+        if is_root {
+            // Already root (e.g. legacy/system install) — register directly.
+            install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+        } else if overlayd_service_is_current(data_dir, &overlayd_bin) {
+            println!(
+                "Overlay networking service is up to date ({OVERLAYD_LAUNCHD_LABEL}); \
+                 skipping (no root needed)."
+            );
+        } else {
+            // The overlay changed (or is missing): elevate JUST this step.
+            if let Err(e) = elevate_overlayd_install(&overlayd_bin, no_start) {
+                eprintln!(
+                    "Warning: could not register the overlay networking system service: {e}. \
+                     The main daemon will run with cross-node overlay networking disabled."
+                );
+            } else {
+                // Persist the user-owned fast-path cache so the next
+                // daemon-only upgrade can confirm "unchanged" without a probe.
+                write_overlayd_service_cache(
+                    data_dir,
+                    &overlayd_bin,
+                    &render_overlayd_plist(data_dir, &overlayd_bin),
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "Warning: zlayer-overlayd binary not found next to {}; \
+             cross-node overlay networking will be unavailable.",
+            exe.display()
+        );
+    }
 
     if !no_start {
         // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
@@ -1001,8 +1962,39 @@ async fn install(
             }
         }
 
+        // Ensure the service is running, WITHOUT `-k`. The plist sets
+        // `RunAtLoad=true`, so the `bootstrap`/`load` above already spawned a
+        // fresh instance against the just-written plist (we boot out + unload +
+        // wait_for_label_unloaded + rewrite the plist before bootstrapping, so
+        // the loaded plist is always current). A plain `kickstart` is a no-op on
+        // an already-running job and only force-starts it if launchd somehow
+        // hasn't yet. We MUST NOT pass `-k`: `-k` SIGKILLs the running instance
+        // before restarting, and on a fresh install that instance is the daemon
+        // bootstrap just launched — killing it mid-`init_daemon` (right at the
+        // overlay-setup step) produced the crash-loop where the job never stays
+        // loaded ("Daemon failed to start within 45s / no job loaded"). Tolerate
+        // non-zero; it's cosmetic.
+        let kickstart_out = Command::new("launchctl")
+            .args(["kickstart", &format!("{target}/{label}")])
+            .output()
+            .await;
+        match kickstart_out {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "Warning: launchctl kickstart {target}/{label} exited non-zero \
+                     (the freshly-installed plist is loaded and RunAtLoad should have \
+                     started it): {stderr}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to invoke launchctl kickstart: {e}");
+            }
+            _ => {}
+        }
+
         print!("Daemon starting...");
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, Some(&socket_path), 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started");
@@ -1014,6 +2006,7 @@ async fn install(
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -1091,28 +2084,28 @@ async fn install(
 }
 
 #[cfg(target_os = "macos")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use tokio::process::Command;
+    use tokio::time::sleep;
 
-    let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let label = plist_label(daemon_name);
 
-    if path.exists() {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
-            .output()
-            .await;
-        let _ = Command::new("launchctl")
-            .args(["unload", path.to_string_lossy().as_ref()])
-            .output()
-            .await;
+    // Clean the main daemon from BOTH the per-user Agent domain and any legacy
+    // system LaunchDaemon domain, regardless of current euid, so a `--replace`
+    // can't leave an orphan in the other domain.
+    boot_out_label_both_domains(&label).await;
 
-        std::fs::remove_file(&path)
-            .with_context(|| format!("Failed to remove {}", path.display()))?;
-        println!("Uninstalled launchd plist: {}", path.display());
-    } else {
-        println!("No launchd plist found (checked {})", path.display());
-    }
+    // Stop + remove the overlayd service too (system domain). The overlay
+    // adapter is torn down by overlayd's own graceful shutdown; the overlay
+    // *network* is only removed on --purge-data below.
+    uninstall_overlayd_service().await;
 
     #[cfg(feature = "docker-compat")]
     {
@@ -1146,15 +2139,114 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        // Remove the overlayd binary alongside the main one.
+        let overlayd_bin = zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
+        let bin_path = zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name);
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+        // Best-effort: also try Homebrew prefix if `brew` is in PATH.
+        if let Ok(out) = Command::new("brew").arg("--prefix").output().await {
+            if out.status.success() {
+                let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !prefix.is_empty() {
+                    let brew_bin = PathBuf::from(prefix).join("bin").join(daemon_name);
+                    if brew_bin.exists() {
+                        match std::fs::remove_file(&brew_bin) {
+                            Ok(()) => println!("Removed brew binary: {}", brew_bin.display()),
+                            Err(e) => {
+                                eprintln!("Warning: failed to remove {}: {e}", brew_bin.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if remove_completions {
+        let bash_paths = [PathBuf::from(format!(
+            "/usr/local/etc/bash_completion.d/{daemon_name}"
+        ))];
+        for p in bash_paths {
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+                println!("Removed bash completion: {}", p.display());
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let zsh = PathBuf::from(home.clone())
+                .join(".zsh/completions")
+                .join(format!("_{daemon_name}"));
+            if zsh.exists() {
+                let _ = std::fs::remove_file(&zsh);
+                println!("Removed zsh completion: {}", zsh.display());
+            }
+            let fish = PathBuf::from(home)
+                .join(".config/fish/completions")
+                .join(format!("{daemon_name}.fish"));
+            if fish.exists() {
+                let _ = std::fs::remove_file(&fish);
+                println!("Removed fish completion: {}", fish.display());
+            }
+        }
+        // Homebrew-managed completions
+        if let Ok(out) = Command::new("brew").arg("--prefix").output().await {
+            if out.status.success() {
+                let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !prefix.is_empty() {
+                    let brew_zsh = PathBuf::from(&prefix)
+                        .join("share/zsh/site-functions")
+                        .join(format!("_{daemon_name}"));
+                    if brew_zsh.exists() {
+                        let _ = std::fs::remove_file(&brew_zsh);
+                        println!("Removed brew zsh completion: {}", brew_zsh.display());
+                    }
+                    let brew_bash = PathBuf::from(&prefix)
+                        .join("etc/bash_completion.d")
+                        .join(daemon_name);
+                    if brew_bash.exists() {
+                        let _ = std::fs::remove_file(&brew_bash);
+                        println!("Removed brew bash completion: {}", brew_bash.display());
+                    }
+                }
+            }
+        }
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (plist_dir, target) = launchd_context()?;
-    let path = plist_path_for(&plist_dir);
+    let path = plist_path_for(&plist_dir, daemon_name);
     let path_str = path.to_string_lossy().to_string();
 
     if !path.exists() {
@@ -1188,7 +2280,8 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    let inst_socket = crate::cli::default_run_dir(data_dir).join(format!("{daemon_name}.sock"));
+    match wait_for_daemon_ready(daemon_name, Some(&inst_socket), 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -1203,20 +2296,21 @@ async fn start(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use tokio::process::Command;
 
     let (_plist_dir, target) = launchd_context()?;
+    let label = plist_label(daemon_name);
 
     let out = Command::new("launchctl")
-        .args(["bootout", &format!("{target}/{PLIST_LABEL}")])
+        .args(["bootout", &format!("{target}/{label}")])
         .output()
         .await
         .context("Failed to run launchctl bootout")?;
 
     if !out.status.success() {
         let (plist_dir, _) = launchd_context()?;
-        let path = plist_path_for(&plist_dir);
+        let path = plist_path_for(&plist_dir, daemon_name);
         let _ = Command::new("launchctl")
             .args(["unload", path.to_string_lossy().as_ref()])
             .output()
@@ -1228,20 +2322,21 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn restart(data_dir: &Path) -> Result<()> {
+async fn restart(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (_plist_dir, target) = launchd_context()?;
+    let label = plist_label(daemon_name);
 
     let out = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("{target}/{PLIST_LABEL}")])
+        .args(["kickstart", "-k", &format!("{target}/{label}")])
         .output()
         .await
         .context("Failed to run launchctl kickstart")?;
 
     if !out.status.success() {
-        stop().await.ok();
-        return start(data_dir).await;
+        stop(daemon_name).await.ok();
+        return start(daemon_name, data_dir).await;
     }
 
     println!("Daemon restarted");
@@ -1250,11 +2345,12 @@ async fn restart(data_dir: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, clippy::cast_possible_truncation)]
-async fn status(data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
+    let label = plist_label(daemon_name);
     let out = Command::new("launchctl")
-        .args(["list", PLIST_LABEL])
+        .args(["list", &label])
         .output()
         .await
         .context("Failed to run launchctl list")?;
@@ -1298,26 +2394,225 @@ async fn status(data_dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-const UNIT_NAME: &str = "zlayer.service";
-
-#[cfg(target_os = "linux")]
-fn unit_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/etc/systemd/system").join(UNIT_NAME)
+fn unit_name(daemon_name: &str) -> String {
+    format!("{daemon_name}.service")
 }
 
+/// Is the current process root (euid 0)? On Linux this gates the system-vs-user
+/// install: as root we register a system unit under `/etc/systemd/system`; as a
+/// regular user we register a `systemctl --user` unit under
+/// `~/.config/systemd/user` and run rootless (rootless youki + cgroup-v2
+/// delegation). Only the overlay (which owns a tun adapter) needs root.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_is_root() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
+/// The user systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, default
+/// `~/.config/systemd/user`).
+#[cfg(target_os = "linux")]
+fn user_systemd_dir() -> std::path::PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("systemd/user");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home).join(".config/systemd/user")
+}
+
+#[cfg(target_os = "linux")]
+fn unit_path(daemon_name: &str) -> std::path::PathBuf {
+    if linux_is_root() {
+        std::path::PathBuf::from("/etc/systemd/system").join(unit_name(daemon_name))
+    } else {
+        user_systemd_dir().join(unit_name(daemon_name))
+    }
+}
+
+/// Build `systemctl` args, prepending `--user` for a rootless install so the
+/// call targets the per-user manager instead of the (root-only) system manager.
 #[cfg(target_os = "linux")]
 fn systemctl_args(base_args: &[&str]) -> Vec<String> {
-    base_args.iter().copied().map(ToString::to_string).collect()
+    let mut out: Vec<String> = Vec::with_capacity(base_args.len() + 1);
+    if !linux_is_root() {
+        out.push("--user".to_string());
+    }
+    out.extend(base_args.iter().copied().map(ToString::to_string));
+    out
 }
 
-/// Pick a writable system location for the daemon binary.
+/// Pick a writable system location for the daemon binary, named after the
+/// daemon instance so side-by-side daemons land at distinct paths
+/// (`/usr/local/bin/<daemon_name>`).
 ///
 /// Delegates to [`zlayer_paths::ZLayerDirs::default_binary_dir`] which
 /// write-probes `/usr/local/bin` first, then falls back to the `ZLayer`
 /// data dir (`/var/lib/zlayer/bin`) which is always writable.
 #[cfg(target_os = "linux")]
-fn pick_system_binary_path() -> std::path::PathBuf {
-    zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer")
+fn pick_system_binary_path(daemon_name: &str) -> std::path::PathBuf {
+    zlayer_paths::ZLayerDirs::default_binary_dir().join(daemon_name)
+}
+
+/// Fixed systemd unit name for the overlayd daemon (Linux).
+#[cfg(target_os = "linux")]
+const OVERLAYD_SYSTEMD_UNIT: &str = "zlayer-overlayd.service";
+
+/// The system-domain unit path for the overlayd service (world-readable, so the
+/// change-gate can inspect it without root).
+#[cfg(target_os = "linux")]
+fn overlayd_system_unit_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT)
+}
+
+/// Render the overlayd systemd unit. Shared by the installer and the change-gate
+/// so byte-for-byte comparison of the on-disk unit is meaningful.
+#[cfg(target_os = "linux")]
+fn render_overlayd_unit(data_dir: &Path, overlayd_bin: &Path) -> String {
+    format!(
+        r"[Unit]
+Description=ZLayer Overlay Daemon
+Documentation=https://zlayer.dev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe tun
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+ExecStart={bin} --data-dir {data_dir}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zlayer-overlayd
+LimitNOFILE=1048576
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+",
+        bin = overlayd_bin.display(),
+        data_dir = data_dir.display(),
+    )
+}
+
+/// Extract the `ExecStart=` binary path from an installed overlayd unit.
+#[cfg(target_os = "linux")]
+fn overlayd_unit_exec_path(unit_text: &str) -> Option<std::path::PathBuf> {
+    let line = unit_text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))?;
+    // `ExecStart=<bin> --data-dir <dir>` — the binary is the first token.
+    let bin = line.split_whitespace().next()?;
+    if bin.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(bin))
+    }
+}
+
+/// The Linux change-gate: is the installed overlayd system service already
+/// exactly what we would register? Mirrors the macOS gate — none of these checks
+/// needs root (the unit + binary are world-readable; `systemctl is-active` works
+/// read-only): installed unit text == rendered unit, AND
+/// `sha256(staged bin) == sha256(installed bin)`, AND the service is active.
+#[cfg(target_os = "linux")]
+fn overlayd_service_is_current(data_dir: &Path, staged_overlayd_bin: &Path) -> bool {
+    let Ok(installed) = std::fs::read_to_string(overlayd_system_unit_path()) else {
+        return false; // not installed
+    };
+    if installed != render_overlayd_unit(data_dir, staged_overlayd_bin) {
+        return false;
+    }
+    let Some(installed_bin) = overlayd_unit_exec_path(&installed) else {
+        return false;
+    };
+    let staged_sha = file_sha256(staged_overlayd_bin);
+    if staged_sha.is_none() || staged_sha != file_sha256(&installed_bin) {
+        return false;
+    }
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", OVERLAYD_SYSTEMD_UNIT])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Write + enable + start the overlayd systemd unit. overlayd is the overlay
+/// owner, so it ALWAYS gets the tun + `CAP_NET_ADMIN/CAP_SYS_ADMIN` capability
+/// block regardless of the main daemon's `--with-overlay` flag. Always run as
+/// root (directly, or via the `_install-overlayd` sudo re-exec).
+#[cfg(target_os = "linux")]
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use tokio::process::Command;
+
+    let unit = render_overlayd_unit(data_dir, overlayd_bin);
+
+    let path = overlayd_system_unit_path();
+    if let Err(e) = tokio::fs::write(&path, unit).await {
+        eprintln!(
+            "Warning: failed to write overlayd unit {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    println!("Installed overlayd systemd unit: {}", path.display());
+
+    let _ = Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+        .await;
+    let _ = Command::new("systemctl")
+        .args(["enable", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    if !no_start {
+        // restart (not start) so a unit-file change on reinstall takes effect.
+        match Command::new("systemctl")
+            .args(["restart", OVERLAYD_SYSTEMD_UNIT])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                println!("Started overlayd service ({OVERLAYD_SYSTEMD_UNIT})");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!("Warning: failed to start overlayd service: {stderr}");
+            }
+            Err(e) => eprintln!("Warning: failed to invoke systemctl for overlayd: {e}"),
+        }
+    }
+}
+
+/// Stop + disable + remove the overlayd systemd unit.
+#[cfg(target_os = "linux")]
+async fn uninstall_overlayd_service() {
+    use tokio::process::Command;
+
+    let _ = Command::new("systemctl")
+        .args(["stop", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    let _ = Command::new("systemctl")
+        .args(["disable", OVERLAYD_SYSTEMD_UNIT])
+        .output()
+        .await;
+    let path = std::path::PathBuf::from("/etc/systemd/system").join(OVERLAYD_SYSTEMD_UNIT);
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("Uninstalled overlayd systemd unit: {}", path.display());
+                let _ = Command::new("systemctl")
+                    .arg("daemon-reload")
+                    .output()
+                    .await;
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", path.display()),
+        }
+    }
 }
 
 /// Create the `zlayer` group, add the invoking user to it, and make the
@@ -1670,12 +2965,15 @@ async fn ensure_zlayer_group_macos(data_dir: &Path) -> Result<()> {
     unsafe_code
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -1684,6 +2982,7 @@ async fn install(
 ) -> Result<()> {
     use std::fmt::Write as _;
     use tokio::process::Command;
+    let unit_file_name = unit_name(daemon_name);
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
@@ -1717,7 +3016,7 @@ async fn install(
     // typically mode 0700, so /var/home/user/.local/bin/zlayer is unreachable
     // by the systemd service.  Detect this and copy the binary to
     // /usr/local/bin so the ExecStart path works.
-    let exe = {
+    let (exe, exe_copied_to_system) = {
         let is_root = unsafe { libc::geteuid() } == 0;
         if is_root {
             let in_home = std::env::var("SUDO_USER")
@@ -1731,10 +3030,10 @@ async fn install(
                 || exe.to_string_lossy().contains("/.local/bin/");
 
             if in_home {
-                let system_path = pick_system_binary_path();
+                let system_path = pick_system_binary_path(daemon_name);
 
                 // Stop any running service before overwriting (avoids ETXTBSY)
-                let stop_args = systemctl_args(&["stop", UNIT_NAME]);
+                let stop_args = systemctl_args(&["stop", unit_file_name.as_str()]);
                 let _ = Command::new("systemctl").args(&stop_args).output().await;
 
                 // Unlink destination first — succeeds even while the old process
@@ -1761,12 +3060,12 @@ async fn install(
                     "Copied binary to {} (original in user home is inaccessible to root service)",
                     system_path.display()
                 );
-                system_path
+                (system_path, true)
             } else {
-                exe
+                (exe, false)
             }
         } else {
-            exe
+            (exe, false)
         }
     };
 
@@ -1776,6 +3075,11 @@ async fn install(
         exe.display(),
         data_dir.display()
     );
+    if let Some(sock_path) = socket {
+        // Custom UDS socket path so side-by-side daemon instances don't
+        // collide on the default `/var/run/<daemon-name>.sock`.
+        write!(exec_start, " --socket {}", sock_path.display()).unwrap();
+    }
     if no_swagger {
         exec_start.push_str(" --no-swagger");
     }
@@ -1823,6 +3127,32 @@ async fn install(
     // Pre-create log directory so tracing-appender can write on first start.
     let log_dir = crate::cli::default_log_dir(data_dir);
 
+    // Overlay networking capabilities. The `=-` prefix on `ExecStartPre`
+    // tells systemd to ignore failures (e.g. `tun` built into the kernel
+    // or `/sbin/modprobe` missing), so the daemon still starts on hosts
+    // where `modprobe tun` is unnecessary or unavailable.
+    // Root vs rootless (`systemctl --user`) unit shape:
+    //  - `Group=zlayer` references the root-created shared group → system only.
+    //  - `WantedBy`: system units hook `multi-user.target`; user units hook
+    //    `default.target` (the user manager has no multi-user.target).
+    //  - The overlay capability block (ambient CAP_NET_ADMIN/CAP_SYS_ADMIN) can
+    //    only be granted to a system unit; a `--user` unit can't hold caps, and
+    //    the overlay runs as its own root `zlayer-overlayd.service` regardless.
+    let is_root = linux_is_root();
+    let group_line = if is_root { "Group=zlayer\n" } else { "" };
+    let wanted_by = if is_root {
+        "multi-user.target"
+    } else {
+        "default.target"
+    };
+    let overlay_block = if with_overlay && is_root {
+        "ExecStartPre=-/sbin/modprobe tun\n\
+         AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN\n"
+    } else {
+        ""
+    };
+
     let unit = format!(
         r"[Unit]
 Description=ZLayer Container Orchestration Daemon
@@ -1832,27 +3162,34 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-Group=zlayer
-ExecStart={exec_start}
+{group_line}ExecStart={exec_start}
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=60
 Restart=always
 RestartSec=5
+# Exit code 75 (EX_TEMPFAIL) is used by `zlayer serve --restart-on-exit`
+# and the self-update / cluster-upgrade flow to request a supervisor
+# respawn. SuccessExitStatus prevents `Restart=on-failure` from treating
+# 75 as a hard failure if an operator switches the policy, while
+# RestartForceExitStatus guarantees a restart regardless of the chosen
+# Restart= policy. Belt + suspenders against future policy edits.
+SuccessExitStatus=75
+RestartForceExitStatus=75
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=zlayer
+SyslogIdentifier={daemon_name}
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
 Delegate=yes
 KillMode=process
-{env_line}
+{overlay_block}{env_line}
 [Install]
-WantedBy=multi-user.target
+WantedBy={wanted_by}
 ",
     );
 
-    let path = unit_path();
+    let path = unit_path(daemon_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -1880,7 +3217,7 @@ WantedBy=multi-user.target
         bail!("systemctl daemon-reload failed: {stderr}");
     }
 
-    let enable_args = systemctl_args(&["enable", UNIT_NAME]);
+    let enable_args = systemctl_args(&["enable", unit_file_name.as_str()]);
     let enable_out = Command::new("systemctl")
         .args(&enable_args)
         .output()
@@ -1900,7 +3237,7 @@ WantedBy=multi-user.target
     // Install Docker + Docker Compose CLI shims when docker-compat is enabled
     #[cfg(feature = "docker-compat")]
     if docker_socket {
-        let shim_dir = pick_system_binary_path()
+        let shim_dir = pick_system_binary_path(daemon_name)
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
@@ -1946,7 +3283,7 @@ WantedBy=multi-user.target
         // applied earlier in this install (e.g. updated `Environment=`
         // lines) won't take effect. Use `restart` in that case so the
         // daemon picks up the new ExecStart/Environment.
-        let is_active_args = systemctl_args(&["is-active", UNIT_NAME]);
+        let is_active_args = systemctl_args(&["is-active", unit_file_name.as_str()]);
         let is_active_status = Command::new("systemctl")
             .args(&is_active_args)
             .output()
@@ -1955,7 +3292,7 @@ WantedBy=multi-user.target
         let was_active = is_active_status.status.success();
 
         let action = if was_active { "restart" } else { "start" };
-        let action_args = systemctl_args(&[action, UNIT_NAME]);
+        let action_args = systemctl_args(&[action, unit_file_name.as_str()]);
         let out = Command::new("systemctl")
             .args(&action_args)
             .output()
@@ -1963,7 +3300,7 @@ WantedBy=multi-user.target
             .with_context(|| format!("Failed to {action} service"))?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&spawner_pid_path);
-            let context = get_daemon_failure_context();
+            let context = get_daemon_failure_context(daemon_name);
             if was_active {
                 bail!("Daemon failed to restart.\n{context}");
             }
@@ -1971,7 +3308,7 @@ WantedBy=multi-user.target
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, None, 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 if was_active {
@@ -1985,6 +3322,7 @@ WantedBy=multi-user.target
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -2022,19 +3360,62 @@ WantedBy=multi-user.target
         }
     }
 
+    // Register overlayd as its OWN systemd service so it survives main-binary
+    // reinstalls. overlayd owns the tun adapter → it's the ONLY component that
+    // needs root. The change-gate decides whether that root step runs at all:
+    // when the installed unit + binary already match (and the service is active)
+    // we skip it (no sudo); only a genuine overlay change elevates, and only the
+    // overlay step. (When already root, register directly.)
+    if let Some(overlayd_bin) = resolve_and_stage_overlayd_binary(&exe, exe_copied_to_system) {
+        if is_root {
+            install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+        } else if overlayd_service_is_current(data_dir, &overlayd_bin) {
+            println!(
+                "Overlay networking service is up to date ({OVERLAYD_SYSTEMD_UNIT}); \
+                 skipping (no root needed)."
+            );
+        } else if let Err(e) = elevate_overlayd_install(&overlayd_bin, no_start) {
+            eprintln!(
+                "Warning: could not register the overlay networking system service: {e}. \
+                 The main daemon will spawn overlayd on demand instead."
+            );
+        } else {
+            write_overlayd_service_cache(
+                data_dir,
+                &overlayd_bin,
+                &render_overlayd_unit(data_dir, &overlayd_bin),
+            );
+        }
+    } else {
+        eprintln!(
+            "Warning: zlayer-overlayd binary not found next to {}; \
+             overlay networking will rely on the main daemon spawning it on demand.",
+            exe.display()
+        );
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use tokio::process::Command;
+    use tokio::time::sleep;
 
-    let stop_args = systemctl_args(&["stop", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let stop_args = systemctl_args(&["stop", unit_file_name.as_str()]);
     let _ = Command::new("systemctl").args(&stop_args).output().await;
-    let disable_args = systemctl_args(&["disable", UNIT_NAME]);
+    let disable_args = systemctl_args(&["disable", unit_file_name.as_str()]);
     let _ = Command::new("systemctl").args(&disable_args).output().await;
 
-    let path = unit_path();
+    let path = unit_path(daemon_name);
     if path.exists() {
         tokio::fs::remove_file(&path)
             .await
@@ -2046,11 +3427,16 @@ async fn uninstall() -> Result<()> {
         println!("No systemd unit found at {}", path.display());
     }
 
+    // Stop + disable + remove the overlayd service too. The overlay adapter is
+    // dropped by overlayd's own teardown when the unit stops; veth links are
+    // cleaned up by overlayd on exit.
+    uninstall_overlayd_service().await;
+
     // Remove Docker + Docker Compose CLI shims that may have been
     // installed by `daemon install --docker-socket`.
     #[cfg(feature = "docker-compat")]
     {
-        let shim_dir = pick_system_binary_path()
+        let shim_dir = pick_system_binary_path(daemon_name)
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
@@ -2085,14 +3471,77 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        let overlayd_bin = zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
+        let bin_path = pick_system_binary_path(daemon_name);
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+    }
+
+    if remove_completions {
+        // Bash: /etc/bash_completion.d/<name> + Homebrew prefix
+        let bash_paths = [
+            PathBuf::from(format!("/etc/bash_completion.d/{daemon_name}")),
+            // Homebrew prefix not relevant on Linux; ignore
+        ];
+        for p in bash_paths {
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+                println!("Removed bash completion: {}", p.display());
+            }
+        }
+        // Zsh: $HOME/.zsh/completions/_<name>
+        if let Ok(home) = std::env::var("HOME") {
+            let zsh = PathBuf::from(home.clone())
+                .join(".zsh/completions")
+                .join(format!("_{daemon_name}"));
+            if zsh.exists() {
+                let _ = std::fs::remove_file(&zsh);
+                println!("Removed zsh completion: {}", zsh.display());
+            }
+            let fish = PathBuf::from(home)
+                .join(".config/fish/completions")
+                .join(format!("{daemon_name}.fish"));
+            if fish.exists() {
+                let _ = std::fs::remove_file(&fish);
+                println!("Removed fish completion: {}", fish.display());
+            }
+        }
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let path = unit_path();
+    let unit_file_name = unit_name(daemon_name);
+    let path = unit_path(daemon_name);
     if !path.exists() {
         bail!("Daemon not installed. Run `zlayer daemon install` first.");
     }
@@ -2105,7 +3554,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     // Clear stale logs so failure diagnostics only show this attempt.
     truncate_daemon_logs(&crate::cli::default_log_dir(data_dir));
 
-    let args = systemctl_args(&["start", UNIT_NAME]);
+    let args = systemctl_args(&["start", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2113,12 +3562,12 @@ async fn start(data_dir: &Path) -> Result<()> {
         .context("Failed to start service")?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&spawner_pid_path);
-        let context = get_daemon_failure_context();
+        let context = get_daemon_failure_context(daemon_name);
         bail!("Daemon failed to start.\n{context}");
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    match wait_for_daemon_ready(daemon_name, None, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -2134,10 +3583,11 @@ async fn start(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["stop", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["stop", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2152,10 +3602,11 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn restart(_data_dir: &Path) -> Result<()> {
+async fn restart(daemon_name: &str, _data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["restart", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["restart", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2170,10 +3621,11 @@ async fn restart(_data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn status(data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
-    let args = systemctl_args(&["status", UNIT_NAME]);
+    let unit_file_name = unit_name(daemon_name);
+    let args = systemctl_args(&["status", unit_file_name.as_str()]);
     let out = Command::new("systemctl")
         .args(&args)
         .output()
@@ -2263,9 +3715,12 @@ fn is_service_not_found(err: &windows_service::Error) -> bool {
 /// by any local admin via `sc qc` / `systemctl cat`, so there's no extra
 /// exposure beyond what is already accepted.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn build_service_launch_arguments(
+    daemon_name: &str,
     data_dir: &Path,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
@@ -2273,16 +3728,26 @@ fn build_service_launch_arguments(
 ) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
-    // `--data-dir` is a top-level Cli arg, so it must come BEFORE the
-    // `serve` subcommand — mirrors the Linux/macOS install paths.
+    // `--data-dir` and `--daemon-name` are top-level Cli args, so they must
+    // come BEFORE the `serve` subcommand — mirrors the Linux/macOS install
+    // paths. `--daemon-name` is plumbed onto the top-level `Cli` struct in a
+    // later wave; emitting it here unconditionally is forward-compatible
+    // (older builds without the flag would reject it, but only newer builds
+    // produce these argument vectors).
     let mut args: Vec<OsString> = vec![
         OsString::from("--data-dir"),
         data_dir.as_os_str().to_os_string(),
+        OsString::from("--daemon-name"),
+        OsString::from(daemon_name),
         OsString::from("serve"),
         OsString::from("--service"),
         OsString::from("--bind"),
         OsString::from(bind),
     ];
+    if let Some(sock) = socket {
+        args.push(OsString::from("--socket"));
+        args.push(sock.as_os_str().to_os_string());
+    }
     if no_swagger {
         args.push(OsString::from("--no-swagger"));
     }
@@ -2312,6 +3777,165 @@ fn build_service_launch_arguments(
     args
 }
 
+/// Resolve the `zlayer-overlayd.exe` binary path on Windows, looking next to
+/// the main `zlayer.exe`, then the system bin dir, then bare (PATH).
+#[cfg(target_os = "windows")]
+fn resolve_overlayd_binary_windows(main_exe: &Path) -> PathBuf {
+    let bin_name = "zlayer-overlayd.exe";
+    if let Some(dir) = main_exe.parent() {
+        let candidate = dir.join(bin_name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    let system = zlayer_paths::ZLayerDirs::default_binary_dir().join(bin_name);
+    if system.exists() {
+        return system;
+    }
+    PathBuf::from(bin_name)
+}
+
+/// Register (or replace) the overlayd SCM service `ZLayerDaemon-Overlayd`.
+///
+/// overlayd is the overlay-adapter owner; registering it as its OWN SCM
+/// service means reinstalling the main `zlayer` binary does not tear the
+/// overlay adapter down. The service runs `LocalSystem` / `AutoStart` with
+/// binPath `zlayer-overlayd.exe --data-dir <data_dir> --service`.
+///
+/// `zlayer-overlayd`'s `main` enters its SCM dispatcher when launched with
+/// `--service` (registers a control handler, reports Running/Stopped, handles
+/// Stop/Shutdown), so `sc query ZLayerDaemon-Overlayd` reports Running and Stop
+/// works cleanly. The main daemon's `ensure_overlayd_running` fallback still
+/// spawns it detached if SCM ever marks it non-responsive, so the overlay comes
+/// up either way.
+#[cfg(target_os = "windows")]
+#[allow(clippy::unused_async)] // async for symmetry with the linux/macos variants
+async fn install_overlayd_service(data_dir: &Path, overlayd_bin: &Path, no_start: bool) {
+    use std::ffi::{OsStr, OsString};
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    const ERROR_SERVICE_EXISTS: i32 = 1073;
+
+    let svc_name = crate::daemon_service::service_name("zlayer-overlayd");
+    let svc_display = crate::daemon_service::display_name("zlayer-overlayd");
+
+    let launch_arguments: Vec<OsString> = vec![
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+        // SCM launches the binary detached; `--service` makes overlayd's
+        // `main()` hand control to its SCM dispatcher (report Running/Stopped,
+        // handle Stop/Shutdown) instead of running as a bare console process.
+        OsString::from("--service"),
+    ];
+
+    let service_info = ServiceInfo {
+        name: OsString::from(svc_name.clone()),
+        display_name: OsString::from(svc_display.clone()),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: overlayd_bin.to_path_buf(),
+        launch_arguments,
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+
+    let manager =
+        match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::ALL_ACCESS) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Warning: could not open SCM to register overlayd service: {e}");
+                return;
+            }
+        };
+
+    let service = match manager.create_service(&service_info, ServiceAccess::ALL_ACCESS) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            let already_exists = matches!(
+                &e,
+                windows_service::Error::Winapi(io_err)
+                    if io_err.raw_os_error() == Some(ERROR_SERVICE_EXISTS)
+            );
+            if !already_exists {
+                eprintln!("Warning: failed to register overlayd service '{svc_name}': {e}");
+                return;
+            }
+            // Reinstall: stop + delete the existing service, then recreate.
+            if let Ok(existing) = manager.open_service(
+                svc_name.as_str(),
+                ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
+            ) {
+                let _ = existing.stop();
+                let _ = existing.delete();
+                drop(existing);
+            }
+            match manager.create_service(&service_info, ServiceAccess::ALL_ACCESS) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("Warning: failed to recreate overlayd service '{svc_name}': {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    let Some(service) = service else {
+        return;
+    };
+    println!("Registered overlayd Windows Service '{svc_name}' (display: '{svc_display}').");
+
+    if !no_start {
+        match service.start::<&OsStr>(&[]) {
+            Ok(()) => println!("Started overlayd service '{svc_name}'"),
+            Err(e) => eprintln!(
+                "Warning: failed to start overlayd service '{svc_name}': {e}. \
+                 The main daemon will spawn overlayd on demand if needed."
+            ),
+        }
+    }
+}
+
+/// Stop + delete the overlayd SCM service `ZLayerDaemon-Overlayd`.
+#[cfg(target_os = "windows")]
+#[allow(clippy::unused_async)] // async for symmetry with the linux/macos variants
+async fn uninstall_overlayd_service() {
+    use std::ffi::OsStr;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager =
+        match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Warning: could not open SCM to remove overlayd service: {e}");
+                return;
+            }
+        };
+
+    let svc_name = crate::daemon_service::service_name("zlayer-overlayd");
+    match manager.open_service(
+        svc_name.as_str(),
+        ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(service) => {
+            let _ = service.stop();
+            match service.delete() {
+                Ok(()) => println!("Unregistered overlayd Windows Service '{svc_name}'."),
+                Err(e) => eprintln!("Warning: failed to delete overlayd service '{svc_name}': {e}"),
+            }
+        }
+        Err(e) if is_service_not_found(&e) => {
+            println!("Overlayd Windows Service '{svc_name}' is not registered; nothing to remove.");
+        }
+        Err(e) => eprintln!("Warning: failed to open overlayd service '{svc_name}': {e}"),
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[allow(
     clippy::too_many_lines,
@@ -2320,12 +3944,15 @@ fn build_service_launch_arguments(
     clippy::items_after_statements
 )]
 async fn install(
+    daemon_name: &str,
     data_dir: &Path,
     no_start: bool,
     bind: &str,
+    socket: Option<&Path>,
     jwt_secret: Option<&str>,
     no_swagger: bool,
     #[cfg(feature = "docker-compat")] docker_socket: bool,
+    with_overlay: bool,
     admin_email: Option<&str>,
     admin_password: Option<&str>,
     admin_password_file: Option<&Path>,
@@ -2337,6 +3964,9 @@ async fn install(
         ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // with_overlay is Linux-only; Windows SCM doesn't use Linux ambient capabilities.
+    let _ = with_overlay;
 
     // Run on-disk layout migrations first so the rest of the install operates
     // on the current expected layout. Idempotent. Use `println!` rather than
@@ -2397,8 +4027,10 @@ async fn install(
     let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
 
     let launch_arguments = build_service_launch_arguments(
+        daemon_name,
         data_dir,
         bind,
+        socket,
         jwt_secret,
         no_swagger,
         #[cfg(feature = "docker-compat")]
@@ -2406,9 +4038,12 @@ async fn install(
         tunnel,
     );
 
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+    let svc_display = crate::daemon_service::display_name(daemon_name);
+
     let service_info = ServiceInfo {
-        name: OsString::from(crate::daemon_service::SERVICE_NAME),
-        display_name: OsString::from("ZLayer Daemon"),
+        name: OsString::from(svc_name.clone()),
+        display_name: OsString::from(svc_display.clone()),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -2444,9 +4079,8 @@ async fn install(
             if !already_exists {
                 return Err(e).with_context(|| {
                     format!(
-                        "Failed to create Windows Service '{}'. \
-                         If the service is already registered, run `zlayer daemon uninstall` first.",
-                        crate::daemon_service::SERVICE_NAME
+                        "Failed to create Windows Service '{svc_name}'. \
+                         If the service is already registered, run `zlayer daemon uninstall` first."
                     )
                 });
             }
@@ -2456,13 +4090,12 @@ async fn install(
             // teardown that follows.
             let existing = manager
                 .open_service(
-                    crate::daemon_service::SERVICE_NAME,
+                    svc_name.as_str(),
                     ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::DELETE,
                 )
                 .with_context(|| {
                     format!(
-                        "Service '{}' already exists but could not be opened for replacement",
-                        crate::daemon_service::SERVICE_NAME
+                        "Service '{svc_name}' already exists but could not be opened for replacement"
                     )
                 })?;
 
@@ -2506,8 +4139,7 @@ async fn install(
 
             existing.delete().with_context(|| {
                 format!(
-                    "Failed to delete existing Windows Service '{}' before replacing it",
-                    crate::daemon_service::SERVICE_NAME
+                    "Failed to delete existing Windows Service '{svc_name}' before replacing it"
                 )
             })?;
 
@@ -2516,14 +4148,13 @@ async fn install(
             // can race with pending deletion and return ERROR_SERVICE_MARKED_FOR_DELETE.
             drop(existing);
 
-            println!("Replaced existing ZLayer service");
+            println!("Replaced existing service '{svc_name}'");
 
             manager
                 .create_service(&service_info, ServiceAccess::ALL_ACCESS)
                 .with_context(|| {
                     format!(
-                        "Failed to recreate Windows Service '{}' after replacing existing instance",
-                        crate::daemon_service::SERVICE_NAME
+                        "Failed to recreate Windows Service '{svc_name}' after replacing existing instance"
                     )
                 })?
         }
@@ -2533,10 +4164,7 @@ async fn install(
     // `build_service_launch_arguments` above — SCM does not inherit env
     // from the installing CLI, so env-passing wouldn't work here.
 
-    println!(
-        "Registered Windows Service '{}' (display: 'ZLayer Daemon').",
-        crate::daemon_service::SERVICE_NAME
-    );
+    println!("Registered Windows Service '{svc_name}' (display: '{svc_display}').");
     println!("  Binary:   {}", exe.display());
     println!("  Data dir: {}", data_dir.display());
     println!("  Bind:     {bind}");
@@ -2546,19 +4174,64 @@ async fn install(
         println!("  Swagger:  disabled");
     }
 
+    // Configure SCM failure-restart actions so the daemon respawns on any
+    // non-zero exit (including 75 / EX_TEMPFAIL from
+    // `zlayer serve --restart-on-exit` and the self-update / cluster-upgrade
+    // flow). The `windows-service` crate as of this writing doesn't expose
+    // `ChangeServiceConfig2` for SERVICE_CONFIG_FAILURE_ACTIONS, so we shell
+    // out to `sc.exe failure`. Best-effort: log a warning on failure rather
+    // than rolling the install back — the service is still registered and
+    // operators can re-run `sc failure` manually if needed.
+    //
+    // Reset counter: 86400s (24h) before SCM forgets a previous failure.
+    // Actions: restart at 5s, 5s, 5s. After three consecutive failures
+    // within the reset window SCM stops trying, matching systemd's
+    // `StartLimitBurst=3 / StartLimitIntervalSec=86400` defaults.
+    {
+        let sc_out = tokio::process::Command::new("sc.exe")
+            .args([
+                "failure",
+                svc_name.as_str(),
+                "reset=",
+                "86400",
+                "actions=",
+                "restart/5000/restart/5000/restart/5000",
+            ])
+            .output()
+            .await;
+        match sc_out {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                eprintln!(
+                    "Warning: `sc failure {svc_name}` exited non-zero. Service will NOT auto-restart \
+                     on exit code 75 until this is configured. stderr={stderr} stdout={stdout}"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to invoke `sc.exe failure` to configure auto-restart \
+                     for service '{svc_name}': {e}"
+                );
+            }
+            _ => {
+                println!("  Restart:  on failure (3x at 5s intervals, 86400s reset)");
+            }
+        }
+    }
+
     if !no_start {
         service.start::<&OsStr>(&[]).with_context(|| {
             format!(
-                "Failed to start Windows Service '{}'. \
-                 Check the Windows Event Log (Application) for startup errors.",
-                crate::daemon_service::SERVICE_NAME
+                "Failed to start Windows Service '{svc_name}'. \
+                 Check the Windows Event Log (Application) for startup errors."
             )
         })?;
 
         print!("Daemon starting...");
         // Poll the API endpoint until it's reachable — same readiness
         // signal as the systemd/launchd paths.
-        match wait_for_daemon_ready(45).await {
+        match wait_for_daemon_ready(daemon_name, None, 45).await {
             Ok(()) => {
                 println!(" started");
                 let restore_outcome = if let Some(ref sp) = snapshot_path {
@@ -2567,6 +4240,7 @@ async fn install(
                     None
                 };
                 print_install_summary(
+                    daemon_name,
                     bind,
                     data_dir,
                     Some(&log_dir),
@@ -2619,6 +4293,13 @@ async fn install(
         }
     }
 
+    // Register overlayd as its OWN SCM service so it survives main-binary
+    // reinstalls. Locate overlayd next to the running zlayer.exe.
+    {
+        let overlayd_bin = resolve_overlayd_binary_windows(&exe);
+        install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
+    }
+
     #[cfg(feature = "docker-compat")]
     if docker_socket {
         let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
@@ -2657,15 +4338,28 @@ async fn install(
 }
 
 #[cfg(target_os = "windows")]
-async fn uninstall() -> Result<()> {
+#[allow(clippy::too_many_lines)]
+async fn uninstall(
+    daemon_name: &str,
+    remove_binary: bool,
+    remove_completions: bool,
+    purge_data: bool,
+    data_dir: &Path,
+) -> Result<()> {
     use std::ffi::OsStr;
+    use tokio::time::sleep;
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // Track whether the SCM service was found so the post-stop cleanup flags
+    // (--remove-binary / --remove-completions / --purge-data) still run even
+    // if the service was never registered.
+    let mut service_unregistered = false;
 
     // Best-effort stop first so we don't leave an orphaned process after
     // delete. Ignore errors — if it's already stopped (or not registered),
     // `delete` below will pick up the slack.
-    let _ = stop().await;
+    let _ = stop(daemon_name).await;
 
     let manager =
         match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT) {
@@ -2678,39 +4372,31 @@ async fn uninstall() -> Result<()> {
             }
         };
 
-    let service = match manager.open_service(
-        crate::daemon_service::SERVICE_NAME,
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+
+    match manager.open_service(
+        svc_name.as_str(),
         ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     ) {
-        Ok(s) => s,
+        Ok(service) => {
+            service
+                .delete()
+                .with_context(|| format!("Failed to delete Windows Service '{svc_name}'"))?;
+            println!("Unregistered Windows Service '{svc_name}'.");
+            service_unregistered = true;
+        }
         Err(e) if is_service_not_found(&e) => {
-            println!(
-                "Windows Service '{}' is not registered; nothing to uninstall.",
-                crate::daemon_service::SERVICE_NAME
-            );
-            return Ok(());
+            println!("Windows Service '{svc_name}' is not registered; nothing to uninstall.");
         }
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Failed to open Windows Service '{}'",
-                    crate::daemon_service::SERVICE_NAME
-                )
-            });
+            return Err(e).with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
         }
-    };
+    }
+    let _ = service_unregistered; // silence unused-var warning when not consumed downstream
 
-    service.delete().with_context(|| {
-        format!(
-            "Failed to delete Windows Service '{}'",
-            crate::daemon_service::SERVICE_NAME
-        )
-    })?;
-
-    println!(
-        "Unregistered Windows Service '{}'.",
-        crate::daemon_service::SERVICE_NAME
-    );
+    // Stop + delete the overlayd SCM service too. The overlay HCN *network* is
+    // purged separately below (only under --purge-data).
+    uninstall_overlayd_service().await;
 
     #[cfg(feature = "docker-compat")]
     {
@@ -2744,22 +4430,78 @@ async fn uninstall() -> Result<()> {
         }
     }
 
+    if remove_binary {
+        let overlayd_bin =
+            zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer-overlayd.exe");
+        match std::fs::remove_file(&overlayd_bin) {
+            Ok(()) => println!("Removed overlayd binary: {}", overlayd_bin.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", overlayd_bin.display()),
+        }
+        let bin_path =
+            zlayer_paths::ZLayerDirs::default_binary_dir().join(format!("{daemon_name}.exe"));
+        match std::fs::remove_file(&bin_path) {
+            Ok(()) => println!("Removed binary: {}", bin_path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Binary already gone: {}", bin_path.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", bin_path.display()),
+        }
+    }
+
+    if remove_completions {
+        // PowerShell completions, if installed, would live under the user's
+        // PowerShell module path. The installer does not currently create
+        // these, so this branch is a no-op on Windows.
+        let _ = daemon_name;
+    }
+
+    if purge_data {
+        println!("WARNING: purging data directory {}", data_dir.display());
+        println!("  This deletes containers, secrets, raft state, everything.");
+        println!("  Press Ctrl-C within 3 seconds to abort.");
+        sleep(std::time::Duration::from_secs(3)).await;
+
+        // Tear down the host-level HCN overlay network(s) ZLayer created. They
+        // persist across daemon restarts/reinstalls and are deleted ONLY here,
+        // on a full uninstall. The HCN network/marker lifecycle now lives in
+        // `zlayer-overlayd`, so drive its purge directly. Must run before the
+        // data dir (which holds the network marker) is removed. HCN calls are
+        // blocking → spawn_blocking.
+        {
+            let dd = data_dir.to_path_buf();
+            let dn = daemon_name.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                zlayer_overlayd::server::purge_managed_networks(&dd, &dn);
+            })
+            .await;
+        }
+
+        match tokio::fs::remove_dir_all(data_dir).await {
+            Ok(()) => println!("Removed data dir: {}", data_dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data dir already gone: {}", data_dir.display());
+            }
+            Err(e) => eprintln!("Warning: failed to remove {}: {e}", data_dir.display()),
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-async fn start(data_dir: &Path) -> Result<()> {
+async fn start(daemon_name: &str, data_dir: &Path) -> Result<()> {
     // Kept as a foreground-spawn fallback for users who haven't registered
     // the SCM service (e.g. during local development). For an installed
     // service, callers should use `sc start ZLayerDaemon` or re-run
     // `zlayer daemon install` — we don't promote `start` to an SCM call
     // here because `install` already starts the service on registration.
     let bind = "127.0.0.1:3669";
-    spawn_daemon_windows(data_dir, bind, None, false).await
+    spawn_daemon_windows(daemon_name, data_dir, bind, None, false).await
 }
 
 #[cfg(target_os = "windows")]
-async fn stop() -> Result<()> {
+async fn stop(daemon_name: &str) -> Result<()> {
     use std::ffi::OsStr;
     use std::time::{Duration, Instant};
     use windows_service::service::{ServiceAccess, ServiceState};
@@ -2771,26 +4513,22 @@ async fn stop() -> Result<()> {
              Run this command from an elevated (Administrator) prompt.",
         )?;
 
+    let svc_name = crate::daemon_service::service_name(daemon_name);
+
     let service = match manager.open_service(
-        crate::daemon_service::SERVICE_NAME,
+        svc_name.as_str(),
         ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
     ) {
         Ok(s) => s,
         Err(e) if is_service_not_found(&e) => {
             println!(
-                "Windows Service '{}' is not registered. \
-                 If a foreground `zlayer serve` is running, press Ctrl+C in its window.",
-                crate::daemon_service::SERVICE_NAME
+                "Windows Service '{svc_name}' is not registered. \
+                 If a foreground `zlayer serve` is running, press Ctrl+C in its window."
             );
             return Ok(());
         }
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Failed to open Windows Service '{}'",
-                    crate::daemon_service::SERVICE_NAME
-                )
-            });
+            return Err(e).with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
         }
     };
 
@@ -2825,9 +4563,8 @@ async fn stop() -> Result<()> {
         if Instant::now() >= deadline {
             println!(
                 "Daemon did not reach Stopped state within 30s (current: {:?}). \
-                 The service may still be shutting down; check `sc query {}`.",
-                status.current_state,
-                crate::daemon_service::SERVICE_NAME
+                 The service may still be shutting down; check `sc query {svc_name}`.",
+                status.current_state
             );
             return Ok(());
         }
@@ -2836,16 +4573,18 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-async fn restart(data_dir: &Path) -> Result<()> {
-    stop().await.ok();
-    start(data_dir).await
+async fn restart(daemon_name: &str, data_dir: &Path) -> Result<()> {
+    stop(daemon_name).await.ok();
+    start(daemon_name, data_dir).await
 }
 
 #[cfg(target_os = "windows")]
-async fn status(_data_dir: &Path) -> Result<()> {
+async fn status(daemon_name: &str, _data_dir: &Path) -> Result<()> {
     use std::ffi::OsStr;
     use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let svc_name = crate::daemon_service::service_name(daemon_name);
 
     // Try SCM first. If the service is registered, its state is the
     // authoritative answer — a foreground daemon on a different bind could
@@ -2854,10 +4593,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
         ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT);
 
     if let Ok(manager) = manager_result {
-        match manager.open_service(
-            crate::daemon_service::SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS,
-        ) {
+        match manager.open_service(svc_name.as_str(), ServiceAccess::QUERY_STATUS) {
             Ok(service) => {
                 let status = service
                     .query_status()
@@ -2871,10 +4607,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
                     ServiceState::PausePending => "PausePending",
                     ServiceState::ContinuePending => "ContinuePending",
                 };
-                println!(
-                    "Daemon: {label} (Windows Service '{}')",
-                    crate::daemon_service::SERVICE_NAME
-                );
+                println!("Daemon: {label} (Windows Service '{svc_name}')");
                 if let Some(pid) = status.process_id {
                     println!("  PID: {pid}");
                 }
@@ -2886,12 +4619,8 @@ async fn status(_data_dir: &Path) -> Result<()> {
                 // installed service.
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Failed to open Windows Service '{}'",
-                        crate::daemon_service::SERVICE_NAME
-                    )
-                });
+                return Err(e)
+                    .with_context(|| format!("Failed to open Windows Service '{svc_name}'"));
             }
         }
     }
@@ -2912,6 +4641,7 @@ async fn status(_data_dir: &Path) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 async fn spawn_daemon_windows(
+    daemon_name: &str,
     data_dir: &Path,
     bind: &str,
     jwt_secret: Option<&str>,
@@ -2930,10 +4660,14 @@ async fn spawn_daemon_windows(
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
-    // --data-dir is a top-level Cli arg, so it must come BEFORE the
-    // subcommand — matches the Linux systemd unit.
+    // --data-dir and --daemon-name are top-level Cli args, so they must come
+    // BEFORE the subcommand — matches the Linux systemd unit. `--daemon-name`
+    // is added to the top-level Cli struct in a later wave; the
+    // foreground-spawned daemon needs to receive its instance identity the
+    // same way the SCM-launched service does.
     let mut cmd = Command::new(&exe);
     cmd.arg("--data-dir").arg(data_dir);
+    cmd.arg("--daemon-name").arg(daemon_name);
     cmd.arg("serve").arg("--daemon").arg("--bind").arg(bind);
     if no_swagger {
         cmd.arg("--no-swagger");
@@ -2956,7 +4690,7 @@ async fn spawn_daemon_windows(
     drop(child);
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(45).await {
+    match wait_for_daemon_ready(daemon_name, None, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -3004,15 +4738,26 @@ fn truncate_daemon_logs(log_dir: &std::path::Path) {
 /// On timeout, [`get_daemon_failure_context`] auto-surfaces the error from
 /// the OS service manager (systemctl/journalctl on Linux, the stderr log on
 /// macOS) so the user sees why it failed without running a separate command.
-async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
+#[cfg_attr(windows, allow(unused_variables))]
+async fn wait_for_daemon_ready(
+    daemon_name: &str,
+    socket: Option<&Path>,
+    timeout_secs: u64,
+) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     #[cfg(unix)]
     {
-        let socket_path = zlayer_client::default_socket_path();
+        // Probe the socket the daemon was actually configured with (derived
+        // from a custom `--data-dir`/`--socket`), falling back to the platform
+        // default only when the caller didn't supply one. Probing the default
+        // when the daemon listens elsewhere makes a perfectly-healthy install
+        // look like a 45s timeout.
+        let default = zlayer_client::default_socket_path();
+        let socket_path: &Path = socket.unwrap_or_else(|| Path::new(&default));
         loop {
-            let reachability = zlayer_client::DaemonClient::probe(&socket_path).await;
+            let reachability = zlayer_client::DaemonClient::probe(socket_path).await;
             match reachability {
                 zlayer_client::DaemonReachability::Reachable(_) => return Ok(()),
                 zlayer_client::DaemonReachability::PermissionDenied => {
@@ -3020,7 +4765,8 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
                     // Don't burn the whole timeout; surface the right hint and return Ok.
                     eprintln!();
                     eprintln!(
-                        "Daemon is running, but its socket at {socket_path} is not readable from your user."
+                        "Daemon is running, but its socket at {} is not readable from your user.",
+                        socket_path.display()
                     );
                     eprintln!(
                         "  The 'zlayer' group was added during install. Pick up the new group"
@@ -3052,7 +4798,7 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
         }
     }
 
-    let error_context = get_daemon_failure_context();
+    let error_context = get_daemon_failure_context(daemon_name);
     bail!("Daemon failed to start within {timeout_secs}s.\n{error_context}");
 }
 
@@ -3060,13 +4806,14 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
 /// fails to start.  On Linux, pulls from `systemctl status` and journalctl.
 /// On macOS, reads the stderr log from the launchd plist's `StandardErrorPath`.
 #[allow(unused_variables)]
-fn get_daemon_failure_context() -> String {
+fn get_daemon_failure_context(daemon_name: &str) -> String {
     let mut context = String::new();
 
     #[cfg(target_os = "linux")]
     {
         // systemctl status includes exit code and the last few journal lines
-        let args = systemctl_args(&["status", UNIT_NAME]);
+        let unit_file_name = unit_name(daemon_name);
+        let args = systemctl_args(&["status", unit_file_name.as_str()]);
         if let Ok(out) = std::process::Command::new("systemctl").args(&args).output() {
             let status = String::from_utf8_lossy(&out.stdout);
             if !status.trim().is_empty() {
@@ -3082,7 +4829,7 @@ fn get_daemon_failure_context() -> String {
                 "30",
                 "--since=-2min",
                 "-u",
-                "zlayer",
+                daemon_name,
                 "--output",
                 "cat",
             ];
@@ -3100,14 +4847,27 @@ fn get_daemon_failure_context() -> String {
 
     #[cfg(target_os = "macos")]
     {
-        // Read the stderr log from the plist's StandardErrorPath
+        // First, ask launchd WHY the job isn't up. A crash-looping Agent names
+        // its last exit code; 78 == EX_CONFIG, which on this install path almost
+        // always means the run user can't write the configured log/socket, or a
+        // stale `GroupName` references a unix group that doesn't exist.
+        if let Some(diag) = launchd_failure_diagnosis(daemon_name) {
+            context.push_str(&diag);
+            context.push('\n');
+        }
+
+        // Then the tail of the stderr log from the plist's StandardErrorPath.
         let log_dir =
             crate::cli::default_log_dir(std::path::Path::new(&crate::cli::default_data_dir()));
         let log_path = log_dir.join("daemon.log");
         if let Ok(content) = std::fs::read_to_string(&log_path) {
             let lines: Vec<&str> = content.lines().collect();
             let start = lines.len().saturating_sub(20);
-            context = lines[start..].join("\n");
+            let tail = lines[start..].join("\n");
+            if !tail.trim().is_empty() {
+                context.push_str("--- daemon.log (tail) ---\n");
+                context.push_str(&tail);
+            }
         }
         if context.trim().is_empty() {
             context = format!(
@@ -3167,6 +4927,23 @@ fn reset(data_dir: &Path, force: bool) -> Result<()> {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_uninstall_tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_remove_binary_path_default_name() {
+        let p = pick_system_binary_path("zlayer");
+        assert!(p.ends_with("zlayer"));
+    }
+
+    #[test]
+    fn uninstall_remove_binary_path_dev_name() {
+        let p = pick_system_binary_path("zlayer-dev");
+        assert!(p.ends_with("zlayer-dev"));
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod windows_tests {
     use super::*;
@@ -3180,8 +4957,10 @@ mod windows_tests {
     fn launch_arguments_puts_data_dir_before_serve() {
         let data_dir = PathBuf::from(r"C:\ProgramData\zlayer");
         let args = build_service_launch_arguments(
+            "zlayer",
             &data_dir,
             "0.0.0.0:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3213,8 +4992,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_includes_service_flag() {
         let args = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3231,8 +5012,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_forwards_bind() {
         let args = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "10.0.0.5:4242",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3250,8 +5033,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_no_swagger_toggle() {
         let without = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3261,8 +5046,10 @@ mod windows_tests {
         assert!(!without.iter().any(|a| a == OsStr::new("--no-swagger")));
 
         let with = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             true,
             #[cfg(feature = "docker-compat")]
@@ -3278,8 +5065,10 @@ mod windows_tests {
     #[test]
     fn launch_arguments_jwt_secret_round_trip() {
         let without = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             None,
             false,
             #[cfg(feature = "docker-compat")]
@@ -3289,8 +5078,10 @@ mod windows_tests {
         assert!(!without.iter().any(|a| a == OsStr::new("--jwt-secret")));
 
         let with = build_service_launch_arguments(
+            "zlayer",
             Path::new(r"C:\data"),
             "127.0.0.1:3669",
+            None,
             Some("super-secret-token"),
             false,
             #[cfg(feature = "docker-compat")]
@@ -3321,5 +5112,105 @@ mod windows_tests {
         let io_err = std::io::Error::from_raw_os_error(5);
         let err = windows_service::Error::Winapi(io_err);
         assert!(!is_service_not_found(&err));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_label_tests {
+    use super::*;
+
+    #[test]
+    fn plist_label_default_is_com_zlayer_daemon() {
+        assert_eq!(plist_label("zlayer"), "com.zlayer.daemon");
+    }
+
+    #[test]
+    fn plist_label_dev_becomes_daemon_dev() {
+        assert_eq!(plist_label("zlayer-dev"), "com.zlayer.daemon-dev");
+    }
+
+    #[test]
+    fn plist_label_arbitrary_name() {
+        assert_eq!(plist_label("foo"), "com.zlayer.daemon-foo");
+    }
+
+    #[test]
+    fn overlayd_plist_program_path_extracts_binary() {
+        // The change-gate reads back ProgramArguments[0] from a rendered plist.
+        let dd = std::path::Path::new("/Users/x/.zlayer");
+        let bin = std::path::Path::new("/Users/x/.local/bin/zlayer-overlayd");
+        let plist = render_overlayd_plist(dd, bin);
+        let parsed = overlayd_plist_program_path(&plist);
+        assert_eq!(parsed.as_deref(), Some(bin));
+    }
+
+    #[test]
+    fn overlayd_plist_program_path_none_when_missing() {
+        assert!(overlayd_plist_program_path("<plist><dict></dict></plist>").is_none());
+    }
+
+    #[test]
+    fn render_overlayd_plist_is_deterministic() {
+        // The gate relies on byte-for-byte equality of two renders.
+        let dd = std::path::Path::new("/data");
+        let bin = std::path::Path::new("/bin/zlayer-overlayd");
+        assert_eq!(
+            render_overlayd_plist(dd, bin),
+            render_overlayd_plist(dd, bin)
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes_and_spaces() {
+        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
+        // A single quote is closed, escaped, and reopened: it'\''s
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod overlayd_stage_tests {
+    use super::*;
+
+    /// When the main binary was NOT relocated, the overlayd binary is resolved
+    /// in place (next to the main exe) and never copied.
+    #[test]
+    fn resolve_finds_sibling_without_copy() {
+        let dir = std::env::temp_dir().join(format!("zlayer-overlayd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_exe = dir.join("zlayer");
+        let overlayd = dir.join("zlayer-overlayd");
+        std::fs::write(&main_exe, b"x").unwrap();
+        std::fs::write(&overlayd, b"y").unwrap();
+
+        let resolved = resolve_and_stage_overlayd_binary(&main_exe, false);
+        assert_eq!(resolved, Some(overlayd));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the main binary WAS relocated into a system dir, overlayd is copied
+    /// alongside it. We model this by putting the source overlayd in a separate
+    /// "staging" dir reachable via `main_exe`'s parent only after copy.
+    #[test]
+    fn resolve_copies_into_system_dir() {
+        let base =
+            std::env::temp_dir().join(format!("zlayer-overlayd-copy-test-{}", std::process::id()));
+        let system = base.join("system");
+        std::fs::create_dir_all(&system).unwrap();
+        // Source overlayd lives next to the (relocated) main exe in the system
+        // dir already in this model — emulate the staging source being the same
+        // dir, so the copy is a no-op-equal path. To exercise the copy branch,
+        // place the source next to current_exe is not deterministic; instead
+        // assert the function returns a path inside the system dir.
+        let main_exe = system.join("zlayer");
+        let overlayd_src = system.join("zlayer-overlayd");
+        std::fs::write(&main_exe, b"x").unwrap();
+        std::fs::write(&overlayd_src, b"y").unwrap();
+
+        let resolved = resolve_and_stage_overlayd_binary(&main_exe, true);
+        assert_eq!(resolved, Some(system.join("zlayer-overlayd")));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

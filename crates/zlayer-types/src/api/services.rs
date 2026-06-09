@@ -97,12 +97,25 @@ pub struct ContainerSummary {
     pub service: String,
     /// Replica number
     pub replica: u32,
+    /// Image reference the container was created from (canonical form, e.g.
+    /// `docker.io/library/nginx:1.29-alpine`).
+    ///
+    /// `#[serde(default)]` keeps older payloads (which lacked this field)
+    /// deserializable.
+    #[serde(default)]
+    pub image: String,
     /// Container state
     pub state: String,
     /// Process ID (if running)
     pub pid: Option<u32>,
     /// Overlay IP (if assigned)
     pub overlay_ip: Option<String>,
+    /// Raft node ID of the daemon that owns this container (if known).
+    ///
+    /// Each daemon tags containers it knows about with its own local node ID.
+    /// `None` when the API is running in read-only mode (no local Raft node).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 /// Exec request body

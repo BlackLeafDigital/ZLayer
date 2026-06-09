@@ -39,7 +39,7 @@ pub use auth::{
     create_token, parse_env_id_from_scope, require_secret_perm, resolve_registry_auth_async,
     secret_storage_key, verify_token, AuthState, AuthUser, Claims, OptionalAuthUser,
 };
-pub use config::ApiConfig;
+pub use config::{ApiConfig, ApiTlsConfig};
 pub use error::{ApiError, Result};
 pub use event_bus::{
     ContainerEvent, ContainerEventBus, ContainerEventKind, DaemonEvent, DaemonEventBus, ImageEvent,
@@ -59,13 +59,14 @@ pub use router::{
     build_event_routes, build_group_routes, build_image_routes, build_image_routes_with_state,
     build_internal_routes, build_job_routes, build_network_routes, build_notifier_routes,
     build_permission_routes, build_project_routes, build_project_webhook_routes,
-    build_proxy_routes, build_router, build_router_full, build_router_with_builds,
-    build_router_with_containers, build_router_with_deployment_state, build_router_with_internal,
-    build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
-    build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
-    build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_sync_routes,
-    build_task_routes, build_tunnel_routes, build_variable_routes, build_volume_routes,
-    build_webhook_receiver_routes, build_workflow_routes,
+    build_proxy_routes, build_router, build_router_full, build_router_secrets_only_base,
+    build_router_with_builds, build_router_with_containers, build_router_with_deployment_state,
+    build_router_with_internal, build_router_with_internal_and_secrets, build_router_with_jobs,
+    build_router_with_secrets, build_router_with_services, build_router_with_services_and_secrets,
+    build_router_with_storage, build_router_with_tunnels, build_secrets_routes,
+    build_storage_routes, build_sync_routes, build_task_routes, build_tunnel_routes,
+    build_variable_routes, build_volume_routes, build_webhook_receiver_routes,
+    build_workflow_routes,
 };
 pub use server::ApiServer;
 pub use server::{bind_dual_with_local_auth, serve_bound, BoundListeners};
@@ -91,6 +92,9 @@ pub use handlers::credentials::{
     RegistryCredentialResponse,
 };
 pub use handlers::cron::CronState;
+pub use handlers::dedicated_mesh::{
+    distribute_dedicated_service, remove_dedicated_service_endpoint, InternalRemovePeerRequest,
+};
 pub use handlers::deployments::{DeploymentState, ServiceHealthInfo};
 pub use handlers::environments::{
     CreateEnvironmentRequest, EnvironmentsRouterState, EnvironmentsState, UpdateEnvironmentRequest,

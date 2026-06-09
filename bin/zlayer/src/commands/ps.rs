@@ -27,7 +27,13 @@ struct ContainerRow {
     service: String,
     container: String,
     replica: u32,
+    /// Image reference the container was created from. Serialized as `image`
+    /// (the raft e2e harness reads `entry["image"]`).
+    #[serde(default)]
+    image: String,
     state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 /// Execute the `ps` command.
@@ -126,7 +132,9 @@ pub(crate) async fn ps(
                             service: svc_name.clone(),
                             container: c["id"].as_str().unwrap_or("unknown").to_string(),
                             replica: c["replica"].as_u64().unwrap_or(0) as u32,
+                            image: c["image"].as_str().unwrap_or_default().to_string(),
                             state: c["state"].as_str().unwrap_or("unknown").to_string(),
+                            node_id: c["node_id"].as_str().map(str::to_string),
                         });
                     }
                 } else {
@@ -230,7 +238,14 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
     if show_containers && !container_rows.is_empty() {
         println!();
 
-        let chdr = ["DEPLOYMENT", "SERVICE", "CONTAINER", "REPLICA", "STATE"];
+        let chdr = [
+            "DEPLOYMENT",
+            "SERVICE",
+            "CONTAINER",
+            "REPLICA",
+            "IMAGE",
+            "STATE",
+        ];
         let mut cwidths: Vec<usize> = chdr.iter().map(|h| h.len()).collect();
 
         for c in container_rows {
@@ -238,47 +253,53 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             cwidths[1] = cwidths[1].max(c.service.len());
             cwidths[2] = cwidths[2].max(c.container.len());
             cwidths[3] = cwidths[3].max(c.replica.to_string().len());
-            cwidths[4] = cwidths[4].max(c.state.len());
+            cwidths[4] = cwidths[4].max(c.image.len());
+            cwidths[5] = cwidths[5].max(c.state.len());
         }
 
         let csep = format!(
-            "{}-+-{}-+-{}-+-{}-+-{}",
+            "{}-+-{}-+-{}-+-{}-+-{}-+-{}",
             "-".repeat(cwidths[0]),
             "-".repeat(cwidths[1]),
             "-".repeat(cwidths[2]),
             "-".repeat(cwidths[3]),
             "-".repeat(cwidths[4]),
+            "-".repeat(cwidths[5]),
         );
 
         println!("{csep}");
         println!(
-            "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$}",
+            "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$} | {:<w5$}",
             chdr[0],
             chdr[1],
             chdr[2],
             chdr[3],
             chdr[4],
+            chdr[5],
             w0 = cwidths[0],
             w1 = cwidths[1],
             w2 = cwidths[2],
             w3 = cwidths[3],
             w4 = cwidths[4],
+            w5 = cwidths[5],
         );
         println!("{csep}");
 
         for c in container_rows {
             println!(
-                "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$}",
+                "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$} | {:<w5$}",
                 c.deployment,
                 c.service,
                 c.container,
                 c.replica,
+                c.image,
                 c.state,
                 w0 = cwidths[0],
                 w1 = cwidths[1],
                 w2 = cwidths[2],
                 w3 = cwidths[3],
                 w4 = cwidths[4],
+                w5 = cwidths[5],
             );
         }
         println!("{csep}");
@@ -472,10 +493,22 @@ mod tests {
             service: "web".to_string(),
             container: "web-rep-1".to_string(),
             replica: 1,
+            image: "docker.io/library/nginx:1.29-alpine".to_string(),
             state: "running".to_string(),
+            node_id: None,
         };
         let json = serde_json::to_string(&row).unwrap();
         assert!(json.contains("web-rep-1"));
+
+        // CONTRACT: the JSON MUST carry the image reference under the exact
+        // field name `image` (the raft e2e harness reads `entry["image"]`).
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["image"].as_str(),
+            Some("docker.io/library/nginx:1.29-alpine"),
+            "ContainerRow JSON must serialize the image ref under `image`"
+        );
+        assert_eq!(parsed["state"].as_str(), Some("running"));
     }
 
     #[test]
@@ -524,14 +557,18 @@ mod tests {
                 service: "web".to_string(),
                 container: "web-rep-1".to_string(),
                 replica: 1,
+                image: "docker.io/library/nginx:1.29-alpine".to_string(),
                 state: "running".to_string(),
+                node_id: None,
             },
             ContainerRow {
                 deployment: "my-app".to_string(),
                 service: "web".to_string(),
                 container: "web-rep-2".to_string(),
                 replica: 2,
+                image: "docker.io/library/nginx:1.29-alpine".to_string(),
                 state: "running".to_string(),
+                node_id: None,
             },
         ];
         // Should not panic

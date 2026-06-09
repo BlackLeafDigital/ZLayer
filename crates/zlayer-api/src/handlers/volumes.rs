@@ -24,6 +24,8 @@ use tracing::info;
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
 use crate::event_bus::DaemonEventBus;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 pub use zlayer_types::api::volumes::*;
 
@@ -703,7 +705,9 @@ mod tests {
 
     #[test]
     fn test_sidecar_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-sidecar-roundtrip-")
+            .unwrap();
         let vol = tmp.path().join("vol1");
         std::fs::create_dir(&vol).unwrap();
 
@@ -728,7 +732,9 @@ mod tests {
 
     #[test]
     fn test_sidecar_absent_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-sidecar-absent-returns-none-")
+            .unwrap();
         let vol = tmp.path().join("legacy-vol");
         std::fs::create_dir(&vol).unwrap();
 
@@ -737,7 +743,9 @@ mod tests {
 
     #[test]
     fn test_volume_info_from_disk_with_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-volume-info-from-disk-with-sidecar-")
+            .unwrap();
         let vol = tmp.path().join("pg-data");
         std::fs::create_dir(&vol).unwrap();
 
@@ -762,7 +770,9 @@ mod tests {
 
     #[test]
     fn test_volume_info_from_disk_legacy_no_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-volume-info-from-disk-legacy-no-sidecar-")
+            .unwrap();
         let vol = tmp.path().join("legacy");
         std::fs::create_dir(&vol).unwrap();
         std::fs::write(vol.join("x"), b"abc").unwrap();
@@ -778,7 +788,9 @@ mod tests {
 
     #[test]
     fn test_has_user_content_ignores_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-has-user-content-ignores-sidecar-")
+            .unwrap();
         let vol = tmp.path().join("empty-with-meta");
         std::fs::create_dir(&vol).unwrap();
         let meta = VolumeMetadata {

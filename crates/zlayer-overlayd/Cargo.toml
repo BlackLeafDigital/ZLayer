@@ -1,0 +1,52 @@
+[package]
+name = "zlayer-overlayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone ZLayer overlay daemon: owns the WireGuard/Wintun adapter, HCN/bridge mechanics, IP allocation, DNS and NAT; driven by the main daemon over IPC"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "zlayer-overlayd"
+path = "src/main.rs"
+
+[dependencies]
+zlayer-types.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zlayer-overlay = { workspace = true, features = ["nat"] }
+zlayer-paths.workspace = true
+zlayer-core.workspace = true
+ipnet.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+ipnetwork = "0.21"
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util.workspace = true
+libc.workspace = true
+netlink-packet-route = "0.19"
+nix.workspace = true
+rtnetlink = "0.14"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_HostComputeSystem", "Win32_System_HostComputeNetwork", "Win32_System_Threading", "Win32_System_IO", "Win32_Security"] }
+windows-service = "0.8"
+zlayer-hns.workspace = true
+
+[target."cfg(unix)".dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

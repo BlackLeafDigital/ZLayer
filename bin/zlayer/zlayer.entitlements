@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required to create/boot guest VMs with the macOS VZ runtimes: native
+         macOS guests (crates/zlayer-agent/src/runtimes/macos_vz.rs) and Linux
+         guests (crates/zlayer-agent/src/runtimes/macos_vz_linux.rs). NAT
+         networking needs only this entitlement, NOT com.apple.vm.networking.
+         Works with an ad-hoc signature (`codesign -s -`) for local use on the
+         same Mac; use a real Developer ID identity to distribute a signed build. -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+    <!-- The libkrun VM runtime (crates/zlayer-agent/src/runtimes/macos_vm.rs)
+         dlopen()s a third-party `libkrun[-efi].dylib` (from `brew install
+         krunkit`). The binary is signed with the hardened runtime, which
+         enforces library validation and would otherwise refuse to load a dylib
+         signed by a different team; this entitlement permits it. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

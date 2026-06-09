@@ -27,14 +27,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
 use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_paths::ZLayerDirs;
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, PullPolicy,
     ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
 };
+use zlayer_types::Scratch;
 
 // =============================================================================
 // Test Binary Constants and Helpers
@@ -87,12 +88,14 @@ fn make_invalid_component() -> Vec<u8> {
 }
 
 /// Create a temporary cache directory for testing
-fn create_test_cache_dir() -> TempDir {
-    tempfile::tempdir().expect("Failed to create temp directory")
+fn create_test_cache_dir() -> Scratch {
+    ZLayerDirs::system_default()
+        .scratch_dir("create-test-cache-dir-")
+        .expect("Failed to create temp directory")
 }
 
 /// Create a `WasmConfig` for testing with shorter timeouts
-fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
+fn create_test_config(cache_dir: &Scratch) -> WasmConfig {
     WasmConfig {
         cache_dir: cache_dir.path().to_path_buf(),
         enable_epochs: true,
@@ -116,10 +119,7 @@ fn unique_service_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_service_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_service_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for WASM testing
@@ -130,6 +130,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         image: ImageSpec {
             name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::Never, // Using local cache
+            source_policy: None,
         },
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
@@ -137,6 +138,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,
@@ -156,6 +158,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: zlayer_spec::ServiceType::Standard,
         wasm: None,
         logs: None,
@@ -183,6 +186,9 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     }
 }
 
@@ -205,7 +211,7 @@ fn create_wasm_spec_with_args(image: &str, args: Vec<String>) -> ServiceSpec {
 }
 
 /// Write bytes to the cache directory and return the "image" name
-fn write_wasm_to_cache(cache_dir: &TempDir, name: &str, wasm_bytes: &[u8]) -> String {
+fn write_wasm_to_cache(cache_dir: &Scratch, name: &str, wasm_bytes: &[u8]) -> String {
     let cache_key = name.replace(['/', ':', '@'], "_");
     let cache_path = cache_dir.path().join(format!("{cache_key}.wasm"));
     std::fs::write(&cache_path, wasm_bytes).expect("Failed to write WASM to cache");
@@ -862,10 +868,7 @@ mod error_handling_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "nonexistent-service".to_string(),
-            replica: 999,
-        };
+        let id = ContainerId::new("nonexistent-service".to_string(), 999);
 
         // All operations on nonexistent container should fail
         let state_result = runtime.container_state(&id).await;
@@ -1287,10 +1290,7 @@ mod logs_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "ghost".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("ghost".to_string(), 1);
 
         let logs_result = runtime.container_logs(&id, 100).await;
         assert!(
@@ -1328,10 +1328,7 @@ mod concurrent_tests {
             let runtime = runtime.clone();
             let image = image.clone();
 
-            let id = ContainerId {
-                service: format!("concurrent-{}-{}", i, std::process::id()),
-                replica: 1,
-            };
+            let id = ContainerId::new(format!("concurrent-{}-{}", i, std::process::id()), 1);
             guards.push(InstanceGuard::new(runtime.clone(), id.clone()));
 
             handles.push(tokio::spawn(async move {
@@ -1374,10 +1371,7 @@ mod concurrent_tests {
         let service_name = format!("sequential-{}", std::process::id());
 
         for i in 0..3 {
-            let id = ContainerId {
-                service: service_name.clone(),
-                replica: i,
-            };
+            let id = ContainerId::new(service_name.clone(), i);
             let spec = create_wasm_spec(&image);
 
             runtime.create_container(&id, &spec).await.unwrap();

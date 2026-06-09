@@ -37,6 +37,12 @@ pub struct ServiceState {
     pub service_manager: Option<Arc<RwLock<ServiceManager>>>,
     /// Storage backend for deployment specifications
     pub storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    /// Raft node ID of the local daemon, if Raft is initialized.
+    ///
+    /// Surfaced on container API responses so the CLI/UI can show which node
+    /// owns each container. `None` in read-only mode or when Raft failed to
+    /// initialize.
+    pub local_node_id: Option<String>,
 }
 
 impl ServiceState {
@@ -44,10 +50,12 @@ impl ServiceState {
     pub fn new(
         service_manager: Arc<RwLock<ServiceManager>>,
         storage: Arc<dyn DeploymentStorage + Send + Sync>,
+        local_node_id: Option<String>,
     ) -> Self {
         Self {
             service_manager: Some(service_manager),
             storage,
+            local_node_id,
         }
     }
 
@@ -59,6 +67,7 @@ impl ServiceState {
         Self {
             service_manager: None,
             storage,
+            local_node_id: None,
         }
     }
 }
@@ -402,20 +411,27 @@ pub async fn list_containers(
         )));
     }
 
-    // Get container info from service manager if available
+    // Aggregate containers cluster-wide: a service's replicas may be
+    // distributed across nodes, so the leader fans out to every node holding
+    // the service and tags each container with its real host node_id (not the
+    // responding daemon's local id). Single-node clusters return just the local
+    // view.
     let mut containers = Vec::new();
     if let Some(ref manager) = state.service_manager {
         let manager = manager.read().await;
-        let container_ids = manager.get_service_containers(&service).await;
-        for cid in container_ids {
-            containers.push(ContainerSummary {
-                id: cid.to_string(),
-                service: cid.service.clone(),
-                replica: cid.replica,
-                state: "running".to_string(),
-                pid: None,
-                overlay_ip: None,
-            });
+        for ns in manager.cluster_service_states(&service).await {
+            for c in ns.containers {
+                containers.push(ContainerSummary {
+                    id: c.id,
+                    service: c.service,
+                    replica: c.replica,
+                    image: c.image,
+                    state: c.state,
+                    pid: c.pid,
+                    overlay_ip: c.overlay_ip,
+                    node_id: Some(c.node_id.to_string()),
+                });
+            }
         }
     }
 

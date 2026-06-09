@@ -16,10 +16,11 @@ pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
         #[cfg(feature = "docker")]
         RuntimeType::Docker => RuntimeConfig::Docker,
         #[cfg(target_os = "linux")]
-        RuntimeType::Youki => RuntimeConfig::Youki(YoukiConfig {
-            state_dir: cli.effective_state_dir(),
-            ..Default::default()
-        }),
+        RuntimeType::Youki => {
+            let mut youki_cfg = YoukiConfig::from_data_dir(&cli.effective_data_dir());
+            youki_cfg.state_dir = cli.effective_state_dir();
+            RuntimeConfig::Youki(youki_cfg)
+        }
         #[cfg(target_os = "macos")]
         RuntimeType::MacSandbox => RuntimeConfig::MacSandbox(MacSandboxConfig {
             data_dir: cli.effective_data_dir(),
@@ -28,5 +29,7 @@ pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
         }),
         #[cfg(target_os = "macos")]
         RuntimeType::MacVm => RuntimeConfig::MacVm,
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacVz => RuntimeConfig::MacVz,
     }
 }

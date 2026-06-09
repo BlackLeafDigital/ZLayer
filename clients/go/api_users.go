@@ -149,13 +149,12 @@ func (r ApiDeleteUserRequest) Execute() (*http.Response, error) {
 }
 
 /*
-DeleteUser Delete a user. Admin only. Callers cannot delete their own account.
+DeleteUser Delete a user. Admin only. Callers cannot delete their own account. Idempotent — returns 204 whether the user existed or not.
 
 # Errors
 
 Returns [`ApiError::Forbidden`] when the caller is not an admin,
-[`ApiError::BadRequest`] when an admin tries to delete themselves,
-[`ApiError::NotFound`] when the user does not exist, or
+[`ApiError::BadRequest`] when an admin tries to delete themselves, or
 [`ApiError::Internal`] if a backing store fails.
 
  @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().

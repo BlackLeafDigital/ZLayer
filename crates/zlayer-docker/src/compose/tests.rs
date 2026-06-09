@@ -10,6 +10,7 @@ use zlayer_spec::{DependencyCondition, HealthCheck, Protocol, ScaleSpec, Storage
 use super::convert::compose_to_deployment;
 use super::types::{ComposePort, ComposeServiceNetworks, ComposeVolume, DependsOnCondition};
 use crate::compose::parse_compose;
+use zlayer_paths::ZLayerDirs;
 
 // =========================================================================
 // ComposePort::parse (pub method on a pub type)
@@ -171,7 +172,7 @@ services:
     let spec = compose_to_deployment(&compose, "build-img-test").unwrap();
 
     let app = &spec.services["app"];
-    assert_eq!(app.image.name.to_string(), "docker.io/library/myapp:v1");
+    assert_eq!(app.image.name.to_string(), "myapp:v1");
 }
 
 // =========================================================================
@@ -482,7 +483,9 @@ services:
 #[test]
 fn test_env_file_single_path() {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ZLayerDirs::system_default()
+        .scratch_dir("test-env-file-single-path-")
+        .unwrap();
     let env_path = dir.path().join(".env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "# comment").unwrap();
@@ -553,7 +556,9 @@ services:
 #[test]
 fn test_env_file_list_mixed() {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ZLayerDirs::system_default()
+        .scratch_dir("test-env-file-list-mixed-")
+        .unwrap();
     let env_path = dir.path().join("real.env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "REAL_VAR=yes").unwrap();
@@ -1023,7 +1028,7 @@ services:
     let app = &spec.services["app"];
     assert_eq!(app.env.get("LOG_LEVEL").unwrap(), "info");
     assert_eq!(app.env.get("TZ").unwrap(), "UTC");
-    assert_eq!(app.image.name.to_string(), "docker.io/library/myapp:latest");
+    assert_eq!(app.image.name.to_string(), "myapp:latest");
 }
 
 // =========================================================================
@@ -1264,10 +1269,7 @@ volumes:
 
     // Step 3: Verify nginx service.
     let nginx = &spec.services["nginx"];
-    assert_eq!(
-        nginx.image.name.to_string(),
-        "docker.io/library/nginx:alpine"
-    );
+    assert_eq!(nginx.image.name.to_string(), "nginx:alpine");
     assert_eq!(nginx.endpoints.len(), 2);
     assert_eq!(nginx.storage.len(), 1);
     assert_eq!(nginx.depends.len(), 1);
@@ -1288,7 +1290,7 @@ volumes:
 
     // Step 4: Verify api service.
     let api = &spec.services["api"];
-    assert_eq!(api.image.name.to_string(), "docker.io/library/myapi:latest");
+    assert_eq!(api.image.name.to_string(), "myapi:latest");
     assert_eq!(api.endpoints.len(), 1);
     assert_eq!(api.endpoints[0].port, 3000);
     assert_eq!(api.endpoints[0].target_port, Some(3000));
@@ -1319,10 +1321,7 @@ volumes:
 
     // Step 5: Verify db service.
     let db = &spec.services["db"];
-    assert_eq!(
-        db.image.name.to_string(),
-        "docker.io/library/postgres:16-alpine"
-    );
+    assert_eq!(db.image.name.to_string(), "postgres:16-alpine");
     assert_eq!(db.env.get("POSTGRES_USER").unwrap(), "user");
     assert_eq!(db.env.get("POSTGRES_PASSWORD").unwrap(), "pass");
     assert_eq!(db.env.get("POSTGRES_DB").unwrap(), "myapp");
@@ -1348,10 +1347,7 @@ volumes:
 
     // Step 6: Verify redis service.
     let redis = &spec.services["redis"];
-    assert_eq!(
-        redis.image.name.to_string(),
-        "docker.io/library/redis:7-alpine"
-    );
+    assert_eq!(redis.image.name.to_string(), "redis:7-alpine");
     assert_eq!(redis.endpoints.len(), 1);
     assert_eq!(redis.endpoints[0].port, 6379);
     assert_eq!(redis.endpoints[0].protocol, Protocol::Tcp);
@@ -1441,10 +1437,7 @@ volumes:
 
     // frontend
     let frontend = &spec.services["frontend"];
-    assert_eq!(
-        frontend.image.name.to_string(),
-        "docker.io/library/node:20-alpine"
-    );
+    assert_eq!(frontend.image.name.to_string(), "node:20-alpine");
     assert_eq!(frontend.env.get("NODE_ENV").unwrap(), "production");
     assert_eq!(frontend.env.get("API_URL").unwrap(), "http://backend:4000");
     assert_eq!(frontend.depends.len(), 1);

@@ -89,6 +89,30 @@ pub enum MergeError {
 /// non-empty input slice has been processed (which the early-return guard
 /// already rules out, so this is guaranteed unreachable in practice).
 pub fn merge_compose_files(files: &[PathBuf]) -> Result<ComposeFile, MergeError> {
+    let merged = merge_compose_files_to_value(files)?;
+    serde_yaml::from_value::<ComposeFile>(merged).map_err(|e| MergeError::Schema { source: e })
+}
+
+/// Read and merge compose files into a single raw [`serde_yaml::Value`] without
+/// deserializing into the typed [`ComposeFile`].
+///
+/// This is the seam variable interpolation must run on: typed deserializers
+/// (notably the short-port parser, which splits `host:container` on `:`) would
+/// otherwise mangle un-interpolated values like `${PORT:-3080}:3000` — the `:`
+/// inside `:-` gets treated as the port separator, leaving a truncated
+/// `${PORT` that no longer has a closing brace. Interpolating at the `Value`
+/// layer (before the typed parse) keeps `${...}` blocks intact. See
+/// `cli::compose_cmd::load_project`.
+///
+/// # Errors
+/// Returns [`MergeError`] when `files` is empty, a file can't be read, or a
+/// file isn't valid YAML.
+///
+/// # Panics
+/// Never in practice: the `expect` after the loop only fires if `files` is
+/// non-empty yet the accumulator stayed `None`, which the early empty-check and
+/// the unconditional per-iteration assignment make impossible.
+pub fn merge_compose_files_to_value(files: &[PathBuf]) -> Result<serde_yaml::Value, MergeError> {
     if files.is_empty() {
         return Err(MergeError::NoFiles);
     }
@@ -111,9 +135,7 @@ pub fn merge_compose_files(files: &[PathBuf]) -> Result<ComposeFile, MergeError>
         });
     }
 
-    let merged = acc.expect("acc populated by non-empty loop");
-
-    serde_yaml::from_value::<ComposeFile>(merged).map_err(|e| MergeError::Schema { source: e })
+    Ok(acc.expect("acc populated by non-empty loop"))
 }
 
 /// Merge two YAML values per the Compose spec. `override_with` wins.
@@ -164,6 +186,7 @@ pub fn resolve_paths(project_dir: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use zlayer_paths::ZLayerDirs;
 
     fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -180,7 +203,9 @@ mod tests {
 
     #[test]
     fn merge_single_file_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-single-file-round-trips-")
+            .unwrap();
         let f = write_file(
             dir.path(),
             "compose.yaml",
@@ -199,7 +224,9 @@ services:
 
     #[test]
     fn merge_two_files_later_overrides_scalar() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-two-files-later-overrides-scalar-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -225,7 +252,9 @@ services:
 
     #[test]
     fn merge_two_files_named_maps_are_merged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-two-files-named-maps-are-merged-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -273,7 +302,9 @@ services:
     fn merge_lists_are_replaced_not_appended() {
         // The Compose spec states that lists are replaced wholesale by the
         // override.  This is the property regression-tested here.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-lists-are-replaced-not-appended-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -304,7 +335,9 @@ services:
     #[test]
     fn merge_environment_maps_are_merged() {
         // When `environment` arrives as a YAML mapping it merges per-key.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-environment-maps-are-merged-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -339,7 +372,9 @@ services:
 
     #[test]
     fn merge_three_files_chain_left_to_right() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-three-files-chain-left-to-right-")
+            .unwrap();
         let a = write_file(
             dir.path(),
             "a.yaml",
@@ -393,7 +428,9 @@ services:
 
     #[test]
     fn merge_rejects_invalid_yaml() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("merge-rejects-invalid-yaml-")
+            .unwrap();
         let f = write_file(dir.path(), "bad.yaml", ":\n  - oops\n   bad indent\n");
         let err = merge_compose_files(std::slice::from_ref(&f)).unwrap_err();
         match err {

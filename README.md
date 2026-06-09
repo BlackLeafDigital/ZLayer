@@ -440,6 +440,15 @@ zlayer node list
 zlayer node status
 ```
 
+### Test coverage
+
+The behaviors described above (cluster bootstrap, two-mode join, dynamic voter management, heartbeat health monitoring, automatic failover, and allocation modes) are backed by automated tests:
+
+- **In-process integration tests** under `crates/zlayer-scheduler/tests/`: `single_node_bootstrap`, `two_node_cluster`, `three_node_replication`, `leader_failover`, `allocation_modes`. Each test brings up N `RaftService` instances on loopback ports and drives them through the real HTTP/2 transport.
+- **Process-level e2e** via `crates/zlayer-manager/tests/e2e/scripts/run-suite.py` suites `cluster_3node` (boot a 3-node cluster from `zlayer node init` + `zlayer node join`, assert all nodes reach `status: ready` with the correct roles) and `cluster_failover` (kill a worker, assert the leader marks it `dead` within 30s, restart it, assert recovery to `ready`).
+
+Run them with `cargo test --workspace` and `uv run python crates/zlayer-manager/tests/e2e/scripts/run-suite.py cluster_3node` respectively.
+
 ## Deployment Spec
 
 The deployment spec is documented inline below and in the per-type schemas exposed by `zlayer spec dump`. The canonical Rust types live in the [`zlayer-spec`](./crates/zlayer-spec) crate.

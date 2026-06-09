@@ -108,6 +108,8 @@ fn empty_vm_document(owner: &str) -> CsDoc {
         hosting_system_id: String::new(),
         container: None,
         virtual_machine: Some(VirtualMachine {
+            stop_on_reset: false,
+            registry_changes: None,
             chipset: Some(Chipset {
                 uefi: Some(Uefi {
                     boot_this: Some(UefiBootEntry {
@@ -115,17 +117,22 @@ fn empty_vm_document(owner: &str) -> CsDoc {
                         device_path: String::new(),
                         disk_number: None,
                     }),
+                    ..Default::default()
                 }),
             }),
             compute_topology: Some(Topology {
-                memory: Some(TopologyMemory { size_in_mb: 256 }),
+                memory: Some(TopologyMemory {
+                    size_in_mb: 256,
+                    ..Default::default()
+                }),
                 processor: Some(TopologyProcessor { count: 1 }),
             }),
             devices: None,
+            debug_options: None,
             guest_state: None,
             runtime_state_file_path: None,
         }),
-        should_terminate_on_last_handle_closed: Some(true),
+        should_terminate_on_last_handle_closed: None,
     }
 }
 
@@ -149,7 +156,6 @@ fn schema_round_trip() {
     assert_eq!(back.owner, "zlayer-test");
     assert_eq!(back.schema_version, SchemaVersion { major: 2, minor: 1 });
     assert!(back.container.is_none());
-    assert_eq!(back.should_terminate_on_last_handle_closed, Some(true));
 
     let vm = back.virtual_machine.expect("virtual machine present");
     let topology = vm.compute_topology.expect("topology present");

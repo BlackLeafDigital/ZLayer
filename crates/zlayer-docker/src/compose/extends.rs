@@ -342,6 +342,7 @@ fn load_external_parent(
 #[cfg(test)]
 mod tests {
     use crate::compose::parse_compose;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn extends_same_file_inherits_image() {
@@ -487,7 +488,9 @@ services:
 
     #[test]
     fn extends_external_file_resolves_via_parse_compose_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("extends-external-file-resolves-via-parse-compose-file-")
+            .unwrap();
         let parent_path = dir.path().join("parent.yaml");
         std::fs::write(
             &parent_path,

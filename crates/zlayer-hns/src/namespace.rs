@@ -59,15 +59,22 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    /// Create a fresh `HostDefault` HCN namespace with a newly-generated
+    /// Create a fresh per-container `Host` HCN namespace with a newly-generated
     /// GUID. This is the common case for per-container attach.
+    ///
+    /// **Type=Host** (not `HostDefault`): hcsshim's `containerd-shim-runhcs-v1`
+    /// creates a unique `Host` namespace for every process-isolated WCOW
+    /// container (verified May 2026 via ETW capture of
+    /// `Microsoft-Windows-Hyper-V-Compute` during `ctr run`). The previously-used
+    /// `HostDefault` is a system singleton — HCS `Construct` rejects
+    /// compute-system docs that reference it with `E_INVALIDARG (0x80070057)`.
     pub fn create_host_default() -> HnsResult<Self> {
         let id = GUID::new().map_err(|e| HnsError::Other {
             hresult: e.code().0,
             message: format!("GUID::new failed: {e}"),
         })?;
         let spec = HostComputeNamespace {
-            ty: NamespaceType::HostDefault,
+            ty: NamespaceType::Host,
             schema_version: SchemaVersion::default(),
             ..HostComputeNamespace::default()
         };
@@ -106,7 +113,82 @@ impl Namespace {
         // SAFETY: HCN just handed us ownership of `raw`; we transfer it to
         // OwnedNamespace which is responsible for closing it on drop.
         let handle = unsafe { OwnedNamespace::from_raw(raw as HcnNamespaceHandle) };
-        Ok(Self { id, handle })
+
+        // CRITICAL: HCN's `HostDefault` namespace is a SYSTEM SINGLETON.
+        // `HcnCreateNamespace` ignores the `id` GUID we pass and returns a
+        // handle to the existing default namespace (verified empirically:
+        // multiple "creates" all return the same handle with assigned ID
+        // `910F7D92-...`, and all containers' endpoints appear in that single
+        // namespace's ResourceList). For HCS Construct to resolve the
+        // `Container.Networking.Namespace` reference, we MUST report the ID
+        // HCN actually assigned, not the GUID we requested.
+        let real_id = query_handle_id(handle.as_raw()).unwrap_or(id);
+        let ns = Self {
+            id: real_id,
+            handle,
+        };
+        // Because the default namespace is a singleton, ORPHAN endpoint
+        // references accumulate across container lifecycles (a container that
+        // failed mid-create may have added an endpoint that was later
+        // deleted via network cascade, leaving a dangling ref in the
+        // namespace). HCS `Construct` iterates the namespace's resources and
+        // fails `E_INVALIDARG` if any referenced endpoint no longer exists.
+        // Reconcile here so the namespace only references live endpoints.
+        ns.reconcile_orphan_endpoints();
+        Ok(ns)
+    }
+
+    /// Remove any endpoint references in this namespace whose underlying
+    /// endpoint no longer exists. Best-effort: errors are logged and swallowed.
+    fn reconcile_orphan_endpoints(&self) {
+        let Some(json) = query_handle_raw(self.handle.as_raw(), "{}") else {
+            return;
+        };
+        let live: std::collections::HashSet<String> = crate::endpoint::list("{}")
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| {
+                format!("{g:?}")
+                    .trim_matches(|c: char| c == '{' || c == '}')
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return;
+        };
+        let Some(resources) = v.get("ResourceList").and_then(|r| r.as_array()) else {
+            return;
+        };
+        for r in resources {
+            if r.get("Type").and_then(|t| t.as_str()) != Some("Endpoint") {
+                continue;
+            }
+            let Some(id_str) = r
+                .get("Data")
+                .and_then(|d| d.get("Id"))
+                .and_then(|s| s.as_str())
+            else {
+                continue;
+            };
+            let id_norm = id_str
+                .trim_matches(|c: char| c == '{' || c == '}')
+                .to_ascii_lowercase();
+            if live.contains(&id_norm) {
+                continue;
+            }
+            // Orphan: build a Remove request and best-effort modify.
+            let body = format!(
+                r#"{{"ResourceType":"Endpoint","RequestType":"Remove","Settings":{{"EndpointId":"{id_norm}"}}}}"#
+            );
+            if let Err(e) = self.modify_json(&body) {
+                tracing::warn!(
+                    endpoint = %id_norm,
+                    error = %e,
+                    "reconcile: failed to remove orphan endpoint ref from default namespace",
+                );
+            }
+        }
     }
 
     /// Open an existing namespace by GUID.
@@ -151,10 +233,12 @@ impl Namespace {
     /// references this namespace's GUID in its `Container.Networking.Namespace`
     /// field. `ResourceType: 1` is the well-known `Endpoint` selector.
     pub fn add_endpoint(&self, endpoint_id: GUID) -> HnsResult<()> {
+        // HCN rejects Settings-as-string with "ExpectedObject"; Settings must be
+        // an embedded JSON object.
         let req = ModifyNamespaceSettingRequest {
-            resource_type: 1, // Endpoint
+            resource_type: "Endpoint".to_string(),
             request_type: ModifyRequestType::Add,
-            settings: serde_json::json!({ "EndpointId": format!("{endpoint_id:?}") }),
+            settings: serde_json::json!({ "EndpointId": format_endpoint_id(endpoint_id) }),
         };
         self.modify_json(&serde_json::to_string(&req)?)
     }
@@ -162,9 +246,9 @@ impl Namespace {
     /// Detach an endpoint from this namespace.
     pub fn remove_endpoint(&self, endpoint_id: GUID) -> HnsResult<()> {
         let req = ModifyNamespaceSettingRequest {
-            resource_type: 1, // Endpoint
+            resource_type: "Endpoint".to_string(),
             request_type: ModifyRequestType::Remove,
-            settings: serde_json::json!({ "EndpointId": format!("{endpoint_id:?}") }),
+            settings: serde_json::json!({ "EndpointId": format_endpoint_id(endpoint_id) }),
         };
         self.modify_json(&serde_json::to_string(&req)?)
     }
@@ -273,6 +357,56 @@ pub fn list(query_json: &str) -> HnsResult<Vec<GUID>> {
 // These are duplicated from `network.rs` / `endpoint.rs`. Once all three
 // modules are in, we should hoist them into `pub(crate) mod internal;`.
 
+/// Format a GUID as a **bare, lowercase, un-braced** string for the
+/// `EndpointId` field of an `HcnModifyNamespace` request, matching how
+/// hcsshim's `AddNamespaceEndpoint` passes the id (`guid.String()` →
+/// `aabbccdd-eeff-...`). The windows-rs `{:?}` formatter emits the
+/// brace-wrapped, upper-case form (`{AABBCCDD-...}`); HCN's namespace-modify
+/// path is stricter than its endpoint-create path and rejects that, so we
+/// normalise here.
+fn format_endpoint_id(id: GUID) -> String {
+    format!("{id:?}")
+        .trim_matches(|c: char| c == '{' || c == '}')
+        .to_ascii_lowercase()
+}
+
+/// Query the HCN-assigned ID of a namespace handle. Used by `Namespace::create`
+/// to recover the real namespace ID (because `HostDefault` is a singleton —
+/// HCN ignores the requested GUID and returns the existing default's handle).
+/// Returns `None` on any failure so the caller can fall back to the user-
+/// supplied id.
+fn query_handle_raw(handle: HcnNamespaceHandle, query_json: &str) -> Option<String> {
+    let query_hstring = HSTRING::from(query_json);
+    let mut out_properties: PWSTR = PWSTR::null();
+    let mut err_record: PWSTR = PWSTR::null();
+    // SAFETY: handle is live; out-params point at local mutable storage;
+    // query string outlives the call.
+    let hr = unsafe {
+        HcnQueryNamespaceProperties(
+            handle,
+            &query_hstring,
+            &mut out_properties,
+            Some(&mut err_record),
+        )
+    };
+    if hr.is_err() {
+        // err_record leaked on the rare failure path (Win32_System_Memory not
+        // enabled in this crate); caller falls back gracefully.
+        return None;
+    }
+    Some(decode_pwstr(out_properties))
+}
+
+fn query_handle_id(handle: HcnNamespaceHandle) -> Option<GUID> {
+    let json = query_handle_raw(handle, "{}")?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let id_str = v.get("ID").and_then(|s| s.as_str())?;
+    // Windows GUID parses both `{XXXX...}` and `XXXX...` forms.
+    GUID::try_from(id_str)
+        .or_else(|_| GUID::try_from(format!("{{{id_str}}}").as_str()))
+        .ok()
+}
+
 /// Convert an HCN-returned PWSTR to an owned `String` and free its backing
 /// `LocalAlloc` buffer. Safe to call with a null pointer (returns empty).
 fn decode_pwstr(p: PWSTR) -> String {
@@ -352,36 +486,39 @@ mod tests {
         // wire format matches hcsshim expectations.
         let endpoint_id = GUID::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
         let req = ModifyNamespaceSettingRequest {
-            resource_type: 1,
+            resource_type: "Endpoint".to_string(),
             request_type: ModifyRequestType::Add,
             settings: serde_json::json!({
-                "EndpointId": format!("{endpoint_id:?}")
+                "EndpointId": format_endpoint_id(endpoint_id)
             }),
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["ResourceType"], serde_json::json!(1));
+        assert_eq!(v["ResourceType"], serde_json::json!("Endpoint"));
         assert_eq!(v["RequestType"], serde_json::json!("Add"));
+        let ep = v["Settings"]["EndpointId"].as_str().unwrap();
         assert!(
-            v["Settings"]["EndpointId"]
-                .as_str()
-                .unwrap()
-                .contains("12345678"),
+            ep.contains("12345678"),
             "EndpointId should contain GUID data: {v}"
         );
+        assert!(
+            !ep.contains('{') && !ep.contains('}'),
+            "EndpointId must be un-braced for HcnModifyNamespace: {ep}"
+        );
+        assert_eq!(ep, ep.to_ascii_lowercase(), "EndpointId must be lowercase");
     }
 
     #[test]
     fn remove_endpoint_request_uses_remove_verb() {
         let endpoint_id = GUID::zeroed();
         let req = ModifyNamespaceSettingRequest {
-            resource_type: 1,
+            resource_type: "Endpoint".to_string(),
             request_type: ModifyRequestType::Remove,
             settings: serde_json::json!({
-                "EndpointId": format!("{endpoint_id:?}")
+                "EndpointId": format_endpoint_id(endpoint_id)
             }),
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["RequestType"], serde_json::json!("Remove"));
-        assert_eq!(v["ResourceType"], serde_json::json!(1));
+        assert_eq!(v["ResourceType"], serde_json::json!("Endpoint"));
     }
 }

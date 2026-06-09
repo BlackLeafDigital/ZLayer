@@ -35,6 +35,48 @@ pub struct SecretsState {
 
     /// Replicated secrets, keyed by their `storage_key` (`"{scope}:{name}"`).
     pub secrets: HashMap<String, ReplicatedSecret>,
+
+    /// Revoked join tokens, keyed by `token_hash` (lowercase hex SHA-256
+    /// of the full token b64 envelope). Auto-pruned during apply: any
+    /// `RevokeToken` op also sweeps entries whose `expires_at < now()`.
+    pub revoked_tokens: HashMap<String, chrono::DateTime<chrono::Utc>>,
+
+    /// Trusted foreign-cluster trust bundles, keyed by `cluster_domain`.
+    /// Imported via [`SecretsRaftOp::ImportTrustBundle`] and consulted
+    /// by [`crate::cluster_signer::ClusterCa::verify_ca_cert`] when a
+    /// v=2 signed token carries a `ca_chain` whose `cluster_domain`
+    /// is not the local cluster's.
+    ///
+    /// `#[serde(default)]` so snapshots written before this field
+    /// existed restore with an empty map.
+    #[serde(default)]
+    pub trusted_bundles: HashMap<String, zlayer_types::api::cluster::TrustBundle>,
+
+    /// Cluster-wide JWT algorithm policy. Drives which join-token
+    /// formats `cluster_join` accepts. Default `Both` for safety —
+    /// the daemon's bootstrap may override based on whether
+    /// `{data_dir}/join_secret` is already present on first start.
+    ///
+    /// `#[serde(default)]` so pre-Wave-11 snapshots restore cleanly.
+    #[serde(default)]
+    pub jwt_algorithm: zlayer_types::api::cluster::JwtAlgorithm,
+
+    /// Timestamp when `WipeJoinSecret` last applied (None = never).
+    ///
+    /// Two daemon mechanisms consult this field:
+    /// - The apply-time wrapper in `zlayer_scheduler::raft::ClusterState`
+    ///   fires `NodeSideEffects::fire_wipe_join_secret`, which the daemon's
+    ///   watcher task drains to delete `{data_dir}/join_secret`.
+    /// - The boot-time reconcile in `zlayer serve` checks this field on
+    ///   startup; if `Some(_)` and the file still exists locally (e.g. the
+    ///   node restored from a snapshot where the wipe already happened),
+    ///   the file is removed before the HS256 HMAC loader runs.
+    ///
+    /// Both paths are idempotent.
+    ///
+    /// `#[serde(default)]` for pre-Wave-11 snapshots.
+    #[serde(default)]
+    pub join_secret_wiped_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl SecretsState {
@@ -85,6 +127,56 @@ impl SecretsState {
                 })?;
                 Ok(())
             }
+            SecretsRaftOp::RevokeToken {
+                token_hash,
+                expires_at,
+            } => {
+                // Insert the revocation. Idempotent: replaying the same op is
+                // a no-op overwrite. Trailing expired entries are pruned in
+                // the same pass so the table stays bounded.
+                let now = Utc::now();
+                if expires_at > now {
+                    self.revoked_tokens.insert(token_hash, expires_at);
+                }
+                // Sweep expired entries opportunistically on every revoke apply.
+                self.revoked_tokens.retain(|_, exp| *exp > now);
+                Ok(())
+            }
+            SecretsRaftOp::ImportTrustBundle { bundle } => {
+                // Idempotent: replacing an existing bundle with the
+                // same `cluster_domain` overwrites in place. Operators
+                // re-importing after a key rotation in the source
+                // cluster do this; the trust relationship stays one
+                // entry per foreign cluster.
+                self.trusted_bundles
+                    .insert(bundle.cluster_domain.clone(), bundle);
+                Ok(())
+            }
+            SecretsRaftOp::RemoveTrustBundle { cluster_domain } => {
+                // Removal is also idempotent — silently no-op if the
+                // entry is already absent.
+                self.trusted_bundles.remove(&cluster_domain);
+                Ok(())
+            }
+            SecretsRaftOp::SetJwtAlgorithm { algorithm } => {
+                self.jwt_algorithm = algorithm;
+                Ok(())
+            }
+            SecretsRaftOp::WipeJoinSecret => {
+                // Record the wipe instant. The actual filesystem delete
+                // happens outside this pure-sync apply path: the wrapper
+                // closure in `zlayer_scheduler::raft::ClusterState` fires
+                // `NodeSideEffects::fire_wipe_join_secret` post-apply, and
+                // the daemon's watcher in `zlayer serve` drains the notify
+                // to `remove_file({data_dir}/join_secret)`. The boot-time
+                // reconcile in `zlayer serve` covers the snapshot-install
+                // path on followers. All three are idempotent; replaying
+                // this op preserves the first-applied timestamp for audit.
+                if self.join_secret_wiped_at.is_none() {
+                    self.join_secret_wiped_at = Some(Utc::now());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -113,6 +205,36 @@ impl SecretsState {
         self.wrapped_dek
             .as_ref()
             .is_some_and(|w| w.wraps.contains_key(node_id))
+    }
+
+    /// Returns true if the given token hash is currently revoked.
+    ///
+    /// Auto-pruning happens at apply time; callers can rely on the
+    /// in-memory map being a tight view of un-expired revocations.
+    #[must_use]
+    pub fn token_revoked(&self, token_hash: &str) -> bool {
+        self.revoked_tokens.contains_key(token_hash)
+    }
+
+    /// Look up a trusted foreign cluster's bundle by domain.
+    #[must_use]
+    pub fn trust_bundle_for(
+        &self,
+        cluster_domain: &str,
+    ) -> Option<&zlayer_types::api::cluster::TrustBundle> {
+        self.trusted_bundles.get(cluster_domain)
+    }
+
+    /// Return the current JWT algorithm policy.
+    #[must_use]
+    pub fn jwt_algorithm(&self) -> zlayer_types::api::cluster::JwtAlgorithm {
+        self.jwt_algorithm
+    }
+
+    /// `true` if `WipeJoinSecret` has been applied at least once.
+    #[must_use]
+    pub fn join_secret_wiped(&self) -> bool {
+        self.join_secret_wiped_at.is_some()
     }
 }
 
@@ -369,5 +491,201 @@ mod tests {
             .expect("rotate exclude a");
         assert!(!state.node_can_decrypt("node-a"));
         assert!(state.node_can_decrypt("node-b"));
+    }
+
+    #[test]
+    fn revoke_token_inserts_entry() {
+        let mut state = SecretsState::default();
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "abc123".to_string(),
+                expires_at,
+            })
+            .unwrap();
+        assert!(state.token_revoked("abc123"));
+        assert!(!state.token_revoked("def456"));
+    }
+
+    #[test]
+    fn revoke_token_is_idempotent() {
+        let mut state = SecretsState::default();
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        let op = SecretsRaftOp::RevokeToken {
+            token_hash: "abc123".to_string(),
+            expires_at,
+        };
+        state.apply(op.clone()).unwrap();
+        state.apply(op).unwrap();
+        assert_eq!(state.revoked_tokens.len(), 1);
+    }
+
+    #[test]
+    fn revoke_token_skips_already_expired_input() {
+        let mut state = SecretsState::default();
+        let expired_at = Utc::now() - chrono::Duration::hours(1);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "abc123".to_string(),
+                expires_at: expired_at,
+            })
+            .unwrap();
+        // Already-expired entries are not even inserted.
+        assert!(!state.token_revoked("abc123"));
+    }
+
+    #[test]
+    fn revoke_token_apply_prunes_expired_neighbors() {
+        let mut state = SecretsState::default();
+        // Seed with an expired entry, then apply a fresh revoke; the
+        // expired neighbor should be swept in the same pass.
+        let expired_at = Utc::now() - chrono::Duration::hours(1);
+        state.revoked_tokens.insert("stale".to_string(), expired_at);
+        let fresh_expires = Utc::now() + chrono::Duration::hours(24);
+        state
+            .apply(SecretsRaftOp::RevokeToken {
+                token_hash: "fresh".to_string(),
+                expires_at: fresh_expires,
+            })
+            .unwrap();
+        assert!(state.token_revoked("fresh"));
+        assert!(!state.token_revoked("stale"));
+    }
+
+    fn make_trust_bundle(
+        cluster_domain: &str,
+        ca_kid: &str,
+    ) -> zlayer_types::api::cluster::TrustBundle {
+        zlayer_types::api::cluster::TrustBundle {
+            v: zlayer_types::api::cluster::TRUST_BUNDLE_FORMAT_VERSION,
+            cluster_domain: cluster_domain.to_string(),
+            ca_public_key_b64: format!("pubkey-of-{cluster_domain}"),
+            ca_kid: ca_kid.to_string(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn import_trust_bundle_inserts_entry() {
+        let mut state = SecretsState::default();
+        let bundle = make_trust_bundle("prod-east", "deadbeef");
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: bundle.clone(),
+            })
+            .unwrap();
+        let got = state
+            .trust_bundle_for("prod-east")
+            .expect("must be present");
+        assert_eq!(got.cluster_domain, "prod-east");
+        assert_eq!(got.ca_kid, "deadbeef");
+        assert!(state.trust_bundle_for("prod-west").is_none());
+    }
+
+    #[test]
+    fn import_trust_bundle_is_idempotent_overwriting_in_place() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "deadbeef"),
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "newkid12"),
+            })
+            .unwrap();
+        let got = state.trust_bundle_for("prod-east").unwrap();
+        assert_eq!(got.ca_kid, "newkid12", "re-import must overwrite in place");
+        assert_eq!(state.trusted_bundles.len(), 1);
+    }
+
+    #[test]
+    fn remove_trust_bundle_drops_entry() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::ImportTrustBundle {
+                bundle: make_trust_bundle("prod-east", "deadbeef"),
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::RemoveTrustBundle {
+                cluster_domain: "prod-east".into(),
+            })
+            .unwrap();
+        assert!(state.trust_bundle_for("prod-east").is_none());
+    }
+
+    #[test]
+    fn remove_trust_bundle_is_idempotent_for_unknown_domain() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::RemoveTrustBundle {
+                cluster_domain: "never-imported".into(),
+            })
+            .unwrap();
+        // No assertion needed — the test verifies apply doesn't error.
+    }
+
+    #[test]
+    fn set_jwt_algorithm_default_is_both() {
+        let state = SecretsState::default();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Both,
+            "default policy is Both for safety during migration"
+        );
+    }
+
+    #[test]
+    fn set_jwt_algorithm_flips_policy() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Eddsa,
+            })
+            .unwrap();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Eddsa
+        );
+    }
+
+    #[test]
+    fn set_jwt_algorithm_is_idempotent() {
+        let mut state = SecretsState::default();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Hs256,
+            })
+            .unwrap();
+        state
+            .apply(SecretsRaftOp::SetJwtAlgorithm {
+                algorithm: zlayer_types::api::cluster::JwtAlgorithm::Hs256,
+            })
+            .unwrap();
+        assert_eq!(
+            state.jwt_algorithm(),
+            zlayer_types::api::cluster::JwtAlgorithm::Hs256
+        );
+    }
+
+    #[test]
+    fn wipe_join_secret_records_timestamp() {
+        let mut state = SecretsState::default();
+        assert!(!state.join_secret_wiped());
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        assert!(state.join_secret_wiped());
+        assert!(state.join_secret_wiped_at.is_some());
+    }
+
+    #[test]
+    fn wipe_join_secret_is_idempotent_preserves_first_timestamp() {
+        let mut state = SecretsState::default();
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        let first = state.join_secret_wiped_at.unwrap();
+        // Re-apply: timestamp must NOT update (preserves audit trail).
+        state.apply(SecretsRaftOp::WipeJoinSecret).unwrap();
+        assert_eq!(state.join_secret_wiped_at.unwrap(), first);
     }
 }

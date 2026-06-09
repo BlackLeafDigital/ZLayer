@@ -22,7 +22,7 @@ use std::path::PathBuf;
 ///     db_path: PathBuf::from("/var/lib/myapp/data.db"),
 ///     s3_bucket: "my-bucket".to_string(),
 ///     s3_prefix: "sqlite-backups/myapp/".to_string(),
-///     cache_dir: PathBuf::from("/tmp/zlayer-replicator/cache"),
+///     cache_dir: PathBuf::from("/var/lib/zlayer/sqlite-replicator/cache"),
 ///     max_cache_size: 100 * 1024 * 1024, // 100MB
 ///     auto_restore: true,
 ///     snapshot_interval_secs: 3600,
@@ -90,7 +90,9 @@ impl Default for SqliteReplicatorConfig {
             db_path: PathBuf::new(),
             s3_bucket: String::new(),
             s3_prefix: "sqlite-replication/".to_string(),
-            cache_dir: PathBuf::from("/tmp/zlayer-replicator/cache"),
+            cache_dir: zlayer_paths::ZLayerDirs::system_default()
+                .data_dir()
+                .join("sqlite-replicator/cache"),
             max_cache_size: default_max_cache_size(),
             auto_restore: default_auto_restore(),
             snapshot_interval_secs: default_snapshot_interval(),
@@ -212,7 +214,9 @@ impl Default for LayerStorageConfig {
             prefix: default_prefix(),
             region: None,
             endpoint_url: None,
-            staging_dir: PathBuf::from("/tmp/zlayer-storage/staging"),
+            staging_dir: zlayer_paths::ZLayerDirs::system_default()
+                .data_dir()
+                .join("layer-staging"),
             state_db_path: zlayer_paths::ZLayerDirs::system_default()
                 .data_dir()
                 .join("layer-state.sqlite"),

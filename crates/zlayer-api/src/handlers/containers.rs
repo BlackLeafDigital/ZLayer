@@ -122,6 +122,47 @@ pub struct ContainerApiState {
     /// daemon attached interactively — non-TTY containers have no entry, and
     /// the resize endpoint returns `400` for those.
     pub container_pty_resizers: Arc<DashMap<ContainerId, mpsc::Sender<(u16, u16)>>>,
+    /// Optional cluster handle. When `Some`, a create request carrying
+    /// `node_selector` / `platform` triggers cross-node placement: the leader
+    /// chooses a matching node and either creates locally or forwards the
+    /// request to the chosen node's internal create endpoint. `None` on
+    /// single-node / non-clustered daemons — placement fields are then ignored
+    /// and the container is always created locally.
+    pub cluster: Option<Arc<dyn zlayer_scheduler::cluster::Cluster>>,
+    /// Shared secret presented as `X-ZLayer-Internal-Token` on cross-node
+    /// container dispatch (both signing outbound forwards and validating the
+    /// inbound `/api/v1/internal/containers` endpoint). `None` disables the
+    /// internal endpoint and cross-node forwarding.
+    pub internal_token: Option<String>,
+    /// HTTP client reused for cross-node container forwarding.
+    pub http_client: reqwest::Client,
+    /// Optional `ServiceManager` handle so the unified container-name resolver
+    /// (and `docker ps`) can see DEPLOYMENT/compose containers — not just
+    /// standalone ones. Compose `up` registers containers in the
+    /// `ServiceManager`, NOT in [`Self::containers`]; without this handle a
+    /// compose `container_name:` (e.g. `forgejo-e2e`) resolves to nothing and
+    /// `docker exec`/`docker ps` 404 / show empty. The runtime is the SAME
+    /// shared instance, so once the resolver recovers a `ContainerId` from the
+    /// manager, `runtime.exec(...)` drives the right container. `None` in
+    /// read-only / test states that have no manager.
+    pub service_manager: Option<Arc<RwLock<zlayer_agent::ServiceManager>>>,
+    /// Optional overlay manager. Populated by the daemon when the encrypted
+    /// `WireGuard` overlay is active. On hosts where there is no Docker
+    /// bridge-network runtime (notably macOS VZ-Linux), this is the mechanism
+    /// used to satisfy `CreateContainerRequest::networks` attachments: instead
+    /// of failing, the create handler attaches the standalone container to the
+    /// overlay (allocating an overlay IP via overlayd) so the container can
+    /// reach the node overlay IP (e.g. the CI runner's cache server at
+    /// `10.200.0.1`), sibling containers, and overlay DNS. `None` on daemons
+    /// with no overlay.
+    pub overlay_manager: Option<Arc<RwLock<zlayer_agent::OverlayManager>>>,
+    /// Optional overlay DNS authority. Populated alongside
+    /// [`Self::overlay_manager`]; lets the overlay-attach path register the
+    /// requested user-defined network name(s) + the container name as A
+    /// records pointing at the container's overlay IP, so sibling containers
+    /// resolve each other by name (mirroring the bare-service-name DNS the
+    /// deployment supervisor registers). `None` when no overlay DNS is running.
+    pub dns_server: Option<Arc<zlayer_overlay::DnsServer>>,
 }
 
 /// Metadata for a standalone container (not managed by a deployment)
@@ -167,6 +208,12 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
+            service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -185,6 +232,12 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
+            service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -207,6 +260,12 @@ impl ContainerApiState {
             compose_storage: Arc::new(InMemoryComposeProjectStorage::new()),
             exec_instances: Arc::new(ExecInstances::new()),
             container_pty_resizers: Arc::new(DashMap::new()),
+            cluster: None,
+            internal_token: None,
+            http_client: reqwest::Client::new(),
+            service_manager: None,
+            overlay_manager: None,
+            dns_server: None,
         }
     }
 
@@ -275,6 +334,58 @@ impl ContainerApiState {
     #[must_use]
     pub fn with_compose_storage(mut self, compose_storage: Arc<dyn ComposeProjectStorage>) -> Self {
         self.compose_storage = compose_storage;
+        self
+    }
+
+    /// Attach the daemon's [`ServiceManager`](zlayer_agent::ServiceManager) so
+    /// the unified container-name resolver and `docker ps` can see compose /
+    /// deployment containers (addressed by their `container_name:` label or the
+    /// conventional compose names), not just standalone containers.
+    #[must_use]
+    pub fn with_service_manager(
+        mut self,
+        service_manager: Arc<RwLock<zlayer_agent::ServiceManager>>,
+    ) -> Self {
+        self.service_manager = Some(service_manager);
+        self
+    }
+
+    /// Attach the overlay manager so the container-create handler can fall back
+    /// to overlay attachment when there is no Docker bridge-network runtime
+    /// (e.g. macOS VZ-Linux). See [`Self::overlay_manager`].
+    #[must_use]
+    pub fn with_overlay_manager(
+        mut self,
+        overlay_manager: Arc<RwLock<zlayer_agent::OverlayManager>>,
+    ) -> Self {
+        self.overlay_manager = Some(overlay_manager);
+        self
+    }
+
+    /// Attach the overlay DNS authority so the overlay-attach fallback can
+    /// register the requested network name(s) + container name as A records.
+    /// See [`Self::dns_server`].
+    #[must_use]
+    pub fn with_dns_server(mut self, dns_server: Arc<zlayer_overlay::DnsServer>) -> Self {
+        self.dns_server = Some(dns_server);
+        self
+    }
+
+    /// Attach a cluster handle so container-create honors `node_selector` /
+    /// `platform` by placing across the cluster. Without it, those fields are
+    /// ignored and containers are always created locally.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<dyn zlayer_scheduler::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Set the shared internal token used to authenticate cross-node container
+    /// dispatch (outbound forwards and the inbound `/internal/containers`
+    /// endpoint).
+    #[must_use]
+    pub fn with_internal_token(mut self, token: String) -> Self {
+        self.internal_token = Some(token);
         self
     }
 
@@ -529,10 +640,7 @@ fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
         Some(n) => format!("standalone-{n}"),
         None => format!("standalone-{}", uuid::Uuid::new_v4().as_simple()),
     };
-    let cid = ContainerId {
-        service: service_name.clone(),
-        replica: 0,
-    };
+    let cid = ContainerId::new(service_name.clone(), 0);
     (service_name, cid)
 }
 
@@ -607,15 +715,82 @@ pub(crate) async fn resolve_container_lookup(
         }
     }
 
-    // Fall-back: legacy service-name lookup. The storage map is keyed by
-    // the service-name string, so a present entry means the raw identifier
-    // is itself a valid storage key.
+    // Fall-back 1: the raw identifier is itself a valid storage key (the full
+    // `standalone-<name>` service-name string).
     let g = state.containers.read().await;
     if let Some(meta) = g.get(raw) {
         return Some(ResolvedContainer {
             container_id: meta.container_id.clone(),
             storage_key: raw.to_string(),
         });
+    }
+
+    // Fall-back 2: Docker addresses standalone containers by their user-facing
+    // NAME (`docker start <name>`), but the map is keyed by `standalone-<name>`
+    // (see `generate_container_id`). Try the prefixed key so start / stop /
+    // inspect / logs / exec / wait resolve a bare name like real Docker. Without
+    // this, every Docker client that addresses a container by name 404s even
+    // though the container exists.
+    let prefixed = format!("standalone-{raw}");
+    if let Some(meta) = g.get(&prefixed) {
+        return Some(ResolvedContainer {
+            container_id: meta.container_id.clone(),
+            storage_key: prefixed,
+        });
+    }
+
+    // Fall-back 3: match the recorded original name directly. Covers any key
+    // scheme and names that already begin with `standalone-`.
+    for (key, meta) in g.iter() {
+        if meta.name.as_deref() == Some(raw) {
+            return Some(ResolvedContainer {
+                container_id: meta.container_id.clone(),
+                storage_key: key.clone(),
+            });
+        }
+    }
+    drop(g);
+
+    // Fall-back 4: the raw identifier is a deployment container's `ContainerId`
+    // Display string (`{service}-{role}-{replica}-on-{node}` or the legacy
+    // `{service}-rep-{replica}`). Deployment containers live in the
+    // ServiceManager/runtime, NOT the standalone-container map — but the runtime
+    // is the SAME shared instance, so once we recover the `ContainerId` the
+    // logs / inspect / state handlers resolve it directly. The foreground
+    // `zlayer run` path discovers a container via the deployment-scoped
+    // `list_containers` (which emits this Display string) and then streams its
+    // logs through `/api/v1/containers/{id}/logs` — without this fallback that
+    // id resolves to nothing here and the run path 404s even though the
+    // container is up. Verify the runtime actually knows it (don't resolve a
+    // bogus string into a phantom container).
+    if let Some(cid) = ContainerId::parse_display(raw) {
+        if state.runtime.container_state(&cid).await.is_ok() {
+            let storage_key = raw.to_string();
+            return Some(ResolvedContainer {
+                container_id: cid,
+                storage_key,
+            });
+        }
+    }
+
+    // Fall-back 5: DEPLOYMENT / compose containers. These live in the
+    // `ServiceManager`, not the standalone map, so none of the above hit them.
+    // Ask the manager to resolve the raw identifier as a compose
+    // `container_name:` label, a conventional compose name
+    // (`{project}-{service}-{n}` / `{project}_{service}_{n}`), a bare service
+    // name, or a `ContainerId` Display string — and return the live
+    // `ContainerId`. The runtime is shared, so the recovered id drives exec /
+    // logs / inspect directly. This is what makes `docker exec forgejo-e2e ...`
+    // resolve a compose deployment's `container_name`.
+    if let Some(mgr) = state.service_manager.as_ref() {
+        let manager = mgr.read().await;
+        if let Some(cid) = manager.resolve_container_name(raw).await {
+            let storage_key = cid.to_string();
+            return Some(ResolvedContainer {
+                container_id: cid,
+                storage_key,
+            });
+        }
     }
     None
 }
@@ -768,6 +943,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
                 Some("never") => PullPolicy::Never,
                 _ => PullPolicy::IfNotPresent,
             },
+            source_policy: None,
         },
         resources,
         env: request.env.clone(),
@@ -787,8 +963,9 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         cap_drop: request.cap_drop.clone(),
         privileged: request.privileged.unwrap_or(false),
         node_mode: NodeMode::default(),
-        node_selector: None,
-        platform: None,
+        node_selector: request.node_selector.clone(),
+        affinity: None,
+        platform: request.platform.clone(),
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,
@@ -818,6 +995,10 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        replica_groups: None,
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     })
 }
 
@@ -909,6 +1090,30 @@ fn state_to_string(state: &ContainerState) -> String {
     }
 }
 
+/// Reconcile the reported `exit_code` with the live container state.
+///
+/// `inspect.exit_code` comes from the runtime's `inspect_detailed` override,
+/// which not every runtime implements (e.g. the macOS VZ-Linux runtime returns
+/// the default empty record, so its `exit_code` is `None`). The authoritative
+/// captured exit code for those runtimes is instead surfaced through
+/// `container_state`, which returns `ContainerState::Exited { code }` once the
+/// workload's outcome is captured — the SAME source `wait_container` reads.
+///
+/// So when `inspect_detailed` didn't carry an exit code, fall back to the code
+/// embedded in `ContainerState::Exited` (reusing the `container_state` result
+/// the caller already fetched). This keeps inspect's `exit_code` consistent with
+/// `wait` without introducing a second source of truth. A non-`None`
+/// `inspect.exit_code` always wins (the runtime spoke explicitly).
+fn reconcile_exit_code(inspect_exit_code: Option<i32>, state: &ContainerState) -> Option<i32> {
+    if inspect_exit_code.is_some() {
+        return inspect_exit_code;
+    }
+    match state {
+        ContainerState::Exited { code } => Some(*code),
+        _ => None,
+    }
+}
+
 /// Wire-format projection of [`ContainerInspectDetails`] — the fields
 /// [`ContainerInfo`] carries on top of the basic identity/state fields.
 ///
@@ -954,6 +1159,179 @@ impl From<ContainerInspectDetails> for InspectFields {
 /// network endpoints expect for `NetworkConnectRequest.container`.
 fn runtime_container_name(id: &ContainerId) -> String {
     format!("zlayer-{}-{}", id.service, id.replica)
+}
+
+/// How the create handler will satisfy a request's `networks` attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkAttachMode {
+    /// No attachment to perform (empty request, or no mechanism available so
+    /// we degrade to a no-network create).
+    None,
+    /// Attach via the Docker bridge-network runtime (bollard).
+    Bridge,
+    /// Attach to the encrypted `WireGuard` overlay (macOS VZ-Linux / bridgeless
+    /// overlay hosts).
+    Overlay,
+}
+
+/// True when a real Docker bridge-network runtime is wired into the registry.
+///
+/// The registry can exist in metadata-only mode (`runtime: None`) on hosts
+/// where Docker was unreachable at boot — notably macOS, which has no Docker
+/// daemon at all. In that case bridge attachment is impossible and the create
+/// handler routes to the overlay (or no-network) path instead of 500ing.
+fn has_bridge_runtime(registry: Option<&BridgeNetworkApiState>) -> bool {
+    registry.is_some_and(|r| r.runtime.is_some())
+}
+
+/// Structural-only validation of network attachments, used by the overlay
+/// path: the requested network does not have to pre-exist (overlay membership
+/// is a single flat mesh), but the `network` name must be non-empty and any
+/// `ipv4_address` must parse.
+fn validate_network_attachments_structural(attachments: &[NetworkAttachmentRequest]) -> Result<()> {
+    for attach in attachments {
+        if attach.network.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "network attachment entry has empty 'network' field".to_string(),
+            ));
+        }
+        if let Some(ip) = attach.ipv4_address.as_deref() {
+            ip.parse::<std::net::Ipv4Addr>().map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "network attachment for '{}': invalid ipv4_address '{ip}': {e}",
+                    attach.network
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Attach a started standalone container to the encrypted `WireGuard` overlay,
+/// mapping the requested user-defined network(s) onto the flat overlay mesh.
+///
+/// This mirrors the deployment supervisor's overlay-attach path
+/// (`zlayer_agent::service::ServiceInstance::scale_to`): for a VM-guest runtime
+/// (`OverlayAttachKind::InGuestVsock`, i.e. macOS VZ-Linux) it asks overlayd to
+/// allocate the overlay identity (keypair + address + peer set), pushes that
+/// config into the guest over vsock, and registers DNS so siblings resolve each
+/// other by name. The result is the container gets a `zl-overlay0` IP and can
+/// reach the node overlay IP (e.g. the CI runner's cache server at
+/// `10.200.0.1`), Forgejo, and any sibling job containers.
+///
+/// Unlike the bridge path there is no per-network endpoint: the overlay is one
+/// flat mesh. The requested user-defined network name(s) + any aliases + the
+/// container's own name are therefore registered purely as overlay-DNS A
+/// records pointing at the single overlay IP, so name-based discovery still
+/// works (e.g. a service reaching the executor by its `runner` alias).
+///
+/// # Errors
+/// Returns an error if no overlay manager is configured, if overlayd cannot
+/// allocate/push the guest config, or if the runtime is not a guest-managed
+/// (vsock) runtime (overlay attachment for host-process runtimes is handled by
+/// the deployment supervisor via veth+netns and is not reachable here).
+async fn attach_container_to_overlay(
+    state: &ContainerApiState,
+    container_id: &ContainerId,
+    container_name: Option<&str>,
+    attachments: &[NetworkAttachmentRequest],
+) -> Result<()> {
+    let Some(overlay) = state.overlay_manager.as_ref() else {
+        return Err(ApiError::Internal(
+            "overlay attachment requested but no overlay manager is configured".to_string(),
+        ));
+    };
+
+    // The overlay scopes its allocation by the container id string; use the
+    // same `service-replica` handle the runtime + supervisor use so a later
+    // teardown can release it.
+    let cid = container_id.to_string();
+    // Service name for the overlay identity: prefer the human container name,
+    // else the runtime service component. This is what overlayd uses for the
+    // canonical service-name DNS record.
+    let service_name = container_name.map_or_else(|| container_id.service.clone(), str::to_string);
+
+    // Only the in-guest vsock path is reachable from the docker-compat create
+    // handler (host-process overlay attach is done by the supervisor, which has
+    // the PID). Guard explicitly so a misconfigured host fails loudly.
+    if state.runtime.overlay_attach_kind() != zlayer_agent::runtime::OverlayAttachKind::InGuestVsock
+    {
+        return Err(ApiError::Internal(format!(
+            "overlay attachment for standalone container requested but runtime \
+             attach kind is {:?}, not InGuestVsock; cannot attach over vsock",
+            state.runtime.overlay_attach_kind()
+        )));
+    }
+
+    let overlay_guard = overlay.read().await;
+    let cfg = overlay_guard
+        .attach_container_guest(&cid, &service_name, true)
+        .await
+        .map_err(|e| ApiError::Internal(format!("overlayd guest allocation failed: {e}")))?;
+    let overlay_ip = cfg.overlay_ip;
+
+    if let Err(e) = state.runtime.push_overlay_config(container_id, &cfg).await {
+        // Roll back the overlayd allocation so we don't leak an IP/peer.
+        if let Err(de) = overlay_guard.detach_container_guest(&cid).await {
+            tracing::warn!(
+                container = %container_id,
+                error = %de,
+                "failed to roll back guest overlay allocation after push failure"
+            );
+        }
+        return Err(ApiError::Internal(format!(
+            "failed to push overlay config into guest: {e}"
+        )));
+    }
+    drop(overlay_guard);
+
+    tracing::info!(
+        container = %container_id,
+        overlay_ip = %overlay_ip,
+        "attached standalone container to overlay (docker-network -> overlay mapping)"
+    );
+
+    // Register overlay-DNS A records so name-based discovery works. We register:
+    //   * the container's own name + the runtime service name (so siblings can
+    //     reach it the way the deployment supervisor registers bare names),
+    //   * every requested user-defined network name (docker maps the network
+    //     to a resolvable scope; on the flat overlay we approximate that by
+    //     making the name resolve to this container — sufficient for the
+    //     single-attached-container discovery the runner relies on),
+    //   * every requested alias.
+    if let Some(dns) = state.dns_server.as_ref() {
+        let mut names: Vec<String> = vec![service_name.clone()];
+        if let Some(n) = container_name {
+            if n != service_name {
+                names.push(n.to_string());
+            }
+        }
+        for attach in attachments {
+            names.push(attach.network.clone());
+            for alias in &attach.aliases {
+                names.push(alias.clone());
+            }
+        }
+        for name in names {
+            if name.trim().is_empty() {
+                continue;
+            }
+            match dns.add_record(&name, overlay_ip).await {
+                Ok(()) => tracing::debug!(
+                    hostname = %name,
+                    ip = %overlay_ip,
+                    "registered overlay DNS record for standalone container"
+                ),
+                Err(e) => tracing::warn!(
+                    hostname = %name,
+                    error = %e,
+                    "failed to register overlay DNS record"
+                ),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate the `networks` field of a [`CreateContainerRequest`] up-front.
@@ -1153,6 +1531,21 @@ async fn rollback_attachments(
 ///
 /// Returns an error if image pull fails, container creation fails, or the
 /// user lacks the operator role.
+/// Header carrying the chosen node id on a leader→target dispatch. Its
+/// presence tells the receiving node "you were selected — create locally, do
+/// not re-run placement", which prevents forwarding loops.
+const PLACED_HEADER: &str = "X-ZLayer-Placed";
+
+/// Create and start a container (public, JWT-authenticated entry point).
+///
+/// When the daemon has a cluster handle and the request carries
+/// `node_selector` / `platform`, the request is placed across the cluster
+/// (see [`place_or_create`]); otherwise the container is created locally.
+///
+/// # Errors
+///
+/// Returns an error if image pull fails, container creation fails, no node
+/// satisfies the placement constraints, or the user lacks the operator role.
 #[utoipa::path(
     post,
     path = "/api/v1/containers",
@@ -1162,19 +1555,162 @@ async fn rollback_attachments(
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - operator role required"),
+        (status = 409, description = "No node satisfies the placement constraints"),
         (status = 500, description = "Internal error"),
     ),
     security(("bearer_auth" = [])),
     tag = "Containers"
 )]
-#[allow(clippy::too_many_lines)]
 pub async fn create_container(
     user: AuthUser,
     State(state): State<ContainerApiState>,
     Json(request): Json<CreateContainerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
     user.require_role("operator")?;
+    // Public clients never set the placed marker; placement (if any) is decided
+    // here, on the receiving node.
+    place_or_create(&state, request, false).await
+}
 
+/// Internal, token-authenticated container-create endpoint used for cross-node
+/// dispatch. Carries the same body as the public endpoint plus the
+/// [`PLACED_HEADER`]: when present the node creates locally (it was chosen by
+/// the leader); when absent the receiving node runs placement itself (used
+/// when a follower forwards to the leader).
+///
+/// # Errors
+///
+/// Returns `401` if the internal token is missing/invalid, or any error from
+/// [`place_or_create`].
+pub async fn create_container_internal(
+    State(state): State<ContainerApiState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CreateContainerRequest>,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let expected = state.internal_token.as_deref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("internal container API is not configured".to_string())
+    })?;
+    let provided = headers
+        .get(crate::handlers::internal::INTERNAL_AUTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if provided.is_empty() || provided != expected {
+        return Err(ApiError::Unauthorized(
+            "invalid or missing internal token".to_string(),
+        ));
+    }
+    let already_placed = headers
+        .get(PLACED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.is_empty());
+    place_or_create(&state, request, already_placed).await
+}
+
+/// Decide where a container runs and create it.
+///
+/// Fast path (create locally) when: there is no cluster handle, the request
+/// carries no `node_selector`/`platform`, or `already_placed` is set. Otherwise
+/// the leader computes placement via [`Cluster::place_container`]; a follower
+/// forwards the request to the leader first.
+async fn place_or_create(
+    state: &ContainerApiState,
+    request: CreateContainerRequest,
+    already_placed: bool,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let has_constraints = request.platform.is_some() || request.node_selector.is_some();
+    let Some(cluster) = state.cluster.clone() else {
+        return create_container_local(state, request).await;
+    };
+    if already_placed || !has_constraints {
+        return create_container_local(state, request).await;
+    }
+
+    // Placement is a leader-only decision. A follower forwards the (unplaced)
+    // request to the leader, which then runs this same logic.
+    if !cluster.is_leader().await {
+        let leader = cluster.leader_addr().await.ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "no cluster leader currently available to place the container".to_string(),
+            )
+        })?;
+        return forward_create(state, &format!("http://{leader}"), &request, false).await;
+    }
+
+    let spec = build_service_spec(&request)?;
+    let placement = cluster
+        .place_container(&spec)
+        .await
+        .map_err(|e| ApiError::Internal(format!("container placement failed: {e}")))?;
+    match placement {
+        None => Err(ApiError::Conflict(format!(
+            "no cluster node satisfies the requested placement (platform={:?}, node_selector={:?}, \
+             cpu={:?}, memory={:?})",
+            request.platform, request.node_selector, spec.resources.cpu, spec.resources.memory
+        ))),
+        Some(p) if p.is_self => create_container_local(state, request).await,
+        Some(p) => {
+            info!(
+                node_id = p.node_id,
+                target = %p.api_base_url,
+                "Dispatching one-off container to remote node"
+            );
+            forward_create(state, &p.api_base_url, &request, true).await
+        }
+    }
+}
+
+/// Forward a create request to another node's internal container endpoint.
+/// `placed` sets the [`PLACED_HEADER`] so the target creates locally instead of
+/// re-placing (used for leader→target); leave it `false` for follower→leader.
+async fn forward_create(
+    state: &ContainerApiState,
+    base_url: &str,
+    request: &CreateContainerRequest,
+    placed: bool,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
+    let token = state.internal_token.clone().ok_or_else(|| {
+        ApiError::Internal(
+            "internal token not configured; cannot dispatch container cross-node".to_string(),
+        )
+    })?;
+    let url = format!("{base_url}/api/v1/containers/_dispatch");
+    let mut req = state
+        .http_client
+        .post(&url)
+        .header(crate::handlers::internal::INTERNAL_AUTH_HEADER, token)
+        .json(request)
+        .timeout(std::time::Duration::from_secs(300));
+    if placed {
+        req = req.header(PLACED_HEADER, "1");
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("forwarding container to {url} failed: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!(
+            "remote container create at {url} failed (HTTP {status}): {body}"
+        )));
+    }
+    let info: ContainerInfo = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("invalid response from {url}: {e}")))?;
+    Ok((axum::http::StatusCode::CREATED, Json(info)))
+}
+
+/// Create and start a container on the local node (no placement / forwarding).
+///
+/// # Errors
+///
+/// Returns an error if image pull fails or container creation/start fails.
+#[allow(clippy::too_many_lines)]
+async fn create_container_local(
+    state: &ContainerApiState,
+    request: CreateContainerRequest,
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
     // Validate image
     if request.image.is_empty() {
         return Err(ApiError::BadRequest("Image is required".to_string()));
@@ -1209,13 +1745,46 @@ pub async fn create_container(
         }
     }
 
-    // Pre-validate bridge-network attachments: every referenced network must
-    // already exist in the registry (if attached) and any static IPv4 must
-    // parse. We do this up-front — before the image pull — so we fail fast
-    // without side effects when the request is malformed.
-    if !request.networks.is_empty() {
+    // Decide HOW we will satisfy any requested network attachments, and
+    // pre-validate accordingly — before the image pull — so a malformed
+    // request fails fast without side effects.
+    //
+    // Three modes:
+    //   * `Bridge`  — a Docker bridge-network runtime is wired in; validate the
+    //                 referenced networks against the bridge registry and attach
+    //                 via bollard after start (the historical behaviour).
+    //   * `Overlay` — no bridge runtime, but the daemon has the encrypted
+    //                 WireGuard overlay (macOS VZ-Linux). Map the requested
+    //                 user-defined network(s) onto the overlay: the container
+    //                 gets a `zl-overlay0` IP and overlay-DNS records so it can
+    //                 reach the node overlay IP (e.g. the CI runner cache at
+    //                 10.200.0.1), sibling containers, and resolve names.
+    //   * `None`    — neither is available. Succeed the create WITHOUT the
+    //                 network (so callers' documented "network failed -> no-
+    //                 network fallback" can engage) rather than hard-500.
+    let network_mode = if request.networks.is_empty() {
+        NetworkAttachMode::None
+    } else if has_bridge_runtime(state.bridge_networks.as_ref()) {
         validate_network_attachments(&request.networks, state.bridge_networks.as_ref())?;
-    }
+        NetworkAttachMode::Bridge
+    } else if state.overlay_manager.is_some() {
+        // Overlay mode: only structural validation (non-empty network names +
+        // parseable static IPv4). We don't require the network to pre-exist —
+        // overlay membership is a single flat mesh, so the requested
+        // user-defined network name is just registered as a DNS alias.
+        validate_network_attachments_structural(&request.networks)?;
+        NetworkAttachMode::Overlay
+    } else {
+        // No bridge runtime AND no overlay: degrade to no-network instead of
+        // erroring, so the caller's no-network fallback path engages.
+        tracing::warn!(
+            networks = ?request.networks.iter().map(|n| &n.network).collect::<Vec<_>>(),
+            "container requested user-defined network attachment but daemon has \
+             neither a bridge-network runtime nor an overlay; creating WITHOUT \
+             network attachment"
+        );
+        NetworkAttachMode::None
+    };
 
     let (id_str, container_id) = generate_container_id(request.name.as_deref());
     let mut spec = build_service_spec(&request)?;
@@ -1251,7 +1820,12 @@ pub async fn create_container(
     .await?;
     state
         .runtime
-        .pull_image_with_policy(&request.image, pull_policy, resolved_auth.as_ref())
+        .pull_image_with_policy(
+            &request.image,
+            pull_policy,
+            resolved_auth.as_ref(),
+            spec.image.source_policy.unwrap_or_default(),
+        )
         .await
         .map_err(|e| {
             ApiError::Internal(format!("Failed to pull image '{}': {e}", request.image))
@@ -1264,35 +1838,71 @@ pub async fn create_container(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to create container: {e}")))?;
 
-    // Start the container
-    state
-        .runtime
-        .start_container(&container_id)
-        .await
-        .map_err(|e| {
-            // Best-effort cleanup: remove the created-but-not-started container
-            let rt = state.runtime.clone();
-            let cid = container_id.clone();
-            tokio::spawn(async move {
-                let _ = rt.remove_container(&cid).await;
-            });
-            ApiError::Internal(format!("Failed to start container: {e}"))
-        })?;
+    // Honour the create-only contract: native callers (and any client that
+    // omits `start`) get the historical create-and-start behaviour, while the
+    // Docker-compat shim sets `start: false` so `POST /containers/create`
+    // leaves the container in `created`/`pending` state until an explicit
+    // `POST /containers/{id}/start`.
+    let started = request.should_start_on_create();
+    if started {
+        // Start the container
+        state
+            .runtime
+            .start_container(&container_id)
+            .await
+            .map_err(|e| {
+                // Best-effort cleanup: remove the created-but-not-started container
+                let rt = state.runtime.clone();
+                let cid = container_id.clone();
+                tokio::spawn(async move {
+                    let _ = rt.remove_container(&cid).await;
+                });
+                ApiError::Internal(format!("Failed to start container: {e}"))
+            })?;
 
-    // Attach the container to any user-defined bridge networks requested in
-    // the body. We do this AFTER the container is started so Docker has a
-    // concrete container to wire an endpoint up to. If any attachment fails,
-    // best-effort roll back already-completed attachments and stop/remove
-    // the container before returning the error.
-    if !request.networks.is_empty() {
-        attach_container_to_networks(
-            state.bridge_networks.as_ref(),
-            &state.runtime,
-            &container_id,
-            request.name.as_deref(),
-            &request.networks,
-        )
-        .await?;
+        // Attach the container to any user-defined networks requested in the
+        // body. We do this AFTER the container is started so we have a concrete,
+        // running container (bollard needs a live endpoint; the overlay path
+        // needs a booted guest to push the WireGuard config into over vsock).
+        match network_mode {
+            NetworkAttachMode::Bridge => {
+                // If any attachment fails, best-effort roll back already-
+                // completed attachments and stop/remove the container.
+                attach_container_to_networks(
+                    state.bridge_networks.as_ref(),
+                    &state.runtime,
+                    &container_id,
+                    request.name.as_deref(),
+                    &request.networks,
+                )
+                .await?;
+            }
+            NetworkAttachMode::Overlay => {
+                // macOS VZ-Linux (and any bridgeless overlay host): map the
+                // requested user-defined network(s) onto the overlay so the
+                // container gets a `zl-overlay0` IP + DNS records.
+                if let Err(e) = attach_container_to_overlay(
+                    state,
+                    &container_id,
+                    request.name.as_deref(),
+                    &request.networks,
+                )
+                .await
+                {
+                    // Best-effort cleanup, then surface the error: the runner's
+                    // no-network fallback only engages when CREATE itself fails,
+                    // so failing here is the correct signal.
+                    let rt = state.runtime.clone();
+                    let cid = container_id.clone();
+                    tokio::spawn(async move {
+                        let _ = rt.stop_container(&cid, Duration::from_secs(5)).await;
+                        let _ = rt.remove_container(&cid).await;
+                    });
+                    return Err(e);
+                }
+            }
+            NetworkAttachMode::None => {}
+        }
     }
 
     // Get PID
@@ -1341,17 +1951,23 @@ pub async fn create_container(
         .id_map
         .register(state.id_map.daemon_uuid(), &container_id);
 
-    // Emit container.start event on the daemon-wide bus.
-    state.event_bus.publish(ContainerEvent::start(
-        hex_id.clone(),
-        request.labels.clone(),
-    ));
+    // Emit container.start event on the daemon-wide bus — but only when the
+    // container was actually started. A create-only request (Docker compat)
+    // emits no start event; the explicit `POST /containers/{id}/start` will.
+    if started {
+        state.event_bus.publish(ContainerEvent::start(
+            hex_id.clone(),
+            request.labels.clone(),
+        ));
+    }
 
     let info = ContainerInfo {
         id: hex_id,
         name: request.name,
         image: request.image,
-        state: "running".to_string(),
+        // Create-only requests (Docker compat) leave the container in
+        // `pending`; native start-on-create requests report `running`.
+        state: if started { "running" } else { "pending" }.to_string(),
         labels: request.labels,
         created_at: now,
         pid,
@@ -1462,11 +2078,86 @@ pub async fn list_containers(
             networks: inspect.networks,
             ipv4: inspect.ipv4,
             health: inspect.health,
-            exit_code: inspect.exit_code,
+            exit_code: reconcile_exit_code(inspect.exit_code, &runtime_state),
         });
     }
+    drop(containers);
+
+    // Append DEPLOYMENT / compose containers from the ServiceManager. These are
+    // not in the standalone `containers` map, so `docker ps` would otherwise
+    // show nothing for a `docker compose up` stack.
+    append_deployment_containers(&state, label_filter.as_ref(), &mut results).await;
 
     Ok(Json(results))
+}
+
+/// Append the daemon's DEPLOYMENT / compose containers (from the
+/// `ServiceManager`) to a `docker ps` result set.
+///
+/// Each [`zlayer_agent::DeploymentContainerView`] is rendered with its
+/// user-facing Docker name (the compose `container_name:`, falling back to the
+/// conventional `{project}-{service}-{replica}` name), image, state, pid, and
+/// published ports, plus the standard `com.docker.compose.*` labels so clients
+/// can correlate it with its project/service. A `None` service manager (tests /
+/// read-only) is a no-op.
+async fn append_deployment_containers(
+    state: &ContainerApiState,
+    label_filter: Option<&(String, String)>,
+    results: &mut Vec<ContainerInfo>,
+) {
+    let Some(mgr) = state.service_manager.as_ref() else {
+        return;
+    };
+    let manager = mgr.read().await;
+    for view in manager.list_container_views().await {
+        // Apply the same label filter to deployment containers.
+        if let Some((key, value)) = label_filter {
+            let cname_matches = key == "com.docker.compose.container_name"
+                && view.container_name.as_deref() == Some(value.as_str());
+            if !cname_matches {
+                continue;
+            }
+        }
+        let hex_id = state
+            .id_map
+            .lookup_container(&view.container_id)
+            .unwrap_or_else(|| {
+                state
+                    .id_map
+                    .register(state.id_map.daemon_uuid(), &view.container_id)
+            });
+        // Docker name: the compose container_name, else the conventional
+        // `{project}-{service}-{replica}` (1-based).
+        let display_name = view.container_name.clone().unwrap_or_else(|| {
+            let dep = view.deployment.as_deref().unwrap_or("");
+            format!("{dep}-{}-{}", view.service, view.container_id.replica + 1)
+        });
+        let mut labels = HashMap::new();
+        if let Some(ref dep) = view.deployment {
+            labels.insert("com.docker.compose.project".to_string(), dep.clone());
+        }
+        labels.insert(
+            "com.docker.compose.service".to_string(),
+            view.service.clone(),
+        );
+        if let Some(ref cn) = view.container_name {
+            labels.insert("com.docker.compose.container_name".to_string(), cn.clone());
+        }
+        results.push(ContainerInfo {
+            id: hex_id,
+            name: Some(display_name),
+            image: view.image,
+            state: view.state,
+            labels,
+            created_at: String::new(),
+            pid: view.pid,
+            ports: view.ports,
+            networks: Vec::new(),
+            ipv4: None,
+            health: None,
+            exit_code: None,
+        });
+    }
 }
 
 /// Get details for a specific container.
@@ -1550,7 +2241,7 @@ pub async fn get_container(
         networks: inspect.networks,
         ipv4: inspect.ipv4,
         health: inspect.health,
-        exit_code: inspect.exit_code,
+        exit_code: reconcile_exit_code(inspect.exit_code, &runtime_state),
     }))
 }
 
@@ -2040,6 +2731,135 @@ pub async fn kill_container(
         .publish(ContainerEvent::die(hex_id, labels, None, Some(reason)));
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Interactive stdin (host -> guest pipeline for `zlayer run -it`)
+// ---------------------------------------------------------------------------
+
+/// Write a chunk of raw stdin bytes to a running container's main process.
+///
+/// Powers the host→guest direction of an interactive (`-it`) session: the CLI's
+/// raw-mode terminal reader streams chunks here, the daemon forwards them to the
+/// runtime ([`Runtime::write_stdin`]), and the VZ-Linux runtime relays each as a
+/// `Msg::Stdin` frame to the in-guest agent which pipes it to the workload.
+///
+/// The request body is the raw bytes to write (`application/octet-stream`); an
+/// empty body is a no-op success. Use `DELETE /api/v1/containers/{id}/stdin` to
+/// signal end-of-input (Ctrl-D).
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime does
+/// not support interactive stdin, and 500 for other runtime errors.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/stdin",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body(content = Vec<u8>, description = "Raw stdin bytes", content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "Stdin chunk accepted"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support interactive stdin"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn write_container_stdin(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    // An empty body carries no bytes; treat it as a no-op so callers can flush
+    // without special-casing.
+    if body.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    state
+        .runtime
+        .write_stdin(&container_id, &body)
+        .await
+        .map_err(map_stdin_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Signal end-of-input (close stdin) for a running container.
+///
+/// Powers Ctrl-D / detach for an interactive session: the CLI calls this once
+/// the host terminal reaches EOF, the daemon forwards to the runtime
+/// ([`Runtime::close_stdin`]), and the VZ-Linux runtime drops its stdin sender
+/// so the drain task emits a final `Msg::StdinEof` to the guest.
+///
+/// # Errors
+///
+/// Returns 404 when the container can't be resolved, 501 when the runtime does
+/// not support interactive stdin, and 500 for other runtime errors.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/containers/{id}/stdin",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 204, description = "Stdin closed"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support interactive stdin"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn close_container_stdin(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
+    let resolved = resolve_container_lookup(&state, &id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+    let container_id = resolved.container_id.clone();
+
+    state
+        .runtime
+        .close_stdin(&container_id)
+        .await
+        .map_err(map_stdin_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map a runtime stdin error onto the right HTTP status: 404 for a vanished
+/// container, 501 for runtimes that don't implement interactive stdin, 500
+/// otherwise.
+fn map_stdin_error(e: zlayer_agent::AgentError) -> ApiError {
+    match e {
+        zlayer_agent::AgentError::NotFound { reason, .. } => {
+            ApiError::NotFound(format!("Container not found: {reason}"))
+        }
+        zlayer_agent::AgentError::Unsupported(reason) => ApiError::NotImplemented(format!(
+            "Runtime does not support interactive stdin: {reason}"
+        )),
+        other => ApiError::Internal(format!("Failed to write stdin: {other}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2864,7 +3684,19 @@ pub async fn get_container_logs(
             zlayer_agent::AgentError::NotFound { reason, .. } => {
                 ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Failed to start log stream: {other}")),
+            other => {
+                // Previously this 500'd silently — the error was mapped to
+                // `ApiError::Internal` with NOTHING logged, so a runtime that
+                // returned `Unsupported` (e.g. a backend with no log stream)
+                // produced an opaque `internal_error` with no daemon-log trail.
+                // Log it so the failure is diagnosable.
+                tracing::error!(
+                    container = %container_id,
+                    error = %other,
+                    "GET /containers/{{id}}/logs: runtime logs_stream failed — returning 500",
+                );
+                ApiError::Internal(format!("Failed to start log stream: {other}"))
+            }
         })?;
 
     let (content_type, body_stream): (&'static str, StreamingBody) = match format {
@@ -2959,6 +3791,17 @@ pub async fn exec_in_container(
         .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
     let container_id = resolved.container_id;
 
+    // Build the Docker exec options (`--user`, `-w`, `-e`) so the runtime can
+    // drop to the requested uid/gid, chdir, and inject env. Only `command`,
+    // `user`, `working_dir`, and `env` are honoured by the buffered exec path.
+    let exec_opts = zlayer_agent::runtime::ExecOptions {
+        command: request.command.clone(),
+        env: request.env.clone(),
+        working_dir: request.working_dir.clone(),
+        user: request.user.clone(),
+        ..Default::default()
+    };
+
     if query.stream {
         let events = state
             .runtime
@@ -2992,7 +3835,7 @@ pub async fn exec_in_container(
 
     let (exit_code, stdout, stderr) = state
         .runtime
-        .exec(&container_id, &request.command)
+        .exec_with_opts(&container_id, &exec_opts)
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { reason, .. } => {
@@ -3568,7 +4411,18 @@ pub async fn get_container_stats(
             zlayer_agent::AgentError::NotFound { reason, .. } => {
                 ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Failed to start stats stream: {other}")),
+            other => {
+                // Previously this 500'd silently (see `get_container_logs`).
+                // Log the runtime error so a swallowed `Unsupported` no longer
+                // surfaces as an opaque `internal_error` with no daemon-log
+                // trail.
+                tracing::error!(
+                    container = %container_id,
+                    error = %other,
+                    "GET /containers/{{id}}/stats: runtime stats_stream failed — returning 500",
+                );
+                ApiError::Internal(format!("Failed to start stats stream: {other}"))
+            }
         })?;
 
     let body_stream: StreamingBody = if query.stream {
@@ -3823,10 +4677,7 @@ mod tests {
         use zlayer_agent::runtime::{ExecEvent, MockRuntime, Runtime};
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "test-svc".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("test-svc".to_string(), 0);
         // `MockRuntime::exec` returns `(0, cmd.join(" "), "")`, so with a
         // non-empty stdout and empty stderr the default fallback should emit
         // exactly two events: Stdout then Exit.
@@ -4277,10 +5128,7 @@ mod tests {
         // Seed the storage with two records — one "named" container and one
         // anonymous — that the cache should pick up on repopulate.
         let alpha = StandaloneContainer {
-            container_id: ContainerId {
-                service: "standalone-alpha".to_string(),
-                replica: 0,
-            },
+            container_id: ContainerId::new("standalone-alpha".to_string(), 0),
             image: "alpine:latest".to_string(),
             name: Some("alpha".to_string()),
             labels: HashMap::new(),
@@ -4288,10 +5136,7 @@ mod tests {
             delete_on_exit: false,
         };
         let beta = StandaloneContainer {
-            container_id: ContainerId {
-                service: "standalone-beta".to_string(),
-                replica: 0,
-            },
+            container_id: ContainerId::new("standalone-beta".to_string(), 0),
             image: "alpine:3.20".to_string(),
             name: None,
             labels: HashMap::new(),
@@ -4337,10 +5182,7 @@ mod tests {
     ) -> (ContainerApiState, ContainerId, String) {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state = ContainerApiState::with_daemon_uuid(runtime, daemon_uuid.to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica,
-        };
+        let cid = ContainerId::new(service.to_string(), replica);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4403,6 +5245,46 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn resolve_container_id_resolves_bare_docker_name() {
+        // Real create stores standalone containers keyed by `standalone-<name>`
+        // (see `generate_container_id`) while recording the user-facing
+        // `<name>`. Docker clients address the container by the BARE name, so
+        // the resolver must map `demo` -> the `standalone-demo` entry. Before
+        // the fix this 404'd, which made `docker start <name>` / inspect / logs
+        // / exec / wait fail for every container created via the compat socket.
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::with_daemon_uuid(runtime, "test-daemon-uuid".to_string());
+        let cid = ContainerId::new("standalone-demo".to_string(), 0);
+        let _hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("demo".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-06-05T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-demo".to_string(), standalone);
+
+        // Bare docker name resolves to the prefixed storage key.
+        let resolved = resolve_container_lookup(&state, "demo")
+            .await
+            .expect("bare docker name must resolve to the standalone-<name> entry");
+        assert_eq!(resolved.container_id, cid);
+        assert_eq!(resolved.storage_key, "standalone-demo");
+
+        // The full storage key still resolves.
+        let resolved2 = resolve_container_lookup(&state, "standalone-demo")
+            .await
+            .expect("full storage key must still resolve");
+        assert_eq!(resolved2.container_id, cid);
+    }
+
     // -----------------------------------------------------------------------
     // Tasks 5.1.1-3 / 5.2.1-4 — POST /wait?condition= and /rename?name=
     //
@@ -4438,8 +5320,11 @@ mod tests {
             image: &str,
             policy: zlayer_spec::PullPolicy,
             auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
         ) -> zlayer_agent::error::Result<()> {
-            self.inner.pull_image_with_policy(image, policy, auth).await
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
         }
         async fn create_container(
             &self,
@@ -4524,10 +5409,7 @@ mod tests {
         });
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime;
         let state = ContainerApiState::with_daemon_uuid(runtime_dyn, "wait-fixed-uuid".to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new(service.to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
         let standalone = StandaloneContainer {
             container_id: cid.clone(),
@@ -4631,8 +5513,11 @@ mod tests {
                 image: &str,
                 policy: zlayer_spec::PullPolicy,
                 auth: Option<&zlayer_spec::RegistryAuth>,
+                source: zlayer_spec::SourcePolicy,
             ) -> AgentResult<()> {
-                self.inner.pull_image_with_policy(image, policy, auth).await
+                self.inner
+                    .pull_image_with_policy(image, policy, auth, source)
+                    .await
             }
             async fn create_container(
                 &self,
@@ -4711,10 +5596,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "rename-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-rename".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-rename".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4811,8 +5693,11 @@ mod tests {
                 image: &str,
                 policy: zlayer_spec::PullPolicy,
                 auth: Option<&zlayer_spec::RegistryAuth>,
+                source: zlayer_spec::SourcePolicy,
             ) -> AgentResult<()> {
-                self.inner.pull_image_with_policy(image, policy, auth).await
+                self.inner
+                    .pull_image_with_policy(image, policy, auth, source)
+                    .await
             }
             async fn create_container(
                 &self,
@@ -4897,10 +5782,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "update-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-update".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-update".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -4983,10 +5865,7 @@ mod tests {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state =
             ContainerApiState::with_daemon_uuid(runtime, "update-unsupported-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-unsupported".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-unsupported".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
 
         let standalone = StandaloneContainer {
@@ -5123,10 +6002,7 @@ mod tests {
         #[tokio::test]
         async fn json_format_emits_ndjson_per_chunk() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "logs-json".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("logs-json".to_string(), 0);
             // Pre-script three chunks: one stdout (UTF-8), one stderr (with
             // timestamp), and one stdout containing non-UTF8 bytes that must
             // be base64-encoded.
@@ -5231,10 +6107,7 @@ mod tests {
         #[tokio::test]
         async fn stream_false_emits_exactly_one_sample() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "stats-once".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("stats-once".to_string(), 0);
             // Enqueue three samples; only the first must reach the body.
             runtime.enqueue_stats_sample(&id, sample(1)).await;
             runtime.enqueue_stats_sample(&id, sample(2)).await;
@@ -5260,10 +6133,7 @@ mod tests {
         #[tokio::test]
         async fn stream_true_emits_multiple_samples() {
             let runtime = MockRuntime::new();
-            let id = ContainerId {
-                service: "stats-many".to_string(),
-                replica: 0,
-            };
+            let id = ContainerId::new("stats-many".to_string(), 0);
             for n in 1u64..=4 {
                 runtime.enqueue_stats_sample(&id, sample(n)).await;
             }
@@ -5686,10 +6556,7 @@ mod tests {
 
     #[test]
     fn runtime_container_name_matches_docker_convention() {
-        let id = ContainerId {
-            service: "svc".to_string(),
-            replica: 3,
-        };
+        let id = ContainerId::new("svc".to_string(), 3);
         assert_eq!(runtime_container_name(&id), "zlayer-svc-3");
     }
 
@@ -5793,6 +6660,7 @@ mod tests {
                 _image: &str,
                 _policy: zlayer_spec::PullPolicy,
                 _auth: Option<&zlayer_spec::RegistryAuth>,
+                _source: zlayer_spec::SourcePolicy,
             ) -> std::result::Result<(), zlayer_agent::AgentError> {
                 Ok(())
             }
@@ -5896,10 +6764,7 @@ mod tests {
         // `attach_container_to_networks` via the Runtime trait object.
         let tracing_concrete = Arc::new(TracingRuntime::default());
         let tracing: Arc<dyn Runtime + Send + Sync> = tracing_concrete.clone();
-        let cid = ContainerId {
-            service: "svc".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("svc".to_string(), 0);
 
         let attachments = vec![
             NetworkAttachmentRequest {
@@ -5976,8 +6841,11 @@ mod tests {
             image: &str,
             policy: zlayer_spec::PullPolicy,
             auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
         ) -> zlayer_agent::error::Result<()> {
-            self.inner.pull_image_with_policy(image, policy, auth).await
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
         }
         async fn create_container(
             &self,
@@ -6168,10 +7036,7 @@ mod tests {
         let runtime_dyn: Arc<dyn Runtime + Send + Sync> = runtime.clone();
         let state =
             ContainerApiState::with_daemon_uuid(runtime_dyn, "lifecycle-test-uuid".to_string());
-        let cid = ContainerId {
-            service: "standalone-life".to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new("standalone-life".to_string(), 0);
         let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
         let standalone = StandaloneContainer {
             container_id: cid.clone(),
@@ -6411,5 +7276,166 @@ mod tests {
         .await
         .expect_err("missing path must yield BadRequest");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // exit_code reconciliation — inspect must surface the REAL captured exit
+    // code for an exited VZ-Linux container even when the runtime doesn't
+    // override `inspect_detailed` (so `inspect.exit_code` is None). The
+    // authoritative code is carried by `container_state`'s
+    // `ContainerState::Exited { code }` — the same source `wait_container` uses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reconcile_exit_code_prefers_runtime_inspect_value() {
+        // An explicit runtime-reported exit code always wins.
+        let state = ContainerState::Exited { code: 7 };
+        assert_eq!(reconcile_exit_code(Some(137), &state), Some(137));
+    }
+
+    #[test]
+    fn reconcile_exit_code_falls_back_to_exited_state() {
+        // `inspect_detailed` returned None (VZ-Linux case): derive from the
+        // captured `Exited { code }`.
+        let state = ContainerState::Exited { code: 42 };
+        assert_eq!(reconcile_exit_code(None, &state), Some(42));
+    }
+
+    #[test]
+    fn reconcile_exit_code_running_is_none() {
+        assert_eq!(reconcile_exit_code(None, &ContainerState::Running), None);
+    }
+
+    /// Runtime whose `container_state` reports `Exited { code: 42 }` and whose
+    /// `inspect_detailed` is the default (all-`None`, so `exit_code: None`) —
+    /// exactly the VZ-Linux shape. The `get_container` handler must derive
+    /// `ContainerInfo.exit_code == Some(42)` from the state.
+    #[derive(Default)]
+    struct ExitedStateRuntime {
+        inner: zlayer_agent::MockRuntime,
+        code: i32,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for ExitedStateRuntime {
+        async fn pull_image(&self, image: &str) -> zlayer_agent::error::Result<()> {
+            self.inner.pull_image(image).await
+        }
+        async fn pull_image_with_policy(
+            &self,
+            image: &str,
+            policy: zlayer_spec::PullPolicy,
+            auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
+        }
+        async fn create_container(
+            &self,
+            id: &ContainerId,
+            spec: &zlayer_spec::ServiceSpec,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.create_container(id, spec).await
+        }
+        async fn start_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.start_container(id).await
+        }
+        async fn stop_container(
+            &self,
+            id: &ContainerId,
+            t: std::time::Duration,
+        ) -> zlayer_agent::error::Result<()> {
+            self.inner.stop_container(id, t).await
+        }
+        async fn remove_container(&self, id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            self.inner.remove_container(id).await
+        }
+        async fn container_state(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::runtime::ContainerState> {
+            Ok(ContainerState::Exited { code: self.code })
+        }
+        // NB: no `inspect_detailed` override → default record → exit_code: None,
+        // mirroring the macOS VZ-Linux runtime.
+        async fn container_logs(
+            &self,
+            id: &ContainerId,
+            tail: usize,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.container_logs(id, tail).await
+        }
+        async fn exec(
+            &self,
+            id: &ContainerId,
+            cmd: &[String],
+        ) -> zlayer_agent::error::Result<(i32, String, String)> {
+            self.inner.exec(id, cmd).await
+        }
+        async fn get_container_stats(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::cgroups_stats::ContainerStats> {
+            self.inner.get_container_stats(id).await
+        }
+        async fn wait_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<i32> {
+            // Same captured code the state path reports — single source of truth.
+            Ok(self.code)
+        }
+        async fn get_logs(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.get_logs(id).await
+        }
+        async fn get_container_pid(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<u32>> {
+            self.inner.get_container_pid(id).await
+        }
+        async fn get_container_ip(
+            &self,
+            id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<std::net::IpAddr>> {
+            self.inner.get_container_ip(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn get_container_surfaces_real_exit_code_for_exited_vz_container() {
+        // Regression: `sh -c "sleep 2 && exit 42"` on the VZ-Linux runtime.
+        // `container_state` -> Exited{42}, `inspect_detailed` -> None. The
+        // handler must report `exit_code == Some(42)` and `state == "exited(42)"`,
+        // matching what `POST /containers/{id}/wait` returns.
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(ExitedStateRuntime {
+            code: 42,
+            ..ExitedStateRuntime::default()
+        });
+        let state = ContainerApiState::with_daemon_uuid(runtime, "exit-test-uuid".to_string());
+        let cid = ContainerId::new("standalone-exit42".to_string(), 0);
+        let hex = state.id_map.register(state.id_map.daemon_uuid(), &cid);
+        let standalone = StandaloneContainer {
+            container_id: cid.clone(),
+            image: "alpine:latest".to_string(),
+            name: Some("exit42".to_string()),
+            labels: HashMap::new(),
+            created_at: "2026-06-05T00:00:00Z".to_string(),
+            delete_on_exit: false,
+        };
+        state
+            .containers
+            .write()
+            .await
+            .insert("standalone-exit42".to_string(), standalone);
+
+        let Json(info) = get_container(operator_user(), State(state), Path(hex))
+            .await
+            .expect("get_container must succeed for an exited container");
+
+        assert_eq!(info.exit_code, Some(42));
+        assert_eq!(info.state, "exited(42)");
     }
 }

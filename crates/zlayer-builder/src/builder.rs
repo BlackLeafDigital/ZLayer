@@ -116,6 +116,8 @@ use tokio::fs;
 #[cfg(feature = "local-registry")]
 use tracing::warn;
 use tracing::{debug, info, instrument};
+#[cfg(feature = "local-registry")]
+use zlayer_paths::ZLayerDirs;
 
 use crate::backend::BuildBackend;
 #[cfg(feature = "local-registry")]
@@ -292,6 +294,13 @@ pub struct BuildOptions {
     pub runtime: Option<Runtime>,
     /// Build arguments (ARG values)
     pub build_args: HashMap<String, String>,
+    /// Pipeline variables (`${VAR}`) expanded into the `ZImagefile` body
+    /// (`base:`, `run:`, ...) before parsing. Used by the pipeline executor to
+    /// parametrize a single `ZImagefile` set across e.g. Windows LTSC lines
+    /// (`--set LTSC=ltsc2025`). Empty for direct (non-pipeline) builds.
+    /// Only applied to `ZImagefile` bodies, never to Dockerfiles (whose
+    /// `${ARG}` syntax is parsed natively).
+    pub pipeline_vars: HashMap<String, String>,
     /// Target stage for multi-stage builds
     pub target: Option<String>,
     /// Image tags to apply
@@ -399,6 +408,34 @@ pub struct BuildOptions {
     /// Mirrors `cargo update` semantics. On non-macOS backends this flag is
     /// ignored.
     pub update_bottles: bool,
+    /// Windows LTSC line to target for FROM image rewrites
+    /// (e.g. `"ltsc2022"`, `"ltsc2025"`).
+    ///
+    /// Only consumed by the Windows (HCS / WCOW) backend. When set, the
+    /// builder rewrites generic Docker Hub references (`ubuntu:24.04`,
+    /// `golang:1.24`, etc.) to the equivalent prebuilt Windows image via
+    /// `windows_image_resolver::rewrite_image_for_windows`. `None` means
+    /// the backend uses its built-in default (`ltsc2022`).
+    pub windows_ltsc: Option<String>,
+    /// Force `--net=host` on every `buildah run` for this build.
+    ///
+    /// When `true`, the buildah backend asks [`DockerfileTranslator`] to
+    /// emit `--net=host` on every translated `RUN` instruction, overriding
+    /// any per-instruction `network` value. This mirrors Docker's
+    /// `docker build --network=host` flag and bypasses buildah's CNI /
+    /// netavark plumbing entirely — the container shares the host's
+    /// network namespace.
+    ///
+    /// Default: `false`. Wired up from the top-level `zlayer
+    /// --host-network` CLI flag (see `bin/zlayer/src/cli.rs`).
+    pub host_network: bool,
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` means "use `detect_backend()`'s default for the host × target
+    /// combination" (current behavior). `Some(kind)` forces that backend; if it's
+    /// unavailable for this host × target combination, the build fails with
+    /// `BuildError::NotSupported { operation: ... }`.
+    pub backend_override: Option<zlayer_types::builder::BuilderBackendKind>,
 }
 
 impl Default for BuildOptions {
@@ -408,6 +445,7 @@ impl Default for BuildOptions {
             zimagefile: None,
             runtime: None,
             build_args: HashMap::new(),
+            pipeline_vars: HashMap::new(),
             target: None,
             tags: Vec::new(),
             no_cache: false,
@@ -428,6 +466,104 @@ impl Default for BuildOptions {
             source_hash: None,
             pull: PullBaseMode::default(),
             update_bottles: false,
+            windows_ltsc: None,
+            host_network: false,
+            backend_override: None,
+        }
+    }
+}
+
+/// Expand `${VAR}` references in a `ZImagefile` body using pipeline variables.
+///
+/// Mirrors `pipeline::executor::expand_tag_with_vars`: each `${key}` is replaced
+/// with its value; unknown references are left intact. Returns `content`
+/// unchanged when `vars` is empty (the common direct-build case), so this is a
+/// no-op for every non-pipeline caller.
+fn expand_zimage_vars(content: &str, vars: &std::collections::HashMap<String, String>) -> String {
+    if vars.is_empty() {
+        return content.to_string();
+    }
+    let mut result = content.to_string();
+    for (key, value) in vars {
+        result = result.replace(&format!("${{{key}}}"), value);
+    }
+    result
+}
+
+/// Discover a `ZImagefile` in the build context directory.
+///
+/// Resolution order matches user intuition:
+///
+/// 1. **Literal `ZImagefile`** in the context root — by far the most common
+///    layout (e.g. a one-image repo whose build file is just `ZImagefile`).
+/// 2. **Any `ZImagefile.<suffix>`** glob — the convention this repo itself
+///    uses (`ZImagefile.zlayer-node`, `ZImagefile.zlayer-manager`, …). If
+///    exactly one match exists, use it.
+/// 3. **Zero matches** → return `Ok(None)` so the caller falls through to the
+///    Dockerfile path.
+/// 4. **Multiple `ZImagefile.<suffix>` matches and no literal `ZImagefile`**
+///    → ambiguous; return an error telling the user to pick one with
+///    `-z <path>`. We don't silently pick "the first one" because that's a
+///    correctness landmine — a repo with `ZImagefile.prod` and
+///    `ZImagefile.dev` would otherwise build whichever entry the filesystem
+///    listed first.
+///
+/// The lookup is sync (a single `read_dir`) and doesn't follow symlinks
+/// beyond the standard `DirEntry::file_type()` semantics. Errors reading the
+/// directory propagate so the caller can attach a `BuildError::ContextRead`.
+fn find_context_zimagefile(context: &Path) -> std::io::Result<Option<PathBuf>> {
+    // (1) Literal `ZImagefile` wins outright.
+    let literal = context.join("ZImagefile");
+    if literal.exists() {
+        return Ok(Some(literal));
+    }
+
+    // (2) Scan for `ZImagefile.<suffix>` entries. We treat any non-empty
+    // suffix as a candidate; the suffix is opaque to the builder (it's just
+    // a disambiguator, like `Dockerfile.prod`).
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let entries = match std::fs::read_dir(context) {
+        Ok(e) => e,
+        // Context dir doesn't exist / not readable: caller will surface a
+        // proper error elsewhere. Returning Ok(None) keeps this helper
+        // narrow.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if let Some(rest) = name_str.strip_prefix("ZImagefile.") {
+            if !rest.is_empty() {
+                matches.push(entry.path());
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.pop().expect("len == 1"))),
+        _ => {
+            matches.sort();
+            let names: Vec<String> = matches
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "multiple ZImagefile candidates in {}: {} — pass `-z <path>` to pick one",
+                    context.display(),
+                    names.join(", "),
+                ),
+            ))
         }
     }
 }
@@ -615,7 +751,9 @@ impl ImageBuilder {
     /// host/target combination (e.g. Windows image requested on a Linux host).
     pub async fn with_target_os(mut self, target_os: crate::backend::ImageOs) -> Result<Self> {
         self.target_os = Some(target_os);
-        self.backend = Some(crate::backend::detect_backend(target_os).await?);
+        self.backend = Some(
+            crate::backend::detect_backend_with_options(target_os, Some(&self.options)).await?,
+        );
         Ok(self)
     }
 
@@ -790,6 +928,33 @@ impl ImageBuilder {
         self
     }
 
+    /// Set pipeline variables expanded into the `ZImagefile` body before parse.
+    ///
+    /// `${VAR}` / `$VAR` references in a `ZImagefile`'s `base:`/`run:`/etc. are
+    /// replaced with the matching value; unknown references are left untouched.
+    /// Only `ZImagefile` bodies are expanded — Dockerfiles keep their native
+    /// `${ARG}` semantics. Used by the pipeline executor to drive one
+    /// `ZImagefile` set across variants (e.g. Windows `--set LTSC=ltsc2025`).
+    #[must_use]
+    pub fn pipeline_vars(mut self, vars: HashMap<String, String>) -> Self {
+        self.options.pipeline_vars.extend(vars);
+        self
+    }
+
+    /// Set the Windows LTSC line to target for FROM image rewrites
+    /// (e.g. `"ltsc2022"`, `"ltsc2025"`).
+    ///
+    /// Only consumed by the Windows (HCS / WCOW) backend. The pipeline
+    /// executor wires this from the `LTSC` pipeline variable, so a
+    /// `zlayer pipeline --set LTSC=ltsc2025` invocation flows down to the
+    /// FROM rewriter in `windows_builder::start_build`. Has no effect on
+    /// Linux / macOS backends.
+    #[must_use]
+    pub fn windows_ltsc(mut self, ltsc: impl Into<String>) -> Self {
+        self.options.windows_ltsc = Some(ltsc.into());
+        self
+    }
+
     /// Set the target stage for multi-stage builds
     ///
     /// When building a multi-stage Dockerfile, you can stop at a specific
@@ -879,6 +1044,39 @@ impl ImageBuilder {
     #[must_use]
     pub fn update_bottles(mut self, update_bottles: bool) -> Self {
         self.options.update_bottles = update_bottles;
+        self
+    }
+
+    /// Force `--net=host` on every `buildah run` emitted by this build.
+    ///
+    /// Mirrors Docker's `docker build --network=host` flag. When `on` is
+    /// `true`, every translated `RUN` instruction is annotated with
+    /// `RunNetwork::Host` regardless of any per-instruction `--network`
+    /// directive, and the buildah backend emits `--net=host` on the
+    /// resulting `buildah run` invocation. This bypasses buildah's CNI /
+    /// netavark plumbing entirely (the container shares the host's
+    /// network namespace).
+    ///
+    /// Wired from the top-level `zlayer --host-network` CLI flag.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.options.host_network = on;
+        self
+    }
+
+    /// Override the auto-detected build backend.
+    ///
+    /// `None` (the default) leaves backend selection to `detect_backend()`.
+    /// `Some(kind)` forces that backend; if it is unavailable for the host ×
+    /// target combination, the eventual build will fail with
+    /// `BuildError::NotSupported`. Wired from the `zlayer build --backend`
+    /// CLI flag.
+    #[must_use]
+    pub fn with_backend_override(
+        mut self,
+        backend: Option<zlayer_types::builder::BuilderBackendKind>,
+    ) -> Self {
+        self.options.backend_override = backend;
         self
     }
 
@@ -1523,7 +1721,9 @@ impl ImageBuilder {
         #[cfg(feature = "local-registry")]
         if let Some(ref registry) = self.local_registry {
             if !built.tags.is_empty() {
-                let tmp_path = std::env::temp_dir().join(format!(
+                let tmp_dir = ZLayerDirs::system_default().tmp();
+                std::fs::create_dir_all(&tmp_dir).ok();
+                let tmp_path = tmp_dir.join(format!(
                     "zlayer-build-{}-{}.tar",
                     std::process::id(),
                     start_time.elapsed().as_nanos()
@@ -1597,22 +1797,47 @@ impl ImageBuilder {
     /// hint, so they fall through to the caller's pin or the default.
     async fn resolve_target_os_and_backend(&mut self) -> Result<()> {
         // Explicit pin always wins: the backend was already detected for
-        // this OS by `new_with_os`/`with_target_os`. Nothing to do.
-        if self.target_os.is_some() {
+        // this OS by `new_with_os`/`with_target_os`. But the caller may
+        // have set `backend_override` AFTER construction (via
+        // `with_backend_override`), in which case the cached backend was
+        // selected without that hint — re-detect so the override is honored.
+        if let Some(target_os) = self.target_os {
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(target_os, Some(&self.options))
+                        .await?,
+                );
+            }
             return Ok(());
         }
 
         // Peek at the ZImagefile (if the caller pointed us at one, or if one
         // lives in the context dir). We only inspect the OS-related fields so
         // a malformed ZImagefile body defers its error to `get_build_output`.
-        let zimage_path = self.options.zimagefile.clone().or_else(|| {
-            let candidate = self.context.join("ZImagefile");
-            candidate.exists().then_some(candidate)
-        });
+        // Auto-detection accepts both a literal `ZImagefile` and any
+        // `ZImagefile.<suffix>`. Read errors / ambiguity here are non-fatal
+        // for OS peeking — `get_build_output` will surface them with a
+        // proper `BuildError::ContextRead`.
+        let zimage_path = self
+            .options
+            .zimagefile
+            .clone()
+            .or_else(|| find_context_zimagefile(&self.context).ok().flatten());
 
         let Some(path) = zimage_path else {
             // No ZImagefile — Dockerfile / runtime template paths have no OS
-            // metadata, so the initial Linux detection stands.
+            // metadata, so the initial Linux detection stands. If the caller
+            // set a backend_override after construction, re-resolve so the
+            // cached default backend is replaced.
+            if self.options.backend_override.is_some() {
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(
+                        crate::backend::ImageOs::Linux,
+                        Some(&self.options),
+                    )
+                    .await?,
+                );
+            }
             return Ok(());
         };
 
@@ -1620,6 +1845,7 @@ impl ImageBuilder {
         let Ok(content) = fs::read_to_string(&path).await else {
             return Ok(());
         };
+        let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
         let Ok(zimage) = crate::zimage::parse_zimagefile(&content) else {
             return Ok(());
         };
@@ -1627,16 +1853,31 @@ impl ImageBuilder {
         if let Some(resolved) = zimage.resolve_target_os() {
             // Re-detect only if the resolved OS differs from the one we
             // probed at construction. `new_with_os(None)` probes Linux, so
-            // the common Linux case short-circuits.
+            // the common Linux case short-circuits — unless the caller
+            // set a backend_override after construction, in which case we
+            // must re-detect even for the initial OS to apply the override.
             let initial = crate::backend::ImageOs::Linux;
-            if resolved != initial {
+            if resolved != initial || self.options.backend_override.is_some() {
                 info!(
                     "Re-detecting build backend for target OS {:?} (inferred from ZImagefile)",
                     resolved
                 );
-                self.backend = Some(crate::backend::detect_backend(resolved).await?);
+                self.backend = Some(
+                    crate::backend::detect_backend_with_options(resolved, Some(&self.options))
+                        .await?,
+                );
             }
             self.target_os = Some(resolved);
+        } else if self.options.backend_override.is_some() {
+            // ZImagefile present but resolves to no explicit OS — apply the
+            // override against the Linux default that was cached.
+            self.backend = Some(
+                crate::backend::detect_backend_with_options(
+                    crate::backend::ImageOs::Linux,
+                    Some(&self.options),
+                )
+                .await?,
+            );
         }
 
         Ok(())
@@ -1668,13 +1909,23 @@ impl ImageBuilder {
                         path: zimage_path.clone(),
                         source: e,
                     })?;
+            let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
             let zimage = crate::zimage::parse_zimagefile(&content)?;
             return self.handle_zimage(&zimage).await;
         }
 
-        // (c) Auto-detect ZImagefile in context directory.
-        let auto_zimage_path = self.context.join("ZImagefile");
-        if auto_zimage_path.exists() {
+        // (c) Auto-detect ZImagefile in context directory. Accepts both a
+        // literal `ZImagefile` and any `ZImagefile.<suffix>` (the convention
+        // ZLayer itself uses: `ZImagefile.zlayer-node`,
+        // `ZImagefile.zlayer-manager`, etc.). Ambiguity (multiple
+        // `ZImagefile.<suffix>` entries with no literal tiebreaker) is a
+        // hard error — the user must pass `-z <path>` to disambiguate.
+        let auto_zimage_path =
+            find_context_zimagefile(&self.context).map_err(|e| BuildError::ContextRead {
+                path: self.context.clone(),
+                source: e,
+            })?;
+        if let Some(auto_zimage_path) = auto_zimage_path {
             debug!(
                 "Found ZImagefile in context: {}",
                 auto_zimage_path.display()
@@ -1685,6 +1936,7 @@ impl ImageBuilder {
                     source: e,
                 }
             })?;
+            let content = expand_zimage_vars(&content, &self.options.pipeline_vars);
             let zimage = crate::zimage::parse_zimagefile(&content)?;
             return self.handle_zimage(&zimage).await;
         }
@@ -2284,6 +2536,89 @@ async fn write_wasm_oci_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_zimage_vars_substitutes_known_and_keeps_unknown() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("LTSC".to_string(), "ltsc2025".to_string());
+        vars.insert(
+            "REGISTRY".to_string(),
+            "ghcr.io/blackleafdigital/zlayer".to_string(),
+        );
+        let content = "base: ${REGISTRY}/base:windows-${LTSC}\nrun: echo ${UNKNOWN}\n";
+        let out = expand_zimage_vars(content, &vars);
+        assert_eq!(
+            out,
+            "base: ghcr.io/blackleafdigital/zlayer/base:windows-ltsc2025\nrun: echo ${UNKNOWN}\n"
+        );
+    }
+
+    #[test]
+    fn expand_zimage_vars_empty_is_noop() {
+        let vars = std::collections::HashMap::new();
+        let content = "base: mcr.microsoft.com/windows/servercore:${LTSC}\n";
+        assert_eq!(expand_zimage_vars(content, &vars), content);
+    }
+
+    #[test]
+    fn find_context_zimagefile_prefers_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both a literal `ZImagefile` AND a `.suffix` variant exist — the
+        // literal wins outright per the documented resolution order.
+        std::fs::write(dir.path().join("ZImagefile"), "base: alpine\n").unwrap();
+        std::fs::write(dir.path().join("ZImagefile.prod"), "base: alpine\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, Some(dir.path().join("ZImagefile")));
+    }
+
+    #[test]
+    fn find_context_zimagefile_picks_unique_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only one `ZImagefile.<suffix>` and no literal — auto-detect
+        // returns it. This is the common multi-image-repo convention
+        // (e.g. `ZImagefile.zataserver`).
+        std::fs::write(dir.path().join("ZImagefile.zataserver"), "base: rust\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, Some(dir.path().join("ZImagefile.zataserver")));
+    }
+
+    #[test]
+    fn find_context_zimagefile_none_when_only_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_context_zimagefile_ambiguous_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two `.suffix` variants and NO literal `ZImagefile` to break the
+        // tie — silently picking either one is a footgun, so this MUST
+        // surface as an error pointing the user at `-z <path>`.
+        std::fs::write(dir.path().join("ZImagefile.prod"), "base: alpine\n").unwrap();
+        std::fs::write(dir.path().join("ZImagefile.dev"), "base: alpine\n").unwrap();
+        let err = find_context_zimagefile(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multiple ZImagefile candidates"),
+            "error must explain ambiguity, got: {msg}"
+        );
+        assert!(msg.contains("ZImagefile.dev"));
+        assert!(msg.contains("ZImagefile.prod"));
+        assert!(msg.contains("-z"));
+    }
+
+    #[test]
+    fn find_context_zimagefile_ignores_empty_suffix() {
+        // A file named literally `ZImagefile.` (with a trailing dot and no
+        // suffix) is a weird edge case but it shouldn't be picked up as a
+        // candidate — the helper requires a non-empty suffix.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ZImagefile."), "junk\n").unwrap();
+        let found = find_context_zimagefile(dir.path()).unwrap();
+        assert_eq!(found, None);
+    }
 
     #[test]
     fn test_registry_auth_new() {

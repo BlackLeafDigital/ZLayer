@@ -298,10 +298,11 @@ fn desired_state_for(state: &str) -> &'static str {
 /// Build a Docker [`Task`] from a daemon-side
 /// [`ContainerSummary`] plus the deployment+service it belongs to.
 ///
-/// The mapping follows the rules documented at the module level. Fields the
-/// `ZLayer` daemon does not surface (image, command, labels, timestamps)
-/// are populated with their Docker defaults so the JSON shape stays
-/// well-formed regardless of which fields the caller's tooling reads.
+/// The mapping follows the rules documented at the module level. The image is
+/// carried through from the [`ContainerSummary`] when the daemon reports it;
+/// other fields it does not surface (command, labels, timestamps) are
+/// populated with their Docker defaults so the JSON shape stays well-formed
+/// regardless of which fields the caller's tooling reads.
 fn task_from_replica(deployment: &str, service: &str, summary: &ContainerSummary) -> Task {
     let docker_state = map_task_state(&summary.state);
     let desired = desired_state_for(docker_state);
@@ -323,7 +324,7 @@ fn task_from_replica(deployment: &str, service: &str, summary: &ContainerSummary
         updated_at: now.clone(),
         spec: TaskTemplate {
             container_spec: ContainerSpec {
-                image: String::new(),
+                image: summary.image.clone(),
                 labels: Value::Object(serde_json::Map::new()),
                 command: Vec::new(),
                 args: Vec::new(),
@@ -589,9 +590,11 @@ mod tests {
             id: format!("{service}-rep-{replica}"),
             service: service.to_string(),
             replica,
+            image: "docker.io/library/nginx:latest".to_string(),
             state: state.to_string(),
             pid: Some(1234),
             overlay_ip: None,
+            node_id: None,
         }
     }
 

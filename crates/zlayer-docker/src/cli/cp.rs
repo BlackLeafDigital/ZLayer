@@ -33,6 +33,8 @@ use anyhow::{bail, Context};
 use bytes::Bytes;
 use clap::Parser;
 use zlayer_client::{default_socket_path, DaemonClient};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Arguments for `docker cp`.
 ///
@@ -464,7 +466,9 @@ mod tests {
 
     #[test]
     fn build_tar_round_trips_a_single_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("build-tar-round-trips-a-single-file-")
+            .unwrap();
         let src = dir.path().join("hello.txt");
         std::fs::write(&src, b"hi\n").unwrap();
         let bytes = build_tar_from_local(&src, "hello.txt").unwrap();
@@ -481,7 +485,9 @@ mod tests {
     #[test]
     fn top_level_entries_dedupe_directory_children() {
         // Build an archive with a directory and a file inside it.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("top-level-entries-dedupe-directory-children-")
+            .unwrap();
         std::fs::create_dir_all(dir.path().join("a")).unwrap();
         std::fs::write(dir.path().join("a/b.txt"), b"x").unwrap();
         let bytes = build_tar_from_local(dir.path(), "root").unwrap();

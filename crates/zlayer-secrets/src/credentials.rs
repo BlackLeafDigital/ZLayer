@@ -72,6 +72,18 @@ impl<S: SecretsStore> CredentialStore<S> {
         Self { store }
     }
 
+    /// Borrow the underlying secrets store.
+    ///
+    /// Useful for constructing sibling typed stores (e.g.
+    /// [`crate::RegistryCredentialStore`] / [`crate::GitCredentialStore`]) that
+    /// share the same concrete backing store without re-opening it. When `S` is
+    /// an `Arc<_>` (the common case), call `.clone()` on the returned reference
+    /// for a cheap refcount bump.
+    #[must_use]
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     /// Validate an API key and secret pair.
     ///
     /// Returns `Some(roles)` if the credentials are valid, `None` if invalid.
@@ -240,9 +252,12 @@ impl<S: SecretsStore> CredentialStore<S> {
 mod tests {
     use super::*;
     use crate::{EncryptionKey, PersistentSecretsStore};
+    use zlayer_paths::ZLayerDirs;
 
-    async fn create_test_store() -> (PersistentSecretsStore, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn create_test_store() -> (PersistentSecretsStore, zlayer_types::Scratch) {
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("create-test-store-")
+            .unwrap();
         let db_path = temp_dir.path().join("test_creds.sqlite");
         let key = EncryptionKey::generate();
         let store = PersistentSecretsStore::open(&db_path, key).await.unwrap();

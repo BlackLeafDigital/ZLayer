@@ -203,6 +203,12 @@ pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
 pub mod windows;
+pub mod windows_builder;
+pub mod windows_image_resolver;
+// Inner `#![cfg(target_os = "windows")]` in the module gates the body; declare
+// it unconditionally here (like `windows_builder`) so a redundant cfg isn't
+// applied twice.
+pub mod windows_toolchain;
 pub mod zimage;
 
 // Re-export main types at crate root
@@ -265,6 +271,14 @@ pub use pipeline::{
 #[cfg(target_os = "macos")]
 pub use backend::SandboxBackend;
 pub use backend::{detect_backend, BuildBackend, BuildahBackend, ImageOs, ImageOsParseError};
+
+/// Process-wide lock shared by every test in this crate that mutates
+/// environment variables (`PATH`, `ZLAYER_BUILDD_BIN`, etc.). Cargo runs
+/// tests from a single crate in the same process by default, so any two
+/// env-mutating tests that don't share a lock will race. New env-mutating
+/// tests in this crate MUST acquire this mutex before touching env state.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -353,6 +367,7 @@ ENTRYPOINT ["/app"]
             mounts: vec![],
             network: None,
             security: None,
+            env: std::collections::HashMap::new(),
         });
         let cmds = BuildahCommand::from_instruction(container, &run);
         assert_eq!(cmds.len(), 1);

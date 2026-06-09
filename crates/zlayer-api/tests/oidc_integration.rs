@@ -48,6 +48,7 @@ use zlayer_api::storage::{
     SqlxUserStore, UserStorage,
 };
 use zlayer_api::{build_router_with_storage, ApiConfig, IdentityManager};
+use zlayer_paths::ZLayerDirs;
 
 // ---------------------------------------------------------------------------
 // Mock provider state
@@ -267,7 +268,7 @@ struct Harness {
     oidc_identities: Arc<dyn OidcIdentityStorage>,
     // Retained for Drop side-effects (keep tempdirs alive for the duration of
     // the test).
-    _tempdir: tempfile::TempDir,
+    _tempdir: zlayer_types::Scratch,
     // Retained so the spawned mock server outlives the test (dropping the
     // join handle cancels it). We don't await it.
     _server_task: tokio::task::JoinHandle<()>,
@@ -302,7 +303,9 @@ async fn boot() -> Harness {
     tokio::task::yield_now().await;
 
     // Build ZLayer storage + identity.
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = ZLayerDirs::system_default()
+        .scratch_dir("build-zlayer-storage-identity-")
+        .expect("tempdir");
     let users: Arc<dyn UserStorage> = Arc::new(
         SqlxUserStore::in_memory()
             .await

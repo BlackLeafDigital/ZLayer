@@ -55,6 +55,11 @@ jobs:
   # ===========================================
   version:
     runs-on: ubuntu-latest
+    # Global CI skip: a commit message containing `[skip]` skips the entire
+    # pipeline. `version` is the root every other job chains from via `needs`,
+    # so skipping it cascades a skip to all dependents whose `if:` has no status
+    # function. The one `always()` job (cache-cleanup) is guarded separately.
+    if: ${{ !contains(github.event.head_commit.message, '[skip]') }}
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -439,6 +444,9 @@ jobs:
         with:
           packages: 'protoc'
           cross-platform: 'true'
+
+      - name: Install Git Bash
+        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
 
       - name: Export PROTOC env
         if: steps.check.outputs.completed != 'true'
@@ -1062,7 +1070,9 @@ jobs:
     name: Cleanup Old Caches
     runs-on: ubuntu-latest
     needs: [build, build-macos, feature-tests]
-    if: always()
+    # `always()` removes the implicit success() gate, so this would still fire
+    # when `version` is skipped — exclude the global `[skip]` marker explicitly.
+    if: ${{ always() && !contains(github.event.head_commit.message, '[skip]') }}
     steps:
       - name: Cleanup old caches
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main

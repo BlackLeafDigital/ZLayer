@@ -99,7 +99,7 @@ generate_go() {
         -i "$OPENAPI_SPEC" \
         -g go \
         -o "$CLIENTS_DIR/go" \
-        --additional-properties=packageName=zlayer,packageVersion=0.0.0-dev,isGoSubmodule=true,gitUserId=BlackLeafDigital,gitRepoId=ZLayer/clients/go
+        --additional-properties=packageName=zlayer,packageVersion=0.0.0-dev,isGoSubmodule=true,gitUserId=BlackLeafDigital,gitRepoId=ZLayer/clients/go,enumClassPrefix=true
 
     # Add go.mod (the 'github.com/BlackLeafDigital/ZLayer/clients/go' subpath
     # mirrors the plugin-SDK pattern — consumers `go get` it via a tag of the

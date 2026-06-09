@@ -117,7 +117,7 @@ pub enum StorageTier {
 }
 
 /// Node selection constraints for service placement
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSelector {
     /// Required labels that nodes must have (all must match)
@@ -126,6 +126,102 @@ pub struct NodeSelector {
     /// Preferred labels (soft constraint, nodes with these are preferred)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub prefer_labels: HashMap<String, String>,
+}
+
+/// Affinity hint for a single replica group's placement.
+///
+/// Three behaviors:
+/// - `Spread`: try to put each replica on a different node (default).
+/// - `Pack`: bin-pack onto the fewest nodes that can fit.
+/// - `Pin`: pin all replicas to a single node, identified either by
+///   node id (`"id=2"`) or label match (`"role=database"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GroupAffinity {
+    /// Default: spread across distinct nodes.
+    #[default]
+    Spread,
+    /// Pack onto fewest nodes.
+    Pack,
+    /// Pin to a specific node selector.
+    ///
+    /// Examples:
+    /// - `Pin("id=2")` — exact node id match
+    /// - `Pin("zone=us-east-1a")` — label match
+    Pin(String),
+}
+
+/// Regex for [`ReplicaGroup::role`] validation. A valid DNS label: starts with
+/// a lowercase letter, then any mix of lowercase letters, digits, or
+/// internal hyphens, ending with a letter or digit. 1-30 chars total.
+static REPLICA_GROUP_ROLE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z]([a-z0-9-]{0,28}[a-z0-9])?$").expect("valid regex literal")
+});
+
+/// One named replica group within a service.
+///
+/// When `ServiceSpec.replica_groups` is set, the service is composed of one
+/// or more groups, each with its own count, optional overrides, and
+/// affinity hint. Containers in each group get DNS names of the form
+/// `<role>.<service>.<deployment>.zlayer.internal` and proxy backends
+/// can target a single role via `EndpointSpec.target_role`.
+///
+/// Backward compat: services without `replica_groups` are treated as a
+/// single implicit group `{role: "default", count: <scale.replicas>}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaGroup {
+    /// Group identifier. Becomes part of container IDs and DNS names.
+    /// Must be a valid DNS label: lowercase letters, digits, and hyphens;
+    /// must not start or end with a hyphen; ≤ 30 chars.
+    #[validate(length(min = 1, max = 30))]
+    #[validate(regex(path = *REPLICA_GROUP_ROLE_RE))]
+    pub role: String,
+
+    /// Number of replicas in this group.
+    #[validate(range(min = 1))]
+    pub count: u32,
+
+    /// Image override (inherits `ServiceSpec.image` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSpec>,
+
+    /// Environment variables MERGED on top of `ServiceSpec.env`. Entries
+    /// in this map win on conflict (group overrides service default).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+
+    /// Command override (inherits `ServiceSpec.command` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandSpec>,
+
+    /// Resources override (inherits `ServiceSpec.resources` when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesSpec>,
+
+    /// Affinity hint for placement of this group's replicas.
+    #[serde(default)]
+    pub affinity: GroupAffinity,
+}
+
+/// Validate that no two [`ReplicaGroup`]s share the same `role` within a
+/// single [`ServiceSpec`].
+///
+/// Called from the deploy handler before storing the spec; not wired into
+/// the `Validate` derive on `ServiceSpec` because validator 0.19's `custom`
+/// only sees the field type (`Option<Vec<ReplicaGroup>>`) and not the
+/// surrounding struct.
+///
+/// # Errors
+/// Returns the duplicated role name on first collision.
+pub fn validate_unique_replica_group_roles(groups: &[ReplicaGroup]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for g in groups {
+        if !seen.insert(g.role.as_str()) {
+            return Err(g.role.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Operating system a service needs to run on.
@@ -894,6 +990,20 @@ where
     Ok(NetworkMode::from(inner))
 }
 
+/// Container isolation mode (Windows containers only; ignored on Linux/macOS).
+///
+/// * `Auto` (default) — runtime picks: Hyper-V on Windows client SKUs, Process on Server with matching build.
+/// * `Process` — shared host kernel (fast, requires container OS build to match host).
+/// * `Hyperv` — utility VM (stronger boundary, cross-version compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationMode {
+    #[default]
+    Auto,
+    Process,
+    Hyperv,
+}
+
 /// Per-process resource limit (Docker `--ulimit` style).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -907,7 +1017,7 @@ pub struct UlimitSpec {
 }
 
 /// Per-service specification
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Validate)]
 #[serde(from = "ServiceSpecCompat")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServiceSpec {
@@ -961,6 +1071,24 @@ pub struct ServiceSpec {
     #[validate(custom(function = "crate::spec::validate::validate_scale_spec"))]
     pub scale: ScaleSpec,
 
+    /// Heterogeneous replica groups within this service.
+    ///
+    /// When set, the service is composed of multiple named groups (e.g.
+    /// `primary` + `read` + `cache`) instead of a flat `scale.replicas`.
+    /// Each group inherits `ServiceSpec` defaults (image, env, command,
+    /// resources) and overrides per-group fields.
+    ///
+    /// When `None` (default), the service uses `scale` directly with an
+    /// implicit single group `{role: "default", count: <scale.replicas>}`.
+    /// This is the backward-compatible path used by all existing
+    /// specifications.
+    ///
+    /// Cross-group role uniqueness is validated separately by
+    /// [`validate_unique_replica_group_roles`] from the deploy handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub replica_groups: Option<Vec<ReplicaGroup>>,
+
     /// Dependency specifications
     #[serde(default)]
     pub depends: Vec<DependsSpec>,
@@ -984,6 +1112,10 @@ pub struct ServiceSpec {
     /// container record after termination.
     #[serde(default)]
     pub lifecycle: LifecycleSpec,
+
+    /// Container isolation mode (Windows containers only; ignored on Linux/macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationMode>,
 
     /// Device passthrough (e.g., /dev/kvm for VMs)
     #[serde(default)]
@@ -1021,6 +1153,20 @@ pub struct ServiceSpec {
     /// Node selection constraints (required/preferred labels)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
+
+    /// Placement affinity for this service's replicas when the service is NOT
+    /// composed of `replica_groups` (each group carries its own affinity).
+    ///
+    /// `None` (the default) preserves historical shared-mode behavior:
+    /// bin-pack / concentrate consecutive replicas onto the fewest nodes that
+    /// fit. Set to `spread` for same-service anti-affinity (replicas land on
+    /// distinct nodes for higher availability), `pack` to concentrate
+    /// explicitly, or `pin` to bind all replicas to one node.
+    ///
+    /// Note: capacity always wins — a replica that does not fit on a node is
+    /// placed elsewhere regardless of affinity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<GroupAffinity>,
 
     /// Target platform for this service. When `None` (default), the service is
     /// eligible to run on any agent regardless of OS/architecture. When `Some`,
@@ -1179,6 +1325,57 @@ pub struct ServiceSpec {
     /// inter-service traffic without publishing to the host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expose: Vec<String>,
+
+    /// Per-service overlay-network configuration.
+    ///
+    /// When `None` (default), the daemon uses the cluster-level overlay
+    /// default. When `Some`, the service opts into an explicit mode /
+    /// parent. See [`crate::overlay::OverlayConfig`] for the v0.51
+    /// implementation status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<crate::overlay::OverlayConfig>,
+
+    /// Policy for making this service's exposed ports reachable on the node's
+    /// loopback (`127.0.0.1:<port>`) for same-node consumers — the GitHub
+    /// Actions "service published to localhost" convention. See
+    /// [`LocalhostReachability`]. Default [`LocalhostReachability::Auto`].
+    #[serde(default, skip_serializing_if = "LocalhostReachability::is_default")]
+    pub localhost_reachability: LocalhostReachability,
+}
+
+/// How a service's exposed ports are made reachable on the node's loopback
+/// (`127.0.0.1:<port>`) for same-service / same-node consumers.
+///
+/// `127.0.0.1` always means *this container's own* loopback — isolated per
+/// container on Linux (youki netns), macOS VZ, and Windows HCS; shared with the
+/// host on the macOS seatbelt / libkrun runtimes. This setting never rewrites a
+/// container's own loopback. It controls only whether the daemon ALSO binds the
+/// service's exposed port on the *node's* loopback and L4-forwards it to the
+/// container, so a consumer that shares the node loopback can reach the service
+/// at `localhost:<port>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalhostReachability {
+    /// Publish to the node loopback only when the service is effectively
+    /// single-member (no replica groups, scaling disabled or capped at one
+    /// replica). A multi-member service is not a "pod", so name-based overlay
+    /// DNS (`<service>.service.local`) stays the addressing path to avoid an
+    /// ambiguous single loopback port fronting many replicas. Default.
+    #[default]
+    Auto,
+    /// Always publish each exposed port on the node loopback.
+    Always,
+    /// Never publish to the node loopback (name / overlay addressing only).
+    Never,
+}
+
+impl LocalhostReachability {
+    /// True for the serde default ([`LocalhostReachability::Auto`]); used to
+    /// skip serializing the field when it carries the default value.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 /// Deserialization shim for [`ServiceSpec`].
@@ -1209,6 +1406,8 @@ struct ServiceSpecCompat {
     #[serde(default)]
     scale: ScaleSpec,
     #[serde(default)]
+    replica_groups: Option<Vec<ReplicaGroup>>,
+    #[serde(default)]
     depends: Vec<DependsSpec>,
     #[serde(default = "default_health")]
     health: HealthSpec,
@@ -1218,6 +1417,8 @@ struct ServiceSpecCompat {
     errors: ErrorsSpec,
     #[serde(default)]
     lifecycle: LifecycleSpec,
+    #[serde(default)]
+    isolation: Option<IsolationMode>,
     #[serde(default)]
     devices: Vec<DeviceSpec>,
     #[serde(default)]
@@ -1234,6 +1435,8 @@ struct ServiceSpecCompat {
     node_mode: NodeMode,
     #[serde(default)]
     node_selector: Option<NodeSelector>,
+    #[serde(default)]
+    affinity: Option<GroupAffinity>,
     #[serde(default)]
     platform: Option<TargetPlatform>,
     #[serde(default)]
@@ -1290,6 +1493,10 @@ struct ServiceSpecCompat {
     cgroup_parent: Option<String>,
     #[serde(default)]
     expose: Vec<String>,
+    #[serde(default)]
+    overlay: Option<crate::overlay::OverlayConfig>,
+    #[serde(default)]
+    localhost_reachability: LocalhostReachability,
 }
 
 impl From<ServiceSpecCompat> for ServiceSpec {
@@ -1314,11 +1521,13 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             network: c.network,
             endpoints: c.endpoints,
             scale: c.scale,
+            replica_groups: c.replica_groups,
             depends: c.depends,
             health: c.health,
             init: c.init,
             errors: c.errors,
             lifecycle: c.lifecycle,
+            isolation: c.isolation,
             devices: c.devices,
             storage: c.storage,
             port_mappings: c.port_mappings,
@@ -1327,6 +1536,7 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             privileged: c.privileged,
             node_mode: c.node_mode,
             node_selector: c.node_selector,
+            affinity: c.affinity,
             platform: c.platform,
             service_type: c.service_type,
             wasm: c.wasm,
@@ -1354,6 +1564,83 @@ impl From<ServiceSpecCompat> for ServiceSpec {
             userns_mode: c.userns_mode,
             cgroup_parent: c.cgroup_parent,
             expose: c.expose,
+            overlay: c.overlay,
+            localhost_reachability: c.localhost_reachability,
+        }
+    }
+}
+
+impl ServiceSpec {
+    /// True when this service is effectively a single member: it has no
+    /// (multi-member) replica groups and a scale policy that cannot exceed one
+    /// replica (`Fixed { 0 | 1 }`, `Adaptive { max <= 1 }`, or `Manual`).
+    ///
+    /// Used by [`LocalhostReachability::Auto`] to decide whether publishing the
+    /// service's ports on the node loopback is unambiguous — a genuine
+    /// multi-member service would put several backends behind one loopback port,
+    /// so name-based overlay DNS is the correct addressing for those instead.
+    #[must_use]
+    pub fn is_single_member(&self) -> bool {
+        if let Some(groups) = &self.replica_groups {
+            let total: u32 = groups.iter().map(|g| g.count).sum();
+            return groups.len() <= 1 && total <= 1;
+        }
+        match &self.scale {
+            ScaleSpec::Fixed { replicas } => *replicas <= 1,
+            ScaleSpec::Adaptive { max, .. } => *max <= 1,
+            ScaleSpec::Manual => true,
+        }
+    }
+
+    /// Whether the daemon should publish this service's exposed ports on the
+    /// node loopback (`127.0.0.1:<port>`), per its [`LocalhostReachability`]
+    /// policy. `Auto` publishes only for effectively single-member services
+    /// (see [`ServiceSpec::is_single_member`]).
+    #[must_use]
+    pub fn publish_to_node_loopback(&self) -> bool {
+        match self.localhost_reachability {
+            LocalhostReachability::Always => true,
+            LocalhostReachability::Never => false,
+            LocalhostReachability::Auto => self.is_single_member(),
+        }
+    }
+
+    /// Construct a minimally-populated [`ServiceSpec`] with just the two
+    /// fields callers always have to supply explicitly: the logical service
+    /// name (used for diagnostics / labels at the call site — this struct
+    /// does not carry the service name itself; it is the key in
+    /// [`DeploymentSpec::services`]) and the container image. Every other
+    /// field is filled in from [`Default::default`].
+    ///
+    /// Intended for tests and one-off in-memory fixtures. Production code
+    /// paths that build a `ServiceSpec` from user input should still go
+    /// through `serde` deserialization or an explicit struct literal so that
+    /// every field is consciously set.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let spec = ServiceSpec::minimal("api", "ghcr.io/acme/api:1.2");
+    /// ```
+    ///
+    /// # Panics
+    /// Panics only if the fixed fallback string `"scratch:latest"` cannot
+    /// be parsed as an [`ImageReference`] — which would indicate a bug in
+    /// the OCI reference parser, not in caller input.
+    #[must_use]
+    pub fn minimal(_name: impl Into<String>, image: impl Into<String>) -> Self {
+        use std::str::FromStr;
+        let image_str = image.into();
+        let image_ref = crate::ImageRef::from_str(&image_str).unwrap_or_else(|_| {
+            crate::ImageRef::from_str("scratch:latest")
+                .expect("'scratch:latest' is a valid image reference")
+        });
+        Self {
+            image: ImageSpec {
+                name: image_ref,
+                pull_policy: default_pull_policy(),
+                source_policy: None,
+            },
+            ..Self::default()
         }
     }
 }
@@ -1390,10 +1677,11 @@ fn default_health() -> HealthSpec {
 }
 
 /// Resource type - determines container lifecycle
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResourceType {
     /// Long-running container, receives traffic, load-balanced
+    #[default]
     Service,
     /// Run-to-completion, triggered by endpoint/CLI/internal system
     Job,
@@ -1401,68 +1689,84 @@ pub enum ResourceType {
     Cron,
 }
 
+/// Per-image override for the registry resolution chain order.
+///
+/// The puller's default chain is LOCAL store → local CACHE → shared S3 tier →
+/// the ref's own registry (URL) → last-resort default registry. A spec/compose
+/// entry may pin a different behavior; `None` on [`ImageSpec`] == [`Self::LocalFirst`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePolicy {
+    /// Default chain order (local store → cache → S3 → URL → fallback).
+    #[default]
+    LocalFirst,
+    /// Probe the shared S3 tier BEFORE the local in-process cache (otherwise
+    /// the default order). Useful when S3 is the fleet's canonical warm pool.
+    S3First,
+    /// Skip every local/cached/S3 source — always resolve from the ref's own
+    /// registry (or the configured default registry for a bare name).
+    RemoteOnly,
+    /// Resolve ONLY from local sources (local store + cache); never touch S3,
+    /// the network, or the default-registry fallback. A miss is an error.
+    LocalOnly,
+}
+
 /// Container image specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ImageSpec {
     /// Image name (e.g., "ghcr.io/org/api:latest")
-    #[serde(with = "crate::image_ref_serde")]
-    pub name: crate::ImageReference,
+    pub name: crate::ImageRef,
 
     /// When to pull the image
     #[serde(default = "default_pull_policy")]
     pub pull_policy: PullPolicy,
+
+    /// Optional override for the registry resolution chain order.
+    /// `None` is treated as [`SourcePolicy::LocalFirst`] (the default chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_policy: Option<SourcePolicy>,
 }
 
 fn default_pull_policy() -> PullPolicy {
     PullPolicy::IfNotPresent
 }
 
-/// Image pull policy
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PullPolicy {
-    /// Always pull the image, even if cached
-    Always,
-    /// Resolve remote digest; pull and recreate when it differs from local/running
-    Newer,
-    /// Pull only if not present locally
-    IfNotPresent,
-    /// Never pull, use local image only
-    Never,
-}
-
-/// Resolve the effective pull policy for a deploy/scale operation.
-///
-/// The serde default for `pull_policy` is `IfNotPresent` (preserved for
-/// backwards compatibility). When the user has not opted out (i.e. the policy
-/// is the default `IfNotPresent`) AND the image tag is `:latest` or unspecified,
-/// we auto-upgrade to `Newer` so freshly-pushed `:latest` images get picked up
-/// on redeploy. Users who explicitly want immutable behaviour on a `:latest`
-/// tag can set `pull_policy: never`.
-#[must_use]
-pub fn effective_pull_policy(image: &crate::ImageReference, spec_policy: PullPolicy) -> PullPolicy {
-    match spec_policy {
-        PullPolicy::Always | PullPolicy::Never | PullPolicy::Newer => spec_policy,
-        PullPolicy::IfNotPresent => {
-            // Auto-upgrade IfNotPresent to Newer for :latest / no-tag images
-            if image_is_latest_or_untagged(image) {
-                PullPolicy::Newer
-            } else {
-                PullPolicy::IfNotPresent
-            }
+impl Default for ImageSpec {
+    /// Placeholder default used by [`ServiceSpec::default`] (and downstream
+    /// tests). The wrapped reference (`scratch:latest`) is not meaningful on
+    /// its own — every real construction path should override this via
+    /// [`ServiceSpec::minimal`] or an explicit literal. The point of having a
+    /// `Default` is to make `ServiceSpec` itself `Default`-able so adding a new
+    /// optional field on it does not force every existing literal site to be
+    /// touched.
+    fn default() -> Self {
+        use std::str::FromStr;
+        Self {
+            name: crate::ImageRef::from_str("scratch:latest")
+                .expect("'scratch:latest' is a valid image reference"),
+            pull_policy: default_pull_policy(),
+            source_policy: None,
         }
     }
 }
 
-fn image_is_latest_or_untagged(image: &crate::ImageReference) -> bool {
-    // `ImageReference` is `oci_spec::distribution::Reference`, which exposes a
-    // clean `tag()` accessor returning `Option<&str>`. No tag, or tag "latest",
-    // is treated as the rolling case.
-    match image.tag() {
-        None => true,
-        Some(tag) => tag == "latest",
-    }
+/// Image pull policy
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullPolicy {
+    /// Always pull the image, even if cached.
+    Always,
+    /// Resolve remote digest; pull and recreate when it differs from local/running.
+    Newer,
+    /// Use the local image if present; otherwise pull. Never contact a
+    /// registry for revalidation when the image is already cached locally.
+    /// This is the literal Docker/Kubernetes semantics — no silent upgrade
+    /// to `Newer` for `:latest` tags (set `pull_policy: newer` explicitly
+    /// when you want redeploy-picks-up-new-latest behavior).
+    IfNotPresent,
+    /// Never pull, use local image only.
+    Never,
 }
 
 /// Device passthrough specification
@@ -1700,6 +2004,38 @@ pub struct GpuSpec {
     /// GPU sharing mode: exclusive (default), mps, or time-slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharing: Option<GpuSharingMode>,
+    /// Host directory for the NVIDIA MPS control pipe.
+    ///
+    /// Only consulted when `sharing == Mps`. Defaults to `/tmp/nvidia-mps`
+    /// when unset. The directory MUST exist on the host (created by the
+    /// `nvidia-cuda-mps-control` daemon). It is bind-mounted into the
+    /// container at the same path and exported as `CUDA_MPS_PIPE_DIRECTORY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mps_pipe_dir: Option<String>,
+    /// Host directory for NVIDIA MPS log output.
+    ///
+    /// Only consulted when `sharing == Mps`. Defaults to `/tmp/nvidia-log`
+    /// when unset. The directory MUST exist on the host. It is bind-mounted
+    /// into the container and exported as `CUDA_MPS_LOG_DIRECTORY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mps_log_dir: Option<String>,
+    /// CUDA device index this replica should see when `sharing == TimeSlice`.
+    ///
+    /// Emitted as `CUDA_VISIBLE_DEVICES=<slice_index>`, overriding the default
+    /// 0..count visibility list. Use this together with a host-side NVIDIA
+    /// time-slicing config to advertise a single physical GPU as multiple
+    /// virtual slices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_slice_index: Option<u32>,
+    /// Optional host path to a NVIDIA time-slicing config YAML.
+    ///
+    /// When set, the file is bind-mounted read-only at
+    /// `/etc/nvidia/gpu-time-slicing.yaml` inside the container so tools that
+    /// inspect the slicing topology (e.g. monitoring sidecars) can read it.
+    /// The file is not interpreted by `ZLayer` — it's purely informational for
+    /// the workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_slicing_config_path: Option<String>,
 }
 
 fn default_gpu_count() -> u32 {
@@ -1867,6 +2203,32 @@ pub struct EndpointSpec {
     /// Only applicable when protocol is tcp or udp
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<StreamEndpointConfig>,
+
+    /// Restrict this endpoint to backends in a specific replica role.
+    ///
+    /// When `Some`, only containers whose `replica_groups.role` matches this
+    /// value receive traffic from this endpoint. When `None` (default), the
+    /// endpoint accepts all containers of the service (legacy behavior).
+    ///
+    /// Validation: when set, the role MUST appear in the parent
+    /// `ServiceSpec.replica_groups` (enforced at deploy time in the API
+    /// handler, not via derive(Validate)).
+    ///
+    /// Example (a postgres service with primary + read replicas):
+    ///
+    /// ```yaml
+    /// endpoints:
+    ///   - name: write
+    ///     port: 5432
+    ///     protocol: tcp
+    ///     target_role: primary
+    ///   - name: read
+    ///     port: 5433
+    ///     protocol: tcp
+    ///     target_role: read
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_role: Option<String>,
 
     /// Optional tunnel configuration for this endpoint
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2130,6 +2492,16 @@ pub struct HealthSpec {
 
 fn default_retries() -> u32 {
     3
+}
+
+impl Default for HealthSpec {
+    /// Returns the same shape as the per-field serde defaults: a 5-second
+    /// start grace, 3 retries, and a TCP check against port 0 ("use first
+    /// endpoint"). Matches [`default_health`] which is the serde fallback
+    /// when no `health:` block is supplied in a deployment spec.
+    fn default() -> Self {
+        default_health()
+    }
 }
 
 /// Health check type
@@ -2627,6 +2999,41 @@ pub struct PortMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_spec_default_round_trips_through_json() {
+        // Building `ServiceSpec::default()` must succeed (no panics on the
+        // placeholder image reference) and the result must round-trip through
+        // serde_json so callers can store / transport a default spec without
+        // surprises.
+        let spec = ServiceSpec::default();
+
+        // Sanity on a handful of fields that depend on custom Default impls.
+        assert_eq!(spec.rtype, ResourceType::Service);
+        assert_eq!(spec.image.pull_policy, PullPolicy::IfNotPresent);
+        assert_eq!(spec.health.retries, 3);
+        assert_eq!(spec.network_mode, NetworkMode::Default);
+        assert!(spec.env.is_empty());
+        assert!(spec.endpoints.is_empty());
+        assert!(spec.overlay.is_none());
+
+        let json = serde_json::to_string(&spec).expect("serialize default ServiceSpec");
+        let parsed: ServiceSpec =
+            serde_json::from_str(&json).expect("re-parse default ServiceSpec");
+        assert_eq!(spec, parsed);
+    }
+
+    #[test]
+    fn service_spec_minimal_sets_name_and_image() {
+        let spec = ServiceSpec::minimal("api", "ghcr.io/acme/api:1.2");
+        assert_eq!(spec.image.name.repository(), "acme/api");
+        assert_eq!(spec.image.name.tag(), Some("1.2"));
+        // Everything else should match Default exactly.
+        let baseline = ServiceSpec::default();
+        assert_eq!(spec.rtype, baseline.rtype);
+        assert_eq!(spec.scale, baseline.scale);
+        assert_eq!(spec.network_mode, baseline.network_mode);
+    }
 
     #[test]
     fn port_mapping_defaults_via_serde() {
@@ -3886,5 +4293,221 @@ services:
         let reparsed_svc = reparsed.services.get("app").expect("app service after rt");
         assert!(reparsed_svc.lifecycle.delete_on_exit);
         assert_eq!(svc.lifecycle, reparsed_svc.lifecycle);
+    }
+}
+
+#[cfg(test)]
+mod replica_group_tests {
+    use super::{
+        validate_unique_replica_group_roles, EndpointSpec, GroupAffinity, LocalhostReachability,
+        ReplicaGroup, ScaleSpec, ScaleTargets, ServiceSpec, REPLICA_GROUP_ROLE_RE,
+    };
+
+    #[test]
+    fn yaml_roundtrip_basic_group() {
+        let yaml = r"
+role: primary
+count: 1
+env:
+  POSTGRES_REPLICATION_MODE: primary
+affinity: spread
+";
+        let group: ReplicaGroup = serde_yaml::from_str(yaml).expect("parse basic group");
+        assert_eq!(group.role, "primary");
+        assert_eq!(group.count, 1);
+        assert_eq!(group.affinity, GroupAffinity::Spread);
+        assert_eq!(
+            group.env.get("POSTGRES_REPLICATION_MODE"),
+            Some(&"primary".to_string())
+        );
+    }
+
+    #[test]
+    fn yaml_default_affinity_is_spread() {
+        let yaml = "role: x\ncount: 2\n";
+        let group: ReplicaGroup = serde_yaml::from_str(yaml).expect("parse minimal group");
+        assert_eq!(group.affinity, GroupAffinity::Spread);
+    }
+
+    #[test]
+    fn role_regex_accepts_valid_labels() {
+        for ok in ["a", "primary", "read-only", "x1", "ab-cd-ef"] {
+            assert!(
+                REPLICA_GROUP_ROLE_RE.is_match(ok),
+                "regex should accept: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_regex_rejects_invalid_labels() {
+        for bad in [
+            "",
+            "-primary",
+            "primary-",
+            "Primary",
+            "0primary",
+            "primary_role",
+            "this-is-way-too-long-of-a-role-name-here",
+        ] {
+            assert!(
+                !REPLICA_GROUP_ROLE_RE.is_match(bad),
+                "regex should reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_affinity_pin_roundtrips_via_serde_yaml() {
+        // Externally-tagged enum with a single string payload serializes as
+        // a mapping `pin: <value>` under snake_case naming.
+        let pinned = GroupAffinity::Pin("id=2".to_string());
+        let dumped = serde_yaml::to_string(&pinned).expect("serialize pin");
+        let reparsed: GroupAffinity = serde_yaml::from_str(&dumped).expect("reparse pin");
+        match reparsed {
+            GroupAffinity::Pin(s) => assert_eq!(s, "id=2"),
+            other => panic!("expected Pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unique_role_validator_rejects_duplicates() {
+        let mk = |role: &str| ReplicaGroup {
+            role: role.to_string(),
+            count: 1,
+            image: None,
+            env: std::collections::HashMap::new(),
+            command: None,
+            resources: None,
+            affinity: GroupAffinity::Spread,
+        };
+        assert!(validate_unique_replica_group_roles(&[mk("a"), mk("b")]).is_ok());
+        let err = validate_unique_replica_group_roles(&[mk("a"), mk("a")])
+            .expect_err("duplicate should fail");
+        assert_eq!(err, "a");
+    }
+
+    #[test]
+    fn endpoint_target_role_yaml_roundtrip() {
+        let yaml = "name: read\nprotocol: tcp\nport: 5433\ntarget_role: read\n";
+        let ep: EndpointSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ep.target_role, Some("read".to_string()));
+    }
+
+    #[test]
+    fn endpoint_without_target_role_is_none() {
+        let yaml = "name: any\nprotocol: tcp\nport: 5432\n";
+        let ep: EndpointSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ep.target_role, None);
+    }
+
+    // ==========================================================================
+    // LocalhostReachability / single-member publishing tests
+    // ==========================================================================
+
+    fn spec_with_scale(scale: ScaleSpec) -> ServiceSpec {
+        let mut s = ServiceSpec::minimal("svc", "scratch:latest");
+        s.scale = scale;
+        s
+    }
+
+    fn replica_group(role: &str, count: u32) -> ReplicaGroup {
+        ReplicaGroup {
+            role: role.to_string(),
+            count,
+            image: None,
+            env: std::collections::HashMap::new(),
+            command: None,
+            resources: None,
+            affinity: GroupAffinity::Spread,
+        }
+    }
+
+    #[test]
+    fn is_single_member_across_scale_modes() {
+        assert!(spec_with_scale(ScaleSpec::Fixed { replicas: 1 }).is_single_member());
+        assert!(spec_with_scale(ScaleSpec::Fixed { replicas: 0 }).is_single_member());
+        assert!(!spec_with_scale(ScaleSpec::Fixed { replicas: 3 }).is_single_member());
+
+        let adaptive = |min, max| ScaleSpec::Adaptive {
+            min,
+            max,
+            cooldown: None,
+            targets: ScaleTargets::default(),
+        };
+        assert!(spec_with_scale(adaptive(1, 1)).is_single_member());
+        assert!(!spec_with_scale(adaptive(1, 5)).is_single_member());
+
+        assert!(spec_with_scale(ScaleSpec::Manual).is_single_member());
+    }
+
+    #[test]
+    fn is_single_member_with_replica_groups() {
+        // One group, total 1 -> single member.
+        let mut s = ServiceSpec::minimal("svc", "scratch:latest");
+        s.replica_groups = Some(vec![replica_group("only", 1)]);
+        assert!(s.is_single_member());
+
+        // One group, total 2 -> multi member.
+        s.replica_groups = Some(vec![replica_group("only", 2)]);
+        assert!(!s.is_single_member());
+
+        // Two groups, total 2 -> multi member.
+        s.replica_groups = Some(vec![replica_group("a", 1), replica_group("b", 1)]);
+        assert!(!s.is_single_member());
+
+        // replica_groups takes precedence over scale.
+        s.scale = ScaleSpec::Fixed { replicas: 1 };
+        s.replica_groups = Some(vec![replica_group("a", 1), replica_group("b", 1)]);
+        assert!(!s.is_single_member());
+    }
+
+    #[test]
+    fn publish_to_node_loopback_override_matrix() {
+        // Single-member base spec.
+        let single = spec_with_scale(ScaleSpec::Fixed { replicas: 1 });
+        // Multi-member base spec.
+        let multi = spec_with_scale(ScaleSpec::Fixed { replicas: 3 });
+
+        // Auto: follows single-member-ness.
+        let mut s = single.clone();
+        s.localhost_reachability = LocalhostReachability::Auto;
+        assert!(s.publish_to_node_loopback());
+        let mut m = multi.clone();
+        m.localhost_reachability = LocalhostReachability::Auto;
+        assert!(!m.publish_to_node_loopback());
+
+        // Always: publishes regardless of member count.
+        let mut s = single.clone();
+        s.localhost_reachability = LocalhostReachability::Always;
+        assert!(s.publish_to_node_loopback());
+        let mut m = multi.clone();
+        m.localhost_reachability = LocalhostReachability::Always;
+        assert!(m.publish_to_node_loopback());
+
+        // Never: never publishes regardless of member count.
+        let mut s = single;
+        s.localhost_reachability = LocalhostReachability::Never;
+        assert!(!s.publish_to_node_loopback());
+        let mut m = multi;
+        m.localhost_reachability = LocalhostReachability::Never;
+        assert!(!m.publish_to_node_loopback());
+    }
+
+    #[test]
+    fn localhost_reachability_default_is_auto() {
+        assert_eq!(
+            LocalhostReachability::default(),
+            LocalhostReachability::Auto
+        );
+        assert!(LocalhostReachability::Auto.is_default());
+        assert!(!LocalhostReachability::Always.is_default());
+        assert!(!LocalhostReachability::Never.is_default());
+        // A minimal spec defaults to Auto reachability, but the default scale
+        // is Adaptive { max: 10 } (multi-member), so Auto does NOT publish.
+        let minimal = ServiceSpec::minimal("svc", "scratch:latest");
+        assert_eq!(minimal.localhost_reachability, LocalhostReachability::Auto);
+        assert!(!minimal.is_single_member());
+        assert!(!minimal.publish_to_node_loopback());
     }
 }

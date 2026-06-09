@@ -10,6 +10,8 @@
 //! specific user rather than the local admin.
 
 use std::path::PathBuf;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use anyhow::{Context, Result};
 use tracing::debug;
@@ -159,7 +161,9 @@ mod tests {
     #[test]
     fn test_write_read_delete_and_mode() {
         // Point HOME at a temp dir so the test never touches the real ~/.zlayer.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-write-read-delete-and-mode-")
+            .unwrap();
         let prev_home = std::env::var_os("HOME");
         // SAFETY: single-threaded test, env var mutation scope limited to this test.
         unsafe {

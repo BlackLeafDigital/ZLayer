@@ -25,7 +25,7 @@ steps:
 
   # Successful login navigates to "/" where the dashboard renders.
   - type: waitForSelector
-    target: { role: heading }
+    target: { role: heading, name: "Dashboard" }
     state: visible
     timeout: 15000
 

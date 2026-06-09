@@ -89,30 +89,27 @@ pub fn Permissions() -> impl IntoView {
     // concatenating the results. See the module-level comment for why —
     // the daemon's filter surface only accepts ONE subject per query.
     //
-    // `Resource::new` requires a `PartialEq` source, and `ManagerUserView`
-    // isn't `PartialEq`; using the `(Vec<id>, Vec<id>)` projection as the
-    // source re-fires the fetch when users or groups are added/removed
-    // while avoiding an extra derive on the shared `ManagerUserView` type.
-    let subject_ids = Signal::derive(move || {
-        let uids: Vec<String> = users
-            .get()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|u| u.id)
-            .collect();
-        let gids: Vec<String> = groups
-            .get()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|g| g.id)
-            .collect();
-        (uids, gids)
-    });
+    // The async body fetches users + groups inline rather than reading the
+    // upstream `users` / `groups` resources through a `Signal::derive` source.
+    // Earlier versions chained a `Signal::derive` over those two upstream
+    // resources and used the projected `(Vec<id>, Vec<id>)` as this
+    // resource's source — under SSR that triggered the dependent resource's
+    // source closure to read other resources before their owners were
+    // stable, panicking with "Tried to access a reactive value that has
+    // already been disposed" inside `reactive_graph::traits::Get::get`
+    // during `/permissions` render. Keeping the reactive graph shallow
+    // (a unit source plus an inline fetch) avoids that cross-resource
+    // disposal race. Mutations that need to refresh the list call
+    // `permissions.refetch()` explicitly, same as every other page.
     let permissions = Resource::new(
-        move || subject_ids.get(),
-        move |(uids, gids)| async move { load_all_permissions(uids, gids).await },
+        || (),
+        |()| async move {
+            let users_list = manager_list_users().await?;
+            let groups_list = manager_list_groups().await?;
+            let uids: Vec<String> = users_list.into_iter().map(|u| u.id).collect();
+            let gids: Vec<String> = groups_list.into_iter().map(|g| g.id).collect();
+            load_all_permissions(uids, gids).await
+        },
     );
 
     // Filter state. `RwSignal` because multiple event handlers both read

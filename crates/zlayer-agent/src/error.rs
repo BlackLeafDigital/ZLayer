@@ -67,6 +67,42 @@ pub enum AgentError {
     #[error("Operation not supported by this runtime: {0}")]
     Unsupported(String),
 
+    /// GPU was requested by the service spec, but the underlying WSL2 host
+    /// cannot deliver GPU access (typically because `/dev/dxg` is not exposed
+    /// by the running WSL2 kernel, or the `WSLg` driver shim mount is missing).
+    ///
+    /// Returned by the WSL2 delegate when wiring `/dev/dxg` and the `WSLg` lib
+    /// mounts into the youki bundle. Silent CPU fallback would be surprising
+    /// for users who explicitly asked for a GPU, so this is a hard error;
+    /// callers must either downgrade the spec to drop `resources.gpu` or
+    /// re-place the workload on a node whose WSL2 distro exposes the
+    /// `DirectX` kernel interface.
+    #[error("GPU requested but WSL2 GPU support not available on this host: {reason}")]
+    WslGpuUnavailable { reason: String },
+
+    /// GPU sharing was requested (MPS or time-slicing) but the host or
+    /// runtime cannot satisfy the requested mode.
+    ///
+    /// Typical causes:
+    /// * `mode = "mps"` but the host MPS pipe / log directory does not exist
+    ///   (the `nvidia-cuda-mps-control` daemon is not running).
+    /// * `mode = "mps"` combined with `isolation: hyperv` on Windows — MPS is
+    ///   not exposed inside the UVM kernel.
+    ///
+    /// Silent fallback to exclusive-mode access would be surprising for users
+    /// who explicitly opted in to sharing (they may be relying on sharing for
+    /// capacity planning), so this is a hard error. Callers must either fix
+    /// the host (start the MPS daemon, switch isolation) or drop the
+    /// `sharing` field from the spec.
+    #[error("GPU sharing mode '{mode}' is unavailable: {reason}")]
+    GpuSharingUnavailable {
+        /// Sharing mode that could not be satisfied (`"mps"`, `"time-slice"`).
+        mode: String,
+        /// Human-readable explanation (e.g. "/tmp/nvidia-mps does not exist; \
+        /// ensure nvidia-cuda-mps-control is running").
+        reason: String,
+    },
+
     /// The workload cannot run on this node and must be re-placed on a peer
     /// that can satisfy `required_os`.
     ///
@@ -92,6 +128,37 @@ pub enum AgentError {
         required_os: String,
         /// Human-readable explanation (e.g. "no WSL2 delegate configured on this Windows node").
         reason: String,
+    },
+
+    /// The local runtime cannot service this image because the image's OS
+    /// does not match the runtime's expected OS.
+    ///
+    /// Returned by the HCS runtime when an image's OCI config reports
+    /// `os != "windows"` (e.g. a Linux alpine image landing on a Windows host
+    /// that also has a WSL2 delegate). Calling `vmcompute.dll!ProcessBaseImage`
+    /// on a non-Windows base layer is guaranteed to fail with
+    /// `ERROR_PATH_NOT_FOUND (0x80070003)` because the HCS API expects the
+    /// Windows-specific `Hives/` / `UtilityVM/` / `Files/Windows/System32/`
+    /// layout. Bailing early with this variant lets the composite runtime
+    /// treat the call as a soft skip (the delegate's parallel pull is the one
+    /// that actually owns the image) instead of failing the whole pull.
+    ///
+    /// This is *not* a container failure: callers in the composite layer
+    /// should distinguish this from a real `PullFailed` and continue with the
+    /// delegate's result.
+    #[error(
+        "wrong-platform: {runtime} runtime cannot handle image '{image}' (expected os={expected}, got os={actual})"
+    )]
+    WrongPlatform {
+        /// Identifier of the runtime that rejected the image (e.g. `"hcs"`,
+        /// `"wsl2"`).
+        runtime: String,
+        /// OCI-canonical OS this runtime expects (e.g. `"windows"`, `"linux"`).
+        expected: String,
+        /// OCI-canonical OS the image manifest reports.
+        actual: String,
+        /// Image reference that triggered the mismatch.
+        image: String,
     },
 }
 

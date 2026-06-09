@@ -42,6 +42,7 @@ use crate::handlers::containers::ContainerApiState;
 use crate::handlers::credentials::CredentialState;
 use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
+use crate::handlers::edge_cache::EdgeCacheApiState;
 use crate::handlers::environments::{EnvironmentsRouterState, EnvironmentsState};
 use crate::handlers::groups::GroupsState;
 use crate::handlers::internal::InternalState;
@@ -229,6 +230,7 @@ pub fn build_router_with_storage(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", deployments_api)
+        .nest("/api/v1/daemon", build_daemon_routes())
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
@@ -244,6 +246,19 @@ pub fn build_router_with_storage(
     }
 
     router
+}
+
+/// Build routes for daemon-level introspection.
+///
+/// Currently exposes only the process-wide capability survey at
+/// `GET /capabilities`. The handler is state-free — the survey is memoised
+/// in a process-wide `OnceLock` inside
+/// [`zlayer_agent::capability::DaemonCapabilities`].
+pub fn build_daemon_routes() -> Router<()> {
+    Router::new().route(
+        "/capabilities",
+        get(handlers::daemon::get_daemon_capabilities),
+    )
 }
 
 /// Build the API router with job and cron execution capabilities
@@ -374,7 +389,7 @@ pub fn build_router_full(
 /// let runtime = Arc::new(MockRuntime::new());
 /// let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
 ///
-/// let router = build_router_with_services(&config, storage, service_manager);
+/// let router = build_router_with_services(&config, storage, service_manager, None);
 /// # Ok(())
 /// # }
 /// ```
@@ -382,6 +397,7 @@ pub fn build_router_with_services(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Auth state
     let auth_state = AuthState {
@@ -399,7 +415,7 @@ pub fn build_router_with_services(
     let deployment_state = DeploymentState::new(storage.clone());
 
     // Service state (for service scaling operations)
-    let service_state = ServiceState::new(service_manager, storage);
+    let service_state = ServiceState::new(service_manager, storage, local_node_id);
 
     // Rate limiting
     let rate_limit_state = RateLimitState::new(&config.rate_limit);
@@ -472,6 +488,7 @@ pub fn build_router_with_services(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
+        .nest("/api/v1/daemon", build_daemon_routes())
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
@@ -505,6 +522,7 @@ pub fn build_router_with_deployment_state(
     deployment_state: DeploymentState,
     service_manager: Arc<RwLock<ServiceManager>>,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Auth state
     let auth_state = AuthState {
@@ -519,7 +537,7 @@ pub fn build_router_with_deployment_state(
     log_auth_state_audit(&auth_state);
 
     // Service state (for service scaling operations)
-    let service_state = ServiceState::new(service_manager, storage);
+    let service_state = ServiceState::new(service_manager, storage, local_node_id);
 
     // Rate limiting
     let rate_limit_state = RateLimitState::new(&config.rate_limit);
@@ -592,6 +610,75 @@ pub fn build_router_with_deployment_state(
         .nest("/auth", auth_routes)
         .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
+        .nest("/api/v1/daemon", build_daemon_routes())
+        .layer(Extension(auth_state))
+        .layer(Extension(rate_limit_state))
+        .layer(Extension(ip_limiter))
+        .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(middleware::from_fn(csrf_middleware))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // Add Swagger UI if enabled
+    if config.swagger_enabled {
+        router = router
+            .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    }
+
+    router
+}
+
+/// Build the lean base router for `zlayer serve --secrets-only`.
+///
+/// Mounts ONLY the non-orchestration prefixes the secrets daemon needs from
+/// the base layer: `/health` (liveness/readiness, unauthenticated), `/auth`
+/// (login/whoami/token), and `/api/v1/users` (admin user CRUD). The caller
+/// (the `--secrets-only` branch in `commands::serve`) nests the remaining
+/// secrets-relevant surfaces — `/api/v1/{groups,permissions,audit,secrets,
+/// environments,cluster}` — on top, and deliberately skips deployments,
+/// services, daemon, projects, sync, internal, tunnel, overlay, container,
+/// image, volume, job, and cron routes.
+///
+/// This mirrors the middleware/CORS/Swagger stack of
+/// [`build_router_with_deployment_state`] so the auth, rate-limit, CSRF, and
+/// trace layers behave identically; it just omits the orchestration nests.
+///
+/// The trailing `AuthState` extension layer must be re-applied by the caller
+/// AFTER its own `.nest()` calls (same requirement as the full serve path) so
+/// routes nested after this base also see the `AuthState` extension.
+pub fn build_router_secrets_only_base(config: &ApiConfig) -> Router {
+    // Auth state
+    let auth_state = AuthState {
+        jwt_secret: config.jwt_secret.clone(),
+        credential_store: config.credential_store.clone(),
+        user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
+        cookie_secure: false,
+    };
+    log_auth_state_audit(&auth_state);
+
+    // Rate limiting
+    let rate_limit_state = RateLimitState::new(&config.rate_limit);
+    let ip_limiter = Arc::new(IpRateLimiter::new(config.rate_limit.clone()));
+
+    // CORS layer
+    let cors = build_cors_layer(config);
+
+    // Health routes (no auth required)
+    let health_routes = Router::new()
+        .route("/live", get(handlers::health::liveness))
+        .route("/ready", get(handlers::health::readiness));
+
+    // Auth + users routes
+    let auth_routes = build_auth_routes(auth_state.clone());
+    let users_routes = build_users_routes(auth_state.clone());
+
+    let mut router = Router::new()
+        .nest("/health", health_routes)
+        .nest("/auth", auth_routes)
+        .nest("/api/v1/users", users_routes)
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
@@ -626,7 +713,35 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             "/replicas/{service}",
             get(handlers::internal::get_replicas_internal),
         )
+        // This node's local view of a service (running count, health,
+        // containers) — the leader fans out to every node and aggregates these
+        // for cluster-wide replica counts, health, and `ps` listing.
+        .route(
+            "/services/{service}/state",
+            get(handlers::internal::service_state_internal),
+        )
         .route("/add-peer", post(handlers::internal::add_peer_internal))
+        .route(
+            "/remove-peer",
+            post(handlers::internal::remove_peer_internal),
+        )
+        // `zlayer node upgrade` — the leader hits `upgrade/start` on each
+        // follower in turn and polls `upgrade/{id}` for progress.
+        .route(
+            "/upgrade/start",
+            post(handlers::internal::internal_upgrade_start),
+        )
+        .route(
+            "/upgrade/{upgrade_id}",
+            get(handlers::internal::internal_upgrade_status),
+        )
+        // Pre-self-upgrade nudge: the leader picks a healthy follower
+        // and POSTs here so that follower campaigns immediately
+        // instead of waiting for heartbeat-loss after the leader exits.
+        .route(
+            "/raft/trigger-elect",
+            post(handlers::internal::internal_raft_trigger_elect),
+        )
         .layer(Extension(internal_state.clone()))
         .with_state(internal_state)
 }
@@ -664,6 +779,7 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
 ///     storage,
 ///     service_manager,
 ///     internal_token,
+///     None,
 /// );
 /// # Ok(())
 /// # }
@@ -673,9 +789,11 @@ pub fn build_router_with_internal(
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     internal_token: String,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager.clone());
+    let base_router =
+        build_router_with_services(config, storage, service_manager.clone(), local_node_id);
 
     // Create internal state
     let internal_state = InternalState::new(service_manager, internal_token);
@@ -1066,8 +1184,9 @@ pub fn build_router_with_services_and_secrets(
     service_manager: Arc<RwLock<ServiceManager>>,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
     env_store: Arc<dyn EnvironmentStorage>,
+    local_node_id: Option<String>,
 ) -> Router {
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
 
     let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
     let env_state = EnvironmentsState::new(env_store);
@@ -1099,8 +1218,15 @@ pub fn build_router_with_internal_and_secrets(
     internal_token: String,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
     env_store: Arc<dyn EnvironmentStorage>,
+    local_node_id: Option<String>,
 ) -> Router {
-    let base_router = build_router_with_internal(config, storage, service_manager, internal_token);
+    let base_router = build_router_with_internal(
+        config,
+        storage,
+        service_manager,
+        internal_token,
+        local_node_id,
+    );
 
     let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
     let env_state = EnvironmentsState::new(env_store);
@@ -1127,9 +1253,35 @@ pub fn build_node_routes(node_state: NodeApiState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::nodes::list_nodes))
         .route("/{id}", get(handlers::nodes::get_node))
-        .route("/{id}/labels", post(handlers::nodes::update_node_labels))
         .route("/join-token", post(handlers::nodes::generate_join_token))
         .with_state(node_state)
+}
+
+/// Build routes for the edge-cache eligibility API.
+///
+/// The three endpoints expose the surface upstream callers (the consuming
+/// cluster manager) need to mark `ZLayer` nodes
+/// eligible for edge caching:
+///
+/// - `POST   /api/v1/nodes/{node_id}/edge-cache`
+/// - `DELETE /api/v1/nodes/{node_id}/edge-cache`
+/// - `GET    /api/v1/nodes/{node_id}/edge-cache/stats`
+///
+/// Both mutation endpoints require authentication. Stats is a documented
+/// placeholder today (always returns zeroes) — see
+/// [`crate::handlers::edge_cache`] for details.
+pub fn build_edge_cache_routes(state: EdgeCacheApiState) -> Router<()> {
+    Router::new()
+        .route(
+            "/api/v1/nodes/{node_id}/edge-cache",
+            post(handlers::edge_cache::enable_edge_cache)
+                .delete(handlers::edge_cache::disable_edge_cache),
+        )
+        .route(
+            "/api/v1/nodes/{node_id}/edge-cache/stats",
+            get(handlers::edge_cache::edge_cache_stats),
+        )
+        .with_state(state)
 }
 
 /// Build routes for overlay network status
@@ -1150,6 +1302,17 @@ pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
         .route("/ip-alloc", get(handlers::overlay::get_ip_allocation))
         .route("/dns", get(handlers::overlay::get_dns_status))
         .route("/nat/status", get(handlers::overlay::get_nat_status))
+        // Per-service overlay status and per-(service, node) bridge view.
+        // These are v0.51 stubs whose contract is wired now so adapter
+        // crates can consume them day-one; P9a populates the real data.
+        .route(
+            "/services/{name}",
+            get(handlers::overlay::get_service_overlay_status),
+        )
+        .route(
+            "/services/{name}/bridges/{node_id}",
+            get(handlers::overlay::get_service_bridge),
+        )
         .with_state(overlay_state)
 }
 
@@ -1186,9 +1349,10 @@ pub fn build_router_with_nodes_and_overlay(
     service_manager: Arc<RwLock<ServiceManager>>,
     node_state: NodeApiState,
     overlay_state: OverlayApiState,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router = build_router_with_services(config, storage, service_manager, local_node_id);
 
     // Build node and overlay routes
     let node_routes = build_node_routes(node_state);
@@ -1264,11 +1428,91 @@ pub fn build_router_with_tunnels(
 pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
     Router::new()
         .route("/join", post(handlers::cluster::cluster_join))
+        .route(
+            "/signing-pubkey",
+            get(handlers::cluster::cluster_signing_pubkey),
+        )
+        .route(
+            "/signing-pubkeys",
+            get(handlers::cluster::cluster_signing_pubkeys),
+        )
+        .route(
+            "/trust-bundle",
+            get(handlers::cluster::cluster_trust_bundle),
+        )
+        .route(
+            "/trust-imports",
+            post(handlers::cluster::cluster_import_trust_bundle),
+        )
+        .route(
+            "/trust-bundles",
+            get(handlers::cluster::cluster_list_trust_bundles),
+        )
+        .route(
+            "/trust-imports/{cluster_domain}",
+            delete(handlers::cluster::cluster_remove_trust_bundle),
+        )
+        .route(
+            "/rotate-signing-key",
+            post(handlers::cluster::cluster_rotate_signing_key),
+        )
+        .route(
+            "/revoke-token",
+            post(handlers::cluster::cluster_revoke_token),
+        )
+        .route(
+            "/revocations",
+            get(handlers::cluster::cluster_list_revocations),
+        )
+        .route(
+            "/jwt-algorithm",
+            post(handlers::cluster::cluster_set_jwt_algorithm),
+        )
+        .route("/jwt-status", get(handlers::cluster::cluster_jwt_status))
+        .route(
+            "/wipe-join-secret",
+            post(handlers::cluster::cluster_wipe_join_secret),
+        )
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
+        .route("/workers", get(handlers::cluster::cluster_list_workers))
+        .route(
+            "/gossip/peers",
+            get(handlers::cluster::cluster_list_gossip_peers),
+        )
         .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .route(
             "/force-leader",
             post(handlers::cluster::cluster_force_leader),
+        )
+        // Rolling daemon-binary upgrade entry point. Followers respond
+        // with 421 + X-Leader-Addr so the CLI can redirect to the leader.
+        .route("/upgrade", post(handlers::cluster::cluster_upgrade))
+        // Leader self-upgrade. Re-enters internal/upgrade/start over
+        // loopback so the daemon exits 75 and is respawned by the
+        // supervisor on the new binary.
+        .route(
+            "/upgrade-self",
+            post(handlers::cluster::cluster_upgrade_self),
+        )
+        .route(
+            "/nodes/{id}",
+            delete(handlers::cluster::cluster_remove_node),
+        )
+        .route(
+            "/nodes/{id}/mode",
+            put(handlers::cluster::cluster_set_node_mode),
+        )
+        .route(
+            "/nodes/{id}/labels",
+            post(handlers::cluster::cluster_set_node_labels),
+        )
+        .route(
+            "/nodes/{id}/drain",
+            put(handlers::cluster::cluster_drain_node),
+        )
+        .route(
+            "/nodes/{id}/undrain",
+            put(handlers::cluster::cluster_undrain_node),
         )
         .with_state(cluster_state)
 }
@@ -1323,6 +1567,13 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
     Router::new()
         .route("/", post(handlers::containers::create_container))
         .route("/", get(handlers::containers::list_containers))
+        // Internal, token-authenticated cross-node dispatch target. Mounted
+        // under the container routes (shares `ContainerApiState`); a static
+        // segment so it never shadows the `/{id}` param routes.
+        .route(
+            "/_dispatch",
+            post(handlers::containers::create_container_internal),
+        )
         .route("/{id}", get(handlers::containers::get_container))
         .route("/{id}", delete(handlers::containers::delete_container))
         .route("/{id}/logs", get(handlers::containers::get_container_logs))
@@ -1331,6 +1582,18 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         // tests and the Docker compat shim's translation layer; the active
         // wire shape on this path is now the create-exec one.
         .route("/{id}/exec", post(handlers::exec_instances::create_exec))
+        // Buffered one-shot exec: run `command` to completion inside the
+        // container and return a single JSON `{exit_code, stdout, stderr}`
+        // body (or an SSE stream when `?stream=true`). This is the shape the
+        // Docker-compat shim's non-interactive exec path
+        // (`DaemonClient::exec_in_container`) consumes. Kept distinct from
+        // `/{id}/exec`, whose create-exec handler returns `{"Id": ...}` for
+        // the interactive WebSocket flow — pointing the buffered client at
+        // that path made it fail to parse `exit_code`.
+        .route(
+            "/{id}/exec_sync",
+            post(handlers::containers::exec_in_container),
+        )
         .route("/{id}/resize", post(handlers::containers::resize_container))
         .route("/{id}/wait", get(handlers::containers::wait_container))
         .route(
@@ -1350,6 +1613,13 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
             post(handlers::containers::restart_container),
         )
         .route("/{id}/kill", post(handlers::containers::kill_container))
+        // Interactive `-it` stdin: POST writes a chunk of host stdin to the
+        // workload; DELETE signals end-of-input (Ctrl-D / detach).
+        .route(
+            "/{id}/stdin",
+            post(handlers::containers::write_container_stdin)
+                .delete(handlers::containers::close_container_stdin),
+        )
         .route("/{id}/pause", post(handlers::containers::pause_container))
         .route(
             "/{id}/unpause",
@@ -1494,12 +1764,16 @@ pub fn build_router_with_containers(
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync>,
+    local_node_id: Option<String>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager);
+    let base_router =
+        build_router_with_services(config, storage, Arc::clone(&service_manager), local_node_id);
 
-    // Create container state (carries the shared event bus)
-    let container_state = ContainerApiState::new(runtime);
+    // Create container state (carries the shared event bus). Attach the
+    // ServiceManager so the unified name resolver + `docker ps` can see compose
+    // / deployment containers, not just standalone ones.
+    let container_state = ContainerApiState::new(runtime).with_service_manager(service_manager);
 
     // Build container + event + exec routes from the same state so all three
     // sides see the same event bus and `ExecInstances`. The state type is
@@ -1752,7 +2026,8 @@ mod tests {
         let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
         let internal_token = "test-secret-token".to_string();
 
-        let _router = build_router_with_internal(&config, storage, service_manager, internal_token);
+        let _router =
+            build_router_with_internal(&config, storage, service_manager, internal_token, None);
         // Router builds without error
     }
 
@@ -1795,6 +2070,7 @@ mod tests {
             service_manager,
             node_state,
             overlay_state,
+            None,
         );
         // Router builds without error
     }
@@ -1845,7 +2121,8 @@ mod tests {
         let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
         let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime.clone())));
 
-        let _router = build_router_with_containers(&config, storage, service_manager, runtime);
+        let _router =
+            build_router_with_containers(&config, storage, service_manager, runtime, None);
         // Router builds without error
     }
 }

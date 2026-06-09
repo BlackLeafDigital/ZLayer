@@ -32,7 +32,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="${TMPDIR:-/tmp}/zlayer-macos-images"
+BUILD_DIR="${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/macos-images"
 REGISTRY="ghcr.io/blackleafdigital/zlayer"
 
 # ---------------------------------------------------------------------------

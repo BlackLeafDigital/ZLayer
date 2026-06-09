@@ -7,6 +7,8 @@
 //! - Querying build status and logs
 //! - Listing available runtime templates
 
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 pub use zlayer_types::api::build::*;
 
 use std::collections::HashMap;
@@ -215,6 +217,19 @@ pub fn build_event_to_wrapper(event: BuildEvent) -> BuildEventWrapper {
             data: serde_json::json!({
                 "total_stages": total_stages,
                 "total_instructions": total_instructions,
+            }),
+        },
+        BuildEvent::BuildPlan { stages } => BuildEventWrapper {
+            event_type: "build_plan".to_string(),
+            data: serde_json::json!({
+                "stages": stages
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "name": s.name,
+                        "base_image": s.base_image,
+                        "instructions": s.instructions,
+                    }))
+                    .collect::<Vec<_>>(),
             }),
         },
         BuildEvent::StageStarted {
@@ -907,7 +922,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_manager() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-build-manager-")
+            .unwrap();
         let manager = BuildManager::new(temp_dir.path().to_path_buf());
 
         // Register a build
@@ -940,7 +957,9 @@ mod tests {
     /// terminal state and return with the final `BuildStatus`.
     #[tokio::test]
     async fn test_wait_for_build_returns_on_complete() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-wait-for-build-returns-on-complete-")
+            .unwrap();
         let manager = Arc::new(BuildManager::new(temp_dir.path().to_path_buf()));
 
         let _tx = manager.register_build("wait-1".to_string()).await;
@@ -970,7 +989,9 @@ mod tests {
     /// `wait_for_build` returns `None` when the id was never registered.
     #[tokio::test]
     async fn test_wait_for_build_unknown_id_returns_none() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-wait-for-build-unknown-id-returns-none-")
+            .unwrap();
         let manager = BuildManager::new(temp_dir.path().to_path_buf());
 
         assert!(manager.wait_for_build("ghost").await.is_none());

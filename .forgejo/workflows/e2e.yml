@@ -12,19 +12,31 @@ on:
         required: false
         type: string
       test:
-        description: 'Run a single intellitester test (e.g. nav-smoke.test.yaml). Leave empty to run the full suite.'
+        description: 'Run a specific e2e suite (empty = all). For the intellitester subset, use `manager-intellitester:<yaml>` to run a single test.'
         required: false
         default: ''
         type: choice
         options:
           - ''
-          - bootstrap.test.yaml
-          - login.test.yaml
-          - logout.test.yaml
-          - nav-smoke.test.yaml
-          - stale-session-setup.test.yaml
-          - stale-session-verify.test.yaml
-          - auth.workflow.yaml
+          - youki
+          - wasm
+          - docker
+          - manager-unit
+          - manager-intellitester
+          - manager-intellitester:login.test.yaml
+          - manager-intellitester:nav-smoke.test.yaml
+          - manager-intellitester:stale-session-setup.test.yaml
+          - manager-intellitester:stale-session-verify.test.yaml
+          - raft-e2e
+          - raft-e2e:cluster_3node
+          - raft-e2e:cluster_failover
+          - raft-e2e:cluster_scaling
+          - raft-e2e:cluster_upgrade
+          - raft-e2e:cluster_node_upgrade
+          - scheduler-unit
+          - macos-sandbox
+          - windows-hcs
+          - windows-hcs-hyperv
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -43,18 +55,29 @@ jobs:
   e2e-tests:
     name: E2E Tests (Youki)
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    if: inputs.test == '' || inputs.test == 'youki'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent crates/zlayer-registry crates/zlayer-overlay crates/zlayer-types Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-youki
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -62,9 +85,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -83,37 +106,39 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Login to Docker Hub
+      - name: Authenticate to Docker Hub
         if: steps.check.outputs.completed != 'true'
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u zachhandley --password-stdin
+        # The youki job runs in `node:20-bullseye`, which has no docker CLI, so
+        # `docker login` 127s. ZLayer doesn't need it: its AuthResolver defaults
+        # to AuthSource::DockerConfig and reads ~/.docker/config.json directly
+        # (DockerConfigAuth maps docker.io -> https://index.docker.io/v1/ and
+        # base64-decodes the `auth` field). So write that file ourselves — the
+        # youki e2e's `runtime.pull_image` then pulls Docker Hub authenticated
+        # (rate-limit-safe) with no docker binary involved.
+        run: |
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s' "zachhandley:${{ secrets.DOCKERHUB_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}\n' "$AUTH" > ~/.docker/config.json
 
       - name: Setup E2E environment
         if: steps.check.outputs.completed != 'true'
         run: |
           # Clean up any leftover state from previous runs
-          sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
+          rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
           # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
 
       - name: Run E2E tests
         if: steps.check.outputs.completed != 'true'
-        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
+        run: cargo test --package zlayer-agent --test youki_e2e -- --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
 
-      - name: Fix permissions after sudo test
-        if: always()
-        run: |
-          # sudo cargo test creates root-owned files in CARGO_HOME and CARGO_TARGET_DIR
-          # The runner's cache mechanism can't tar them up without this
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_HOME}" 2>/dev/null || true
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_TARGET_DIR}" 2>/dev/null || true
-
       - name: Cleanup
         if: always()
         run: |
-          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
+          rm -rf /var/lib/zlayer/* 2>/dev/null || true
           rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
 
       - name: Mark step complete
@@ -121,7 +146,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-youki
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -133,18 +158,29 @@ jobs:
   wasm-e2e-tests:
     name: E2E Tests (WASM)
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    if: inputs.test == '' || inputs.test == 'wasm'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/wasm.rs crates/zlayer-agent/src/runtimes/wasm_http.rs crates/zlayer-agent/tests/wasm_runtime_test.rs crates/zlayer-agent/tests/wasip2_integration_test.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-wasm
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -152,9 +188,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -185,7 +221,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-wasm
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -197,18 +233,29 @@ jobs:
   docker-e2e-tests:
     name: E2E Tests (Docker)
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock
+    if: inputs.test == '' || inputs.test == 'docker'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-docker crates/zlayer-agent/src/runtimes/docker.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-docker
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -216,9 +263,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev docker.io'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -253,7 +300,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-docker
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -265,18 +312,29 @@ jobs:
   manager-tests:
     name: E2E Tests (Manager)
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    if: inputs.test == '' || inputs.test == 'manager-unit'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-manager Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -284,9 +342,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -317,7 +375,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -326,26 +384,44 @@ jobs:
   # ===========================================
   # E2E Tests (Manager Intellitester / Playwright)
   #
-  # Boots a hermetic daemon + manager on non-default ports
-  # (data-dir under /tmp), then runs the Intellitester YAML suite
-  # via crates/zlayer-manager/tests/e2e/scripts/run-suite.sh.
-  # Use the `test` workflow_dispatch input to run a single test.
+  # Boots a hermetic daemon + manager on non-default ports (data-dir
+  # under target/zlayer-e2e/<suite-id>/), then runs the Intellitester
+  # YAML suite via
+  # `uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py`.
+  # Use the `test` workflow_dispatch input (e.g.
+  # `manager-intellitester:login.test.yaml`) to run a single test.
   # ===========================================
   manager-intellitester-tests:
     name: E2E Tests (Manager Intellitester)
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    # Temporarily disabled: last run hung indefinitely on the throwaway
+    # daemon. Re-enable by restoring the `inputs.test == ''` branch once
+    # run-suite.py is stabilised. Still selectable via the dropdown.
+    if: |
+      inputs.test == 'manager-intellitester' ||
+      startsWith(inputs.test, 'manager-intellitester:')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager-intellitester
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -353,9 +429,9 @@ jobs:
 
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev sqlite3
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev sqlite3'
 
       - name: Setup Rust
         if: steps.check.outputs.completed != 'true'
@@ -391,31 +467,59 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: cargo install cargo-leptos --locked || true
 
+      - name: Setup pnpm
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node
+        if: steps.check.outputs.completed != 'true'
+        uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install node deps
         if: steps.check.outputs.completed != 'true'
-        run: pnpm install --prefix crates/zlayer-manager/tests/e2e
+        run: |
+          pnpm install --prefix crates/zlayer-manager
+          pnpm install --prefix crates/zlayer-manager/tests/e2e
 
       - name: Install Playwright Chromium
         if: steps.check.outputs.completed != 'true'
         run: pnpm --prefix crates/zlayer-manager/tests/e2e dlx playwright install chromium --with-deps
 
+      - name: Setup uv
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
       - name: Run manager intellitester suite
         if: steps.check.outputs.completed != 'true'
         run: |
-          if [ -n "${{ inputs.test }}" ]; then
-            sudo -E env "PATH=$PATH" crates/zlayer-manager/tests/e2e/scripts/run-suite.sh --only "${{ inputs.test }}"
+          # The dropdown emits either '', 'manager-intellitester', or
+          # 'manager-intellitester:<yaml>'. Strip the prefix to get the
+          # --only target; bare/empty values run the full suite.
+          YAML="${{ inputs.test }}"
+          case "$YAML" in
+            manager-intellitester:*) ONLY="${YAML#manager-intellitester:}" ;;
+            *) ONLY="" ;;
+          esac
+          # Container has CAP_NET_ADMIN + /dev/net/tun via the privileged
+          # block above, so the throwaway daemon's overlay/TUN init no
+          # longer degrades. --sudo-daemon is not needed.
+          if [ -n "$ONLY" ]; then
+            uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py \
+              --throwaway --only "$ONLY"
           else
-            sudo -E env "PATH=$PATH" crates/zlayer-manager/tests/e2e/scripts/run-suite.sh
+            uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py \
+              --throwaway
           fi
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: info
-
-      - name: Fix permissions after sudo
-        if: always()
-        run: |
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_HOME}" 2>/dev/null || true
-          sudo chown -R "$(id -u):$(id -g)" "${CARGO_TARGET_DIR}" 2>/dev/null || true
 
       - name: Save Playwright cache
         if: steps.check.outputs.completed != 'true'
@@ -441,13 +545,279 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intellitester-e2e-${{ github.run_id }}
+          path: target/zlayer-e2e/**
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-manager-intellitester
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # E2E Tests (Raft / Cluster)
+  #
+  # Builds zlayer once, then runs one or more cluster suites via the
+  # throwaway-daemon harness (run-suite.py). Use the `test` input to
+  # pick a single suite (e.g. `raft-e2e:cluster_failover`) or pass the
+  # bare `raft-e2e` value (or leave empty) to run all four suites
+  # sequentially.
+  # ===========================================
+  raft-e2e-tests:
+    name: E2E Tests (Raft)
+    # Pin to the NVIDIA/GPU runners (MiniBeast / BeastPC): they reliably honor
+    # `--privileged`, giving the job container a WRITABLE cgroup-v2 subtree so the
+    # cluster_scaling / cluster_upgrade suites can create real workload
+    # containers. The plain `ubuntu-latest` pool also includes GitRunner, which
+    # does NOT reliably grant privilege (job container lands at the cgroup-v2
+    # root with /sys/fs/cgroup read-only) — which is why those two suites flaked.
+    runs-on: nvidia
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    if: |
+      inputs.test == '' ||
+      inputs.test == 'raft-e2e' ||
+      startsWith(inputs.test, 'raft-e2e:')
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc crates/zlayer-overlayd bin/zlayer/src/commands/cluster.rs crates/zlayer-manager/tests/e2e Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-raft
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          # psmisc (fuser) + lsof power the port-clearing fallback in
+          # run-suite.py that prevents cross-suite contamination between
+          # the five cluster suites sharing ports 19110/19120/19130.
+          packages: 'sudo protobuf-compiler libseccomp-dev psmisc lsof'
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cargo cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Setup uv
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # The cluster_scaling / cluster_upgrade suites create real workload
+      # containers, which need a WRITABLE cgroup-v2 subtree. Inside the runner's
+      # job container the daemon lands at the cgroup-v2 root (`0::/`) with
+      # `/sys/fs/cgroup` mounted read-only, so libcontainer cannot create the
+      # per-container cgroup ("no writable cgroup parent"). Make the hierarchy
+      # writable and delegate a `zlayer-e2e` parent (the v2 ROOT is exempt from
+      # the no-internal-process rule, so we can enable controllers there even
+      # though the daemon runs at root). Best-effort: if the container isn't
+      # privileged the remount fails and the diagnostics below say so — the
+      # pure-raft suites still run regardless.
+      - name: Prepare writable cgroup for nested container creation
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set +e
+          echo "== cgroup diagnostics (before) =="
+          cat /proc/self/cgroup || true
+          grep -E 'cgroup' /proc/mounts || true
+          ls -ld /sys/fs/cgroup || true
+          # Make the cgroup2 filesystem writable (requires a privileged container).
+          mount -o remount,rw /sys/fs/cgroup 2>&1 \
+            && echo "remount rw: OK" \
+            || echo "remount rw: FAILED (job container is not privileged)"
+          if mkdir -p /sys/fs/cgroup/zlayer-e2e 2>/dev/null; then
+            echo "created /sys/fs/cgroup/zlayer-e2e"
+            # Enable controllers at the root subtree (root is exempt from the
+            # cgroup-v2 no-internal-process rule) and delegate them into our
+            # parent so per-container leaves can apply cpu/memory/pids limits.
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+            echo "+cpu +memory +pids +io" > /sys/fs/cgroup/zlayer-e2e/cgroup.subtree_control 2>/dev/null || true
+            echo "ZLAYER_CGROUP_PARENT=/zlayer-e2e" >> "$GITHUB_ENV"
+            echo "exported ZLAYER_CGROUP_PARENT=/zlayer-e2e"
+          else
+            echo "cgroup root not writable; cluster_scaling/cluster_upgrade cannot create containers"
+            echo "  -> the forgejo runner must launch job containers privileged (or delegate a writable cgroup)"
+          fi
+          echo "== cgroup diagnostics (after) =="
+          ls -ld /sys/fs/cgroup /sys/fs/cgroup/zlayer-e2e 2>/dev/null || true
+          cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+          # Never fail the job here — the pure-raft suites do not need cgroups.
+          exit 0
+
+      - name: Build zlayer
+        if: steps.check.outputs.completed != 'true'
+        run: cargo build --release -p zlayer -p zlayer-overlayd
+
+      - name: Run raft cluster suite(s)
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -eo pipefail
+          YAML="${{ inputs.test }}"
+          case "$YAML" in
+            raft-e2e:*) SUITE="${YAML#raft-e2e:}" ;;
+            *) SUITE="cluster_3node" ;;
+          esac
+          if [ "$YAML" = "raft-e2e" ] || [ -z "$YAML" ]; then
+            worst=0
+            for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade cluster_node_upgrade; do
+              echo "=== Running suite: $s ==="
+              if uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"; then
+                echo "=== Suite $s OK ==="
+              else
+                rc=$?
+                echo "=== Suite $s FAILED (rc=$rc) ==="
+                worst=$rc
+              fi
+            done
+            exit $worst
+          else
+            uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$SUITE"
+          fi
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: info
+
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raft-e2e-${{ github.run_id }}
+          path: target/zlayer-e2e/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-raft
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # Scheduler Unit Tests
+  #
+  # Pure-Rust unit-test coverage for the zlayer-scheduler crate using
+  # the `test-skip-http` feature to bypass real HTTP transports.
+  # ===========================================
+  scheduler-unit-tests:
+    name: Unit Tests (Scheduler)
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
+    if: inputs.test == '' || inputs.test == 'scheduler-unit'
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-scheduler crates/zlayer-consensus crates/zlayer-cluster-rpc Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: scheduler-unit
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev'
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cargo cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Install cargo-nextest
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/taiki-e/install-action@nextest
+
+      - name: Run scheduler unit tests
+        if: steps.check.outputs.completed != 'true'
+        run: cargo nextest run -p zlayer-scheduler --features test-skip-http
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: warn
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: scheduler-unit
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
@@ -458,18 +828,26 @@ jobs:
   macos-sandbox-e2e:
     name: E2E Tests (macOS Sandbox)
     runs-on: macos-latest
+    if: inputs.test == '' || inputs.test == 'macos-sandbox'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
 
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/macos_sandbox.rs crates/zlayer-agent/src/runtimes/macos_vm.rs crates/zlayer-agent/tests/macos_sandbox_e2e.rs crates/zlayer-builder/src/macos_image_resolver.rs crates/zlayer-builder/src/macos_toolchain.rs crates/zlayer-builder/src/macos_compat.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-macos
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -523,8 +901,215 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version || github.sha }}
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-macos
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # E2E Tests (Windows HCS)
+  #
+  # windows-latest provides HCS + HCN out of the box on Server 2022 image,
+  # so the Host Compute Service / overlay / cluster-join suites can run
+  # directly on the runner without extra VM provisioning. The three suites
+  # below are all #[ignore]'d to keep `cargo test` quiet on non-Windows
+  # hosts, hence the `--ignored` flag.
+  # ===========================================
+  windows-hcs-e2e:
+    name: E2E Tests (Windows HCS)
+    runs-on: windows-latest
+    if: inputs.test == '' || inputs.test == 'windows-hcs'
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
+      - name: Compute step fingerprint
+        id: fingerprint
+        shell: bash
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/runtimes/wsl2_delegate.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-wsl Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-windows-hcs
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          sccache: true
+          sccache-s3-bucket: ${{ secrets.S3_BUCKET }}
+          sccache-s3-endpoint: https://${{ secrets.S3_ENDPOINT }}
+          sccache-s3-region: ${{ secrets.S3_REGION }}
+          sccache-s3-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
+          sccache-s3-secret-access-key: ${{ secrets.S3_ACCESS_SECRET }}
+          sccache-key-prefix: sccache-windows-e2e
+
+      - name: Restore cargo registry cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-windows-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Install protoc
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protoc'
+          cross-platform: 'true'
+
+      - name: Export PROTOC env
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+
+      - name: Run Windows HCS E2E tests
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_hcs_e2e -- --ignored --nocapture
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_overlay_e2e -- --ignored --nocapture
+          cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_cluster_join_e2e -- --ignored --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf target
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-windows-hcs
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # E2E Tests (Windows HCS Hyper-V)
+  #
+  # Runs the Hyper-V isolation variant on the same `windows-latest`
+  # runner used by the W2 (process-isolated) job above; nested virt is
+  # required on that host. The single suite below uses
+  # `--test-threads=1` because two concurrent Hyper-V UVMs would stress
+  # the runner's memory + CPU budget beyond what's comfortable.
+  # ===========================================
+  windows-hcs-hyperv-e2e:
+    name: E2E Tests (Windows HCS Hyper-V)
+    runs-on: windows-latest
+    if: inputs.test == '' || inputs.test == 'windows-hcs-hyperv'
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Setup Shell
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-shell@main
+
+      - name: Compute step fingerprint
+        id: fingerprint
+        shell: bash
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-agent/src/runtimes/hcs.rs crates/zlayer-agent/src/windows crates/zlayer-hcs crates/zlayer-hns crates/zlayer-agent/tests/windows_hcs_hyperv_e2e.rs Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-windows-hcs-hyperv
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          sccache: true
+          sccache-s3-bucket: ${{ secrets.S3_BUCKET }}
+          sccache-s3-endpoint: https://${{ secrets.S3_ENDPOINT }}
+          sccache-s3-region: ${{ secrets.S3_REGION }}
+          sccache-s3-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
+          sccache-s3-secret-access-key: ${{ secrets.S3_ACCESS_SECRET }}
+          sccache-key-prefix: sccache-windows-hyperv-e2e
+
+      - name: Restore cargo registry cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-windows-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Install protoc
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protoc'
+          cross-platform: 'true'
+
+      - name: Export PROTOC env
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+
+      - name: Run Windows HCS Hyper-V E2E tests
+        if: steps.check.outputs.completed != 'true'
+        run: cargo test --package zlayer-agent --features hcs-runtime,wsl --test windows_hcs_hyperv_e2e -- --ignored --test-threads=1 --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf target
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-windows-hcs-hyperv
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
@@ -544,8 +1129,11 @@ jobs:
   dispatch-build:
     name: Dispatch Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, macos-sandbox-e2e]
-    if: inputs.version != ''
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, manager-intellitester-tests, raft-e2e-tests, scheduler-unit-tests, macos-sandbox-e2e, windows-hcs-e2e, windows-hcs-hyperv-e2e]
+    # Release dispatch requires `inputs.test == ''` so partial e2e runs
+    # (e.g. `test: manager-intellitester`) never short-circuit into a
+    # build — the other suites would be skipped, not passed.
+    if: inputs.version != '' && inputs.test == '' && !failure() && !cancelled()
     steps:
       - name: Dispatch Build workflow
         run: |

@@ -117,9 +117,9 @@ async fn extract_forwarded_headers() -> ForwardedHeaders {
 /// coexist — the typical login flow emits both a session cookie and a
 /// CSRF-token cookie in one response.
 #[cfg(feature = "ssr")]
-fn propagate_set_cookies(cookies: &[String]) {
+fn propagate_set_cookies(opts: Option<&leptos_axum::ResponseOptions>, cookies: &[String]) {
     use axum::http::{header::SET_COOKIE, HeaderValue};
-    let Some(opts) = use_context::<leptos_axum::ResponseOptions>() else {
+    let Some(opts) = opts else {
         tracing::warn!("ResponseOptions not in context; cannot propagate Set-Cookie headers");
         return;
     };
@@ -146,6 +146,7 @@ async fn forward_raw(
     body: Option<&[u8]>,
     hdr: &ForwardedHeaders,
 ) -> std::result::Result<crate::api_client::RawResponse, ServerFnError> {
+    let response_opts = use_context::<leptos_axum::ResponseOptions>();
     let resp = client
         .raw_request(
             method,
@@ -156,7 +157,7 @@ async fn forward_raw(
         )
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
-    propagate_set_cookies(&resp.set_cookies);
+    propagate_set_cookies(response_opts.as_ref(), &resp.set_cookies);
     Ok(resp)
 }
 

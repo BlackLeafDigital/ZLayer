@@ -1,0 +1,15 @@
+# OverlayMode
+
+## Enum
+
+
+* `AUTO` (value: `"auto"`)
+
+* `SHARED` (value: `"shared"`)
+
+* `DEDICATED` (value: `"dedicated"`)
+
+
+[[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
+
+

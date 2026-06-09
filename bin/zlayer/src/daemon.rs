@@ -28,12 +28,13 @@ use zlayer_api::{
 use zlayer_overlay::NatConfig;
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
+use zlayer_scheduler::raft::{BootstrapState, CoordinatorInit};
 use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
 use zlayer_secrets::{
-    load_or_generate_node_keypair, CredentialStore, KeyManager, PersistentSecretsStore,
-    RaftSecretsHandle, RaftSecretsStore, RecipientPrivateKey, SecretsStore,
+    load_or_generate_node_keypair, CredentialStore, KeyManager, NodeSideEffects,
+    PersistentSecretsStore, RaftSecretsHandle, RaftSecretsStore, RecipientPrivateKey, SecretsStore,
 };
 use zlayer_tunnel::{
     AccessManager, ControlHandler, ListenerManager, NodeTunnelManager, TokenValidator, TunnelError,
@@ -74,6 +75,12 @@ pub(crate) struct NodeConfig {
     pub(crate) is_leader: bool,
     /// Timestamp when node was created
     pub(crate) created_at: String,
+    /// Per-node preferred overlay mode. When `None`, the node defers to the
+    /// cluster-level default (`AgentConfig::overlay_default_mode`). Per-service
+    /// overrides on the spec take precedence over both. Every value eventually
+    /// funnels through [`zlayer_types::overlay::OverlayMode::resolve`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) overlay_preferred_mode: Option<zlayer_types::overlay::OverlayMode>,
 }
 
 /// Generate a unique node ID.
@@ -178,6 +185,14 @@ pub struct DaemonConfig {
     /// Deployment name used for overlay interface naming and DNS zone.
     pub deployment_name: String,
 
+    /// Daemon instance name resolved from the top-level `--daemon-name`
+    /// flag (with a `current_exe()` fallback to the binary's filename and a
+    /// final fallback of `"zlayer"`). Drives the HCS owner tag, the HCN
+    /// overlay network name, and any other per-daemon resource scoping the
+    /// runtime needs at boot. Defaults to `"zlayer"` to preserve the legacy
+    /// single-instance install.
+    pub daemon_name: String,
+
     /// Container runtime selection (Auto, Youki, Docker, etc.).
     pub runtime_config: RuntimeConfig,
 
@@ -187,6 +202,13 @@ pub struct DaemonConfig {
     /// Root data directory (databases, state).
     /// Default: `~/.zlayer` on macOS, `/var/lib/zlayer` (root) or `~/.zlayer` (user) on Linux.
     pub data_dir: PathBuf,
+
+    /// API bind port (the `<port>` half of `--bind <host>:<port>`).
+    /// Threaded through so `init_daemon` can sync the loaded/initialised
+    /// `node_config.api_port` with the daemon's actual listening port —
+    /// otherwise cluster state reports a stale/hardcoded port to
+    /// API clients (e.g. e2e harness).
+    pub api_port: u16,
 
     /// Log directory.  Default: `{data_dir}/logs` on macOS, `/var/log/zlayer` on Linux.
     pub log_dir: PathBuf,
@@ -231,9 +253,11 @@ impl Default for DaemonConfig {
         Self {
             host_network: false,
             deployment_name: "zlayer".to_string(),
+            daemon_name: "zlayer".to_string(),
             runtime_config: RuntimeConfig::Auto,
             dns_port: 15353,
             data_dir,
+            api_port: 3669,
             log_dir,
             run_dir,
             s3_storage: None,
@@ -310,6 +334,14 @@ pub struct DaemonState {
     /// Background task for log rotation (hourly).
     pub log_rotator_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Handle for the background task that periodically prunes expired
+    /// grace entries from the cluster signing keystore (Wave 5A.5).
+    /// Spawned once at init; never cancelled during normal operation.
+    /// The `JoinHandle` is retained on `DaemonState` so the task lives for the
+    /// lifetime of the daemon and is aborted during shutdown (see
+    /// `commands/serve.rs` teardown sequence).
+    pub keystore_pruner_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// Background task for L4 stream backend health checking.
     pub health_checker_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -341,6 +373,16 @@ pub struct DaemonState {
     /// Needed by serve.rs to create `InternalState` with the same token.
     pub internal_token: String,
 
+    /// Per-node side-effect channel fired by the Raft apply wrapper.
+    ///
+    /// `serve.rs` clones this handle into a watcher task that awaits
+    /// [`NodeSideEffects::wait_wipe_join_secret`] and runs the local
+    /// filesystem delete of `{data_dir}/join_secret` on every wake.
+    /// `serve.rs` also consults `coordinator.secrets_state()` at boot
+    /// and forces the same delete if `join_secret_wiped_at` is already
+    /// `Some(_)` (covers the snapshot-restore path on followers).
+    pub node_effects: Arc<NodeSideEffects>,
+
     /// `SQLite` replicator for deployment DB backup to S3.
     /// `None` when S3 storage is not configured.
     pub replicator: Option<Arc<zlayer_storage::SqliteReplicator>>,
@@ -359,6 +401,11 @@ pub struct DaemonState {
     /// is populated by the API handler when a token is created and read by
     /// the tunnel server's [`TokenValidator`].
     pub tunnel_api_state: TunnelApiState,
+
+    /// Capability survey performed at daemon startup. Exposes whether the
+    /// daemon is running with full host privileges, scoped inside another
+    /// container, or in a degraded mode missing critical kernel features.
+    pub capabilities: &'static zlayer_agent::capability::DaemonCapabilities,
 }
 
 /// Bag of tunnel-server runtime handles owned by [`DaemonState`].
@@ -432,6 +479,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
         wireguard_public_key: public_key,
         is_leader: true,
         created_at: current_timestamp(),
+        overlay_preferred_mode: None,
     };
 
     save_node_config(data_dir, &cfg).await?;
@@ -497,6 +545,53 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         "Daemon directories ready"
     );
 
+    // ---------------------------------------------------------------------
+    // Phase 1b: Capability survey
+    //
+    // Probe the daemon's effective execution environment (host vs. nested,
+    // cgroup-write privilege, CAP_NET_ADMIN, /dev/net/tun availability) so
+    // downstream phases can degrade cleanly when running inside another
+    // container (e.g. the CI runner) instead of failing opaquely at
+    // libcontainer time.
+    // ---------------------------------------------------------------------
+    let capabilities = zlayer_agent::capability::DaemonCapabilities::seed(
+        zlayer_agent::capability::DaemonCapabilities::probe(),
+    );
+    info!(
+        mode = ?capabilities.effective_mode,
+        is_root = capabilities.is_root,
+        is_nested = capabilities.is_nested,
+        cgroup_parent = ?capabilities.cgroup_parent,
+        can_write_cgroup_root = capabilities.can_write_cgroup_root,
+        has_cap_net_admin = capabilities.has_cap_net_admin,
+        tun_device_available = capabilities.tun_device_available,
+        "Daemon capability survey complete",
+    );
+
+    // Persist the survey for post-mortem diagnostics. Failures here are
+    // non-fatal: the capability cache is already seeded in-memory and the
+    // on-disk copy is purely a debugging aid.
+    {
+        let capabilities_path = config.data_dir.join("daemon_capabilities.json");
+        match serde_json::to_vec_pretty(capabilities) {
+            Ok(bytes) => {
+                if let Err(err) = tokio::fs::write(&capabilities_path, &bytes).await {
+                    warn!(
+                        path = %capabilities_path.display(),
+                        error = %err,
+                        "Failed to persist daemon capability survey (non-fatal)"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to serialise daemon capability survey (non-fatal)"
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2: Container runtime
     //
@@ -511,13 +606,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             use zlayer_agent::YoukiConfig;
             match config.runtime_config.clone() {
                 RuntimeConfig::Auto => {
-                    // Override Auto with an explicitly configured Youki runtime
-                    // so that the log directory settings are propagated.
-                    let youki_cfg = YoukiConfig {
-                        log_base_dir: Some(config.log_dir.clone()),
-                        deployment_name: Some(config.deployment_name.clone()),
-                        ..Default::default()
-                    };
+                    // Override Auto with an explicitly configured Youki runtime so the
+                    // subdirectories (cache_dir, state_dir, etc.) land under the
+                    // daemon's configured data_dir rather than the platform default,
+                    // and the log directory + deployment name are propagated.
+                    let mut youki_cfg = YoukiConfig::from_data_dir(&config.data_dir);
+                    youki_cfg.log_base_dir = Some(config.log_dir.clone());
+                    youki_cfg.deployment_name = Some(config.deployment_name.clone());
                     RuntimeConfig::Youki(youki_cfg)
                 }
                 RuntimeConfig::Youki(mut youki_cfg) => {
@@ -532,7 +627,36 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 other => other,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            // Override Auto with an explicitly configured HCS runtime so the
+            // resolved `daemon_name` lands on `HcsConfig.daemon_name` —
+            // without this, `create_auto_runtime` falls back to
+            // `HcsConfig::default()` which always uses the legacy
+            // `"zlayer"` owner tag and clobbers any second instance.
+            match config.runtime_config.clone() {
+                RuntimeConfig::Auto => RuntimeConfig::Hcs(zlayer_agent::runtimes::hcs::HcsConfig {
+                    daemon_name: config.daemon_name.clone(),
+                    data_dir: config.data_dir.clone(),
+                    ..zlayer_agent::runtimes::hcs::HcsConfig::default()
+                }),
+                RuntimeConfig::Hcs(mut hcs_cfg) => {
+                    // If the caller built an explicit HcsConfig without
+                    // setting daemon_name (i.e. left it at the default
+                    // `"zlayer"`), inherit the daemon's resolved name so
+                    // per-instance scoping still applies.
+                    if hcs_cfg.daemon_name == "zlayer" && config.daemon_name != "zlayer" {
+                        hcs_cfg.daemon_name.clone_from(&config.daemon_name);
+                    }
+                    // The daemon's resolved `--data-dir` is authoritative for
+                    // the managed-network marker location.
+                    hcs_cfg.data_dir.clone_from(&config.data_dir);
+                    RuntimeConfig::Hcs(hcs_cfg)
+                }
+                other => other,
+            }
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         {
             config.runtime_config.clone()
         }
@@ -551,14 +675,21 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         info!("Host networking mode: skipping overlay network setup");
         None
     } else {
-        match OverlayManager::new(config.deployment_name.clone()).await {
+        match OverlayManager::new(
+            config.deployment_name.clone(),
+            std::process::id().to_string(),
+        )
+        .await
+        {
             Ok(om) => {
                 // Data-dir-aware UAPI socket dir: a daemon launched with
                 // `--data-dir /tmp/foo` writes its boringtun sockets under
                 // `/tmp/foo/run/wireguard` so it does not collide with a
                 // system-wide zlayer install owning `/var/run/wireguard`.
                 let uapi_sock_dir = zlayer_paths::ZLayerDirs::new(&config.data_dir).wireguard();
-                let om = om.with_uapi_sock_dir(uapi_sock_dir);
+                let om = om
+                    .with_uapi_sock_dir(uapi_sock_dir)
+                    .with_data_dir(&config.data_dir);
                 #[cfg(feature = "nat")]
                 let mut om = om.with_nat_config(config.nat.clone());
                 #[cfg(not(feature = "nat"))]
@@ -568,7 +699,10 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 } else {
                     info!("Global overlay network created");
                 }
-                Some(Arc::new(RwLock::new(om)))
+                // Per-container orphan veth sweeping now lives in zlayer-overlayd
+                // (it owns the overlay mechanics); no agent-side sweep to start.
+                let om = Arc::new(RwLock::new(om));
+                Some(om)
             }
             Err(e) => {
                 warn!("Overlay manager init failed: {e}");
@@ -658,6 +792,55 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 match dns.start_background().await {
                     Ok(handle) => {
                         info!(%dns_addr, "DNS server started");
+
+                        // VZ-guest reachability: the loopback listener above is
+                        // unreachable from a VZ Linux guest (it lives in its own
+                        // network namespace and reaches us only over the overlay).
+                        // Bind a SECOND listener on the node's overlay IP, port 53,
+                        // sharing this server's authority, and tell the overlay
+                        // manager to advertise `<node_overlay_ip>:53` to guests as
+                        // their `dns_server`. Compose service names (registered in
+                        // ServiceManager) then resolve from inside the guest.
+                        if let Some(om_arc) = overlay.clone() {
+                            let node_ip = om_arc.read().await.node_ip();
+                            if let Some(node_ip) = node_ip {
+                                // Bind on the node overlay IP at the (non-privileged)
+                                // overlay DNS port. An unprivileged macOS daemon cannot
+                                // bind port 53, so the in-guest vzagent runs a tiny
+                                // 127.0.0.1:53 -> <node_ip>:<dns_port> UDP relay and
+                                // points the workload's resolv.conf at 127.0.0.1. The
+                                // port the guest relays to is the canonical overlay DNS
+                                // port (zlayer_overlay::DEFAULT_DNS_PORT), which equals
+                                // config.dns_port's default.
+                                let guest_dns_addr = SocketAddr::new(node_ip, config.dns_port);
+                                match dns.bind_secondary(guest_dns_addr).await {
+                                    Ok(_) => {
+                                        info!(
+                                            %guest_dns_addr,
+                                            "overlay DNS listener bound on node overlay IP (guest-reachable)"
+                                        );
+                                        // Advertise the node overlay IP to guests as
+                                        // their resolver; the guest relay forwards to
+                                        // <node_ip>:<DEFAULT_DNS_PORT>.
+                                        om_arc.write().await.set_dns_config(
+                                            Some(guest_dns_addr),
+                                            Some(zone.trim_end_matches('.').to_string()),
+                                        );
+                                    }
+                                    Err(e) => warn!(
+                                        %guest_dns_addr,
+                                        "failed to bind overlay DNS listener on node IP \
+                                         (VZ-guest service-name DNS will be unavailable): {e}"
+                                    ),
+                                }
+                            } else {
+                                warn!(
+                                    "overlay manager has no node IP yet; VZ-guest service-name \
+                                     DNS will be unavailable until overlay is up"
+                                );
+                            }
+                        }
+
                         (Some(dns), Some(handle))
                     }
                     Err(e) => {
@@ -924,18 +1107,88 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     info!("Log rotation background task started");
 
     // -----------------------------------------------------------------------
+    // Phase 12b: Cluster signing keystore prune background task (Wave 5A.5)
+    // -----------------------------------------------------------------------
+    let keystore_pruner_handle = {
+        let path = config.data_dir.join("cluster_signing.key");
+        Some(tokio::spawn(async move {
+            keystore_prune_loop(path).await;
+        }))
+    };
+    info!("Cluster signing keystore prune background task started");
+
+    // -----------------------------------------------------------------------
     // Phase 13: Node configuration (auto-init if first run)
     // -----------------------------------------------------------------------
     let mut node_config = load_or_init_node_config(&config.data_dir).await?;
+
+    // Sync node_config.api_port with the actual bind port. Without this,
+    // a node auto-initialised with hardcoded 3669 (or loaded with a stale
+    // value from a prior bind) reports the wrong port to cluster state —
+    // breaks anything (including the e2e harness) that identifies nodes
+    // by their actual API endpoint.
+    if node_config.api_port != config.api_port {
+        info!(
+            previous = node_config.api_port,
+            new = config.api_port,
+            "Updating node_config.api_port to match --bind"
+        );
+        node_config.api_port = config.api_port;
+        save_node_config(&config.data_dir, &node_config)
+            .await
+            .context("Failed to persist updated node_config after api_port sync")?;
+    }
 
     // -----------------------------------------------------------------------
     // Phase 14: Internal token (generated early for Raft auth + Scheduler)
     // -----------------------------------------------------------------------
 
-    // Generate the internal token up-front so the Raft RPC layer, the
-    // Scheduler (for dispatching scale requests), and the API InternalState
-    // (for validating them) all share the same secret.
-    let internal_token = generate_internal_token();
+    // Derive the internal token deterministically from the cluster
+    // `join_secret` so the Raft RPC layer, the Scheduler (for dispatching
+    // scale requests), and the API InternalState (for validating them) all
+    // share the same secret across every node in the cluster.
+    //
+    // Before this, `generate_internal_token` minted a random per-process
+    // value, which meant a leader's outbound Bearer never matched a
+    // follower's validator and every cross-node Raft RPC 401'd. This was
+    // masked by in-process Raft test suites and only surfaced once the
+    // multi-process raft e2e harness landed.
+    let internal_token = {
+        let path = config.data_dir.join("join_secret");
+        let secret = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // First boot on this node: generate-and-persist so subsequent
+                // reads (serve.rs's HS256 loader, generate-join-token, etc.)
+                // see the same value and so cross-node Raft RPCs converge on
+                // one derived bearer. A joiner's `node join` would normally
+                // write this file from the leader's response before serve
+                // starts; the only path that hits this branch is the leader's
+                // very first boot.
+                let bytes: [u8; 32] = rand::random();
+                let fresh = hex::encode(bytes);
+                if let Err(write_err) = tokio::fs::write(&path, &fresh).await {
+                    warn!(
+                        error = %write_err,
+                        path = %path.display(),
+                        "Failed to persist generated join_secret — cross-node Raft RPCs will fail on next restart",
+                    );
+                } else {
+                    info!(path = %path.display(), "Generated cluster join_secret at daemon init");
+                }
+                fresh
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "join_secret read failed at daemon startup; falling back to random internal_token — cross-node Raft RPCs will fail",
+                );
+                hex::encode(rand::random::<[u8; 32]>())
+            }
+        };
+        derive_internal_token(&secret)
+    };
 
     // -----------------------------------------------------------------------
     // Phase 14b: Force-leader recovery check
@@ -957,6 +1210,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         node_config.raft_node_id = 1;
     }
 
+    // Per-node side-effect channel for Raft apply: shared between the
+    // coordinator's apply wrapper (fires the notify) and the watcher task
+    // spawned in `serve.rs` (drains it). Constructed unconditionally so the
+    // handle exists on DaemonState even when Raft fails to initialize — in
+    // that case the watcher never wakes, which is correct.
+    let node_effects = NodeSideEffects::new();
+
     // -----------------------------------------------------------------------
     // Phase 15: Raft distributed consensus
     // -----------------------------------------------------------------------
@@ -977,29 +1237,35 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         // disable the secrets helpers entirely.
         let raft_node_priv: RecipientPrivateKey = (*node_priv).clone();
         let raft_node_uuid = node_config.node_id.clone();
-        match RaftCoordinator::with_auth_and_secrets(
+        match RaftCoordinator::with_auth_secrets_and_effects(
             raft_cfg,
             Some(internal_token.clone()),
             Some(raft_node_priv),
             Some(raft_node_uuid),
+            Some(Arc::clone(&node_effects)),
         )
         .await
         {
-            Ok(coordinator) => {
-                // Bootstrap as single-node cluster if this is the leader (first node)
+            Ok(CoordinatorInit {
+                coordinator,
+                bootstrap_state,
+            }) => {
+                // Bootstrap as single-node cluster if this is the leader AND we
+                // didn't just load existing state from disk. The scheduler reports
+                // BootstrapState::Resuming after detecting prior raft-log/raft-sm
+                // files at construction time — calling bootstrap() in that case
+                // would trigger openraft's internal `error!("Can not initialize")`
+                // even though the daemon would still recover. Gating here keeps
+                // restart logs clean.
                 if node_config.is_leader {
-                    // Check metrics before bootstrapping to avoid openraft's
-                    // internal ERROR log ("Can not initialize") on restart.
-                    let metrics = coordinator.metrics();
-                    if metrics.current_term > 0 {
-                        info!("Raft already bootstrapped (resuming from persisted state)");
-                    } else {
-                        match coordinator.bootstrap().await {
-                            Ok(()) => info!("Raft single-node cluster bootstrapped"),
-                            Err(e) => {
-                                info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
-                            }
+                    match bootstrap_state {
+                        BootstrapState::Resuming => {
+                            info!("Raft already bootstrapped (resuming from persisted state)");
                         }
+                        BootstrapState::Fresh => match coordinator.bootstrap().await {
+                            Ok(()) => info!("Raft single-node cluster bootstrapped"),
+                            Err(e) => warn!("Raft bootstrap failed unexpectedly: {e}"),
+                        },
                     }
 
                     // Register the leader node in the Raft state machine so it
@@ -1043,10 +1309,41 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
                             arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
                             slice_cidr: leader_slice_cidr,
+                            labels: std::collections::HashMap::new(),
                         })
                         .await
                     {
                         warn!("Failed to register leader in Raft state: {e}");
+                    }
+
+                    // Register the leader in the SECRETS node table too, and
+                    // bootstrap the cluster DEK with the leader as the sole
+                    // initial recipient. Without this, the first joiner
+                    // triggers DEK creation from an empty `current.nodes` set
+                    // — the resulting DEK wraps only for the joiner, not the
+                    // leader, and the next join fails with "leader has no
+                    // wrap in current DEK". Idempotent-on-restart via the
+                    // wrapped_dek presence check; we only seed when the
+                    // secrets table is empty.
+                    if coordinator.secrets_state().await.wrapped_dek.is_none() {
+                        let leader_identity = zlayer_types::storage::NodeIdentity {
+                            node_id: node_config.node_id.clone(),
+                            secrets_pubkey: *node_priv.public_key().as_bytes(),
+                            wg_pubkey: node_config.wireguard_public_key.clone(),
+                            joined_at: chrono::Utc::now(),
+                            revoked_at: None,
+                        };
+                        match coordinator
+                            .propose_register_node_and_rotate(leader_identity)
+                            .await
+                        {
+                            Ok(_) => info!(
+                                "Leader registered in secrets node table; cluster DEK initialized"
+                            ),
+                            Err(e) => {
+                                warn!("Failed to bootstrap secrets node table for leader: {e}");
+                            }
+                        }
                     }
                 }
 
@@ -1069,20 +1366,32 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 let coordinator = Arc::new(coordinator);
 
                 // Start Raft RPC server in the background.
-                // Bind to the overlay IP when available so Raft traffic stays on
-                // the encrypted WireGuard mesh. Fall back to 127.0.0.1 (loopback)
-                // in host-networking mode -- never bind to 0.0.0.0.
+                //
+                // Bind raft to whatever `advertise_addr` resolves to. The cluster
+                // topology stores each node's `address` as
+                // `{advertise_addr}:{raft_port}` (see `Request::RegisterNode`
+                // a few lines up + the corresponding propose for joiners), so
+                // peers connect to that exact pair. If we bound the listener to
+                // a different IP (e.g. the overlay IP) the peers' connections
+                // would land on a port no one is listening on and openraft
+                // would log `Unreachable node: ... /raft/append`. In normal
+                // production deploys `advertise_addr` IS the overlay IP, so
+                // this preserves the encrypted-mesh property; in loopback /
+                // host-network test setups `advertise_addr` is `127.0.0.1` and
+                // raft correctly binds there too.
                 let raft_service =
                     RaftService::with_auth(Arc::clone(&coordinator), Some(internal_token.clone()));
 
-                let raft_bind_ip: std::net::IpAddr = if let Some(om) = &overlay {
-                    om.read()
-                        .await
-                        .node_ip()
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                };
+                let raft_bind_ip: std::net::IpAddr = node_config
+                    .advertise_addr
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            advertise_addr = %node_config.advertise_addr,
+                            "advertise_addr is not a parseable IP — falling back to 127.0.0.1 for raft bind. Inter-node raft replication will fail unless advertise_addr resolves at the peer."
+                        );
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    });
                 let raft_addr = std::net::SocketAddr::new(raft_bind_ip, node_config.raft_port);
 
                 let raft_handle = {
@@ -1152,6 +1461,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             raft: RaftConfig {
                 node_id: node_config.raft_node_id,
                 address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
+                data_dir: config.data_dir.join("raft"),
                 ..Default::default()
             },
             ..Default::default()
@@ -1363,6 +1673,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         stream_registry,
         cert_manager,
         log_rotator_handle,
+        keystore_pruner_handle,
         health_checker_handle: Some(health_checker_handle),
         nat_maintenance_handle,
         node_config,
@@ -1372,11 +1683,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         dead_node_detection_handle,
         scheduler,
         internal_token,
+        node_effects,
         replicator,
         job_executor,
         cron_scheduler,
         tunnel: tunnel_handles_opt,
         tunnel_api_state,
+        capabilities,
     })
 }
 
@@ -1455,7 +1768,7 @@ async fn dead_node_detection_loop(
     timeout: std::time::Duration,
 ) {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         // Only the leader should perform dead-node detection.
         if !raft.is_leader() {
@@ -1483,12 +1796,35 @@ async fn dead_node_detection_loop(
                     now_ms = now,
                     "Node missed heartbeat deadline, marking dead"
                 );
-                let _ = raft
-                    .propose(Request::UpdateNodeStatus {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    raft.propose(Request::UpdateNodeStatus {
                         node_id: *id,
                         status: "dead".to_string(),
-                    })
-                    .await;
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        info!(
+                            node_id = id,
+                            "Dead-node propose committed: status updated to dead"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            node_id = id,
+                            error = %e,
+                            "Dead-node propose FAILED — status will not reflect in cluster state"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            node_id = id,
+                            "Dead-node propose TIMED OUT after 2s — openraft client_write blocked; will retry next tick"
+                        );
+                    }
+                }
 
                 // Rebalance voters to maintain odd count (promotes eligible learners
                 // if the dead node was a voter).
@@ -1515,15 +1851,40 @@ async fn dead_node_detection_loop(
     }
 }
 
-/// Generate a random internal token for scheduler-to-agent communication.
-fn generate_internal_token() -> String {
-    use std::fmt::Write;
-    let mut buf = String::with_capacity(64);
-    for _ in 0..32 {
-        let byte: u8 = rand::random();
-        let _ = write!(buf, "{byte:02x}");
+/// Derive the internal Raft bearer token from the cluster `join_secret`.
+///
+/// All nodes that share the `join_secret` produce the same token, so the
+/// leader's outbound `Authorization: Bearer` matches the followers'
+/// validator. The token format is the lowercase hex SHA-256 of a
+/// domain-tagged prefix concatenated with the join secret bytes —
+/// 64 ASCII hex characters, suitable for use as an HTTP bearer.
+fn derive_internal_token(join_secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"zlayer-raft-internal-token-v1\0");
+    hasher.update(join_secret.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(digest)
+}
+
+#[cfg(test)]
+mod internal_token_tests {
+    use super::derive_internal_token;
+
+    #[test]
+    fn derive_internal_token_is_deterministic() {
+        let a = derive_internal_token("deadbeef");
+        let b = derive_internal_token("deadbeef");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // sha256 hex
     }
-    buf
+
+    #[test]
+    fn derive_internal_token_distinguishes_secrets() {
+        let a = derive_internal_token("aaa");
+        let b = derive_internal_token("bbb");
+        assert_ne!(a, b);
+    }
 }
 
 /// Path to the bootstrap wrapped DEK file written by the join handler
@@ -1681,6 +2042,46 @@ async fn log_rotation_loop(log_dir: &std::path::Path, data_dir: &std::path::Path
         // Phase 3: Clean up old log files in the daemon log directory
         if let Err(e) = cleanup_old_logs(log_dir).await {
             warn!(error = %e, "Log cleanup encountered an error");
+        }
+    }
+}
+
+/// Background task: every hour, prune expired grace entries from the
+/// cluster signing keystore.
+///
+/// Mirrors the pattern of [`log_rotation_loop`]: infinite loop, sleep,
+/// do work, log warnings on error, continue. Spawned once during daemon
+/// init (Phase 12b) and held alive via
+/// [`DaemonState::keystore_pruner_handle`].
+///
+/// The actual pruning logic lives in [`zlayer_secrets::prune_expired_grace`],
+/// which removes any `retired_grace_until` entries whose timestamp has passed
+/// and the matching `keys` entries, persisting if anything changed.
+async fn keystore_prune_loop(keystore_path: std::path::PathBuf) {
+    const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+    loop {
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+        match zlayer_secrets::prune_expired_grace(&keystore_path).await {
+            Ok(0) => {
+                tracing::debug!(
+                    path = %keystore_path.display(),
+                    "cluster signing keystore prune: no expired grace entries"
+                );
+            }
+            Ok(n) => {
+                tracing::info!(
+                    path = %keystore_path.display(),
+                    pruned = n,
+                    "cluster signing keystore prune: removed expired grace entries"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %keystore_path.display(),
+                    error = %e,
+                    "cluster signing keystore prune failed; will retry next interval"
+                );
+            }
         }
     }
 }
@@ -2031,15 +2432,38 @@ async fn restore_single_deployment(state: &DaemonState, stored: &StoredDeploymen
 
         // 2. Set up service overlay network (non-fatal if overlay is unavailable)
         if let Some(om) = &state.overlay {
-            let om_guard = om.read().await;
-            match om_guard.setup_service_overlay(name).await {
-                Ok(iface) => {
+            let mode = service_spec
+                .overlay
+                .as_ref()
+                .map(|o| o.mode)
+                .unwrap_or_default();
+            let setup_result = {
+                let om_guard = om.read().await;
+                om_guard.setup_service_overlay(name, mode).await
+            };
+            match setup_result {
+                Ok(info) => {
                     info!(
                         deployment = %deployment_name,
                         service = %name,
-                        interface = %iface,
+                        interface = %info.name,
                         "Restored service overlay"
                     );
+                    // Dedicated mode: republish + re-mesh on every restore.
+                    // This restore loop runs on daemon startup, so wiring the
+                    // distribution here doubles as the boot reconcile backstop
+                    // that self-heals dropped per-service peers.
+                    if let Some(raft) = state.raft.as_ref() {
+                        zlayer_api::distribute_dedicated_service(
+                            raft,
+                            om,
+                            &state.internal_token,
+                            &state.node_config.advertise_addr,
+                            name,
+                            &info,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     warn!(

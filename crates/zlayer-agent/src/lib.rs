@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod autoscale_controller;
 pub mod bundle;
+pub mod capability;
 pub mod cdi;
 pub mod cgroups_stats;
 pub mod container_supervisor;
@@ -19,7 +20,6 @@ pub mod health;
 pub mod init;
 pub mod job;
 pub mod metrics_providers;
-pub mod netlink;
 pub mod overlay_manager;
 pub mod proxy_manager;
 pub mod runtime;
@@ -27,6 +27,7 @@ pub mod runtimes;
 pub mod service;
 pub mod stabilization;
 pub mod storage_manager;
+pub mod worker_client;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -77,6 +78,9 @@ pub use stabilization::{
     wait_for_stabilization, ServiceHealthSummary, StabilizationOutcome, StabilizationResult,
 };
 pub use storage_manager::{StorageError, StorageManager, VolumeInfo};
+pub use worker_client::{
+    WorkerClientError, WorkerClientImpl, WorkerIdentity, WorkerStatusProvider,
+};
 
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -136,9 +140,13 @@ pub enum RuntimeConfig {
     /// Use macOS sandbox-based container runtime
     #[cfg(target_os = "macos")]
     MacSandbox(MacSandboxConfig),
-    /// Use macOS Virtualization.framework for full VM isolation
+    /// Use macOS libkrun micro-VMs for Linux-guest isolation.
     #[cfg(target_os = "macos")]
     MacVm,
+    /// Use Apple `Virtualization.framework` for ephemeral native-macOS guest
+    /// VMs. Opt-in only (never `Auto`); route via `com.zlayer.isolation=vz`.
+    #[cfg(target_os = "macos")]
+    MacVz,
     /// WSL2 backend (deprecated).
     ///
     /// Preserved for one release for back-compat with existing `runtime: wsl2`
@@ -254,6 +262,7 @@ pub fn is_wasm_available() -> bool {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn create_runtime(
     config: RuntimeConfig,
     auth_ctx: Option<ContainerAuthContext>,
@@ -283,7 +292,7 @@ pub async fn create_runtime(
                 auth_ctx.clone(),
             )?);
             let delegate: Option<Arc<dyn Runtime>> = match runtimes::macos_vm::VmRuntime::new(
-                auth_ctx,
+                auth_ctx.clone(),
             ) {
                 Ok(rt) => {
                     tracing::info!(
@@ -299,12 +308,53 @@ pub async fn create_runtime(
                     None
                 }
             };
-            Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
-                primary, delegate,
-            )))
+            // VZ Linux-guest delegate (the default Linux path on macOS). First
+            // party (no dylib), so this normally succeeds.
+            let vz_linux: Option<Arc<dyn Runtime>> =
+                runtimes::macos_vz_linux::VzLinuxRuntime::new(auth_ctx.clone())
+                    .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+                    .ok();
+            // Opt-in VZ delegate (native-macOS guests via `com.zlayer.isolation=vz`).
+            let vz: Option<Arc<dyn Runtime>> = match runtimes::macos_vz::VzRuntime::new(auth_ctx) {
+                Ok(rt) => Some(Arc::new(rt)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "macOS VZ delegate unavailable");
+                    None
+                }
+            };
+            // Point image-OS inspection at BOTH persistent blob caches the
+            // composite's `pull_image` writes into, tried in order:
+            //   1. the VZ-Linux runtime's `{data_dir}/vz/linux/images/blobs.redb`
+            //      (the delegate that actually runs the Linux workload), and
+            //   2. the primary Sandbox runtime's `{data_dir}/images/blobs.redb`.
+            // `pull_image` pulls into BOTH (primary first, then VZ-Linux), and
+            // either pull short-circuits under `IfNotPresent` when its rootfs
+            // already exists — so an already-pulled image's manifest+config may
+            // live in only ONE of the two stores. Probing both (local-only, no
+            // network per cache) lets the composite resolve a locally-cached
+            // Linux image's OS with NO network call — so the workload still
+            // routes to VZ-Linux even when Docker Hub is rate-limiting the
+            // redundant OS re-inspection.
+            let data_dir = zlayer_paths::ZLayerDirs::default_data_dir();
+            let os_inspect_cache_paths = vec![
+                data_dir
+                    .join("vz")
+                    .join("linux")
+                    .join("images")
+                    .join("blobs.redb"),
+                data_dir.join("images").join("blobs.redb"),
+            ];
+            Ok(Arc::new(
+                runtimes::composite::CompositeRuntime::new(primary, delegate)
+                    .with_vz_delegate(vz)
+                    .with_vz_linux_delegate(vz_linux)
+                    .with_os_inspect_cache_paths(os_inspect_cache_paths),
+            ))
         }
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new(auth_ctx)?)),
+        #[cfg(target_os = "macos")]
+        RuntimeConfig::MacVz => Ok(Arc::new(runtimes::macos_vz::VzRuntime::new(auth_ctx)?)),
         #[cfg(target_os = "windows")]
         #[allow(deprecated)]
         RuntimeConfig::Wsl2 => {
@@ -425,11 +475,39 @@ async fn create_auto_runtime(
                 None
             }
         };
+        // Opt-in VZ delegate (native-macOS guests via `com.zlayer.isolation=vz`);
+        // never the default, only used when a service requests it.
+        let vz: Option<Arc<dyn Runtime>> = runtimes::macos_vz::VzRuntime::new(auth_ctx.clone())
+            .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+            .ok();
+        // VZ Linux-guest delegate — the default Linux path on macOS.
+        let vz_linux: Option<Arc<dyn Runtime>> =
+            runtimes::macos_vz_linux::VzLinuxRuntime::new(auth_ctx.clone())
+                .map(|rt| Arc::new(rt) as Arc<dyn Runtime>)
+                .ok();
 
         if let Some(p) = primary {
-            return Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
-                p, delegate,
-            )));
+            // Point image-OS dispatch inspection at BOTH persistent blob caches
+            // the composite's `pull_image` writes into (VZ-Linux first, then the
+            // primary Sandbox store), so an already-pulled image's OS resolves
+            // LOCAL-ONLY with no network round-trip — the cached Linux image
+            // routes to VZ-Linux even when Docker Hub is rate-limiting. Mirrors
+            // the `RuntimeConfig::MacSandbox` arm above.
+            let data_dir = zlayer_paths::ZLayerDirs::default_data_dir();
+            let os_inspect_cache_paths = vec![
+                data_dir
+                    .join("vz")
+                    .join("linux")
+                    .join("images")
+                    .join("blobs.redb"),
+                data_dir.join("images").join("blobs.redb"),
+            ];
+            return Ok(Arc::new(
+                runtimes::composite::CompositeRuntime::new(p, delegate)
+                    .with_vz_delegate(vz)
+                    .with_vz_linux_delegate(vz_linux)
+                    .with_os_inspect_cache_paths(os_inspect_cache_paths),
+            ));
         }
         // If sandbox failed but VM succeeded, use the VM runtime on its own —
         // it's still the best available native macOS path before falling back

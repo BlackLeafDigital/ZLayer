@@ -43,5 +43,12 @@ images:
       - "${REGISTRY}/zlayer-manager:${VERSION}"
       - "${REGISTRY}/zlayer-manager:latest"
 
+  zlayer-e2e-node:
+    file: images/ZImagefile.zlayer-e2e-node
+    context: "."
+    tags:
+      - "${REGISTRY}/zlayer-e2e-node:${VERSION}"
+      - "${REGISTRY}/zlayer-e2e-node:latest"
+
 push:
   after_all: false

@@ -5,21 +5,158 @@
 //! - config.json: OCI runtime specification
 //! - rootfs/: Container filesystem (symlink or bind mount target)
 
+use crate::cdi::{self, CdiContainerEdits, CdiRegistry};
 use crate::error::{AgentError, Result};
 use crate::runtime::ContainerId;
 use oci_spec::runtime::{
-    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDeviceBuilder,
-    LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxMemoryBuilder, LinuxNamespaceBuilder,
-    LinuxNamespaceType, LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder,
-    Spec, SpecBuilder, UserBuilder,
+    Capability, Hook, HookBuilder, Hooks, HooksBuilder, LinuxBuilder, LinuxCapabilitiesBuilder,
+    LinuxCpuBuilder, LinuxDeviceBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType,
+    LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
+    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
+// `LinuxIdMappingBuilder` is only used by the unix-gated rootless user-namespace
+// helpers below; importing it unconditionally trips dead-code lints on Windows.
+#[cfg(unix)]
+use oci_spec::runtime::LinuxIdMappingBuilder;
 use std::collections::{HashMap, HashSet};
+// `MetadataExt` is only meaningful on Unix-like hosts where `/dev/*` nodes exist
+// and have major/minor numbers. On Windows this module is still built so that
+// `BundleBuilder::build_spec_only` (cross-platform OCI Spec generation) can be
+// called from the WSL2 delegate runtime, which then pipes the generated
+// `config.json` into a Linux WSL2 distro that owns the actual device
+// fingerprint. See G-1 / G-2 in the Windows plan. The import is performed
+// inside `get_device_major_minor` itself to avoid an unused-import warning on
+// non-Unix platforms.
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
 use zlayer_secrets::SecretsProvider;
-use zlayer_spec::{ServiceSpec, StorageSpec, StorageTier};
+use zlayer_spec::{GpuSharingMode, ServiceSpec, StorageSpec, StorageTier};
+
+/// Default host directory for the NVIDIA MPS control pipe when the spec
+/// doesn't override [`zlayer_spec::GpuSpec::mps_pipe_dir`].
+const DEFAULT_MPS_PIPE_DIR: &str = "/tmp/nvidia-mps";
+
+/// Default host directory for NVIDIA MPS log output when the spec doesn't
+/// override [`zlayer_spec::GpuSpec::mps_log_dir`].
+const DEFAULT_MPS_LOG_DIR: &str = "/tmp/nvidia-log";
+
+/// Container path where a host-supplied NVIDIA time-slicing config YAML is
+/// surfaced (read-only). The file is informational — `ZLayer` doesn't interpret
+/// it; tools running inside the container can read it to discover slice
+/// topology.
+const TIMESLICE_CONFIG_CONTAINER_PATH: &str = "/etc/nvidia/gpu-time-slicing.yaml";
+
+/// Resolved MPS host directories (pipe + log), validated to exist on disk.
+///
+/// Returned by [`resolve_mps_dirs`] only when `GpuSpec.sharing == Mps`. Both
+/// paths are absolute and guaranteed to be directories at the time the
+/// helper ran — callers can bind-mount them directly.
+struct MpsDirs {
+    pipe_dir: PathBuf,
+    log_dir: PathBuf,
+}
+
+/// Resolve and validate the MPS pipe / log directories for a GPU spec.
+///
+/// Returns `Ok(None)` when sharing is not MPS (or absent), `Ok(Some(...))`
+/// when both directories exist on the host, or
+/// [`AgentError::GpuSharingUnavailable`] when either directory is missing.
+///
+/// Defaults to [`DEFAULT_MPS_PIPE_DIR`] / [`DEFAULT_MPS_LOG_DIR`] when the
+/// spec omits explicit paths, matching the convention used by
+/// `nvidia-cuda-mps-control` out of the box.
+fn resolve_mps_dirs(gpu: &zlayer_spec::GpuSpec) -> Result<Option<MpsDirs>> {
+    if gpu.sharing != Some(GpuSharingMode::Mps) {
+        return Ok(None);
+    }
+
+    let pipe_dir = PathBuf::from(gpu.mps_pipe_dir.as_deref().unwrap_or(DEFAULT_MPS_PIPE_DIR));
+    let log_dir = PathBuf::from(gpu.mps_log_dir.as_deref().unwrap_or(DEFAULT_MPS_LOG_DIR));
+
+    if !pipe_dir.is_dir() {
+        return Err(AgentError::GpuSharingUnavailable {
+            mode: "mps".to_string(),
+            reason: format!(
+                "MPS pipe directory {} does not exist; ensure nvidia-cuda-mps-control is running",
+                pipe_dir.display()
+            ),
+        });
+    }
+    if !log_dir.is_dir() {
+        return Err(AgentError::GpuSharingUnavailable {
+            mode: "mps".to_string(),
+            reason: format!(
+                "MPS log directory {} does not exist; ensure nvidia-cuda-mps-control is running",
+                log_dir.display()
+            ),
+        });
+    }
+
+    Ok(Some(MpsDirs { pipe_dir, log_dir }))
+}
+
+/// Convert a CDI device node descriptor into the OCI [`LinuxDevice`] used by
+/// the runtime.
+///
+/// CDI device nodes may omit `type`, `major`, and `minor` — in that case we
+/// probe the host (via `get_device_type` / `get_device_major_minor`) using
+/// the resolved host path, falling back to character device with zero
+/// major/minor when the file is unavailable (typical for test fixtures
+/// that reference paths that don't exist on the build host).
+fn cdi_node_to_oci_device(
+    node: &crate::cdi::CdiDeviceNode,
+) -> Result<oci_spec::runtime::LinuxDevice> {
+    let host_path = node.host_path.as_deref().unwrap_or(&node.path);
+
+    let dev_type = match node.device_type.as_deref() {
+        Some("c" | "u") => LinuxDeviceType::C,
+        Some("b") => LinuxDeviceType::B,
+        Some("p") => LinuxDeviceType::P,
+        _ => get_device_type(host_path).unwrap_or(LinuxDeviceType::C),
+    };
+
+    let (major, minor) = if let (Some(maj), Some(min)) = (node.major, node.minor) {
+        (maj, min)
+    } else {
+        get_device_major_minor(host_path).unwrap_or((0, 0))
+    };
+
+    let mut builder = LinuxDeviceBuilder::default()
+        .path(node.path.clone())
+        .typ(dev_type)
+        .major(major)
+        .minor(minor);
+    if let Some(mode) = node.file_mode {
+        builder = builder.file_mode(mode);
+    } else {
+        builder = builder.file_mode(0o666u32);
+    }
+    builder = builder.uid(node.uid.unwrap_or(0));
+    builder = builder.gid(node.gid.unwrap_or(0));
+
+    builder.build().map_err(|e| {
+        AgentError::InvalidSpec(format!(
+            "failed to build CDI device {path}: {e}",
+            path = node.path
+        ))
+    })
+}
+
+/// Convert a CDI hook descriptor into the OCI [`Hook`] used by the runtime.
+fn convert_cdi_hook(cdi_hook: &crate::cdi::CdiHook) -> Result<Hook> {
+    let mut builder = HookBuilder::default().path(PathBuf::from(&cdi_hook.path));
+    if !cdi_hook.args.is_empty() {
+        builder = builder.args(cdi_hook.args.clone());
+    }
+    if !cdi_hook.env.is_empty() {
+        builder = builder.env(cdi_hook.env.clone());
+    }
+    builder
+        .build()
+        .map_err(|e| AgentError::InvalidSpec(format!("failed to build CDI hook: {e}")))
+}
 
 /// All Linux capabilities for privileged mode
 const ALL_CAPABILITIES: &[Capability] = &[
@@ -116,6 +253,13 @@ pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
 }
 
 /// Get major and minor device numbers from a device path
+///
+/// Unix-only: relies on `MetadataExt::rdev()` which isn't available on Windows.
+/// When `bundle.rs` is compiled for a Windows host (for the WSL2 delegate's
+/// cross-platform `build_spec_only` path), device probing is skipped entirely —
+/// the Linux side of the delegate is responsible for its own device fingerprint.
+/// The non-Unix stub below returns `Unsupported` so the `if let Ok(..)` /
+/// `.unwrap_or(..)` call sites at the CDI / GPU passthrough paths skip cleanly.
 #[cfg(unix)]
 #[allow(clippy::cast_possible_wrap)]
 fn get_device_major_minor(path: &str) -> std::io::Result<(i64, i64)> {
@@ -138,6 +282,9 @@ fn get_device_major_minor(_path: &str) -> std::io::Result<(i64, i64)> {
 }
 
 /// Detect device type from path
+///
+/// Unix-only: uses `FileTypeExt::is_char_device` / `is_block_device` which are
+/// not available on Windows. See `get_device_major_minor` for the rationale.
 #[cfg(unix)]
 fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
     use std::os::unix::fs::FileTypeExt;
@@ -200,6 +347,13 @@ pub struct BundleBuilder {
     deployment_scope: Option<String>,
     /// Host-side Unix socket path to bind-mount into the container
     socket_path: Option<String>,
+    /// Optional CDI registry override (defaults to discovery from system paths).
+    ///
+    /// Wrapped in `Arc` so [`BundleBuilder`] can stay [`Clone`]. Primarily set
+    /// in tests via [`BundleBuilder::with_cdi_registry`]; production paths
+    /// leave this `None` and lazy-discover via [`CdiRegistry::discover`] when
+    /// a `GpuSpec` is present.
+    cdi_registry: Option<Arc<CdiRegistry>>,
 }
 
 impl std::fmt::Debug for BundleBuilder {
@@ -217,8 +371,66 @@ impl std::fmt::Debug for BundleBuilder {
             .field("secrets_provider", &self.secrets_provider.is_some())
             .field("deployment_scope", &self.deployment_scope)
             .field("socket_path", &self.socket_path)
+            .field("cdi_registry", &self.cdi_registry.is_some())
             .finish()
     }
+}
+
+/// Build OCI `uid_mappings` (or `gid_mappings` — same structure) for a rootless
+/// container. Always emits a single-id mapping (container 0 → `host_id`, size 1).
+/// If `username` has an entry in `subid_path` (e.g. /etc/subuid), appends a
+/// range mapping (container 1 → range start, size = range count).
+///
+/// Rootless user-namespace mapping is a Linux/libcontainer concept; on Windows
+/// containers run via HCS so this helper is unix-only.
+#[cfg(unix)]
+fn build_rootless_id_mappings(
+    host_id: u32,
+    subid_path: &str,
+    username: &str,
+) -> Vec<oci_spec::runtime::LinuxIdMapping> {
+    let mut mappings = vec![LinuxIdMappingBuilder::default()
+        .container_id(0_u32)
+        .host_id(host_id)
+        .size(1_u32)
+        .build()
+        .unwrap()];
+    if !username.is_empty() {
+        if let Some((start, count)) = read_subid_range(subid_path, username) {
+            mappings.push(
+                LinuxIdMappingBuilder::default()
+                    .container_id(1_u32)
+                    .host_id(start)
+                    .size(count)
+                    .build()
+                    .unwrap(),
+            );
+        }
+    }
+    mappings
+}
+
+/// Read /etc/subuid (or /etc/subgid) and return the (start, count) range
+/// allocated to the given username, if any. Returns None on any I/O error
+/// or when the user has no entry — callers must fall back to a single-id
+/// mapping in that case.
+///
+/// Subuid files are a Linux concept and the only caller is the unix-gated
+/// `build_rootless_id_mappings`, so this helper is unix-only as well.
+#[cfg(unix)]
+fn read_subid_range(path: &str, username: &str) -> Option<(u32, u32)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let mut parts = line.splitn(3, ':');
+        let user = parts.next()?;
+        if user != username {
+            continue;
+        }
+        let start: u32 = parts.next()?.parse().ok()?;
+        let count: u32 = parts.next()?.parse().ok()?;
+        return Some((start, count));
+    }
+    None
 }
 
 impl BundleBuilder {
@@ -246,7 +458,20 @@ impl BundleBuilder {
             secrets_provider: None,
             deployment_scope: None,
             socket_path: None,
+            cdi_registry: None,
         }
+    }
+
+    /// Override the CDI registry used for GPU device resolution.
+    ///
+    /// When unset, [`build_oci_spec`](Self::build_oci_spec) discovers CDI
+    /// specs lazily from the standard system search paths (`/etc/cdi`,
+    /// `/var/run/cdi`, plus `$CDI_SPEC_DIRS`). Tests use this setter to
+    /// inject fixture-backed registries pointed at a temp directory.
+    #[must_use]
+    pub fn with_cdi_registry(mut self, registry: Arc<CdiRegistry>) -> Self {
+        self.cdi_registry = Some(registry);
+        self
     }
 
     /// Create a `BundleBuilder` for a container in the default bundle location
@@ -371,6 +596,14 @@ impl BundleBuilder {
     /// # Errors
     /// - `AgentError::CreateFailed` if directory creation fails
     /// - `AgentError::InvalidSpec` if the OCI spec generation fails
+    ///
+    /// # Platform
+    /// Unix-only. Uses `tokio::fs::symlink` which is defined in terms of
+    /// `std::os::unix::fs::symlink` and does not exist on Windows. The Windows
+    /// WSL2 delegate path should call [`BundleBuilder::build_spec_only`] to
+    /// obtain the OCI [`Spec`] and pipe it into the WSL2 distro, where the
+    /// Linux side of the delegate handles bundle directory creation.
+    #[cfg(unix)]
     pub async fn build(&self, container_id: &ContainerId, spec: &ServiceSpec) -> Result<PathBuf> {
         // Create bundle directory
         fs::create_dir_all(&self.bundle_dir)
@@ -428,7 +661,7 @@ impl BundleBuilder {
 
         // Generate OCI runtime spec
         let oci_spec = self
-            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .build_spec_only(container_id, spec, &self.volume_paths)
             .await?;
 
         // Write config.json
@@ -458,15 +691,22 @@ impl BundleBuilder {
     /// Render the OCI runtime spec without creating a bundle directory
     /// or writing `config.json`.
     ///
-    /// Used by the WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`):
-    /// the Windows host renders the spec, then streams the JSON into the
-    /// WSL distro filesystem where `youki` will consume it. The bundle
-    /// path passed to `BundleBuilder::new` is purely informational in
-    /// that flow; this method never touches the filesystem.
+    /// This is the cross-platform entry point for OCI spec generation and is
+    /// the only bundle-builder method that is callable on Windows. Used by the
+    /// WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`): the Windows host
+    /// renders the spec, then streams the JSON into the WSL distro filesystem
+    /// where `youki` will consume it. The bundle path passed to
+    /// `BundleBuilder::new` is purely informational in that flow; this method
+    /// never touches the filesystem.
+    ///
+    /// Unix hosts that want both the spec *and* the on-disk bundle layout
+    /// (rootfs symlink, `config.json`, parent directories) should continue to
+    /// use [`BundleBuilder::build`] or [`BundleBuilder::write_config`].
     ///
     /// # Errors
-    ///
-    /// Returns [`AgentError::InvalidSpec`] if the spec generation fails.
+    /// Returns [`AgentError::InvalidSpec`] if any of the OCI `*Builder` types
+    /// reject the configuration, or if environment-variable secret resolution
+    /// fails.
     pub async fn build_spec_only(
         &self,
         container_id: &ContainerId,
@@ -476,7 +716,87 @@ impl BundleBuilder {
         self.build_oci_spec(container_id, spec, volume_paths).await
     }
 
-    /// Build the OCI runtime spec from `ServiceSpec`
+    /// Resolve CDI edits for a service spec's GPU request, if any.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when the spec has no `GpuSpec`, when the vendor isn't a
+    ///   known CDI-published kind (e.g. `"apple"`), or when no explicit
+    ///   registry was set and lazy discovery turned up no installed specs
+    ///   (production fallback — baked-in defaults take over).
+    /// - `Ok(Some(vec))` with one entry per requested device when CDI specs
+    ///   are available and resolution succeeds.
+    /// - `Err(AgentError::InvalidSpec(...))` when the caller explicitly opted
+    ///   into CDI (via `with_cdi_registry`) but the resolution fails —
+    ///   surfaces [`cdi::CdiError::SpecMissing`] /
+    ///   [`cdi::CdiError::DeviceMissing`] / [`cdi::CdiError::NoDevices`] as
+    ///   actionable strings.
+    fn resolve_cdi_edits(&self, spec: &ServiceSpec) -> Result<Option<Vec<CdiContainerEdits>>> {
+        let Some(ref gpu) = spec.resources.gpu else {
+            return Ok(None);
+        };
+
+        // Map short vendor to CDI kind. Unknown vendors (e.g. "apple") fall
+        // back to baked-in behavior.
+        let Some(kind) = cdi::vendor_to_cdi_kind(&gpu.vendor) else {
+            return Ok(None);
+        };
+
+        // Decide registry source:
+        // - Explicit override: strict mode. Missing kind/device == hard error.
+        // - Lazy discover: opportunistic. Missing kind == silent fallback to
+        //   baked-in defaults so prod hosts without CDI installed keep
+        //   working.
+        let (registry, strict) = if let Some(reg) = &self.cdi_registry {
+            (reg.clone(), true)
+        } else {
+            let reg = Arc::new(CdiRegistry::discover());
+            if reg.is_empty() {
+                return Ok(None);
+            }
+            (reg, false)
+        };
+
+        let device_names: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
+
+        match registry.resolve_for_kind(kind, &device_names) {
+            Ok(edits) => Ok(Some(edits)),
+            Err(err) => {
+                if strict {
+                    Err(AgentError::InvalidSpec(format!(
+                        "CDI resolution failed for vendor '{}': {err}",
+                        gpu.vendor
+                    )))
+                } else {
+                    tracing::warn!(
+                        vendor = %gpu.vendor,
+                        kind = %kind,
+                        error = %err,
+                        "CDI resolution failed; falling back to baked-in GPU device passthrough"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Build the OCI runtime spec from `ServiceSpec`.
+    ///
+    /// The full, CDI-aware implementation that backs both
+    /// [`BundleBuilder::build_spec_only`] (cross-platform, public) and the
+    /// Unix-only [`BundleBuilder::build`] / [`BundleBuilder::write_config`]
+    /// paths that additionally manage the bundle directory on disk.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidSpec`] if any of the OCI `*Builder` types
+    /// reject the configuration, or if environment-variable secret resolution
+    /// fails.
+    ///
+    /// # Panics
+    /// Panics if the builder-internal `MountBuilder::build()` call fails for
+    /// the optional `ZLayer` API socket bind-mount. This is only reachable when
+    /// [`BundleBuilder::with_socket_mount`] has been used with a malformed
+    /// path, and is treated as a programmer error because all fields are
+    /// statically constructed from known-good inputs.
     #[allow(clippy::too_many_lines)]
     async fn build_oci_spec(
         &self,
@@ -484,6 +804,11 @@ impl BundleBuilder {
         spec: &ServiceSpec,
         volume_paths: &std::collections::HashMap<String, PathBuf>,
     ) -> Result<Spec> {
+        // Resolve CDI edits up front. When present, these replace the
+        // baked-in vendor device-node / env injection below; when absent
+        // (no CDI installed, unknown vendor), the legacy code paths run.
+        let cdi_edits = self.resolve_cdi_edits(spec)?;
+
         // Build user: image config user > root (spec doesn't currently have user override)
         let user = {
             let (uid, gid) = if let Some(user_str) = self
@@ -598,10 +923,27 @@ impl BundleBuilder {
             env.push(format!("{key}={value}"));
         }
 
-        // Inject GPU device visibility environment variables based on vendor
-        // and allocated indices so runtimes (CUDA, ROCm, oneAPI) see only
-        // the GPUs assigned to this container.
-        if let Some(ref gpu) = spec.resources.gpu {
+        // GPU device visibility environment variables.
+        //
+        // When CDI edits are available, the vendor-supplied spec is the
+        // source of truth (e.g. NVIDIA's `nvidia-ctk cdi generate` emits
+        // `NVIDIA_VISIBLE_DEVICES` plus driver-capability env on every
+        // device entry). Otherwise fall back to the historical baked-in
+        // strings so non-CDI hosts continue to advertise the right devices
+        // to CUDA/ROCm/oneAPI runtimes.
+        if let Some(ref edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for entry in &edits.env {
+                    if let Some(key) = entry.split('=').next() {
+                        if env_keys.contains(key) {
+                            env.retain(|e| e.split('=').next() != Some(key));
+                        }
+                        env_keys.insert(key.to_string());
+                    }
+                    env.push(entry.clone());
+                }
+            }
+        } else if let Some(ref gpu) = spec.resources.gpu {
             // Default to 0..count when no explicit indices are provided
             let indices: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
             let device_list = indices.join(",");
@@ -618,6 +960,51 @@ impl BundleBuilder {
                     env.push(format!("ZE_AFFINITY_MASK={device_list}"));
                 }
                 _ => {}
+            }
+        }
+
+        // GPU sharing (MPS / time-slicing) env injection.
+        //
+        // Layered on top of the CDI / baked-in `*_VISIBLE_DEVICES` block above:
+        // * MPS: validate host pipe/log dirs exist (error otherwise) and
+        //   export `CUDA_MPS_PIPE_DIRECTORY` / `CUDA_MPS_LOG_DIRECTORY`.
+        // * Time-slicing: override `CUDA_VISIBLE_DEVICES` to the configured
+        //   slice index so the workload sees a single virtualised GPU rather
+        //   than the full 0..count list emitted above.
+        //
+        // The mount side (bind-mounting the MPS dirs / time-slicing config
+        // file) is handled further down where the rest of the mounts get
+        // assembled.
+        let mps_dirs = if let Some(ref gpu) = spec.resources.gpu {
+            resolve_mps_dirs(gpu)?
+        } else {
+            None
+        };
+        if let Some(ref dirs) = mps_dirs {
+            let pipe = format!("CUDA_MPS_PIPE_DIRECTORY={}", dirs.pipe_dir.display());
+            let log = format!("CUDA_MPS_LOG_DIRECTORY={}", dirs.log_dir.display());
+            if env_keys.contains("CUDA_MPS_PIPE_DIRECTORY") {
+                env.retain(|e| e.split('=').next() != Some("CUDA_MPS_PIPE_DIRECTORY"));
+            }
+            if env_keys.contains("CUDA_MPS_LOG_DIRECTORY") {
+                env.retain(|e| e.split('=').next() != Some("CUDA_MPS_LOG_DIRECTORY"));
+            }
+            env_keys.insert("CUDA_MPS_PIPE_DIRECTORY".to_string());
+            env_keys.insert("CUDA_MPS_LOG_DIRECTORY".to_string());
+            env.push(pipe);
+            env.push(log);
+        }
+        if let Some(ref gpu) = spec.resources.gpu {
+            if gpu.sharing == Some(GpuSharingMode::TimeSlice) {
+                if let Some(idx) = gpu.time_slice_index {
+                    // Time-slicing virtualises a single physical GPU as N
+                    // slices; the workload sees one device, addressed by
+                    // its slice index. Override whatever the CDI / baked-in
+                    // path emitted earlier.
+                    env.retain(|e| e.split('=').next() != Some("CUDA_VISIBLE_DEVICES"));
+                    env_keys.insert("CUDA_VISIBLE_DEVICES".to_string());
+                    env.push(format!("CUDA_VISIBLE_DEVICES={idx}"));
+                }
             }
         }
 
@@ -711,8 +1098,97 @@ impl BundleBuilder {
             );
         }
 
+        // Append CDI-provided mounts (e.g. vendor driver libraries that the
+        // GPU runtime needs to expose to the container).
+        if let Some(ref edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for cdi_mount in &edits.mounts {
+                    let mut opts = cdi_mount.options.clone();
+                    if !opts.iter().any(|o| o == "bind" || o == "rbind") {
+                        opts.push("rbind".to_string());
+                    }
+                    mounts.push(
+                        MountBuilder::default()
+                            .destination(cdi_mount.container_path.clone())
+                            .typ("bind")
+                            .source(cdi_mount.host_path.clone())
+                            .options(opts)
+                            .build()
+                            .map_err(|e| {
+                                AgentError::InvalidSpec(format!("failed to build CDI mount: {e}"))
+                            })?,
+                    );
+                }
+            }
+        }
+
+        // GPU sharing mounts.
+        //
+        // MPS: bind-mount the host pipe / log directories into the container
+        // at the same path so the in-container CUDA runtime can talk to the
+        // MPS daemon over its UNIX socket and append to the shared log.
+        // The env vars (`CUDA_MPS_PIPE_DIRECTORY` / `CUDA_MPS_LOG_DIRECTORY`)
+        // are exported earlier in the env-assembly block.
+        //
+        // Time-slicing: optionally surface the host's slicing config YAML at
+        // a well-known read-only path so introspection tools inside the
+        // container can read it.
+        if let Some(ref dirs) = mps_dirs {
+            mounts.push(
+                MountBuilder::default()
+                    .destination(dirs.pipe_dir.clone())
+                    .typ("bind")
+                    .source(dirs.pipe_dir.clone())
+                    .options(vec!["rbind".into(), "rw".into()])
+                    .build()
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!("failed to build MPS pipe mount: {e}"))
+                    })?,
+            );
+            mounts.push(
+                MountBuilder::default()
+                    .destination(dirs.log_dir.clone())
+                    .typ("bind")
+                    .source(dirs.log_dir.clone())
+                    .options(vec!["rbind".into(), "rw".into()])
+                    .build()
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!("failed to build MPS log mount: {e}"))
+                    })?,
+            );
+        }
+        if let Some(ref gpu) = spec.resources.gpu {
+            if gpu.sharing == Some(GpuSharingMode::TimeSlice) {
+                if let Some(ref cfg_path) = gpu.time_slicing_config_path {
+                    let host = PathBuf::from(cfg_path);
+                    if !host.is_file() {
+                        return Err(AgentError::GpuSharingUnavailable {
+                            mode: "time-slice".to_string(),
+                            reason: format!(
+                                "time-slicing config {} is not a regular file on the host",
+                                host.display()
+                            ),
+                        });
+                    }
+                    mounts.push(
+                        MountBuilder::default()
+                            .destination(PathBuf::from(TIMESLICE_CONFIG_CONTAINER_PATH))
+                            .typ("bind")
+                            .source(host)
+                            .options(vec!["rbind".into(), "ro".into()])
+                            .build()
+                            .map_err(|e| {
+                                AgentError::InvalidSpec(format!(
+                                    "failed to build time-slicing config mount: {e}"
+                                ))
+                            })?,
+                    );
+                }
+            }
+        }
+
         // Build Linux-specific config
-        let linux = self.build_linux_config(spec)?;
+        let linux = self.build_linux_config(container_id, spec, cdi_edits.as_deref())?;
 
         // Determine hostname
         let hostname = self
@@ -720,18 +1196,101 @@ impl BundleBuilder {
             .clone()
             .unwrap_or_else(|| container_id.to_string());
 
-        // Build the complete spec
-        let oci_spec = SpecBuilder::default()
+        // Build the complete spec, attaching any CDI-provided hooks.
+        let mut spec_builder = SpecBuilder::default()
             .version("1.0.2".to_string())
             .root(root)
             .process(process)
             .hostname(hostname)
             .mounts(mounts)
-            .linux(linux)
+            .linux(linux);
+
+        if let Some(ref edits_per_device) = cdi_edits {
+            if let Some(hooks) = Self::build_hooks_from_cdi(edits_per_device)? {
+                spec_builder = spec_builder.hooks(hooks);
+            }
+        }
+
+        let oci_spec = spec_builder
             .build()
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {e}")))?;
 
         Ok(oci_spec)
+    }
+
+    /// Convert the union of CDI hooks across all resolved devices into an
+    /// OCI [`Hooks`] block.
+    ///
+    /// Returns `Ok(None)` when no device contributed hooks (so the spec
+    /// builder skips the empty block — `oci-spec` treats `null` as "no
+    /// hooks" while serializers may emit empty arrays otherwise).
+    fn build_hooks_from_cdi(edits_per_device: &[CdiContainerEdits]) -> Result<Option<Hooks>> {
+        let mut prestart: Vec<Hook> = Vec::new();
+        let mut create_runtime: Vec<Hook> = Vec::new();
+        let mut create_container: Vec<Hook> = Vec::new();
+        let mut start_container: Vec<Hook> = Vec::new();
+        let mut poststart: Vec<Hook> = Vec::new();
+        let mut poststop: Vec<Hook> = Vec::new();
+
+        for edits in edits_per_device {
+            let Some(ref h) = edits.hooks else { continue };
+            for hook in &h.prestart {
+                prestart.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.create_runtime {
+                create_runtime.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.create_container {
+                create_container.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.start_container {
+                start_container.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.poststart {
+                poststart.push(convert_cdi_hook(hook)?);
+            }
+            for hook in &h.poststop {
+                poststop.push(convert_cdi_hook(hook)?);
+            }
+        }
+
+        if prestart.is_empty()
+            && create_runtime.is_empty()
+            && create_container.is_empty()
+            && start_container.is_empty()
+            && poststart.is_empty()
+            && poststop.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let mut builder = HooksBuilder::default();
+        if !prestart.is_empty() {
+            #[allow(deprecated)]
+            {
+                builder = builder.prestart(prestart);
+            }
+        }
+        if !create_runtime.is_empty() {
+            builder = builder.create_runtime(create_runtime);
+        }
+        if !create_container.is_empty() {
+            builder = builder.create_container(create_container);
+        }
+        if !start_container.is_empty() {
+            builder = builder.start_container(start_container);
+        }
+        if !poststart.is_empty() {
+            builder = builder.poststart(poststart);
+        }
+        if !poststop.is_empty() {
+            builder = builder.poststop(poststop);
+        }
+
+        let hooks = builder
+            .build()
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build CDI hooks: {e}")))?;
+        Ok(Some(hooks))
     }
 
     /// Build Linux capabilities configuration
@@ -1157,7 +1716,14 @@ impl BundleBuilder {
     }
 
     /// Build Linux-specific configuration
-    fn build_linux_config(&self, spec: &ServiceSpec) -> Result<oci_spec::runtime::Linux> {
+    #[allow(clippy::similar_names)] // euid/egid are POSIX-standard paired names
+    #[allow(clippy::too_many_lines)]
+    fn build_linux_config(
+        &self,
+        container_id: &ContainerId,
+        spec: &ServiceSpec,
+        cdi_edits: Option<&[CdiContainerEdits]>,
+    ) -> Result<oci_spec::runtime::Linux> {
         // Build namespaces
         let mut namespaces = vec![
             LinuxNamespaceBuilder::default()
@@ -1190,7 +1756,53 @@ impl BundleBuilder {
             );
         }
 
+        // `nix::unistd` is unix-only. On non-unix targets (Windows), libcontainer
+        // is not the runtime path (HCS is) and this function is effectively dead
+        // code — so we statically force `rootless = false` there and skip the
+        // user-namespace mapping block entirely.
+        #[cfg(unix)]
+        let rootless = !nix::unistd::geteuid().is_root();
+        #[cfg(not(unix))]
+        let rootless = false;
+
+        if rootless {
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::User)
+                    .build()
+                    .unwrap(),
+            );
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Cgroup)
+                    .build()
+                    .unwrap(),
+            );
+        }
+
         let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
+
+        #[cfg(unix)]
+        if rootless {
+            let euid = nix::unistd::geteuid();
+            let egid = nix::unistd::getegid();
+            let username = nix::unistd::User::from_uid(euid)
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_default();
+            linux_builder = linux_builder
+                .uid_mappings(build_rootless_id_mappings(
+                    euid.as_raw(),
+                    "/etc/subuid",
+                    &username,
+                ))
+                .gid_mappings(build_rootless_id_mappings(
+                    egid.as_raw(),
+                    "/etc/subgid",
+                    &username,
+                ));
+        }
 
         // Build resources (CPU, memory, devices)
         let resources = self.build_resources(spec)?;
@@ -1198,8 +1810,20 @@ impl BundleBuilder {
             linux_builder = linux_builder.resources(resources);
         }
 
-        // Build device entries for passthrough
-        let devices = self.build_devices(spec, None)?;
+        // Build device entries for passthrough.
+        //
+        // When CDI edits are present, the vendor-supplied device-node list
+        // replaces our baked-in vendor-specific defaults — CDI knows the
+        // host's exact device geometry (which majors/minors map to which
+        // GPUs) so we trust it over our static `/dev/nvidiaN` enumeration.
+        let mut devices = self.build_devices(spec, None, cdi_edits.is_some())?;
+        if let Some(edits_per_device) = cdi_edits {
+            for edits in edits_per_device {
+                for node in &edits.device_nodes {
+                    devices.push(cdi_node_to_oci_device(node)?);
+                }
+            }
+        }
         if !devices.is_empty() {
             linux_builder = linux_builder.devices(devices);
         }
@@ -1238,6 +1862,138 @@ impl BundleBuilder {
             linux_builder = linux_builder
                 .masked_paths(masked_paths)
                 .readonly_paths(readonly_paths);
+        }
+
+        // Determine cgroups_path so libcontainer creates the container cgroup
+        // under the current process's cgroup rather than at the v2 root. This
+        // is required when running inside another container (e.g. Forgejo CI
+        // `container:` block) where `/sys/fs/cgroup/cgroup.subtree_control` is
+        // read-only. Precedence:
+        //   1. spec.cgroup_parent (per-service override)         — all platforms
+        //   2. ZLAYER_CGROUP_PARENT env var (host-wide override) — all platforms
+        //   3. /proc/self/cgroup (auto-detect when nested)       — Linux only
+        //   4. unset (default — bare-metal happy path; also the WSL2-delegate
+        //      case on non-Linux hosts, where libcontainer inside the WSL
+        //      distro resolves the parent at `zlayer runtime create` time)
+        let cid = container_id.to_string();
+
+        // Explicit overrides are honored on every platform: a user might pin a
+        // cgroup_parent for a WSL-delegate-bound spec even when this process
+        // is running on Windows.
+        let explicit_parent: Option<(String, &'static str)> =
+            if let Some(p) = spec.cgroup_parent.as_deref().filter(|s| !s.is_empty()) {
+                Some((p.to_string(), "spec"))
+            } else if let Some(p) = std::env::var("ZLAYER_CGROUP_PARENT")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                Some((p, "env"))
+            } else {
+                None
+            };
+
+        // Auto-detect (and the "no writable parent" hard error below) are
+        // Linux-only: they inspect /proc/self/cgroup and /sys/fs/cgroup, which
+        // don't exist on Windows hosts. When the bundle is destined for the
+        // WSL2 delegate, cgroup-parent resolution happens inside the distro
+        // at `zlayer runtime create` time, not here on the host.
+        #[cfg(target_os = "linux")]
+        let auto_parent: Option<(String, &'static str)> =
+            if let Some(p) = crate::capability::ensure_daemon_leaf_and_container_parent() {
+                Some((p, "auto-init"))
+            } else if let Some(p) = crate::capability::current_cgroup_v2_path() {
+                // Fallback: migration failed (likely cgroup root is read-only); use the
+                // raw scope path. Pre-fix behaviour — surfaces the original error.
+                Some((p, "auto"))
+            } else {
+                None
+            };
+        #[cfg(not(target_os = "linux"))]
+        let auto_parent: Option<(String, &'static str)> = None;
+
+        let (cgroup_parent_value, cgroup_parent_source): (Option<String>, &'static str) =
+            explicit_parent
+                .or(auto_parent)
+                .map_or((None, "none"), |(p, s)| (Some(p), s));
+
+        // Diagnostic guard rail: capability survey says we're nested, but we
+        // couldn't resolve a cgroup parent here. This combination should not
+        // normally happen because both code paths consult the same
+        // `current_cgroup_v2_path()` helper. Surface it so an operator can
+        // investigate; do not fail container creation. Linux-only — the
+        // capability survey is itself a no-op on non-Linux.
+        #[cfg(target_os = "linux")]
+        if cgroup_parent_value.is_none() && crate::capability::DaemonCapabilities::get().is_nested {
+            tracing::warn!(
+                container_id = %cid,
+                "capability survey reports nested daemon but cgroup_parent could not be resolved — proceeding with v2 root"
+            );
+        }
+
+        if let Some(parent) = cgroup_parent_value {
+            let parent = parent.trim_end_matches('/');
+            let full = format!("{parent}/{cid}");
+            match cgroup_parent_source {
+                "spec" => tracing::info!(
+                    container_id = %cid,
+                    source = "spec",
+                    path = %full,
+                    "cgroup_parent selected"
+                ),
+                "env" => tracing::info!(
+                    container_id = %cid,
+                    source = "env",
+                    path = %full,
+                    "cgroup_parent selected"
+                ),
+                "auto" => tracing::info!(
+                    container_id = %cid,
+                    source = "auto",
+                    path = %full,
+                    "cgroup_parent selected (from /proc/self/cgroup)"
+                ),
+                "auto-init" => tracing::info!(
+                    container_id = %cid,
+                    source = "auto-init",
+                    path = %full,
+                    "cgroup_parent selected (migrated daemon to <scope>/init; containers go under <scope>/containers)"
+                ),
+                _ => unreachable!(),
+            }
+            linux_builder = linux_builder.cgroups_path(std::path::PathBuf::from(full));
+        } else {
+            // Auto-detect found nothing AND no explicit override. Behaviour
+            // differs by platform:
+            //   - Linux: this is a real error in nested-container envs where
+            //     the cgroup root is read-only. Emit the hard error so an
+            //     operator fixes the env.
+            //   - Non-Linux (Windows host building a bundle for the WSL2
+            //     delegate): expected path; cgroup setup happens inside the
+            //     distro at runtime-create time.
+            #[cfg(target_os = "linux")]
+            {
+                let caps = crate::capability::DaemonCapabilities::get();
+                if !caps.can_write_cgroup_root {
+                    return Err(AgentError::InvalidSpec(format!(
+                        "cannot create container {cid}: no writable cgroup parent. \
+                         /proc/self/cgroup reports the cgroup-v2 root, and \
+                         /sys/fs/cgroup is read-only to this process. Fix one of: \
+                         (a) run the daemon's outer container with --cgroupns=host \
+                         so /proc/self/cgroup reports a real parent; \
+                         (b) set ZLAYER_CGROUP_PARENT=/path/to/writable/cgroup; \
+                         (c) grant the daemon write access to /sys/fs/cgroup."
+                    )));
+                }
+                tracing::info!(
+                    container_id = %cid,
+                    "cgroup_parent unset — libcontainer will use v2 root (cgroup root is writable here)"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            tracing::debug!(
+                container_id = %cid,
+                "non-Linux host — cgroup_parent unset; libcontainer inside the WSL distro will resolve a parent from its cgroup-v2 root"
+            );
         }
 
         linux_builder
@@ -1361,7 +2117,10 @@ impl BundleBuilder {
                 rules.push(rule);
             }
 
-            // Allow specific devices from spec
+            // Allow specific devices from spec (Unix-only: requires /dev/* fs
+            // probing via `MetadataExt::rdev`). On Windows the WSL2 delegate
+            // path regenerates these inside the Linux distro, so we skip here.
+            #[cfg(unix)]
             for device in &spec.devices {
                 if let Ok((major, minor)) = get_device_major_minor(&device.path) {
                     let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
@@ -1503,257 +2262,315 @@ impl BundleBuilder {
     }
 
     /// Build Linux device entries for passthrough
+    ///
+    /// # Platform
+    /// Every branch below walks `/dev/*` on the host to resolve major/minor
+    /// numbers via `MetadataExt::rdev`. On Windows (where this module is
+    /// compiled only to feed the WSL2 delegate's cross-platform spec path) we
+    /// skip device discovery and return an empty list — the Linux side of the
+    /// delegate re-runs this step inside the WSL2 distro.
     #[allow(clippy::unused_self, clippy::too_many_lines)]
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::needless_return))]
     fn build_devices(
         &self,
         spec: &ServiceSpec,
         gpu_indices: Option<&[u32]>,
+        skip_gpu_defaults: bool,
     ) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
-        let mut devices = Vec::new();
-
-        for device in &spec.devices {
-            if let Ok((major, minor)) = get_device_major_minor(&device.path) {
-                let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
-
-                let linux_device = LinuxDeviceBuilder::default()
-                    .path(device.path.clone())
-                    .typ(dev_type)
-                    .major(major)
-                    .minor(minor)
-                    .file_mode(0o666u32)
-                    .uid(0u32)
-                    .gid(0u32)
-                    .build()
-                    .map_err(|e| {
-                        AgentError::InvalidSpec(format!(
-                            "failed to build device {}: {}",
-                            device.path, e
-                        ))
-                    })?;
-
-                devices.push(linux_device);
-            }
+        #[cfg(not(unix))]
+        {
+            let _ = (spec, gpu_indices, skip_gpu_defaults);
+            return Ok(Vec::new());
         }
 
-        // Auto-inject GPU devices when gpu spec is set
-        if let Some(ref gpu) = spec.resources.gpu {
-            let indices: Vec<u32> =
-                gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
+        #[cfg(unix)]
+        {
+            let mut devices = Vec::new();
 
-            match gpu.vendor.as_str() {
-                "nvidia" => {
-                    // Always needed: nvidiactl, nvidia-uvm, nvidia-uvm-tools
-                    let always_devices =
-                        ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"];
-                    for dev_path in &always_devices {
-                        if let Ok((major, minor)) = get_device_major_minor(dev_path) {
-                            let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path((*dev_path).to_string())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+            for device in &spec.devices {
+                if let Ok((major, minor)) = get_device_major_minor(&device.path) {
+                    let dev_type = get_device_type(&device.path).unwrap_or(LinuxDeviceType::C);
 
-                    // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/nvidia{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+                    let linux_device = LinuxDeviceBuilder::default()
+                        .path(device.path.clone())
+                        .typ(dev_type)
+                        .major(major)
+                        .minor(minor)
+                        .file_mode(0o666u32)
+                        .uid(0u32)
+                        .gid(0u32)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build device {}: {}",
+                                device.path, e
+                            ))
+                        })?;
+
+                    devices.push(linux_device);
                 }
-                "amd" => {
-                    // AMD ROCm: /dev/kfd is always required for compute
-                    let amd_always_devices = ["/dev/kfd"];
-                    for dev_path in &amd_always_devices {
-                        if let Ok((major, minor)) = get_device_major_minor(dev_path) {
-                            let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path((*dev_path).to_string())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+            }
 
-                    // DRI render nodes: /dev/dri/renderD128, renderD129, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+            // When CDI is providing GPU device descriptors the caller will
+            // append the vendor-supplied entries; skip our hard-coded
+            // `/dev/nvidiaN` enumeration so we don't end up with both sources
+            // of truth.
+            if skip_gpu_defaults {
+                return Ok(devices);
+            }
 
-                    // DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/card{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
-                }
-                "intel" => {
-                    // Intel GPU: DRI render nodes /dev/dri/renderD128, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
-                        }
-                    }
+            // Auto-inject GPU devices when gpu spec is set
+            if let Some(ref gpu) = spec.resources.gpu {
+                let indices: Vec<u32> =
+                    gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
 
-                    // Intel DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/card{i}");
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
+                match gpu.vendor.as_str() {
+                    "nvidia" => {
+                        // Always needed: nvidiactl, nvidia-uvm, nvidia-uvm-tools
+                        let always_devices =
+                            ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"];
+                        for dev_path in &always_devices {
+                            if let Ok((major, minor)) = get_device_major_minor(dev_path) {
+                                let dev_type =
+                                    get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path((*dev_path).to_string())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/nvidia{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
                         }
                     }
-                }
-                other => {
-                    // Unknown vendor - try DRI render nodes as default
-                    tracing::warn!(
-                        vendor = %other,
-                        "Unknown GPU vendor, attempting DRI device passthrough"
-                    );
-                    for i in &indices {
-                        let dev_path = format!("/dev/dri/renderD{}", 128 + i);
-                        if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
-                            let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
-                            let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.clone())
-                                .typ(dev_type)
-                                .major(major)
-                                .minor(minor)
-                                .file_mode(0o666u32)
-                                .uid(0u32)
-                                .gid(0u32)
-                                .build()
-                                .map_err(|e| {
-                                    AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {dev_path}: {e}"
-                                    ))
-                                })?;
-                            devices.push(linux_device);
-                        } else {
-                            tracing::warn!("GPU device {} not found on host, skipping", dev_path);
+                    "amd" => {
+                        // AMD ROCm: /dev/kfd is always required for compute
+                        let amd_always_devices = ["/dev/kfd"];
+                        for dev_path in &amd_always_devices {
+                            if let Ok((major, minor)) = get_device_major_minor(dev_path) {
+                                let dev_type =
+                                    get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path((*dev_path).to_string())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // DRI render nodes: /dev/dri/renderD128, renderD129, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // DRI card nodes: /dev/dri/card0, card1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/card{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                    "intel" => {
+                        // Intel GPU: DRI render nodes /dev/dri/renderD128, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+
+                        // Intel DRI card nodes: /dev/dri/card0, card1, etc.
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/card{i}");
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
+                        }
+                    }
+                    other => {
+                        // Unknown vendor - try DRI render nodes as default
+                        tracing::warn!(
+                            vendor = %other,
+                            "Unknown GPU vendor, attempting DRI device passthrough"
+                        );
+                        for i in &indices {
+                            let dev_path = format!("/dev/dri/renderD{}", 128 + i);
+                            if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
+                                let dev_type =
+                                    get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
+                                let linux_device = LinuxDeviceBuilder::default()
+                                    .path(dev_path.clone())
+                                    .typ(dev_type)
+                                    .major(major)
+                                    .minor(minor)
+                                    .file_mode(0o666u32)
+                                    .uid(0u32)
+                                    .gid(0u32)
+                                    .build()
+                                    .map_err(|e| {
+                                        AgentError::InvalidSpec(format!(
+                                            "failed to build GPU device {dev_path}: {e}"
+                                        ))
+                                    })?;
+                                devices.push(linux_device);
+                            } else {
+                                tracing::warn!(
+                                    "GPU device {} not found on host, skipping",
+                                    dev_path
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Ok(devices)
+            Ok(devices)
+        } // end #[cfg(unix)]
     }
 
     /// Generate the OCI spec and write config.json to the bundle directory
@@ -1774,7 +2591,7 @@ impl BundleBuilder {
     ) -> Result<PathBuf> {
         // Generate OCI runtime spec
         let oci_spec = self
-            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .build_spec_only(container_id, spec, &self.volume_paths)
             .await?;
 
         // Write config.json
@@ -1874,6 +2691,13 @@ impl BundleBuilder {
 ///
 /// # Errors
 /// Returns an error if bundle creation fails.
+///
+/// # Platform
+/// Unix-only — wraps [`BundleBuilder::build`], which uses
+/// `tokio::fs::symlink` (not available on Windows). Windows callers should
+/// use [`BundleBuilder::build_spec_only`] directly and pipe the result into
+/// a WSL2 delegate.
+#[cfg(unix)]
 pub async fn create_bundle(
     container_id: &ContainerId,
     spec: &ServiceSpec,
@@ -1927,6 +2751,7 @@ services:
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn mock_spec_with_resources() -> ServiceSpec {
         serde_yaml::from_str::<DeploymentSpec>(
             r"
@@ -1955,6 +2780,7 @@ services:
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn mock_privileged_spec() -> ServiceSpec {
         serde_yaml::from_str::<DeploymentSpec>(
             r"
@@ -2004,10 +2830,7 @@ services:
     #[test]
     fn test_bundle_builder_for_container() {
         let dirs = zlayer_paths::ZLayerDirs::system_default();
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
         let builder = BundleBuilder::for_container(&id);
         assert_eq!(builder.bundle_dir(), dirs.bundles().join("myservice-rep-1"));
     }
@@ -2020,17 +2843,15 @@ services:
         assert_eq!(builder.rootfs_path, Some(dirs.rootfs().join("myimage")));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_basic() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2044,17 +2865,15 @@ services:
         assert!(oci_spec.linux().is_some());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_with_resources() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec_with_resources();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2072,17 +2891,15 @@ services:
         assert_eq!(memory.limit(), Some(512 * 1024 * 1024)); // 512Mi
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_privileged() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_privileged_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2102,18 +2919,16 @@ services:
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_oci_spec_environment() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec_with_resources();
         let builder = BundleBuilder::new("/tmp/test-bundle".into())
             .with_env("EXTRA_VAR".to_string(), "extra_value".to_string());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
 
@@ -2129,17 +2944,15 @@ services:
         assert!(env.iter().any(|e| e.starts_with("PATH=")));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_namespaces() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
@@ -2157,17 +2970,15 @@ services:
         assert!(namespace_types.contains(&LinuxNamespaceType::Network));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_build_namespaces_host_network() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into()).with_host_network(true);
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
             .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
@@ -2402,12 +3213,10 @@ services:
         assert!(result.is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_oci_spec_includes_storage_mounts() {
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
@@ -2433,7 +3242,7 @@ services:
         let volume_paths = std::collections::HashMap::new();
 
         let oci_spec = builder
-            .build_oci_spec(&id, &spec, &volume_paths)
+            .build_spec_only(&id, &spec, &volume_paths)
             .await
             .unwrap();
 
@@ -2449,5 +3258,444 @@ services:
         assert!(destinations.contains(&"/dev".to_string())); // default
         assert!(destinations.contains(&"/app/data".to_string())); // storage bind
         assert!(destinations.contains(&"/app/tmp".to_string())); // storage tmpfs
+    }
+
+    fn mock_gpu_spec(vendor: &str, count: u32) -> ServiceSpec {
+        let yaml = format!(
+            "
+version: v1
+deployment: test
+services:
+  test:
+    rtype: service
+    image:
+      name: test:latest
+    resources:
+      gpu:
+        count: {count}
+        vendor: {vendor}
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+"
+        );
+        serde_yaml::from_str::<DeploymentSpec>(&yaml)
+            .unwrap()
+            .services
+            .remove("test")
+            .unwrap()
+    }
+
+    fn write_nvidia_cdi_fixture(dir: &std::path::Path, json: &str) {
+        std::fs::write(dir.join("nvidia.json"), json).unwrap();
+    }
+
+    fn nvidia_cdi_fixture() -> &'static str {
+        r#"{
+            "cdiVersion": "0.6.0",
+            "kind": "nvidia.com/gpu",
+            "devices": [{
+                "name": "0",
+                "containerEdits": {
+                    "deviceNodes": [
+                        {"path": "/dev/nvidia0", "type": "c", "major": 195, "minor": 0}
+                    ],
+                    "env": ["NVIDIA_VISIBLE_DEVICES=0"],
+                    "hooks": {
+                        "createContainer": [{
+                            "path": "/usr/bin/nvidia-container-runtime-hook",
+                            "args": ["nvidia-container-runtime-hook", "prestart"]
+                        }]
+                    }
+                }
+            }]
+        }"#
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gpu_spec_translates_to_cdi_device_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nvidia_cdi_fixture(dir.path(), nvidia_cdi_fixture());
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        let builder = BundleBuilder::new("/tmp/test-bundle-cdi".into()).with_cdi_registry(registry);
+
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with CDI fixture");
+
+        // CDI device node merged into linux.devices
+        let linux = oci_spec.linux().as_ref().expect("linux config present");
+        let devices = linux.devices().as_ref().expect("devices present");
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.path() == std::path::Path::new("/dev/nvidia0")),
+            "expected /dev/nvidia0 from CDI fixture; got {:?}",
+            devices
+                .iter()
+                .map(oci_spec::runtime::LinuxDevice::path)
+                .collect::<Vec<_>>()
+        );
+
+        // CDI env var merged into process.env
+        let process = oci_spec.process().as_ref().expect("process present");
+        let env = process.env().as_ref().expect("env present");
+        assert!(
+            env.iter().any(|e| e == "NVIDIA_VISIBLE_DEVICES=0"),
+            "expected NVIDIA_VISIBLE_DEVICES=0 in env; got {env:?}"
+        );
+
+        // CDI hook merged into hooks.createContainer
+        let hooks = oci_spec.hooks().as_ref().expect("hooks present");
+        let create_container = hooks
+            .create_container()
+            .as_ref()
+            .expect("createContainer hooks present");
+        assert_eq!(create_container.len(), 1);
+        assert_eq!(
+            create_container[0].path(),
+            &std::path::PathBuf::from("/usr/bin/nvidia-container-runtime-hook")
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_missing_cdi_returns_error() {
+        // Empty tempdir — no CDI specs installed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-missing".into()).with_cdi_registry(registry);
+
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when CDI registry is empty");
+
+        match err {
+            AgentError::InvalidSpec(msg) => {
+                assert!(
+                    msg.contains("nvidia") || msg.contains("CDI"),
+                    "error should mention CDI / vendor; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_unknown_device_returns_error() {
+        // Spec has device "0" but the request will ask for two GPUs (so the
+        // resolver will look for "1" and fail).
+        let dir = tempfile::tempdir().unwrap();
+        write_nvidia_cdi_fixture(dir.path(), nvidia_cdi_fixture());
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 2);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-unknown".into()).with_cdi_registry(registry);
+
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when device '1' is not declared");
+        match err {
+            AgentError::InvalidSpec(msg) => {
+                assert!(
+                    msg.contains("'1'") || msg.contains("device"),
+                    "error should mention the missing device; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gpu_spec_with_all_devices_expands_to_all_in_spec() {
+        // Fixture with two declared devices ("0" and "1").
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = r#"{
+            "cdiVersion": "0.6.0",
+            "kind": "nvidia.com/gpu",
+            "devices": [
+                {
+                    "name": "0",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=0"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia0", "type": "c", "major": 195, "minor": 0}
+                        ]
+                    }
+                },
+                {
+                    "name": "1",
+                    "containerEdits": {
+                        "env": ["NVIDIA_VISIBLE_DEVICES=1"],
+                        "deviceNodes": [
+                            {"path": "/dev/nvidia1", "type": "c", "major": 195, "minor": 1}
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        write_nvidia_cdi_fixture(dir.path(), fixture);
+        let registry = std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir.path()]));
+
+        // Resolve "all" via the registry directly to validate expansion
+        // semantics independently of how we map count -> names.
+        let edits = registry
+            .resolve_for_kind("nvidia.com/gpu", &["all".to_string()])
+            .expect("resolve all");
+        assert_eq!(edits.len(), 2);
+
+        // Now build the bundle for a 2-GPU service and confirm both nodes
+        // land in linux.devices.
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 2);
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-cdi-all".into()).with_cdi_registry(registry);
+
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with 2-device fixture");
+
+        let devices = oci_spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .devices()
+            .as_ref()
+            .expect("devices present");
+        let paths: Vec<_> = devices.iter().map(|d| d.path().clone()).collect();
+        assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia0")));
+        assert!(paths.contains(&std::path::PathBuf::from("/dev/nvidia1")));
+    }
+
+    /// Build the standard fixture-backed CDI registry used by the MPS /
+    /// time-slicing tests. Identical to the helper used by the 5.A CDI
+    /// tests above but expressed as a closure-style helper to keep each test
+    /// self-contained.
+    fn build_nvidia_cdi_registry(dir: &std::path::Path) -> std::sync::Arc<crate::cdi::CdiRegistry> {
+        write_nvidia_cdi_fixture(dir, nvidia_cdi_fixture());
+        std::sync::Arc::new(crate::cdi::CdiRegistry::discover_from(&[dir]))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gpu_spec_with_mps_sharing_injects_env_and_mounts() {
+        // Stage host-side MPS directories in a tempdir so the resolver's
+        // `is_dir()` check passes without touching /tmp/nvidia-mps on the
+        // real host.
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let mps_root = tempfile::tempdir().unwrap();
+        let pipe_dir = mps_root.path().join("nvidia-mps");
+        let log_dir = mps_root.path().join("nvidia-log");
+        std::fs::create_dir(&pipe_dir).unwrap();
+        std::fs::create_dir(&log_dir).unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::Mps);
+        gpu.mps_pipe_dir = Some(pipe_dir.to_string_lossy().into_owned());
+        gpu.mps_log_dir = Some(log_dir.to_string_lossy().into_owned());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-mps-env".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with MPS sharing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        let pipe_expect = format!("CUDA_MPS_PIPE_DIRECTORY={}", pipe_dir.display());
+        let log_expect = format!("CUDA_MPS_LOG_DIRECTORY={}", log_dir.display());
+        assert!(
+            env.iter().any(|e| e == &pipe_expect),
+            "expected {pipe_expect} in env; got {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == &log_expect),
+            "expected {log_expect} in env; got {env:?}"
+        );
+
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.destination() == &pipe_dir && m.source().as_ref() == Some(&pipe_dir)),
+            "expected bind mount of MPS pipe dir {}; got destinations {:?}",
+            pipe_dir.display(),
+            mounts.iter().map(Mount::destination).collect::<Vec<_>>()
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.destination() == &log_dir && m.source().as_ref() == Some(&log_dir)),
+            "expected bind mount of MPS log dir {}",
+            log_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_spec_with_mps_sharing_fails_when_pipe_dir_missing() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::Mps);
+        // Path that demonstrably does not exist — tempdir() returns a unique
+        // path so appending "definitely-not-here" gives a guaranteed miss.
+        let missing = tempfile::tempdir().unwrap();
+        let missing_path = missing.path().join("definitely-not-here");
+        gpu.mps_pipe_dir = Some(missing_path.to_string_lossy().into_owned());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-mps-missing".into()).with_cdi_registry(registry);
+        let err = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("should fail when MPS pipe dir is missing");
+        match err {
+            AgentError::GpuSharingUnavailable { mode, reason } => {
+                assert_eq!(mode, "mps");
+                assert!(
+                    reason.contains("pipe") || reason.contains(&missing_path.display().to_string()),
+                    "reason should mention the missing path; got: {reason}"
+                );
+            }
+            other => panic!("expected GpuSharingUnavailable, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gpu_spec_with_timeslicing_injects_visible_devices() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_gpu_spec("nvidia", 1);
+        let gpu = spec.resources.gpu.as_mut().expect("gpu spec set");
+        gpu.sharing = Some(zlayer_spec::GpuSharingMode::TimeSlice);
+        gpu.time_slice_index = Some(2);
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-timeslice".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build with time-slicing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        // Time-slicing must clobber any earlier `CUDA_VISIBLE_DEVICES` (e.g.
+        // the CDI-emitted full-device list) to advertise exactly the slice.
+        let cuda_entries: Vec<&String> = env
+            .iter()
+            .filter(|e| e.starts_with("CUDA_VISIBLE_DEVICES="))
+            .collect();
+        assert_eq!(
+            cuda_entries.len(),
+            1,
+            "exactly one CUDA_VISIBLE_DEVICES expected; got {cuda_entries:?}"
+        );
+        assert_eq!(cuda_entries[0], "CUDA_VISIBLE_DEVICES=2");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gpu_spec_without_sharing_omits_mps_env() {
+        let cdi_dir = tempfile::tempdir().unwrap();
+        let registry = build_nvidia_cdi_registry(cdi_dir.path());
+
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_gpu_spec("nvidia", 1);
+        assert!(spec.resources.gpu.as_ref().unwrap().sharing.is_none());
+
+        let builder =
+            BundleBuilder::new("/tmp/test-bundle-no-sharing".into()).with_cdi_registry(registry);
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect("build without sharing");
+
+        let env = oci_spec
+            .process()
+            .as_ref()
+            .and_then(|p| p.env().as_ref())
+            .expect("env present");
+        assert!(
+            !env.iter().any(|e| e.starts_with("CUDA_MPS_")),
+            "no CUDA_MPS_* env should be present without sharing; got {env:?}"
+        );
+
+        // No MPS mount should be added either. The 5.A CDI fixture mounts a
+        // /dev/nvidia0 device but never bind-mounts /tmp/nvidia-mps; verify
+        // we don't sneak that in.
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| { m.destination().to_string_lossy().contains("nvidia-mps") }),
+            "no MPS pipe mount should be present without sharing"
+        );
+    }
+
+    #[cfg(unix)]
+    mod subid_tests {
+        use super::super::read_subid_range;
+        use std::io::Write;
+
+        #[test]
+        fn read_subid_range_returns_range_for_user() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            writeln!(tmp, "alice:100000:65536").unwrap();
+            writeln!(tmp, "bob:165536:65536").unwrap();
+            tmp.flush().unwrap();
+            let path = tmp.path().to_str().unwrap();
+            assert_eq!(read_subid_range(path, "bob"), Some((165_536, 65_536)));
+            assert_eq!(read_subid_range(path, "alice"), Some((100_000, 65_536)));
+        }
+
+        #[test]
+        fn read_subid_range_returns_none_for_unknown_user() {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            writeln!(tmp, "alice:100000:65536").unwrap();
+            tmp.flush().unwrap();
+            assert_eq!(
+                read_subid_range(tmp.path().to_str().unwrap(), "carol"),
+                None
+            );
+        }
+
+        #[test]
+        fn read_subid_range_returns_none_on_missing_file() {
+            assert_eq!(
+                read_subid_range("/this/path/does/not/exist/subuid", "anyone"),
+                None
+            );
+        }
     }
 }

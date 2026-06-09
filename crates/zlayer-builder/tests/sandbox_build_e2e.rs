@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use zlayer_builder::sandbox_builder::{SandboxImageBuilder, SandboxImageConfig};
 use zlayer_builder::Dockerfile;
+use zlayer_paths::ZLayerDirs;
 use zlayer_registry::{BlobCache, ImagePuller, RegistryAuth};
 
 /// Helper: generate a unique temp directory name for test isolation.
@@ -23,7 +24,9 @@ fn test_data_dir(prefix: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let dir = std::env::temp_dir().join(format!("zlayer-sandbox-e2e-{prefix}-{ts}"));
+    let dir = ZLayerDirs::system_default()
+        .tmp()
+        .join(format!("zlayer-sandbox-e2e-{prefix}-{ts}"));
     std::fs::create_dir_all(&dir).expect("failed to create test data dir");
     dir
 }
@@ -37,6 +40,7 @@ fn test_data_dir(prefix: &str) -> PathBuf {
 /// This validates the platform resolver, which must select the correct
 /// architecture manifest from the multi-arch index.
 #[tokio::test]
+#[ignore = "live network: pulls alpine:3.20 from Docker Hub (run with --ignored)"]
 async fn test_pull_alpine_manifest() {
     let cache = BlobCache::new().expect("failed to create blob cache");
     let puller = ImagePuller::new(cache);
@@ -68,6 +72,7 @@ async fn test_pull_alpine_manifest() {
 /// Pull the full image (manifest + layers) for `alpine:3.20` and verify the
 /// layer data is non-empty.
 #[tokio::test]
+#[ignore = "live network: pulls alpine:3.20 from Docker Hub (run with --ignored)"]
 async fn test_pull_alpine_layers() {
     let cache = BlobCache::new().expect("failed to create blob cache");
     let puller = ImagePuller::new(cache);
@@ -101,7 +106,9 @@ async fn test_pull_alpine_layers() {
 /// output rootfs and config.json are created.
 #[tokio::test]
 async fn test_sandbox_build_simple() {
-    let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+    let tmp = ZLayerDirs::system_default()
+        .scratch_dir("test-sandbox-build-simple-")
+        .expect("failed to create temp dir");
     let context_dir = tmp.path().join("context");
     std::fs::create_dir_all(&context_dir).expect("failed to create context dir");
 
@@ -184,7 +191,9 @@ async fn test_sandbox_build_simple() {
 /// resulting `config.json` captures them correctly.
 #[tokio::test]
 async fn test_sandbox_build_env_workdir() {
-    let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+    let tmp = ZLayerDirs::system_default()
+        .scratch_dir("test-sandbox-build-env-workdir-")
+        .expect("failed to create temp dir");
     let context_dir = tmp.path().join("context");
     std::fs::create_dir_all(&context_dir).expect("failed to create context dir");
 

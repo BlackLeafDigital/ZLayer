@@ -4,6 +4,11 @@
 # Options (set as environment variables before running):
 #   $env:ZLAYER_VERSION = "0.9.6"         - Install specific version
 #   $env:ZLAYER_INSTALL_DIR = "C:\path"   - Custom install directory
+#   $env:ZLAYER_SETUP_HYPERV = "yes"      - Enable the Hyper-V + Containers
+#                                           Windows features needed for native
+#                                           Windows containers (requires a
+#                                           reboot). Off by default; when unset
+#                                           the installer only prints guidance.
 
 $ErrorActionPreference = 'Stop'
 
@@ -244,6 +249,84 @@ try {
             Write-Host "  Retry later with 'wsl --install --no-distribution' in an elevated shell,"
             Write-Host "  or run 'zlayer node init --install-wsl yes' to be prompted again."
         }
+    }
+
+    # --- Hyper-V + Containers features (opt-in; required for native Windows
+    #     containers) ---
+    # The HCS runtime needs the `Containers` Windows feature to create compute
+    # systems at all, and `Microsoft-Hyper-V-All` to run Hyper-V-isolated
+    # containers. Hyper-V isolation is mandatory on client SKUs (Win10/11)
+    # whenever the container image build does not match the host build — e.g.
+    # nanoserver:ltsc2022 (20348) on a 24H2 host (26100) can ONLY run
+    # Hyper-V-isolated. Enabling both features installs the UVM boot files at
+    # %ProgramData%\Microsoft\Windows\Hyper-V\Containers that the runtime boots
+    # from.
+    #
+    # This is a heavy, reboot-requiring change, so it is strictly opt-in via
+    # $env:ZLAYER_SETUP_HYPERV. When unset we only print guidance. WSL2-only
+    # (Linux container) users never need this.
+    Write-Host ""
+    Write-Host "Checking Windows container features (Hyper-V + Containers)..."
+    $WantHyperV = $false
+    if ($env:ZLAYER_SETUP_HYPERV) {
+        switch ($env:ZLAYER_SETUP_HYPERV.ToLower()) {
+            { $_ -in 'yes', 'y', '1', 'true' } { $WantHyperV = $true }
+        }
+    }
+
+    # Best-effort state probe (Get-WindowsOptionalFeature needs elevation to be
+    # fully reliable, but the read usually works unelevated; treat failure as
+    # "unknown" rather than aborting).
+    $HyperVState = $null
+    $ContainersState = $null
+    try {
+        $HyperVState = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop).State
+        $ContainersState = (Get-WindowsOptionalFeature -Online -FeatureName Containers -ErrorAction Stop).State
+    }
+    catch {
+        # Leave both null — we'll fall through to the guidance/opt-in path.
+    }
+
+    if ($HyperVState -eq 'Enabled' -and $ContainersState -eq 'Enabled') {
+        Write-Host "  Hyper-V + Containers already enabled." -ForegroundColor Green
+    }
+    elseif ($WantHyperV) {
+        Write-Host "  Enabling Microsoft-Hyper-V-All + Containers (UAC prompt will appear)..."
+        Write-Host "  This requires a reboot to finish." -ForegroundColor Yellow
+        # DISM is the most reliable elevated path for batch feature enablement.
+        # /norestart so we control the reboot messaging; exit 3010 = reboot req.
+        $DismArgs = "/online /enable-feature /featurename:Microsoft-Hyper-V-All /featurename:Containers /all /norestart"
+        try {
+            $Proc = Start-Process -FilePath "dism.exe" `
+                -ArgumentList $DismArgs `
+                -Verb RunAs -Wait -PassThru -ErrorAction Stop
+            switch ($Proc.ExitCode) {
+                0 {
+                    Write-Host "  Features enabled. Reboot to finish, then native Windows containers will work." -ForegroundColor Green
+                }
+                3010 {
+                    Write-Host "  Features enabled; REBOOT REQUIRED to complete setup." -ForegroundColor Yellow
+                }
+                default {
+                    Write-Host "  DISM exited with code $($Proc.ExitCode)." -ForegroundColor Yellow
+                    Write-Host "  Retry in an elevated shell:" -ForegroundColor Yellow
+                    Write-Host "    dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /featurename:Containers /all"
+                }
+            }
+        }
+        catch {
+            # Most common path: user clicked No on the UAC prompt.
+            Write-Host "  Feature enablement was cancelled or failed: $_" -ForegroundColor Yellow
+            Write-Host "  Retry later in an elevated shell:" -ForegroundColor Yellow
+            Write-Host "    dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /featurename:Containers /all"
+        }
+    }
+    else {
+        Write-Host "  Not enabled. Native Windows containers need the Hyper-V + Containers features." -ForegroundColor Yellow
+        Write-Host "  Re-run with `$env:ZLAYER_SETUP_HYPERV='yes' to enable them (reboot required)," -ForegroundColor Yellow
+        Write-Host "  or enable manually in an elevated shell:" -ForegroundColor Yellow
+        Write-Host "    dism /online /enable-feature /featurename:Microsoft-Hyper-V-All /featurename:Containers /all"
+        Write-Host "  (Linux-only / WSL2 users can ignore this.)"
     }
 
     # --- Install PowerShell completions (fail-soft) ---

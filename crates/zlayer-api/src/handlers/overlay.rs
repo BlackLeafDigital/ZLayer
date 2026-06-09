@@ -1,10 +1,15 @@
 //! Overlay network status endpoints
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use tokio::sync::RwLock;
 pub use zlayer_types::api::overlay::*;
+use zlayer_types::overlay::OverlayMode;
 
 use crate::error::{ApiError, Result};
 use zlayer_agent::OverlayManager;
@@ -100,8 +105,10 @@ pub async fn get_overlay_status(
     let port = guard.overlay_port();
     let active = guard.has_global_transport();
 
-    // Count service transports as peers (each service overlay is a peer context)
-    let peer_count = guard.service_transport_count().await;
+    // Count per-service bridge contexts (one per service overlay). Renamed
+    // from `service_transport_count` in v0.51 alongside the bridge rewrite
+    // (P9a) — local variable name and the underlying method now agree.
+    let service_bridge_count = guard.service_bridge_count().await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -114,8 +121,8 @@ pub async fn get_overlay_status(
         node_ip,
         cidr,
         port,
-        total_peers: peer_count,
-        healthy_peers: if active { peer_count } else { 0 },
+        total_peers: service_bridge_count,
+        healthy_peers: if active { service_bridge_count } else { 0 },
         unhealthy_peers: 0,
         last_check: now,
     }))
@@ -155,15 +162,103 @@ pub async fn get_overlay_peers(
         }));
     }
 
-    // Service transports represent active per-service overlay connections.
-    // Report them as peers with their service names as identifiers.
-    let peer_count = guard.service_transport_count().await;
+    // Per-service bridge contexts (each service overlay is one entry).
+    let service_bridge_count = guard.service_bridge_count().await;
 
     Ok(Json(PeerListResponse {
-        total: peer_count,
-        healthy: peer_count,
+        total: service_bridge_count,
+        healthy: service_bridge_count,
         peers: vec![],
     }))
+}
+
+/// Get the overlay status for a single service.
+///
+/// Returns the resolved overlay mode (after `resolve`) and the
+/// per-node bridge map describing where on each node the service's
+/// overlay terminates.
+///
+/// In v0.51 this endpoint is a stub: the bridge map is always empty and
+/// the mode is always `Shared` (the only implemented mode). Real wiring
+/// lands in P9a once `OverlayManager` exposes a per-service bridge view.
+///
+/// # Errors
+///
+/// Returns 503 if the overlay manager is not initialised (host
+/// networking mode). The 404 case (service unknown to this node) is
+/// reserved for the post-P9a implementation; today the stub always
+/// responds with an empty bridge map for any name.
+#[utoipa::path(
+    get,
+    path = "/api/v1/overlay/services/{name}",
+    params(
+        ("name" = String, Path, description = "Service name")
+    ),
+    responses(
+        (status = 200, description = "Service overlay status", body = ServiceOverlayStatus),
+        (status = 503, description = "Overlay not initialized"),
+    ),
+    tag = "Overlay"
+)]
+pub async fn get_service_overlay_status(
+    State(state): State<OverlayApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<ServiceOverlayStatus>> {
+    // The endpoint is reachable even in host-networking mode (the manager
+    // UI hits it on every service detail page) but we surface 503 when no
+    // overlay is configured rather than lying with an empty payload.
+    if state.overlay.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "Overlay not initialized (host networking mode)".to_string(),
+        ));
+    }
+
+    Ok(Json(ServiceOverlayStatus {
+        service: name,
+        mode: OverlayMode::Auto.resolve(),
+        bridges_by_node: HashMap::new(),
+    }))
+}
+
+/// Get the bridge attachment for a service on a specific node.
+///
+/// In v0.51 this endpoint is a stub: the bridge map is not yet populated
+/// by the overlay manager, so every call returns 404. The endpoint
+/// contract is defined now so adapter crates (zlayer-docker, manager UI,
+/// Python SDK) can consume it day-one once P9a wires the real bridges.
+///
+/// # Errors
+///
+/// Returns 503 if the overlay manager is not initialised, and 404 in all
+/// other cases until P9a lands.
+#[utoipa::path(
+    get,
+    path = "/api/v1/overlay/services/{name}/bridges/{node_id}",
+    params(
+        ("name" = String, Path, description = "Service name"),
+        ("node_id" = String, Path, description = "Node ID")
+    ),
+    responses(
+        (status = 200, description = "Bridge info for this service on this node", body = BridgeInfo),
+        (status = 404, description = "No bridge found for this service on this node"),
+        (status = 503, description = "Overlay not initialized"),
+    ),
+    tag = "Overlay"
+)]
+pub async fn get_service_bridge(
+    State(state): State<OverlayApiState>,
+    Path((name, node_id)): Path<(String, String)>,
+) -> Result<Json<BridgeInfo>> {
+    if state.overlay.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "Overlay not initialized (host networking mode)".to_string(),
+        ));
+    }
+
+    Err(ApiError::NotFound(format!(
+        "service '{name}' has no bridge on node '{node_id}' yet \
+         (service bridges not yet populated in v0.51)",
+    )))
 }
 
 /// Get IP allocation status.
@@ -419,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_overlay_status_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -436,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_overlay_peers_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -450,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_ip_allocation_with_manager() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -696,7 +791,7 @@ mod tests {
     /// surfaces the configured STUN defaults and an empty candidate list.
     #[tokio::test]
     async fn test_get_nat_status_with_manager_no_traversal() {
-        let om = OverlayManager::new("test-deploy".to_string())
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
             .await
             .unwrap();
         let om = Arc::new(RwLock::new(om));
@@ -749,5 +844,91 @@ mod tests {
             "server-reflexive"
         );
         assert_eq!(candidate_kind_str(CandidateType::Relay), "relay");
+    }
+
+    // =========================================================================
+    // Service overlay status / bridge stubs (P4.5b)
+    //
+    // These cover the day-one contract for `GET
+    // /api/v1/overlay/services/{name}` and
+    // `GET /api/v1/overlay/services/{name}/bridges/{node_id}`. The real
+    // wiring lands in P9a once the bridge map is populated by the overlay
+    // manager; these tests pin down what adapter crates can rely on today.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_service_overlay_status_returns_unavailable_when_none() {
+        let state = OverlayApiState::new();
+        let result = get_service_overlay_status(State(state), Path("test-svc".to_string())).await;
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::ServiceUnavailable(msg)) => {
+                assert!(msg.contains("Overlay not initialized"));
+            }
+            _ => panic!("Expected ServiceUnavailable error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_service_overlay_status_returns_shared_stub_with_manager() {
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let result = get_service_overlay_status(State(state), Path("test-svc".to_string())).await;
+        assert!(result.is_ok(), "stub should succeed with a live manager");
+        let Json(status) = result.unwrap();
+        assert_eq!(status.service, "test-svc");
+        // v0.51 always resolves Auto -> Shared
+        assert_eq!(status.mode, OverlayMode::Shared);
+        assert!(
+            status.bridges_by_node.is_empty(),
+            "bridge map is unpopulated until P9a lands"
+        );
+
+        // Pin the wire shape: mode must serialise as "shared", and
+        // `bridges_by_node` must be an empty object.
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"service\":\"test-svc\""));
+        assert!(json.contains("\"mode\":\"shared\""));
+        assert!(json.contains("\"bridges_by_node\":{}"));
+    }
+
+    #[tokio::test]
+    async fn test_get_service_bridge_returns_unavailable_when_none() {
+        let state = OverlayApiState::new();
+        let result = get_service_bridge(
+            State(state),
+            Path(("test-svc".to_string(), "node-xyz".to_string())),
+        )
+        .await;
+        match result {
+            Err(ApiError::ServiceUnavailable(msg)) => {
+                assert!(msg.contains("Overlay not initialized"));
+            }
+            other => panic!("Expected ServiceUnavailable error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_service_bridge_returns_not_found_with_manager() {
+        let om = OverlayManager::new("test-deploy".to_string(), "test".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let result = get_service_bridge(
+            State(state),
+            Path(("test-svc".to_string(), "node-xyz".to_string())),
+        )
+        .await;
+        match result {
+            Err(ApiError::NotFound(msg)) => {
+                assert!(msg.contains("test-svc"));
+                assert!(msg.contains("node-xyz"));
+            }
+            other => panic!("Expected NotFound error, got {other:?}"),
+        }
     }
 }

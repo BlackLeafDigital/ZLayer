@@ -81,16 +81,26 @@ impl AccessSession {
     }
 
     /// Check if the session has expired
+    ///
+    /// A session is expired once the current instant has reached (not merely
+    /// passed) `expires_at`, so a zero-duration TTL is expired immediately and
+    /// deterministically — without relying on the monotonic clock ticking
+    /// between construction and this check.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.expires_at.is_some_and(|e| Instant::now() > e)
+        self.expires_at.is_some_and(|e| Instant::now() >= e)
     }
 
     /// Get the remaining TTL for the session
+    ///
+    /// Returns `None` once the session is expired (zero or negative remaining),
+    /// mirroring [`Self::is_expired`]; otherwise the strictly-positive time left.
     #[must_use]
     pub fn remaining_ttl(&self) -> Option<Duration> {
-        self.expires_at
-            .and_then(|e| e.checked_duration_since(Instant::now()))
+        self.expires_at.and_then(|e| {
+            let now = Instant::now();
+            (e > now).then(|| e - now)
+        })
     }
 
     /// Add bytes to the transfer counters

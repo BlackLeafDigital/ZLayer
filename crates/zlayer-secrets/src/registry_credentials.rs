@@ -184,9 +184,12 @@ impl<S: SecretsStore> RegistryCredentialStore<S> {
 mod tests {
     use super::*;
     use crate::{EncryptionKey, PersistentSecretsStore};
+    use zlayer_paths::ZLayerDirs;
 
-    async fn create_test_store() -> (PersistentSecretsStore, tempfile::TempDir) {
-        let temp_dir = tempfile::tempdir().unwrap();
+    async fn create_test_store() -> (PersistentSecretsStore, zlayer_types::Scratch) {
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("create-test-store-")
+            .unwrap();
         let db_path = temp_dir.path().join("test_registry_creds.sqlite");
         let key = EncryptionKey::generate();
         let store = PersistentSecretsStore::open(&db_path, key).await.unwrap();

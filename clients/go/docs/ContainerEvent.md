@@ -4,7 +4,7 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**At** | **time.Time** | Wall-clock time the event was emitted.  Serialized as an RFC 3339 string on the wire. Typed as [&#x60;chrono::DateTime&lt;Utc&gt;&#x60;] in-process for ergonomic manipulation; the &#x60;#[schema(value_type &#x3D; String, format &#x3D; DateTime)]&#x60; attribute teaches &#x60;utoipa&#x60; to render a proper string schema in the &#x60;OpenAPI&#x60; output. | 
+**At** | **time.Time** | Wall-clock time the event was emitted.  Serialized as an RFC 3339 string on the wire. | 
 **ExitCode** | Pointer to **NullableInt32** | Exit code, when known. Populated for &#x60;Die&#x60; events where a wait has already resolved; otherwise &#x60;None&#x60;. | [optional] 
 **Id** | **string** | Container identifier (the API&#39;s id string, not the raw runtime id). | 
 **Kind** | [**ContainerEventKind**](ContainerEventKind.md) | What kind of transition this event represents. | 

@@ -6,10 +6,12 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::info;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use axum::Router;
 
-use crate::config::ApiConfig;
+use crate::config::{ApiConfig, ApiTlsConfig};
 use crate::router::build_router;
 
 /// Persist the local-admin bearer token to disk so a local `DaemonClient` can
@@ -71,6 +73,147 @@ fn persist_admin_bearer(bearer: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TLS plumbing
+//
+// Wave 2 of the join-token hardening wires `ApiTlsConfig` into the TCP
+// listener so the verifying-key endpoint cannot be trivially MitM-ed.
+// Mirrors the proxy's rustls + tokio-rustls stack (see
+// `crates/zlayer-proxy/src/tls.rs` and `acme.rs`) — uses `axum-server`
+// 0.8 with its `tls-rustls` feature, which is a thin tokio-rustls wrapper
+// that integrates with axum's `Router` make-service. No second TLS stack.
+// ---------------------------------------------------------------------------
+
+/// Load a static cert + key pair from disk into a `RustlsConfig`.
+///
+/// PEM-format only. The `axum-server` helper internally calls
+/// `ServerConfig::builder().with_no_client_auth().with_single_cert(...)`,
+/// which requires a default `rustls::CryptoProvider`. We install one
+/// idempotently before the call so unrelated test ordering can't break it.
+///
+/// # Errors
+///
+/// Returns an error if either file cannot be read or the PEM cannot be
+/// parsed as a valid certificate chain + private key pair.
+async fn load_static_rustls_config(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    install_default_crypto_provider();
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load TLS cert+key from {} / {}: {e}",
+                cert_path.display(),
+                key_path.display(),
+            )
+        })
+}
+
+/// Build an `axum-server` `RustlsConfig` from the proxy's `CertManager`.
+///
+/// Wraps `CertManager::build_server_config`, which itself wraps a fresh
+/// `SniCertResolver` populated from the manager's current cert cache.
+/// Hot-reload is a Wave 2.4 concern — for the join-token verifying-key
+/// listener, restarting the daemon on cert renewal is acceptable since
+/// renewals happen every ~60-90 days.
+///
+/// # Errors
+///
+/// Returns an error if any cached certificate fails to load into the
+/// SNI resolver (malformed PEM, key/cert mismatch, etc.).
+async fn load_managed_rustls_config(
+    cert_manager: &zlayer_proxy::CertManager,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    install_default_crypto_provider();
+    let server_config = cert_manager
+        .build_server_config()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to build TLS config from cert manager: {e}"))?;
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        server_config,
+    ))
+}
+
+/// Idempotently install a default `rustls::CryptoProvider`.
+///
+/// rustls 0.23 with both `aws-lc-rs` and `ring` features compiled in
+/// refuses to pick a default automatically and panics if a builder is
+/// called without one installed. The workspace pin enables `aws-lc-rs`
+/// as the rustls default feature, so we install that. Safe to call
+/// repeatedly — the second call returns `Err` which we discard.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        // Discarded `Err` means a provider is already installed — fine.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// Serve a TCP listener with optional rustls TLS termination.
+///
+/// Used by every TCP-listening entry point in this module so the
+/// `Option<ApiTlsConfig>` branch lives in exactly one place. UDS
+/// listeners stay plaintext — they live on the local filesystem with
+/// 0o660 perms, so wrapping them in TLS would buy nothing.
+///
+/// `shutdown` is awaited concurrently with the accept loop. For plain
+/// HTTP it integrates with `axum::serve::with_graceful_shutdown`; for
+/// TLS it spawns a small task that flips the `axum_server::Handle`'s
+/// graceful-shutdown signal when the future resolves.
+///
+/// # Errors
+///
+/// Returns an error if loading the TLS config fails or the underlying
+/// HTTP/HTTPS server returns an error during operation.
+async fn serve_tcp_with_optional_tls(
+    listener: TcpListener,
+    router: Router,
+    tls: Option<&ApiTlsConfig>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
+
+    match tls {
+        None => {
+            axum::serve(listener, make_service)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+            Ok(())
+        }
+        Some(tls_config) => {
+            let rustls_config = match tls_config {
+                ApiTlsConfig::Static {
+                    cert_path,
+                    key_path,
+                } => load_static_rustls_config(cert_path, key_path).await?,
+                ApiTlsConfig::Managed { cert_manager } => {
+                    load_managed_rustls_config(cert_manager).await?
+                }
+            };
+
+            // Convert tokio listener -> std listener so `axum-server` can
+            // own it. `into_std()` sets non-blocking mode implicitly.
+            let std_listener = listener.into_std()?;
+
+            let handle = axum_server::Handle::new();
+            let handle_for_shutdown = handle.clone();
+            tokio::spawn(async move {
+                shutdown.await;
+                handle_for_shutdown.graceful_shutdown(None);
+            });
+
+            axum_server::from_tcp_rustls(std_listener, rustls_config)?
+                .handle(handle)
+                .serve(make_service)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+    }
+}
+
 /// Pre-bound TCP and Unix listeners ready to be handed to [`serve_bound`].
 ///
 /// Created by [`bind_dual_with_local_auth`] so that the Unix socket file
@@ -89,6 +232,27 @@ pub struct BoundListeners {
     pub local_bearer: String,
     /// Filesystem path of the Unix socket (kept for cleanup on shutdown).
     pub unix_path: std::path::PathBuf,
+    /// Optional TLS configuration applied to the TCP listener at
+    /// [`serve_bound`] time. `None` (the default) keeps today's plaintext
+    /// HTTP behaviour. The UDS listener is always plaintext — it's gated
+    /// by 0o660 perms + local-bearer injection, so TLS would buy nothing.
+    /// Populated via [`BoundListeners::with_tls`] by Wave 2.4 daemon
+    /// wiring; left `None` by [`bind_dual_with_local_auth`] so existing
+    /// callers stay source-compatible.
+    pub tls: Option<ApiTlsConfig>,
+}
+
+#[cfg(unix)]
+impl BoundListeners {
+    /// Attach an optional TLS configuration to the bound TCP listener.
+    ///
+    /// Returns `self` for chained construction:
+    /// `bind_dual_with_local_auth(...).await?.with_tls(Some(cfg))`.
+    #[must_use]
+    pub fn with_tls(mut self, tls: Option<ApiTlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
 }
 
 /// Bind TCP and Unix listeners and mint the local admin JWT token.
@@ -193,6 +357,7 @@ pub async fn bind_dual_with_local_auth(
         unix,
         local_bearer,
         unix_path,
+        tls: None,
     })
 }
 
@@ -222,12 +387,14 @@ pub async fn serve_bound(
 
     let bearer = listeners.local_bearer;
     let unix_path = listeners.unix_path;
+    let tls = listeners.tls;
 
     persist_admin_bearer(&bearer);
 
     info!(
         tcp = %listeners.tcp_local_addr,
         unix = %unix_path.display(),
+        tls = tls.is_some(),
         "Starting API server on TCP and Unix socket (with local auth bypass)"
     );
 
@@ -261,26 +428,26 @@ pub async fn serve_bound(
         },
     ));
 
-    // TCP server with ConnectInfo<SocketAddr> for existing handlers
-    let tcp_server = axum::serve(
-        listeners.tcp,
-        tcp_router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    // TCP server: branch on tls inside the helper. Plaintext today,
+    // wrapped with rustls when Wave 2.4 sets `BoundListeners::tls`.
+    let tcp_shutdown = async move {
         let _ = shutdown_rx_tcp.wait_for(|&v| v).await;
-    });
+    };
+    let tcp_future =
+        serve_tcp_with_optional_tls(listeners.tcp, tcp_router, tls.as_ref(), tcp_shutdown);
 
-    // Unix socket server without ConnectInfo (no TCP addresses on UDS)
+    // Unix socket server without ConnectInfo (no TCP addresses on UDS).
+    // UDS stays plaintext regardless of `tls` — TLS over a 0o660 local
+    // socket buys nothing.
     let unix_server = axum::serve(listeners.unix, unix_router.into_make_service())
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx_unix.wait_for(|&v| v).await;
         });
 
     // Run both servers concurrently, stop when either errors or both finish
-    let result = tokio::try_join!(
-        async { tcp_server.await.map_err(anyhow::Error::from) },
-        async { unix_server.await.map_err(anyhow::Error::from) },
-    );
+    let result = tokio::try_join!(tcp_future, async {
+        unix_server.await.map_err(anyhow::Error::from)
+    });
 
     // Clean up the Unix socket file
     let _ = std::fs::remove_file(&unix_path);
@@ -310,6 +477,24 @@ pub struct BoundListeners {
     /// `Bearer <token>` value reserved for future loopback/local-auth paths.
     /// Not currently injected into any request — see Phase F-7b.
     pub local_bearer: String,
+    /// Optional TLS configuration applied to the TCP listener at
+    /// [`serve_bound`] time. `None` (the default) keeps today's plaintext
+    /// HTTP behaviour. Populated via [`BoundListeners::with_tls`] by
+    /// Wave 2.4 daemon wiring.
+    pub tls: Option<ApiTlsConfig>,
+}
+
+#[cfg(windows)]
+impl BoundListeners {
+    /// Attach an optional TLS configuration to the bound TCP listener.
+    ///
+    /// Returns `self` for chained construction:
+    /// `bind_dual_with_local_auth(...).await?.with_tls(Some(cfg))`.
+    #[must_use]
+    pub fn with_tls(mut self, tls: Option<ApiTlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
 }
 
 /// Bind a TCP listener and mint the local admin JWT token (Windows).
@@ -356,6 +541,7 @@ pub async fn bind_dual_with_local_auth(
         tcp,
         tcp_local_addr,
         local_bearer,
+        tls: None,
     })
 }
 
@@ -376,15 +562,11 @@ pub async fn serve_bound(
     persist_admin_bearer(&listeners.local_bearer);
     info!(
         tcp = %listeners.tcp_local_addr,
+        tls = listeners.tls.is_some(),
         "Starting API server on TCP (Windows)"
     );
 
-    axum::serve(
-        listeners.tcp,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    serve_tcp_with_optional_tls(listeners.tcp, router, listeners.tls.as_ref(), shutdown).await?;
 
     info!("API server (TCP) shut down");
     Ok(())
@@ -415,24 +597,25 @@ impl ApiServer {
     /// Returns an error if binding to the address or serving fails.
     pub async fn run(self) -> anyhow::Result<()> {
         let addr = self.config.bind;
+        let tls = self.config.tls.clone();
         let router = build_router(&self.config);
 
         info!(
             bind = %addr,
             swagger = self.config.swagger_enabled,
             rate_limit = self.config.rate_limit.enabled,
+            tls = tls.is_some(),
             "Starting API server"
         );
 
         let listener = TcpListener::bind(addr).await?;
 
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
-
-        Ok(())
+        // No shutdown future is supplied here — `run` is the one-shot
+        // serve-forever entry point. `std::future::pending()` parks the
+        // graceful-shutdown branch indefinitely so the server only exits
+        // on an underlying I/O error.
+        serve_tcp_with_optional_tls(listener, router, tls.as_ref(), std::future::pending::<()>())
+            .await
     }
 
     /// Run the server with graceful shutdown.
@@ -445,22 +628,19 @@ impl ApiServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
         let addr = self.config.bind;
+        let tls = self.config.tls.clone();
         let router = build_router(&self.config);
 
         info!(
             bind = %addr,
             swagger = self.config.swagger_enabled,
+            tls = tls.is_some(),
             "Starting API server with graceful shutdown"
         );
 
         let listener = TcpListener::bind(addr).await?;
 
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown)
-        .await?;
+        serve_tcp_with_optional_tls(listener, router, tls.as_ref(), shutdown).await?;
 
         info!("API server shut down");
         Ok(())
@@ -575,14 +755,14 @@ impl ApiServer {
         let tcp_router = router.clone();
         let unix_router = router.clone();
 
-        // TCP server with ConnectInfo<SocketAddr> for existing handlers
-        let tcp_server = axum::serve(
-            tcp_listener,
-            tcp_router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
+        // TCP server: plaintext only — `run_dual` takes no `ApiConfig` and
+        // no explicit TLS source. Callers that need TLS use
+        // `ApiServer::run_with_shutdown` or `serve_bound` with a
+        // `BoundListeners::with_tls(Some(...))`-decorated listener.
+        let tcp_shutdown = async move {
             let _ = shutdown_rx_tcp.wait_for(|&v| v).await;
-        });
+        };
+        let tcp_future = serve_tcp_with_optional_tls(tcp_listener, tcp_router, None, tcp_shutdown);
 
         // Unix socket server without ConnectInfo (no TCP addresses on UDS)
         let unix_server = axum::serve(unix_listener, unix_router.into_make_service())
@@ -591,10 +771,9 @@ impl ApiServer {
             });
 
         // Run both servers concurrently, stop when either errors or both finish
-        let result = tokio::try_join!(
-            async { tcp_server.await.map_err(anyhow::Error::from) },
-            async { unix_server.await.map_err(anyhow::Error::from) },
-        );
+        let result = tokio::try_join!(tcp_future, async {
+            unix_server.await.map_err(anyhow::Error::from)
+        });
 
         // Clean up the Unix socket file
         let _ = std::fs::remove_file(&unix_path);
@@ -666,7 +845,9 @@ mod tests {
         use axum::routing::get;
         use std::time::Duration;
 
-        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-run-dual-starts-and-shuts-down-")
+            .unwrap();
         let sock_path = tmp_dir.path().join("test.sock");
 
         let router = Router::new().route("/health", get(|| async { "ok" }));
@@ -721,6 +902,172 @@ mod tests {
         assert!(
             !sock_path.exists(),
             "Unix socket file should be removed after shutdown"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS plumbing tests (Wave 2.2)
+    //
+    // These verify the new `serve_tcp_with_optional_tls` helper's three
+    // branches without binding real listeners. The static-cert PEM-loading
+    // path is exercised with an rcgen-generated self-signed cert written to
+    // a tempdir — no network, no system openssl.
+    // -----------------------------------------------------------------------
+
+    /// Write an rcgen self-signed cert + key to a tempdir for static-cert
+    /// loading tests. Returns the paths.
+    fn write_self_signed_pem(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("rcgen params");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+
+        let cert_path = dir.join("test.crt");
+        let key_path = dir.join("test.key");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert pem");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key pem");
+        (cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn load_static_rustls_config_loads_self_signed_pem() {
+        let tmp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-static-rustls-config-")
+            .unwrap();
+        let (cert_path, key_path) = write_self_signed_pem(tmp_dir.path());
+
+        let result = load_static_rustls_config(&cert_path, &key_path).await;
+        assert!(
+            result.is_ok(),
+            "Expected static rustls config to load from self-signed PEM, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_static_rustls_config_missing_files_returns_err() {
+        let tmp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-static-rustls-missing-")
+            .unwrap();
+        let cert_path = tmp_dir.path().join("does-not-exist.crt");
+        let key_path = tmp_dir.path().join("does-not-exist.key");
+
+        let result = load_static_rustls_config(&cert_path, &key_path).await;
+        assert!(
+            result.is_err(),
+            "Expected load_static_rustls_config to fail when files are missing"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("does-not-exist.crt") || err.contains("does-not-exist.key"),
+            "Error should mention one of the missing paths: {err}"
+        );
+    }
+
+    #[test]
+    fn install_default_crypto_provider_is_idempotent() {
+        // Two back-to-back calls must not panic. The first call installs
+        // (or no-ops if some other test already did). The second is a
+        // guaranteed no-op via `std::sync::Once`.
+        install_default_crypto_provider();
+        install_default_crypto_provider();
+    }
+
+    #[test]
+    fn bound_listeners_with_tls_attaches_config() {
+        // Verifies the builder method threads an `ApiTlsConfig::Static`
+        // value through without losing it. We construct the struct by
+        // hand here (rather than via `bind_dual_with_local_auth`) so the
+        // test stays a pure unit test — no listener binds, no token mint.
+        //
+        // `BoundListeners` carries platform-conditional fields (`unix` /
+        // `unix_path` on unix), so this assertion is itself gated.
+        #[cfg(unix)]
+        {
+            // Bind ephemeral listeners just for struct construction. Using
+            // 127.0.0.1:0 + a tempdir socket so this is local and clean.
+            let tmp_dir = ZLayerDirs::system_default()
+                .scratch_dir("test-with-tls-")
+                .unwrap();
+            let sock_path = tmp_dir.path().join("with-tls.sock");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let tcp_local_addr = tcp.local_addr().unwrap();
+                let unix = UnixListener::bind(&sock_path).unwrap();
+
+                let listeners = BoundListeners {
+                    tcp,
+                    tcp_local_addr,
+                    unix,
+                    local_bearer: "Bearer test".to_string(),
+                    unix_path: sock_path.clone(),
+                    tls: None,
+                };
+
+                assert!(listeners.tls.is_none(), "default tls should be None");
+
+                let listeners = listeners.with_tls(Some(ApiTlsConfig::Static {
+                    cert_path: "/tmp/cert.pem".into(),
+                    key_path: "/tmp/key.pem".into(),
+                }));
+
+                assert!(
+                    matches!(listeners.tls, Some(ApiTlsConfig::Static { .. })),
+                    "with_tls(Some(Static)) should leave the variant intact"
+                );
+
+                // Clean up.
+                let _ = std::fs::remove_file(&sock_path);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_shutdown_constructs_plain_http_when_tls_none() {
+        // Smoke-test: starting `ApiServer::run_with_shutdown` with the
+        // default config (no TLS) hits the plaintext branch and shuts
+        // down cleanly. Binds 127.0.0.1:0 so we don't collide with any
+        // running daemon and the OS picks the port.
+        use std::time::Duration;
+
+        let config = ApiConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            ..Default::default()
+        };
+        let server = ApiServer::new(config);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+
+        let handle = tokio::spawn(async move { server.run_with_shutdown(shutdown).await });
+
+        // Give the server a moment to bind. If TLS construction were
+        // accidentally entered here it would error out — see the
+        // shutdown / timeout below for the failure mode.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Signal shutdown and wait. The plain-HTTP branch wires
+        // `with_graceful_shutdown` directly, so this must return Ok
+        // within the timeout.
+        let _ = tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("server should shut down within 5s")
+            .expect("server task should not panic");
+
+        assert!(
+            result.is_ok(),
+            "run_with_shutdown with tls=None should return Ok: {:?}",
+            result.err()
         );
     }
 }

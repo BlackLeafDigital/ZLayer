@@ -1,0 +1,78 @@
+version: "1"
+
+# Windows sandbox images — the WCOW counterpart of images/macos/ZPipeline.yaml.
+#
+# Builds language base images on a Windows host (HcsBackend) and pushes them to
+# the BlackLeafDigital/ZLayer GHCR org. Tags are OS-suffixed so they never
+# clobber the macOS/Linux tags published under the same image names.
+#
+# Both LTSC lines are produced from THIS single file set by overriding the
+# `LTSC` var at invocation, e.g.:
+#   zlayer pipeline -f images/windows/ZPipeline.yaml --set LTSC=ltsc2022 --push
+#   zlayer pipeline -f images/windows/ZPipeline.yaml --set LTSC=ltsc2025 --push
+# (`${LTSC}` is expanded in each ZImagefile's `base:`/`run:` lines and in the
+# tags below.)
+
+vars:
+  REGISTRY: ghcr.io/blackleafdigital/zlayer
+  # Windows base-OS line. Override per build with `--set LTSC=ltsc2025`.
+  LTSC: ltsc2022
+
+images:
+  base:
+    file: ZImagefile.base
+    context: .
+    os: windows
+    tags:
+      - "${REGISTRY}/base:windows-${LTSC}"
+
+  golang:
+    file: ZImagefile.golang
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/golang:windows-${LTSC}"
+
+  rust:
+    file: ZImagefile.rust
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/rust:windows-${LTSC}"
+
+  node:
+    file: ZImagefile.node
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/node:windows-${LTSC}"
+
+  python:
+    file: ZImagefile.python
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/python:windows-${LTSC}"
+
+  deno:
+    file: ZImagefile.deno
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/deno:windows-${LTSC}"
+
+  bun:
+    file: ZImagefile.bun
+    context: .
+    os: windows
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/bun:windows-${LTSC}"
+
+push:
+  after_all: true

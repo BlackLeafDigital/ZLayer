@@ -45,6 +45,8 @@
 //   / `used_underscore_binding` / `no_effect_underscore_binding` /
 //   `needless_raw_string_hashes`: style-only, not semantic issues.
 #![allow(
+    unsafe_code,
+    clippy::borrow_as_ptr,
     clippy::type_complexity,
     clippy::must_use_candidate,
     clippy::default_trait_access,
@@ -72,10 +74,12 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout as tokio_timeout;
 use tracing::instrument;
 use windows::core::GUID;
-use zlayer_hns::attach::{self as hns_attach, EndpointAttachment};
-use zlayer_observability::logs::LogEntry;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_overlay::ipnet;
 use zlayer_spec::{PullPolicy, RegistryAuth as SpecRegistryAuth, ServiceSpec};
+
+use zlayer_overlayd::OverlaydClient;
+use zlayer_types::overlayd::{AttachHandle, OverlaydRequest, OverlaydResponse};
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
@@ -83,26 +87,111 @@ use crate::runtime::{
     ContainerId, ContainerInspectDetails, ContainerState, ExecEvent, ExecEventStream, ImageInfo,
     PruneResult, Runtime, WaitOutcome, WaitReason,
 };
+use crate::windows::uvm::Uvm;
 use crate::windows::{scratch, unpacker};
 
 use zlayer_hcs::enumerate;
 use zlayer_hcs::events::{self, HcsEventKind};
 use zlayer_hcs::schema::{
-    ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory, ContainerProcessor,
-    ProcessParameters, SchemaVersion, Statistics, Storage as HcsStorage,
+    Chipset, ComputeSystem as HcsDoc, Container as HcsContainer, ContainerMemory,
+    ContainerProcessor, DebugOptions, Devices, GpuAssignment, GpuAssignmentMode,
+    GpuAssignmentRequest, GuestCrashReporting, GuestOs as HcsGuestOs, HvSocket2,
+    HvSocketServiceConfig, HvSocketSystemConfig, ProcessParameters, RegistryChanges, RegistryHive,
+    RegistryKey, RegistryValue, RegistryValueType, SchemaVersion, ScsiAttachment, ScsiController,
+    Statistics, Storage as HcsStorage, Topology, TopologyMemory, TopologyProcessor, Uefi,
+    UefiBootEntry, VirtualMachine, VirtualSmb, VirtualSmbShare, VirtualSmbShareOptions,
 };
 use zlayer_hcs::system::ComputeSystem;
 
-/// Owner tag stamped onto every compute system this runtime creates. Used at
-/// startup to discover zombie systems from a previous agent run, and as the
-/// filter for [`enumerate::list_by_owner`].
-pub const OWNER_TAG: &str = "zlayer";
+/// Owner tag stamped onto every compute system + HCN endpoint this runtime
+/// creates. Used at startup to discover zombie systems from a previous agent
+/// run, and as the filter for [`enumerate::list_by_owner`].
+///
+/// The legacy single-instance value is `"zlayer"`. To keep that install
+/// stable, [`owner_tag`] returns `"zlayer"` verbatim when `daemon_name` is
+/// `"zlayer"`; any other name is used as-is so two daemons running
+/// side-by-side never sweep each other's compute systems.
+#[must_use]
+pub fn owner_tag(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "zlayer".to_string()
+    } else {
+        daemon_name.to_string()
+    }
+}
 
-/// Name used for the per-daemon HCN Transparent overlay network on the host.
-/// Every `ZLayer` container on this node attaches an endpoint into this
-/// network; the network's IPAM subnet is the node's per-node `/28` slice of
-/// the cluster CIDR (no longer a constant — see [`HcsConfig::slice_cidr`]).
-const OVERLAY_NETWORK_NAME: &str = "zlayer-overlay";
+/// Name of the per-daemon HCN overlay network on the host. Every
+/// `ZLayer` container on this node attaches an endpoint into this network;
+/// the network's IPAM subnet is the node's per-node `/28` slice of the
+/// cluster CIDR (see [`HcsConfig::slice_cidr`]).
+///
+/// The legacy single-instance value is `"zlayer-overlay"`. To keep that
+/// install stable, [`overlay_network_name`] returns `"zlayer-overlay"`
+/// verbatim when `daemon_name` is `"zlayer"`; any other name becomes
+/// `"<daemon_name>-overlay"` so multiple daemons each get their own
+/// network handle.
+#[must_use]
+pub fn overlay_network_name(daemon_name: &str) -> String {
+    if daemon_name == "zlayer" {
+        "zlayer-overlay".to_string()
+    } else {
+        format!("{daemon_name}-overlay")
+    }
+}
+
+/// Format a GUID as the **bare, lowercase, un-braced** string HCN/HCS use to
+/// identify a namespace inside a compute-system document's
+/// `Container.Networking.Namespace` field (e.g. `aabbccdd-eeff-...`).
+///
+/// The windows-rs `{:?}` formatter emits the brace-wrapped, upper-case form
+/// (`{AABBCCDD-...}`); HCS's `Construct` step then fails to resolve the
+/// namespace against HCN and returns `0x80070490 ERROR_NOT_FOUND`. Normalising
+/// to the bare form here keeps the lookup string byte-identical to the id HCN
+/// registered.
+fn format_guid_bare(id: GUID) -> String {
+    // hcsshim uses bare lowercase GUIDs (`aabbccdd-eeff-...`) for HCN/HCS
+    // wire references. The previous "braced uppercase" experiment failed; the
+    // real bug was that `Namespace::create` returned our random GUID instead
+    // of HCN's actual assigned ID (HostDefault is a singleton). With that
+    // fixed, bare lowercase should now resolve.
+    format!("{id:?}")
+        .trim_matches(|c: char| c == '{' || c == '}')
+        .to_ascii_lowercase()
+}
+
+/// Coerce an arbitrary identifier into a `NetBIOS`-shaped hostname suitable for
+/// `Container.GuestOs.HostName`.
+///
+/// `NetBIOS` rules: 1..=15 ASCII characters, alphanumerics and hyphens only, no
+/// underscores, no dots, must start with an ASCII letter. `hcs_id` strings such
+/// as `fallthrough-svc-rep-0` are >15 chars; longer values are silently
+/// truncated by some HCS builds and rejected by others. We pre-truncate to 15
+/// after stripping disallowed characters so HCS never sees a malformed value.
+fn netbios_hostname(raw: &str) -> String {
+    let mut cleaned: String = raw
+        .chars()
+        .filter_map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' => Some(c),
+            '_' | '.' | ' ' => Some('-'),
+            _ => None,
+        })
+        .collect();
+    // NetBIOS requires the first character to be an ASCII letter; prepend `z`
+    // if the cleaned string starts with a digit or hyphen.
+    if !cleaned
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        cleaned.insert(0, 'z');
+    }
+    cleaned.truncate(15);
+    if cleaned.is_empty() {
+        "zlayer".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Isolation mode for the compute systems this runtime creates.
 ///
@@ -120,14 +209,121 @@ pub enum IsolationMode {
     Hyperv,
 }
 
+/// Cached host Windows version as `(major, minor, build)`. The host's build
+/// number is immutable for the process lifetime, so we cache the first
+/// successful probe and never re-query.
+static HOST_WIN_BUILD: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+
+/// Return the host's `(major, minor, build)` Windows version via
+/// `ntdll!RtlGetVersion` — the only API that returns the actual build number
+/// even when the calling process has no manifest declaring Windows 10/11
+/// compatibility. `GetVersionExW` and `GetVersion` are manifest-shimmed and
+/// will return 6.2 (Windows 8) on a 10.0.26100 host without an explicit
+/// manifest entry, which would make isolation-mode detection wrong.
+///
+/// Backing FFI: `ntdll.dll!RtlGetVersion(version_info: *mut OSVERSIONINFOW)
+/// -> NTSTATUS`. We declare the link inline (matching the pattern used in
+/// `crate::windows::wclayer::layer_id_for_path`) so we don't need to widen
+/// the agent's `windows` crate feature set.
+///
+/// Returns `None` only if the syscall fails — never observed in practice on
+/// any supported Windows host.
+fn host_windows_build() -> Option<(u32, u32, u32)> {
+    *HOST_WIN_BUILD.get_or_init(|| {
+        use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+        windows::core::link!(
+            "ntdll.dll" "system" fn RtlGetVersion(
+                version_info: *mut OSVERSIONINFOW,
+            ) -> windows::core::HRESULT
+        );
+
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `info` is a live, exclusively-borrowed, correctly-sized
+        // OSVERSIONINFOW. RtlGetVersion only writes through the pointer and
+        // returns an NTSTATUS-as-HRESULT. (RtlGetVersion's signature is
+        // documented as NTSTATUS, but `windows::core::link!` accepts HRESULT
+        // as a thin wrapper around the same i32 — STATUS_SUCCESS = 0 maps
+        // to HRESULT 0 which `.is_ok()` accepts.)
+        let hr = unsafe { RtlGetVersion(&mut info) };
+        if hr.is_ok() {
+            Some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a Windows `os.version` string (e.g. `"10.0.20348.2700"`) into
+/// `(major, minor, build)`. Ignores the UBR (revision) component since
+/// different MCR tags within the same build (UBR drift) are
+/// isolation-compatible — process isolation tolerates a UBR delta but not a
+/// build delta. Returns `None` on parse failure or when the string has
+/// fewer than three dotted components.
+fn parse_os_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.').map(str::parse::<u32>);
+    let major = parts.next()?.ok()?;
+    let minor = parts.next()?.ok()?;
+    let build = parts.next()?.ok()?;
+    Some((major, minor, build))
+}
+
+/// Pure-logic decision matrix used by [`resolve_isolation_for_image`].
+///
+/// Extracted as a separate function so tests can drive every cell of the
+/// matrix without depending on [`host_windows_build`]'s Windows FFI.
+///
+/// | spec    | image build       | host build       | result   | reason |
+/// |---------|-------------------|------------------|----------|--------|
+/// | Process | *                 | *                | Process  | explicit operator choice |
+/// | Hyperv  | *                 | *                | Hyperv   | explicit operator choice |
+/// | Auto    | known + matches   | known            | Process  | build-matched, no UVM needed |
+/// | Auto    | known + mismatch  | known            | Hyperv   | cross-build, UVM required |
+/// | Auto    | known             | unknown          | Hyperv   | safer (UVM works on any host) |
+/// | Auto    | unknown           | *                | Process  | preserves prior default; documented |
+fn decide_isolation(
+    spec: Option<zlayer_spec::IsolationMode>,
+    image_build: Option<(u32, u32, u32)>,
+    host_build: Option<(u32, u32, u32)>,
+) -> IsolationMode {
+    use zlayer_spec::IsolationMode as Spec;
+    match spec {
+        Some(Spec::Process) => IsolationMode::Process,
+        Some(Spec::Hyperv) => IsolationMode::Hyperv,
+        None | Some(Spec::Auto) => match (image_build, host_build) {
+            (Some(img), Some(host)) if img == host => IsolationMode::Process,
+            (Some(_), Some(_) | None) => IsolationMode::Hyperv,
+            (None, _) => IsolationMode::Process,
+        },
+    }
+}
+
+/// Resolve the runtime-internal [`IsolationMode`] for a container, picking
+/// Process vs. Hyper-V based on the spec, the image's builder-asserted
+/// `os.version`, and the host's Windows build.
+///
+/// Spec values flow through [`decide_isolation`]; the only side effects are
+/// the cached [`host_windows_build`] probe and `image_os_version` parsing.
+fn resolve_isolation_for_image(
+    spec: Option<zlayer_spec::IsolationMode>,
+    image_os_version: Option<&str>,
+) -> IsolationMode {
+    decide_isolation(
+        spec,
+        image_os_version.and_then(parse_os_version),
+        host_windows_build(),
+    )
+}
+
 /// Configuration for [`HcsRuntime`].
 #[derive(Debug, Clone)]
 pub struct HcsConfig {
     /// Root directory for the read-only image layer cache (`<root>/images/`)
     /// and the per-container scratch layers (`<root>/scratch/<id>/`).
     pub storage_root: PathBuf,
-    /// Default isolation mode applied when a service spec does not pin one.
-    pub default_isolation: IsolationMode,
     /// Default scratch layer size in GiB. `0` requests the HCS default.
     pub default_scratch_size_gb: u64,
     /// Cluster CIDR (e.g. "10.200.0.0/16") used for per-endpoint policy
@@ -138,6 +334,17 @@ pub struct HcsConfig {
     /// the node joins the cluster and the leader hands out a slice. When
     /// `None`, [`HcsRuntime::ensure_overlay_network`] cannot proceed.
     pub slice_cidr: Option<ipnet::IpNet>,
+    /// Daemon instance name (resolved from the top-level `--daemon-name`
+    /// flag, with a `current_exe()` fallback). Drives the HCS owner tag
+    /// stamped onto every compute system this runtime owns and the name
+    /// of the per-daemon HCN overlay network so two daemons
+    /// running side-by-side on one host never collide. Defaults to
+    /// `"zlayer"` for backward compatibility with single-instance installs.
+    pub daemon_name: String,
+    /// Daemon data directory (`--data-dir`). Used to locate the managed-network
+    /// marker file (`{data_dir}/agent_network.json`) so the HCN overlay network
+    /// is reused across restarts and torn down only on a full uninstall.
+    pub data_dir: PathBuf,
 }
 
 impl Default for HcsConfig {
@@ -146,10 +353,16 @@ impl Default for HcsConfig {
         Self {
             storage_root: std::env::var("ZLAYER_HCS_STORAGE_ROOT")
                 .map_or_else(|_| dirs.containers().join("hcs"), PathBuf::from),
-            default_isolation: IsolationMode::default(),
+            // Per-container isolation is resolved per-image at
+            // `create_container` time via [`resolve_isolation_for_image`]
+            // (matrix: spec choice × image `os.version` × host build). There
+            // is no operator-level default anymore — the image-aware
+            // resolver is always correct given the inputs.
             default_scratch_size_gb: 20,
             cluster_cidr: "10.200.0.0/16".to_string(),
             slice_cidr: None,
+            daemon_name: "zlayer".to_string(),
+            data_dir: dirs.data_dir().to_path_buf(),
         }
     }
 }
@@ -160,6 +373,12 @@ struct CachedImage {
     /// Parent chain (child-to-parent order) ready to be plugged into a
     /// compute-system document.
     unpacked: unpacker::UnpackedImage,
+    /// Builder-asserted Windows OS version (e.g. `"10.0.20348.2031"`) from
+    /// the OCI image config's top-level `os.version` field. `None` when the
+    /// field is absent in the config or the pre-fetch failed (best-effort —
+    /// only the build-vs-host isolation auto-resolver consumes this, and it
+    /// gracefully degrades to Hyper-V when the image's build is unknown).
+    os_version: Option<String>,
 }
 
 /// Per-running-container state tracked by the runtime.
@@ -177,30 +396,68 @@ struct ContainerEntry {
     /// Last observed exit code, set when a `SystemExited` event is received
     /// via the HCS event stream. `None` while the container is still running.
     last_exit_code: Arc<RwLock<Option<i32>>>,
-    /// HCN namespace + endpoint pair that wires this container into the
-    /// daemon's Transparent overlay network. `None` if HCN was unavailable
-    /// at [`HcsRuntime::create_container`] time — we still let the container
-    /// start, but it won't have networking.
-    network_attachment: Option<EndpointAttachment>,
+    /// Overlay attachment created for this container by `zlayer-overlayd`.
+    /// `None` if overlayd was unavailable at [`HcsRuntime::create_container`]
+    /// time — we still let the container start, but it won't have networking.
+    /// overlayd owns the underlying HCN endpoint + namespace lifecycle; the
+    /// agent only records the identifiers it needs to embed in the compute
+    /// document and to drive detach.
+    overlay_attach: Option<WindowsOverlayAttach>,
+    /// Hyper-V utility VM backing this container when isolation is
+    /// [`IsolationMode::Hyperv`]. `None` for [`IsolationMode::Process`]
+    /// entries. Dropped on remove so the per-container scratch VHDX is
+    /// cleaned up via [`Uvm::Drop`].
+    uvm: Option<Uvm>,
+    /// Parent (read-only) layer paths that were `ActivateLayer` +
+    /// `PrepareLayer`d into HCS before this container's compute system was
+    /// created. Stored in original child-to-parent order (matching
+    /// `parent_layers` from [`HcsRuntime::resolve_parent_chain`]). On
+    /// [`HcsRuntime::remove_container`] each entry is `UnprepareLayer` +
+    /// `DeactivateLayer`d in **reverse order** (parent-to-child) so HCS's
+    /// internal layer table is cleared and a subsequent container with the
+    /// same parents can activate them again.
+    activated_parent_layers: Vec<PathBuf>,
+    /// Connected GCS bridge into this container's hosting UVM. `Some` only
+    /// for [`IsolationMode::Hyperv`] entries; `None` for Process-isolated
+    /// entries (which have no UVM to bridge into). Created during
+    /// [`HcsRuntime::create_container`] after the UVM is started; held here
+    /// so a future patch can route container lifecycle RPCs (start/shutdown,
+    /// exec, hot-attach) through the in-guest GCS rather than through host-
+    /// side HCS APIs.
+    ///
+    /// Currently the entry is recorded but lifecycle routing through the
+    /// bridge is NOT YET wired — `start_container` / `stop_container` still
+    /// drive the host-side `ComputeSystem` handle. That swap lives in the
+    /// next patch (B4.3); see TODO at the bottom of the Hyper-V branch in
+    /// `create_container`.
+    #[cfg(feature = "hcs-runtime")]
+    #[allow(dead_code)] // read by B4.3 lifecycle routing
+    gcs: Option<zlayer_gcs::bridge::GcsBridge>,
+    /// In-memory ring of captured log lines for this container.
+    ///
+    /// HCS does not host-spawn the container's image entrypoint (it runs
+    /// inside the compute system once started), so there is no host-side pipe
+    /// to that init process. What IS capturable is every `exec`'d process's
+    /// stdout/stderr (the `exec` path creates the HCS stdio pipes and now
+    /// drains them). Those lines are appended here so `container_logs` /
+    /// `get_logs` return real, non-empty output — mirroring the file-backed
+    /// log readers on the youki / WSL2 runtimes, but kept in memory because
+    /// the HCS pipes are streamed, not written to a host log file by HCS.
+    log_buffer: Arc<RwLock<Vec<LogEntry>>>,
 }
 
-/// Per-daemon HCN Transparent overlay network created lazily on first
-/// [`HcsRuntime::create_container`] call. We never tear this down during the
-/// daemon's lifetime — containers share it by attaching HCN endpoints to
-/// fresh per-container namespaces.
-#[derive(Debug)]
-struct OverlayNetwork {
-    /// HCN-addressable GUID of the network.
-    id: GUID,
-    /// CIDR the network was created with (this node's per-node slice).
-    /// Informational — kept for logging and diagnostics.
-    #[allow(dead_code)]
-    subnet: String,
-    /// Keep the `Network` handle alive so the handle's `Drop` does not close
-    /// out from under concurrent endpoint creates. `HcnCloseNetwork` only
-    /// releases the caller's handle; the network itself lives until we call
-    /// `HcnDeleteNetwork` (we never do, for the daemon's lifetime).
-    _network: zlayer_hns::network::Network,
+/// Overlay attachment identifiers returned by `zlayer-overlayd` for a Windows
+/// container. overlayd created (and owns the lifetime of) the HCN endpoint +
+/// per-container namespace on its HCN Internal network; the agent records only
+/// what it needs to (a) embed the namespace GUID in the compute-system document
+/// and (b) drive `DetachContainer` on removal.
+#[derive(Debug, Clone)]
+struct WindowsOverlayAttach {
+    /// Bare-lowercase HCN namespace GUID overlayd created for this container.
+    /// Embedded into `Container.Networking.Namespace`.
+    namespace_guid: String,
+    /// The overlay IP overlayd assigned to the container's endpoint.
+    ip: IpAddr,
 }
 
 /// HCS-backed implementation of [`Runtime`].
@@ -217,11 +474,13 @@ pub struct HcsRuntime {
     /// Auth resolver used to pick up persisted credentials when no inline
     /// auth is supplied on the pull.
     auth_resolver: zlayer_core::AuthResolver,
-    /// Lazily-created HCN Transparent overlay network all containers attach
-    /// to. Guarded by a `tokio::sync::Mutex` so the first `create_container`
-    /// call wins the race and every subsequent call returns the cached GUID
-    /// without a double-create.
-    overlay_network: Arc<Mutex<Option<OverlayNetwork>>>,
+    /// IPC client to `zlayer-overlayd`, which owns all HCN network/endpoint/
+    /// namespace mechanics. `None` when overlayd could not be reached at
+    /// construction time — container creation then fails loudly (a Windows
+    /// container with no overlay attach has no addressable network surface).
+    /// `Mutex` serializes request/response round-trips on the single framed
+    /// connection.
+    overlayd: Option<Arc<Mutex<OverlaydClient>>>,
     /// Per-container IP address stashed here by
     /// [`HcsRuntime::set_next_container_ip`] just before the matching
     /// [`Runtime::create_container`] call. Consumed by `create_container` so
@@ -237,6 +496,12 @@ pub struct HcsRuntime {
     /// set any DNS configuration at all for the next container — the endpoint
     /// is created without a `Dns` field (legacy behavior).
     next_container_dns: Arc<Mutex<Option<(Option<IpAddr>, Option<String>)>>>,
+    /// Per-node IP allocator seeded from [`HcsConfig::slice_cidr`]. `Some` once
+    /// this node has an assigned slice. The slice gateway (`network + 1`) is
+    /// reserved at construction via `allocate_first` so the first container gets
+    /// `.2` and never collides with the overlay network's gateway. `Mutex`
+    /// because allocate/release take `&mut self`; never held across an `.await`.
+    ip_allocator: Mutex<Option<zlayer_overlay::IpAllocator>>,
 }
 
 impl std::fmt::Debug for HcsRuntime {
@@ -268,7 +533,45 @@ impl HcsRuntime {
             AgentError::Configuration(format!("failed to open HCS blob cache: {e}"))
         })?;
         let registry = Arc::new(zlayer_registry::ImagePuller::with_cache(blob_cache));
-        Self::new_with_registry(config, registry)
+        let data_dir = config.data_dir.clone();
+        let mut runtime = Self::new_with_registry(config, registry)?;
+
+        // Connect to overlayd, which owns all HCN network/endpoint/namespace
+        // mechanics. Best-effort with backoff so the agent can come up while
+        // overlayd is still binding its socket; a hard failure here is surfaced
+        // later (per-container) as a CreateFailed rather than blocking startup.
+        let socket = zlayer_paths::ZLayerDirs::default_overlayd_socket_path_for(&data_dir);
+        match OverlaydClient::connect_with_backoff(std::path::Path::new(&socket)).await {
+            Ok(client) => {
+                runtime.overlayd = Some(Arc::new(Mutex::new(client)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    socket = %socket,
+                    error = %e,
+                    "could not connect to overlayd; Windows containers will fail to attach overlay networking until it is reachable"
+                );
+            }
+        }
+
+        // Best-effort startup reconcile: terminate orphan ComputeSystems left
+        // over from a previous crashed daemon run, then reap any stray HCN
+        // endpoints. Both are non-fatal — a failure here must not block the
+        // daemon from coming up.
+        if let Err(e) = runtime.reconcile_orphan_systems().await {
+            tracing::warn!(
+                error = %e,
+                "startup reconcile of orphan HCS compute systems failed; continuing without it"
+            );
+        }
+        if let Err(e) = runtime.reconcile_orphans().await {
+            tracing::warn!(
+                error = %e,
+                "startup reconcile of orphan HCN endpoints failed; continuing without it"
+            );
+        }
+
+        Ok(runtime)
     }
 
     /// Build a new [`HcsRuntime`] with an explicit registry client.
@@ -292,15 +595,38 @@ impl HcsRuntime {
         std::fs::create_dir_all(config.storage_root.join("scratch")).map_err(|e| {
             AgentError::Configuration(format!("failed to create HCS scratch dir: {e}"))
         })?;
+        // Seed the per-node IP allocator from the assigned slice (if any),
+        // reserving the slice gateway (`network + 1`) so container IPs start at
+        // `.2` and never collide with the overlay network's default-route
+        // gateway. A parse failure is unreachable (the source is a validated
+        // `IpNet`); degrade to `None` (no-network) rather than failing.
+        let ip_allocator = config.slice_cidr.and_then(|slice| {
+            match zlayer_overlay::IpAllocator::new(&slice.to_string()) {
+                Ok(mut alloc) => {
+                    let _ = alloc.allocate_first(); // reserve the .1 gateway
+                    Some(alloc)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slice = %slice,
+                        error = %e,
+                        "failed to build IP allocator from slice_cidr; Windows \
+                         containers will start without overlay networking"
+                    );
+                    None
+                }
+            }
+        });
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             images: RwLock::new(HashMap::new()),
             registry,
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
-            overlay_network: Arc::new(Mutex::new(None)),
+            overlayd: None,
             next_container_ip: Arc::new(Mutex::new(None)),
             next_container_dns: Arc::new(Mutex::new(None)),
+            ip_allocator: Mutex::new(ip_allocator),
         })
     }
 
@@ -323,67 +649,6 @@ impl HcsRuntime {
     /// Scratch-layer directory for a specific container.
     fn scratch_dir(&self, hcs_id: &str) -> PathBuf {
         self.config.storage_root.join("scratch").join(hcs_id)
-    }
-
-    /// Lazy-create the per-daemon HCN Transparent overlay network on first
-    /// use and cache its GUID.
-    ///
-    /// The network's IPAM subnet is this node's per-node `/28` slice of the
-    /// cluster CIDR (supplied by the caller). HCN installs a connected route
-    /// for that slice on the uplink vSwitch so traffic within the slice is
-    /// routed without NAT — callers are responsible for ensuring the
-    /// overlay tunnel is set up so cross-node traffic works.
-    ///
-    /// Idempotent: subsequent calls return the cached GUID without touching
-    /// HCN. All `HcnCreateNetwork` traffic runs on a `spawn_blocking` thread
-    /// because the underlying syscall is synchronous and can block for tens
-    /// of milliseconds on a cold host.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the underlying [`zlayer_hns::error::HnsError`] when HCN
-    /// refuses the create (e.g. `AccessDenied` when the daemon is not
-    /// running as Administrator, or `SubnetConflict` if another network
-    /// already owns the slice).
-    async fn ensure_overlay_network(&self, slice_cidr: ipnet::IpNet) -> Result<GUID> {
-        let mut guard = self.overlay_network.lock().await;
-        if let Some(net) = guard.as_ref() {
-            return Ok(net.id);
-        }
-
-        let net_id = GUID::new().map_err(|e| {
-            AgentError::Internal(format!("GUID::new for overlay network failed: {e}"))
-        })?;
-        let uplink = zlayer_hns::adapter::find_primary_adapter()
-            .map_err(|e| AgentError::Internal(format!("find_primary_adapter: {e}")))?;
-        let subnet_str = slice_cidr.to_string();
-        let subnet_for_create = subnet_str.clone();
-        let uplink_for_create = uplink.clone();
-
-        let network = tokio::task::spawn_blocking(move || {
-            zlayer_hns::network::Network::create_transparent(
-                net_id,
-                OVERLAY_NETWORK_NAME,
-                &subnet_for_create,
-                &uplink_for_create,
-            )
-        })
-        .await
-        .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
-        .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork(zlayer-overlay): {e}")))?;
-
-        *guard = Some(OverlayNetwork {
-            id: net_id,
-            subnet: subnet_str.clone(),
-            _network: network,
-        });
-        tracing::info!(
-            network_id = %format!("{net_id:?}"),
-            subnet = %subnet_str,
-            uplink = %uplink,
-            "created HCN Transparent overlay network"
-        );
-        Ok(net_id)
     }
 
     /// Stash the IP the next [`Runtime::create_container`] call should assign
@@ -416,101 +681,171 @@ impl HcsRuntime {
         *self.next_container_dns.lock().await = Some((dns_server, dns_domain));
     }
 
-    /// Scan the host for HCN endpoints owned by this runtime (name prefix
-    /// matches [`OWNER_TAG`]) and delete them.
+    /// Ask overlayd to attach a Windows container to the overlay: overlayd
+    /// ensures the HCN Internal network exists, creates the per-container
+    /// endpoint + namespace at `ip`, and returns the bare-lowercase namespace
+    /// GUID for the agent to embed in the compute-system document.
     ///
-    /// Intended for agent startup: the in-memory container map is empty at
-    /// that moment so every owned endpoint is by definition an orphan from a
-    /// previous crashed run. Call sites must supply a `live` set of HCS ids
-    /// already known to the runtime so we don't reap endpoints still in use;
-    /// an empty set means "reap everything we own".
+    /// # Errors
+    /// Returns an error when overlayd is unreachable or the attach fails.
+    async fn overlayd_attach_windows(
+        &self,
+        container_id: &str,
+        service: &str,
+        ip: IpAddr,
+        dns_server: Option<IpAddr>,
+        dns_domain: Option<String>,
+    ) -> Result<WindowsOverlayAttach> {
+        let client = self.overlayd.as_ref().ok_or_else(|| {
+            AgentError::Network("overlayd is not connected; cannot attach overlay".to_string())
+        })?;
+        let resp = {
+            let mut conn = client.lock().await;
+            conn.call(OverlaydRequest::AttachContainer {
+                handle: AttachHandle::WindowsContainer {
+                    container_id: container_id.to_string(),
+                    ip: Some(ip),
+                },
+                // The real service name (the identity the deploy/scheduler path
+                // uses), threaded from `ContainerId::service` at the call site.
+                // Required for overlayd to (a) place a Dedicated service's
+                // container on its own per-service HCN network, and (b) tag the
+                // attachment correctly even in Shared mode.
+                service: service.to_string(),
+                join_global: false,
+                dns_server,
+                dns_domain,
+            })
+            .await
+            .map_err(|e| AgentError::Network(format!("overlayd AttachContainer failed: {e}")))?
+        };
+        match resp {
+            OverlaydResponse::Attached(result) => Ok(WindowsOverlayAttach {
+                namespace_guid: result.namespace_guid.unwrap_or_default(),
+                ip: result.ip,
+            }),
+            other => Err(AgentError::Network(format!(
+                "overlayd AttachContainer returned unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Ask overlayd to detach (and reap the HCN endpoint + namespace for) a
+    /// Windows container previously attached via [`Self::overlayd_attach_windows`].
+    /// Best-effort: logs on failure rather than propagating.
+    async fn overlayd_detach_windows(&self, namespace_guid: &str) {
+        let Some(client) = self.overlayd.as_ref() else {
+            return;
+        };
+        let mut conn = client.lock().await;
+        if let Err(e) = conn
+            .call(OverlaydRequest::DetachContainer {
+                handle: AttachHandle::WindowsContainer {
+                    container_id: namespace_guid.to_string(),
+                    ip: None,
+                },
+            })
+            .await
+        {
+            tracing::warn!(ns = %namespace_guid, error = %e, "overlayd DetachContainer failed");
+        }
+    }
+
+    /// Scan HCS for compute systems owned by this runtime that we do **not**
+    /// track in [`Self::containers`], and terminate them.
     ///
-    /// Individual delete failures are logged and swallowed so one stuck
-    /// endpoint cannot block the rest of reconciliation.
+    /// This covers the daemon-crash recovery window where
+    /// [`Runtime::create_container`] succeeded (the `ComputeSystem` exists in the
+    /// Windows kernel and is tagged with our [`owner_tag`]) but the daemon
+    /// went down before recording it in any persistence — so on next boot
+    /// the in-memory map has no entry and the system would otherwise leak
+    /// until manual cleanup.
+    ///
+    /// At startup the live set is whatever [`Self::containers`] currently
+    /// holds (usually empty); every enumerated system not in that set is an
+    /// orphan. Each orphan is opened with default access, terminated via
+    /// `HcsTerminateComputeSystem`, and the handle is dropped — HCS removes
+    /// the system entirely once the explicit terminate completes.
+    ///
+    /// Individual failures (open, terminate) are logged and swallowed so one
+    /// stuck system cannot block the rest of reconciliation; the enumeration
+    /// error itself is propagated.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the initial HCN enumeration fails. Per-
-    /// endpoint delete failures are logged.
-    #[allow(dead_code)]
-    pub async fn reconcile_orphans(&self) -> Result<()> {
+    /// Returns an error only if [`enumerate::list_by_owner`] fails. Per-system
+    /// failures are logged.
+    pub async fn reconcile_orphan_systems(&self) -> Result<()> {
         let live: std::collections::HashSet<String> =
             self.containers.read().await.keys().cloned().collect();
 
-        let owned = tokio::task::spawn_blocking(|| hns_attach::list_owned_endpoints(OWNER_TAG))
+        let tag = owner_tag(&self.config.daemon_name);
+        let systems = enumerate::list_by_owner(&tag)
             .await
-            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
-            .map_err(|e| AgentError::Internal(format!("list_owned_endpoints: {e}")))?;
+            .map_err(|e| AgentError::Internal(format!("HcsEnumerateComputeSystems: {e}")))?;
 
-        for (endpoint_id, name) in owned {
-            // Endpoint name is `{OWNER_TAG}-{container_id}`. Strip the prefix
-            // + dash to recover the container id and skip live containers.
-            let prefix = format!("{OWNER_TAG}-");
-            let container_id = name.strip_prefix(&prefix).unwrap_or(name.as_str());
-            if live.contains(container_id) {
+        if systems.is_empty() {
+            tracing::debug!(owner = %tag, "reconcile: no HCS compute systems found for owner");
+            return Ok(());
+        }
+
+        for sys in systems {
+            if live.contains(&sys.id) {
                 continue;
             }
 
-            // We only stored the endpoint id in HCN; the matched namespace is
-            // discovered via the endpoint's properties. Best-effort: query,
-            // then delete both. On failure we log and continue.
-            let ep_id = endpoint_id;
-            let namespace_id = match tokio::task::spawn_blocking(move || {
-                zlayer_hns::endpoint::Endpoint::open(ep_id).and_then(|ep| ep.query_properties("{}"))
-            })
-            .await
-            {
-                Ok(Ok(props)) => props
-                    .host_compute_namespace
-                    .as_deref()
-                    .and_then(parse_guid_loose),
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        endpoint_id = %format!("{ep_id:?}"),
-                        error = %e,
-                        "reconcile: failed to query orphan endpoint properties"
-                    );
-                    None
-                }
+            // Open with `requested_access = 0` (default access for our token)
+            // and terminate. Both calls are best-effort: log on failure and
+            // continue so a single wedged orphan can't block the sweep.
+            let id = sys.id.clone();
+            match ComputeSystem::open(&id, 0) {
+                Ok(system) => match system.terminate("").await {
+                    Ok(()) => {
+                        tracing::info!(
+                            hcs_id = %id,
+                            state = %sys.state,
+                            "reconcile: terminated orphan HCS compute system"
+                        );
+                        // Drop the handle so HCS releases its internal
+                        // refcount and finalizes the post-terminate cleanup.
+                        drop(system);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            hcs_id = %id,
+                            error = %e,
+                            "reconcile: HcsTerminateComputeSystem failed for orphan; \
+                             system may need manual cleanup"
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
-                        endpoint_id = %format!("{ep_id:?}"),
+                        hcs_id = %id,
                         error = %e,
-                        "reconcile: spawn_blocking join failed"
-                    );
-                    None
-                }
-            };
-
-            let res = tokio::task::spawn_blocking(move || match namespace_id {
-                Some(ns) => hns_attach::delete_endpoint_and_namespace(ep_id, ns),
-                None => zlayer_hns::endpoint::Endpoint::delete(ep_id),
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {
-                    tracing::info!(
-                        endpoint_id = %format!("{ep_id:?}"),
-                        container_id = %container_id,
-                        "reconcile: reaped orphan HCN endpoint"
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        endpoint_id = %format!("{ep_id:?}"),
-                        error = %e,
-                        "reconcile: failed to delete orphan endpoint"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        endpoint_id = %format!("{ep_id:?}"),
-                        error = %e,
-                        "reconcile: spawn_blocking join failed during delete"
+                        "reconcile: HcsOpenComputeSystem failed for enumerated orphan; \
+                         skipping (may have just exited)"
                     );
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Reconcile orphan HCN endpoints.
+    ///
+    /// As of the overlayd migration, HCN endpoint + namespace lifecycle is owned
+    /// entirely by `zlayer-overlayd`: it creates them on `AttachContainer` and
+    /// reaps them on `DetachContainer` / its own periodic orphan sweep. The
+    /// agent must NOT also enumerate-and-delete HCN endpoints, or it would race
+    /// overlayd and tear down endpoints for live containers it doesn't track.
+    /// This is therefore a no-op retained for ABI parity with the startup
+    /// reconcile call in [`HcsRuntime::new`].
+    ///
+    /// # Errors
+    /// Infallible.
+    #[allow(clippy::unused_async)]
+    pub async fn reconcile_orphans(&self) -> Result<()> {
         Ok(())
     }
 
@@ -563,6 +898,46 @@ impl HcsRuntime {
                 reason: format!("manifest pull: {e}"),
             })?;
 
+        // Inspect the OCI image config's `os` field before invoking the
+        // unpacker. The unpacker calls `vmcompute.dll!ProcessBaseImage` on the
+        // base layer, which expects the Windows-specific `Hives/` /
+        // `UtilityVM/` / `Files/Windows/System32/` layout. Running it against
+        // a non-Windows image (e.g. an alpine layer chain when the composite
+        // fans the pull out to both HCS and the WSL2 delegate) is guaranteed
+        // to return `ERROR_PATH_NOT_FOUND (0x80070003)`. Bail out cleanly with
+        // a typed `WrongPlatform` error so the composite can treat us as a
+        // soft skip and consume the delegate's result instead.
+        //
+        // `image_os` returns `Ok(None)` when the manifest has no recognized
+        // OS field; in that case we fall through to the unpacker (it might
+        // still be a valid Windows image with a non-canonical config).
+        match self.registry.image_os(image, &auth).await {
+            Ok(Some(os)) if os != zlayer_spec::OsKind::Windows => {
+                tracing::debug!(
+                    image,
+                    image_os = os.as_oci_str(),
+                    "HCS runtime skipping unpack: image is not a Windows image"
+                );
+                return Err(AgentError::WrongPlatform {
+                    runtime: "hcs".to_string(),
+                    expected: zlayer_spec::OsKind::Windows.as_oci_str().to_string(),
+                    actual: os.as_oci_str().to_string(),
+                    image: image.to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Non-fatal: we couldn't fetch / parse the config. Log and
+                // continue — if the image really is non-Windows the unpacker
+                // will fail with a clearer message from `ProcessBaseImage`.
+                tracing::warn!(
+                    image,
+                    error = %e,
+                    "failed to inspect image OS before HCS unpack; proceeding optimistically",
+                );
+            }
+        }
+
         let descriptors = Self::manifest_to_descriptors(&manifest);
         let dest_root = self.image_layer_dir(image);
 
@@ -579,8 +954,31 @@ impl HcsRuntime {
             reason: format!("unpack: {e}"),
         })?;
 
+        // Best-effort fetch of the image's `os.version` (Windows build
+        // identifier the image was authored against). The isolation
+        // auto-resolver uses this to pick Process-vs-Hyper-V based on
+        // build-vs-host match. Failure here is non-fatal: a `None` value
+        // simply funnels Auto resolution to the safer Hyper-V fallback.
+        let os_version = match self.registry.image_os_version(image, &auth).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    image,
+                    error = %e,
+                    "failed to fetch image os.version; isolation auto-resolution will fall back to Hyper-V",
+                );
+                None
+            }
+        };
+
         let mut cache = self.images.write().await;
-        cache.insert(image.to_string(), CachedImage { unpacked });
+        cache.insert(
+            image.to_string(),
+            CachedImage {
+                unpacked,
+                os_version,
+            },
+        );
         Ok(())
     }
 
@@ -594,6 +992,8 @@ impl HcsRuntime {
     /// attached to. Empty means no network attachment — the resulting
     /// compute-system doc will omit the `Networking` field entirely so HCS
     /// treats the container as isolated.
+    // HCS create-container call has to plumb container_id, spec, image, network, mounts, devices, isolation, and gpu through; splitting would just shuffle the surface area.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn build_compute_system_doc(
         &self,
         hcs_id: &str,
@@ -601,22 +1001,103 @@ impl HcsRuntime {
         scratch_layer: &scratch::WritableLayer,
         parent_layers: Vec<zlayer_hcs::schema::Layer>,
         namespace_ids: Vec<String>,
-    ) -> HcsDoc {
-        let processor = spec.resources.cpu.and_then(|cpu| {
-            // `count` must be at least 1 vCPU; we round up fractional requests.
-            let count = cpu.ceil();
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let count_u32 = if count.is_finite() && count >= 1.0 {
-                count as u32
-            } else {
-                return None;
-            };
-            Some(ContainerProcessor {
-                count: Some(count_u32),
-                maximum: None,
-                weight: None,
-            })
-        });
+        isolation: IsolationMode,
+        uvm: Option<&Uvm>,
+    ) -> Result<HcsDoc> {
+        // Hyper-V isolation populates the `VirtualMachine` body using the UVM
+        // the caller already provisioned: scratch VHDX → SCSI attachment, layer
+        // dirs → read-only VirtualSMB shares, boot-files dir → GuestState.
+        // [`IsolationMode::Process`] flows down through the `Container` path
+        // unchanged.
+        //
+        // GPU-PV: when `spec.resources.gpu` is set, we enumerate host adapters
+        // via DXGI and filter by the spec's vendor/model/count. The filtered
+        // list is passed into the VirtualMachine document. Process-isolated
+        // containers cannot use GPU-PV; the equivalent DirectX-device-sharing
+        // path (`\\.\GLOBALROOT\Device\…` SMB shares + dxgkrnl projection) is
+        // an hcsshim-internal surface whose exact paths drift between Windows
+        // builds, so rather than fabricate paths we surface a typed error.
+        // Users wanting GPU with `isolation: process` must switch to
+        // `isolation: hyperv` for now.
+        let gpu_adapters: Vec<HostGpuAdapter> = if let Some(gpu_spec) = spec.resources.gpu.as_ref()
+        {
+            if matches!(isolation, IsolationMode::Process) {
+                return Err(AgentError::Unsupported(
+                    "GPU passthrough with `isolation: process` is not yet wired; switch to \
+                     `isolation: hyperv` (DirectX device-sharing for Process isolation requires \
+                     dxgkrnl device paths that drift between Windows builds and would need a \
+                     stable hcsshim binding to be safe)"
+                        .to_string(),
+                ));
+            }
+            // MPS requires the host MPS control daemon (`nvidia-cuda-mps-control`)
+            // to be reachable from the workload. Under Hyper-V isolation the
+            // workload runs inside a UVM kernel that does NOT expose the host
+            // MPS pipe directory, so MPS sharing is meaningless here.
+            // Reject up-front rather than silently producing a broken setup.
+            if matches!(gpu_spec.sharing, Some(zlayer_spec::GpuSharingMode::Mps))
+                && matches!(isolation, IsolationMode::Hyperv)
+            {
+                return Err(AgentError::GpuSharingUnavailable {
+                    mode: "mps".to_string(),
+                    reason: "MPS is not supported with Hyper-V isolation; use Process isolation \
+                             or remove the sharing config"
+                        .to_string(),
+                });
+            }
+            let all_adapters =
+                enumerate_host_gpu_adapters().map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("DXGI host GPU enumeration: {e}"),
+                })?;
+            filter_adapters_by_gpu_spec(&all_adapters, gpu_spec)
+        } else {
+            Vec::new()
+        };
+
+        let virtual_machine = match isolation {
+            IsolationMode::Process => None,
+            IsolationMode::Hyperv => {
+                let uvm = uvm.ok_or_else(|| {
+                    AgentError::Internal(
+                        "build_compute_system_doc called with Hyperv isolation but no UVM provided"
+                            .to_string(),
+                    )
+                })?;
+                Some(build_virtual_machine_doc(
+                    uvm,
+                    &parent_layers,
+                    spec,
+                    &gpu_adapters,
+                ))
+            }
+        };
+
+        // `Container.Processor` is always present in containerd-shim-runhcs-v1
+        // docs (verified via ETW capture, May 2026), even when the spec sets
+        // no CPU limits — containerd emits an empty `{}` object. Match that
+        // behavior so HCS `Construct` sees the field unconditionally; without
+        // CPU limits we send a default (all fields `None`/skipped → `{}`).
+        let processor = Some(
+            spec.resources
+                .cpu
+                .and_then(|cpu| {
+                    // `count` must be at least 1 vCPU; we round up fractional requests.
+                    let count = cpu.ceil();
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let count_u32 = if count.is_finite() && count >= 1.0 {
+                        count as u32
+                    } else {
+                        return None;
+                    };
+                    Some(ContainerProcessor {
+                        count: Some(count_u32),
+                        maximum: None,
+                        weight: None,
+                    })
+                })
+                .unwrap_or_default(),
+        );
 
         let memory = spec.resources.memory.as_ref().and_then(|mem_str| {
             crate::bundle::parse_memory_string(mem_str)
@@ -630,41 +1111,89 @@ impl HcsRuntime {
                 })
         });
 
+        // `Storage.Path` for a process-isolated container must be the prepared
+        // writable layer's *volume GUID path* (`\\?\Volume{GUID}\`, with a
+        // trailing backslash), as returned by `GetLayerMountPath` and captured
+        // in `vhd_mount_path()` — NOT the layer directory. HCS validates this
+        // format and rejects a plain directory with `ERROR_NOT_A_REPARSE_POINT`
+        // (0x80071126) during "Construct". Matches hcsshim's
+        // `internal/hcsoci/hcsdoc_wcow.go` (`v2Container.Storage.Path =
+        // coi.Spec.Root.Path`, a volume GUID path).
+        let mut root_path = scratch_layer.vhd_mount_path().to_string();
+        if !root_path.is_empty() && !root_path.ends_with('\\') {
+            root_path.push('\\');
+        }
         let storage = HcsStorage {
             layers: parent_layers,
-            path: Some(scratch_layer.layer_path().to_string_lossy().into_owned()),
+            path: Some(root_path),
         };
 
-        let networking = if namespace_ids.is_empty() {
-            None
-        } else {
-            Some(zlayer_hcs::schema::ContainerNetworking {
-                allow_unqualified_dns_query: None,
-                dns_search_list: Vec::new(),
-                namespace: namespace_ids,
-                network_shared_container_name: None,
-            })
-        };
+        // HCS's `Container.Networking.Namespace` is a single GUID string, so
+        // collapse the id list to its first entry (a container attaches to
+        // exactly one HCN namespace).
+        //
+        // `AllowUnqualifiedDnsQuery: true` is set by containerd's
+        // `containerd-shim-runhcs-v1` on every container it creates (verified
+        // via ETW capture of `Microsoft-Windows-Hyper-V-Compute`, May 2026).
+        // The flag enables lookups of unqualified hostnames against the
+        // namespace's DNS suffix list — required for typical service-discovery
+        // patterns inside a container.
+        let networking =
+            namespace_ids
+                .into_iter()
+                .next()
+                .map(|ns| zlayer_hcs::schema::ContainerNetworking {
+                    allow_unqualified_dns_query: Some(true),
+                    dns_search_list: Vec::new(),
+                    namespace: Some(ns),
+                    network_shared_container_name: None,
+                });
 
+        // GuestOs.HostName: hcsshim's WCOW path only emits this when
+        // `Spec.Hostname != ""` (`internal/hcsoci/hcsdoc_wcow.go:218`), but in
+        // its production callers (containerd-shim-runhcs-v1, CRI, Docker) the
+        // OCI runtime spec ALWAYS defaults `Spec.Hostname` to a non-empty
+        // value (typically the first 12 chars of the container id), so that
+        // branch is never taken in practice. When `Networking.Namespace` is
+        // set and `GuestOs` is absent, `HcsCreateComputeSystem` rejects the
+        // doc with `E_INVALIDARG (0x80070057)` at
+        // `OperationFailure.Detail="Construct"` (verified on
+        // 10.0.26100/Windows 11 24H2, May 2026). Match the de-facto behavior:
+        // always populate `GuestOs.HostName`, defaulting to the netbios-safe
+        // form of `hcs_id` when the spec doesn't supply one.
+        let hostname_source = spec.hostname.as_deref().unwrap_or(hcs_id);
+        let guest_os = Some(HcsGuestOs {
+            host_name: Some(netbios_hostname(hostname_source)),
+        });
         let container = HcsContainer {
+            guest_os,
             storage: Some(storage),
             networking,
             mapped_directories: Vec::new(),
             mapped_pipes: Vec::new(),
-            hostname: spec.hostname.clone(),
             processor,
             memory,
         };
 
-        HcsDoc {
-            owner: OWNER_TAG.to_string(),
+        // A Hyper-V-isolated compute system carries the `VirtualMachine` body
+        // and omits the `Container` body — HCS picks up the container
+        // configuration from the workload running inside the UVM, not from the
+        // outer compute system. Process isolation is the inverse.
+        let (container_doc, vm_doc) = match isolation {
+            IsolationMode::Process => (Some(container), None),
+            IsolationMode::Hyperv => (None, virtual_machine),
+        };
+
+        let doc = HcsDoc {
+            owner: owner_tag(&self.config.daemon_name),
             schema_version: SchemaVersion::default(),
             hosting_system_id: String::new(),
-            container: Some(container),
-            virtual_machine: None,
+            container: container_doc,
+            virtual_machine: vm_doc,
             should_terminate_on_last_handle_closed: Some(true),
         }
-        .apply_service_id(hcs_id)
+        .apply_service_id(hcs_id);
+        Ok(doc)
     }
 
     /// Return the cached unpacked image's parent-chain layers in the
@@ -676,6 +1205,77 @@ impl HcsRuntime {
             reason: format!("image '{image}' not pulled before create_container"),
         })?;
         Ok(entry.unpacked.chain.0.clone())
+    }
+
+    /// Return the cached image's `os.version` (Windows build the image was
+    /// authored against), or `None` when the image was never pulled or its
+    /// config blob did not record an `os.version`. Used by
+    /// [`resolve_isolation_for_image`] to pick Process-vs-Hyper-V isolation
+    /// based on whether the image build matches the host build.
+    async fn resolve_image_os_version(&self, image: &str) -> Option<String> {
+        let cache = self.images.read().await;
+        cache.get(image).and_then(|e| e.os_version.clone())
+    }
+
+    /// Activate + Prepare every parent (read-only) layer with HCS before its
+    /// `Path` may legally appear in a `Container.Storage.Layers[].Path` entry.
+    ///
+    /// HCS's `Construct` step rejects compute-system documents whose layer
+    /// paths have not been registered with the host-side layer table; the
+    /// observed failure is `E_INVALIDARG (0x80070057)`. hcsshim handles this
+    /// in its snapshotter by calling `HcsActivateLayer` for every parent layer
+    /// (and `HcsPrepareLayer` so the merged read-only view materialises) prior
+    /// to writing the `MountedLayerPaths` block into the container doc — see
+    /// `internal/layers/wcow_mount.go::mountProcessIsolatedWCIFSLayers` for
+    /// the canonical ordering.
+    ///
+    /// `parent_layers` is the child-to-parent vec from
+    /// [`Self::resolve_parent_chain`]. We iterate **oldest to newest**
+    /// (reverse) so each `PrepareLayer` call sees a chain whose parents are
+    /// already active, mirroring hcsshim. Each layer's `PrepareLayer` parent
+    /// chain is the slice **older** than itself (child-to-parent ordered).
+    ///
+    /// On error, every layer that was activated (and possibly prepared) is
+    /// rolled back in reverse order so a partial failure leaves the host
+    /// layer table clean.
+    ///
+    /// Returns the list of successfully activated+prepared layer paths in the
+    /// original child-to-parent order. The caller must hand this list to
+    /// [`ContainerEntry::activated_parent_layers`] so `remove_container` can
+    /// `UnprepareLayer` + `DeactivateLayer` each one on teardown.
+    fn activate_parent_layers(
+        parent_layers: &[zlayer_hcs::schema::Layer],
+    ) -> std::io::Result<Vec<PathBuf>> {
+        // Read-only parent layers ONLY need `ActivateLayer` — calling
+        // `PrepareLayer` on a parent puts it into a "ready for writes" state,
+        // which is the SCRATCH layer's role, not a parent's. hcsshim's
+        // snapshotter calls `ActivateLayer` on every parent then
+        // `ActivateLayer`+`PrepareLayer` on the scratch only
+        // (`Microsoft/hcsshim/internal/wclayer` + `containerd-shim-runhcs-v1`
+        // snapshotter `Mount`). Misordered prepare on a parent makes HCS
+        // `Construct` reject the eventual compute-system doc with
+        // `E_INVALIDARG (0x80070057)`.
+        let mut activated: Vec<PathBuf> = Vec::with_capacity(parent_layers.len());
+        let n = parent_layers.len();
+        // Oldest-to-newest: walk reverse indices.
+        for i in (0..n).rev() {
+            let layer = &parent_layers[i];
+            let layer_path = PathBuf::from(&layer.path);
+
+            if let Err(e) = crate::windows::wclayer::activate_layer(&layer_path) {
+                rollback_parent_activations(&activated);
+                return Err(std::io::Error::other(format!(
+                    "ActivateLayer({}) failed: {e}",
+                    layer_path.display()
+                )));
+            }
+            activated.push(layer_path);
+        }
+
+        // Reverse into the original child-to-parent order for storage in
+        // [`ContainerEntry::activated_parent_layers`].
+        activated.reverse();
+        Ok(activated)
     }
 
     /// Spawn a background task that subscribes to the compute system's
@@ -717,14 +1317,2295 @@ impl HcsRuntime {
             }
         });
     }
+
+    /// Orchestrate the Hyper-V-isolated boot of a container via the GCS
+    /// bridge. Returns the host-side UVM `ComputeSystem` handle (so the
+    /// caller can subscribe to UVM exit events / drive lifecycle) plus the
+    /// connected GCS bridge wrapped in `HyperVGcsState` (so it can be
+    /// stashed on the container's `ContainerEntry` for later RPCs).
+    ///
+    /// The flow mirrors hcsshim's `internal/hcsoci/create.go`:
+    ///
+    /// 1. Build the UVM-only compute-system doc (via
+    ///    [`build_uvm_only_doc`]) and `HcsCreateComputeSystem` it. This
+    ///    cold-creates the utility VM with its sandbox VHDX on SCSI LUN 0
+    ///    and the image's `UtilityVM\Files` over the `"os"` VSMB share.
+    ///
+    /// 2. `HcsStartComputeSystem` to power the UVM on. After this the
+    ///    in-guest GCS listener is reachable over hvsock at the UVM's
+    ///    pre-injected `RuntimeId` GUID.
+    ///
+    /// 3. Connect the GCS bridge over hvsock and negotiate the protocol
+    ///    version. `GcsBridge::listen` binds the host listener before start;
+    ///    `PendingGcsBridge::accept` accepts the guest's dial-out and
+    ///    negotiates after start.
+    ///
+    /// 4. Hot-attach each parent layer as a read-only VSMB share via
+    ///    `system.add_vsmb` (host-side `HcsModifyComputeSystem` with
+    ///    resource-path `VirtualMachine/Devices/VirtualSmb/Shares/N`).
+    ///
+    /// 5. Hot-attach the container's writable scratch VHDX as a SCSI
+    ///    attachment on LUN 1 (LUN 0 is already taken by the UVM's
+    ///    sandbox).
+    ///
+    /// 6. Issue `RpcModifySettings` over the bridge to drive
+    ///    `CombineLayersWCOW` inside the guest — combining the just-added
+    ///    VSMB read-only layers and the SCSI scratch into a single WCIFS
+    ///    root that the hosted container can use as its `Storage.Path`.
+    ///
+    /// 7. Build the hosted-container body (via
+    ///    [`build_hosted_container_doc`]) and `RpcCreate` it over the
+    ///    bridge with the container's HCS id as the RPC container id.
+    ///
+    /// 8. `RpcStart` the hosted container to actually launch the workload.
+    ///
+    /// All in-guest paths used in step 6 and step 7 are placeholders today
+    /// — hcsshim derives them from the actual guest VSMB/SCSI mount paths
+    /// returned by the in-guest `MountVSMB` / `AttachSCSI` responses,
+    /// which we do not yet round-trip through the bridge. The placeholders
+    /// produce a well-formed JSON document so HCS accepts the RPCs; real
+    /// mount-path discovery is tracked for a follow-up patch (see TODO in
+    /// the body for the exact spots that need replacement).
+    #[cfg(all(target_os = "windows", feature = "hcs-runtime"))]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn hyperv_create_via_gcs(
+        &self,
+        hcs_id: &str,
+        spec: &ServiceSpec,
+        scratch_layer: &scratch::WritableLayer,
+        parent_layers: &[zlayer_hcs::schema::Layer],
+        namespace_strs: &[String],
+        uvm: &Uvm,
+        network_attachment: Option<&WindowsOverlayAttach>,
+    ) -> Result<(ComputeSystem, HyperVGcsState)> {
+        use uuid::Uuid;
+        use zlayer_gcs::bridge::GcsBridge;
+        use zlayer_gcs::diagnostics::ts_us;
+        use zlayer_gcs::frame::RpcMessageType;
+        use zlayer_gcs::protocol::{
+            CreateRequest, CreateResponse, ModifySettingsRequest, ModifySettingsResponse,
+            RequestBase, StartRequest, StartResponse,
+        };
+
+        // Mirror every Hyper-V step transition to stderr alongside
+        // `gcs-bridge-send` / `gcs-bridge-reader` so the test stdout has a
+        // single monotonically-timestamped timeline of host-side activity
+        // (the cargo test harness doesn't init a tracing subscriber, so
+        // `tracing::info!` alone is invisible). Sharing
+        // [`zlayer_gcs::diagnostics::ts_us`]'s epoch keeps these aligned
+        // with the bridge log microsecond-for-microsecond.
+        macro_rules! step_log {
+            ($($arg:tt)*) => {{
+                eprintln!(
+                    "[t=+{}us] hcs_id={hcs_id} Hyper-V step: {}",
+                    ts_us(),
+                    format_args!($($arg)*),
+                );
+            }};
+        }
+
+        // GPU adapter probe — Hyper-V isolation supports GPU-PV when the
+        // workload requests it. Mirrors the gating in
+        // `build_compute_system_doc` so the UVM-only doc carries the
+        // same GpuAssignment block.
+        let gpu_adapters: Vec<HostGpuAdapter> = if let Some(gpu_spec) = spec.resources.gpu.as_ref()
+        {
+            if matches!(gpu_spec.sharing, Some(zlayer_spec::GpuSharingMode::Mps)) {
+                return Err(AgentError::GpuSharingUnavailable {
+                    mode: "mps".to_string(),
+                    reason: "MPS is not supported with Hyper-V isolation; use Process \
+                                 isolation or remove the sharing config"
+                        .to_string(),
+                });
+            }
+            let all_adapters =
+                enumerate_host_gpu_adapters().map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("DXGI host GPU enumeration: {e}"),
+                })?;
+            filter_adapters_by_gpu_spec(&all_adapters, gpu_spec)
+        } else {
+            Vec::new()
+        };
+
+        // ----------------------------------------------------------------
+        // Step 1: build the UVM-only compute-system doc.
+        // ----------------------------------------------------------------
+        let owner = owner_tag(&self.config.daemon_name);
+        let uvm_doc = build_uvm_only_doc(&owner, hcs_id, uvm, parent_layers, spec, &gpu_adapters);
+        let uvm_doc_json =
+            serde_json::to_string(&uvm_doc).map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 1: serialize UVM doc: {e}"),
+            })?;
+        tracing::error!(
+            target: "zlayer_agent::hcs::diag",
+            hcs_id = %hcs_id,
+            doc = %uvm_doc_json,
+            "HCS_CREATE_UVM_DOC"
+        );
+        if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
+            let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.uvm.json"));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, &uvm_doc_json);
+        }
+
+        // ----------------------------------------------------------------
+        // Step 1b: HcsGrantVmAccess on every parent layer dir.
+        //
+        // Grant the UVM's per-VM virtual SID read access to every parent
+        // layer dir surfaced via VSMB into the guest. Same root cause as
+        // the sandbox VHDX grant in `Uvm::create`: without these the VM's
+        // effective identity has no ACL on host-owned files and the UVM
+        // fails to start. hcsshim does this in `internal/uvm/vsmb.go::Add`
+        // when each VSMB share is added; we batch here since we know the
+        // full parent set up front.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            parents = parent_layers.len(),
+            "Hyper-V step 1b: HcsGrantVmAccess on parent layer dirs",
+        );
+        step_log!(
+            "1b: HcsGrantVmAccess on parent layer dirs ({} parents)",
+            parent_layers.len()
+        );
+        for layer in parent_layers {
+            crate::windows::wclayer::grant_vm_access(
+                uvm.runtime_id(),
+                std::path::Path::new(&layer.path),
+            )
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 1b: HcsGrantVmAccess(parent layer {}): {e}",
+                    layer.path
+                ),
+            })?;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 2: HcsCreateComputeSystem for the UVM.
+        //
+        // The UVM's compute-system ID handed to HCS must be the runtime GUID
+        // (bare lowercase form). HCS uses this ID as the hvsock VM ID for
+        // routing GCS connections — mirrors hcsshim's `internal/uvm/create_wcow.go`
+        // where `uvm.id` (the runtime GUID) is passed as the first arg to
+        // `HcsCreateComputeSystem`. The runtime GUID is NEVER serialized into
+        // the compute-system JSON document itself.
+        //
+        // `hcs_id` (the human slug like `pair-a-…-rep-1`) stays as the
+        // in-process key for `ContainerEntry` indexing — it is unrelated to
+        // the string handed to HCS for the UVM.
+        // ----------------------------------------------------------------
+        let uvm_system_id = format_guid_bare(uvm.runtime_id());
+        tracing::info!(
+            hcs_id = %hcs_id,
+            uvm_system_id = %uvm_system_id,
+            "Hyper-V step 2: HcsCreateComputeSystem (UVM)"
+        );
+        step_log!("2: HcsCreateComputeSystem (UVM) uvm_system_id={uvm_system_id}");
+        // windows-debug diagnostics that require offline edits to the UVM's BCD
+        // (the `{default}` Windows Boot Loader). The BCD lives on the read-only
+        // "os" VSMB source dir but is host-writable before HcsCreate.
+        //   * ZLAYER_GCS_BOOTLOG=1 → `bootlog Yes`: kernel writes
+        //     `\Windows\ntbtlog.txt` (driver-load log) onto the scratch; read it
+        //     offline after a never-dial run.
+        //   * ZLAYER_GCS_KD=1 → `debug Yes`: enable the kernel debugger over the
+        //     COM1 transport the BCD `{dbgsettings}` already configures (Serial,
+        //     debugport 1, 115200). A `kd` client then attaches to the UVM's COM1
+        //     named pipe to observe the user-mode service-start failure
+        //     (`mpssvc`/`netsetupsvc`) that bootlog can't see.
+        // Both best-effort; failures are logged, not fatal.
+        #[cfg(feature = "windows-debug")]
+        {
+            let bcd = uvm.os_files_dir().join(r"EFI\Microsoft\Boot\BCD");
+            let set_bcd = |opt: &str, val: &str| match std::process::Command::new("bcdedit")
+                .args([
+                    "/store",
+                    bcd.to_string_lossy().as_ref(),
+                    "/set",
+                    "{default}",
+                    opt,
+                    val,
+                ])
+                .output()
+            {
+                Ok(o) => step_log!(
+                    "2-bcd (windows-debug): {opt} {val} on {} status={} out={} err={}",
+                    bcd.display(),
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => step_log!("2-bcd (windows-debug): bcdedit {opt} spawn failed: {e}"),
+            };
+            if std::env::var("ZLAYER_GCS_BOOTLOG").as_deref() == Ok("1") {
+                set_bcd("bootlog", "Yes");
+            }
+            if std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1") {
+                set_bcd("debug", "Yes");
+            }
+            // ZLAYER_GCS_SVCDUMP=1: inject the host `sc.exe` into the UVM. The
+            // stripped nanoserver UtilityVM ships `cmd.exe`/`services.exe` but
+            // NOT `sc.exe`; its deps (advapi32 etc.) ARE present. The os-files
+            // dir is the read-only "os" VSMB source and is host-writable before
+            // HcsCreate, so we drop the host's `%SystemRoot%\System32\sc.exe`
+            // into `<os_files>\Windows\System32\sc.exe`. The injected
+            // `zlayer-svcdump` SCM service (see `build_uvm_registry_changes`)
+            // then runs `sc queryex`/`sc qc`/`sc query` to capture WHY
+            // `mpssvc`/`netsetupsvc` fail to reach Running. Best-effort: failures
+            // are logged, not fatal.
+            if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref() == Ok("1") {
+                let host_sc = std::path::Path::new(
+                    &std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+                )
+                .join(r"System32\sc.exe");
+                let dst_sc = uvm.os_files_dir().join(r"Windows\System32\sc.exe");
+                match std::fs::copy(&host_sc, &dst_sc) {
+                    Ok(n) => step_log!(
+                        "2-svcdump (windows-debug): injected sc.exe {} -> {} ({n} bytes)",
+                        host_sc.display(),
+                        dst_sc.display(),
+                    ),
+                    Err(e) => step_log!(
+                        "2-svcdump (windows-debug): sc.exe inject {} -> {} FAILED: {e}",
+                        host_sc.display(),
+                        dst_sc.display(),
+                    ),
+                }
+            }
+        }
+        let uvm_system = ComputeSystem::create(&uvm_system_id, &uvm_doc_json)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 2: HcsCreateComputeSystem (UVM): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 3a: bind the host GCS hvsock listener BEFORE starting the UVM.
+        // Windows' model (hcsshim create_wcow.go / start.go): the HOST listens
+        // on (runtimeID, GCS service GUID) and the in-guest GCS dials OUT once
+        // it boots. The listener must already exist when the UVM powers on, so
+        // we bind here — between create and start — and accept after start.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            runtime_id = %format_guid_bare(uvm.runtime_id()),
+            "Hyper-V step 3a: GcsBridge::listen (bind host hvsock listener)"
+        );
+        step_log!(
+            "3a: GcsBridge::listen (bind host hvsock listener) runtime_id={}",
+            format_guid_bare(uvm.runtime_id())
+        );
+        // Bind on (uvm.runtime_id, GCS service GUID) — matches hcsshim
+        // create_wcow.go:126-142 (`winio.ListenHvsock{VMID: uvm.runtimeID,
+        // ServiceID: gcsServiceID}`). A wildcard-VMID variant was tested and
+        // produced the same timeout, ruling out a runtime_id≠partition-GUID
+        // routing mismatch — the in-guest GCS service is not dialing at all.
+        let pending_bridge =
+            GcsBridge::listen(uvm.runtime_id())
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 3a: GcsBridge::listen: {e}"),
+                })?;
+
+        // ----------------------------------------------------------------
+        // Step 3a' (windows-debug only): bind the host log-forward hvsock
+        // listener BEFORE starting the UVM. hcsshim's create_wcow.go binds
+        // `uvm.outputListener = winio.ListenHvsock{VMID: uvm.RuntimeID(),
+        // ServiceID: WindowsLoggingHvsockServiceID}` here (between create and
+        // start) so the host is listening when the in-guest GCS log-forward
+        // service dials out. The guest only STARTS forwarding after we issue
+        // the `StartLogForwarding` GCS RPC (done inside the bridge's accept(),
+        // post-negotiate, windows-debug gated), but the listener must already
+        // exist or the guest's connect fails. The receive loop is spawned just
+        // after HcsStart (below); records land in `gcs-forward.log` in the
+        // UVM debug dir, which `read_uvm_debug_dump` collects.
+        #[cfg(feature = "windows-debug")]
+        let log_fwd = {
+            tracing::info!(
+                hcs_id = %hcs_id,
+                runtime_id = %format_guid_bare(uvm.runtime_id()),
+                "Hyper-V step 3a' (windows-debug): bind host log-forward hvsock listener"
+            );
+            step_log!("3a' (windows-debug): bind host log-forward hvsock listener");
+            zlayer_gcs::log_forward::LogForwardListener::bind(uvm.runtime_id(), uvm.debug_dir())
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 3a': LogForwardListener::bind: {e}"),
+                })?
+        };
+
+        // ----------------------------------------------------------------
+        // Step 3: HcsStartComputeSystem — power the UVM on.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 3: HcsStartComputeSystem (UVM)");
+        step_log!("3: HcsStartComputeSystem (UVM)");
+        uvm_system
+            .start("")
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 3: HcsStartComputeSystem (UVM): {e}"),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 3b' (windows-debug only): spawn the host log-forward receive
+        // loop now that the UVM is Running. The guest's GCS log-forward
+        // service may dial as soon as it boots; the listener is already bound
+        // (step 3a'). Records are appended to `gcs-forward.log` in the UVM
+        // debug dir and echoed to stderr.
+        // ----------------------------------------------------------------
+        #[cfg(feature = "windows-debug")]
+        log_fwd.spawn();
+
+        // NOTE: there is intentionally NO writable "zlayer-debug" VSMB share.
+        // A guest-writable VSMB share is rejected by HCS at hot-attach with
+        // PowerOnCold `0x80070057` (E_INVALIDARG) regardless of `options` —
+        // confirmed on the box (a pre-accept `add_vsmb(zlayer-debug)` fails
+        // create outright). Guest-side diagnostics are exfiltrated instead via
+        // GCS log forwarding (steps 3a'/3b'), which streams the guest GCS's own
+        // logrus records to a HOST file over the logging hvsock — no
+        // guest-writable share required.
+
+        // Diagnostic: the CreateFailed reason string is the only channel the
+        // e2e test surfaces, so query the HCS-assigned base properties (carries
+        // "RuntimeId") and the GuestConnection property (populated iff HCS is
+        // managing an INTERNAL GCS connection) once at start. Folded into the
+        // step-4 error below if accept times out. This localizes whether our
+        // external listener is bound on the wrong VMID or whether HCS grabbed
+        // the GCS internally (the latter would mean GuestConnection is set).
+        let diag_base_props = uvm_system
+            .properties("{}")
+            .await
+            .unwrap_or_else(|e| format!("<base-props query failed: {e}>"));
+        let diag_guest_conn = uvm_system
+            .properties(r#"{"PropertyTypes":["GuestConnection"]}"#)
+            .await
+            .unwrap_or_else(|e| format!("<guest-conn query failed: {e}>"));
+
+        // ----------------------------------------------------------------
+        // Step 4: accept the in-guest GCS's inbound hvsock connection (it
+        // dials out after boot) and negotiate the protocol. 120s mirrors
+        // hcsshim's GCSConnectionTimeout — the guest GCS can take a while to
+        // come up on a cold UVM.
+        //
+        // While we wait, poll the UVM's HCS state every 5s and log it. If the
+        // guest bugchecks / fails to boot, the VM leaves "Running" (e.g. to
+        // "Stopped" / "SystemCrashed") — a decisive signal that the GCS never
+        // dialed because the guest never came up, vs. a guest that is up but
+        // not dialing. The poll borrows `&uvm_system` concurrently with the
+        // accept future via `select!`.
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            runtime_id = %format_guid_bare(uvm.runtime_id()),
+            "Hyper-V step 4: PendingGcsBridge::accept (await guest GCS dial-out)"
+        );
+        step_log!("4: PendingGcsBridge::accept (await guest GCS dial-out, 120s timeout)");
+        // Query the host's real timezone and render it as hcsschema's
+        // `TimeZoneInformation` JSON to attach to the cold-start Create's
+        // UvmConfig — mirroring hcsshim's default (real-host-TZ) path rather
+        // than the all-zero-transition-date UTC constant the bridge falls back
+        // to. `None` (a failed Win32 query) makes the bridge use that UTC
+        // constant fallback.
+        let host_tz = crate::windows::timezone::host_timezone_information();
+        if host_tz.is_none() {
+            tracing::warn!(
+                hcs_id = %hcs_id,
+                "Hyper-V step 4: host timezone query returned TIME_ZONE_ID_INVALID; \
+                 cold-start Create will fall back to the UTC TimeZoneInformation constant"
+            );
+        }
+        // Accept window. Default 120s mirrors hcsshim's GCSConnectionTimeout.
+        // Overridable via ZLAYER_GCS_ACCEPT_TIMEOUT_SECS so a KD/diagnostic run
+        // can hold the UVM alive long enough to attach a kernel debugger and
+        // inspect the in-guest service-start state without racing teardown.
+        let accept_secs = std::env::var("ZLAYER_GCS_ACCEPT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120);
+        let accept_fut =
+            pending_bridge.accept(std::time::Duration::from_secs(accept_secs), host_tz);
+        tokio::pin!(accept_fut);
+        let mut state_poll = tokio::time::interval(std::time::Duration::from_secs(5));
+        let bridge = loop {
+            tokio::select! {
+                res = &mut accept_fut => {
+                    match res {
+                        Ok(bridge) => break bridge,
+                        Err(e) => {
+                            // Read back any files the in-guest `zlayer-dump`
+                            // diagnostic service wrote into the writable
+                            // VSMB exfil share. Folded into the error so
+                            // the e2e test (which only surfaces the
+                            // CreateFailed.reason string) carries the
+                            // actual root-cause signal.
+                            let dump = read_uvm_debug_dump(uvm.debug_dir());
+                            // ZLAYER_GCS_SVCDUMP=1 capture, populated below
+                            // after the scratch is preserved + mounted on-box.
+                            // Defaults empty so the error string is unaffected
+                            // on a normal run.
+                            #[allow(unused_mut)]
+                            let mut svcdump_capture = String::new();
+                            // ZLAYER_KEEP_UVM_ON_FAILURE=1 → TERMINATE the
+                            // UVM here (don't leave it running). A running
+                            // UVM holds the scratch VHDX locked, so it can't
+                            // be mounted offline — and since GCS is broken,
+                            // a live UVM is useless. Terminating releases the
+                            // scratch VHDX lock; the `Uvm` Rust wrapper's
+                            // KEEP-aware Drop then PRESERVES the (now-unlocked)
+                            // scratch VHDX + temp dir when this function
+                            // returns Err below. The operator mounts the
+                            // preserved VHDX offline and reads the guest
+                            // event logs + any WER crash dump from it.
+                            if std::env::var("ZLAYER_KEEP_UVM_ON_FAILURE").as_deref()
+                                == Ok("1")
+                            {
+                                // Best-effort terminate to unlock the scratch
+                                // VHDX. This is the SAME compute system the
+                                // normal-path cleanup would terminate; the
+                                // error return below skips that path, so this
+                                // is the only terminate of `uvm_system` on this
+                                // branch — no double-terminate. The `Uvm`
+                                // wrapper (`uvm`) is NOT consumed here, so its
+                                // Drop still runs at scope exit and performs
+                                // the KEEP-aware preservation.
+                                if let Err(te) = uvm_system.terminate("").await {
+                                    tracing::warn!(
+                                        hcs_id = %hcs_id,
+                                        error = %te,
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — best-effort UVM terminate failed; scratch VHDX may remain locked until the VM is stopped manually",
+                                    );
+                                }
+                                let vhdx = uvm.scratch_vhdx().display().to_string();
+                                tracing::warn!(
+                                    hcs_id = %hcs_id,
+                                    runtime_id = %format_guid_bare(uvm.runtime_id()),
+                                    scratch_vhdx = %vhdx,
+                                    "ZLAYER_KEEP_UVM_ON_FAILURE=1 — UVM TERMINATED and scratch VHDX PRESERVED for offline inspection",
+                                );
+
+                                // The test harness surfaces ONLY eprintln!/
+                                // step_log! (stdout.log), not `tracing` — and on
+                                // panic it deletes the test's parent temp dir,
+                                // nuking the in-place VHDX (why preserve-in-place
+                                // failed). So ALSO emit via step_log! AND copy the
+                                // scratch VHDX to a stable host dir OUTSIDE the
+                                // temp tree before it is reaped. Best-effort: log
+                                // on failure, never panic. Copy at most ONE VHDX
+                                // per run (skip if the debug dir already has one)
+                                // to bound disk cost when several UVMs fail.
+                                let debug_root =
+                                    std::path::Path::new(r"C:\zlayer-uvm-debug");
+                                let already_have_vhdx = std::fs::read_dir(debug_root)
+                                    .map(|rd| {
+                                        rd.filter_map(Result::ok).any(|e| {
+                                            e.path()
+                                                .extension()
+                                                .is_some_and(|x| x.eq_ignore_ascii_case("vhdx"))
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if already_have_vhdx {
+                                    step_log!(
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — {} already contains a captured *.vhdx; skipping copy of {vhdx}",
+                                        debug_root.display(),
+                                    );
+                                } else if let Err(ce) = std::fs::create_dir_all(debug_root) {
+                                    eprintln!(
+                                        "ZLAYER_KEEP_UVM_ON_FAILURE=1 — failed to create {}: {ce}; scratch VHDX NOT copied out (in-place copy at {vhdx} will be reaped on panic)",
+                                        debug_root.display(),
+                                    );
+                                } else {
+                                    let dest = debug_root
+                                        .join(format!("{hcs_id}-scratch.vhdx"));
+                                    let dest_str = dest.display().to_string();
+                                    match std::fs::copy(uvm.scratch_vhdx(), &dest) {
+                                        Ok(_) => {
+                                            step_log!(
+                                            "ZLAYER_KEEP_UVM_ON_FAILURE=1 — scratch VHDX COPIED to {dest_str} (survives temp-dir reap). \
+                                             Read the guest event log + any WER dump OFFLINE from the COPY:\n\
+                                             \x20 Mount-VHD -Path '{dest_str}' -ReadOnly   # note the drive letter, e.g. X:\n\
+                                             \x20 Get-WinEvent -Path 'X:\\Windows\\System32\\winevt\\Logs\\Application.evtx' | Select-Object -First 100 | Format-List\n\
+                                             \x20 Get-WinEvent -Path 'X:\\Windows\\System32\\winevt\\Logs\\System.evtx'      | Select-Object -First 100 | Format-List\n\
+                                             \x20 Get-ChildItem 'X:\\zlayer-dbg\\*.dmp'\n\
+                                             \x20 Dismount-VHD -Path '{dest_str}'",
+                                            );
+                                            // ZLAYER_GCS_SVCDUMP=1: the dev is
+                                            // AT the box watching a foreground
+                                            // `--nocapture` run, so mount the
+                                            // just-copied scratch ON THIS
+                                            // machine (not offline-detached),
+                                            // read `C:\zlayer-dbg\svcdump.txt`
+                                            // (what the injected `zlayer-svcdump`
+                                            // SCM service wrote), and surface it
+                                            // both into the CreateFailed reason
+                                            // AND live on stderr. This is the
+                                            // whole point of the SVCDUMP run:
+                                            // see WHY mpssvc/netsetupsvc don't
+                                            // reach Running without offline VHDX
+                                            // gymnastics.
+                                            #[cfg(feature = "windows-debug")]
+                                            if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref()
+                                                == Ok("1")
+                                            {
+                                                let cap = mount_and_read_svcdump(&dest);
+                                                step_log!(
+                                                    "ZLAYER_GCS_SVCDUMP=1 — on-box svcdump capture from {dest_str}:\n{cap}",
+                                                );
+                                                svcdump_capture = cap;
+                                            }
+                                        }
+                                        Err(ce) => eprintln!(
+                                            "ZLAYER_KEEP_UVM_ON_FAILURE=1 — failed to copy scratch VHDX {vhdx} -> {dest_str}: {ce}; \
+                                             fall back to the in-place copy at {vhdx} if it survives",
+                                        ),
+                                    }
+                                }
+                            }
+                            let svcdump_fold = if svcdump_capture.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" || svcdump={svcdump_capture}")
+                            };
+                            return Err(AgentError::CreateFailed {
+                                id: hcs_id.to_string(),
+                                reason: format!(
+                                    "Hyper-V step 4: GcsBridge accept: {e} || create_id={uvm_system_id} \
+                                     || base_props={diag_base_props} || guest_conn={diag_guest_conn} \
+                                     || guest_debug_dump={dump}{svcdump_fold}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                _ = state_poll.tick() => {
+                    match uvm_system.properties("{}").await {
+                        Ok(props) => tracing::info!(
+                            hcs_id = %hcs_id,
+                            uvm_props = %props,
+                            "Hyper-V step 4: UVM state poll (awaiting guest GCS dial-out)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            hcs_id = %hcs_id,
+                            error = %e,
+                            "Hyper-V step 4: UVM state poll failed"
+                        ),
+                    }
+                }
+            }
+        };
+
+        // ----------------------------------------------------------------
+        // Step 4b: external-GCS HvSocket setup (hcsshim's
+        // configureHvSocketForGCS, start.go:36-59). Sent immediately after the
+        // GCS connection is established and BEFORE any container resource ops.
+        // It makes the guest GCS set up registry keys required to run
+        // containers in the UVM. HCS does this automatically for an internal
+        // GCS connection; an external GCS connection (our model) must issue it
+        // by hand. It is a guest-routed Update of ResourceType "HvSocket" whose
+        // Settings is an HvSocketAddress {LocalAddress: <UVM runtime GUID>,
+        // ParentAddress: WindowsGcsHvHostID}.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 4b: configureHvSocketForGCS");
+        step_log!("4b: configureHvSocketForGCS");
+        let hvsocket_setup_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            // The bridge `Request` field must carry the guest modification
+            // DIRECTLY — `{RequestType, ResourceType, Settings}` — NOT wrapped
+            // in another `GuestRequest`. hcsshim's `uvm.modify` unwraps
+            // `doc.GuestRequest` and sends exactly that via `gc.Modify`
+            // (internal/uvm/modify.go). An extra `GuestRequest` nesting made
+            // the guest mis-type `Settings`, so it failed to marshal the
+            // `HvSocketAddress` and rejected `$.ParentAddress`/`$.LocalAddress`
+            // with C037010D.
+            request: serde_json::json!({
+                "ResourceType": "HvSocket",
+                "RequestType": "Update",
+                "Settings": {
+                    "LocalAddress": format_guid_bare(uvm.runtime_id()),
+                    "ParentAddress": format_guid_bare(
+                        zlayer_gcs::transport::WINDOWS_GCS_HV_HOST_ID
+                    ),
+                }
+            }),
+        };
+        let hvsocket_setup_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &hvsocket_setup_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 4b: GCS HvSocket setup: {e}"),
+            })?;
+        if hvsocket_setup_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(hvsocket_setup_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 4b: GCS HvSocket setup returned HRESULT 0x{hresult_u32:08x}: {}",
+                    hvsocket_setup_resp.error_message,
+                ),
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Step 5: hot-attach each parent layer as a read-only VSMB share
+        //         on the UVM. Indices are sequential; guest-side VSMB paths
+        //         are `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`. Parent layers start at
+        //         index 0 (there is no longer a writable debug share occupying
+        //         index 0 — guest diagnostics use GCS log forwarding instead).
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            layer_count = parent_layers.len(),
+            "Hyper-V step 5: hot-attach per-layer VSMB shares"
+        );
+        step_log!(
+            "5: hot-attach per-layer VSMB shares ({} layers)",
+            parent_layers.len()
+        );
+        for (i, layer) in parent_layers.iter().enumerate() {
+            // Share NAME is `sN` (matching hcsshim's vsmb naming) and is the
+            // component the guest uses in the VSMB path
+            // `\\?\VMSMB\VSMB-{guid}\sN` — so the Step 6 guest paths below MUST
+            // use the same `sN`. (The host-side share name is just an
+            // identifier; what matters is host name == guest path component.)
+            let share = VirtualSmbShare {
+                name: format!("s{i}"),
+                path: layer.path.clone(),
+                options: Some(VirtualSmbShareOptions {
+                    read_only: true,
+                    share_read: true,
+                    cache_io: true,
+                    pseudo_oplocks: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            uvm_system
+                .add_vsmb(&share)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 5: add_vsmb(s{i} -> {}): {e}", layer.id),
+                })?;
+        }
+
+        // ----------------------------------------------------------------
+        // Step 6: hot-attach the container's writable scratch VHDX as a
+        //         SCSI attachment on LUN 1 (LUN 0 holds the UVM sandbox).
+        // ----------------------------------------------------------------
+        tracing::info!(
+            hcs_id = %hcs_id,
+            "Hyper-V step 6: hot-attach scratch VHDX on SCSI LUN 1"
+        );
+        step_log!("6: hot-attach scratch VHDX on SCSI LUN 1");
+        // A SCSI `VirtualDisk` attachment takes the backing `.vhdx` FILE path,
+        // not the host volume-GUID mount path (`vhd_mount_path()`, which is the
+        // container ROOT path in the create doc). The sandbox VHDX lives in the
+        // writable layer dir.
+        let scratch_vhd = scratch_layer
+            .layer_path()
+            .join("sandbox.vhdx")
+            .to_string_lossy()
+            .into_owned();
+        let scratch_attachment = ScsiAttachment {
+            path: scratch_vhd.clone(),
+            r#type: "VirtualDisk".to_string(),
+            read_only: Some(false),
+        };
+        uvm_system
+            .add_scsi(PRIMARY_SCSI_CTRL_GUID, 1, &scratch_attachment)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 6: add_scsi({PRIMARY_SCSI_CTRL_GUID}, 1, {scratch_vhd}): {e}"
+                ),
+            })?;
+
+        // ----------------------------------------------------------------
+        // Step 7: drive CombineLayersWCOW inside the guest over the GCS
+        //         bridge. The exact `ResourcePath` string hcsshim uses for
+        //         this varies between builds — what we send below is the
+        //         starting shape derived from hcsshim's Combine handler;
+        //         live ETW capture from a Windows host will let us pin the
+        //         canonical form. See `crates/zlayer-gcs/src/protocol.rs`
+        //         `ModifySettingsRequest` for the wire envelope.
+        //
+        //         TODO(B4.3): replace the placeholder guest paths below
+        //         with the real per-VSMB / per-SCSI guest paths returned
+        //         by the in-guest `MountVSMB` / `AttachSCSI` responses.
+        //         hcsshim's convention for the placeholders we emit:
+        //           - VSMB share index `N` mounts at
+        //             `\\?\VMSMB\VSMB-{<vsmb-guid>}\sN`
+        //           - SCSI LUN `N` on controller `M` mounts at a guest-
+        //             chosen `\\?\Volume{<guid>}\`
+        //         The guest will reply with the actual chosen path in a
+        //         future protocol round-trip we do not yet implement.
+        // ----------------------------------------------------------------
+        // hcsshim's well-known VSMB controller GUID — same across all
+        // hcsshim builds; lives in `internal/uvm/vsmb.go`.
+        let vsmb_controller_guid = "{dcc079ae-60ba-4d07-847c-3493609c0870}";
+        // Guest-side VSMB path component `sN` must match the share NAME set at
+        // Step 5 hot-attach (`s{i}`). There is no writable debug share occupying
+        // index 0, so the first parent layer is `s0`.
+        let guest_vsmb_paths: Vec<String> = (0..parent_layers.len())
+            .map(|n| format!(r"\\?\VMSMB\VSMB-{vsmb_controller_guid}\s{n}"))
+            .collect();
+        // Step 6.5: mount the SCSI-attached scratch INSIDE the guest at a
+        // host-chosen path, then use that path as the container root. hcsshim's
+        // SCSI mount manager picks the guest path host-side as
+        // `fmt.Sprintf(WCOWGlobalScsiMountPrefixFmt, index)`
+        // (`c:\mounts\scsi\m%d`, internal/guestpath) and sends a guest-routed
+        // `MappedVirtualDisk` modify (`{ContainerPath, Lun}`) to mount the disk
+        // there; `CombineLayersWCOW` then passes that SAME path as
+        // `ContainerRootPath`. WCOW has no separate `ScratchPath` — the scratch
+        // IS the writable container root, with the read-only layers overlaid
+        // via WCIFS on top. One container per UVM ⇒ the lone scratch is mount
+        // index 0. (Without this guest mount the path does not exist and
+        // CombineLayersWCOW fails with `0x80070003`.)
+        let guest_root_path = r"c:\mounts\scsi\m0".to_string();
+        tracing::info!(hcs_id = %hcs_id, scratch_mount = %guest_root_path, "Hyper-V step 6.5: GCS MappedVirtualDisk (mount scratch in guest)");
+        step_log!("6.5: GCS MappedVirtualDisk (mount scratch in guest) at {guest_root_path}");
+        let mount_scratch_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            request: serde_json::json!({
+                "ResourceType": "MappedVirtualDisk",
+                "RequestType": "Add",
+                "Settings": { "ContainerPath": guest_root_path, "Lun": 1 },
+            }),
+        };
+        let mount_scratch_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &mount_scratch_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 6.5: GCS MappedVirtualDisk (mount scratch): {e}"),
+            })?;
+        if mount_scratch_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(mount_scratch_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 6.5: MappedVirtualDisk (scratch) returned HRESULT 0x{hresult_u32:08x}: {}",
+                    mount_scratch_resp.error_message,
+                ),
+            });
+        }
+
+        tracing::info!(
+            hcs_id = %hcs_id,
+            guest_root = %guest_root_path,
+            "Hyper-V step 7: CombineLayersWCOW via GCS"
+        );
+        step_log!("7: CombineLayersWCOW via GCS guest_root={guest_root_path}");
+        let combine_req = ModifySettingsRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                // CombineLayersWCOW targets the UVM-scoped setting, not a
+                // specific hosted container — the null GUID is hcsshim's
+                // convention for "this UVM".
+                container_id: NULL_GUID_STR.to_string(),
+            },
+            // Guest-routed modify: `ResourceType` (NOT a host `ResourcePath`).
+            // hcsshim uses `guestresource.ResourceTypeCombinedLayers`
+            // ("CombinedLayers") with Settings = CombinedLayers{ContainerRootPath,
+            // Layers, ScratchPath}. A `ResourcePath` here is rejected with
+            // `$.ResourcePath` C037010D (same class as the step-4b GuestRequest
+            // bug). `Layers` is an array of Layer OBJECTS (`{Id, Path}`), NOT
+            // bare path strings — `WCOWCombinedLayers.Layers` is
+            // `[]hcsschema.Layer`; sending strings makes the guest reject the
+            // whole Settings at `$`.
+            request: serde_json::json!({
+                "ResourceType": "CombinedLayers",
+                "RequestType": "Add",
+                // WCOW `CombinedLayers` has NO `ScratchPath` (LCOW-only) and
+                // omits `FilterType` (WCIFS is the default). `ContainerRootPath`
+                // is the in-guest scratch mount from step 6.5; `Layers` are the
+                // read-only VSMB shares as `{Id, Path}` objects.
+                "Settings": {
+                    "ContainerRootPath": guest_root_path,
+                    "Layers": parent_layers
+                        .iter()
+                        .zip(guest_vsmb_paths.iter())
+                        .map(|(orig, gp)| serde_json::json!({ "Id": orig.id, "Path": gp }))
+                        .collect::<Vec<_>>(),
+                },
+            }),
+        };
+        let combine_resp: ModifySettingsResponse = bridge
+            .send_rpc_json(RpcMessageType::ModifySettings, &combine_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 7: GCS ModifySettings (CombineLayersWCOW): {e}"),
+            })?;
+        if combine_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(combine_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 7: CombineLayersWCOW returned HRESULT 0x{hresult_u32:08x}: {}",
+                    combine_resp.error_message,
+                ),
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Step 7.5: surface the host-side HCN endpoint inside the UVM's
+        //           network compartment so the workload can actually use
+        //           it. overlayd already created the endpoint on the host
+        //           and added it to the per-container HCN namespace, BUT in
+        //           Hyper-V isolation the namespace's compartment lives
+        //           INSIDE the UVM — the in-guest GCS has to be told
+        //           explicitly to attach the endpoint to that compartment.
+        //           Mirrors hcsshim's
+        //           `internal/hcsoci/network.go::addEndpointsToNS` which
+        //           issues `ModifySettings({ResourcePath:"Container/Networks",
+        //           RequestType:"Add",Settings:{NamespaceId, EndpointId,
+        //           AllocatedIPAddress}})` after CombineLayersWCOW and
+        //           before RpcCreate of the hosted container.
+        //
+        //           Because overlayd owns the endpoint, the agent does not
+        //           hold an `endpoint_id` directly: resolve it by opening the
+        //           overlayd-created namespace and listing its endpoints
+        //           (there is exactly one per overlay attach). The namespace
+        //           GUID is the bare-lowercase form overlayd returned.
+        //
+        // Skipped entirely when there is no overlay attachment (degraded
+        // mode — overlayd unreachable, or no slice/IP): the container runs
+        // in the UVM with no overlay NIC. The GCS bridge + RpcCreate
+        // (steps 8/9) still proceed, so the dial path stays exercisable
+        // without a fully-configured overlayd.
+        // ----------------------------------------------------------------
+        if let Some(network_attachment) = network_attachment {
+            let namespace_guid = network_attachment.namespace_guid.clone();
+            let ns_id =
+                GUID::try_from(namespace_guid.as_str()).map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!(
+                    "Hyper-V step 7.5: overlayd namespace GUID {namespace_guid} unparseable: {e}"
+                ),
+                })?;
+            let endpoint_guid = {
+                let ns_for_lookup = ns_id;
+                let endpoints = tokio::task::spawn_blocking(move || {
+                    zlayer_hns::namespace::Namespace::open(ns_for_lookup)
+                        .and_then(|ns| ns.list_endpoints())
+                })
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 7.5: spawn_blocking join failed: {e}"),
+                })?
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!(
+                    "Hyper-V step 7.5: failed to list endpoints for namespace {namespace_guid}: {e}"
+                ),
+                })?;
+                endpoints
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: hcs_id.to_string(),
+                        reason: format!(
+                        "Hyper-V step 7.5: overlayd namespace {namespace_guid} has no endpoints"
+                    ),
+                    })?
+            };
+            // `list_endpoints` returns brace/case-normalized GUID strings; reduce
+            // to the bare-lowercase form HCS expects in the compartment-attach doc.
+            let endpoint_id_bare = endpoint_guid
+                .trim_matches(|c: char| c == '{' || c == '}')
+                .to_ascii_lowercase();
+            tracing::info!(
+                hcs_id = %hcs_id,
+                endpoint_id = %endpoint_id_bare,
+                namespace_id = %namespace_guid,
+                "Hyper-V step 7.5: wiring HCN endpoint into UVM network compartment"
+            );
+            step_log!(
+            "7.5: wiring HCN endpoint into UVM network compartment endpoint_id={} namespace_id={}",
+            endpoint_id_bare,
+            namespace_guid,
+        );
+            let add_endpoint_req = ModifySettingsRequest {
+                base: RequestBase {
+                    activity_id: Uuid::new_v4(),
+                    container_id: hcs_id.to_string(),
+                },
+                request: serde_json::json!({
+                    "ResourcePath": "Container/Networks",
+                    "RequestType": "Add",
+                    "Settings": {
+                        "NamespaceId": namespace_guid,
+                        "EndpointId": endpoint_id_bare,
+                        "AllocatedIPAddress": network_attachment.ip.to_string(),
+                    },
+                }),
+            };
+            let add_endpoint_resp: ModifySettingsResponse = bridge
+                .send_rpc_json(RpcMessageType::ModifySettings, &add_endpoint_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!("Hyper-V step 7.5 (network compartment attach): {e}"),
+                })?;
+            if add_endpoint_resp.result != 0 {
+                // Reinterpret the HRESULT bit pattern as u32 for `{:08x}` printing
+                // (HRESULT severity-bit set ⇒ i32 < 0, but the canonical Windows
+                // textual form is the 8-hex-digit unsigned value, e.g. 0x80070057).
+                let hresult_u32 = u32::from_ne_bytes(add_endpoint_resp.result.to_ne_bytes());
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.to_string(),
+                    reason: format!(
+                        "Hyper-V step 7.5 (network compartment attach): guest GCS returned \
+                     HRESULT 0x{:08x}: {}",
+                        hresult_u32, add_endpoint_resp.error_message,
+                    ),
+                });
+            }
+        } else {
+            step_log!(
+                "7.5: skipped network compartment attach — no overlay attachment \
+                 (degraded; container has no overlay NIC)"
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Step 8: build the hosted-container body using guest paths.
+        // ----------------------------------------------------------------
+        let guest_layers: Vec<zlayer_hcs::schema::Layer> = parent_layers
+            .iter()
+            .zip(guest_vsmb_paths.iter())
+            .map(|(orig, guest_path)| zlayer_hcs::schema::Layer {
+                id: orig.id.clone(),
+                path: guest_path.clone(),
+            })
+            .collect();
+        let namespace_id = namespace_strs.first().cloned();
+        let hosted_doc =
+            build_hosted_container_doc(spec, guest_layers, guest_root_path, namespace_id, hcs_id);
+
+        // ----------------------------------------------------------------
+        // Step 9: RpcCreate the hosted container over the bridge.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 9: GCS RpcCreate (hosted container)");
+        step_log!("9: GCS RpcCreate (hosted container)");
+        // The GCS RpcCreate config for a hosted container is a
+        // `hcsschema.HostedSystem` — `{SchemaVersion:{2,1}, Container:{...}}` —
+        // NOT a bare `Container`. Without the `SchemaVersion` wrapper the guest
+        // parses the body against an older schema and rejects the v2 fields
+        // (`$.HostName`/`$.Processor`/`$.Path` → C037010D). Mirrors hcsshim's
+        // `internal/hcsoci/create.go` (`HostedSystem{SchemaVersion:
+        // schemaversion.SchemaV21(), Container: v2}`).
+        let container_value =
+            serde_json::to_value(&hosted_doc).map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 9: serialize hosted-container body: {e}"),
+            })?;
+        let create_settings = serde_json::json!({
+            "SchemaVersion": { "Major": 2, "Minor": 1 },
+            "Container": container_value,
+        });
+        let create_req = CreateRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            container_config: zlayer_gcs::protocol::AnyInString::new(create_settings),
+        };
+        let create_resp: CreateResponse = bridge
+            .send_rpc_json(RpcMessageType::Create, &create_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 9: GCS RpcCreate: {e}"),
+            })?;
+        if create_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(create_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 9: GCS RpcCreate returned HRESULT 0x{hresult_u32:08x}: {}",
+                    create_resp.error_message,
+                ),
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Step 10: RpcStart the hosted container.
+        // ----------------------------------------------------------------
+        tracing::info!(hcs_id = %hcs_id, "Hyper-V step 10: GCS RpcStart (hosted container)");
+        step_log!("10: GCS RpcStart (hosted container)");
+        let start_req = StartRequest {
+            base: RequestBase {
+                activity_id: Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+        };
+        let start_resp: StartResponse = bridge
+            .send_rpc_json(RpcMessageType::Start, &start_req)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!("Hyper-V step 10: GCS RpcStart: {e}"),
+            })?;
+        if start_resp.result != 0 {
+            let hresult_u32 = u32::from_ne_bytes(start_resp.result.to_ne_bytes());
+            return Err(AgentError::CreateFailed {
+                id: hcs_id.to_string(),
+                reason: format!(
+                    "Hyper-V step 10: GCS RpcStart returned HRESULT 0x{hresult_u32:08x}: {}",
+                    start_resp.error_message,
+                ),
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Step 11: hand back the UVM ComputeSystem + the live bridge.
+        //          The caller stashes the bridge on the ContainerEntry so
+        //          B4.3 can route lifecycle through it; for now lifecycle
+        //          (start/stop) still drives the host-side ComputeSystem
+        //          handle. That is harmless on the create path because
+        //          we have just RpcStart'd the workload — subsequent
+        //          `start_container` calls (idempotent re-arms after a
+        //          warm restart) are routed via the host handle, which is
+        //          a no-op on an already-started system.
+        // ----------------------------------------------------------------
+        Ok((
+            uvm_system,
+            HyperVGcsState {
+                bridge: Some(bridge),
+            },
+        ))
+    }
 }
 
-/// Parse a GUID that may or may not be brace-wrapped, as HCN emits them on
-/// the wire (`"{aabbccdd-...}"` or bare `"aabbccdd-..."`). Returns `None` for
-/// any malformed input so callers can fall back gracefully.
-fn parse_guid_loose(s: &str) -> Option<GUID> {
-    let bare = s.trim_matches(|c: char| c == '{' || c == '}');
-    GUID::try_from(bare).ok()
+/// Stub-out the Hyper-V-via-GCS path when the `hcs-runtime` feature is
+/// disabled — the call site in `create_container` is feature-agnostic, so
+/// we surface a typed error rather than gating the whole match arm. This
+/// keeps the Process-isolation path compiling and testable on Windows
+/// without pulling in the `zlayer-gcs` dependency.
+#[cfg(all(target_os = "windows", not(feature = "hcs-runtime")))]
+impl HcsRuntime {
+    // Signature mirrors the real `hcs-runtime` implementation so callers
+    // compile identically with or without the feature; the stub body neither
+    // awaits nor uses its args.
+    #[allow(clippy::too_many_arguments, clippy::unused_async)]
+    async fn hyperv_create_via_gcs(
+        &self,
+        hcs_id: &str,
+        _spec: &ServiceSpec,
+        _scratch_layer: &scratch::WritableLayer,
+        _parent_layers: &[zlayer_hcs::schema::Layer],
+        _namespace_strs: &[String],
+        _uvm: &Uvm,
+        _network_attachment: Option<&WindowsOverlayAttach>,
+    ) -> Result<(ComputeSystem, HyperVGcsState)> {
+        Err(AgentError::Unsupported(format!(
+            "Hyper-V isolation requires the `hcs-runtime` cargo feature \
+             (zlayer-gcs); rebuild zlayer-agent with --features hcs-runtime \
+             or set `isolation: process` for {hcs_id}",
+        )))
+    }
+}
+
+/// HCS-conventional "null" GUID used as the `ContainerId` field on GCS
+/// RPCs that target the UVM itself rather than a hosted container (e.g.
+/// `CombineLayersWCOW`).
+#[cfg(all(target_os = "windows", feature = "hcs-runtime"))]
+const NULL_GUID_STR: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Per-Hyper-V-create state returned by [`HcsRuntime::hyperv_create_via_gcs`]
+/// alongside the UVM's [`ComputeSystem`] handle. Process-isolated creates
+/// produce an empty default value via [`HyperVGcsState::default`].
+///
+/// The struct exists so [`HcsRuntime::create_container`] can use one
+/// expression to bind both halves of the create result without a tuple of
+/// `Option`s in the Process path. The `bridge` field is only populated for
+/// successful Hyper-V creates.
+#[derive(Default)]
+struct HyperVGcsState {
+    /// Live GCS bridge into the freshly-booted UVM. Populated by the
+    /// Hyper-V path; always `None` for the Process path.
+    #[cfg(feature = "hcs-runtime")]
+    bridge: Option<zlayer_gcs::bridge::GcsBridge>,
+}
+
+/// Default vCPU count assigned to a freshly-provisioned UVM.
+///
+/// Two vCPUs is the hcsshim convention for a Hyper-V-isolated container's
+/// utility VM — enough to keep the guest kernel responsive without giving up
+/// large amounts of host scheduling capacity per container.
+const UVM_DEFAULT_VCPUS: u32 = 2;
+
+/// Default memory (MiB) assigned to a freshly-provisioned UVM.
+///
+/// 1 GiB matches the hcsshim default for `WCOW` utility VMs. The container's
+/// own memory pressure is independent of this number — the limit set on the
+/// service's [`ServiceSpec::resources`] is applied to the workload running
+/// inside the UVM, not the UVM itself.
+const UVM_DEFAULT_MEMORY_MB: u64 = 1024;
+
+/// Stable controller GUID hcsshim uses for the primary (boot) SCSI controller
+/// on a Hyper-V-isolated WCOW UVM. Matches
+/// `internal/uvm/scsi.go::guestPrimaryScsiControllerGUID` in hcsshim — HCS keys
+/// the controller in `Devices.Scsi` by this exact string and rejects the
+/// document if it sees the legacy ordinal `"0"` form for a VM that boots from
+/// `VmbFs`.
+const PRIMARY_SCSI_CTRL_GUID: &str = "df6d0690-79e5-55b6-a5ec-c1e2f77f580a";
+
+/// `prot.WindowsLoggingHvsockServiceID` from hcsshim
+/// (`internal/gcs/prot/protocol.go`). Re-added after ground-truth ETW capture of
+/// containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes
+/// confirmed runhcs.exe DOES emit this entry (with `AllowWildcardBinds=true` +
+/// BA/SY bind+connect SDs). Prior revert was based on misreading
+/// `create_wcow.go` (the doc entry is guarded by `LogForwardingEnabled` BUT
+/// the resulting wire bytes still include it — runhcs runs with log
+/// forwarding on by default).
+const WINDOWS_LOGGING_HVSOCK_SERVICE_ID: &str = "172dad59-976d-45f2-8b6c-6d1b13f2ac4d";
+
+/// Build a [`VirtualMachine`] document populated from a freshly-provisioned
+/// [`Uvm`] plus the parent read-only layer chain.
+///
+/// Layout follows the hcsshim convention for Hyper-V-isolated WCOW containers:
+///
+/// * `chipset.uefi` boots from `VmbFs` at `\EFI\Microsoft\Boot\bootmgfw.efi`,
+///   served out of the image's `UtilityVM\Files` directory via the `"os"`
+///   `VirtualSMB` share — there is no host-side `GuestState` VHD.
+/// * `compute_topology` defaults to [`UVM_DEFAULT_VCPUS`] vCPUs and
+///   [`UVM_DEFAULT_MEMORY_MB`] MiB of memory.
+/// * `devices.scsi[<PRIMARY_SCSI_CTRL_GUID>]` carries one attachment at LUN
+///   `"0"` for the scratch VHDX (writable). The controller is keyed by the
+///   hcsshim-canonical primary SCSI controller GUID.
+/// * `devices.virtual_smb` exposes the `"os"` boot-files share plus one
+///   read-only share per parent layer so the container workload can mount its
+///   image.
+/// * `guest_state` is omitted entirely — VmbFs-boot UVMs persist VM state via
+///   the SCSI scratch alone; no `.vmgs` host file is needed.
+///
+/// `spec` carries the workload's [`zlayer_spec::GpuSpec`] (if any) so GPU-PV
+/// adapters can be attached when the caller has already enumerated and
+/// filtered the host's GPU adapters; the UVM's CPU/memory topology stays
+/// fixed by the constants above so the per-container CPU/memory limits remain
+/// a property of the workload inside the UVM (see
+/// [`HcsRuntime::build_compute_system_doc`]'s `ContainerProcessor`/`ContainerMemory`).
+///
+/// `gpu_adapters` is the already-filtered list of host adapters to attach for
+/// Hyper-V GPU-PV. The caller is responsible for vendor/model filtering and
+/// for honoring `spec.resources.gpu.count`. An empty slice paired with a
+/// populated `spec.resources.gpu` produces a [`GpuAssignmentMode::Default`]
+/// block (let HCS pick); a non-empty slice produces a
+/// [`GpuAssignmentMode::List`] block.
+/// Encode a `REG_MULTI_SZ` payload (UTF-16LE, null-terminated strings, final
+/// extra null terminator) as base64 — the wire format HCS expects in a
+/// `RegistryValue.BinaryValue` field when `Type=MultiString`. Used to
+/// override `gcs.DependOnService` so SCM does not block waiting for network
+/// services that never come up in a NIC-less UVM.
+///
+/// Used by `build_uvm_registry_changes` for the `gcs.DependOnService`
+/// override.
+fn encode_multi_sz_utf16le(strs: &[&str]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::<u8>::new();
+    for s in strs {
+        for c in s.encode_utf16() {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        // Null-terminate this string.
+        bytes.extend_from_slice(&[0, 0]);
+    }
+    // Final extra null terminator marks end-of-list.
+    bytes.extend_from_slice(&[0, 0]);
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
+}
+
+/// Read the writable `zlayer-debug` VSMB share's host-side backing directory
+/// after a step-4 accept timeout and produce a compact one-line summary of
+/// what the in-guest `zlayer-dump` diagnostic service wrote there.
+///
+/// Each file is truncated to the first ~2KB so the resulting string stays
+/// embeddable in `AgentError::CreateFailed { reason }` (which is what the
+/// integration test surfaces — there is no separate log channel from the
+/// runtime to the test harness). UTF-8 invalid bytes are replaced (the
+/// guest writes ASCII output from `sc.exe` / `wevtutil` / `dir` / `tasklist`,
+/// but defensive against encoding surprises).
+///
+/// Returns `(empty)` when the dir is absent (UVM never started) or empty
+/// (guest never reached the SCM auto-start phase). Returns `(no-files)`
+/// when the dir exists but contains zero files — also a signal: SCM didn't
+/// kick off our injected service even though the guest reached user-mode.
+#[cfg(feature = "hcs-runtime")]
+fn read_uvm_debug_dump(debug_dir: &std::path::Path) -> String {
+    /// Per-file truncation cap, in bytes. 2KB × ~7 expected files = ~14KB
+    /// total dump fold-in, well below any reasonable error-message ceiling.
+    const PER_FILE_CAP: usize = 2 * 1024;
+
+    let Ok(entries) = std::fs::read_dir(debug_dir) else {
+        return "(empty)".to_string();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    if files.is_empty() {
+        return "(no-files)".to_string();
+    }
+    files.sort(); // deterministic order across runs
+
+    let mut out = String::new();
+    for path in &files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".to_string());
+        // Crash artifacts (saved-state / kernel dump) are large binaries — do
+        // NOT slurp them into the error. Note their size; they're fetched
+        // separately and analyzed with cdb on the host.
+        let is_binary_artifact = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("vmrs") || e.eq_ignore_ascii_case("dmp"));
+        let body = if is_binary_artifact {
+            match std::fs::metadata(path) {
+                Ok(m) => format!("<binary crash artifact, {} bytes>", m.len()),
+                Err(e) => format!("<binary crash artifact, stat error: {e}>"),
+            }
+        } else {
+            // Bounded read — never pull more than PER_FILE_CAP+1 bytes into
+            // memory regardless of on-disk size.
+            match read_prefix(path, PER_FILE_CAP + 1) {
+                Ok(bytes) => {
+                    let truncated = bytes.len() > PER_FILE_CAP;
+                    let cap = bytes.len().min(PER_FILE_CAP);
+                    let body = String::from_utf8_lossy(&bytes[..cap])
+                        .replace(['\n', '\r'], " ")
+                        .trim()
+                        .to_string();
+                    if truncated {
+                        format!("{body}…<truncated>")
+                    } else {
+                        body
+                    }
+                }
+                Err(e) => format!("<read error: {e}>"),
+            }
+        };
+        if !out.is_empty() {
+            out.push_str(" || ");
+        }
+        out.push_str(&name);
+        out.push('=');
+        out.push_str(&body);
+    }
+    out
+}
+
+/// Read at most `max` bytes from the start of `path` without loading the whole
+/// file. Used by [`read_uvm_debug_dump`] so a multi-gigabyte crash artifact
+/// that happens to land in the debug dir can never OOM the read-back path.
+#[cfg(feature = "hcs-runtime")]
+fn read_prefix(path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max];
+    let mut filled = 0usize;
+    while filled < max {
+        let n = f.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// (`windows-debug` only) Mount a preserved scratch VHDX **on this machine**
+/// (read-only), read the in-guest `C:\zlayer-dbg\svcdump.txt` the injected
+/// `zlayer-svcdump` SCM service wrote, then dismount. Returns the file's
+/// contents (collapsed to one line, capped) or a `(…)` marker string on any
+/// failure. Used by the cold-start failure path under `ZLAYER_GCS_SVCDUMP=1`
+/// so the dev watching a foreground `--nocapture` run sees the service-state
+/// dump live, without the offline-detached `Set-VHD`/`Mount-DiskImage` dance.
+///
+/// This is the on-box ergonomic counterpart to the offline-VHDX recipe: the
+/// scratch is a differencing disk, but it mounts coherently on the SAME box
+/// that wrote it because the parent (the `UtilityVM` base) is local. We mount
+/// read-only and never alter the disk, so re-running the offline recipe later
+/// still works.
+#[cfg(all(feature = "hcs-runtime", feature = "windows-debug"))]
+fn mount_and_read_svcdump(vhdx: &std::path::Path) -> String {
+    /// Cap the folded-in svcdump so the `CreateFailed` reason stays bounded;
+    /// the full file remains on the preserved VHDX for offline reading.
+    const SVCDUMP_CAP: usize = 16 * 1024;
+
+    let vhdx_str = vhdx.display().to_string();
+    // One PowerShell invocation: mount RO, resolve the assigned letter, read
+    // the svcdump (Raw so newlines survive), dismount in `finally` so a read
+    // error never leaves the disk attached. `Get-Content -Raw` returns $null
+    // for a missing file; we emit a marker so the caller can tell "mounted but
+    // no svcdump" (SCM never ran our service) from a mount failure.
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$p='{vhdx_str}'
+try {{
+  $img = Mount-DiskImage -ImagePath $p -Access ReadOnly -PassThru
+  $disk = $img | Get-DiskImage | Get-Disk
+  $letters = ($disk | Get-Partition | Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ $_.DriveLetter }})
+  $found=$null
+  foreach ($dl in $letters) {{
+    $f = ($dl + ':\zlayer-dbg\svcdump.txt')
+    if (Test-Path $f) {{ $found=$f; break }}
+  }}
+  if ($found) {{ Get-Content -Raw -LiteralPath $found }}
+  else {{ Write-Output '(mounted-no-svcdump)' }}
+}} finally {{
+  try {{ Dismount-DiskImage -ImagePath $p | Out-Null }} catch {{}}
+}}"#,
+    );
+    let out = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("(mount-spawn-failed: {e})"),
+    };
+    if !out.status.success() {
+        return format!(
+            "(mount-failed: status={} err={})",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .replace(['\n', '\r'], " ")
+                .trim(),
+        );
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if trimmed.len() > SVCDUMP_CAP {
+        format!("{}…<truncated>", &trimmed[..SVCDUMP_CAP])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the offline `RegistryChanges` HCS applies to the guest hives before
+/// first boot.
+///
+/// Two purposes:
+///
+/// 1. **hcsshim parity** — the `gns` `EnableCompartmentNamespace=1` networking
+///    workaround hcsshim sets on every WCOW UVM (`prepareCommonConfigDoc` in
+///    `create_wcow.go`).
+///
+/// 2. **gcs `DependOnService` override** — strip `mpssvc`/`netsetupsvc` from
+///    `gcs`'s SCM dependency chain so the GCS service starts in a UVM that
+///    has no virtual NIC. See the comment block on that entry for rationale.
+///
+/// (B-4 dropped the prior `zlayer-dump` SCM service and WER `LocalDumps`
+/// registry entries because both wrote to the now-removed writable
+/// `zlayer-debug` VSMB share. The host-side HCS ETW capture from
+/// `scripts/windows/launch_e2e.ps1` is the replacement diagnostic channel
+/// while we bisect the 0xEF cause.)
+fn build_uvm_registry_changes() -> Vec<RegistryValue> {
+    let mut values = vec![
+        // hcsshim parity: gns EnableCompartmentNamespace=1.
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\gns".to_string(),
+            }),
+            name: "EnableCompartmentNamespace".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            d_word_value: Some(1),
+            ..Default::default()
+        },
+    ];
+
+    // gcs `DependOnService`: keep the STOCK inbox chain (condrv,
+    // hvsocketcontrol, mpssvc, netsetupsvc) — hcsshim parity. The inbox gcs
+    // depends on mpssvc (firewall) / netsetupsvc, which now reach Running
+    // because the layer unpacker applies the image's per-file security
+    // descriptors (so LocalService can read `mpssvc.dll` — see
+    // `windows::layer::BackupStreamWriter`). The historical strip to
+    // condrv+hvsocketcontrol was a workaround for the never-dial that traded it
+    // for a cold-start Create fault (gcs ran without the firewall/network
+    // substrate its Create handler needs); it is no longer needed and is
+    // retained only as an opt-in debug A/B via `ZLAYER_GCS_STRIP_DEPS=1`. The
+    // strip is REG_MULTI_SZ (UTF-16LE, base64).
+    if std::env::var("ZLAYER_GCS_STRIP_DEPS").as_deref() == Ok("1") {
+        tracing::warn!(
+            "ZLAYER_GCS_STRIP_DEPS=1 — stripping gcs DependOnService to \
+             condrv+hvsocketcontrol (debug A/B; not the normal path)"
+        );
+        values.push(RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Services\gcs".to_string(),
+            }),
+            name: "DependOnService".to_string(),
+            r#type: Some(RegistryValueType::MultiString),
+            binary_value: encode_multi_sz_utf16le(&["condrv", "hvsocketcontrol"]),
+            ..Default::default()
+        });
+    }
+
+    // windows-debug + ZLAYER_GCS_KD=1: open the kernel DbgPrint filter wide
+    // (`Session Manager\Debug Print Filter\DEFAULT = 0xFFFFFFFF`) so all kernel
+    // `DbgPrintEx` output streams to the attached `kd` over the COM1 transport
+    // (user-mode `OutputDebugString` from svchost/SCM reaches kd regardless).
+    // Lets the KD capture show why `mpssvc`/`netsetupsvc` fail to reach Running.
+    #[cfg(feature = "windows-debug")]
+    if std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1") {
+        values.push(RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: r"CurrentControlSet\Control\Session Manager\Debug Print Filter".to_string(),
+            }),
+            name: "DEFAULT".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 0x7FFFFFFF (max positive i32): verbose DbgPrint across components
+            // without signed-serialization ambiguity of a full 0xFFFFFFFF.
+            d_word_value: Some(0x7FFF_FFFF),
+            ..Default::default()
+        });
+    }
+
+    // windows-debug + ZLAYER_GCS_SVCDUMP=1: register an auto-start SCM service
+    // `zlayer-svcdump` that names WHY `mpssvc`/`netsetupsvc` don't reach Running
+    // (handoff NEXT ACTION). Unlike the dead writable-VSMB exfil path, this
+    // writes to the guest-local scratch volume `C:\zlayer-dbg` (the same path
+    // WER LocalDumps uses), which survives offline on the preserved scratch
+    // VHDX and is also readable on-box (the host writes the scratch).
+    //
+    //   * Start=2 (SERVICE_AUTO_START), Type=0x10 (SERVICE_WIN32_OWN_PROCESS),
+    //     ErrorControl=0 (SERVICE_ERROR_IGNORE) — boot keeps going even if our
+    //     dumper bombs.
+    //   * NO `DependOnService` — SCM starts it regardless of the firewall/
+    //     network services we're trying to diagnose (so it can observe THEM
+    //     stuck in START_PENDING/STOPPED).
+    //   * `ImagePath` is REG_EXPAND_SZ (`%comspec%` expands at service start)
+    //     and loops ~12 times, ~5s apart, appending `sc queryex`/`sc qc`/
+    //     `sc query` snapshots so we capture WIN32_EXIT_CODE/SERVICE_EXIT_CODE
+    //     over the window the services would normally start.
+    //
+    // NOTE: an SCM service `ImagePath` is NOT a normal interactive process — it
+    // must call StartServiceCtrlDispatcher within ~30s or SCM kills it. A raw
+    // `cmd /c` here is reaped quickly by SCM, but the loop body runs at least
+    // once or twice before that, which is enough to capture the post-boot
+    // service state. (services.exe still launches the ImagePath process and the
+    // child `cmd` keeps running detached long enough on a stripped UVM with no
+    // contending workload.) We deliberately keep the loop short so the captured
+    // file is bounded.
+    #[cfg(feature = "windows-debug")]
+    if std::env::var("ZLAYER_GCS_SVCDUMP").as_deref() == Ok("1") {
+        let svc = r"CurrentControlSet\Services\zlayer-svcdump";
+        let svc_key = || {
+            Some(RegistryKey {
+                hive: Some(RegistryHive::System),
+                name: svc.to_string(),
+            })
+        };
+        // %comspec% /c "for /l %i in (1,1,12) do ( <dump one snapshot> & ping -n 6 127.0.0.1 >nul )"
+        // `ping -n 6 127.0.0.1` is the inbox-safe ~5s sleep (no `timeout.exe`
+        // in nanoserver, and `timeout` needs a console anyway). `>>` appends so
+        // every iteration accumulates. `2>&1` folds stderr in so a missing
+        // service name still records its error. `md` (ignored if present)
+        // creates the scratch-local dir first.
+        let image_path = concat!(
+            r#"%comspec% /c "md C:\zlayer-dbg 2>nul & for /l %i in (1,1,12) do ("#,
+            r#"echo ===== iter %i ===== >> C:\zlayer-dbg\svcdump.txt & "#,
+            r#"sc queryex mpssvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex netsetupsvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex BFE >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex RpcSs >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex nsi >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc queryex gcs >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc qc mpssvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc qc netsetupsvc >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"sc query >> C:\zlayer-dbg\svcdump.txt 2>&1 & "#,
+            r#"ping -n 6 127.0.0.1 >nul )""#,
+        );
+        values.extend([
+            RegistryValue {
+                key: svc_key(),
+                name: "Start".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(2), // SERVICE_AUTO_START
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "Type".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(0x10), // SERVICE_WIN32_OWN_PROCESS
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "ErrorControl".to_string(),
+                r#type: Some(RegistryValueType::DWord),
+                d_word_value: Some(0), // SERVICE_ERROR_IGNORE
+                ..Default::default()
+            },
+            RegistryValue {
+                key: svc_key(),
+                name: "ImagePath".to_string(),
+                // REG_EXPAND_SZ via the `string_value` field (NOT MultiString /
+                // binary) so `%comspec%` expands at service-start time.
+                r#type: Some(RegistryValueType::ExpandedString),
+                string_value: image_path.to_string(),
+                ..Default::default()
+            },
+        ]);
+    }
+
+    // windows-debug: append WER LocalDumps for vmcomputeagent.exe, pointing
+    // its full-crash `DumpFolder` at the guest-local scratch path
+    // `C:\zlayer-dbg`. WER auto-creates the folder; the dump persists on the
+    // preserved scratch VHDX for offline inspection. Compiled out entirely in
+    // normal builds.
+    #[cfg(feature = "windows-debug")]
+    values.extend(build_uvm_debug_registry_changes());
+
+    values
+}
+
+/// (`windows-debug` only) Offline registry changes that arm Windows Error
+/// Reporting so that, if `vmcomputeagent.exe` (the in-guest GCS host process)
+/// fully crashes during the cold-start `RpcCreate`/`HvSocket` handshake, a full
+/// crash dump lands on the guest's writable scratch volume (`C:\`) where the
+/// operator can read it offline after the failed UVM is terminated and the
+/// scratch VHDX is mounted host-side.
+///
+/// **WER `LocalDumps` for `vmcomputeagent.exe`.** If gcs.exe actually crashes
+/// during cold-start `Create`, Windows Error Reporting writes a full
+/// (`DumpType=2`) minidump into the configured `DumpFolder`. WER auto-creates
+/// the folder, so we point it at a guest-local path on the scratch volume
+/// (`C:\zlayer-dbg`) rather than any VSMB share — there is no guest-writable
+/// VSMB share (HCS rejects one at hot-attach), and the scratch VHDX persists
+/// after a failure under `ZLAYER_KEEP_UVM_ON_FAILURE=1`, so the dump survives
+/// for offline inspection. Lives in the `Software` hive at
+/// `Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe`.
+///
+/// (The prior `zlayer-dbg` SCM service was removed: it wrote `sc`/`wevtutil`
+/// output to a now-dead VSMB share. The replacement diagnostic path reads the
+/// guest's raw `.evtx` event logs offline from the preserved scratch VHDX
+/// (`C:\Windows\System32\winevt\Logs\{Application,System}.evtx`), which needs
+/// no in-guest service.)
+#[cfg(feature = "windows-debug")]
+fn build_uvm_debug_registry_changes() -> Vec<RegistryValue> {
+    // Guest-local path on the writable scratch volume (guest `C:\`). WER
+    // auto-creates this folder before writing the dump. The scratch VHDX is
+    // preserved + unlocked after a cold-start failure (KEEP mode terminates
+    // the UVM, releasing the disk lock), so the operator can mount it offline
+    // and read `C:\zlayer-dbg\*.dmp`.
+    let dump_folder = r"C:\zlayer-dbg".to_string();
+
+    vec![
+        // --- WER LocalDumps for vmcomputeagent.exe ---
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpFolder".to_string(),
+            r#type: Some(RegistryValueType::ExpandedString),
+            string_value: dump_folder,
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpType".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            // 2 = full dump.
+            d_word_value: Some(2),
+            ..Default::default()
+        },
+        RegistryValue {
+            key: Some(RegistryKey {
+                hive: Some(RegistryHive::Software),
+                name: r"Microsoft\Windows\Windows Error Reporting\LocalDumps\vmcomputeagent.exe"
+                    .to_string(),
+            }),
+            name: "DumpCount".to_string(),
+            r#type: Some(RegistryValueType::DWord),
+            d_word_value: Some(5),
+            ..Default::default()
+        },
+    ]
+}
+
+#[allow(clippy::too_many_lines)] // construction is sequential by HCS field; splitting hurts readability
+fn build_virtual_machine_doc(
+    uvm: &Uvm,
+    // Retained in the signature so callers + tests stay stable, but no
+    // longer materialised into the UVM-create-time `VirtualSmb.Shares`
+    // array — see the share-construction comment below.
+    _parent_layers: &[zlayer_hcs::schema::Layer],
+    spec: &ServiceSpec,
+    gpu_adapters: &[HostGpuAdapter],
+) -> VirtualMachine {
+    use std::collections::BTreeMap;
+
+    let mut scsi_attachments: BTreeMap<String, ScsiAttachment> = BTreeMap::new();
+    scsi_attachments.insert(
+        "0".to_string(),
+        ScsiAttachment {
+            path: uvm.scratch_vhdx().to_string_lossy().into_owned(),
+            r#type: "VirtualDisk".to_string(),
+            read_only: Some(false),
+        },
+    );
+
+    let mut scsi: BTreeMap<String, ScsiController> = BTreeMap::new();
+    scsi.insert(
+        PRIMARY_SCSI_CTRL_GUID.to_string(),
+        ScsiController {
+            attachments: scsi_attachments,
+        },
+    );
+
+    // VirtualSMB shares at UVM-create time: ONLY the `"os"` share that
+    // exposes the image's `UtilityVM\Files` directory as the UVM's boot
+    // volume (UEFI boots from `VmbFs:\EFI\Microsoft\Boot\bootmgfw.efi`).
+    //
+    // We deliberately do NOT include parent-layer shares here, nor the
+    // writable `"zlayer-debug"` diagnostic exfil share. Hcsshim's
+    // `internal/uvm/create_wcow.go` only writes the `os` share at
+    // create-time; parent-layer shares are hot-attached AFTER the UVM
+    // boots, per hosted container, via `uvm.Add` (`internal/uvm/vsmb.go`).
+    // Our `hyperv_create_via_gcs` does those hot-attaches at Step 5 (parent
+    // layers) and, under `windows-debug`, the writable `zlayer-debug` share
+    // at Step 3c' (post-HcsStart, pre-accept); injecting any of them into the
+    // create-time doc poisons gcs.exe's host-compartment init during
+    // cold-start `RpcCreate` and is the working hypothesis for the observed
+    // 0xEF `CRITICAL_PROCESS_DIED` bugcheck ~0.8 s after Negotiate. See:
+    //
+    //   `.claude/plans/okay-todo-delme-md-this-is-abstract-kernighan.md`
+    //   `BlackLeafDocs/zlayer/windowshcs/gcs-bridge-and-0xEF.md`
+    //
+    // The `os` options match hcsshim's `DefaultVSMBOptions(true)` from
+    // `internal/uvm/vsmb.go` — read-only, share-read, cache-io,
+    // pseudo-oplocks, take-backup-privilege.
+    // `"os"` share goes FIRST per hcsshim convention (it is the OS root).
+    let shares: Vec<VirtualSmbShare> = vec![VirtualSmbShare {
+        name: "os".to_string(),
+        path: uvm.os_files_dir().to_string_lossy().into_owned(),
+        options: Some(VirtualSmbShareOptions {
+            read_only: true,
+            share_read: true,
+            cache_io: true,
+            pseudo_oplocks: true,
+            take_backup_privilege: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    // B-4: writable `zlayer-debug` VSMB share REMOVED from the
+    // create-time doc to test whether it is what kills the in-guest GCS
+    // during cold-start RpcCreate. Hcsshim's create-time doc has ONLY the
+    // `os` (read-only) share; every parent layer + every additional share
+    // is hot-attached AFTER the UVM boots. Our prior `zlayer-debug` share
+    // was a session-evidence-only diagnostic — losing it costs us in-guest
+    // observability (start.txt, env.txt, dir.txt, sc-*.txt, sys.txt,
+    // app.txt) but the host-side HCS ETW + Hyper-V-Worker channels + the
+    // bridge wire trace are still live.
+    //
+    // Original comment for reference (kept while the bisect is in flight):
+    //   Mounted in the guest at `\\?\VMSMB\VSMB-{dcc079ae-…}\zlayer-debug`
+    //   per hcsshim's `internal/uvm/vsmb.go`. No `options` because
+    //   `share_read`/`cache_io`/`take_backup_privilege` on a writable
+    //   share triggers HCS `PowerOnCold` HRESULT 0x80070057.
+    let virtual_smb = Some(VirtualSmb {
+        shares,
+        // hcsshim sets DirectFileMappingInMB=1024 on every WCOW UVM VSMB block
+        // (`create_wcow.go` prepareCommonConfigDoc). A "sensible default" per
+        // their comment; we mirror it for parity.
+        direct_file_mapping_in_mb: Some(1024),
+    });
+
+    // DebugOptions + GuestCrashReporting removed (2026-05-30 round 2 — second
+    // attempt at this revert). Ground-truth ETW capture of
+    // containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes
+    // shows runhcs emits NEITHER block. Our first attempt to drop them (B-5)
+    // produced a never-dial regression, but that test was confounded by
+    // COM-pipe additions also being active; the present state has those
+    // reverted via Phase H, so re-testing.
+    let debug_options: Option<DebugOptions> = None;
+    let guest_crash_reporting: Option<GuestCrashReporting> = None;
+
+    // Populate the GPU-PV block when the workload requested a GPU. With no
+    // candidate adapters we emit `Default` so HCS picks the host default
+    // instead of silently dropping the request; with candidates we list them
+    // explicitly.
+    let gpu = spec.resources.gpu.as_ref().map(|_| {
+        let requests: Vec<GpuAssignmentRequest> = gpu_adapters
+            .iter()
+            .map(|a| GpuAssignmentRequest {
+                #[allow(clippy::cast_sign_loss)]
+                virtual_machine_id_string: format!(
+                    "0x{:08x}:0x{:08x}",
+                    a.luid_high, a.luid_low as u32,
+                ),
+                adapter_luid_high_part: a.luid_high,
+                adapter_luid_low_part: a.luid_low,
+            })
+            .collect();
+        let mode = if requests.is_empty() {
+            GpuAssignmentMode::Default
+        } else {
+            GpuAssignmentMode::List
+        };
+        GpuAssignment {
+            assignment_mode: mode,
+            assignment_request: requests,
+            allow_vendor_extension: Some(true),
+        }
+    });
+
+    VirtualMachine {
+        // hcsshim sets StopOnReset=true on every utility VM so a guest-side
+        // reset/bugcheck during boot surfaces as a clean Stop (observable in
+        // HCS state) instead of an endless reboot loop.
+        stop_on_reset: true,
+        // Mirror hcsshim's WCOW `prepareCommonConfigDoc` registry edits. The
+        // `gns` `EnableCompartmentNamespace` key is the networking workaround
+        // hcsshim applies by default (`!opts.DisableCompartmentNamespace`); it
+        // gates a GNS.dll change for SMB-share access inside the UVM. We skip
+        // the WER/dump keys (hcsshim only sets those when a dump location is
+        // configured, which we don't).
+        registry_changes: Some(RegistryChanges {
+            add_values: build_uvm_registry_changes(),
+        }),
+        debug_options,
+        chipset: Some(Chipset {
+            uefi: Some(Uefi {
+                boot_this: Some(UefiBootEntry {
+                    device_type: "VmbFs".to_string(),
+                    device_path: r"\EFI\Microsoft\Boot\bootmgfw.efi".to_string(),
+                    disk_number: None,
+                }),
+                // NOTE: hcsshim's `internal/uvm/create_wcow.go:313-319` populates
+                // `Devices.ComPorts["0"].NamedPipe` for the host-side debug
+                // serial console but does NOT set `Uefi.Console = "ComPort1"`.
+                // Setting that redirect breaks the WCOW UVM boot in our
+                // testing — the UVM enters Running state without ever
+                // executing UEFI/bootmgr. Leave Console unset (Default).
+                ..Default::default()
+            }),
+        }),
+        compute_topology: Some(Topology {
+            memory: Some(TopologyMemory {
+                size_in_mb: UVM_DEFAULT_MEMORY_MB,
+                // Mirror hcsshim `prepareCommonConfigDoc`: both fields enabled by
+                // default on every WCOW UVM. Phase F diff confirmed gcs.exe's
+                // reference doc has them; ZLayer was omitting both.
+                allow_overcommit: Some(true),
+                enable_hot_hint: Some(true),
+            }),
+            processor: Some(TopologyProcessor {
+                count: UVM_DEFAULT_VCPUS,
+            }),
+        }),
+        devices: Some(Devices {
+            // COM1 → host named pipe so we can capture UEFI / bootmgr /
+            // winload / SMSS / wininit early-boot output that has no other
+            // channel before the in-guest GCS comes up and starts logging
+            // over hvsock. Mirrors hcsshim `internal/uvm/create_wcow.go`
+            // (`doc.VirtualMachine.Devices.ComPorts["0"].NamedPipe`).
+            // Pipe name is keyed off the UVM's RuntimeId GUID so concurrent
+            // UVMs do not collide on a single pipe. The host-side reader is
+            // spawned by `scripts/windows/launch_e2e.ps1` which watches for
+            // `\\.\pipe\zlayer-uvm-*-com1` and tees each pipe into
+            // `$RunDir\com-zlayer-uvm-<id>-com1.log`.
+            com_ports: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "0".to_string(),
+                    zlayer_hcs::schema::ComPort {
+                        named_pipe: format!(
+                            r"\\.\pipe\zlayer-uvm-{}-com1",
+                            format_guid_bare(uvm.runtime_id())
+                        ),
+                        // When KD is enabled (windows-debug + ZLAYER_GCS_KD=1),
+                        // ask HCS to set up the COM1 named pipe with
+                        // debugger-friendly semantics so a `kd`/`windbg` client
+                        // can sync over it (a plain pipe stalls in the
+                        // "Refreshing KD connection" resync loop).
+                        optimize_for_debugger: std::env::var("ZLAYER_GCS_KD").as_deref() == Ok("1"),
+                    },
+                );
+                m
+            },
+            scsi,
+            virtual_smb,
+            gpu,
+            // The in-guest GCS only accepts the host's hvsock connection when
+            // the UVM authorizes SYSTEM/admin binds. "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+            // = DACL granting Full Access to NT AUTHORITY\SYSTEM (SY) and
+            // BUILTIN\Administrators (BA). Mirrors hcsshim create_wcow.go:270-274,
+            // which sets ONLY DefaultBindSecurityDescriptor for WCOW (the guest
+            // GCS dials OUT, authorized guest-side; DefaultConnectSecurityDescriptor
+            // is LCOW-only, where the host dials the guest — verified against the
+            // hcsshim tree, and an e2e with the connect SD set still hit the 120s
+            // accept timeout with bridge_started=0, confirming it is not the gap).
+            hv_socket: Some(HvSocket2 {
+                hv_socket_config: Some(HvSocketSystemConfig {
+                    default_bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                    service_table: {
+                        let mut table = BTreeMap::new();
+                        table.insert(
+                            WINDOWS_LOGGING_HVSOCK_SERVICE_ID.to_string(),
+                            HvSocketServiceConfig {
+                                bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                                connect_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                                    .to_string(),
+                                allow_wildcard_binds: true,
+                                ..Default::default()
+                            },
+                        );
+                        table
+                    },
+                    ..Default::default()
+                }),
+            }),
+            guest_crash_reporting,
+        }),
+        // VmbFs boot path means HCS persists VM state via the SCSI scratch
+        // alone; no host-side `.vmgs` guest-state file is needed (or wanted —
+        // supplying one with VmbFs boot triggers an HCS validation error).
+        guest_state: None,
+        runtime_state_file_path: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hyper-V two-document builders (B4.1)
+//
+// The Hyper-V isolation flow needs TWO separate payloads:
+//
+//   1. A UVM-only `ComputeSystem` doc (`virtual_machine: Some(_)`,
+//      `container: None`) handed to `HcsCreateComputeSystem` to boot the
+//      utility VM.
+//   2. A hosted-container `Container` body (NOT a full ComputeSystem) handed
+//      to the GCS bridge's `RpcCreate.settings` field after the UVM is up.
+//
+// `build_compute_system_doc` above still produces the legacy single-doc form;
+// the new builders below are not yet wired into the create-container flow.
+// B4.2 will swap callers over to use both helpers in sequence.
+// ---------------------------------------------------------------------------
+
+/// Shared `Container.Processor` constructor used by both the legacy single-doc
+/// path and the new hosted-container builder. Matches containerd-shim-runhcs-v1
+/// behavior: always `Some(_)`, defaulting to `ContainerProcessor::default()`
+/// when the spec sets no CPU limits.
+//
+// `Option<_>` is intentional even though we always return `Some(_)` — the
+// HCS schema's `Container.Processor` field is `Option<ContainerProcessor>`
+// and callers assign the return value directly into it; collapsing to a bare
+// `ContainerProcessor` would force every caller to re-wrap.
+// dead_code: per-container CPU/memory limits are not set on the Hyper-V hosted
+// container body (those are UVM-level — they size the UVM in
+// `build_virtual_machine_doc`, currently fixed at the UVM defaults). Retained
+// for the follow-up that wires spec resources into UVM sizing / process
+// isolation.
+#[allow(clippy::unnecessary_wraps, dead_code)]
+fn build_container_processor(spec: &ServiceSpec) -> Option<ContainerProcessor> {
+    Some(
+        spec.resources
+            .cpu
+            .and_then(|cpu| {
+                let count = cpu.ceil();
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let count_u32 = if count.is_finite() && count >= 1.0 {
+                    count as u32
+                } else {
+                    return None;
+                };
+                Some(ContainerProcessor {
+                    count: Some(count_u32),
+                    maximum: None,
+                    weight: None,
+                })
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// Shared `Container.Memory` constructor. Returns `None` when the spec sets no
+/// memory limit; HCS treats absence as "no memory constraint."
+// dead_code: see note on `build_container_processor` — UVM-level for Hyper-V.
+#[allow(dead_code)]
+fn build_container_memory(spec: &ServiceSpec) -> Option<ContainerMemory> {
+    spec.resources.memory.as_ref().and_then(|mem_str| {
+        crate::bundle::parse_memory_string(mem_str)
+            .ok()
+            .map(|bytes| {
+                // HCS takes MiB. Round up so 512Mi → 512, 1.5GiB → 1536, etc.
+                let mib = bytes.div_ceil(1024 * 1024);
+                ContainerMemory {
+                    size_in_mb: Some(mib),
+                }
+            })
+    })
+}
+
+/// Build the UVM-only compute-system document for a Hyper-V-isolated
+/// container. This is the FIRST `HcsCreateComputeSystem` call in the Hyper-V
+/// flow — it boots the UVM. The container itself is created INSIDE the UVM via
+/// a subsequent GCS `RpcCreate` (see [`build_hosted_container_doc`]).
+///
+/// `parent_layers` populates the per-layer `VirtualSMB` shares in the UVM doc.
+/// `uvm` provides the scratch VHDX + image's `UtilityVM\Files` os-share path.
+/// `spec` provides resource constraints (gpu) consulted by
+/// [`build_virtual_machine_doc`]; the UVM's own CPU/memory topology stays
+/// fixed at [`UVM_DEFAULT_VCPUS`] / [`UVM_DEFAULT_MEMORY_MB`] — per-container
+/// limits live on the hosted-container body instead.
+#[allow(dead_code)] // B4.2 will wire this into create_container.
+fn build_uvm_only_doc(
+    owner_tag: &str,
+    uvm_id: &str,
+    uvm: &Uvm,
+    parent_layers: &[zlayer_hcs::schema::Layer],
+    spec: &ServiceSpec,
+    gpu_adapters: &[HostGpuAdapter],
+) -> HcsDoc {
+    let vm_doc = build_virtual_machine_doc(uvm, parent_layers, spec, gpu_adapters);
+    HcsDoc {
+        owner: owner_tag.to_string(),
+        schema_version: SchemaVersion::default(),
+        hosting_system_id: String::new(),
+        container: None,
+        virtual_machine: Some(vm_doc),
+        should_terminate_on_last_handle_closed: Some(true),
+    }
+    .apply_service_id(uvm_id)
+}
+
+/// Build the hosted-container body for a Hyper-V-isolated container. This is
+/// the SECOND payload — it's a [`HcsContainer`] body, fed to the GCS bridge's
+/// `RpcCreate` `settings` field (NOT to `HcsCreateComputeSystem`).
+///
+/// IMPORTANT: the layer paths inside this Container body are GUEST paths
+/// (in-UVM `\\?\VMSMB\VSMB-{dcc079ae-...}\sN`), NOT host paths. The caller
+/// (B4.2) provides them after `CombineLayersWCOW` via GCS resolves the per-VSMB
+/// guest path. This builder accepts a `Vec<Layer>` of guest layer paths
+/// verbatim and a `guest_root_volume` (the guest-side prepared-volume path)
+/// for `Storage.Path`.
+///
+/// `namespace_id` attaches the container to a single HCN namespace inside the
+/// guest; `None` means no network — `Networking` is omitted entirely, matching
+/// the legacy single-doc path.
+#[allow(dead_code)] // B4.2 will wire this into create_container.
+fn build_hosted_container_doc(
+    _spec: &ServiceSpec,
+    guest_layers: Vec<zlayer_hcs::schema::Layer>,
+    guest_root_volume: String,
+    namespace_id: Option<String>,
+    _hcs_id: &str,
+) -> HcsContainer {
+    let storage = HcsStorage {
+        layers: guest_layers,
+        path: Some(guest_root_volume),
+    };
+    let networking = namespace_id.map(|ns| zlayer_hcs::schema::ContainerNetworking {
+        allow_unqualified_dns_query: Some(true),
+        dns_search_list: Vec::new(),
+        namespace: Some(ns),
+        network_shared_container_name: None,
+    });
+    // The GCS-forwarded HOSTED container config is MINIMAL: for Hyper-V
+    // isolation the CPU/memory limits and hostname belong to the UVM (set in
+    // the UVM create doc), not the hosted container, and the guest's hosted
+    // schema rejects them as unknown properties (`$.HostName`, `$.Processor`
+    // → C037010D). Send only `Storage` (the combined WCIFS root + layers) and
+    // `Networking` (the HCN namespace). `Processor`/`Memory`/`GuestOs` are
+    // intentionally omitted.
+    HcsContainer {
+        guest_os: None,
+        storage: Some(storage),
+        networking,
+        mapped_directories: Vec::new(),
+        mapped_pipes: Vec::new(),
+        processor: None,
+        memory: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host GPU adapter probe (DXGI) + spec-side filtering
+// ---------------------------------------------------------------------------
+
+/// One host GPU adapter as seen by DXGI.
+///
+/// `luid_high` / `luid_low` come from
+/// `IDXGIAdapter::GetDesc().AdapterLuid` — Microsoft's `LUID` carries
+/// `HighPart: i32` and `LowPart: u32` on the wire but the HCS GPU-PV schema
+/// expects `AdapterLuidHighPart: u32` and `AdapterLuidLowPart: i32`, so we
+/// match that orientation here and apply the sign conversion at the wire
+/// boundary inside [`build_virtual_machine_doc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostGpuAdapter {
+    /// `LUID.HighPart` cast to `u32` for HCS.
+    pub luid_high: u32,
+    /// `LUID.LowPart` cast to `i32` for HCS.
+    pub luid_low: i32,
+    /// Human-readable adapter description (`Description` field of
+    /// `DXGI_ADAPTER_DESC`, NUL-trimmed and UTF-8'd).
+    pub description: String,
+    /// PCI vendor id (e.g. `0x10de` for NVIDIA, `0x1002` for AMD, `0x8086`
+    /// for Intel, `0x1414` for Microsoft Basic Render Driver / WARP).
+    pub vendor_id: u32,
+    /// PCI device id.
+    pub device_id: u32,
+}
+
+/// PCI vendor id of Microsoft's software renderer (WARP / Basic Render
+/// Driver). We skip these in [`enumerate_host_gpu_adapters`] because they
+/// cannot back GPU-PV passthrough.
+const VENDOR_ID_MICROSOFT_BASIC: u32 = 0x1414;
+
+/// Enumerate host GPU adapters via DXGI on Windows. Returns
+/// [`io::ErrorKind::Unsupported`] on every other platform so the runtime
+/// surfaces a clean error rather than panicking when a cross-compile slips
+/// through.
+#[cfg(target_os = "windows")]
+fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+
+    // SAFETY: `CreateDXGIFactory1` is the documented entry point for the
+    // DXGI 1.1 factory; we hold the resulting interface for the lifetime of
+    // this function only, so the COM ref-count is managed entirely by
+    // `windows-rs`. No raw pointers are dereferenced by the caller.
+    let factory: IDXGIFactory1 = unsafe {
+        CreateDXGIFactory1()
+            .map_err(|e| std::io::Error::other(format!("CreateDXGIFactory1 failed: {e}")))?
+    };
+
+    let mut adapters = Vec::new();
+    let mut index: u32 = 0;
+    loop {
+        // SAFETY: `EnumAdapters` returns `DXGI_ERROR_NOT_FOUND` once the
+        // index runs past the last adapter; we treat that as the loop's
+        // natural termination. Any other error is propagated.
+        let adapter: IDXGIAdapter = unsafe {
+            match factory.EnumAdapters(index) {
+                Ok(a) => a,
+                Err(e) => {
+                    // DXGI_ERROR_NOT_FOUND is HRESULT 0x887A0002. The HRESULT
+                    // bit pattern is what we compare against — sign-loss here
+                    // is the intended reinterpretation of the i32 as u32.
+                    #[allow(clippy::cast_sign_loss)]
+                    let code = e.code().0 as u32;
+                    if code == 0x887A_0002 {
+                        break;
+                    }
+                    return Err(std::io::Error::other(format!(
+                        "IDXGIFactory1::EnumAdapters({index}) failed: {e}",
+                    )));
+                }
+            }
+        };
+
+        // SAFETY: `IDXGIAdapter::GetDesc` returns the descriptor by value;
+        // `windows-rs` wraps the HRESULT into a `Result`. No raw pointers are
+        // dereferenced by the caller.
+        let desc = unsafe {
+            adapter.GetDesc().map_err(|e| {
+                std::io::Error::other(format!("IDXGIAdapter::GetDesc({index}) failed: {e}"))
+            })?
+        };
+
+        if desc.VendorId == VENDOR_ID_MICROSOFT_BASIC {
+            // Skip WARP / Basic Render Driver — cannot back GPU-PV.
+            index += 1;
+            continue;
+        }
+
+        // `Description` is a NUL-terminated UTF-16 array up to 128 chars.
+        let nul = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let description = String::from_utf16_lossy(&desc.Description[..nul]);
+
+        // LUID parts are opaque bit patterns; the LUID is a 64-bit ID split
+        // across i32 high / u32 low in Win32, and our `HostGpuAdapter`
+        // stores them as `u32 high / i32 low` to match the HCS schema's
+        // `GpuAssignmentRequest` field types. Reinterpret bit patterns.
+        #[allow(clippy::cast_sign_loss)]
+        let luid_high = desc.AdapterLuid.HighPart as u32;
+        #[allow(clippy::cast_possible_wrap)]
+        let luid_low = desc.AdapterLuid.LowPart as i32;
+        adapters.push(HostGpuAdapter {
+            luid_high,
+            luid_low,
+            description,
+            vendor_id: desc.VendorId,
+            device_id: desc.DeviceId,
+        });
+
+        index += 1;
+    }
+
+    Ok(adapters)
+}
+
+/// Non-Windows stub: DXGI is a Windows-only API. Compiled on every other
+/// platform so unit tests on Linux / macOS can still link the module and
+/// assert the expected error shape.
+#[cfg(not(target_os = "windows"))]
+fn enumerate_host_gpu_adapters() -> std::io::Result<Vec<HostGpuAdapter>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "DXGI host GPU enumeration is Windows-only",
+    ))
+}
+
+/// Map a [`zlayer_spec::GpuSpec`] vendor string to its PCI vendor id, or
+/// `None` when the vendor is `"all"` / empty / unknown (in which case no
+/// vendor filtering is applied).
+fn vendor_id_for_spec(vendor: &str) -> Option<u32> {
+    match vendor.to_ascii_lowercase().as_str() {
+        "nvidia" => Some(0x10de),
+        "amd" | "ati" => Some(0x1002),
+        "intel" => Some(0x8086),
+        _ => None,
+    }
+}
+
+/// Filter a list of host adapters by the spec's vendor + count. Model
+/// filtering matches as a case-insensitive substring against
+/// [`HostGpuAdapter::description`].
+///
+/// Filtering is applied in this order:
+/// 1. Vendor (if not `"all"`/empty/unknown).
+/// 2. Model substring (if present).
+/// 3. Truncate to `count` (always; defaults to 1 in the spec).
+fn filter_adapters_by_gpu_spec(
+    adapters: &[HostGpuAdapter],
+    spec: &zlayer_spec::GpuSpec,
+) -> Vec<HostGpuAdapter> {
+    let vendor_filter = if spec.vendor.eq_ignore_ascii_case("all") || spec.vendor.is_empty() {
+        None
+    } else {
+        vendor_id_for_spec(&spec.vendor)
+    };
+
+    let model_lower = spec.model.as_deref().map(str::to_ascii_lowercase);
+
+    let mut filtered: Vec<HostGpuAdapter> = adapters
+        .iter()
+        .filter(|a| match vendor_filter {
+            Some(vid) => a.vendor_id == vid,
+            None => true,
+        })
+        .filter(|a| match model_lower.as_deref() {
+            Some(needle) => a.description.to_ascii_lowercase().contains(needle),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    let want = spec.count.max(1) as usize;
+    if filtered.len() > want {
+        filtered.truncate(want);
+    }
+    filtered
+}
+
+/// RAII guard that owns a list of parent layer paths that have been
+/// `ActivateLayer` + `PrepareLayer`d. On drop (unless [`Self::disarm`]ed) it
+/// `UnprepareLayer` + `DeactivateLayer`s each entry in reverse order
+/// (parent-to-child of the original child-to-parent list, i.e. newest-first)
+/// so a `create_container` failure between activation and successful
+/// `ContainerEntry` insertion does not leak host layer table entries.
+struct ParentLayerActivationGuard {
+    layers: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl ParentLayerActivationGuard {
+    fn new(layers: Vec<PathBuf>) -> Self {
+        Self {
+            layers,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard and return ownership of the path list. The caller is
+    /// now responsible for `UnprepareLayer` + `DeactivateLayer` on each path
+    /// during container teardown (via [`ContainerEntry::activated_parent_layers`]).
+    fn disarm(mut self) -> Vec<PathBuf> {
+        self.armed = false;
+        std::mem::take(&mut self.layers)
+    }
+}
+
+impl Drop for ParentLayerActivationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The stored order is child-to-parent. Deactivate newest-first so
+        // we mirror hcsshim's teardown direction. Parents were only
+        // `ActivateLayer`d (no `PrepareLayer`), so the matching teardown
+        // is just `DeactivateLayer`.
+        for path in &self.layers {
+            if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+                tracing::warn!(
+                    layer = %path.display(),
+                    error = %e,
+                    "DeactivateLayer failed during create_container rollback",
+                );
+            }
+        }
+    }
+}
+
+/// Roll back a partial parent-layer activation. `activated` is the running
+/// log built by [`HcsRuntime::activate_parent_layers`]: oldest-to-newest in
+/// the order they were activated, with a `was_prepared` flag indicating
+/// whether `PrepareLayer` also succeeded for that entry. We iterate the log
+/// in reverse (newest-back-to-oldest of the activated set) and best-effort
+/// unprepare-then-deactivate each layer. All failures are logged; none are
+/// propagated, because the caller is already returning an error and we do
+/// not want to mask the original cause.
+fn rollback_parent_activations(activated: &[PathBuf]) {
+    for path in activated.iter().rev() {
+        if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+            tracing::warn!(
+                layer = %path.display(),
+                error = %e,
+                "DeactivateLayer failed during parent-activation rollback",
+            );
+        }
+    }
 }
 
 /// Extract an exit code from the JSON payload HCS emits on
@@ -769,6 +3650,176 @@ impl ApplyServiceId for HcsDoc {
 // Runtime impl
 // ---------------------------------------------------------------------------
 
+// Inherent Hyper-V-only helpers for [`HcsRuntime`]. Kept out of the
+// [`Runtime`] trait impl below because a trait impl may not host non-trait
+// methods; `exec` (in the trait impl) dispatches here for isolated containers.
+#[cfg(feature = "hcs-runtime")]
+impl HcsRuntime {
+    /// Hyper-V exec: run `cmd` inside the hosted container over the GCS bridge.
+    ///
+    /// The host `HcsCreateProcess` cannot create a process in a *hosted*
+    /// container (it would target the UVM compute system and return
+    /// `ERROR_NOT_SUPPORTED`), so isolated containers route exec through the
+    /// in-guest GCS via the `RpcExecuteProcess` / `RpcWaitForProcess` RPCs —
+    /// the same bridge the init process is launched over in `create_container`.
+    ///
+    /// stdout/stderr are captured by binding two host-side hvsock listeners
+    /// (one per stream) BEFORE sending `ExecuteProcess`; the guest dials OUT to
+    /// them once the process starts (same direction as the log-forward relay).
+    /// Each listener is drained to EOF; the `WaitForProcess` RPC yields the
+    /// authoritative exit code.
+    #[allow(clippy::too_many_lines)]
+    async fn exec_hyperv(
+        hcs_id: &str,
+        id: &ContainerId,
+        cmd: &[String],
+        bridge: &zlayer_gcs::bridge::GcsBridge,
+        uvm_runtime_id: windows::core::GUID,
+        log_buffer: &Arc<RwLock<Vec<LogEntry>>>,
+    ) -> Result<(i32, String, String)> {
+        use zlayer_gcs::frame::RpcMessageType;
+        use zlayer_gcs::protocol::{
+            ExecuteProcessRequest, ExecuteProcessResponse, ExecuteProcessSettings,
+            RequestBase as GcsRequestBase, StdioRelaySettings, WaitForProcessRequest,
+            WaitForProcessResponse,
+        };
+        use zlayer_gcs::transport::HvSockListener;
+
+        // Fresh hvsock service GUIDs for the stdout + stderr relay. The guest
+        // dials OUT to these after the process starts, so the host MUST be
+        // listening before the `ExecuteProcess` RPC is sent. `GUID::from_u128`
+        // on the uuid's u128 is byte-correct (established elsewhere).
+        let stdout_uuid = uuid::Uuid::new_v4();
+        let stderr_uuid = uuid::Uuid::new_v4();
+        let stdout_listener = HvSockListener::bind(
+            uvm_runtime_id,
+            windows::core::GUID::from_u128(stdout_uuid.as_u128()),
+        )
+        .await
+        .map_err(|e| AgentError::Internal(format!("Hyper-V exec: bind stdout hvsock: {e}")))?;
+        let stderr_listener = HvSockListener::bind(
+            uvm_runtime_id,
+            windows::core::GUID::from_u128(stderr_uuid.as_u128()),
+        )
+        .await
+        .map_err(|e| AgentError::Internal(format!("Hyper-V exec: bind stderr hvsock: {e}")))?;
+
+        // `ProcessParameters` is an `AnyInString` (DOUBLE-ENCODED JSON string)
+        // on the wire — the guest rejects a nested object at `$`. Mirrors the
+        // init-process launch in `create_container`.
+        let pp = serde_json::json!({
+            "CommandLine": cmd.join(" "),
+            "CreateStdInPipe": false,
+            "CreateStdOutPipe": true,
+            "CreateStdErrPipe": true,
+            "EmulateConsole": false,
+        });
+        let process_parameters =
+            serde_json::Value::String(serde_json::to_string(&pp).map_err(|e| {
+                AgentError::Internal(format!("Hyper-V exec: serialize ProcessParameters: {e}"))
+            })?);
+
+        let exec_req = ExecuteProcessRequest {
+            base: GcsRequestBase {
+                activity_id: uuid::Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            settings: ExecuteProcessSettings {
+                process_parameters,
+                stdio_relay_settings: Some(StdioRelaySettings {
+                    stdin_pipe: None,
+                    stdout_pipe: Some(stdout_uuid),
+                    stderr_pipe: Some(stderr_uuid),
+                }),
+            },
+        };
+        let exec_resp: ExecuteProcessResponse = bridge
+            .send_rpc_json(RpcMessageType::ExecuteProcess, &exec_req)
+            .await
+            .map_err(|e| AgentError::Internal(format!("Hyper-V exec ExecuteProcess: {e}")))?;
+        if exec_resp.base.result != 0 {
+            let hr = u32::from_ne_bytes(exec_resp.base.result.to_ne_bytes());
+            return Err(AgentError::Internal(format!(
+                "Hyper-V exec ExecuteProcess returned HRESULT 0x{hr:08x}: {}",
+                exec_resp.base.error_message
+            )));
+        }
+        let pid = exec_resp.process_id;
+
+        // Accept + drain both relay listeners to EOF concurrently. Wrap each
+        // accept in a timeout so a process that writes only one stream does not
+        // hang waiting for the other to dial back (`read_some` returns
+        // `Ok(vec![])` at EOF).
+        let drain = |listener: HvSockListener| async move {
+            // Accept errored or timed out: treat as "no output on this stream"
+            // rather than failing the whole exec.
+            let Ok(Ok(stream)) =
+                tokio::time::timeout(Duration::from_secs(120), listener.accept()).await
+            else {
+                return Vec::<u8>::new();
+            };
+            let mut bytes = Vec::new();
+            loop {
+                match stream.read_some(64 * 1024).await {
+                    Ok(chunk) if chunk.is_empty() => break,
+                    Ok(chunk) => bytes.extend(chunk),
+                    Err(_) => break,
+                }
+            }
+            bytes
+        };
+        let (stdout_bytes, stderr_bytes) =
+            tokio::join!(drain(stdout_listener), drain(stderr_listener));
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+        // Authoritative exit code via `WaitForProcess`.
+        let wait_req = WaitForProcessRequest {
+            base: GcsRequestBase {
+                activity_id: uuid::Uuid::new_v4(),
+                container_id: hcs_id.to_string(),
+            },
+            process_id: pid,
+            timeout_in_ms: u32::MAX,
+        };
+        let wait_resp: WaitForProcessResponse = bridge
+            .send_rpc_json(RpcMessageType::WaitForProcess, &wait_req)
+            .await
+            .map_err(|e| AgentError::Internal(format!("Hyper-V exec WaitForProcess: {e}")))?;
+        #[allow(clippy::cast_possible_wrap)]
+        let exit_code = wait_resp.exit_code as i32;
+
+        // Append captured output to the container log buffer (mirror host path).
+        {
+            let now = chrono::Utc::now();
+            let source = LogSource::Container(id.to_string());
+            let mut buf = log_buffer.write().await;
+            for line in stdout.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+            for line in stderr.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+        }
+
+        Ok((exit_code, stdout, stderr))
+    }
+}
+
 #[async_trait]
 impl Runtime for HcsRuntime {
     #[instrument(skip(self), fields(otel.name = "image.pull", container.image.name = %image))]
@@ -777,7 +3828,7 @@ impl Runtime for HcsRuntime {
     }
 
     #[instrument(
-        skip(self, auth),
+        skip(self, auth, _source),
         fields(otel.name = "image.pull", container.image.name = %image, pull_policy = ?policy)
     )]
     async fn pull_image_with_policy(
@@ -785,6 +3836,7 @@ impl Runtime for HcsRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&SpecRegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         if matches!(policy, PullPolicy::Never) {
             // Never policy: succeed only if we already have it cached.
@@ -801,6 +3853,7 @@ impl Runtime for HcsRuntime {
         self.do_pull(image, policy, auth).await
     }
 
+    #[allow(clippy::too_many_lines)]
     #[instrument(
         skip(self, spec),
         fields(
@@ -826,21 +3879,46 @@ impl Runtime for HcsRuntime {
         }
         let parent_layers = self.resolve_parent_chain(&image_name).await?;
 
+        // 1b. Activate + Prepare every parent (read-only) layer with HCS.
+        //     Without this, HCS's `Construct` step rejects the eventual
+        //     compute-system doc with `E_INVALIDARG (0x80070057)` because the
+        //     `Container.Storage.Layers[].Path` values point at unpacked
+        //     directories that the host-side layer table has never seen.
+        //     Mirrors hcsshim's `mountProcessIsolatedWCIFSLayers`.
+        let parent_activation_guard = {
+            let parents = parent_layers.clone();
+            let activated =
+                tokio::task::spawn_blocking(move || Self::activate_parent_layers(&parents))
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("spawn_blocking join for parent layer activation: {e}"),
+                    })?
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("parent layer activation: {e}"),
+                    })?;
+            ParentLayerActivationGuard::new(activated)
+        };
+
+        // Resolve isolation early — it selects how the scratch is built.
+        // Hyper-V needs an UN-activated sandbox VHDX (SCSI-attached to the UVM
+        // and formatted/mounted in-guest); a host-`ActivateLayer`'d VHDX can't
+        // be attached to the UVM (`0x80070020` sharing violation). Process
+        // isolation host-activates the scratch as before. See
+        // [`decide_isolation`].
+        let image_os_version = self.resolve_image_os_version(&image_name).await;
+        let isolation = resolve_isolation_for_image(spec.isolation, image_os_version.as_deref());
+
         // 2. Build a scratch layer for this container.
         let scratch_dir = self.scratch_dir(&hcs_id);
         // Convert the HCS-ordered parent list into the wclayer LayerChain
         // expected by `scratch::create`.
         let chain = crate::windows::wclayer::LayerChain::new(parent_layers.clone());
-        let scratch_layer = scratch::create(
-            &scratch_dir,
-            &chain,
-            self.config.default_scratch_size_gb,
-            // `is_base_os_bootstrap` is only true for the very first scratch
-            // layer built over a given base OS layer. For the MVP we leave
-            // this at `false`; the unpacker already handled base-layer
-            // preparation during `HcsImportLayer`.
-            false,
-        )
+        let scratch_layer = match isolation {
+            IsolationMode::Hyperv => scratch::create_unactivated(&scratch_dir, &chain),
+            IsolationMode::Process => scratch::create(&scratch_dir, &chain),
+        }
         .map_err(|e| AgentError::CreateFailed {
             id: hcs_id.clone(),
             reason: format!("scratch layer create: {e}"),
@@ -858,102 +3936,215 @@ impl Runtime for HcsRuntime {
         //    slice, and the cluster CIDR drives the OutBoundNAT / SDNRoute /
         //    ACL policies on the endpoint.
         let slice_cidr = self.config.slice_cidr;
-        let allocated_ip = self.next_container_ip.lock().await.take();
+        // Prefer an explicitly-stashed IP (set_next_container_ip path); otherwise
+        // self-allocate from this node's slice allocator. `None` when no slice is
+        // assigned (allocator is `None`) or the slice is exhausted — either way we
+        // fall through to the no-network arm below.
+        let allocated_ip = match self.next_container_ip.lock().await.take() {
+            Some(ip) => Some(ip),
+            None => self
+                .ip_allocator
+                .lock()
+                .await
+                .as_mut()
+                .and_then(zlayer_overlay::IpAllocator::allocate),
+        };
         let dns_config = self.next_container_dns.lock().await.take();
-        let cluster_cidr = self.config.cluster_cidr.clone();
-        let network_attachment = match (slice_cidr, allocated_ip) {
-            (Some(slice), Some(ip)) => match self.ensure_overlay_network(slice).await {
-                Ok(net_id) => {
-                    let cid_for_attach = hcs_id.clone();
-                    let prefix_length = slice.prefix_len();
-                    let cluster_cidr_owned = cluster_cidr;
-                    let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
-                    match tokio::task::spawn_blocking(move || {
-                        EndpointAttachment::create_overlay(
-                            net_id,
-                            OWNER_TAG,
-                            cid_for_attach.as_str(),
-                            ip,
-                            prefix_length,
-                            &cluster_cidr_owned,
-                            dns_server,
-                            dns_domain.as_deref(),
-                        )
-                    })
+        // Overlay attachment is a hard requirement for an HCS-managed container:
+        // without an IP the workload has no addressable network surface, and
+        // `get_container_ip` will return `None` which downstream callers (proxy,
+        // service discovery, health checks) treat as a permanent fault. The HCN
+        // network/endpoint/namespace mechanics now live in overlayd: the agent
+        // allocates (or stashes) the IP and asks overlayd to create the endpoint
+        // + per-container namespace, receiving back the namespace GUID to embed
+        // in the compute-system document. Each failure mode below maps to a
+        // distinct `AgentError::CreateFailed`.
+        // Overlay attachment is best-effort, restoring the documented intent in
+        // the step-3 comment above. The HCN endpoint/namespace now lives in
+        // overlayd, so when overlayd is unreachable (standalone runtime, dev
+        // box, e2e harness) — or no slice/IP is available — we log and proceed
+        // with NO overlay networking rather than failing the create. The
+        // container still starts; it simply has no addressable overlay surface
+        // until networking is (re)attached. A genuine attach error while
+        // overlayd IS connected stays fatal (a real fault, not a missing daemon).
+        // This also keeps the Hyper-V GCS-dial path reachable in tests that do
+        // not stand up a full overlayd.
+        let network_attachment: Option<WindowsOverlayAttach> = match (slice_cidr, allocated_ip) {
+            (Some(_slice), Some(ip)) if self.overlayd.is_some() => {
+                let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
+                match self
+                    .overlayd_attach_windows(&hcs_id, &id.service, ip, dns_server, dns_domain)
                     .await
-                    {
-                        Ok(Ok(att)) => Some(att),
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                hcs_id = %hcs_id,
-                                error = %e,
-                                "HCN overlay endpoint attach failed; starting container without network"
-                            );
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                hcs_id = %hcs_id,
-                                error = %e,
-                                "spawn_blocking join for overlay endpoint attach failed; starting container without network"
-                            );
-                            None
-                        }
+                {
+                    Ok(att) => Some(att),
+                    Err(e) => {
+                        return Err(AgentError::CreateFailed {
+                            id: hcs_id.clone(),
+                            reason: format!("overlayd overlay attach failed: {e}"),
+                        });
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        hcs_id = %hcs_id,
-                        error = %e,
-                        "HCN Transparent overlay network unavailable; starting container without network"
-                    );
-                    None
-                }
-            },
+            }
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "overlayd not connected; starting container without overlay networking"
+                );
+                None
+            }
             (None, _) => {
                 tracing::warn!(
                     hcs_id = %hcs_id,
-                    "HcsConfig.slice_cidr is None (node has no assigned slice yet); starting container without network"
+                    "node has no assigned slice yet; starting container without overlay networking"
                 );
                 None
             }
             (Some(_), None) => {
                 tracing::warn!(
                     hcs_id = %hcs_id,
-                    "no container IP stashed via set_next_container_ip; starting container without network"
+                    "no overlay IP could be allocated; starting container without overlay networking"
                 );
                 None
             }
         };
 
         // 4. Build the compute-system JSON document, populating
-        //    `Container.Networking.Namespace` with the namespace GUID we just
-        //    created. HCS expects the namespace GUID as a brace-wrapped
-        //    string (matching the `{:?}` debug formatter for
-        //    `windows::core::GUID`).
+        //    `Container.Networking.Namespace` with the namespace GUID overlayd
+        //    created. HCS resolves this GUID against HCN during its `Construct`
+        //    step; it must be the **bare, lowercase, un-braced** form
+        //    (`aabbccdd-...`), which overlayd already returns.
         let namespace_strs: Vec<String> = network_attachment
             .as_ref()
-            .map(|att| vec![format!("{:?}", att.namespace_id())])
+            .map(|a| vec![a.namespace_guid.clone()])
             .unwrap_or_default();
-        let doc = self.build_compute_system_doc(
-            &hcs_id,
-            spec,
-            &scratch_layer,
-            parent_layers,
-            namespace_strs,
-        );
-        let doc_json = serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
-            id: hcs_id.clone(),
-            reason: format!("serialize ComputeSystem doc: {e}"),
-        })?;
+        // (Isolation was resolved above, before the scratch was built, because
+        // it selects the scratch-creation path.)
+        //
+        // For Hyper-V isolation, provision the utility VM BEFORE building the
+        // compute-system doc so the doc can reference the UVM's scratch VHDX,
+        // boot files, and per-layer VirtualSMB shares. The UVM's `Drop` impl
+        // cleans up the scratch VHDX if any later step fails; on the happy
+        // path it lands in `ContainerEntry.uvm` and is dropped on
+        // `remove_container`. Process-isolated containers never allocate a
+        // UVM (it would just waste a few hundred MiB of host memory).
+        let uvm =
+            match isolation {
+                IsolationMode::Hyperv => {
+                    // Locate the UVM boot payload bundled inside the image's
+                    // parent chain. Hyper-V isolation REQUIRES a Windows base
+                    // image that ships `UtilityVM\Files\...` and
+                    // `UtilityVM\SystemTemplate.vhdx`; non-Windows or
+                    // nanoserver-without-UVM images fail loudly here rather
+                    // than producing a UVM that can't boot.
+                    let boot_files = crate::windows::unpacker::locate_uvm_boot_files(&chain)
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: hcs_id.clone(),
+                            reason: format!(
+                            "Hyper-V isolation requires a Windows base image with UVM payload: {e}"
+                        ),
+                        })?;
+                    Some(
+                        Uvm::create(&hcs_id, &self.config.storage_root, &boot_files).map_err(
+                            |e| AgentError::CreateFailed {
+                                id: hcs_id.clone(),
+                                reason: format!("UVM provisioning failed: {e}"),
+                            },
+                        )?,
+                    )
+                }
+                IsolationMode::Process => None,
+            };
 
-        // 5. Create the compute system.
-        let system = ComputeSystem::create(&hcs_id, &doc_json)
-            .await
-            .map_err(|e| AgentError::CreateFailed {
-                id: hcs_id.clone(),
-                reason: format!("HcsCreateComputeSystem: {e}"),
-            })?;
+        // 5. Create the compute system. The shape of this differs by
+        //    isolation mode:
+        //
+        //    - Process: build the single legacy doc (Container body only) and
+        //      hand it to `HcsCreateComputeSystem`. One call, one system.
+        //
+        //    - Hyper-V: orchestrate the multi-step GCS-bridge boot sequence
+        //      (build UVM-only doc → create + start UVM → connect GCS over
+        //      hvsock → hot-attach per-layer VSMB + per-container SCSI scratch
+        //      → CombineLayersWCOW inside the guest → RpcCreate the hosted
+        //      container → RpcStart it). See `hyperv_create_via_gcs` for the
+        //      step-by-step.
+        //
+        //    On failure, tear down the HCN endpoint we created in step 3 —
+        //    otherwise the endpoint (and the IP it owns) leaks, and the next
+        //    test/deploy attempt that tries to claim the same IP gets
+        //    `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)`. Also release the
+        //    IP back to the allocator. The parent-layer guard and scratch
+        //    layer cleanup are handled by their own Drop / orphan-reconcile
+        //    paths.
+        let create_result: Result<(ComputeSystem, HyperVGcsState)> = match isolation {
+            IsolationMode::Process => {
+                let doc = self.build_compute_system_doc(
+                    &hcs_id,
+                    spec,
+                    &scratch_layer,
+                    parent_layers.clone(),
+                    namespace_strs.clone(),
+                    isolation,
+                    uvm.as_ref(),
+                )?;
+                let doc_json =
+                    serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("serialize ComputeSystem doc: {e}"),
+                    })?;
+                // Diagnostic: emit the exact JSON we hand to HCS so reproducible
+                // E_INVALIDARG failures can be diffed against hcsshim's known-good
+                // docs. error! so it shows without RUST_LOG configuration.
+                tracing::error!(
+                    target: "zlayer_agent::hcs::diag",
+                    hcs_id = %hcs_id,
+                    doc = %doc_json,
+                    "HCS_CREATE_DOC"
+                );
+                if let Ok(dir) = std::env::var("ZLAYER_HCS_DOC_DUMP_DIR") {
+                    let path = std::path::PathBuf::from(&dir).join(format!("{hcs_id}.json"));
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(&path, &doc_json);
+                }
+                ComputeSystem::create(&hcs_id, &doc_json)
+                    .await
+                    .map(|s| (s, HyperVGcsState::default()))
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("HcsCreateComputeSystem: {e}"),
+                    })
+            }
+            IsolationMode::Hyperv => {
+                let uvm_ref = uvm.as_ref().ok_or_else(|| AgentError::Internal(
+                    "Hyper-V isolation selected but no Uvm was provisioned earlier in create_container".to_string(),
+                ))?;
+                self.hyperv_create_via_gcs(
+                    &hcs_id,
+                    spec,
+                    &scratch_layer,
+                    &parent_layers,
+                    &namespace_strs,
+                    uvm_ref,
+                    network_attachment.as_ref(),
+                )
+                .await
+            }
+        };
+
+        let (system, hyperv_state) = match create_result {
+            Ok(v) => v,
+            Err(e) => {
+                // Ask overlayd to tear down the HCN endpoint + namespace it
+                // created so neither the endpoint nor its IP leaks, then release
+                // the IP back to the node allocator.
+                if let Some(att) = &network_attachment {
+                    self.overlayd_detach_windows(&att.namespace_guid).await;
+                    if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
+                        alloc.release(att.ip);
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // 6. Subscribe to exit events before returning so we don't miss a
         //    fast-exiting container.
@@ -966,14 +4157,132 @@ impl Runtime for HcsRuntime {
         let sink: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
         self.spawn_exit_watcher(hcs_id.clone(), *system.raw(), sink.clone());
 
+        // 6b. Hyper-V: launch the workload (init) process INSIDE the hosted
+        //     container over the GCS bridge, and spawn a detached waiter that
+        //     records its exit code into `sink` (which `container_state` reads).
+        //     The host exit-watcher armed above only observes the UVM compute
+        //     system; the workload runs in the guest container, so its lifecycle
+        //     is tracked via the bridge `ExecuteProcess`/`WaitForProcess` RPCs.
+        //     Process isolation runs the image entrypoint inside its own compute
+        //     system (no bridge) and is unaffected (`hyperv_state.bridge` None).
+        #[cfg(feature = "hcs-runtime")]
+        if let Some(bridge) = hyperv_state.bridge.clone() {
+            use zlayer_gcs::frame::RpcMessageType;
+            use zlayer_gcs::protocol::{
+                ExecuteProcessRequest, ExecuteProcessResponse, ExecuteProcessSettings,
+                RequestBase as GcsRequestBase, WaitForProcessRequest, WaitForProcessResponse,
+            };
+            // Command line = entrypoint + args; working dir from the spec.
+            let mut argv: Vec<String> = spec.command.entrypoint.clone().unwrap_or_default();
+            argv.extend(spec.command.args.clone().unwrap_or_default());
+            let command_line = argv.join(" ");
+            let mut pp = serde_json::json!({
+                "CommandLine": command_line.clone(),
+                "CreateStdInPipe": false,
+                "CreateStdOutPipe": false,
+                "CreateStdErrPipe": false,
+            });
+            if let Some(wd) = spec.command.workdir.clone().filter(|w| !w.is_empty()) {
+                pp["WorkingDirectory"] = serde_json::Value::String(wd);
+            }
+            // `ProcessParameters` is an `AnyInString` (DOUBLE-ENCODED JSON
+            // string) on the wire — the guest rejects a nested object at `$`.
+            // Encode the params object to a JSON string. Mirrors hcsshim's
+            // `prot.ExecuteProcessSettings.ProcessParameters AnyInString`.
+            let process_parameters =
+                serde_json::Value::String(serde_json::to_string(&pp).map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: hcs_id.clone(),
+                        reason: format!("Hyper-V init process: serialize ProcessParameters: {e}"),
+                    }
+                })?);
+            tracing::info!(hcs_id = %hcs_id, command_line = %command_line, "Hyper-V: launching workload init process over GCS bridge");
+            let exec_req = ExecuteProcessRequest {
+                base: GcsRequestBase {
+                    activity_id: uuid::Uuid::new_v4(),
+                    container_id: hcs_id.clone(),
+                },
+                settings: ExecuteProcessSettings {
+                    process_parameters,
+                    stdio_relay_settings: None,
+                },
+            };
+            let exec_resp: ExecuteProcessResponse = bridge
+                .send_rpc_json(RpcMessageType::ExecuteProcess, &exec_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!("Hyper-V init process ExecuteProcess: {e}"),
+                })?;
+            if exec_resp.base.result != 0 {
+                let hr = u32::from_ne_bytes(exec_resp.base.result.to_ne_bytes());
+                return Err(AgentError::CreateFailed {
+                    id: hcs_id.clone(),
+                    reason: format!(
+                        "Hyper-V init process ExecuteProcess returned HRESULT 0x{hr:08x}: {}",
+                        exec_resp.base.error_message
+                    ),
+                });
+            }
+            let pid = exec_resp.process_id;
+            // Detached waiter: record the workload's exit code when it exits.
+            let wait_bridge = bridge.clone();
+            let wait_sink = sink.clone();
+            let wait_hcs_id = hcs_id.clone();
+            tokio::spawn(async move {
+                let wait_req = WaitForProcessRequest {
+                    base: GcsRequestBase {
+                        activity_id: uuid::Uuid::new_v4(),
+                        container_id: wait_hcs_id.clone(),
+                    },
+                    process_id: pid,
+                    timeout_in_ms: u32::MAX,
+                };
+                let res: zlayer_gcs::error::GcsResult<WaitForProcessResponse> = wait_bridge
+                    .send_rpc_json(RpcMessageType::WaitForProcess, &wait_req)
+                    .await;
+                match res {
+                    Ok(resp) => {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let code = resp.exit_code as i32;
+                        *wait_sink.write().await = Some(code);
+                    }
+                    Err(e) => {
+                        tracing::warn!(hcs_id = %wait_hcs_id, error = %e, "Hyper-V init-process WaitForProcess failed; container exit code unobserved");
+                    }
+                }
+            });
+        }
+
         // 7. Register the entry.
+        //
+        // Disarm the parent-layer activation guard and transfer its path list
+        // into the entry. Teardown of these layers now happens during
+        // [`Self::remove_container`] (in reverse order) so subsequent
+        // containers sharing the same parent chain can re-activate them.
+        let activated_parent_layers = parent_activation_guard.disarm();
         let entry = ContainerEntry {
             system,
             scratch_layer: Some(scratch_layer),
             hcs_id: hcs_id.clone(),
             last_exit_code: sink,
-            network_attachment,
+            overlay_attach: network_attachment,
+            uvm,
+            activated_parent_layers,
+            // Carry the GCS bridge through to the entry. Hyper-V path
+            // populates it via `hyperv_create_via_gcs`; Process path leaves
+            // it as `None`. See `ContainerEntry::gcs` for the eventual
+            // lifecycle-routing migration (B4.3).
+            #[cfg(feature = "hcs-runtime")]
+            gcs: hyperv_state.bridge,
+            log_buffer: Arc::new(RwLock::new(Vec::new())),
         };
+        // Suppress "unused" when the `hcs-runtime` feature is off — the
+        // state is only consumed via the gated entry field above. The
+        // Process branch always produces an empty state, so dropping it
+        // here is safe.
+        #[cfg(not(feature = "hcs-runtime"))]
+        let _ = hyperv_state;
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
     }
@@ -988,6 +4297,17 @@ impl Runtime for HcsRuntime {
                 container: hcs_id.clone(),
                 reason: "no HCS entry for container".to_string(),
             })?;
+        // Hyper-V isolation: the workload container is RpcCreate'd AND
+        // RpcStart'd over the GCS bridge during `create_container` (steps
+        // 9/10), and `entry.system` here is the UVM compute system, which is
+        // already Running. Re-running `HcsStartComputeSystem` on the running
+        // UVM returns `0x80370105` (HCS_E_INVALID_STATE), so for Hyper-V the
+        // workload is already started — `start_container` is a no-op. (Process
+        // isolation builds the compute system without starting it, so it still
+        // needs the host start below.)
+        if entry.uvm.is_some() {
+            return Ok(());
+        }
         entry
             .system
             .start("")
@@ -1070,30 +4390,51 @@ impl Runtime for HcsRuntime {
                 .map_err(|e| AgentError::Internal(format!("scratch teardown: {e}")))?;
         }
 
-        // Tear down the HCN endpoint + namespace, if we attached one. Best-
-        // effort: log on failure (the container is already gone so leaving a
-        // dangling endpoint is recoverable via startup reconcile) and do
-        // **not** propagate — scratch teardown already succeeded and the
-        // caller expects success once we reach this point.
-        if let Some(attachment) = entry.network_attachment.take() {
+        // Deactivate every parent (read-only) layer this container's
+        // `create_container` activated. The stored vec is in child-to-parent
+        // order (matching `resolve_parent_chain`); we iterate **reverse** of
+        // activation order — child-most first — mirroring hcsshim's teardown
+        // direction. Parents were only `ActivateLayer`d (not `PrepareLayer`d)
+        // so the matching teardown is `DeactivateLayer` only. Best-effort:
+        // log failures, do NOT propagate.
+        if !entry.activated_parent_layers.is_empty() {
+            let layers = std::mem::take(&mut entry.activated_parent_layers);
             let hcs_id_for_log = entry.hcs_id.clone();
-            let res = tokio::task::spawn_blocking(move || attachment.teardown()).await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        hcs_id = %hcs_id_for_log,
-                        error = %e,
-                        "HCN attachment teardown failed; endpoint may leak until next reconcile"
-                    );
+            let _ = tokio::task::spawn_blocking(move || {
+                for path in &layers {
+                    if let Err(e) = crate::windows::wclayer::deactivate_layer(path) {
+                        tracing::warn!(
+                            hcs_id = %hcs_id_for_log,
+                            layer = %path.display(),
+                            error = %e,
+                            "DeactivateLayer failed during remove_container; layer table may leak until reboot",
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        hcs_id = %hcs_id_for_log,
-                        error = %e,
-                        "spawn_blocking join failed during HCN teardown"
-                    );
-                }
+            })
+            .await;
+        }
+
+        // Tear down the UVM (if any). The scratch VHDX cleanup happens in
+        // `Uvm::Drop` — we explicitly `drop` here so the order with respect to
+        // the scratch-layer teardown above is deterministic and any
+        // best-effort errors get logged via the `Drop` impl's tracing call
+        // before we move on to HCN teardown. Process-isolated entries never
+        // allocated a UVM and skip this no-op.
+        if let Some(uvm) = entry.uvm.take() {
+            drop(uvm);
+        }
+
+        // Tear down the overlay attachment via overlayd, which owns the HCN
+        // endpoint + namespace lifecycle. Best-effort: overlayd logs on failure
+        // and its own orphan sweep recovers a leaked endpoint. We still release
+        // the IP back to the node allocator so a transient overlayd error does
+        // not leak the address (release is idempotent / safe for unknown IPs).
+        if let Some(attachment) = entry.overlay_attach.take() {
+            self.overlayd_detach_windows(&attachment.namespace_guid)
+                .await;
+            if let Some(alloc) = self.ip_allocator.lock().await.as_mut() {
+                alloc.release(attachment.ip);
             }
         }
         drop(entry);
@@ -1121,10 +4462,33 @@ impl Runtime for HcsRuntime {
         Ok(ContainerState::Running)
     }
 
-    async fn container_logs(&self, _id: &ContainerId, _tail: usize) -> Result<Vec<LogEntry>> {
-        Err(AgentError::Unsupported(
-            "container_logs is not yet wired for the HCS runtime; use `zlayer exec` to inspect logs inside the container".to_string(),
-        ))
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
+        let hcs_id = Self::hcs_id(id);
+        let buffer = {
+            let containers = self.containers.read().await;
+            let entry = containers
+                .get(&hcs_id)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: hcs_id.clone(),
+                    reason: "no HCS entry for container".to_string(),
+                })?;
+            entry.log_buffer.clone()
+        };
+
+        // Snapshot the captured lines (already time-ordered by append order).
+        // HCS runs the image entrypoint inside the compute system with no
+        // host-side pipe, so the capturable signal is the stdout/stderr of
+        // every `exec`'d process, which the `exec` path drains and appends
+        // here. This mirrors the file-backed log readers on the youki / WSL2
+        // runtimes (which read a per-container log file) — same contract, an
+        // in-memory ring instead of a file because the HCS pipes are streamed.
+        let mut entries = buffer.read().await.clone();
+
+        // `tail == 0` (and the `usize::MAX` passed by `get_logs`) means "all".
+        if tail > 0 && tail != usize::MAX && entries.len() > tail {
+            entries = entries.split_off(entries.len() - tail);
+        }
+        Ok(entries)
     }
 
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
@@ -1136,13 +4500,56 @@ impl Runtime for HcsRuntime {
             ));
         }
         let hcs_id = Self::hcs_id(id);
-        let containers = self.containers.read().await;
-        let entry = containers
-            .get(&hcs_id)
-            .ok_or_else(|| AgentError::NotFound {
-                container: hcs_id.clone(),
-                reason: "no HCS entry for container".to_string(),
-            })?;
+        // Acquire the read lock once. Always extract the host system handle +
+        // log buffer (needed by the Process-isolation path below); when the
+        // `hcs-runtime` feature is on, also extract the Hyper-V routing handles
+        // (the in-guest GCS bridge + the UVM runtime id) so an isolated
+        // container's exec can be routed over the bridge instead.
+        let (system_handle, log_buffer, hyperv) = {
+            let containers = self.containers.read().await;
+            let entry = containers
+                .get(&hcs_id)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: hcs_id.clone(),
+                    reason: "no HCS entry for container".to_string(),
+                })?;
+            // `entry.gcs` is `Some` only for Hyper-V isolation. Extract the
+            // bridge + UVM runtime id so exec can be bridge-routed.
+            #[cfg(feature = "hcs-runtime")]
+            let hyperv = match entry.gcs.clone() {
+                Some(bridge) => {
+                    let uvm_runtime_id =
+                        entry.uvm.as_ref().map(Uvm::runtime_id).ok_or_else(|| {
+                            AgentError::Internal(
+                                "Hyper-V exec: container has a GCS bridge but no UVM runtime id"
+                                    .to_string(),
+                            )
+                        })?;
+                    Some((bridge, uvm_runtime_id))
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "hcs-runtime"))]
+            let hyperv: Option<()> = None;
+            // `entry.system.raw()` returns `SendHandle<HCS_SYSTEM>` so the
+            // handle can cross into the blocking thread below. See
+            // `zlayer_hcs::handle::SendHandle`.
+            (entry.system.raw(), entry.log_buffer.clone(), hyperv)
+        };
+
+        // Hyper-V isolation: the host `HcsCreateProcess` targets the UVM
+        // compute system, not the hosted container, so it returns
+        // `0x80070032` (`ERROR_NOT_SUPPORTED`). Route exec over the GCS bridge
+        // instead, capturing stdout/stderr via host-side hvsock stdio-relay
+        // listeners the guest dials back into.
+        #[cfg(feature = "hcs-runtime")]
+        if let Some((bridge, uvm_runtime_id)) = hyperv {
+            return Self::exec_hyperv(&hcs_id, id, cmd, &bridge, uvm_runtime_id, &log_buffer).await;
+        }
+        // Consume `hyperv` on builds without the `hcs-runtime` feature (where it
+        // is always `None`) so the binding is never flagged as unused.
+        #[cfg(not(feature = "hcs-runtime"))]
+        let _ = &hyperv;
 
         let command_line = cmd.join(" ");
         let params = ProcessParameters {
@@ -1157,28 +4564,61 @@ impl Runtime for HcsRuntime {
             user: None,
         };
 
-        // `entry.system.raw()` already returns `SendHandle<HCS_SYSTEM>` (the
-        // `ComputeSystem::raw()` accessor wraps the inner handle at the
-        // source so the returned `ComputeProcess::spawn` future remains
-        // `Send` across the enclosing `async fn exec`). See
-        // `zlayer_hcs::handle::SendHandle`.
-        let system_handle = entry.system.raw();
-        let process = ComputeProcess::spawn(system_handle, &params)
-            .await
-            .map_err(|e| AgentError::Internal(format!("HcsCreateProcess: {e}")))?;
+        // Create the process AND capture its stdout/stderr pipe read-ends, then
+        // drain them to EOF — all on a blocking thread, because the pipe
+        // `HANDLE`s are `!Send` and `ReadFile` blocks until the child exits.
+        // The blocking closure returns the (Send) `ComputeProcess` plus the
+        // drained output; we then poll the authoritative exit code in async.
+        let (process, stdout, stderr) = tokio::task::spawn_blocking(move || {
+            let captured = ComputeProcess::create_capturing_blocking(system_handle, &params)?;
+            Ok::<_, zlayer_hcs::error::HcsError>(captured.drain_with_process())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("exec spawn_blocking join: {e}")))?
+        .map_err(|e| AgentError::Internal(format!("HcsCreateProcess/capture: {e}")))?;
 
-        // Poll process properties until it has an exit code. The heavy
-        // stdio-pipe plumbing (tokio-side reads of the HCS pipes) is a
-        // follow-up; for now we synthesize empty stdout/stderr and only
-        // surface the final exit code so callers relying on exec for
-        // health checks still work.
+        // Append the captured output to the container's log buffer so
+        // `container_logs` / `get_logs` surface real, non-empty lines. The
+        // init/image entrypoint runs inside the compute system (no host pipe),
+        // so exec output is the host-capturable signal — mirroring the
+        // file-backed log readers on the youki / WSL2 runtimes.
+        {
+            let now = chrono::Utc::now();
+            let source = LogSource::Container(id.to_string());
+            let mut buf = log_buffer.write().await;
+            for line in stdout.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+            for line in stderr.lines() {
+                buf.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
+            }
+        }
+
+        // The pipes drained at EOF, which means the child closed its write-ends
+        // — i.e. it has exited. Read the authoritative exit code from HCS. A
+        // bounded poll covers the small window where the process record is not
+        // yet finalized after the pipes close.
         for _ in 0..600 {
             let raw_props = process
                 .properties(r#"{"PropertyTypes":["ProcessStatus"]}"#)
                 .await
                 .map_err(|e| AgentError::Internal(format!("HcsGetProcessProperties: {e}")))?;
             if let Some(code) = extract_process_exit_code(&raw_props) {
-                return Ok((code, String::new(), String::new()));
+                return Ok((code, stdout, stderr));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1276,10 +4716,12 @@ impl Runtime for HcsRuntime {
     ) -> Result<Option<windows::core::GUID>> {
         let hcs_id = Self::hcs_id(id);
         let entries = self.containers.read().await;
+        // overlayd created the namespace and returned its bare-lowercase GUID;
+        // parse it back into a `windows::core::GUID` for trait callers.
         Ok(entries.get(&hcs_id).and_then(|e| {
-            e.network_attachment
+            e.overlay_attach
                 .as_ref()
-                .map(EndpointAttachment::namespace_id)
+                .and_then(|a| GUID::try_from(a.namespace_guid.as_str()).ok())
         }))
     }
 
@@ -1292,25 +4734,7 @@ impl Runtime for HcsRuntime {
                 reason: "no HCS entry for container".to_string(),
             });
         };
-        let Some(ip_str) = entry
-            .network_attachment
-            .as_ref()
-            .and_then(|a| a.ip().map(str::to_string))
-        else {
-            return Ok(None);
-        };
-        match ip_str.parse::<IpAddr>() {
-            Ok(ip) => Ok(Some(ip)),
-            Err(e) => {
-                tracing::warn!(
-                    hcs_id = %hcs_id,
-                    ip = %ip_str,
-                    error = %e,
-                    "HCN endpoint returned unparseable IP"
-                );
-                Ok(None)
-            }
-        }
+        Ok(entry.overlay_attach.as_ref().map(|a| a.ip))
     }
 
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
@@ -1383,9 +4807,12 @@ impl Runtime for HcsRuntime {
                 reason: "source image not cached".to_string(),
             });
         };
-        // Clone the UnpackedImage (LayerChain + root are both Clone).
+        // Clone the UnpackedImage (LayerChain + root are both Clone) and
+        // carry the source's builder-asserted `os.version` forward so the
+        // isolation auto-resolver sees the same value for the alias.
         let cloned = CachedImage {
             unpacked: entry.unpacked.clone(),
+            os_version: entry.os_version.clone(),
         };
         cache.insert(target.to_string(), cloned);
         Ok(())
@@ -1477,11 +4904,17 @@ fn extract_process_exit_code(raw_json: &str) -> Option<i32> {
 /// as a free function so the agent's boot path can terminate stragglers
 /// before we create any new systems.
 ///
+/// `daemon_name` selects the owner tag this enumeration sweeps —
+/// pass the value used to construct the [`HcsRuntime`] so a `zlayer-dev`
+/// instance never enumerates a peer `zlayer` daemon's systems (and vice
+/// versa).
+///
 /// # Errors
 ///
 /// Returns the error emitted by [`zlayer_hcs::enumerate::list_by_owner`].
-pub async fn list_owned_systems() -> Result<Vec<String>> {
-    let systems = enumerate::list_by_owner(OWNER_TAG)
+pub async fn list_owned_systems(daemon_name: &str) -> Result<Vec<String>> {
+    let tag = owner_tag(daemon_name);
+    let systems = enumerate::list_by_owner(&tag)
         .await
         .map_err(|e| AgentError::Internal(format!("HcsEnumerateComputeSystems: {e}")))?;
     Ok(systems.into_iter().map(|s| s.id).collect())
@@ -1554,6 +4987,610 @@ mod tests {
         assert!(
             cfg.slice_cidr.is_none(),
             "slice_cidr must be None until the node joins the cluster and the leader hands out a slice"
+        );
+    }
+
+    #[test]
+    fn hcs_config_default_daemon_name_is_legacy() {
+        let cfg = HcsConfig::default();
+        assert_eq!(
+            cfg.daemon_name, "zlayer",
+            "single-instance installs must keep the legacy `zlayer` owner tag"
+        );
+    }
+
+    #[test]
+    fn owner_tag_legacy() {
+        assert_eq!(owner_tag("zlayer"), "zlayer");
+    }
+
+    #[test]
+    fn owner_tag_dev() {
+        assert_eq!(owner_tag("zlayer-dev"), "zlayer-dev");
+    }
+
+    #[test]
+    fn overlay_network_legacy() {
+        assert_eq!(overlay_network_name("zlayer"), "zlayer-overlay");
+    }
+
+    #[test]
+    fn overlay_network_dev() {
+        assert_eq!(overlay_network_name("zlayer-dev"), "zlayer-dev-overlay");
+    }
+
+    /// `parse_os_version` accepts the canonical `major.minor.build.ubr`
+    /// shape MCR emits and discards the UBR component.
+    #[test]
+    fn parse_os_version_four_components() {
+        assert_eq!(parse_os_version("10.0.20348.2700"), Some((10, 0, 20348)));
+    }
+
+    /// `parse_os_version` also accepts a three-component string (no UBR).
+    #[test]
+    fn parse_os_version_three_components() {
+        assert_eq!(parse_os_version("10.0.26100"), Some((10, 0, 26100)));
+    }
+
+    /// `parse_os_version` returns `None` when fewer than three components
+    /// are present or any component fails to parse as `u32`.
+    #[test]
+    fn parse_os_version_rejects_malformed() {
+        assert_eq!(parse_os_version(""), None);
+        assert_eq!(parse_os_version("10"), None);
+        assert_eq!(parse_os_version("10.0"), None);
+        assert_eq!(parse_os_version("10.0.x"), None);
+        assert_eq!(parse_os_version("not.a.version"), None);
+    }
+
+    /// Auto + matching builds → Process (no UVM overhead needed).
+    #[test]
+    fn decide_isolation_auto_matched_builds_picks_process() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 26100)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Process,
+        );
+        // UBR is stripped, so 26100.1742 and 26100.2700 both parse to
+        // (10, 0, 26100) and resolve as matched.
+        assert_eq!(
+            decide_isolation(None, Some((10, 0, 26100)), Some((10, 0, 26100))),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Auto + mismatched builds → Hyper-V (UVM required for cross-build).
+    #[test]
+    fn decide_isolation_auto_mismatched_builds_picks_hyperv() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 20348)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// Auto + known image build but unknown host build → Hyper-V (safer:
+    /// UVM tolerates any host configuration we can detect).
+    #[test]
+    fn decide_isolation_auto_known_image_unknown_host_picks_hyperv() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Auto),
+                Some((10, 0, 26100)),
+                None,
+            ),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// Auto + unknown image build → Process (documented prior default;
+    /// we cannot argue for UVM without a build to compare against).
+    #[test]
+    fn decide_isolation_auto_unknown_image_picks_process() {
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Auto), None, None),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            decide_isolation(None, None, Some((10, 0, 26100))),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Explicit `Process` from the spec wins even when the matrix would
+    /// otherwise pick Hyper-V (operator override).
+    #[test]
+    fn decide_isolation_explicit_process_overrides_matrix() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Process),
+                Some((10, 0, 20348)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Process,
+        );
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Process), None, None),
+            IsolationMode::Process,
+        );
+    }
+
+    /// Explicit `Hyperv` from the spec wins even when the matrix would
+    /// otherwise pick Process (operator override).
+    #[test]
+    fn decide_isolation_explicit_hyperv_overrides_matrix() {
+        assert_eq!(
+            decide_isolation(
+                Some(zlayer_spec::IsolationMode::Hyperv),
+                Some((10, 0, 26100)),
+                Some((10, 0, 26100)),
+            ),
+            IsolationMode::Hyperv,
+        );
+        assert_eq!(
+            decide_isolation(Some(zlayer_spec::IsolationMode::Hyperv), None, None),
+            IsolationMode::Hyperv,
+        );
+    }
+
+    /// `resolve_isolation_for_image` is the production entry point that
+    /// supplies the live host build via [`host_windows_build`]. We can't
+    /// pin the host value cross-machine, so the smoke check just confirms
+    /// the function is callable and returns a concrete variant. The pure
+    /// matrix is covered by the `decide_isolation_*` tests above.
+    #[test]
+    fn resolve_isolation_for_image_smoke() {
+        let mode = resolve_isolation_for_image(None, None);
+        assert!(
+            matches!(mode, IsolationMode::Process | IsolationMode::Hyperv),
+            "resolve_isolation_for_image returned an unexpected variant: {mode:?}",
+        );
+    }
+
+    /// Build a minimal [`ServiceSpec`] for the unit tests below. Mirrors
+    /// `runtimes::composite::tests::make_spec` so the construction stays in
+    /// step with the canonical YAML schema; we only need *a* well-formed spec
+    /// here because `build_virtual_machine_doc` ignores the spec body today.
+    fn fixture_spec() -> ServiceSpec {
+        let yaml = r"
+version: v1
+deployment: test
+services:
+  test:
+    rtype: service
+    image:
+      name: mcr.microsoft.com/windows/nanoserver:ltsc2022
+";
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(yaml)
+            .expect("valid fixture yaml")
+            .services
+            .remove("test")
+            .expect("service 'test' present")
+    }
+
+    /// `build_virtual_machine_doc` populates the `VirtualMachine` body with
+    /// the UVM's scratch VHDX (SCSI attachment under the primary controller
+    /// GUID), the `"os"` VSMB share that exposes `UtilityVM\Files` as the
+    /// boot volume, one read-only `VirtualSMB` share per parent layer, the
+    /// default 2 vCPU / 1024 MiB topology, and the UEFI `VmbFs` boot entry.
+    /// `guest_state` is omitted entirely — `VmbFs` boot does not use a
+    /// host-side `.vmgs`.
+    ///
+    /// Uses [`Uvm::for_test`] so the test does not touch HCS, the VHD APIs,
+    /// or the filesystem under `%ProgramData%`.
+    #[test]
+    fn build_virtual_machine_doc_populates_uvm_fields() {
+        use std::path::PathBuf;
+        use zlayer_hcs::schema::Layer;
+
+        let scratch = PathBuf::from(r"C:\zlayer\uvms\test-container\scratch.vhdx");
+        let os_files = PathBuf::from(r"C:\zlayer\images\app\UtilityVM\Files");
+        let uvm = Uvm::for_test("test-container", scratch.clone(), os_files.clone());
+
+        let parent_layers = vec![
+            Layer {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                path: r"C:\zlayer\images\base".to_string(),
+            },
+            Layer {
+                id: "22222222-2222-2222-2222-222222222222".to_string(),
+                path: r"C:\zlayer\images\app".to_string(),
+            },
+        ];
+
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &parent_layers, &spec, &[]);
+
+        // Chipset / UEFI: boot from VmbFs at the standard Windows boot manager path.
+        let chipset = vm.chipset.expect("chipset");
+        let uefi = chipset.uefi.expect("uefi");
+        let boot_entry = uefi.boot_this.expect("boot_this");
+        assert_eq!(boot_entry.device_type, "VmbFs");
+        assert_eq!(boot_entry.device_path, r"\EFI\Microsoft\Boot\bootmgfw.efi");
+        assert_eq!(boot_entry.disk_number, None);
+
+        // Devices.scsi: one controller keyed by the hcsshim primary-SCSI GUID
+        // with one attachment at LUN `"0"` ↦ scratch VHDX (writable).
+        let devices = vm.devices.expect("devices");
+        let controller = devices
+            .scsi
+            .get(PRIMARY_SCSI_CTRL_GUID)
+            .expect("scsi controller keyed by primary GUID");
+        let attachment = controller.attachments.get("0").expect("scsi attachment 0");
+        assert_eq!(attachment.path, scratch.to_string_lossy());
+        assert_eq!(attachment.r#type, "VirtualDisk");
+        assert_eq!(attachment.read_only, Some(false));
+
+        // Devices.virtual_smb: one `"os"` boot-files share + one share per parent layer.
+        let vsmb = devices
+            .virtual_smb
+            .as_ref()
+            .expect("VirtualSmb block populated");
+        // hcsshim parity: the UVM-create-time doc carries ONLY the `os`
+        // boot-files share. Parent-layer shares are hot-attached AFTER
+        // the UVM boots via `hyperv_create_via_gcs` Step 5
+        // (`uvm_system.add_vsmb`) — they do NOT appear in the create-time
+        // `VirtualSmb.Shares` array. The `zlayer-debug` writable exfil
+        // share was also dropped (B-4) — it was triggering the in-guest
+        // GCS to critical-process-die during cold-start RpcCreate (the
+        // 0xEF bugcheck symptom).
+        assert_eq!(
+            vsmb.shares.len(),
+            1,
+            "create-time shares: `os` only; parent layers hot-attached at Step 5; zlayer-debug dropped per B-4",
+        );
+        assert_eq!(
+            vsmb.shares[0].name, "os",
+            "`os` boot-files share must be first per hcsshim convention",
+        );
+        let os_share = &vsmb.shares[0];
+        assert_eq!(os_share.path, os_files.to_string_lossy());
+        let os_opts = os_share
+            .options
+            .as_ref()
+            .expect("os share carries named options");
+        assert!(os_opts.read_only, "os share must be read-only");
+        assert!(os_opts.share_read, "os share must set ShareRead");
+        assert!(os_opts.cache_io, "os share must set CacheIo");
+        assert!(os_opts.pseudo_oplocks, "os share must set PseudoOplocks");
+        assert!(
+            os_opts.take_backup_privilege,
+            "os share must set TakeBackupPrivilege per hcsshim DefaultVSMBOptions(true)",
+        );
+        assert!(
+            os_share.flags.is_none(),
+            "named options replace the legacy raw flags bitmask",
+        );
+
+        // No parent-layer share and no zlayer-debug share should appear in
+        // the create-time doc.
+        assert!(
+            vsmb.shares.iter().all(|s| s.name == "os"),
+            "create-time VSMB.Shares must be `os` only; got {:?}",
+            vsmb.shares
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+        );
+
+        // Compute topology: defaults to 2 vCPU / 1024 MiB.
+        let topology = vm.compute_topology.expect("compute_topology");
+        assert_eq!(topology.processor.expect("processor").count, 2);
+        assert_eq!(topology.memory.expect("memory").size_in_mb, 1024);
+
+        // GuestState: omitted with VmbFs boot.
+        assert!(
+            vm.guest_state.is_none(),
+            "VmbFs-boot UVMs must not carry a host GuestState path",
+        );
+    }
+
+    /// Pins the hcsshim `prepareCommonConfigDoc` parity fields the UVM doc must
+    /// carry: `StopOnReset`, the `gns` `EnableCompartmentNamespace` registry
+    /// edit, and `VirtualSmb.DirectFileMappingInMB`.
+    #[test]
+    fn build_virtual_machine_doc_sets_hcsshim_parity_fields() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "parity-container",
+            PathBuf::from(r"C:\zlayer\uvms\parity\scratch.vhdx"),
+            PathBuf::from(r"C:\zlayer\images\app\UtilityVM\Files"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+
+        assert!(vm.stop_on_reset, "UVM must set StopOnReset like hcsshim");
+
+        let vsmb = vm
+            .devices
+            .as_ref()
+            .and_then(|d| d.virtual_smb.as_ref())
+            .expect("VirtualSmb block populated");
+        assert_eq!(
+            vsmb.direct_file_mapping_in_mb,
+            Some(1024),
+            "VSMB DirectFileMappingInMB must mirror hcsshim's WCOW default",
+        );
+
+        let reg = vm
+            .registry_changes
+            .as_ref()
+            .expect("UVM must carry RegistryChanges for hcsshim parity");
+        let gns = reg
+            .add_values
+            .iter()
+            .find(|v| v.name == "EnableCompartmentNamespace")
+            .expect("gns EnableCompartmentNamespace key present");
+        assert_eq!(gns.d_word_value, Some(1));
+        assert_eq!(gns.r#type, Some(RegistryValueType::DWord));
+        let key = gns.key.as_ref().expect("registry value carries a key");
+        assert_eq!(key.hive, Some(RegistryHive::System));
+        assert_eq!(key.name, r"CurrentControlSet\Services\gns");
+    }
+
+    /// `build_virtual_machine_doc` against an empty parent chain still
+    /// produces a valid SCSI + chipset + topology block; the `virtual_smb`
+    /// map carries the `"os"` boot-files share + the writable `"zlayer-debug"`
+    /// exfil share. This pins the contract that a zero-layer image
+    /// (theoretical edge case) does not panic and still boots.
+    #[test]
+    fn build_virtual_machine_doc_handles_empty_parent_chain() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "empty-chain",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\os-files"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+
+        let devices = vm.devices.expect("devices");
+        let vsmb = devices
+            .virtual_smb
+            .as_ref()
+            .expect("VirtualSmb block populated");
+        // `os` only (parent layers are hot-attached at Step 5, not at
+        // create time; zlayer-debug dropped per B-4). See
+        // `build_virtual_machine_doc` comment for rationale.
+        assert_eq!(vsmb.shares.len(), 1);
+        assert_eq!(vsmb.shares[0].name, "os");
+        assert_eq!(devices.scsi.len(), 1);
+        assert!(devices.scsi.contains_key(PRIMARY_SCSI_CTRL_GUID));
+        assert!(
+            vm.guest_state.is_none(),
+            "VmbFs-boot UVMs must not carry a host GuestState path",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GPU-PV tests
+    // -----------------------------------------------------------------------
+
+    /// Linux / macOS stub for [`enumerate_host_gpu_adapters`] returns
+    /// `ErrorKind::Unsupported`. The Windows implementation is exercised by
+    /// the `#[ignore]`'d real-host test below.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn enumerate_host_gpu_adapters_returns_unsupported_on_non_windows() {
+        let err =
+            super::enumerate_host_gpu_adapters().expect_err("must be Unsupported off-Windows");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// Smoke-test the real DXGI probe on a Windows host. Ignored by default
+    /// because CI / dev machines may not have a GPU, but flagged so the
+    /// `windows-hcs-e2e` job can opt in with `--ignored`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a real Windows host with at least one GPU adapter"]
+    fn enumerate_host_gpu_adapters_on_windows_finds_at_least_one() {
+        let adapters = super::enumerate_host_gpu_adapters().expect("DXGI probe must succeed");
+        assert!(
+            !adapters.is_empty(),
+            "expected at least one host GPU adapter (WARP excluded); got {adapters:?}",
+        );
+    }
+
+    /// Fixture: three host adapters — 2 NVIDIA, 1 AMD — so the filter tests
+    /// can assert both vendor and count behaviour.
+    fn fixture_adapters() -> Vec<HostGpuAdapter> {
+        vec![
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 1,
+                description: "NVIDIA GeForce RTX 4090".to_string(),
+                vendor_id: 0x10de,
+                device_id: 0x2684,
+            },
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 2,
+                description: "NVIDIA RTX A6000".to_string(),
+                vendor_id: 0x10de,
+                device_id: 0x2230,
+            },
+            HostGpuAdapter {
+                luid_high: 0,
+                luid_low: 3,
+                description: "AMD Radeon RX 7900 XTX".to_string(),
+                vendor_id: 0x1002,
+                device_id: 0x744c,
+            },
+        ]
+    }
+
+    #[test]
+    fn filter_adapters_by_vendor_nvidia() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 99, // do not truncate
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|a| a.vendor_id == 0x10de));
+    }
+
+    #[test]
+    fn filter_adapters_by_count_truncates() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "all".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn filter_adapters_by_model_substring() {
+        let adapters = fixture_adapters();
+        let spec = zlayer_spec::GpuSpec {
+            count: 99,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: Some("a6000".to_string()),
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
+        };
+        let filtered = filter_adapters_by_gpu_spec(&adapters, &spec);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].description, "NVIDIA RTX A6000");
+    }
+
+    /// When `spec.resources.gpu` is set AND we have candidate adapters, the
+    /// `VirtualMachine` document carries a `GpuAssignment` with
+    /// `assignment_mode = List` and one `GpuAssignmentRequest` per adapter.
+    #[test]
+    fn build_virtual_machine_doc_with_gpu_populates_assignment() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "gpu-list",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+
+        let mut spec = fixture_spec();
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
+        });
+
+        let adapters = vec![HostGpuAdapter {
+            luid_high: 0xdead_beef,
+            luid_low: 0x1234_5678,
+            description: "NVIDIA GeForce RTX 4090".to_string(),
+            vendor_id: 0x10de,
+            device_id: 0x2684,
+        }];
+
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &adapters);
+        let devices = vm.devices.expect("devices");
+        let gpu = devices.gpu.expect("gpu assignment present");
+        assert_eq!(gpu.assignment_mode, GpuAssignmentMode::List);
+        assert_eq!(gpu.assignment_request.len(), 1);
+        let req = &gpu.assignment_request[0];
+        assert_eq!(req.adapter_luid_high_part, 0xdead_beef);
+        assert_eq!(req.adapter_luid_low_part, 0x1234_5678);
+        assert_eq!(
+            req.virtual_machine_id_string, "0xdeadbeef:0x12345678",
+            "LUID hex string must be `0x<hi>:0x<lo>`",
+        );
+        assert_eq!(gpu.allow_vendor_extension, Some(true));
+    }
+
+    /// When `spec.resources.gpu` is set but no candidate adapters were found
+    /// on the host, fall back to `assignment_mode = Default` rather than
+    /// silently dropping the request.
+    #[test]
+    fn build_virtual_machine_doc_with_gpu_no_adapters_falls_back_to_default() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "gpu-default",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+
+        let mut spec = fixture_spec();
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "all".to_string(),
+            mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
+        });
+
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+        let devices = vm.devices.expect("devices");
+        let gpu = devices.gpu.expect("gpu assignment present");
+        assert_eq!(gpu.assignment_mode, GpuAssignmentMode::Default);
+        assert!(gpu.assignment_request.is_empty());
+    }
+
+    /// When the spec has no GPU, `devices.gpu` is omitted entirely.
+    #[test]
+    fn build_virtual_machine_doc_without_gpu_omits_assignment() {
+        use std::path::PathBuf;
+
+        let uvm = Uvm::for_test(
+            "no-gpu",
+            PathBuf::from(r"C:\scratch.vhdx"),
+            PathBuf::from(r"C:\boot"),
+        );
+        let spec = fixture_spec();
+        let vm = build_virtual_machine_doc(&uvm, &[], &spec, &[]);
+        let devices = vm.devices.expect("devices");
+        assert!(
+            devices.gpu.is_none(),
+            "spec without GpuSpec must produce a Devices block with no GPU field",
         );
     }
 }

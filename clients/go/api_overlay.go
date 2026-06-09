@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 
@@ -227,6 +228,114 @@ func (a *OverlayAPIService) GetIpAllocationExecute(r ApiGetIpAllocationRequest) 
 	return localVarReturnValue, localVarHTTPResponse, nil
 }
 
+type ApiGetNatStatusRequest struct {
+	ctx context.Context
+	ApiService *OverlayAPIService
+}
+
+func (r ApiGetNatStatusRequest) Execute() (*NatStatusResponse, *http.Response, error) {
+	return r.ApiService.GetNatStatusExecute(r)
+}
+
+/*
+GetNatStatus Get NAT traversal status.
+
+Returns the daemon's current NAT traversal configuration plus the live
+runtime state from the overlay manager: configured STUN/TURN servers,
+the bound relay-server address (if running), the locally gathered ICE
+candidates, per-peer connection types, and the timestamp of the last
+successful STUN refresh.
+
+When the overlay manager is not initialised (host-networking mode) the
+response reports `enabled: false` with empty server / candidate lists
+rather than 503 — the Manager UI uses this endpoint to surface "NAT
+disabled" badges and shouldn't have to special-case missing overlays.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiGetNatStatusRequest
+*/
+func (a *OverlayAPIService) GetNatStatus(ctx context.Context) ApiGetNatStatusRequest {
+	return ApiGetNatStatusRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return NatStatusResponse
+func (a *OverlayAPIService) GetNatStatusExecute(r ApiGetNatStatusRequest) (*NatStatusResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *NatStatusResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "OverlayAPIService.GetNatStatus")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/overlay/nat/status"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiGetOverlayPeersRequest struct {
 	ctx context.Context
 	ApiService *OverlayAPIService
@@ -378,6 +487,237 @@ func (a *OverlayAPIService) GetOverlayStatusExecute(r ApiGetOverlayStatusRequest
 	}
 
 	localVarPath := localBasePath + "/api/v1/overlay/status"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiGetServiceBridgeRequest struct {
+	ctx context.Context
+	ApiService *OverlayAPIService
+	name string
+	nodeId string
+}
+
+func (r ApiGetServiceBridgeRequest) Execute() (*BridgeInfo, *http.Response, error) {
+	return r.ApiService.GetServiceBridgeExecute(r)
+}
+
+/*
+GetServiceBridge Get the bridge attachment for a service on a specific node.
+
+In v0.51 this endpoint is a stub: the bridge map is not yet populated
+by the overlay manager, so every call returns 404. The endpoint
+contract is defined now so adapter crates (zlayer-docker, manager UI,
+Python SDK) can consume it day-one once P9a wires the real bridges.
+
+# Errors
+
+Returns 503 if the overlay manager is not initialised, and 404 in all
+other cases until P9a lands.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param name Service name
+ @param nodeId Node ID
+ @return ApiGetServiceBridgeRequest
+*/
+func (a *OverlayAPIService) GetServiceBridge(ctx context.Context, name string, nodeId string) ApiGetServiceBridgeRequest {
+	return ApiGetServiceBridgeRequest{
+		ApiService: a,
+		ctx: ctx,
+		name: name,
+		nodeId: nodeId,
+	}
+}
+
+// Execute executes the request
+//  @return BridgeInfo
+func (a *OverlayAPIService) GetServiceBridgeExecute(r ApiGetServiceBridgeRequest) (*BridgeInfo, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *BridgeInfo
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "OverlayAPIService.GetServiceBridge")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/overlay/services/{name}/bridges/{node_id}"
+	localVarPath = strings.Replace(localVarPath, "{"+"name"+"}", url.PathEscape(parameterValueToString(r.name, "name")), -1)
+	localVarPath = strings.Replace(localVarPath, "{"+"node_id"+"}", url.PathEscape(parameterValueToString(r.nodeId, "nodeId")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiGetServiceOverlayStatusRequest struct {
+	ctx context.Context
+	ApiService *OverlayAPIService
+	name string
+}
+
+func (r ApiGetServiceOverlayStatusRequest) Execute() (*ServiceOverlayStatus, *http.Response, error) {
+	return r.ApiService.GetServiceOverlayStatusExecute(r)
+}
+
+/*
+GetServiceOverlayStatus Get the overlay status for a single service.
+
+Returns the resolved overlay mode (after `resolve_v0_51`) and the
+per-node bridge map describing where on each node the service's
+overlay terminates.
+
+In v0.51 this endpoint is a stub: the bridge map is always empty and
+the mode is always `Shared` (the only implemented mode). Real wiring
+lands in P9a once `OverlayManager` exposes a per-service bridge view.
+
+# Errors
+
+Returns 503 if the overlay manager is not initialised (host
+networking mode). The 404 case (service unknown to this node) is
+reserved for the post-P9a implementation; today the stub always
+responds with an empty bridge map for any name.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param name Service name
+ @return ApiGetServiceOverlayStatusRequest
+*/
+func (a *OverlayAPIService) GetServiceOverlayStatus(ctx context.Context, name string) ApiGetServiceOverlayStatusRequest {
+	return ApiGetServiceOverlayStatusRequest{
+		ApiService: a,
+		ctx: ctx,
+		name: name,
+	}
+}
+
+// Execute executes the request
+//  @return ServiceOverlayStatus
+func (a *OverlayAPIService) GetServiceOverlayStatusExecute(r ApiGetServiceOverlayStatusRequest) (*ServiceOverlayStatus, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *ServiceOverlayStatus
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "OverlayAPIService.GetServiceOverlayStatus")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/overlay/services/{name}"
+	localVarPath = strings.Replace(localVarPath, "{"+"name"+"}", url.PathEscape(parameterValueToString(r.name, "name")), -1)
 
 	localVarHeaderParams := make(map[string]string)
 	localVarQueryParams := url.Values{}

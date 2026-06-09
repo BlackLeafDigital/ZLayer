@@ -78,8 +78,8 @@ git push --force-with-lease
 # run at https://github.com/ZachHandley/youki/actions and grab the new
 # version from the workflow summary.
 
-# 3. Pick up the new published version in ZLayer / zlayer-zql
-cd /path/to/ZLayer   # (repeat in zlayer-zql)
+# 3. Pick up the new published version in ZLayer
+cd /path/to/ZLayer
 # Bump the `version =` field in crates/zlayer-agent/Cargo.toml to match the
 # new -zlayer.N from the workflow summary, then:
 cargo update -p zlayer-libcontainer -p zlayer-libcgroups
@@ -104,20 +104,16 @@ Carried locally until upstream merges."
 git push --force-with-lease  # or plain push if no rebase needed
 ```
 
-Add a row to the **Current patches** table above. The push to `zlayer-patches` triggers the publish workflow automatically; once it finishes, bump the `version =` field in `crates/zlayer-agent/Cargo.toml` to the new `-zlayer.N` (in both ZLayer and zlayer-zql) and run `cargo update -p zlayer-libcontainer -p zlayer-libcgroups`.
+Add a row to the **Current patches** table above. The push to `zlayer-patches` triggers the publish workflow automatically; once it finishes, bump the `version =` field in `crates/zlayer-agent/Cargo.toml` to the new `-zlayer.N` and run `cargo update -p zlayer-libcontainer -p zlayer-libcgroups`.
 
 ## Retirement
 
 When every cherry-pick has been upstreamed and the fixes are available in a published upstream `libcontainer` (e.g. 0.6.1 finally ships):
 
-1. Edit `crates/zlayer-agent/Cargo.toml` (in both ZLayer and zlayer-zql) — drop the `package =` rename and depend on upstream directly: `libcontainer = { version = "0.6.1", optional = true }`.
+1. Edit `crates/zlayer-agent/Cargo.toml` — drop the `package =` rename and depend on upstream directly: `libcontainer = { version = "0.6.1", optional = true }`.
 2. `cargo update -p libcontainer` and run the workspace check.
 3. Disable `.github/workflows/publish-zlayer-fork.yml` on the fork (`gh workflow disable` or delete the file on `zlayer-patches`).
 4. Delete the `zlayer-patches` branch (the `published/*` tags stay as audit trail).
 5. Optionally `cargo yank` the `zlayer-libcgroups` / `zlayer-libcontainer` versions on crates.io — leaving them yanked-but-listed is fine; consumers get a clear "this version is yanked, use upstream `libcontainer` instead" message.
 
 Don't delete the fork repo itself — keeping it around costs nothing and saves setup time if we need to carry patches again.
-
-## Mirror note
-
-Changes to `crates/zlayer-agent/Cargo.toml` in ZLayer must also be applied (as edits, never `cp`) to the same file in `zlayer-zql`. This document must be kept in sync between both repos.

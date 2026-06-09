@@ -259,6 +259,7 @@ impl VariableStorage for SqlxVariableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     fn make_var(name: &str, value: &str, scope: Option<&str>) -> StoredVariable {
         StoredVariable::new(name, value, scope.map(str::to_string))
@@ -631,7 +632,9 @@ mod tests {
     #[tokio::test]
     async fn test_sqlx_persistent_round_trip() {
         // Survives closing + reopening the database.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-round-trip-")
+            .unwrap();
         let db_path = temp_dir.path().join("variables.db");
 
         let scoped = make_var("PORT", "3000", Some("proj-a"));

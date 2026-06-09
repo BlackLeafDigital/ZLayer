@@ -29,10 +29,28 @@ pub(crate) async fn handle_build(
     verbose_build: bool,
     platform: Option<String>,
     update_bottles: bool,
+    backend: Option<String>,
+    host_network: bool,
 ) -> Result<()> {
     use std::str::FromStr;
     use zlayer_builder::{
         detect_runtime, BuildEvent, ImageBuilder, ImageOs, PlainLogger, PullBaseMode, Runtime,
+    };
+    use zlayer_types::builder::BuilderBackendKind;
+
+    // Parse the optional --backend override into a typed discriminator. We
+    // keep clap's value as `Option<String>` for clean error formatting and
+    // do the typed parse here so callers get an `anyhow` error with the same
+    // remediation hint regardless of which front-end fed the build (CLI vs
+    // pipeline vs daemon RPC).
+    let backend_override: Option<BuilderBackendKind> = match backend.as_deref() {
+        Some(b) => Some(BuilderBackendKind::from_str(b).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid --backend value '{b}': {e} (expected one of: \
+                 buildah-cli, buildah-sidecar, sandbox, hcs)"
+            )
+        })?),
+        None => None,
     };
 
     // L-2: Parse the CLI `--platform` flag into an `ImageOs` pin. When set,
@@ -102,6 +120,29 @@ pub(crate) async fn handle_build(
         })
         .collect();
 
+    // ------------------------------------------------------------------
+    // macOS Linux-build routing: bring up the `zlayer-buildd` VZ sidecar,
+    // stage the build context into its shared mount, and wire the sidecar
+    // backend via env. The image lands in the buildd's in-guest storage;
+    // we export + import it into ZLayer's local registry after the build
+    // (the library's own local-registry import path can't reach the
+    // in-guest store, so we skip it here and do it ourselves).
+    // ------------------------------------------------------------------
+    // `context` is only mutated on the macOS sidecar path below
+    // (`setup_macos_sidecar(&mut context)`); on every other target the binding
+    // is read-only, so silence the platform-specific `unused_mut`.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut context = context;
+    #[cfg(target_os = "macos")]
+    let mac_sidecar = {
+        let target_is_linux = matches!(cli_target_os, None | Some(ImageOs::Linux));
+        if target_is_linux {
+            Some(setup_macos_sidecar(&mut context).await?)
+        } else {
+            None
+        }
+    };
+
     // Create event channel for progress updates
     let (event_tx, event_rx) = mpsc::channel::<BuildEvent>();
 
@@ -146,10 +187,21 @@ pub(crate) async fn handle_build(
         }
     }
 
+    // On the macOS sidecar path the built image lives in the in-guest
+    // buildd store, not a host buildah store — the library's local-registry
+    // import (host `buildah push`) would fail. Skip it; we export + import
+    // from the shared mount ourselves after the build.
+    #[cfg(target_os = "macos")]
+    let wire_local_registry = mac_sidecar.is_none();
+    #[cfg(not(target_os = "macos"))]
+    let wire_local_registry = true;
+
     let registry_path = data_dir.join("registry");
     match zlayer_registry::LocalRegistry::new(registry_path.clone()).await {
         Ok(registry) => {
-            builder = builder.with_local_registry(registry);
+            if wire_local_registry {
+                builder = builder.with_local_registry(registry);
+            }
         }
         Err(e) => {
             if looks_like_permission_denied(&e.to_string()) && is_system_data_dir(&data_dir) {
@@ -205,6 +257,17 @@ pub(crate) async fn handle_build(
     // Forward --update-bottles to the macOS sandbox backend (no-op on Linux/Windows)
     builder = builder.update_bottles(update_bottles);
 
+    // Forward --host-network to the builder so every `buildah run` gets
+    // `--net=host`. This matches Docker's `--network host` build mode and
+    // bypasses buildah's CNI / netavark plumbing entirely.
+    builder = builder.with_host_network(host_network);
+
+    // Forward --backend (if supplied). `None` keeps the auto-detected
+    // default; `Some(kind)` will force that backend at dispatch time. The
+    // value is plumbed onto `BuildOptions::backend_override`; the
+    // `detect_backend()` path will honour it in a follow-up (task 4.1).
+    builder = builder.with_backend_override(backend_override);
+
     // Apply push
     if push {
         builder = builder.push_without_auth();
@@ -213,7 +276,7 @@ pub(crate) async fn handle_build(
     // Determine if we should use TUI or plain output
     let use_tui = !no_tui && std::io::stdout().is_terminal();
 
-    if use_tui {
+    let result = if use_tui {
         // TUI mode - run build with interactive progress display
         use zlayer_builder::BuildTui;
 
@@ -234,16 +297,10 @@ pub(crate) async fn handle_build(
         }
 
         // Wait for build result
-        let result = build_handle
+        build_handle
             .await
             .context("Build task panicked")?
-            .context("Build failed")?;
-
-        println!("\nBuilt image: {}", result.image_id);
-        for tag in &result.tags {
-            println!("  Tagged: {tag}");
-        }
-        println!("Build time: {}ms", result.build_time_ms);
+            .context("Build failed")?
     } else {
         // Plain output mode (CI or --no-tui)
         let logger = PlainLogger::new(verbose_build);
@@ -264,17 +321,132 @@ pub(crate) async fn handle_build(
         }
 
         // Wait for build result
-        let result = build_handle
+        build_handle
             .await
             .context("Build task panicked")?
-            .context("Build failed")?;
+            .context("Build failed")?
+    };
 
-        println!("\nBuilt image: {}", result.image_id);
-        for tag in &result.tags {
-            println!("  Tagged: {tag}");
-        }
-        println!("Build time: {}ms", result.build_time_ms);
+    println!("\nBuilt image: {}", result.image_id);
+    for tag in &result.tags {
+        println!("  Tagged: {tag}");
     }
+    println!("Build time: {}ms", result.build_time_ms);
+
+    // macOS sidecar path: the built image is in the in-guest buildd store.
+    // Export it to an OCI archive in the shared mount and import it into
+    // ZLayer's local registry so `zlayer run <tag>` can resolve it. Then
+    // clean up the staged context.
+    #[cfg(target_os = "macos")]
+    if let Some(sidecar) = mac_sidecar {
+        finalize_macos_sidecar(&sidecar, &result, &data_dir).await?;
+    }
+
+    Ok(())
+}
+
+/// State carried across the macOS sidecar build: the live buildd handle plus
+/// the staged-context dir we must clean up afterward.
+#[cfg(target_os = "macos")]
+struct MacSidecar {
+    handle: crate::commands::buildd_manager::BuilddHandle,
+    staged_host_dir: PathBuf,
+}
+
+/// Bring up the `zlayer-buildd` VZ sidecar, stage `*context` into its shared
+/// mount, repoint `*context` at the staged dir, and export the sidecar
+/// wiring via env vars so `detect_backend` selects the remote sidecar.
+///
+/// Returns the [`MacSidecar`] state for post-build export + cleanup.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+async fn setup_macos_sidecar(context: &mut PathBuf) -> Result<MacSidecar> {
+    use crate::commands::buildd_manager;
+
+    info!("macOS Linux build: routing through zlayer-buildd VZ sidecar");
+    let handle = buildd_manager::ensure_buildd()
+        .await
+        .context("ensuring zlayer-buildd sidecar is running")?;
+
+    // Drop leftover vfs layers from any prior build so the RAM-backed graph
+    // doesn't run out of space on a reused sidecar.
+    buildd_manager::prune_build_storage(&handle).await;
+
+    // Stage the real context into the shared mount; the in-guest buildah
+    // reads it at the returned guest path.
+    let canonical = std::fs::canonicalize(&context).unwrap_or_else(|_| context.clone());
+    let (staged_host_dir, _guest_dir) = buildd_manager::stage_context(&handle, &canonical)
+        .context("staging build context into sidecar shared mount")?;
+
+    // The library reads the Dockerfile from this (host) path AND hands it to
+    // the backend as `context_dir`; the backend then rewrites the host
+    // prefix to the guest prefix via `context_mount` (set in env below).
+    context.clone_from(&staged_host_dir);
+
+    // Wire the sidecar backend via env (read by detect_backend on macOS).
+    let (host_prefix, guest_prefix) = handle.context_mount();
+    // SAFETY: single-threaded setup phase before any build task is spawned.
+    unsafe {
+        std::env::set_var("ZLAYER_BUILDD_ADDR", &handle.addr);
+        std::env::set_var("ZLAYER_BUILDD_TLS_DIR", &handle.tls_dir);
+        std::env::set_var(
+            "ZLAYER_BUILDD_CONTEXT_MOUNT",
+            format!("{}:{}", host_prefix.display(), guest_prefix.display()),
+        );
+    }
+
+    Ok(MacSidecar {
+        handle,
+        staged_host_dir,
+    })
+}
+
+/// Export the freshly-built image out of the in-guest buildd store into an
+/// OCI archive in the shared mount, import it into `ZLayer`'s local registry,
+/// then clean up the staged context + export tar.
+#[cfg(target_os = "macos")]
+async fn finalize_macos_sidecar(
+    sidecar: &MacSidecar,
+    result: &zlayer_builder::BuiltImage,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    use crate::commands::buildd_manager;
+
+    if result.tags.is_empty() {
+        warn!("sidecar build produced no tags; skipping import into local registry");
+        buildd_manager::cleanup_staged(&sidecar.staged_host_dir);
+        return Ok(());
+    }
+
+    let registry_path = data_dir.join("registry");
+    let registry = zlayer_registry::LocalRegistry::new(registry_path.clone())
+        .await
+        .with_context(|| format!("opening local registry at {}", registry_path.display()))?;
+    let cache_path = data_dir.join("cache").join("blobs.redb");
+    let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path)
+        .await
+        .with_context(|| format!("opening blob cache at {}", cache_path.display()))?;
+
+    // Export once using the first tag; import that tar under every tag.
+    let primary = &result.tags[0];
+    println!("Exporting {primary} from sidecar store...");
+    let tar = buildd_manager::export_image(&sidecar.handle, primary)
+        .await
+        .context("exporting built image from sidecar")?;
+
+    for tag in &result.tags {
+        let info =
+            zlayer_registry::import_image(&registry, &tar, Some(tag.as_str()), Some(&blob_cache))
+                .await
+                .with_context(|| format!("importing '{tag}' into local registry"))?;
+        println!("  Imported {tag} (digest {})", info.digest);
+    }
+
+    // Best-effort cleanup of the export tar + staged context.
+    if let Err(e) = std::fs::remove_file(&tar) {
+        warn!(path = %tar.display(), "failed to remove export tar: {e}");
+    }
+    buildd_manager::cleanup_staged(&sidecar.staged_host_dir);
 
     Ok(())
 }

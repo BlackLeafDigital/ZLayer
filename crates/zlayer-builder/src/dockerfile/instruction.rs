@@ -186,6 +186,15 @@ impl Instruction {
                 if let Some(security) = &run.security {
                     format!("{security:?}").hash(&mut hasher);
                 }
+                // Include transient env in the hash — different env values
+                // change the effective RUN behavior even though they are not
+                // baked into the image config.
+                let mut env_keys: Vec<_> = run.env.keys().collect();
+                env_keys.sort();
+                for key in env_keys {
+                    key.hash(&mut hasher);
+                    run.env.get(key).hash(&mut hasher);
+                }
             }
             Self::Copy(copy) => {
                 "COPY".hash(&mut hasher);
@@ -341,6 +350,12 @@ pub struct RunInstruction {
 
     /// Optional security mode (`BuildKit`)
     pub security: Option<RunSecurity>,
+
+    /// Transient environment variables for the RUN. Emitted as `--env K=V` flags
+    /// on `buildah run`; intentionally NOT baked into the image's persistent
+    /// config. Empty by default.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
 }
 
 impl RunInstruction {
@@ -351,6 +366,7 @@ impl RunInstruction {
             mounts: Vec::new(),
             network: None,
             security: None,
+            env: HashMap::new(),
         }
     }
 
@@ -362,6 +378,7 @@ impl RunInstruction {
             mounts: Vec::new(),
             network: None,
             security: None,
+            env: HashMap::new(),
         }
     }
 }
@@ -1056,6 +1073,54 @@ mod tests {
         let env2 = Instruction::Env(EnvInstruction::from_vars(vars2));
 
         assert_eq!(env1.cache_key(), env2.cache_key());
+    }
+
+    #[test]
+    fn test_run_instruction_env_field_default_empty() {
+        // Factory constructors initialise env to an empty map.
+        let s = RunInstruction::shell("echo hi");
+        assert!(s.env.is_empty());
+
+        let e = RunInstruction::exec(vec!["echo".to_string(), "hi".to_string()]);
+        assert!(e.env.is_empty());
+    }
+
+    #[test]
+    fn test_cache_key_env_field_affects_hash_and_is_order_invariant() {
+        // Two RUNs with the same env (different insertion order) hash equal.
+        let mut env1 = HashMap::new();
+        env1.insert("A".to_string(), "1".to_string());
+        env1.insert("B".to_string(), "2".to_string());
+        let r1 = RunInstruction {
+            command: ShellOrExec::Shell("echo".to_string()),
+            mounts: Vec::new(),
+            network: None,
+            security: None,
+            env: env1,
+        };
+
+        let mut env2 = HashMap::new();
+        env2.insert("B".to_string(), "2".to_string());
+        env2.insert("A".to_string(), "1".to_string());
+        let r2 = RunInstruction {
+            command: ShellOrExec::Shell("echo".to_string()),
+            mounts: Vec::new(),
+            network: None,
+            security: None,
+            env: env2,
+        };
+
+        assert_eq!(
+            Instruction::Run(r1.clone()).cache_key(),
+            Instruction::Run(r2).cache_key()
+        );
+
+        // A RUN with env differs from a RUN without env.
+        let r_no_env = RunInstruction::shell("echo");
+        assert_ne!(
+            Instruction::Run(r1).cache_key(),
+            Instruction::Run(r_no_env).cache_key()
+        );
     }
 
     #[test]

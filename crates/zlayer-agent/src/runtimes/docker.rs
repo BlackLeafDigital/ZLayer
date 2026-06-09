@@ -18,9 +18,9 @@ use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, CreateImageInfo,
-    DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, ContainerWaitResponse,
+    CreateImageInfo, DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect,
+    PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
@@ -609,6 +609,48 @@ fn parse_memory(memory: &str) -> Option<i64> {
     Some((num * multiplier as f64) as i64)
 }
 
+/// Map a single frame from bollard's `wait_container` stream to the
+/// container's exit code.
+///
+/// bollard (0.20) does NOT surface a non-zero exit as `Ok`. Its
+/// `wait_container` adapter rewrites any `ContainerWaitResponse` whose
+/// `status_code > 0` into
+/// [`BollardError::DockerContainerWaitError { error, code }`], where `code`
+/// IS the container's exit code and `error` is frequently empty (the daemon
+/// returns a clean `{"StatusCode":N}` with no `Error` field). A zero exit
+/// arrives as `Ok(ContainerWaitResponse { status_code: 0, .. })`.
+///
+/// Therefore both
+/// - `Ok(resp)`                    → `resp.status_code`
+/// - `DockerContainerWaitError { code, .. }` → `code`
+///
+/// are SUCCESSFUL waits and must yield `Ok(exit_code)`. Only genuine
+/// transport / not-found failures — the stream closing with no frame, or any
+/// other [`BollardError`] variant — are mapped to an [`AgentError`].
+#[allow(clippy::cast_possible_truncation)]
+fn wait_exit_code_from_frame(
+    frame: Option<std::result::Result<ContainerWaitResponse, BollardError>>,
+    container: &str,
+) -> Result<i32> {
+    match frame {
+        // Clean terminal frame: exit code 0 (or any code bollard left as Ok).
+        Some(Ok(resp)) => Ok(resp.status_code as i32),
+        // bollard turns a non-zero (`status_code > 0`) wait result into this
+        // error variant — `code` is the real exit code, NOT a wait failure.
+        Some(Err(BollardError::DockerContainerWaitError { code, .. })) => Ok(code as i32),
+        // Any other bollard error is a genuine transport/daemon failure.
+        Some(Err(e)) => Err(AgentError::NotFound {
+            container: container.to_string(),
+            reason: format!("failed to wait for container: {e}"),
+        }),
+        // Stream closed without yielding a frame at all.
+        None => Err(AgentError::NotFound {
+            container: container.to_string(),
+            reason: "wait stream closed unexpectedly".to_string(),
+        }),
+    }
+}
+
 #[async_trait::async_trait]
 impl Runtime for DockerRuntime {
     /// Pull an image to local storage with default policy (`IfNotPresent`)
@@ -620,14 +662,22 @@ impl Runtime for DockerRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull an image to local storage with a specific policy, honouring an
     /// optional inline [`RegistryAuth`] (§3.10).
+    ///
+    /// `_source` is accepted for trait conformance but ignored: the Docker
+    /// backend delegates to `dockerd`, which performs its own tier resolution.
     #[instrument(
-        skip(self, auth),
+        skip(self, auth, _source),
         fields(
             otel.name = "image.pull",
             container.image.name = %image,
@@ -640,6 +690,7 @@ impl Runtime for DockerRuntime {
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Handle Never policy - don't pull at all
         if matches!(policy, PullPolicy::Never) {
@@ -1580,21 +1631,10 @@ impl Runtime for DockerRuntime {
 
         let mut stream = self.docker.wait_container(&name, Some(options));
 
-        // Get the first (and only) result from the wait stream
-        let wait_response = stream
-            .next()
-            .await
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.clone(),
-                reason: "wait stream closed unexpectedly".to_string(),
-            })?
-            .map_err(|e| AgentError::NotFound {
-                container: name.clone(),
-                reason: format!("failed to wait for container: {e}"),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let exit_code = wait_response.status_code as i32;
+        // Get the first (and only) result from the wait stream. bollard maps a
+        // non-zero exit into `DockerContainerWaitError { code, .. }`, so the
+        // exit-code extraction is centralized in `wait_exit_code_from_frame`.
+        let exit_code = wait_exit_code_from_frame(stream.next().await, &name)?;
 
         tracing::info!(container = %name, exit_code = exit_code, "container exited");
 
@@ -1723,20 +1763,10 @@ impl Runtime for DockerRuntime {
 
         let mut stream = self.docker.wait_container(&name, Some(options));
 
-        let wait_response = stream
-            .next()
-            .await
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.clone(),
-                reason: "wait stream closed unexpectedly".to_string(),
-            })?
-            .map_err(|e| AgentError::NotFound {
-                container: name.clone(),
-                reason: format!("failed to wait for container: {e}"),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let exit_code_from_wait = wait_response.status_code as i32;
+        // bollard surfaces a non-zero exit as `DockerContainerWaitError`, which
+        // carries the real exit code; `wait_exit_code_from_frame` normalizes
+        // both that and the clean `Ok` (exit 0) frame into an exit code.
+        let exit_code_from_wait = wait_exit_code_from_frame(stream.next().await, &name)?;
 
         // For `Removed`, the container is gone by definition: we cannot
         // inspect it. Emit a minimal `Exited` outcome carrying just the
@@ -3667,23 +3697,71 @@ mod tests {
 
     #[test]
     fn test_container_name() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
         assert_eq!(container_name(&id), "zlayer-myservice-1");
     }
 
     #[test]
+    fn wait_exit_code_zero_is_ok() {
+        // Exit 0 arrives as a clean `Ok(ContainerWaitResponse)`.
+        let frame = Some(Ok(ContainerWaitResponse {
+            status_code: 0,
+            error: None,
+        }));
+        assert_eq!(wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(), 0);
+    }
+
+    #[test]
+    fn wait_exit_code_nonzero_error_variant_is_ok() {
+        // bollard rewrites a non-zero exit into `DockerContainerWaitError`
+        // (often with an EMPTY `error` string). This is a successful wait whose
+        // exit code is `code`, NOT a failure.
+        let frame = Some(Err(BollardError::DockerContainerWaitError {
+            error: String::new(),
+            code: 42,
+        }));
+        assert_eq!(
+            wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn wait_exit_code_nonzero_with_message_is_ok() {
+        // Even when the daemon includes an `Error.Message`, a non-zero exit is
+        // still the exit code, not a transport failure.
+        let frame = Some(Err(BollardError::DockerContainerWaitError {
+            error: "container exited".to_string(),
+            code: 137,
+        }));
+        assert_eq!(
+            wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap(),
+            137
+        );
+    }
+
+    #[test]
+    fn wait_exit_code_closed_stream_errors() {
+        // A stream that yields no frame at all is a genuine failure.
+        let err = wait_exit_code_from_frame(None, "zlayer-svc-0").unwrap_err();
+        assert!(matches!(err, AgentError::NotFound { .. }));
+    }
+
+    #[test]
+    fn wait_exit_code_other_bollard_error_errors() {
+        // A non-wait bollard error is a real transport/daemon failure.
+        let frame = Some(Err(BollardError::DockerResponseServerError {
+            status_code: 404,
+            message: "no such container".to_string(),
+        }));
+        let err = wait_exit_code_from_frame(frame, "zlayer-svc-0").unwrap_err();
+        assert!(matches!(err, AgentError::NotFound { .. }));
+    }
+
+    #[test]
     fn test_container_name_with_different_replicas() {
-        let id1 = ContainerId {
-            service: "api".to_string(),
-            replica: 0,
-        };
-        let id2 = ContainerId {
-            service: "api".to_string(),
-            replica: 42,
-        };
+        let id1 = ContainerId::new("api".to_string(), 0);
+        let id2 = ContainerId::new("api".to_string(), 42);
         assert_eq!(container_name(&id1), "zlayer-api-0");
         assert_eq!(container_name(&id2), "zlayer-api-42");
     }
@@ -3891,23 +3969,17 @@ mod tests {
                 expose: ExposeType::Internal,
                 stream: None,
                 tunnel: None,
+                target_role: None,
             })
             .collect();
 
         ServiceSpec {
-            rtype: ResourceType::Service,
-            schedule: None,
             image: ImageSpec {
                 name: "test:latest".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
-            resources: ResourcesSpec::default(),
-            env: HashMap::new(),
-            command: CommandSpec::default(),
-            network: ServiceNetworkSpec::default(),
             endpoints,
-            scale: ScaleSpec::default(),
-            depends: vec![],
             health: HealthSpec {
                 start_grace: None,
                 interval: None,
@@ -3915,44 +3987,7 @@ mod tests {
                 retries: 3,
                 check: HealthCheck::Tcp { port: 0 },
             },
-            init: InitSpec::default(),
-            errors: ErrorsSpec::default(),
-            lifecycle: zlayer_spec::LifecycleSpec::default(),
-            devices: vec![],
-            storage: vec![],
-            port_mappings: vec![],
-            capabilities: vec![],
-            cap_drop: vec![],
-            privileged: false,
-            node_mode: NodeMode::default(),
-            node_selector: None,
-            service_type: ServiceType::default(),
-            wasm: None,
-            logs: None,
-            host_network: false,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            platform: None,
-            labels: std::collections::HashMap::new(),
-            user: None,
-            stop_signal: None,
-            stop_grace_period: None,
-            sysctls: std::collections::HashMap::new(),
-            ulimits: std::collections::HashMap::new(),
-            security_opt: Vec::new(),
-            pid_mode: None,
-            ipc_mode: None,
-            network_mode: zlayer_spec::NetworkMode::default(),
-            extra_groups: Vec::new(),
-            read_only_root_fs: false,
-            init_container: None,
-            tty: false,
-            stdin_open: false,
-            userns_mode: None,
-            cgroup_parent: None,
-            expose: Vec::new(),
+            ..ServiceSpec::default()
         }
     }
 
@@ -4748,10 +4783,7 @@ mod tests {
         // the smoke test we rely on a pre-existing `alpine` container
         // named `zlayer-exec-pty-smoke-0` so this test stays independent
         // of the rest of the runtime API.
-        let id = ContainerId {
-            service: "exec-pty-smoke".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("exec-pty-smoke".to_string(), 0);
 
         let opts = ExecOptions {
             command: vec!["sh".into()],

@@ -1,19 +1,30 @@
 //! First-time setup wizard for the WSL2 backend.
 //!
-//! Handles detecting WSL2, optionally running an **elevated** `wsl --install`
-//! after user consent (G-6), creating the dedicated distro, and installing
-//! the `ZLayer` binary inside it.
+//! Handles detecting WSL2, creating the dedicated distro,
+//! and installing the `ZLayer` binary inside it.
+//!
+//! On Windows, when WSL2 is missing this module can auto-install it via an
+//! elevated `wsl.exe --install --no-distribution` (UAC prompt) — but only
+//! after the caller-supplied consent closure returns `Ok(true)`. Callers in
+//! the CLI pipe this through to `crate::ui::consent::wsl2_install_consent`
+//! (see `bin/zlayer/src/ui/consent.rs`).
 
 use super::daemon::WslBackendConfig;
+#[cfg(target_os = "windows")]
+use super::errors::WslError;
 
 /// Ensure the WSL2 backend is fully configured and ready.
 ///
-/// Back-compat entry point: hard-refuses any auto-install prompt. Use
-/// [`ensure_wsl_backend_ready_with_consent`] for the G-6 consent flow.
+/// Backward-compatible wrapper around
+/// [`ensure_wsl_backend_ready_with_consent`] that hard-refuses any
+/// auto-install. Existing call sites that did not ask for consent should
+/// keep using this entry point — the behaviour is identical to the
+/// pre-G-6 bail-out when WSL2 is missing.
 ///
 /// # Errors
 ///
-/// Returns an error if WSL2 is not installed, or setup fails.
+/// Returns an error if WSL2 is not available or setup fails. See
+/// [`WslError`] for the refusal / reboot variants.
 #[cfg(target_os = "windows")]
 pub async fn ensure_wsl_backend_ready() -> anyhow::Result<WslBackendConfig> {
     ensure_wsl_backend_ready_with_consent(|| Ok(false)).await
@@ -30,29 +41,39 @@ pub async fn ensure_wsl_backend_ready() -> anyhow::Result<WslBackendConfig> {
     anyhow::bail!("WSL2 setup is only available on Windows")
 }
 
-/// G-6: consent-aware WSL2 bootstrap.
+/// Ensure the WSL2 backend is ready, asking the caller-supplied closure for
+/// consent before attempting an elevated auto-install.
 ///
-/// Drives the full "detect → (optionally auto-install with consent) → finalize"
-/// flow. The `consent` closure is invoked **only** when WSL2 is missing or
-/// WSL1-only; returning `Ok(false)` surfaces [`crate::errors::WslError::InstallRefused`]
-/// so callers can degrade gracefully (e.g. route Linux workloads to peers).
+/// The `consent` closure is invoked **only** when WSL2 is not installed (or
+/// only WSL1 is available). It must return:
+/// - `Ok(true)` to approve the elevated `wsl --install --no-distribution`.
+/// - `Ok(false)` to decline — this function then returns
+///   [`WslError::InstallRefused`].
+/// - `Err(_)` to bubble the error straight up (e.g. a TTY-detection
+///   failure from the consent helper).
 ///
-/// Exit code `3010` from `wsl --install` (`ERROR_SUCCESS_REBOOT_REQUIRED`) is
-/// mapped to [`crate::errors::WslError::RebootRequired`]. Callers typically bail
-/// on this variant since the installer finished but the kernel module isn't
-/// active yet.
+/// On a successful install the function re-probes `detect_wsl()` and falls
+/// through into the normal VHD + distro + binary setup. If `wsl.exe --install`
+/// returns `ERROR_SUCCESS_REBOOT_REQUIRED` (3010) the error is surfaced as
+/// [`WslError::RebootRequired`] so the caller can show an actionable message.
 ///
 /// # Errors
 ///
-/// - [`crate::errors::WslError::InstallRefused`] — consent closure returned `Ok(false)`.
-/// - [`crate::errors::WslError::RebootRequired`] — installer finished with 3010.
-/// - Any I/O / command failure from downstream setup steps.
+/// - [`WslError::InstallRefused`] if `consent()` returns `Ok(false)`.
+/// - [`WslError::RebootRequired`] if the install asked Windows for a reboot.
+/// - [`WslError::Wsl1Only`] if WSL is present but WSL2 is disabled and the
+///   user declined consent for the version toggle.
+/// - Any lower-level error from [`super::detect`], [`super::distro`],
+///   [`super::wslconfig`], or a failed `ShellExecuteExW` call.
 ///
 /// # Panics
 ///
-/// Panics only if the internal consent slot accounting is violated (the
-/// `consent_slot` `Option` is drained twice on the same code path — this
-/// would be a logic bug in this function, not a user-reachable condition).
+/// Panics if the internal `consent_slot: Option<F>` is `None` immediately
+/// after the WSL-not-installed branch populates it — in practice unreachable
+/// because the slot is initialized to `Some(consent)` directly above and the
+/// `.take()` call is the first consumer. The `.expect("consent_slot was just
+/// populated")` documents the invariant rather than guarding a real failure
+/// mode.
 #[cfg(target_os = "windows")]
 pub async fn ensure_wsl_backend_ready_with_consent<F>(
     consent: F,
@@ -61,18 +82,17 @@ where
     F: FnOnce() -> anyhow::Result<bool>,
 {
     use super::detect;
-    use super::errors::WslError;
 
     let mut status = detect::detect_wsl().await?;
 
     // `consent` is `FnOnce`, so we move it out of an `Option<F>` the first
-    // time we need it. The second branch ("wsl1 only after install") either
-    // already saw consent (because we just ran the install branch — in which
-    // case status.wsl2_available is true and we skip) or reaches into the
-    // same `Option` and drains it.
+    // time we need it. The WSL1-only branch either already saw consent (because
+    // we just ran the install branch — in which case status.wsl2_available is
+    // true and we skip) or reaches into the same `Option` and drains it.
     let mut consent_slot: Option<F> = Some(consent);
 
     if !status.wsl_installed {
+        tracing::info!("WSL2 is not installed; asking for auto-install consent");
         let consent_fn = consent_slot
             .take()
             .expect("consent_slot was just populated");
@@ -81,27 +101,19 @@ where
             return Err(WslError::InstallRefused.into());
         }
 
-        // Elevated `wsl --install --no-distribution`.
-        run_elevated_wsl_install().await?;
+        tracing::info!("Consent granted — launching elevated `wsl --install --no-distribution`");
+        run_elevated_wsl_install()?;
 
-        // After install, make sure the default version is 2. This runs
-        // non-elevated on purpose — `--set-default-version` only needs the
-        // current user's WSL session, not admin.
-        let set_default = tokio::process::Command::new("wsl.exe")
-            .args(["--set-default-version", "2"])
-            .output()
-            .await;
-        if let Ok(out) = &set_default {
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!(
-                    "wsl --set-default-version 2 failed after install: {}",
-                    stderr.trim()
-                );
-            }
+        // Re-probe WSL status now that the installer reported success.
+        let post_install = detect::detect_wsl().await?;
+        if !post_install.wsl_installed {
+            anyhow::bail!(
+                "WSL2 install reported success but `wsl.exe --status` still \
+                 fails — a reboot may be required. Please reboot and re-run \
+                 the command."
+            );
         }
-
-        status = detect::detect_wsl().await?;
+        status = post_install;
     }
 
     if status.wsl_installed && !status.wsl2_available {
@@ -118,7 +130,7 @@ where
 
         // Elevate just for the version toggle — some policies gate it behind
         // admin even though the command itself doesn't strictly require it.
-        run_elevated_set_default_version_2().await?;
+        run_elevated_set_default_version_2()?;
 
         status = detect::detect_wsl().await?;
         if !status.wsl2_available {
@@ -129,13 +141,11 @@ where
     finalize_wsl_backend(&status).await
 }
 
-/// Non-Windows stub that forwards to [`ensure_wsl_backend_ready`] for API
-/// symmetry. Consumers on Linux/macOS still get a clear "WSL is Windows-only"
-/// error instead of a compile break.
+/// Non-Windows stub for [`ensure_wsl_backend_ready_with_consent`].
 ///
 /// # Errors
 ///
-/// Always returns an error on non-Windows platforms (WSL2 is Windows-only).
+/// Always returns an error on non-Windows platforms.
 #[cfg(not(target_os = "windows"))]
 #[allow(clippy::unused_async)]
 pub async fn ensure_wsl_backend_ready_with_consent<F>(
@@ -144,7 +154,7 @@ pub async fn ensure_wsl_backend_ready_with_consent<F>(
 where
     F: FnOnce() -> anyhow::Result<bool>,
 {
-    ensure_wsl_backend_ready().await
+    anyhow::bail!("WSL2 setup is only available on Windows")
 }
 
 /// Same as [`ensure_wsl_backend_ready`] but lets the caller override the VHD cap.
@@ -186,6 +196,8 @@ pub async fn ensure_wsl_backend_ready_with_vhd_gb(
 /// - Writes/updates `.wslconfig` with a generous VHD cap (idempotent).
 /// - Creates the `zlayer` distro if missing.
 /// - Installs the `zlayer` Linux binary inside the distro if missing.
+/// - Sanity-checks that the installed binary exposes the `runtime`
+///   subcommand surface the WSL2 delegate relies on.
 ///
 /// Pre-condition: `status.wsl_installed && status.wsl2_available` holds. On
 /// violation returns the corresponding [`WslError`] instead of bailing.
@@ -193,8 +205,8 @@ pub async fn ensure_wsl_backend_ready_with_vhd_gb(
 async fn finalize_wsl_backend(
     status: &super::detect::WslStatus,
 ) -> anyhow::Result<WslBackendConfig> {
+    use super::detect;
     use super::distro;
-    use super::errors::WslError;
 
     if !status.wsl_installed {
         return Err(WslError::WslNotInstalled.into());
@@ -225,7 +237,9 @@ async fn finalize_wsl_backend(
         }
     }
 
-    if !status.zlayer_distro_exists {
+    // Re-probe to pick up any `zlayer` distro that may already exist.
+    let final_status = detect::detect_wsl().await?;
+    if !final_status.zlayer_distro_exists {
         tracing::info!("ZLayer WSL2 distro not found, creating...");
         setup_distro().await?;
     }
@@ -237,126 +251,139 @@ async fn finalize_wsl_backend(
         install_binary().await?;
     }
 
+    // Sanity-check that the installed binary actually exposes the
+    // `runtime <verb>` subcommand surface the WSL2 delegate relies on. A
+    // present-but-stale binary (wrong arch, built without the
+    // `youki-runtime` feature) would otherwise only blow up on first
+    // container dispatch with a confusing argv-parse error. Bail clearly
+    // here instead.
+    let runtime_check = distro::wsl_exec("/usr/local/bin/zlayer", &["runtime", "--help"]).await?;
+    if !runtime_check.status.success() {
+        return Err(anyhow::anyhow!(
+            "/usr/local/bin/zlayer in the WSL2 distro does not expose the `runtime` \
+             subcommand (status {:?}): {} — the installed binary is likely the wrong \
+             architecture or was built without the `youki-runtime` feature; \
+             rebuild and reinstall the Linux `zlayer` binary",
+            runtime_check.status.code(),
+            String::from_utf8_lossy(&runtime_check.stderr).trim(),
+        ));
+    }
+
     Ok(WslBackendConfig::default())
 }
 
-/// Invoke `wsl.exe --install --no-distribution` elevated via UAC.
+/// Launch `wsl.exe --install --no-distribution` elevated via `ShellExecuteExW`
+/// (UAC prompt) and wait for the spawned process to exit.
 ///
-/// Uses `ShellExecuteExW` with `lpVerb = "runas"`, waits up to 30 minutes for
-/// the installer to finish, then inspects the exit code. `3010`
-/// (`ERROR_SUCCESS_REBOOT_REQUIRED`) is mapped to [`WslError::RebootRequired`].
+/// Returns:
+/// - `Ok(())` on clean exit code 0.
+/// - `Err(WslError::RebootRequired)` on exit code
+///   `ERROR_SUCCESS_REBOOT_REQUIRED` (3010).
+/// - `Err(_)` for every other failure mode (UAC cancel, non-zero exit, etc.).
 #[cfg(target_os = "windows")]
-async fn run_elevated_wsl_install() -> anyhow::Result<()> {
+fn run_elevated_wsl_install() -> anyhow::Result<()> {
     tracing::info!("Launching elevated `wsl.exe --install --no-distribution` (UAC prompt)…");
-    run_elevated_and_wait("wsl.exe", "--install --no-distribution").await
+    run_elevated_and_wait("wsl.exe", "--install --no-distribution")
 }
 
 /// Invoke `wsl.exe --set-default-version 2` elevated via UAC.
 #[cfg(target_os = "windows")]
-async fn run_elevated_set_default_version_2() -> anyhow::Result<()> {
+fn run_elevated_set_default_version_2() -> anyhow::Result<()> {
     tracing::info!("Launching elevated `wsl.exe --set-default-version 2` (UAC prompt)…");
-    run_elevated_and_wait("wsl.exe", "--set-default-version 2").await
+    run_elevated_and_wait("wsl.exe", "--set-default-version 2")
 }
 
 /// Invoke `file params` with the UAC `runas` verb and synchronously wait for
 /// the process to exit (up to 30 minutes), then translate the exit code.
 ///
-/// The heavy FFI / handle work runs on `spawn_blocking` — `ShellExecuteExW`
-/// pumps the COM/UI thread and `WaitForSingleObject` would block the tokio
-/// worker indefinitely otherwise.
+/// `ERROR_SUCCESS_REBOOT_REQUIRED` (3010) is mapped to
+/// [`WslError::RebootRequired`]; every other non-zero exit is propagated as
+/// an anyhow error.
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
-async fn run_elevated_and_wait(file: &'static str, params: &'static str) -> anyhow::Result<()> {
-    use super::errors::WslError;
+fn run_elevated_and_wait(file: &str, params: &str) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
 
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
-        use std::mem::size_of;
-        use windows::core::{w, PCWSTR};
-        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-        use windows::Win32::UI::Shell::{
-            ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-        };
-        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS_REBOOT_REQUIRED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
-        // 30-minute ceiling. `wsl --install` downloads the kernel MSIX and
-        // enables optional Windows features, which on slow links / fresh VMs
-        // can comfortably take 10+ minutes.
-        const WAIT_TIMEOUT_MS: u32 = 30 * 60 * 1000;
-
-        // Convert the lightweight &'static str into NUL-terminated UTF-16
-        // buffers that outlive the ShellExecuteExW call. We keep the Vec<u16>
-        // alive for the full duration of the call by binding it locally.
-        let file_w: Vec<u16> = file.encode_utf16().chain(std::iter::once(0)).collect();
-        let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
-        let verb_w = w!("runas");
-
-        // SAFETY: The lifetimes of `file_w` / `params_w` span the entire
-        // block; `SHELLEXECUTEINFOW` is zeroed except for the fields we set
-        // explicitly. `ShellExecuteExW` reads the struct synchronously and
-        // returns a process HANDLE in `sei.hProcess` because we set
-        // `SEE_MASK_NOCLOSEPROCESS`.
-        unsafe {
-            let mut sei = SHELLEXECUTEINFOW {
-                cbSize: u32::try_from(size_of::<SHELLEXECUTEINFOW>())
-                    .expect("SHELLEXECUTEINFOW size fits in u32"),
-                fMask: SEE_MASK_NOCLOSEPROCESS,
-                lpVerb: verb_w,
-                lpFile: PCWSTR(file_w.as_ptr()),
-                lpParameters: PCWSTR(params_w.as_ptr()),
-                nShow: SW_HIDE.0,
-                ..Default::default()
-            };
-
-            ShellExecuteExW(&raw mut sei).map_err(|e| {
-                anyhow::anyhow!("ShellExecuteExW(runas, {file} {params}) failed: {e}")
-            })?;
-
-            let h_proc: HANDLE = sei.hProcess;
-            if h_proc.is_invalid() {
-                anyhow::bail!(
-                    "ShellExecuteExW returned success but no process handle — UAC likely \
-                     cancelled or no elevation was performed"
-                );
-            }
-
-            let wait_result = WaitForSingleObject(h_proc, WAIT_TIMEOUT_MS);
-            if wait_result == WAIT_FAILED {
-                let _ = CloseHandle(h_proc);
-                anyhow::bail!("WaitForSingleObject failed waiting for {file} {params}");
-            }
-            if wait_result != WAIT_OBJECT_0 {
-                let _ = CloseHandle(h_proc);
-                anyhow::bail!(
-                    "Elevated `{file} {params}` did not finish within {} minutes",
-                    WAIT_TIMEOUT_MS / 60_000
-                );
-            }
-
-            let mut code: u32 = 0;
-            let exit_result = GetExitCodeProcess(h_proc, &raw mut code);
-            // Always close the handle; propagate any GetExitCodeProcess error
-            // after cleanup.
-            let _ = CloseHandle(h_proc);
-            exit_result.map_err(|e| anyhow::anyhow!("GetExitCodeProcess failed: {e}"))?;
-
-            Ok(code)
-        }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("elevated install join error: {e}"))??;
-
-    // 0 = success, 3010 = ERROR_SUCCESS_REBOOT_REQUIRED, anything else is fatal.
-    match result {
-        0 => Ok(()),
-        3010 => Err(WslError::RebootRequired.into()),
-        other => {
-            anyhow::bail!(
-                "Elevated `{file} {params}` exited with code {other}. \
-                 Open an elevated PowerShell and run it manually to see the full error."
-            )
-        }
+    /// Convert a Rust `&str` into a NUL-terminated UTF-16 buffer.
+    fn to_wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
+
+    let verb = to_wide("runas");
+    let file_w = to_wide(file);
+    let parameters = to_wide(params);
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>())
+            .expect("SHELLEXECUTEINFOW size fits in u32"),
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file_w.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_SHOW.0,
+        ..Default::default()
+    };
+
+    // SAFETY: `info` is a valid, fully-initialized SHELLEXECUTEINFOW. The
+    // UTF-16 buffers it points into outlive the call (they're stack-local in
+    // this function and we don't return until after `CloseHandle`).
+    let info_ptr: *mut SHELLEXECUTEINFOW = &raw mut info;
+    unsafe {
+        ShellExecuteExW(info_ptr)
+            .map_err(|e| anyhow::anyhow!("ShellExecuteExW(runas, {file} {params}) failed: {e}"))?;
+    }
+
+    if info.hProcess.is_invalid() {
+        anyhow::bail!(
+            "ShellExecuteExW returned without a process handle — UAC may have been cancelled"
+        );
+    }
+
+    // Wait up to 30 minutes (typical WSL install is ~2 min; give Windows
+    // Update plenty of headroom without blocking forever).
+    let wait_ms = u32::try_from(Duration::from_secs(30 * 60).as_millis()).unwrap_or(INFINITE);
+    // SAFETY: valid process handle returned by ShellExecuteExW.
+    let wait_result = unsafe { WaitForSingleObject(info.hProcess, wait_ms) };
+    if wait_result != WAIT_OBJECT_0 {
+        // SAFETY: close even on wait failure to avoid leaking the handle.
+        let _ = unsafe { CloseHandle(info.hProcess) };
+        anyhow::bail!(
+            "Timed out (or failed) waiting for `{file} {params}` (WaitForSingleObject = 0x{:x})",
+            wait_result.0
+        );
+    }
+
+    let mut exit_code: u32 = 0;
+    let exit_code_ptr: *mut u32 = &raw mut exit_code;
+    // SAFETY: process has exited (WAIT_OBJECT_0), handle is valid.
+    let got_code = unsafe { GetExitCodeProcess(info.hProcess, exit_code_ptr) };
+    // SAFETY: handle is still valid until CloseHandle.
+    let _ = unsafe { CloseHandle(info.hProcess) };
+
+    if let Err(e) = got_code {
+        anyhow::bail!("GetExitCodeProcess failed after `{file} {params}`: {e}");
+    }
+
+    if exit_code == ERROR_SUCCESS_REBOOT_REQUIRED.0 {
+        return Err(WslError::RebootRequired.into());
+    }
+
+    if exit_code != 0 {
+        anyhow::bail!("`{file} {params}` exited with code {exit_code} (0x{exit_code:x})");
+    }
+
+    tracing::info!("`{file} {params}` completed (exit 0)");
+    Ok(())
 }
 
 /// Create the `ZLayer` WSL2 distro with a minimal Alpine rootfs.
@@ -436,5 +463,102 @@ impl<T> ContextConsentExt<T> for anyhow::Result<T> {
     fn context_consent(self) -> anyhow::Result<T> {
         use anyhow::Context;
         self.context("WSL2 install-consent callback failed")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (cross-platform — the elevated install itself can't be unit-tested)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::WslError;
+
+    /// The refuse path runs through the closure synchronously — it doesn't
+    /// touch `detect::detect_wsl()` on non-Windows platforms because the
+    /// function is stubbed there. To cover the refusal variant in a
+    /// platform-agnostic way we call the error constructor directly and
+    /// verify it surfaces as `InstallRefused`.
+    #[test]
+    fn install_refused_error_variant_is_wired() {
+        let err = WslError::InstallRefused;
+        let message = format!("{err}");
+        assert!(
+            message.contains("WSL2 auto-install was declined"),
+            "unexpected InstallRefused text: {message}"
+        );
+        assert!(
+            message.contains("--install-wsl yes"),
+            "error should point users at the consent flag: {message}"
+        );
+    }
+
+    #[test]
+    fn reboot_required_error_variant_is_wired() {
+        let err = WslError::RebootRequired;
+        let message = format!("{err}");
+        assert!(
+            message.contains("reboot"),
+            "reboot-required error should mention reboot: {message}"
+        );
+    }
+
+    /// On non-Windows, `ensure_wsl_backend_ready_with_consent` is the
+    /// platform stub; we just exercise it to guarantee the new signature
+    /// compiles and errors out cleanly without calling the consent closure.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn non_windows_stub_rejects_cleanly() {
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let result = ensure_wsl_backend_ready_with_consent(|| {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        })
+        .await;
+        assert!(result.is_err(), "non-Windows stub must error");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "non-Windows stub must not invoke the consent closure"
+        );
+    }
+
+    /// On Windows, calling the function against a host that already has WSL2
+    /// is impossible to stub cleanly here — but we can verify that refusing
+    /// consent on a WSL2-less host surfaces `InstallRefused`. We guard the
+    /// test behind a real WSL check so it stays meaningful both on
+    /// developer machines with WSL installed and on the Windows CI runner
+    /// (which does not have WSL).
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn refused_consent_yields_install_refused_when_wsl_missing() {
+        let Ok(status) = crate::detect::detect_wsl().await else {
+            return; // cannot probe WSL → test is inapplicable.
+        };
+        if status.wsl_installed {
+            // Host already has WSL; the refusal branch is unreachable. Skip.
+            return;
+        }
+
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let err = ensure_wsl_backend_ready_with_consent(|| {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(false)
+        })
+        .await
+        .expect_err("refused consent must error");
+
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "consent closure must run when WSL2 is missing"
+        );
+
+        let downcast = err
+            .downcast_ref::<WslError>()
+            .expect("error should be a WslError");
+        assert!(
+            matches!(downcast, WslError::InstallRefused),
+            "expected InstallRefused, got: {downcast:?}"
+        );
     }
 }

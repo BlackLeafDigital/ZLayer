@@ -6,7 +6,7 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Aliases** | Pointer to **[]string** | Optional DNS aliases on this network. | [optional] 
 **ContainerId** | **string** | Container id to attach. | 
-**Ipv4Address** | Pointer to **NullableString** | Optional static IPv4 to pin this container to. Validated as [&#x60;Ipv4Addr&#x60;]. | [optional] 
+**Ipv4Address** | Pointer to **NullableString** | Optional static IPv4 to pin this container to. Validated as [&#x60;std::net::Ipv4Addr&#x60;]. | [optional] 
 
 ## Methods
 

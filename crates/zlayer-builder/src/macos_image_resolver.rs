@@ -45,11 +45,14 @@ const PACKAGE_MAP_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Old dirs are abandoned, not migrated.
 const PACKAGE_MAP_CACHE_SUBDIR: &str = "package-maps-v3";
 
-/// Env var holding the shared secret used to sign POST requests to the
-/// `RepoSourceSyncer` formula-cache endpoint. Must match the value the
-/// function expects in its own `REPOSYNC_HMAC_SECRET` env var. If unset, the
-/// resolver skips the cache-warming POST entirely.
-const REPOSYNC_HMAC_SECRET_ENV: &str = "ZLAYER_REPOSYNC_HMAC_SECRET";
+/// HMAC secret compiled into the binary at build time.
+///
+/// Set at `cargo build` time via `ZLAYER_REPOSYNC_HMAC_SECRET=<hex>`. If unset
+/// at build time, this evaluates to `None` and `fire_reposync_hint` silently
+/// skips the POST — useful for dev builds where the cache-warm signal isn't
+/// needed. Released binaries (built by CI with the Forgejo secret in scope)
+/// carry the value forever.
+const REPOSYNC_HMAC_SECRET: Option<&str> = option_env!("ZLAYER_REPOSYNC_HMAC_SECRET");
 
 // ---------------------------------------------------------------------------
 // Package map types (for RepoSources JSON files)
@@ -660,11 +663,11 @@ async fn resolve_package(
             })?;
 
         // Fire-and-forget POST to reposync so it gets cached. Authenticated
-        // via HMAC-SHA256 over the request body using a shared secret. If the
-        // secret env var is unset (developer machine, CI without the
-        // credential), skip the POST — the resolver still works, the upstream
-        // cache just doesn't get warmed.
-        if let Ok(secret) = std::env::var(REPOSYNC_HMAC_SECRET_ENV) {
+        // via HMAC-SHA256 over the request body using a secret baked into the
+        // binary at build time. If the secret was unset at build time (dev
+        // builds, CI without the credential), skip the POST — the resolver
+        // still works, the upstream cache just doesn't get warmed.
+        if let Some(secret) = REPOSYNC_HMAC_SECRET.filter(|s| !s.is_empty()) {
             let formula_name = formula.to_string();
             let body_clone = body.to_vec();
             tokio::spawn(async move {
@@ -673,7 +676,7 @@ async fn resolve_package(
                     formula_name,
                     String::from_utf8_lossy(&body_clone)
                 );
-                let signature = compute_reposync_signature(&secret, payload.as_bytes());
+                let signature = compute_reposync_signature(secret, payload.as_bytes());
                 let _ = reqwest::Client::new()
                     .post("https://reposync.blackleafdigital.com/formula")
                     .header("x-reposync-signature", signature)
@@ -684,7 +687,7 @@ async fn resolve_package(
             });
         } else {
             debug!(
-                "REPOSYNC_HMAC_SECRET unset; skipping reposync cache warm for {}",
+                "ZLAYER_REPOSYNC_HMAC_SECRET not baked into binary (or empty); skipping reposync cache warm for {}",
                 formula
             );
         }
@@ -1763,6 +1766,7 @@ fn compute_reposync_signature(secret: &str, body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_paths::ZLayerDirs;
 
     // -- rewrite_image_for_macos tests --
 
@@ -1925,7 +1929,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "live network test; runs against published RepoSources"]
     async fn test_map_linux_packages_live_reposources() {
-        let tmp = std::env::temp_dir().join("zlayer-test-pkg-map-live");
+        let tmp = ZLayerDirs::system_default()
+            .tmp()
+            .join("zlayer-test-pkg-map-live");
         let _ = tokio::process::Command::new("chmod")
             .args(["-R", "u+w"])
             .arg(&tmp)
@@ -1992,7 +1998,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_linux_packages_with_seeded_cache() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-with-seeded-cache-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("debian_12");
@@ -2036,7 +2044,9 @@ mod tests {
     /// `libssl-dev` (debian-only name) but `common/l.json` does.
     #[tokio::test]
     async fn test_map_linux_packages_falls_back_to_common() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-falls-back-to-common-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("centos_8");
@@ -2081,7 +2091,9 @@ mod tests {
     /// the more-specific source of truth for that distro.
     #[tokio::test]
     async fn test_map_linux_packages_distro_overrides_common() {
-        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let tmp = ZLayerDirs::system_default()
+            .scratch_dir("test-map-linux-packages-distro-overrides-common-")
+            .expect("create tmpdir");
         let cache_dir = tmp.path().to_path_buf();
         let cache_root = cache_dir.join(PACKAGE_MAP_CACHE_SUBDIR);
         let distro_dir = cache_root.join("alpine_3_20");

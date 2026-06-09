@@ -1,0 +1,131 @@
+name: Windows Sandbox Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild all images even if versions unchanged'
+        required: false
+        type: boolean
+        default: false
+      ltsc_lines:
+        description: 'Comma-separated Windows base lines to build (ltsc2022,ltsc2025)'
+        required: false
+        type: string
+        default: 'ltsc2022,ltsc2025'
+
+  # Weekly check for new SDK versions (same cadence as macOS).
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+
+env:
+  REGISTRY: ghcr.io/blackleafdigital/zlayer
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ===========================================
+  # Check for SDK version updates
+  # ===========================================
+  check-versions:
+    name: Check SDK Versions
+    runs-on: ubuntu-latest
+    outputs:
+      any_changed: ${{ steps.check.outputs.any_changed }}
+      go_version: ${{ steps.detect.outputs.go }}
+      rust_version: ${{ steps.detect.outputs.rust }}
+      node_version: ${{ steps.detect.outputs.node }}
+      python_version: ${{ steps.detect.outputs.python }}
+      deno_version: ${{ steps.detect.outputs.deno }}
+      bun_version: ${{ steps.detect.outputs.bun }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: command -v jq >/dev/null || sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Detect latest SDK versions
+        id: detect
+        # No hardcoded fallbacks here — if upstream is unreachable we let the
+        # outputs be empty so the resolver in `windows_toolchain.rs` performs
+        # the lookup at build time instead of pinning a stale guess.
+        run: |
+          fetch_version() { curl -fsSL "$1" 2>/dev/null; }
+          GO=$(fetch_version 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//')
+          RUST=$(fetch_version 'https://api.github.com/repos/rust-lang/rust/releases/latest' | jq -r '.tag_name')
+          NODE=$(fetch_version 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//')
+          PYTHON=$(fetch_version 'https://endoflife.date/api/python.json' | jq -r '.[0].latest')
+          DENO=$(fetch_version 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//')
+          BUN=$(fetch_version 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//')
+
+          echo "go=${GO}" >> "$GITHUB_OUTPUT"
+          echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
+          echo "node=${NODE}" >> "$GITHUB_OUTPUT"
+          echo "python=${PYTHON}" >> "$GITHUB_OUTPUT"
+          echo "deno=${DENO}" >> "$GITHUB_OUTPUT"
+          echo "bun=${BUN}" >> "$GITHUB_OUTPUT"
+          echo "Latest: Go=${GO} Rust=${RUST} Node=${NODE} Python=${PYTHON} Deno=${DENO} Bun=${BUN}"
+
+      - name: Determine if rebuild needed
+        id: check
+        # The mac workflow probes GHCR per-image with the `resolve-version`
+        # action. For the Windows pipeline we default to always rebuilding
+        # (the per-tag content hash + sandbox cache already short-circuits
+        # unchanged images cheaply) — a smarter probe can be added once the
+        # per-LTSC tag layout settles. `force_rebuild=true` overrides regardless.
+        run: |
+          if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            echo "Force rebuild requested"
+          else
+            echo "Defaulting to rebuild"
+          fi
+          echo "any_changed=true" >> "$GITHUB_OUTPUT"
+
+  # ===========================================
+  # Build & Push Windows sandbox images
+  # ===========================================
+  build-and-push:
+    name: Build & Push Windows Images
+    needs: [check-versions]
+    if: needs.check-versions.outputs.any_changed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      # Sequential, fail-fast disabled — one bad LTSC line should not block
+      # the other from publishing. HCS only builds on a Windows host, so the
+      # whole matrix runs `windows-latest`.
+      fail-fast: false
+      matrix:
+        ltsc: [ltsc2022, ltsc2025]
+    env:
+      FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        # `docker login` works inside the windows-latest runner regardless of
+        # whether the docker daemon is in Linux or Windows-container mode —
+        # `zlayer pipeline --push` uses its own OCI push (registry/auth.json),
+        # but the docker creds file `%USERPROFILE%\.docker\config.json` is the
+        # shared auth source it reads.
+        shell: pwsh
+        run: |
+          echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Build zlayer
+        shell: pwsh
+        run: cargo build --release -p zlayer
+
+      - name: Build and push Windows images (${{ matrix.ltsc }})
+        # `--set LTSC=<line>` parametrises every ZImagefile's `base:` / tag via
+        # the pipeline var-expansion landed alongside `images/windows/*` —
+        # one file set produces both Server-Core lines.
+        shell: pwsh
+        run: |
+          ./target/release/zlayer.exe pipeline `
+            -f images/windows/ZPipeline.yaml `
+            --set "LTSC=${{ matrix.ltsc }}" `
+            --push

@@ -415,10 +415,7 @@ impl DependencyConditionChecker {
     pub async fn check_started(&self, service: &str) -> Result<bool> {
         // Try to get state for replica 1 (primary replica)
         // In practice, we might need to check all replicas
-        let id = ContainerId {
-            service: service.to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service.to_string(), 1);
 
         match self.runtime.container_state(&id).await {
             Ok(ContainerState::Running) => Ok(true),
@@ -1014,10 +1011,7 @@ services:
         let checker = DependencyConditionChecker::new(runtime.clone(), health_states, None);
 
         // Create and start a container
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = minimal_spec(vec![]);
         runtime.create_container(&id, &spec).await.unwrap();
         runtime.start_container(&id).await.unwrap();
@@ -1033,10 +1027,7 @@ services:
         let checker = DependencyConditionChecker::new(runtime.clone(), health_states, None);
 
         // Create but don't start container
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = minimal_spec(vec![]);
         runtime.create_container(&id, &spec).await.unwrap();
 
@@ -1218,10 +1209,7 @@ services:
         }
 
         // Start a container
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
         let spec = minimal_spec(vec![]);
         runtime.create_container(&id, &spec).await.unwrap();
         runtime.start_container(&id).await.unwrap();

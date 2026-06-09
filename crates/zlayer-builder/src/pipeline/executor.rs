@@ -120,6 +120,11 @@ pub struct PipelineExecutor {
     fail_fast: bool,
     /// Whether to push images after building
     push_enabled: bool,
+    /// Whether to force `--net=host` on every `buildah run` for every image
+    /// in this pipeline. Forwarded to each [`ImageBuilder`] via
+    /// [`ImageBuilder::with_host_network`]. Mirrors the top-level
+    /// `zlayer --host-network` CLI flag.
+    host_network: bool,
     /// Optional local registry for sharing built images between pipeline stages
     #[cfg(feature = "local-registry")]
     local_registry: Option<Arc<LocalRegistry>>,
@@ -146,6 +151,7 @@ impl PipelineExecutor {
             backend_cache: Arc::new(Mutex::new(HashMap::new())),
             fail_fast: true,
             push_enabled,
+            host_network: false,
             #[cfg(feature = "local-registry")]
             local_registry: None,
         }
@@ -178,6 +184,7 @@ impl PipelineExecutor {
             backend_cache: Arc::new(Mutex::new(HashMap::new())),
             fail_fast: true,
             push_enabled,
+            host_network: false,
             #[cfg(feature = "local-registry")]
             local_registry: None,
         }
@@ -201,6 +208,16 @@ impl PipelineExecutor {
     #[must_use]
     pub fn push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;
+        self
+    }
+
+    /// Force `--net=host` on every `buildah run` for every image in this
+    /// pipeline. Forwarded to each [`ImageBuilder`] via
+    /// [`ImageBuilder::with_host_network`]. Mirrors the top-level
+    /// `zlayer --host-network` CLI flag.
+    #[must_use]
+    pub fn with_host_network(mut self, on: bool) -> Self {
+        self.host_network = on;
         self
     }
 
@@ -410,6 +427,7 @@ impl PipelineExecutor {
         let executor = self.executor.clone();
         let explicit_backend = self.backend.clone();
         let backend_cache = Arc::clone(&self.backend_cache);
+        let host_network = self.host_network;
 
         // Extract local registry root path (if configured) so spawned tasks
         // can create their own LocalRegistry handles pointing at the same store.
@@ -439,6 +457,7 @@ impl PipelineExecutor {
                     explicit_backend,
                     &backend_cache,
                     registry_root.as_deref(),
+                    host_network,
                 )
                 .await;
                 (name, result)
@@ -614,6 +633,7 @@ async fn build_one_image(
     explicit_backend: Option<Arc<dyn BuildBackend>>,
     backend_cache: &Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>>,
     registry_root: Option<&Path>,
+    host_network: bool,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];
     let platforms = effective_platforms(image_config, &pipeline.defaults);
@@ -638,6 +658,7 @@ async fn build_one_image(
                 Some(backend),
                 None,
                 registry_root,
+                host_network,
             )
             .await
         }
@@ -652,6 +673,7 @@ async fn build_one_image(
                 Some(backend),
                 Some(&platform),
                 registry_root,
+                host_network,
             )
             .await
         }
@@ -665,6 +687,7 @@ async fn build_one_image(
                 Some(backend),
                 &platforms,
                 registry_root,
+                host_network,
             )
             .await
         }
@@ -799,6 +822,7 @@ async fn check_cached_image_hash(
 /// When `platform` is `Some`, the builder is configured for that specific
 /// platform (e.g. `"linux/arm64"`), enabling cross-architecture builds.
 #[cfg_attr(not(feature = "local-registry"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn build_single_image(
     name: &str,
     pipeline: &ZPipeline,
@@ -807,6 +831,7 @@ async fn build_single_image(
     backend: Option<Arc<dyn BuildBackend>>,
     platform: Option<&str>,
     registry_root: Option<&Path>,
+    host_network: bool,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];
     let context = base_dir.join(&image_config.context);
@@ -850,6 +875,19 @@ async fn build_single_image(
     // Determine if this is a ZImagefile or Dockerfile based on extension/name
     builder = apply_build_file(builder, &file_path);
 
+    // Expand pipeline `${VAR}` references in the ZImagefile body (base:/run:),
+    // so a single ZImagefile set parametrizes across variants (e.g. the Windows
+    // `--set LTSC=...` lines). No-op for Dockerfiles and for empty vars.
+    builder = builder.pipeline_vars(pipeline.vars.clone());
+
+    // Forward the `LTSC` pipeline var to the Windows backend so FROM-image
+    // rewrites pick the correct prebuilt (`ltsc2022` vs `ltsc2025`). We only
+    // set it when the pipeline actually declares LTSC so non-Windows builds
+    // don't carry a meaningless field.
+    if let Some(ltsc) = pipeline.vars.get("LTSC") {
+        builder = builder.windows_ltsc(ltsc.clone());
+    }
+
     // Pass the source hash so the sandbox builder stores it for future cache checks
     if let Some(hash) = file_hash {
         builder = builder.source_hash(hash);
@@ -868,6 +906,10 @@ async fn build_single_image(
 
     // Apply shared pipeline config (build_args, format, no_cache, cache_mounts, retries)
     builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
+
+    // Forward the pipeline-wide `--host-network` flag (from `zlayer
+    // --host-network pipeline ...`).
+    builder = builder.with_host_network(host_network);
 
     // Wire up local registry so this build can resolve images from earlier waves
     #[cfg(feature = "local-registry")]
@@ -890,6 +932,7 @@ async fn build_single_image(
 /// cross-arch builds), then a buildah manifest list is created that
 /// references all per-platform images.
 #[cfg_attr(not(feature = "local-registry"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn build_multiplatform_image(
     name: &str,
     pipeline: &ZPipeline,
@@ -898,6 +941,7 @@ async fn build_multiplatform_image(
     backend: Option<Arc<dyn BuildBackend>>,
     platforms: &[String],
     registry_root: Option<&Path>,
+    host_network: bool,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];
     let start_time = std::time::Instant::now();
@@ -943,6 +987,16 @@ async fn build_multiplatform_image(
         // Determine file type (same detection as build_single_image)
         builder = apply_build_file(builder, &file_path);
 
+        // Expand pipeline `${VAR}` refs in the ZImagefile body (see build_single_image).
+        builder = builder.pipeline_vars(pipeline.vars.clone());
+
+        // Forward the `LTSC` pipeline var to the Windows backend (see
+        // build_single_image for the rationale). Only set when actually
+        // declared so non-Windows multi-platform builds aren't polluted.
+        if let Some(ltsc) = pipeline.vars.get("LTSC") {
+            builder = builder.windows_ltsc(ltsc.clone());
+        }
+
         // Set platform
         builder = builder.platform(platform);
 
@@ -953,6 +1007,10 @@ async fn build_multiplatform_image(
 
         // Apply shared config (build_args, format, no_cache, cache_mounts, retries)
         builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
+
+        // Forward the pipeline-wide `--host-network` flag (from `zlayer
+        // --host-network pipeline ...`).
+        builder = builder.with_host_network(host_network);
 
         // Wire up local registry so this build can resolve images from earlier waves
         #[cfg(feature = "local-registry")]
@@ -1601,6 +1659,7 @@ images:
             None, // no explicit override — exercise per-target_os routing
             &cache,
             None,
+            false,
         )
         .await;
         assert!(
@@ -1619,6 +1678,7 @@ images:
             None,
             &cache,
             None,
+            false,
         )
         .await;
         let err = win_res.unwrap_err();

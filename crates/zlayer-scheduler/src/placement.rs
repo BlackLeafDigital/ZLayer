@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use zlayer_spec::{GpuSharingMode, NodeMode, NodeSelector, ServiceSpec};
+use zlayer_spec::{GpuSharingMode, GroupAffinity, NodeMode, NodeSelector, ServiceSpec};
 
 use crate::error::{Result, SchedulerError};
 use crate::raft::NodeId;
@@ -365,6 +365,9 @@ pub struct PlacementDecision {
     pub reason: PlacementReason,
     /// GPU indices allocated on the target node (empty if no GPUs requested)
     pub gpu_indices: Vec<u32>,
+    /// Role within the service this container belongs to. Defaults to
+    /// `"default"` for services without `replica_groups`.
+    pub role: String,
 }
 
 impl PlacementDecision {
@@ -458,6 +461,19 @@ impl PlacementState {
         self.containers_on_node(node_id).len()
     }
 
+    /// Count containers belonging to a specific service on a node.
+    ///
+    /// Used for same-service anti-affinity (`GroupAffinity::Spread`): the
+    /// scheduler prefers the node hosting the fewest replicas of *this*
+    /// service, independent of unrelated workloads sharing the node.
+    #[must_use]
+    pub fn service_count_on_node(&self, node_id: NodeId, service_name: &str) -> usize {
+        self.containers_on_node(node_id)
+            .iter()
+            .filter(|c| c.service == service_name)
+            .count()
+    }
+
     /// Remove all container placements from a specific node.
     ///
     /// Returns the list of containers that were removed. This is used during
@@ -499,6 +515,41 @@ impl PlacementState {
 
         removed
     }
+}
+
+/// Whether `node` has enough remaining CPU/memory headroom for `spec`'s
+/// requests. A node reporting zero total CPU/memory is a legacy agent that
+/// never advertised its specs -- treated as a wildcard (always fits) so a
+/// rolling upgrade doesn't strand it (mirrors the os/arch legacy handling).
+#[must_use]
+fn node_has_capacity(node: &NodeState, spec: &ServiceSpec) -> bool {
+    let req_cpu = spec.resources.cpu.unwrap_or(0.0);
+    if req_cpu > 0.0 && node.resources.cpu_total > 0.0 && node.resources.cpu_available() < req_cpu {
+        debug!(
+            node = %node.id,
+            req_cpu,
+            cpu_available = node.resources.cpu_available(),
+            "Node rejected: insufficient CPU"
+        );
+        return false;
+    }
+    let req_mem = spec
+        .resources
+        .memory
+        .as_deref()
+        .and_then(zlayer_spec::validate::memory_string_to_bytes)
+        .unwrap_or(0);
+    if req_mem > 0 && node.resources.memory_total > 0 && node.resources.memory_available() < req_mem
+    {
+        debug!(
+            node = %node.id,
+            req_mem,
+            memory_available = node.resources.memory_available(),
+            "Node rejected: insufficient memory"
+        );
+        return false;
+    }
+    true
 }
 
 /// Check if a node can accept a service based on `node_mode`, constraints, and resource availability
@@ -617,9 +668,9 @@ pub fn can_place_on_node(
     // Check based on node mode
     match node_mode {
         NodeMode::Shared => {
-            // In shared mode, check if node has capacity
-            // For now, just check if node is healthy (resource checking can be added)
-            true
+            // In shared mode the node may co-host workloads, so honor the
+            // request's CPU/memory against this node's remaining capacity.
+            service_spec.is_none_or(|spec| node_has_capacity(node, spec))
         }
         NodeMode::Dedicated => {
             // In dedicated mode, check if node has no containers from THIS service
@@ -655,10 +706,111 @@ fn no_suitable_node_reason(
             return format!("no agent matches required platform {target}");
         }
     }
+    // Capacity diagnosis: if a CPU/memory request is set and no node that
+    // reports its specs has enough remaining headroom, say so explicitly.
+    let req_cpu = service_spec.resources.cpu.unwrap_or(0.0);
+    let req_mem = service_spec
+        .resources
+        .memory
+        .as_deref()
+        .and_then(zlayer_spec::validate::memory_string_to_bytes)
+        .unwrap_or(0);
+    if req_cpu > 0.0 || req_mem > 0 {
+        let any_capacity = nodes.iter().any(|n| {
+            let cpu_ok = req_cpu <= 0.0
+                || n.resources.cpu_total <= 0.0
+                || n.resources.cpu_available() >= req_cpu;
+            let mem_ok = req_mem == 0
+                || n.resources.memory_total == 0
+                || n.resources.memory_available() >= req_mem;
+            cpu_ok && mem_ok
+        });
+        if !any_capacity {
+            return format!(
+                "no agent has sufficient capacity (requested cpu {req_cpu}, memory {req_mem} bytes)"
+            );
+        }
+    }
     format!(
         "No node available for service '{}' with mode {:?}",
         service_name, service_spec.node_mode
     )
+}
+
+/// Pick a node for a single one-off container described by `spec`.
+///
+/// Reuses [`can_place_on_node`] (platform + `node_selector` labels + Shared-mode
+/// CPU/memory capacity) to filter candidates, then [`select_for_bin_packing`]
+/// to rank survivors (preferred-label affinity, then least-utilized). Returns
+/// the chosen [`NodeId`], or `None` when no Ready node satisfies the
+/// constraints. `nodes` is the Ready node set (e.g. from the leader's cluster
+/// state); placement is stateless because a one-off container carries no
+/// prior placement history.
+#[must_use]
+pub fn place_single_container(spec: &ServiceSpec, nodes: &[NodeState]) -> Option<NodeId> {
+    let placements = PlacementState::new();
+    let candidates: Vec<&NodeState> = nodes
+        .iter()
+        .filter(|n| {
+            can_place_on_node(
+                n,
+                "",
+                spec.node_mode,
+                spec.node_selector.as_ref(),
+                &placements,
+                Some(spec),
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let affinity = spec.affinity.clone().unwrap_or(GroupAffinity::Pack);
+    Some(
+        select_for_bin_packing(
+            "",
+            &candidates,
+            &placements,
+            spec.node_selector.as_ref(),
+            Some(spec),
+            &affinity,
+        )
+        .id,
+    )
+}
+
+/// Reserve a placed replica's CPU/memory (and GPU) on `node_id` within the
+/// current scheduling pass.
+///
+/// Consuming CPU/memory here is what makes `node_has_capacity` see reduced
+/// headroom for the *next* replica, so a service whose replicas don't fit
+/// together spreads instead of piling onto one node. Returns the allocated GPU
+/// indices (empty when no GPUs were requested). Resources are restored by
+/// [`gang_rollback`] on an all-or-nothing failure.
+fn reserve_node_resources(
+    nodes: &mut [NodeState],
+    node_id: NodeId,
+    req_cpu: f64,
+    req_mem: u64,
+    gpu_count: u32,
+    gpu_sharing: Option<GpuSharingMode>,
+) -> Vec<u32> {
+    let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) else {
+        return Vec::new();
+    };
+    if req_cpu > 0.0 {
+        node.resources.cpu_used += req_cpu;
+    }
+    if req_mem > 0 {
+        node.resources.memory_used = node.resources.memory_used.saturating_add(req_mem);
+    }
+    if gpu_count > 0 {
+        node.resources
+            .allocate_gpus(gpu_count, gpu_sharing)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Place replicas of a service according to its `node_mode`
@@ -684,6 +836,21 @@ pub fn place_service_replicas(
     let gpu_count_requested = service_spec.resources.gpu.as_ref().map_or(0, |g| g.count);
     let gpu_sharing = service_spec.resources.gpu.as_ref().and_then(|g| g.sharing);
 
+    // Effective placement affinity. `None` means "use the historical default"
+    // (concentrate / bin-pack), so it resolves to `Pack`.
+    let affinity = service_spec.affinity.clone().unwrap_or(GroupAffinity::Pack);
+
+    // Per-replica CPU/memory request, consumed on each chosen node as we go so
+    // successive replicas in this pass see reduced headroom (and restored on a
+    // gang rollback).
+    let req_cpu = service_spec.resources.cpu.unwrap_or(0.0).max(0.0);
+    let req_mem = service_spec
+        .resources
+        .memory
+        .as_deref()
+        .and_then(zlayer_spec::validate::memory_string_to_bytes)
+        .unwrap_or(0);
+
     for replica in 0..replicas {
         let container_id = ContainerId::new(service_name, replica);
 
@@ -700,6 +867,13 @@ pub fn place_service_replicas(
                     Some(service_spec),
                 )
             })
+            // `Pin` restricts placement to the single node named by the
+            // selector ("id=N" or "label=value"); other affinities don't
+            // filter here (they only influence node ranking below).
+            .filter(|n| match &affinity {
+                GroupAffinity::Pin(selector) => node_matches_pin(n, selector),
+                GroupAffinity::Spread | GroupAffinity::Pack => true,
+            })
             .collect();
 
         if suitable_nodes.is_empty() {
@@ -710,6 +884,7 @@ pub fn place_service_replicas(
                     reason: no_suitable_node_reason(service_name, service_spec, nodes),
                 },
                 gpu_indices: Vec::new(),
+                role: "default".to_string(),
             });
             continue;
         }
@@ -720,9 +895,12 @@ pub fn place_service_replicas(
                 // Prefer nodes with lowest utilization (bin-packing)
                 // Also consider preferred labels and GPU availability
                 select_for_bin_packing(
+                    service_name,
                     &suitable_nodes,
+                    placements,
                     service_spec.node_selector.as_ref(),
                     Some(service_spec),
+                    &affinity,
                 )
             }
             NodeMode::Dedicated | NodeMode::Exclusive => {
@@ -746,32 +924,53 @@ pub fn place_service_replicas(
             NodeMode::Exclusive => PlacementReason::ExclusiveNode,
         };
 
-        // Record the placement
+        // Record the placement and reserve its resources on the chosen node so
+        // the next replica in this same pass sees the reduced headroom.
         placements.place(container_id.clone(), selected_id);
-
-        // Allocate specific GPU indices on the selected node
-        let gpu_indices = if gpu_count_requested > 0 {
-            if let Some(node) = nodes.iter_mut().find(|n| n.id == selected_id) {
-                node.resources
-                    .allocate_gpus(gpu_count_requested, gpu_sharing)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+        let gpu_indices = reserve_node_resources(
+            nodes,
+            selected_id,
+            req_cpu,
+            req_mem,
+            gpu_count_requested,
+            gpu_sharing,
+        );
 
         decisions.push(PlacementDecision {
             container_id,
             node_id: Some(selected_id),
             reason,
             gpu_indices,
+            role: "default".to_string(),
         });
     }
 
-    // Gang scheduling: all-or-nothing. If any replica failed to place,
-    // roll back all placements and return all-failed decisions.
+    finalize_gang(
+        service_spec,
+        service_name,
+        replicas,
+        decisions,
+        nodes,
+        placements,
+        req_cpu,
+        req_mem,
+    )
+}
+
+/// Apply gang-scheduling (all-or-nothing) semantics to a completed placement
+/// pass: if the service requested GPU `Gang` scheduling and any replica failed
+/// to place, roll everything back; otherwise return the decisions unchanged.
+#[allow(clippy::too_many_arguments)]
+fn finalize_gang(
+    service_spec: &ServiceSpec,
+    service_name: &str,
+    replicas: u32,
+    decisions: Vec<PlacementDecision>,
+    nodes: &mut [NodeState],
+    placements: &mut PlacementState,
+    req_cpu: f64,
+    req_mem: u64,
+) -> Vec<PlacementDecision> {
     let is_gang = service_spec
         .resources
         .gpu
@@ -780,10 +979,86 @@ pub fn place_service_replicas(
         == Some(zlayer_spec::SchedulingPolicy::Gang);
 
     if is_gang && decisions.iter().any(|d| d.node_id.is_none()) {
-        return gang_rollback(service_name, replicas, &decisions, nodes, placements);
+        return gang_rollback(
+            service_name,
+            replicas,
+            &decisions,
+            nodes,
+            placements,
+            req_cpu,
+            req_mem,
+        );
     }
 
     decisions
+}
+
+/// Place a service's replica groups, returning one `Vec<PlacementDecision>`
+/// flattened across all groups.
+///
+/// Each group is placed independently with its own effective `ServiceSpec`
+/// (group overrides merged onto the base service spec). Cross-group
+/// anti-affinity is not enforced in Phase 2.2 — the placement state's
+/// `container_count` tie-breaks naturally favors spreading.
+///
+/// # Arguments
+/// * `service_name` - Service name (used for `ContainerId` construction).
+/// * `service_spec` - Base `ServiceSpec`; provides defaults for groups
+///   that don't override.
+/// * `groups` - The non-empty `replica_groups` from the spec.
+/// * `nodes` - Cluster nodes (mutated for GPU allocation tracking).
+/// * `placements` - Placement state (mutated as containers are placed).
+///
+/// # Returns
+/// One `PlacementDecision` per replica across all groups, with `role`
+/// populated. The flat `Vec` preserves group declaration order.
+pub fn place_service_with_groups(
+    service_name: &str,
+    service_spec: &ServiceSpec,
+    groups: &[zlayer_types::spec::types::ReplicaGroup],
+    nodes: &mut [NodeState],
+    placements: &mut PlacementState,
+) -> Vec<PlacementDecision> {
+    let mut decisions = Vec::new();
+    for group in groups {
+        let effective = effective_spec_for_group(service_spec, group);
+        let group_decisions =
+            place_service_replicas(service_name, &effective, group.count, nodes, placements);
+        for mut d in group_decisions {
+            d.role.clone_from(&group.role);
+            decisions.push(d);
+        }
+    }
+    decisions
+}
+
+/// Merge a group's overrides onto the base service spec.
+///
+/// Fields with `None` group overrides inherit from the base. The `env`
+/// `HashMap` is merged with group entries winning on conflict.
+fn effective_spec_for_group(
+    base: &ServiceSpec,
+    group: &zlayer_types::spec::types::ReplicaGroup,
+) -> ServiceSpec {
+    let mut effective = base.clone();
+    if let Some(image) = &group.image {
+        effective.image = image.clone();
+    }
+    if let Some(command) = &group.command {
+        effective.command = command.clone();
+    }
+    if let Some(resources) = &group.resources {
+        effective.resources = resources.clone();
+    }
+    // env: merge group entries on top of base.
+    for (k, v) in &group.env {
+        effective.env.insert(k.clone(), v.clone());
+    }
+    // Each group carries its own affinity hint. Surface it as the effective
+    // service-level affinity so `place_service_replicas` honours it (Spread is
+    // the documented group default; previously it was silently ignored).
+    effective.affinity = Some(group.affinity.clone());
+    effective
 }
 
 /// Roll back a failed gang-scheduled placement.
@@ -797,6 +1072,8 @@ fn gang_rollback(
     decisions: &[PlacementDecision],
     nodes: &mut [NodeState],
     placements: &mut PlacementState,
+    req_cpu: f64,
+    req_mem: u64,
 ) -> Vec<PlacementDecision> {
     let placed_count = decisions.iter().filter(|d| d.node_id.is_some()).count();
     debug!(
@@ -806,10 +1083,16 @@ fn gang_rollback(
         "Gang scheduling failed: could not place all replicas, rolling back"
     );
 
-    // Roll back: remove placements and free GPU allocations
+    // Roll back: remove placements and free GPU + CPU/memory allocations
     for decision in decisions {
         if let Some(node_id) = decision.node_id {
             placements.remove_service_from_node(node_id, service_name);
+            if req_cpu > 0.0 || req_mem > 0 {
+                if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
+                    node.resources.cpu_used = (node.resources.cpu_used - req_cpu).max(0.0);
+                    node.resources.memory_used = node.resources.memory_used.saturating_sub(req_mem);
+                }
+            }
             if !decision.gpu_indices.is_empty() {
                 if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
                     for &idx in &decision.gpu_indices {
@@ -849,6 +1132,7 @@ fn gang_rollback(
                     "Gang scheduling: could not place all {replicas} replicas of '{service_name}'"
                 ),
             },
+            role: "default".to_string(),
         })
         .collect()
 }
@@ -859,9 +1143,12 @@ fn gang_rollback(
 /// with a 30% weight. Non-GPU workloads are scored purely on label preference
 /// and CPU/memory utilization as before.
 fn select_for_bin_packing<'a>(
+    service_name: &str,
     nodes: &[&'a NodeState],
+    placements: &PlacementState,
     node_selector: Option<&NodeSelector>,
     service_spec: Option<&ServiceSpec>,
+    affinity: &GroupAffinity,
 ) -> &'a NodeState {
     let wants_gpu = service_spec
         .and_then(|s| s.resources.gpu.as_ref())
@@ -921,17 +1208,80 @@ fn select_for_bin_packing<'a>(
                             .partial_cmp(&b_combined)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     } else {
-                        // Non-GPU: by utilization (lower is better for bin-packing)
-                        // Note: we're using max_by, so we reverse the comparison
-                        b.utilization()
-                            .partial_cmp(&a.utilization())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        // Non-GPU ranking. `max_by` selects the "greater" node.
+                        match affinity {
+                            GroupAffinity::Spread => {
+                                // Same-service anti-affinity is the PRIMARY key,
+                                // NOT a tiebreak under utilization. A spread spec
+                                // commonly requests zero CPU/mem, so the
+                                // per-replica reservation in
+                                // `place_service_replicas` never moves
+                                // utilization; and on a real cluster nodes sit at
+                                // slightly different utilization, so utilizations
+                                // are essentially never exactly equal. If we
+                                // ranked by utilization first (tiebreaking on
+                                // replica count), every replica would pile onto
+                                // the single lowest-utilization node and the
+                                // anti-affinity tiebreak would never fire. So
+                                // rank by FEWER replicas of THIS service first,
+                                // breaking ties with the emptier node. (`b vs a`
+                                // everywhere so the lower value wins under
+                                // `max_by`.)
+                                let a_count = placements.service_count_on_node(a.id, service_name);
+                                let b_count = placements.service_count_on_node(b.id, service_name);
+                                match b_count.cmp(&a_count) {
+                                    std::cmp::Ordering::Equal => b
+                                        .utilization()
+                                        .partial_cmp(&a.utilization())
+                                        .unwrap_or(std::cmp::Ordering::Equal),
+                                    other => other,
+                                }
+                            }
+                            GroupAffinity::Pack | GroupAffinity::Pin(_) => {
+                                // Concentrate (best-fit): prefer the FULLER node
+                                // that still fits, so one node is filled before
+                                // the next is touched. Break utilization ties
+                                // (e.g. zero-resource specs) by packing onto the
+                                // node that already holds MORE containers.
+                                let util_cmp = a
+                                    .utilization()
+                                    .partial_cmp(&b.utilization())
+                                    .unwrap_or(std::cmp::Ordering::Equal);
+                                match util_cmp {
+                                    std::cmp::Ordering::Equal => {
+                                        let a_count = placements.container_count(a.id);
+                                        let b_count = placements.container_count(b.id);
+                                        a_count.cmp(&b_count)
+                                    }
+                                    other => other,
+                                }
+                            }
+                        }
                     }
                 }
                 other => other,
             }
         })
         .expect("nodes should not be empty")
+}
+
+/// Whether `node` matches a `GroupAffinity::Pin` selector.
+///
+/// Accepted selector forms:
+/// - `"id=N"` — exact node id match (e.g. `"id=2"`).
+/// - `"key=value"` — node label match (e.g. `"zone=us-east-1a"`).
+///
+/// A malformed selector (no `=`) matches nothing, so a pinned service with a
+/// bad selector fails placement loudly rather than scattering silently.
+fn node_matches_pin(node: &NodeState, selector: &str) -> bool {
+    let Some((key, value)) = selector.split_once('=') else {
+        return false;
+    };
+    let (key, value) = (key.trim(), value.trim());
+    if key == "id" {
+        return value.parse::<NodeId>().is_ok_and(|id| node.id == id);
+    }
+    node.labels.get(key).map(String::as_str) == Some(value)
 }
 
 /// Select a node for isolation (dedicated/exclusive mode)
@@ -1047,19 +1397,11 @@ mod tests {
 
     fn make_service_spec(node_mode: NodeMode, node_selector: Option<NodeSelector>) -> ServiceSpec {
         ServiceSpec {
-            rtype: zlayer_spec::ResourceType::Service,
-            schedule: None,
             image: ImageSpec {
                 name: "test:latest".parse().expect("valid image reference"),
                 pull_policy: PullPolicy::IfNotPresent,
+                source_policy: None,
             },
-            resources: zlayer_spec::ResourcesSpec::default(),
-            env: HashMap::default(),
-            command: zlayer_spec::CommandSpec::default(),
-            network: zlayer_spec::ServiceNetworkSpec::default(),
-            endpoints: vec![],
-            scale: zlayer_spec::ScaleSpec::default(),
-            depends: vec![],
             health: zlayer_spec::HealthSpec {
                 start_grace: None,
                 interval: None,
@@ -1067,44 +1409,9 @@ mod tests {
                 retries: 3,
                 check: zlayer_spec::HealthCheck::Tcp { port: 8080 },
             },
-            init: zlayer_spec::InitSpec::default(),
-            errors: zlayer_spec::ErrorsSpec::default(),
-            lifecycle: zlayer_spec::LifecycleSpec::default(),
-            devices: vec![],
-            storage: vec![],
-            port_mappings: vec![],
-            capabilities: vec![],
-            cap_drop: vec![],
-            privileged: false,
             node_mode,
             node_selector,
-            service_type: zlayer_spec::ServiceType::default(),
-            wasm: None,
-            logs: None,
-            host_network: false,
-            hostname: None,
-            dns: Vec::new(),
-            extra_hosts: Vec::new(),
-            restart_policy: None,
-            platform: None,
-            labels: HashMap::new(),
-            user: None,
-            stop_signal: None,
-            stop_grace_period: None,
-            sysctls: HashMap::new(),
-            ulimits: HashMap::new(),
-            security_opt: Vec::new(),
-            pid_mode: None,
-            ipc_mode: None,
-            network_mode: zlayer_spec::NetworkMode::default(),
-            extra_groups: Vec::new(),
-            read_only_root_fs: false,
-            init_container: None,
-            tty: false,
-            stdin_open: false,
-            userns_mode: None,
-            cgroup_parent: None,
-            expose: Vec::new(),
+            ..ServiceSpec::default()
         }
     }
 
@@ -1329,6 +1636,50 @@ mod tests {
 
         assert_eq!(decisions.len(), 3);
         assert!(decisions.iter().all(PlacementDecision::is_success));
+    }
+
+    #[test]
+    fn test_place_service_with_groups() {
+        use zlayer_types::spec::types::{GroupAffinity, ReplicaGroup};
+        let groups = vec![
+            ReplicaGroup {
+                role: "primary".to_string(),
+                count: 1,
+                image: None,
+                env: HashMap::default(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::Spread,
+            },
+            ReplicaGroup {
+                role: "read".to_string(),
+                count: 2,
+                image: None,
+                env: HashMap::default(),
+                command: None,
+                resources: None,
+                affinity: GroupAffinity::Spread,
+            },
+        ];
+        let mut nodes = vec![
+            make_node(1, "192.168.1.1:8000"),
+            make_node(2, "192.168.1.2:8000"),
+            make_node(3, "192.168.1.3:8000"),
+        ];
+        let mut placements = PlacementState::new();
+        let spec = make_service_spec(NodeMode::Shared, None);
+
+        let decisions =
+            place_service_with_groups("db", &spec, &groups, &mut nodes, &mut placements);
+
+        assert_eq!(decisions.len(), 3, "1 primary + 2 read = 3");
+        let primary: Vec<_> = decisions.iter().filter(|d| d.role == "primary").collect();
+        let read: Vec<_> = decisions.iter().filter(|d| d.role == "read").collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(read.len(), 2);
+        for d in &decisions {
+            assert!(d.node_id.is_some(), "all replicas should land on a node");
+        }
     }
 
     #[test]
@@ -1595,6 +1946,10 @@ mod tests {
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
         spec
     }
@@ -1862,6 +2217,10 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("gpu-gang", &spec, 3, &mut nodes, &mut placements);
@@ -1895,6 +2254,10 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("gpu-gang", &spec, 4, &mut nodes, &mut placements);
@@ -1934,11 +2297,140 @@ mod tests {
             scheduling: Some(zlayer_spec::SchedulingPolicy::Spread),
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
 
         let decisions = place_service_replicas("spread-svc", &spec, 1, &mut nodes, &mut placements);
 
         // Should prefer node2 (less GPU availability) to spread the workload
         assert_eq!(decisions[0].node_id, Some(2));
+    }
+
+    // -- System-spec-aware (CPU/memory) placement -----------------------------
+
+    fn node_with_capacity(id: NodeId, cpu_total: f64, cpu_used: f64, mem_total: u64) -> NodeState {
+        let mut res = NodeResources::new(cpu_total, mem_total);
+        res.cpu_used = cpu_used;
+        NodeState::new(id, format!("10.0.0.{id}:3669")).with_resources(res)
+    }
+
+    #[test]
+    fn shared_mode_rejects_node_without_cpu_headroom() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(1.0);
+        // 2 total, 2 used -> 0 available.
+        let node = node_with_capacity(1, 2.0, 2.0, 8 * 1024 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(!can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_rejects_node_without_memory_headroom() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.memory = Some("512Mi".to_string());
+        // 256Mi total -> request of 512Mi cannot fit.
+        let node = node_with_capacity(1, 8.0, 0.0, 256 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(!can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_accepts_when_capacity_fits() {
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(1.0);
+        spec.resources.memory = Some("512Mi".to_string());
+        let node = node_with_capacity(1, 4.0, 1.0, 8 * 1024 * 1024 * 1024);
+        let placements = PlacementState::new();
+        assert!(can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    #[test]
+    fn shared_mode_zero_total_capacity_is_wildcard() {
+        // Legacy node that never reported specs (cpu_total/mem_total == 0) must
+        // not be rejected on capacity grounds.
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.cpu = Some(64.0);
+        spec.resources.memory = Some("1Ti".to_string());
+        let node = make_node(1, "10.0.0.1:3669"); // default resources == 0
+        let placements = PlacementState::new();
+        assert!(can_place_on_node(
+            &node,
+            "svc",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec)
+        ));
+    }
+
+    // -- Single-container placement -------------------------------------------
+
+    #[test]
+    fn place_single_container_picks_matching_platform() {
+        let nodes = vec![
+            make_node_with_platform(1, zlayer_spec::OsKind::Linux, zlayer_spec::ArchKind::Amd64),
+            make_node_with_platform(2, zlayer_spec::OsKind::Macos, zlayer_spec::ArchKind::Arm64),
+        ];
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Macos,
+            zlayer_spec::ArchKind::Arm64,
+        ));
+        assert_eq!(place_single_container(&spec, &nodes), Some(2));
+    }
+
+    #[test]
+    fn place_single_container_none_when_no_node_matches() {
+        let nodes = vec![make_node_with_platform(
+            1,
+            zlayer_spec::OsKind::Linux,
+            zlayer_spec::ArchKind::Amd64,
+        )];
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Macos,
+            zlayer_spec::ArchKind::Arm64,
+        ));
+        assert_eq!(place_single_container(&spec, &nodes), None);
+    }
+
+    #[test]
+    fn place_single_container_honors_node_selector_labels() {
+        let nodes = vec![
+            make_node(1, "10.0.0.1:3669").with_label("zone", "a"),
+            make_node(2, "10.0.0.2:3669").with_label("zone", "b"),
+        ];
+        let selector = NodeSelector {
+            labels: [("zone".to_string(), "b".to_string())]
+                .into_iter()
+                .collect(),
+            prefer_labels: HashMap::new(),
+        };
+        let spec = make_service_spec(NodeMode::Shared, Some(selector));
+        assert_eq!(place_single_container(&spec, &nodes), Some(2));
     }
 }

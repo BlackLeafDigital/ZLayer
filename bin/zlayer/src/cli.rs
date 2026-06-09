@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::ui::consent::ConsentMode;
@@ -110,6 +111,18 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) host_network: bool,
 
+    /// Daemon instance name. When set, scopes per-daemon resources (HCS
+    /// owner tag, HCN overlay network name, systemd unit, SCM service
+    /// name, install paths) so multiple `zlayer` daemons can run
+    /// side-by-side on one host. Defaults to the basename of the running
+    /// binary (`current_exe()` filename, with a `.exe` suffix stripped on
+    /// Windows), with a final fallback to `"zlayer"`. This is the single
+    /// source of truth for the daemon's identity at runtime — `daemon
+    /// install` / `serve` / `status` all consult it via
+    /// [`resolve_daemon_name`].
+    #[arg(long, global = true)]
+    pub(crate) daemon_name: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -164,9 +177,12 @@ pub(crate) enum RuntimeType {
     /// macOS sandbox runtime (uses Apple sandbox framework)
     #[cfg(target_os = "macos")]
     MacSandbox,
-    /// macOS VM runtime (uses Virtualization.framework)
+    /// macOS libkrun micro-VM runtime (Linux guests via Hypervisor.framework)
     #[cfg(target_os = "macos")]
     MacVm,
+    /// macOS Apple-Virtualization runtime (ephemeral native-macOS guest VMs)
+    #[cfg(target_os = "macos")]
+    MacVz,
 }
 
 /// Shared flag group controlling WSL2 auto-install consent.
@@ -289,6 +305,45 @@ pub(crate) enum Commands {
         /// WSL2 auto-install consent (Windows only).
         #[command(flatten)]
         install_wsl: InstallWslArgs,
+    },
+
+    /// Run this host as a worker-tier worker node.
+    ///
+    /// Joins a remote control plane via gRPC, registers via a bootstrap
+    /// token + locally-generated mTLS CSR, then long-polls assignments.
+    /// Does not run an API server or raft.
+    ///
+    /// Examples:
+    ///   zlayer worker --server <http://leader1:3670> --token-file /etc/zlayer/worker.token
+    ///   zlayer worker -s <http://10.0.0.1:3670> -s <http://10.0.0.2:3670> --token $TOK \
+    ///                  --labels region=us-east,tier=edge
+    #[command(verbatim_doc_comment)]
+    Worker {
+        /// Control-plane gRPC endpoint (specify multiple times for HA).
+        #[arg(short = 's', long, required = true)]
+        server: Vec<String>,
+
+        /// Bootstrap token. Conflicts with --token-file.
+        #[arg(long, conflicts_with = "token_file")]
+        token: Option<String>,
+
+        /// Path to a file containing the bootstrap token. Conflicts with --token.
+        #[arg(long, conflicts_with = "token")]
+        token_file: Option<String>,
+
+        /// Free-form labels as k=v,k=v (e.g. `region=us-east,tier=edge`).
+        #[arg(long, default_value = "")]
+        labels: String,
+
+        /// Directory to persist the worker's mTLS identity (cert.pem, key.pem,
+        /// ca.pem). Default: `<data_dir>/worker/identity/`.
+        #[arg(long)]
+        identity_dir: Option<PathBuf>,
+
+        /// Local API/health address advertised to the leader for in-cluster
+        /// reachability. Default: 0.0.0.0:3669.
+        #[arg(long, default_value = "0.0.0.0:3669")]
+        api_addr: SocketAddr,
     },
 
     /// List running deployments, services, and containers
@@ -471,6 +526,15 @@ pub(crate) enum Commands {
         /// On non-macOS platforms this flag is accepted but has no effect.
         #[arg(long)]
         update_bottles: bool,
+
+        /// Build backend to use. Auto-detected if omitted.
+        ///
+        /// One of: `buildah-cli`, `buildah-sidecar`, `sandbox`, `hcs`.
+        /// Stage 4 of the buildah-sidecar plan flips the Linux default from
+        /// `buildah-cli` to `buildah-sidecar`; until then, omitting this flag keeps
+        /// the legacy CLI shellout behavior.
+        #[arg(long, value_name = "BACKEND")]
+        backend: Option<String>,
     },
 
     /// Build multiple images from a pipeline manifest
@@ -531,6 +595,52 @@ pub(crate) enum Commands {
     Pull {
         /// Image reference. If omitted, pulls every image from the auto-discovered spec.
         image: Option<String>,
+
+        /// Registry username for authenticated pulls. Falls back to
+        /// `ZLAYER_REGISTRY_USERNAME`, then anonymous.
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Registry password/token for authenticated pulls. Falls back to
+        /// `ZLAYER_REGISTRY_PASSWORD`, then anonymous.
+        #[arg(short = 'p', long)]
+        password: Option<String>,
+    },
+
+    /// Log in to a container registry (stores a credential in the daemon).
+    ///
+    /// Ergonomic wrapper over `zlayer credential registry add`. Prompts for any
+    /// omitted username/password. With `--zauth`, mints a bearer via a `ZAuth`
+    /// OIDC client-credentials exchange and stores it as a token credential.
+    ///
+    /// Examples:
+    ///   zlayer login ghcr.io --username me
+    ///   zlayer login registry.blackleafdigital.com --zauth
+    ///   zlayer login ghcr.io --username me --default
+    #[command(verbatim_doc_comment, display_order = 21)]
+    Login {
+        /// Container registry URL (e.g. `ghcr.io`, `docker.io`).
+        registry: String,
+
+        /// Registry username (prompted if omitted; ignored with `--zauth`).
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Registry password or token (prompted if omitted; ignored with `--zauth`).
+        #[arg(short = 'p', long)]
+        password: Option<String>,
+
+        /// Authentication type.
+        #[arg(long, value_enum, default_value_t = CliRegistryAuthType::Basic)]
+        auth_type: CliRegistryAuthType,
+
+        /// Persist this registry as the daemon's default (`ZLAYER_DEFAULT_REGISTRY`).
+        #[arg(long)]
+        default: bool,
+
+        /// Mint a bearer token via a `ZAuth` OIDC client-credentials exchange.
+        #[arg(long)]
+        zauth: bool,
     },
 
     /// Export an image to a tar file (OCI Image Layout)
@@ -591,6 +701,15 @@ pub(crate) enum Commands {
     /// Manage cluster nodes
     #[command(subcommand, display_order = 30)]
     Node(NodeCommands),
+
+    /// Cluster-level administration commands.
+    ///
+    /// In v0.12.0 these commands were promoted from `zlayer node <…>` to
+    /// their own top-level subgroup. The original `zlayer node <…>`
+    /// invocations still work and dispatch to the same handlers (with a
+    /// deprecation note in their `--help` output, see Wave 5B.5).
+    #[command(subcommand, display_order = 30)]
+    Cluster(ClusterCommands),
 
     /// Start the API server
     #[command(display_order = 31)]
@@ -694,21 +813,107 @@ pub(crate) enum Commands {
         #[clap(long, env = "ZLAYER_TUNNEL_TLS_KEY")]
         tunnel_tls_key: Option<std::path::PathBuf>,
 
+        /// Enable TLS on the daemon API listener by loading a static
+        /// certificate from disk. Requires `--api-tls-key`.
+        ///
+        /// When set, the daemon API binds HTTPS instead of HTTP. The
+        /// cert+key are loaded once at startup. Use `--api-tls-acme` for
+        /// hot-reloading ACME-managed certs instead.
+        #[clap(
+            long,
+            value_name = "PATH",
+            env = "ZLAYER_API_TLS_CERT",
+            requires = "api_tls_key",
+            conflicts_with = "api_tls_acme"
+        )]
+        api_tls_cert: Option<std::path::PathBuf>,
+
+        /// Private key paired with `--api-tls-cert`. PEM-encoded.
+        #[clap(
+            long,
+            value_name = "PATH",
+            env = "ZLAYER_API_TLS_KEY",
+            requires = "api_tls_cert",
+            conflicts_with = "api_tls_acme"
+        )]
+        api_tls_key: Option<std::path::PathBuf>,
+
+        /// Enable TLS on the daemon API listener using the proxy's
+        /// ACME-capable `CertManager`. The same cert pool the reverse proxy
+        /// uses for L7 routes will be served on the daemon API. Mutually
+        /// exclusive with `--api-tls-cert`/`--api-tls-key`.
+        #[clap(
+            long,
+            env = "ZLAYER_API_TLS_ACME",
+            conflicts_with_all = ["api_tls_cert", "api_tls_key"]
+        )]
+        api_tls_acme: bool,
+
         /// Disable the daemon-side tunnel server entirely. Endpoints under
         /// `POST /api/v1/tunnels/access/sessions` will return 503.
         #[clap(long, env = "ZLAYER_DISABLE_TUNNEL_SERVER")]
         no_tunnel_server: bool,
+
+        /// On clean shutdown, exit with code 75 (`EX_TEMPFAIL`) instead of 0, so
+        /// a supervisor (systemd `Restart=on-failure`, runit, etc.) respawns
+        /// the daemon. Used by `zlayer self-update`-driven cluster upgrades.
+        #[arg(long, env = "ZLAYER_RESTART_ON_EXIT")]
+        restart_on_exit: bool,
+
+        /// Wipe `{data_dir}/join_secret` at daemon startup so the HMAC key for
+        /// HS256-JWT join tokens is regenerated.
+        ///
+        /// Use this if you suspect the symmetric secret has leaked. Existing
+        /// HS256 tokens will fail to validate after vacuum (which is the point),
+        /// but new tokens can be issued immediately and the cluster keeps running.
+        /// Ed25519-signed tokens are unaffected.
+        #[clap(long, env = "ZLAYER_VACUUM_SECRETS")]
+        vacuum_secrets: bool,
+
+        /// Run the daemon in secrets-only mode: a lean HA secrets/RBAC service.
+        ///
+        /// Mounts ONLY the secrets-relevant API surface — `/health`, `/auth`,
+        /// `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`
+        /// — and skips every orchestration nest (deployments, services,
+        /// projects, sync, internal agent, tunnel, docker-compat, overlay
+        /// reconcile, container/image/volume/job/cron routes). The HA secrets
+        /// store selection is unchanged: a `{secrets_dir}/wrapped_dek.bin`
+        /// (written by `zlayer node join`) switches the store to
+        /// `RaftSecretsStore` automatically, so a clustered secrets-only node
+        /// serves secrets through Raft.
+        ///
+        /// This is the daemon mode behind the `zsecrets` HA deployment
+        /// (`secrets.blackleafdigital.com`).
+        #[clap(long, env = "ZLAYER_SECRETS_ONLY")]
+        secrets_only: bool,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on
     /// macOS, SCM on Windows).
-    #[command(subcommand, display_order = 32)]
-    Daemon(DaemonAction),
+    ///
+    /// Wraps [`DaemonAction`] alongside a global `--daemon-name` flag so the
+    /// same host can host multiple side-by-side zlayer daemons under
+    /// distinct names. See [`DaemonArgs`] for details.
+    #[command(display_order = 32)]
+    Daemon(DaemonArgs),
 
     /// Windows-only maintenance commands (WSL2 distro management)
     #[cfg(all(target_os = "windows", feature = "wsl"))]
     #[command(subcommand, display_order = 32)]
     Windows(WindowsCommands),
+
+    /// Internal runc-compatible runtime CLI used by `Wsl2DelegateRuntime`.
+    /// Hidden from top-level `--help` because it is not a user-facing
+    /// surface — operators interact with containers via `zlayer container`
+    /// and `zlayer image`, which talk to the daemon over UDS.
+    #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+    #[command(display_order = 32, hide = true)]
+    Runtime {
+        #[command(flatten)]
+        global: RuntimeGlobal,
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
 
     /// Tunnel management commands
     ///
@@ -751,54 +956,31 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 38)]
     Secret(SecretCommands),
 
-    /// Run a local command with secrets injected as env vars.
+    /// Run a container (docker-run semantics), optionally injecting a
+    /// ZLayer secret-environment.
     ///
-    /// Resolution order (later wins on collision):
-    ///   1. Parent env (inherited)
-    ///   2. `global` env secrets (auto-merged unless --no-global)
-    ///   3. Each --merge <slug> env in order
-    ///   4. --env <slug> secrets (highest priority)
+    /// `--env <SLUG>` selects a ZLayer secret-ENVIRONMENT whose secrets are
+    /// resolved and injected into the container. Individual container env
+    /// vars use the SHORT `-e KEY=VAL` flag (docker-style); they override
+    /// any secret of the same name.
+    ///
+    /// Secret precedence (base, lowest → highest):
+    ///   1. `global` env secrets (auto-merged unless --no-global)
+    ///   2. Each --merge <slug> env in order
+    ///   3. --env <slug> secrets (primary)
+    /// then individual `-e KEY=VAL` flags win over all of the above.
+    ///
+    /// To run a local process with only secrets injected (no container),
+    /// use `zlayer env run` instead.
     ///
     /// Examples:
-    ///   zlayer run --env dev -- pnpm run dev
-    ///   zlayer run --env staging --no-global -- bash ./deploy.sh
-    ///   zlayer run --env prod --merge global --merge baseline -- ./bin/server
-    ///   zlayer run --env dev --dry-run         # masked preview
-    ///   zlayer run --env dev --dry-run --unmask  # plaintext (admin)
+    ///   zlayer run --env dev -e PORT=8080 -v /host:/work -w /work rust:1.91 -- cargo build
+    ///   zlayer run -it --rm ubuntu:24.04 -- bash
+    ///   zlayer run -d --name web -p 8080:80 nginx:latest
+    #[cfg(feature = "docker-compat")]
+    #[allow(clippy::doc_markdown, clippy::doc_lazy_continuation)]
     #[command(verbatim_doc_comment, display_order = 39)]
-    Run {
-        /// Primary environment to resolve secrets from (id or name).
-        #[arg(long)]
-        env: String,
-
-        /// Skip the implicit `global` env merge. Off by default.
-        #[arg(long, default_value_t = false)]
-        no_global: bool,
-
-        /// Additional env(s) to merge under the primary env. Left-to-right
-        /// order: later flags win over earlier ones (but the primary --env
-        /// always wins).
-        #[arg(long = "merge", value_name = "SLUG")]
-        merge: Vec<String>,
-
-        /// Project id used to resolve non-UUID env names.
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Print the resolved env instead of spawning. Values are masked
-        /// as `***` unless --unmask is also passed.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-
-        /// Reveal plaintext values in --dry-run output (admin only).
-        #[arg(long, default_value_t = false, requires = "dry_run")]
-        unmask: bool,
-
-        /// Command and arguments to run. Use `--` to separate from zlayer args.
-        /// Example: `zlayer run --env dev -- pnpm run dev`
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
-        command: Vec<String>,
-    },
+    Run(Box<RunArgs>),
 
     /// Environment management commands
     ///
@@ -945,6 +1127,33 @@ pub(crate) enum Commands {
     #[command(subcommand, verbatim_doc_comment, display_order = 45)]
     Docker(Box<zlayer_docker::DockerCommands>),
 
+    // ── Maintenance ───────────────────────────────────────────────────
+    /// Replace the current zlayer binary with a newer release.
+    ///
+    /// Downloads the requested release tarball from GitHub, optionally
+    /// verifies its SHA-256, and atomically swaps the running binary on
+    /// disk. On Unix the swap is in-place (rename onto a running binary
+    /// is safe); Windows requires a manual restart after the new file is
+    /// staged next to the current one.
+    #[command(name = "self-update", display_order = 49)]
+    SelfUpdate {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Re-exec the new binary in place of the current process after install.
+        #[arg(long)]
+        restart: bool,
+
+        /// GitHub repo (owner/name). Override for testing.
+        #[arg(long, default_value = "BlackLeafDigital/ZLayer", hide = true)]
+        repo: String,
+    },
+
     // ── Interface ─────────────────────────────────────────────────────
     /// Launch interactive TUI
     #[command(display_order = 50)]
@@ -967,6 +1176,70 @@ pub(crate) enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// macOS Apple-Virtualization (VZ) base-image tooling.
+    ///
+    /// Builds and publishes the native-macOS guest bundles the VZ runtime
+    /// consumes. macOS-only.
+    #[cfg(target_os = "macos")]
+    #[command(subcommand, display_order = 52)]
+    Vz(VzCommands),
+}
+
+/// macOS VZ base-image subcommands.
+#[cfg(target_os = "macos")]
+#[derive(Debug, clap::Subcommand)]
+pub enum VzCommands {
+    /// Build a macOS VZ base-image bundle from a `.ipsw` restore image and,
+    /// optionally, push it to an OCI registry.
+    ///
+    /// The result is a Tart-style bundle (`disk.img`, `hardware-model.bin`,
+    /// `aux.img`) the VZ runtime can pull. Requires a signed binary
+    /// (`make build` / `scripts/sign-vz.sh`) for the virtualization
+    /// entitlement, and runs the macOS installer (~20-40 min).
+    ///
+    /// Examples:
+    ///   zlayer vz build-base --ipsw ~/UniversalMac.ipsw --output ./macos-base
+    ///   zlayer vz build-base --latest --push ghcr.io/org/macos-vz:sequoia
+    BuildBase {
+        /// Path or URL to a macOS `.ipsw` restore image. Mutually exclusive
+        /// with `--latest`.
+        #[arg(long, value_name = "PATH_OR_URL")]
+        ipsw: Option<String>,
+
+        /// Fetch the latest host-supported restore image from Apple instead of
+        /// supplying `--ipsw`.
+        #[arg(long, conflicts_with = "ipsw")]
+        latest: bool,
+
+        /// Output bundle directory.
+        #[arg(long, short = 'o', default_value = "./macos-vz-base")]
+        output: PathBuf,
+
+        /// Blank system-disk size in GiB (created sparse).
+        #[arg(long, default_value_t = 50)]
+        disk_size_gib: u64,
+
+        /// vCPU count for the install VM (default: the image's minimum).
+        #[arg(long)]
+        cpus: Option<u32>,
+
+        /// Memory in MiB for the install VM (default: the image's minimum).
+        #[arg(long)]
+        memory_mib: Option<u32>,
+
+        /// Push the built bundle to this OCI reference after building.
+        #[arg(long, value_name = "REFERENCE")]
+        push: Option<String>,
+
+        /// Registry username (or set `ZLAYER_REGISTRY_USERNAME`).
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Registry password (or set `ZLAYER_REGISTRY_PASSWORD`).
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 /// Windows-only maintenance commands. Currently exposes VHDX compaction;
@@ -979,6 +1252,90 @@ pub enum WindowsCommands {
         /// Skip the graceful daemon-stop wait; go straight to `wsl --shutdown`.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// Shared flags for every `zlayer runtime` subcommand. `state_root` is the
+/// directory libcontainer uses to persist per-container state (config.json,
+/// pid file, etc.) and matches runc's `--root`.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+#[derive(clap::Args, Debug)]
+pub struct RuntimeGlobal {
+    /// Root directory where container state files live. Defaults to
+    /// `/var/lib/zlayer/oci/state`.
+    #[arg(long, default_value = "/var/lib/zlayer/oci/state", global = true)]
+    pub state_root: std::path::PathBuf,
+}
+
+/// Internal runc-compatible runtime CLI used by `Wsl2DelegateRuntime` to
+/// drive containers inside the `zlayer` WSL2 distro via
+/// `wsl.exe -d zlayer -- /usr/local/bin/zlayer runtime <verb>`. Mirrors the
+/// in-process libcontainer logic in `crates/zlayer-agent/src/runtimes/youki.rs`.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+#[derive(Debug, clap::Subcommand)]
+pub enum RuntimeCommand {
+    /// Query container state. Emits runc-compatible JSON to stdout.
+    State {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Create a container from an OCI bundle (does not start it).
+    Create {
+        /// Container ID.
+        id: String,
+        /// Path to the OCI bundle directory (must contain `config.json`).
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+        /// Optional log file path (runc compatibility).
+        #[arg(long)]
+        log: Option<std::path::PathBuf>,
+    },
+
+    /// Start a previously-created container.
+    Start {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Send a signal to one or all processes in a container.
+    Kill {
+        /// Container ID.
+        id: String,
+        /// Signal name (e.g. `SIGTERM`, `SIGKILL`) or number.
+        signal: String,
+        /// Send the signal to every process in the container, not just init.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Delete a stopped container and free its state.
+    Delete {
+        /// Container ID.
+        id: String,
+        /// Forcefully delete a running container (SIGKILL + remove).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Exec a process inside a running container. Trailing args after `--`
+    /// are the command and its arguments.
+    Exec {
+        /// Container ID.
+        id: String,
+        /// Command and arguments to exec (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Emit cgroup events/stats. With `--stats`, prints a one-shot snapshot
+    /// instead of streaming.
+    Events {
+        /// Container ID.
+        id: String,
+        /// Emit a single stats snapshot and exit.
+        #[arg(long)]
+        stats: bool,
     },
 }
 
@@ -995,6 +1352,12 @@ pub(crate) struct InstallArgs {
     #[arg(long, default_value = "0.0.0.0:3669")]
     pub(crate) bind: String,
 
+    /// Optional override for the daemon UDS socket path. Defaults to
+    /// `/var/run/<daemon-name>.sock`. When set, the installed systemd unit's
+    /// `ExecStart` appends `--socket <PATH>`.
+    #[arg(long)]
+    pub(crate) socket: Option<std::path::PathBuf>,
+
     /// JWT secret for API authentication
     #[arg(long, env = "ZLAYER_JWT_SECRET")]
     pub(crate) jwt_secret: Option<String>,
@@ -1007,6 +1370,13 @@ pub(crate) struct InstallArgs {
     #[cfg(feature = "docker-compat")]
     #[arg(long)]
     pub(crate) docker_socket: bool,
+
+    /// Provision the daemon with overlay-networking capabilities.
+    /// Adds `AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN` to the
+    /// systemd unit and runs `modprobe tun` as a pre-start. No-op on
+    /// macOS (the launchd plist is unchanged).
+    #[arg(long)]
+    pub(crate) with_overlay: bool,
 
     /// WSL2 auto-install consent (Windows only — parsed here for
     /// forward-compatibility when `daemon install` lands on Windows).
@@ -1065,14 +1435,60 @@ pub(crate) struct InstallArgs {
     pub(crate) no_tunnel_server: bool,
 }
 
+/// Wrapper struct for the `daemon` subcommand. The daemon's instance name
+/// is read from the top-level [`Cli::daemon_name`] field (a global
+/// `--daemon-name <NAME>` flag) so the same flag controls install paths,
+/// systemd / SCM unit names, the default socket location, and the
+/// HCS/HCN tags the running daemon stamps on its resources. This struct
+/// only carries the [`DaemonAction`] subcommand.
+///
+/// When `--daemon-name` is unset, [`resolve_daemon_name`] derives the
+/// effective name from `current_exe()`'s file stem so a binary copied as
+/// `zlayer-dev` defaults to a `zlayer-dev` instance, with `"zlayer"` as
+/// the final fallback.
+#[derive(Args, Debug)]
+pub(crate) struct DaemonArgs {
+    #[command(subcommand)]
+    pub(crate) action: DaemonAction,
+}
+
+/// Resolve the effective daemon name. CLI flag wins; otherwise we take the
+/// basename of `current_exe()` and strip a trailing `.exe` (Windows
+/// friendliness, no-op on Linux). Final fallback is `"zlayer"`.
+pub(crate) fn resolve_daemon_name(explicit: Option<&str>) -> String {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "zlayer".to_string())
+}
+
 /// Daemon lifecycle actions
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub(crate) enum DaemonAction {
     /// Install zlayer as a system service (launchd on macOS, systemd on Linux)
     Install(Box<InstallArgs>),
 
-    /// Uninstall the zlayer system service
-    Uninstall,
+    /// Uninstall the zlayer system service.
+    Uninstall {
+        /// Also delete the installed binary at the resolved
+        /// `${bin_dir}/<daemon-name>` path. Default off.
+        #[arg(long)]
+        remove_binary: bool,
+
+        /// Also delete shell-completion files installed under the
+        /// daemon-name (bash/zsh/fish). Default off.
+        #[arg(long)]
+        remove_completions: bool,
+
+        /// Also delete the data directory. DESTRUCTIVE — wipes
+        /// containers, secrets, raft state, everything under
+        /// `--data-dir`. Default off.
+        #[arg(long)]
+        purge_data: bool,
+    },
 
     /// Start the daemon service
     Start,
@@ -1117,6 +1533,23 @@ pub(crate) enum DaemonAction {
         /// Report what would be migrated without making any changes.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// INTERNAL: register the `zlayer-overlayd` system service (requires root).
+    ///
+    /// The rootless macOS install re-execs this under `sudo` ONLY when the
+    /// overlay binary or its plist actually changed, so registering the overlay
+    /// (which owns a system-level `WireGuard`/utun adapter) is the single
+    /// privileged step of an otherwise user-owned install. Not intended for
+    /// direct use.
+    #[command(name = "_install-overlayd", hide = true)]
+    InstallOverlayd {
+        /// Absolute path to the staged `zlayer-overlayd` binary to register.
+        #[arg(long)]
+        overlayd_bin: std::path::PathBuf,
+        /// Register the plist/unit without starting the service.
+        #[arg(long)]
+        no_start: bool,
     },
 }
 
@@ -1621,6 +2054,105 @@ pub(crate) enum SecretCommands {
     },
 }
 
+/// Arguments for the top-level `zlayer run` container runner.
+///
+/// Mirrors the subset of `docker run` flags that the VZ-Linux runtime
+/// supports, plus the ZLayer secret-environment selectors (`--env`,
+/// `--merge`, `--no-global`, `--project`). Note the deliberate flag split:
+/// `--env <SLUG>` names a ZLayer secret-environment to inject, while the
+/// docker-style individual env var is the SHORT `-e KEY=VAL` (no `--env`
+/// long alias).
+#[cfg(feature = "docker-compat")]
+#[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools, clippy::doc_markdown)]
+pub(crate) struct RunArgs {
+    /// Image to run (e.g. `rust:1.91`, `nginx:latest`).
+    pub image: String,
+
+    /// Command (and args) to run in the container. Use `--` to separate
+    /// from zlayer flags, e.g. `zlayer run rust:1.91 -- cargo build`.
+    #[arg(trailing_var_arg = true, num_args = 0..)]
+    pub command: Vec<String>,
+
+    // ---- ZLayer secret-environment selectors ----
+    /// ZLayer secret-ENVIRONMENT (id or slug) to resolve and inject into
+    /// the container. This is the secret-env concept, NOT a single env var.
+    #[arg(long)]
+    pub env: Option<String>,
+
+    /// Additional secret-env(s) to merge under the primary `--env`.
+    /// Left-to-right: later flags win over earlier ones (the primary
+    /// `--env` always wins over merges).
+    #[arg(long = "merge", value_name = "SLUG")]
+    pub merge: Vec<String>,
+
+    /// Skip the implicit `global` secret-env merge. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub no_global: bool,
+
+    /// Project id used to resolve non-UUID secret-env names.
+    #[arg(long)]
+    pub project: Option<String>,
+
+    // ---- docker-run container flags ----
+    /// Bind mount a volume (`HOST:CONTAINER[:OPTS]`).
+    #[arg(short = 'v', long = "volume")]
+    pub volumes: Vec<String>,
+
+    /// Set container env var KEY=VAL (docker-style, short `-e` only).
+    /// Overrides any secret of the same name.
+    #[arg(short = 'e')]
+    pub env_vars: Vec<String>,
+
+    /// Publish a container's port(s) to the host (`HOST:CONTAINER[/PROTO]`).
+    #[arg(short = 'p', long = "publish")]
+    pub ports: Vec<String>,
+
+    /// Working directory inside the container.
+    #[arg(short = 'w', long = "workdir")]
+    pub workdir: Option<String>,
+
+    /// Allocate a pseudo-TTY.
+    #[arg(short = 't', long = "tty")]
+    pub tty: bool,
+
+    /// Keep STDIN open even if not attached.
+    #[arg(short = 'i', long = "interactive")]
+    pub interactive: bool,
+
+    /// Automatically remove the container when it exits.
+    #[arg(long)]
+    pub rm: bool,
+
+    /// Run the container in the background and print its id.
+    #[arg(short = 'd', long = "detach")]
+    pub detach: bool,
+
+    /// Assign a name to the container.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Overwrite the default ENTRYPOINT of the image.
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+
+    /// Username or UID (`<name|uid>[:<group|gid>]`).
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Memory limit (e.g. `512m`, `2g`).
+    #[arg(long)]
+    pub memory: Option<String>,
+
+    /// Number of CPUs (e.g. `1.5`).
+    #[arg(long)]
+    pub cpus: Option<String>,
+
+    /// Connect the container to a network.
+    #[arg(long)]
+    pub network: Option<String>,
+}
+
 /// Environment management subcommands.
 ///
 /// An environment is a named, isolated namespace for secrets (and, in
@@ -1681,6 +2213,55 @@ pub(crate) enum EnvCommands {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+    },
+
+    /// Run a local command with secrets injected as env vars (no container).
+    ///
+    /// Resolution order (later wins on collision):
+    ///   1. Parent env (inherited)
+    ///   2. `global` env secrets (auto-merged unless --no-global)
+    ///   3. Each --merge <slug> env in order
+    ///   4. <env_id> secrets (highest priority)
+    ///
+    /// Examples:
+    ///   zlayer env run dev -- pnpm run dev
+    ///   zlayer env run staging --no-global -- bash ./deploy.sh
+    ///   zlayer env run prod --merge global --merge baseline -- ./bin/server
+    ///   zlayer env run dev --dry-run             # masked preview
+    ///   zlayer env run dev --dry-run --unmask    # plaintext (admin)
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Run {
+        /// Primary environment to resolve secrets from (id or name).
+        env_id: String,
+
+        /// Skip the implicit `global` env merge. Off by default.
+        #[arg(long, default_value_t = false)]
+        no_global: bool,
+
+        /// Additional env(s) to merge under the primary env. Left-to-right
+        /// order: later flags win over earlier ones (but the primary env
+        /// always wins).
+        #[arg(long = "merge", value_name = "SLUG")]
+        merge: Vec<String>,
+
+        /// Project id used to resolve non-UUID env names.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the resolved env instead of spawning. Values are masked
+        /// as `***` unless --unmask is also passed.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Reveal plaintext values in --dry-run output (admin only).
+        #[arg(long, default_value_t = false, requires = "dry_run")]
+        unmask: bool,
+
+        /// Command and arguments to run. Use `--` to separate from zlayer args.
+        /// Example: `zlayer env run dev -- pnpm run dev`
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
     },
 }
 
@@ -2657,11 +3238,246 @@ pub(crate) enum NodeCommands {
         #[arg(long)]
         services: Option<Vec<String>>,
 
+        /// API server port
+        #[arg(long, default_value = "3669")]
+        api_port: u16,
+
+        /// Raft consensus port
+        #[arg(long, default_value = "9000")]
+        raft_port: u16,
+
+        /// Overlay network port (`WireGuard` protocol)
+        #[arg(long, default_value_t = zlayer_core::DEFAULT_WG_PORT)]
+        overlay_port: u16,
+
+        /// Free-form node labels as `k=v,k=v` (e.g. `region=us-east,tier=edge`).
+        /// Advertised at join and used for `NodeSelector` placement matching.
+        #[arg(long, default_value = "")]
+        labels: String,
+
         /// WSL2 auto-install consent (Windows only).
         #[command(flatten)]
         install_wsl: InstallWslArgs,
     },
 
+    /// [deprecated: use `zlayer cluster list` — `zlayer node list` will be removed in v0.13.0]
+    ///
+    /// List all nodes in the cluster
+    #[command(verbatim_doc_comment)]
+    List {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// [deprecated: use `zlayer cluster status` — `zlayer node status` will be removed in v0.13.0]
+    ///
+    /// Show detailed status of a node
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// Node ID (default: this node)
+        node_id: Option<String>,
+    },
+
+    /// [deprecated: use `zlayer cluster remove` — `zlayer node remove` will be removed in v0.13.0]
+    ///
+    /// Remove a node from the cluster
+    #[command(verbatim_doc_comment)]
+    Remove {
+        /// Node ID to remove
+        node_id: String,
+
+        /// Force removal without migrating services
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// [deprecated: use `zlayer cluster set-mode` — `zlayer node set-mode` will be removed in v0.13.0]
+    ///
+    /// Set node resource mode
+    #[command(verbatim_doc_comment)]
+    SetMode {
+        /// Node ID
+        node_id: String,
+
+        /// Mode: full, dedicated, or replicate
+        #[arg(long)]
+        mode: String,
+
+        /// Services for dedicated/replicate mode
+        #[arg(long)]
+        services: Option<Vec<String>>,
+    },
+
+    /// [deprecated: use `zlayer cluster label` — `zlayer node label` will be removed in v0.13.0]
+    ///
+    /// Add label to a node
+    #[command(verbatim_doc_comment)]
+    Label {
+        /// Node ID
+        node_id: String,
+
+        /// Label in key=value format
+        label: String,
+    },
+
+    /// Generate a join token for worker nodes
+    ///
+    /// Creates a base64-encoded token that workers can use to join this cluster.
+    /// If no API endpoint is provided, reads it from the node config.
+    /// If the node hasn't been initialized, auto-initializes with defaults.
+    /// If no deployment name is provided, tries to discover it from .zlayer.yml.
+    ///
+    /// Examples:
+    ///   zlayer node generate-join-token
+    ///   zlayer node generate-join-token my-deploy
+    ///   zlayer node generate-join-token my-deploy -a <http://10.0.0.1:3669>
+    #[command(verbatim_doc_comment)]
+    GenerateJoinToken {
+        /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
+        deployment: Option<String>,
+
+        /// API endpoint URL (inferred from node config if not given)
+        #[arg(short, long)]
+        api: Option<String>,
+
+        /// Service name (optional)
+        #[arg(short, long)]
+        service: Option<String>,
+
+        /// Data directory (where `node_config.json` lives, defaults to platform default)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Token expiration as a duration from now. Defaults to 24h.
+        ///
+        /// Accepts humantime syntax: `1h`, `30m`, `24h`, `7d`, `1week`.
+        /// The signed token's `exp` claim is set to `now() + ttl`. The HS256
+        /// JWT's `exp` claim is set identically. (The legacy plaintext format
+        /// was removed in v0.13.0.)
+        #[arg(long, value_name = "DURATION", default_value = "24h")]
+        ttl: humantime::Duration,
+    },
+
+    /// [deprecated: use `zlayer cluster upgrade` — `zlayer node upgrade` will be removed in v0.13.0]
+    ///
+    /// Roll a new zlayer version across every node in the cluster.
+    ///
+    /// Followers self-update one at a time (deterministic, ascending
+    /// `node_id` order). After the follower walk, the leader self-upgrades
+    /// last: its daemon exits with code 75 and the OS supervisor
+    /// (launchd / systemd) respawns it on the new binary. Pass
+    /// `--skip-leader` to keep the legacy behaviour of leaving the
+    /// leader untouched.
+    #[command(name = "upgrade", verbatim_doc_comment)]
+    Upgrade {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Pause between followers (after each comes back healthy) to let
+        /// observability soak. Default 30s.
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
+        /// Abort the rollout if any follower fails to come back healthy.
+        #[arg(long)]
+        strict: bool,
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Don't auto-upgrade the leader. Use when the operator wants to
+        /// upgrade the leader manually (e.g. to time a deliberate
+        /// failover window).
+        #[arg(long)]
+        skip_leader: bool,
+    },
+
+    /// [deprecated: use `zlayer cluster force-leader` — `zlayer node force-leader` will be removed in v0.13.0]
+    ///
+    /// Force this node to become cluster leader (disaster recovery)
+    ///
+    /// Use when the original leader is permanently lost in a 2-node cluster.
+    /// The surviving learner node will take over with preserved state.
+    /// Requires daemon restart after execution.
+    ///
+    /// Examples:
+    ///   zlayer node force-leader
+    ///   zlayer node force-leader --api-addr 127.0.0.1:3669
+    #[command(verbatim_doc_comment)]
+    ForceLeader {
+        /// API address of this node (host:port)
+        #[arg(long, default_value = "127.0.0.1:3669")]
+        api_addr: String,
+    },
+
+    /// [deprecated: use `zlayer cluster rotate-signing-key` — `zlayer node rotate-signing-key` will be removed in v0.13.0]
+    ///
+    /// Rotate the cluster signing keypair (alias for `zlayer cluster rotate-signing-key`).
+    ///
+    /// If this node is a worker, the daemon forwards the request to the leader.
+    /// If this node is a leader, rotates locally and writes the new keystore.
+    ///
+    /// The previous active key is moved into a grace window (default 7d,
+    /// configurable via --grace) where it continues to verify in-flight
+    /// join tokens.
+    #[command(name = "rotate-signing-key", verbatim_doc_comment)]
+    RotateSigningKey {
+        /// Grace duration before the previous active key is purged.
+        /// Humantime syntax (`24h`, `7d`).
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
+    },
+
+    /// Generate a worker bootstrap token for a worker-tier cluster.
+    ///
+    /// Prints the URL-safe-base64 token to stdout. Use it via
+    /// `zlayer worker --token-file <path>` on the worker node.
+    #[command(name = "generate-worker-token", verbatim_doc_comment)]
+    GenerateWorkerToken {
+        /// Token validity in seconds (default 86400 = 24h).
+        #[arg(long, default_value = "86400")]
+        valid_for: u64,
+
+        /// Maximum number of times this token may be redeemed. 0 = unlimited
+        /// (NOT recommended outside dev). Default 1.
+        #[arg(long, default_value = "1")]
+        max_uses: u32,
+    },
+
+    /// Show the status of currently-leased workers in the cluster.
+    #[command(name = "worker-status")]
+    WorkerStatus,
+
+    /// Mark a worker for graceful drain — existing containers finish their
+    /// current work, no new assignments are pushed to the worker.
+    #[command(name = "worker-drain", verbatim_doc_comment)]
+    WorkerDrain {
+        /// Target worker's node id.
+        node_id: u64,
+
+        /// Grace period in seconds before forceful termination. Default 60.
+        #[arg(long, default_value = "60")]
+        grace: u32,
+    },
+
+    /// Immediately evict a worker — terminates assignments and revokes its
+    /// lease. The worker will need a fresh bootstrap token to rejoin.
+    #[command(name = "worker-evict", verbatim_doc_comment)]
+    WorkerEvict {
+        /// Target worker's node id.
+        node_id: u64,
+    },
+}
+
+/// Cluster-level administration subcommands.
+///
+/// In v0.12.0 these were promoted out of `zlayer node <…>` into a dedicated
+/// `zlayer cluster <…>` namespace. Every variant here corresponds 1:1 to a
+/// `NodeCommands` variant of the same name and delegates to the same
+/// underlying handler (see `commands/cluster.rs`). `RotateSigningKey` is the
+/// lone exception: it is brand new with the Ed25519 join-token work and has
+/// no `NodeCommands` equivalent. Wave 5B.3 wires its dedicated handler.
+#[derive(Subcommand)]
+pub(crate) enum ClusterCommands {
     /// List all nodes in the cluster
     List {
         /// Output format (table or json)
@@ -2708,49 +3524,148 @@ pub(crate) enum NodeCommands {
         label: String,
     },
 
-    /// Generate a join token for worker nodes
-    ///
-    /// Creates a base64-encoded token that workers can use to join this cluster.
-    /// If no API endpoint is provided, reads it from the node config.
-    /// If the node hasn't been initialized, auto-initializes with defaults.
-    /// If no deployment name is provided, tries to discover it from .zlayer.yml.
-    ///
-    /// Examples:
-    ///   zlayer node generate-join-token
-    ///   zlayer node generate-join-token my-deploy
-    ///   zlayer node generate-join-token my-deploy -a <http://10.0.0.1:3669>
-    #[command(verbatim_doc_comment)]
-    GenerateJoinToken {
-        /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
-        deployment: Option<String>,
-
-        /// API endpoint URL (inferred from node config if not given)
-        #[arg(short, long)]
-        api: Option<String>,
-
-        /// Service name (optional)
-        #[arg(short, long)]
-        service: Option<String>,
-
-        /// Data directory (where `node_config.json` lives, defaults to platform default)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-
-    /// Force this node to become cluster leader (disaster recovery)
-    ///
-    /// Use when the original leader is permanently lost in a 2-node cluster.
-    /// The surviving learner node will take over with preserved state.
-    /// Requires daemon restart after execution.
-    ///
-    /// Examples:
-    ///   zlayer node force-leader
-    ///   zlayer node force-leader --api-addr 127.0.0.1:3669
+    /// Force a specific node to become cluster leader (disaster recovery)
     #[command(verbatim_doc_comment)]
     ForceLeader {
         /// API address of this node (host:port)
         #[arg(long, default_value = "127.0.0.1:3669")]
         api_addr: String,
+    },
+
+    /// Roll a new zlayer version across every node in the cluster.
+    #[command(name = "upgrade")]
+    Upgrade {
+        /// Target version (e.g. v0.12.0). Defaults to the latest GitHub release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Pause between followers (after each comes back healthy) to let
+        /// observability soak. Default 30s.
+        #[arg(long, default_value = "30")]
+        cooldown_secs: u64,
+        /// Abort the rollout if any follower fails to come back healthy.
+        #[arg(long)]
+        strict: bool,
+        /// Skip the confirmation prompt and apply immediately.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Don't auto-upgrade the leader.
+        #[arg(long)]
+        skip_leader: bool,
+    },
+
+    /// Rotate the cluster's Ed25519 signing keypair.
+    ///
+    /// Generates a fresh keypair, promotes it to the active slot, and demotes
+    /// the previous key into a verification-only grace window. Workers can
+    /// still validate tokens minted with the old key during the grace period
+    /// — useful for staggered rollouts. Wave 5B.3 wires the dedicated
+    /// handler; this scaffolding only reserves the CLI surface.
+    #[command(name = "rotate-signing-key", verbatim_doc_comment)]
+    RotateSigningKey {
+        /// How long the previous active key continues verifying tokens.
+        /// Humantime syntax (`24h`, `7d`). Defaults to 7d.
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
+    },
+
+    /// Revoke a previously-issued cluster join token.
+    ///
+    /// Adds the token to the cluster-wide Raft-replicated revocation
+    /// list so every node rejects subsequent uses. Accepts either the
+    /// raw token b64 envelope OR a pre-computed 64-char lowercase hex
+    /// SHA-256 of one. The actual token bytes never enter replicated
+    /// state — only the hash leaves the local node.
+    ///
+    /// Entries auto-prune at the token's natural expiry (or `now()+24h`
+    /// when only a hash was supplied) so the list stays bounded.
+    #[command(name = "revoke-token", verbatim_doc_comment)]
+    RevokeToken {
+        /// Raw token (b64 envelope from `zlayer node generate-join-token`)
+        /// OR lowercase hex SHA-256 of one.
+        token_or_hash: String,
+        /// Optional human-readable reason recorded server-side for audit.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// List currently-active token revocations.
+    ///
+    /// Returns the un-expired revocations replicated through Raft on
+    /// this node. Entries auto-prune at apply time so the listing only
+    /// shows revocations that are still load-bearing for validation.
+    #[command(name = "list-revocations", verbatim_doc_comment)]
+    ListRevocations {},
+
+    /// Manage cluster trust bundles for federation.
+    ///
+    /// Subcommands let operators export this cluster's own trust
+    /// bundle (for sharing out-of-band with peer clusters) and
+    /// manage imports of foreign-cluster bundles so this cluster
+    /// validates their signed join tokens.
+    #[command(subcommand, name = "trust-bundle")]
+    TrustBundle(TrustBundleCommands),
+
+    /// Begin the HS256 -> Ed25519-JWT migration.
+    ///
+    /// Sets the cluster JWT algorithm policy to `both` so new tokens
+    /// minted as `EdDSA` work while in-flight HS256 tokens stay valid.
+    /// Operators run this BEFORE re-issuing tokens.
+    #[command(name = "migrate-jwt-to-eddsa", verbatim_doc_comment)]
+    MigrateJwtToEddsa {
+        /// Reserved for future use. The `--grace` knob will become
+        /// meaningful when the migration command also issues a fresh
+        /// signing-key rotation; for now it's accepted and recorded
+        /// for symmetry with the eventual flow.
+        #[arg(long, value_name = "DURATION")]
+        grace: Option<humantime::Duration>,
+    },
+
+    /// Complete the HS256 -> Ed25519-JWT migration.
+    ///
+    /// Flips the cluster JWT algorithm policy to `eddsa`. HS256-JWT
+    /// tokens are rejected after this completes. With
+    /// `--vacuum-secret`, also wipes `{data_dir}/join_secret` on every
+    /// node via a separate Raft op so the symmetric secret is gone.
+    #[command(name = "decommission-hs256", verbatim_doc_comment)]
+    DecommissionHs256 {
+        /// If set, also schedule a cluster-wide wipe of
+        /// `{data_dir}/join_secret`.
+        #[arg(long)]
+        vacuum_secret: bool,
+    },
+
+    /// Show the cluster JWT algorithm status.
+    #[command(name = "jwt-status", verbatim_doc_comment)]
+    JwtStatus {},
+}
+
+/// Subcommands for `zlayer cluster trust-bundle <...>`.
+#[derive(clap::Subcommand)]
+pub(crate) enum TrustBundleCommands {
+    /// Print this cluster's trust bundle as JSON for out-of-band
+    /// transport to a peer cluster.
+    Export {
+        /// Optional file path to write the bundle to. If omitted,
+        /// the JSON is printed to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Import a foreign cluster's trust bundle from a file or URL.
+    Import {
+        /// Path to a JSON file containing a `TrustBundle`, OR an
+        /// `https://` URL to fetch (over TLS).
+        source: String,
+        /// Optional source-URL annotation recorded server-side for
+        /// audit; defaults to the supplied URL when `source` is a URL.
+        #[arg(long)]
+        source_url: Option<String>,
+    },
+    /// List all currently-trusted foreign-cluster bundles.
+    List {},
+    /// Remove a previously-imported trust bundle.
+    Remove {
+        /// The `cluster_domain` of the bundle to forget.
+        cluster_domain: String,
     },
 }
 
@@ -3465,7 +4380,7 @@ mod tests {
             "--no-swagger",
             "--daemon",
             "--socket",
-            "/tmp/zlayer-test.sock",
+            "/var/lib/zlayer-test.sock",
         ])
         .unwrap();
 
@@ -3482,7 +4397,7 @@ mod tests {
                 assert_eq!(jwt_secret, Some("test-secret".to_string()));
                 assert!(no_swagger);
                 assert!(daemon);
-                assert_eq!(socket, Some("/tmp/zlayer-test.sock".to_string()));
+                assert_eq!(socket, Some("/var/lib/zlayer-test.sock".to_string()));
             }
             _ => panic!("Expected Serve command"),
         }
@@ -3577,6 +4492,102 @@ mod tests {
         match cli.command {
             Some(Commands::Serve { dns_port, .. }) => {
                 assert_eq!(dns_port, Some(15354));
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_accepts_api_tls_cert_and_key() {
+        let cli = Cli::try_parse_from([
+            "zlayer",
+            "serve",
+            "--api-tls-cert",
+            "/tmp/c.pem",
+            "--api-tls-key",
+            "/tmp/k.pem",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                api_tls_cert,
+                api_tls_key,
+                api_tls_acme,
+                ..
+            }) => {
+                assert_eq!(api_tls_cert, Some(std::path::PathBuf::from("/tmp/c.pem")));
+                assert_eq!(api_tls_key, Some(std::path::PathBuf::from("/tmp/k.pem")));
+                assert!(!api_tls_acme);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_rejects_api_tls_cert_without_key() {
+        assert!(Cli::try_parse_from(["zlayer", "serve", "--api-tls-cert", "/tmp/c.pem"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_serve_rejects_api_tls_cert_with_acme() {
+        assert!(Cli::try_parse_from([
+            "zlayer",
+            "serve",
+            "--api-tls-cert",
+            "/tmp/c.pem",
+            "--api-tls-key",
+            "/tmp/k.pem",
+            "--api-tls-acme",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn vacuum_secrets_flag_parses() {
+        // Wave 6 (v0.13.0): `--vacuum-secrets` opts a daemon into wiping
+        // its on-disk HS256 join_secret on startup. Verify clap accepts
+        // the flag and surfaces it on `Commands::Serve`.
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--vacuum-secrets"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { vacuum_secrets, .. }) => {
+                assert!(
+                    vacuum_secrets,
+                    "--vacuum-secrets must parse to true when supplied"
+                );
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn vacuum_secrets_defaults_to_false() {
+        // Defensive: a fresh `zlayer serve` invocation must not silently
+        // vacuum the secret. The flag has to be opted into explicitly.
+        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve { vacuum_secrets, .. }) => {
+                assert!(
+                    !vacuum_secrets,
+                    "--vacuum-secrets must default to false (preserve HS256 key across restart)"
+                );
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_accepts_api_tls_acme_alone() {
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--api-tls-acme"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                api_tls_cert,
+                api_tls_key,
+                api_tls_acme,
+                ..
+            }) => {
+                assert!(api_tls_cert.is_none());
+                assert!(api_tls_key.is_none());
+                assert!(api_tls_acme);
             }
             _ => panic!("Expected Serve command"),
         }
@@ -3784,5 +4795,171 @@ mod tests {
             }
             _ => panic!("Expected Build command"),
         }
+    }
+
+    // ── Wave 5B.1+5B.2: `zlayer cluster <…>` scaffolding ────────────────
+    //
+    // These tests confirm:
+    //   1. The new top-level `cluster` subgroup is reachable through clap.
+    //   2. Specific subcommands parse into the expected `ClusterCommands`
+    //      variants (including the new `RotateSigningKey` with `--grace`).
+    //   3. The legacy `zlayer node <…>` invocations STILL parse to
+    //      `Commands::Node(NodeCommands::…)` — i.e. we have not regressed
+    //      the alias surface that ships through one more release.
+
+    #[test]
+    fn cli_recognizes_top_level_cluster_subcommand() {
+        // `--help` causes try_parse_from to return Err with DisplayHelp.
+        // We're checking the subcommand is REACHABLE in the clap tree,
+        // not that help actually renders successfully here.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "--help"]);
+        match cli {
+            Err(e) if matches!(e.kind(), clap::error::ErrorKind::DisplayHelp) => {}
+            Err(e) => panic!("unexpected clap error: {e}"),
+            Ok(_) => panic!("expected DisplayHelp"),
+        }
+    }
+
+    #[test]
+    fn cli_cluster_list_parses() {
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cluster(ClusterCommands::List { .. }))
+        ));
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_parses_with_grace() {
+        let cli =
+            Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key", "--grace", "24h"])
+                .unwrap();
+        let Some(Commands::Cluster(ClusterCommands::RotateSigningKey { grace })) = cli.command
+        else {
+            panic!("expected Commands::Cluster(ClusterCommands::RotateSigningKey {{ .. }})")
+        };
+        assert_eq!(
+            *grace.expect("--grace was provided"),
+            std::time::Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_parses_without_grace() {
+        // No --grace flag → field should be None; the actual default is
+        // applied by the Wave 5B.3 handler, not by clap.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key"]).unwrap();
+        let Some(Commands::Cluster(ClusterCommands::RotateSigningKey { grace })) = cli.command
+        else {
+            panic!("expected Commands::Cluster(ClusterCommands::RotateSigningKey {{ .. }})")
+        };
+        assert!(grace.is_none());
+    }
+
+    #[test]
+    fn cli_node_list_still_works_as_alias() {
+        // Regression check: existing `zlayer node list` invocation must
+        // still parse to NodeCommands::List unchanged.
+        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Node(NodeCommands::List { .. }))
+        ));
+    }
+
+    // ── Wave 5B.3: `zlayer node rotate-signing-key` alias ───────────────
+    //
+    // The dedicated `zlayer cluster rotate-signing-key` surface (covered by
+    // the tests above) ships alongside an alias on `zlayer node …` so the
+    // historic single-namespace muscle memory still works. These tests
+    // confirm both invocations parse, with and without `--grace`.
+
+    #[test]
+    fn cli_node_rotate_signing_key_parses_with_grace() {
+        let cli =
+            Cli::try_parse_from(["zlayer", "node", "rotate-signing-key", "--grace", "1h"]).unwrap();
+        let Some(Commands::Node(NodeCommands::RotateSigningKey { grace })) = cli.command else {
+            panic!("expected Commands::Node(NodeCommands::RotateSigningKey {{ .. }})")
+        };
+        assert_eq!(
+            *grace.expect("--grace was provided"),
+            std::time::Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn cli_node_rotate_signing_key_parses_without_grace() {
+        // No --grace flag → field should be None; the actual default is
+        // applied server-side by the rotate-signing-key handler, not by
+        // clap. Mirrors the cluster-namespace test above.
+        let cli = Cli::try_parse_from(["zlayer", "node", "rotate-signing-key"]).unwrap();
+        let Some(Commands::Node(NodeCommands::RotateSigningKey { grace })) = cli.command else {
+            panic!("expected Commands::Node(NodeCommands::RotateSigningKey {{ .. }})")
+        };
+        assert!(grace.is_none());
+    }
+
+    #[test]
+    fn cli_cluster_rotate_signing_key_alias_still_parses() {
+        // Sanity check that the original cluster-namespace surface is
+        // unchanged by the Wave 5B.3 NodeCommands addition. Tested in the
+        // 5B.1+5B.2 block above, repeated here to anchor the alias
+        // contract.
+        let cli = Cli::try_parse_from(["zlayer", "cluster", "rotate-signing-key", "--grace", "1h"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Cluster(ClusterCommands::RotateSigningKey { .. }))
+        ));
+    }
+
+    // ── Wave 5B.5: deprecation notices on promoted NodeCommands variants ──
+    //
+    // The eight variants that have been promoted into the `zlayer cluster
+    // <…>` namespace (List, Status, Remove, SetMode, Label, ForceLeader,
+    // Upgrade, RotateSigningKey) carry a docstring deprecation note that
+    // surfaces in `zlayer node <variant> --help`. The three variants that
+    // remain node-level (Init, Join, GenerateJoinToken) MUST NOT carry a
+    // deprecation note. These tests pin both contracts.
+
+    #[test]
+    fn node_list_help_includes_deprecation_note() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let node_help = cmd
+            .find_subcommand("node")
+            .expect("`node` subcommand")
+            .find_subcommand("list")
+            .expect("`node list` subcommand");
+        let long_about_or_about = node_help
+            .get_long_about()
+            .or_else(|| node_help.get_about())
+            .expect("help text on `node list`")
+            .to_string();
+        assert!(
+            long_about_or_about.contains("deprecated")
+                && long_about_or_about.contains("zlayer cluster list"),
+            "expected deprecation note in `zlayer node list --help`, got: {long_about_or_about}"
+        );
+    }
+
+    #[test]
+    fn node_init_help_does_not_mention_deprecation() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let node_help = cmd
+            .find_subcommand("node")
+            .expect("`node` subcommand")
+            .find_subcommand("init")
+            .expect("`node init` subcommand");
+        let long_about_or_about = node_help
+            .get_long_about()
+            .or_else(|| node_help.get_about())
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            !long_about_or_about.to_lowercase().contains("deprecated"),
+            "zlayer node init should NOT carry a deprecation note (it stays node-level), got: {long_about_or_about}"
+        );
     }
 }

@@ -949,8 +949,13 @@ impl Runtime for WasmRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull a WASM image with a specific policy.
@@ -960,7 +965,7 @@ impl Runtime for WasmRuntime {
     /// existing `AuthResolver` (hostname-based lookup in the secret store).
     /// Callers that need inline auth should use the Docker runtime.
     #[instrument(
-        skip(self, _auth),
+        skip(self, _auth, _source),
         fields(
             otel.name = "wasm.pull",
             container.image.name = %image,
@@ -972,6 +977,7 @@ impl Runtime for WasmRuntime {
         image: &str,
         policy: PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Handle Never policy
         if matches!(policy, PullPolicy::Never) {
@@ -1369,6 +1375,30 @@ impl Runtime for WasmRuntime {
     }
 
     /// Remove a WASM container (cleanup)
+    ///
+    /// # Resource cleanup
+    ///
+    /// The only host-owned resource referenced by a `WasmInstance` is the
+    /// `tokio::task::JoinHandle` for the execution task. We explicitly call
+    /// `abort()` on it below because `JoinHandle` does **not** cancel the
+    /// underlying task on drop.
+    ///
+    /// All other WASM-side resources — the wasmtime `Store`, the WASI
+    /// context, WASI preopened directories (open file descriptors), socket
+    /// bindings created via `inherit_network`, the `ResourceTable` for the
+    /// component model, the stdout/stderr memory pipes, and the compiled
+    /// `Module` / `Component` — are constructed **inside** the
+    /// `spawn_blocking` closures in `execute_module` (around line 600) and
+    /// `execute_component` (around line 783). They are owned exclusively by
+    /// that closure's stack frame and never escape into the instance map.
+    /// When the blocking task finishes (either naturally or because we
+    /// aborted its `JoinHandle`), the closure returns and the `Store` is
+    /// dropped, which transitively drops the WASI context and closes every
+    /// preopened FD / socket. No explicit shutdown step is required here.
+    ///
+    /// This runtime does not start any host-side HTTP listener for
+    /// `wasi:http` server bindings — only the outbound networking capability
+    /// is granted — so there is nothing extra to tear down on that front.
     #[instrument(
         skip(self),
         fields(
@@ -1382,10 +1412,16 @@ impl Runtime for WasmRuntime {
 
         tracing::info!(instance = %instance_id, "removing WASM instance");
 
-        // Remove from instances map
+        // Remove from instances map. Dropping the `WasmInstance` releases
+        // its captured stdout/stderr buffers and module bytes. The wasmtime
+        // `Store` (and its WASI preopens / sockets) lives inside the
+        // execution task's stack — aborting the task below causes the
+        // closure to unwind, which drops the `Store` and closes those FDs.
         let mut instances = self.instances.write().await;
         if let Some(mut instance) = instances.remove(&instance_id) {
-            // Abort any running execution
+            // Abort any running execution. `JoinHandle::abort()` is the only
+            // explicit cleanup needed: it triggers task cancellation, which
+            // unwinds the closure and drops the wasmtime `Store`.
             if let Some(handle) = instance.execution_handle.take() {
                 handle.abort();
             }
@@ -1725,10 +1761,7 @@ mod tests {
 
     #[test]
     fn test_instance_id_generation() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
 
         let expected = "wasm-myservice-1";
         let result = format!("wasm-{}-{}", id.service, id.replica);

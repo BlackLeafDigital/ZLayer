@@ -47,7 +47,11 @@ func (r ApiStreamEventsRequest) Execute() (*http.Response, error) {
 }
 
 /*
-StreamEvents Stream container lifecycle events as Server-Sent Events.
+StreamEvents Stream daemon lifecycle events as NDJSON.
+
+Each event is one JSON object on its own line, terminated with `\n`. The
+response advertises `Content-Type: application/json` (matching Docker's
+`/events` endpoint contract).
 
 # Errors
 

@@ -1,0 +1,39 @@
+# Cluster e2e fixture — v2 image, 3 replicas. Used by cluster_upgrade suite (post-rollout target).
+
+version: v1
+deployment: e2e-cluster-app
+
+services:
+  web:
+    rtype: service
+    image:
+      name: docker.io/library/nginx:1.29-alpine
+      pull_policy: if_not_present
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    # E2E health: a host-side `true` so the service is "healthy" as soon as a
+    # replica is running, without depending on overlay/HTTP reachability. These
+    # fixtures verify replica scaling + image transition, not endpoint health,
+    # and CI's networking can't probe the container's overlay IP.
+    health:
+      start_grace: 2s
+      interval: 3s
+      timeout: 5s
+      retries: 3
+      check:
+        type: command
+        command: "true"
+
+    # Same-service anti-affinity: distribute replicas across distinct cluster
+    # nodes (matches nginx-v1-3r so the cluster_upgrade rollout keeps the same
+    # spread). Without this the default Pack affinity concentrates replicas.
+    affinity: spread
+
+    scale:
+      mode: fixed
+      replicas: 3

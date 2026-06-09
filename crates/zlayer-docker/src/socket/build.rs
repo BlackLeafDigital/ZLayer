@@ -41,6 +41,7 @@ use zlayer_builder::{BuildEvent, ImageBuilder, PullBaseMode};
 
 use super::auth::decode_x_registry_config;
 use super::SocketState;
+use zlayer_paths::ZLayerDirs;
 
 /// Build API routes.
 pub(crate) fn routes(state: SocketState) -> Router {
@@ -269,11 +270,15 @@ fn build_event_to_ndjson(event: &BuildEvent) -> Option<Bytes> {
         BuildEvent::StageComplete { index } => {
             Some(stream_event(&format!(" ---> Stage {} complete", index + 1)))
         }
-        // BuildStarted, InstructionComplete{cached:false}, BuildComplete, and
-        // BuildFailed are intentionally silent: BuildStarted is metadata only,
-        // a non-cached InstructionComplete is implied by Output lines, and the
-        // terminal aux/errorDetail lines are emitted by the caller.
+        // BuildStarted, BuildPlan, InstructionComplete{cached:false},
+        // BuildComplete, and BuildFailed are intentionally silent: BuildStarted
+        // and BuildPlan are metadata only (the docker NDJSON stream has no
+        // up-front-plan concept; per-step lines come via StageStarted/
+        // InstructionStarted/Output), a non-cached InstructionComplete is
+        // implied by Output lines, and the terminal aux/errorDetail lines are
+        // emitted by the caller.
         BuildEvent::BuildStarted { .. }
+        | BuildEvent::BuildPlan { .. }
         | BuildEvent::InstructionComplete { cached: false, .. }
         | BuildEvent::BuildComplete { .. }
         | BuildEvent::BuildFailed { .. } => None,
@@ -369,7 +374,8 @@ async fn build_image(
     // Materialise the build context to a temp directory. The directory is
     // owned by the build task so it lives until the build finishes; on
     // failure we still tear it down via TempDir's Drop impl.
-    let temp_dir = tempfile::tempdir()
+    let temp_dir = ZLayerDirs::system_default()
+        .scratch_dir("build-image-")
         .map_err(|e| BuildHandlerError::Internal(format!("failed to create temp dir: {e}")))?;
     let context_path = temp_dir.path().to_path_buf();
 
@@ -400,7 +406,7 @@ async fn build_image(
 /// forwards builder events as NDJSON, and emits the terminal aux/error
 /// line when the build resolves.
 #[cfg(feature = "build")]
-fn spawn_streaming_build(query: BuildQuery, temp_dir: tempfile::TempDir) -> Response {
+fn spawn_streaming_build(query: BuildQuery, temp_dir: zlayer_types::Scratch) -> Response {
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, Infallible>>();
 
     tokio::spawn(async move {

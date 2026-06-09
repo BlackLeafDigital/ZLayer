@@ -37,6 +37,7 @@ pub use zlayer_types::api::syncs::*;
 use crate::error::{ApiError, Result};
 use crate::storage::{DeploymentStorage, StoredDeployment, StoredSync, SyncStorage};
 use zlayer_git::sync::{compute_diff, scan_resources, SyncDiff, SyncResource};
+use zlayer_paths::ZLayerDirs;
 
 /// Shared state for sync endpoints.
 #[derive(Clone)]
@@ -58,7 +59,7 @@ impl SyncState {
         Self {
             store,
             deployment_store,
-            clone_root: std::env::temp_dir().join("zlayer-projects"),
+            clone_root: ZLayerDirs::system_default().projects(),
         }
     }
 

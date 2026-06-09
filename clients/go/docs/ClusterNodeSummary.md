@@ -6,6 +6,7 @@ Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Address** | **string** | Network address (Raft RPC address) | 
 **AdvertiseAddr** | **string** | Advertise address (public IP) | 
+**ApiEndpoint** | Pointer to **string** | API endpoint as &#x60;advertise_addr:api_port&#x60; (e.g., \&quot;127.0.0.1:19110\&quot;). Distinct from &#x60;address&#x60; which holds the Raft RPC endpoint. | [optional] 
 **CpuTotal** | **float64** | Total CPU cores on this node | 
 **CpuUsed** | **float64** | Current CPU usage (cores) | 
 **Id** | **string** | UUID or Raft-level ID | 
@@ -77,6 +78,31 @@ and a boolean to check if the value has been set.
 
 SetAdvertiseAddr sets AdvertiseAddr field to given value.
 
+
+### GetApiEndpoint
+
+`func (o *ClusterNodeSummary) GetApiEndpoint() string`
+
+GetApiEndpoint returns the ApiEndpoint field if non-nil, zero value otherwise.
+
+### GetApiEndpointOk
+
+`func (o *ClusterNodeSummary) GetApiEndpointOk() (*string, bool)`
+
+GetApiEndpointOk returns a tuple with the ApiEndpoint field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetApiEndpoint
+
+`func (o *ClusterNodeSummary) SetApiEndpoint(v string)`
+
+SetApiEndpoint sets ApiEndpoint field to given value.
+
+### HasApiEndpoint
+
+`func (o *ClusterNodeSummary) HasApiEndpoint() bool`
+
+HasApiEndpoint returns a boolean if a field has been set.
 
 ### GetCpuTotal
 

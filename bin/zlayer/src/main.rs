@@ -57,6 +57,14 @@ fn main() -> ExitCode {
     // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
+    // Propagate the effective data dir to the process environment so that
+    // DaemonClient::default_socket_path() resolves to the matching per-data-dir
+    // socket (and any auto-spawned daemon inherits the same root via clap's
+    // env-var fallback on the --data-dir field). Without this, `zlayer
+    // --data-dir /custom/foo deploy …` would hit the SYSTEM default socket
+    // (`/var/run/zlayer.sock`) instead of `/custom/foo/run/zlayer.sock`.
+    std::env::set_var("ZLAYER_DATA_DIR", cli.effective_data_dir());
+
     if matches!(&cli.command, None | Some(Commands::Tui { .. })) {
         let stdin_tty = std::io::stdin().is_terminal();
         let stdout_tty = std::io::stdout().is_terminal();
@@ -561,6 +569,8 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
         let _guards = init_observability(&obs_config)
             .context("Failed to initialize observability for Windows Service")?;
 
+        let daemon_name = crate::cli::resolve_daemon_name(cli.daemon_name.as_deref());
+
         daemon_service::run_as_windows_service(
             bind.clone(),
             jwt_secret.clone(),
@@ -569,6 +579,7 @@ fn run_service_entry(cli: &Cli) -> Result<()> {
             cli.host_network,
             data_dir,
             deployment_name.clone(),
+            daemon_name,
             *wg_port,
             *dns_port,
         )
@@ -619,6 +630,7 @@ async fn run(
             verbose_build,
             platform,
             update_bottles,
+            backend,
         } => {
             commands::build::handle_build(
                 context.clone(),
@@ -637,6 +649,8 @@ async fn run(
                 *verbose_build,
                 platform.clone(),
                 *update_bottles,
+                backend.clone(),
+                cli.host_network,
             )
             .await
         }
@@ -663,6 +677,7 @@ async fn run(
                 *no_tui,
                 only.clone(),
                 platform.clone(),
+                cli.host_network,
             )
             .await
         }
@@ -691,8 +706,36 @@ async fn run(
             )
             .await
         }
-        Commands::Pull { image } => {
-            commands::registry::handle_pull(image.as_deref(), &cli.effective_data_dir()).await
+        Commands::Pull {
+            image,
+            username,
+            password,
+        } => {
+            commands::registry::handle_pull(
+                image.as_deref(),
+                username.clone(),
+                password.clone(),
+                &cli.effective_data_dir(),
+            )
+            .await
+        }
+        Commands::Login {
+            registry,
+            username,
+            password,
+            auth_type,
+            default,
+            zauth,
+        } => {
+            commands::login::run(
+                registry.clone(),
+                username.clone(),
+                password.clone(),
+                auth_type.to_string(),
+                *default,
+                *zauth,
+            )
+            .await
         }
 
         // =================================================================
@@ -725,25 +768,43 @@ async fn run(
             tunnel_bind,
             tunnel_tls_cert,
             tunnel_tls_key,
+            api_tls_cert,
+            api_tls_key,
+            api_tls_acme,
             no_tunnel_server,
+            restart_on_exit,
+            vacuum_secrets,
+            secrets_only,
             ..
         } => {
+            let socket_path = cli.effective_socket_path();
+            let data_dir = cli.effective_data_dir();
+
             // Spawn Docker API socket server if enabled. On Unix this is a
             // Unix domain socket; on Windows it is a named pipe. The transport
             // is selected inside `zlayer_docker::socket::serve`.
+            //
+            // The task needs THIS daemon's own UDS (`socket_path`) so it can
+            // wait for the API listener to come up and talk to it directly —
+            // calling `DaemonClient::connect()` at task-spawn time loses a
+            // race with the listener bind and auto-spawns a competing daemon
+            // that fails the :3669 port-bind. See
+            // `DaemonClient::connect_to_no_autospawn` in zlayer-client.
             #[cfg(feature = "docker-compat")]
             if *docker_socket {
                 let path = docker_socket_path.clone();
+                let daemon_uds = socket_path.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = zlayer_docker::socket::serve(std::path::Path::new(&path)).await
+                    if let Err(e) = zlayer_docker::socket::serve(
+                        std::path::Path::new(&path),
+                        std::path::Path::new(&daemon_uds),
+                    )
+                    .await
                     {
                         tracing::error!("Docker API socket server failed: {e}");
                     }
                 });
             }
-
-            let socket_path = cli.effective_socket_path();
-            let data_dir = cli.effective_data_dir();
 
             // Stash CLI-level tunnel overrides so the daemon picks them up
             // alongside the `ZLAYER_TUNNEL_*` env vars when it builds its
@@ -755,6 +816,39 @@ async fn run(
                 tls_key: tunnel_tls_key.clone(),
             };
             commands::serve::set_pending_tunnel_overrides(tunnel_overrides);
+
+            // Stash CLI-level daemon-API TLS overrides. The daemon reads
+            // them inside `serve_with_external_shutdown` and translates them
+            // into a `zlayer_api::config::ApiTlsConfig` that is set on
+            // `ApiConfig::tls` before the API listener binds. Clap's
+            // `requires` / `conflicts_with` constraints (in `cli.rs`) keep
+            // these three flags in a valid combination.
+            let api_tls_overrides = commands::serve::ApiTlsCliOverrides {
+                cert: api_tls_cert.clone(),
+                key: api_tls_key.clone(),
+                acme: *api_tls_acme,
+            };
+            commands::serve::set_pending_api_tls_overrides(api_tls_overrides);
+
+            // Wave 6 (v0.13.0): stash the `--vacuum-secrets` flag so the
+            // daemon's boot path (`serve_with_external_shutdown`) wipes
+            // `{data_dir}/join_secret` BEFORE the HS256 HMAC key derivation
+            // runs. Defaults to `false`; consumed exactly once per process.
+            commands::serve::set_pending_vacuum_secrets(*vacuum_secrets);
+
+            // Secrets-only mode: stash the flag so the daemon's boot path
+            // (`serve_with_external_shutdown`) mounts ONLY the secrets/RBAC
+            // router surface and skips orchestration nests. Same
+            // process-global-slot pattern as the flags above — keeps the
+            // `serve_with_external_shutdown` signature (pinned by the Windows
+            // Service host) untouched. Consumed exactly once per process.
+            commands::serve::set_pending_secrets_only(*secrets_only);
+
+            // Resolve the daemon instance name from the top-level
+            // `--daemon-name` flag (with current_exe fallback) so the
+            // running daemon stamps per-instance owner tags on its
+            // HCS/HCN resources.
+            let daemon_name = crate::cli::resolve_daemon_name(cli.daemon_name.as_deref());
 
             // NAT overrides are gated on the `nat` feature; on builds without
             // it, fall back to the env-var-only path via `serve()`.
@@ -774,9 +868,11 @@ async fn run(
                     cli.host_network,
                     data_dir,
                     deployment_name.clone(),
+                    daemon_name,
                     *wg_port,
                     *dns_port,
                     nat_overrides,
+                    *restart_on_exit,
                 ))
                 .await
             }
@@ -791,8 +887,10 @@ async fn run(
                     cli.host_network,
                     data_dir,
                     deployment_name.clone(),
+                    daemon_name,
                     *wg_port,
                     *dns_port,
+                    *restart_on_exit,
                 ))
                 .await
             }
@@ -833,6 +931,27 @@ async fn run(
                 #[cfg(not(unix))]
                 consent,
             ))
+            .await
+        }
+        Commands::Worker {
+            server,
+            token,
+            token_file,
+            labels,
+            identity_dir,
+            api_addr,
+        } => {
+            let resolved_identity_dir = identity_dir
+                .clone()
+                .unwrap_or_else(|| cli.effective_data_dir().join("worker").join("identity"));
+            commands::worker::run(
+                server.clone(),
+                token.clone(),
+                token_file.clone(),
+                labels.clone(),
+                resolved_identity_dir,
+                *api_addr,
+            )
             .await
         }
         Commands::Status => commands::lifecycle::status(&cli).await,
@@ -891,37 +1010,31 @@ async fn run(
         Commands::Node(node_cmd) => {
             commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
         }
-        Commands::Daemon(action) => {
-            commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
+        Commands::Cluster(cluster_cmd) => {
+            commands::cluster::handle_cluster(cluster_cmd, &cli.effective_data_dir()).await
+        }
+        Commands::Daemon(daemon_args) => {
+            commands::daemon::handle_daemon(
+                daemon_args,
+                &cli.effective_data_dir(),
+                cli.daemon_name.as_deref(),
+            )
+            .await
         }
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         Commands::Windows(cmd) => commands::windows::handle(cmd).await,
+        #[cfg(target_os = "macos")]
+        Commands::Vz(cmd) => commands::vz::handle_vz(&cli, cmd).await,
+        #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+        Commands::Runtime { global, command } => commands::runtime::handle(global, command).await,
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
         Commands::Container(container_cmd) => {
             commands::container::handle_container(&cli, container_cmd).await
         }
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
         Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
-        Commands::Run {
-            env,
-            no_global,
-            merge,
-            project,
-            dry_run,
-            unmask,
-            command,
-        } => {
-            commands::run::handle_run(
-                env,
-                *no_global,
-                merge,
-                project.as_deref(),
-                *dry_run,
-                *unmask,
-                command,
-            )
-            .await
-        }
+        #[cfg(feature = "docker-compat")]
+        Commands::Run(run_args) => commands::run::handle_container_run(run_args).await,
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await
         }
@@ -958,6 +1071,26 @@ async fn run(
                 description,
             } => commands::env::update(id.clone(), name.clone(), description.clone()).await,
             cli::EnvCommands::Delete { id, yes } => commands::env::delete(id.clone(), *yes).await,
+            cli::EnvCommands::Run {
+                env_id,
+                no_global,
+                merge,
+                project,
+                dry_run,
+                unmask,
+                command,
+            } => {
+                commands::run::handle_env_run(
+                    env_id,
+                    *no_global,
+                    merge,
+                    project.as_deref(),
+                    *dry_run,
+                    *unmask,
+                    command,
+                )
+                .await
+            }
         },
         Commands::Task(task_cmd) => match task_cmd {
             cli::TaskCommands::List { project, output } => {
@@ -1240,6 +1373,12 @@ async fn run(
                 commands::permission::revoke(id.clone()).await
             }
         },
+        Commands::SelfUpdate {
+            version,
+            yes,
+            restart,
+            repo,
+        } => commands::self_update::run(version.clone(), *yes, *restart, repo).await,
         Commands::Audit(audit_cmd) => match audit_cmd {
             cli::AuditCommands::Tail {
                 user,

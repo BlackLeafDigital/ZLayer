@@ -19,17 +19,24 @@ members = [
   "crates/zlayer-py",
   "crates/zlayer-web",
   "crates/zlayer-secrets",
+  "crates/secrets-client-api",
+  "crates/zlayer-secrets-client",
   "crates/zlayer-tunnel",
   "bin/zlayer",
   "crates/zlayer-manager",
   "crates/zlayer-consensus",
   "crates/zlayer-docker",
   "crates/zlayer-wsl",
+  "crates/zlayer-gcs",
   "crates/zlayer-git",
   "crates/zlayer-client",
   "crates/zlayer-hcs",
   "crates/zlayer-hns",
   "crates/zlayer-types",
+  "crates/zlayer-overlayd",
+  "crates/zlayer-cluster-rpc",
+  "crates/zlayer-vzagent",
+  "xtask",
 ]
 
 [workspace.package]
@@ -96,6 +103,11 @@ tower-http = { version = "0.6", features = ["full"] }
 # Web framework (for API)
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
+# `axum-server` adds TLS-terminated `axum::Router` serving on top of the
+# same rustls + tokio-rustls stack used by the proxy. Used by zlayer-api to
+# wrap the daemon's TCP listener with TLS when `--api-tls-cert/--api-tls-key`
+# or `--api-tls-acme` are set.
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # JWT Authentication
 jsonwebtoken = "9"
@@ -124,7 +136,7 @@ governor = "0.10"
 tower_governor = "0.8"
 
 # Consensus
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9.24", features = ["serde"] }
 
 # Metrics
 prometheus = "0.13"
@@ -143,6 +155,7 @@ async-trait = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
 
 # Cryptography
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 blake2 = "0.10"
 sha2 = "0.10"
@@ -232,6 +245,7 @@ zlayer-scheduler = { version = "0.0.0-dev", path = "crates/zlayer-scheduler" }
 zlayer-tunnel = { version = "0.0.0-dev", path = "crates/zlayer-tunnel" }
 zlayer-tui = { version = "0.0.0-dev", path = "crates/zlayer-tui" }
 zlayer-consensus = { version = "0.0.0-dev", path = "crates/zlayer-consensus" }
+zlayer-cluster-rpc = { version = "0.0.0-dev", path = "crates/zlayer-cluster-rpc" }
 zlayer-agent = { version = "0.0.0-dev", path = "crates/zlayer-agent" }
 zlayer-docker = { version = "0.0.0-dev", path = "crates/zlayer-docker" }
 zlayer-api = { version = "0.0.0-dev", path = "crates/zlayer-api" }
@@ -242,6 +256,10 @@ zlayer-git = { version = "0.0.0-dev", path = "crates/zlayer-git" }
 zlayer-client = { version = "0.0.0-dev", path = "crates/zlayer-client" }
 zlayer-hcs = { version = "0.0.0-dev", path = "crates/zlayer-hcs" }
 zlayer-hns = { version = "0.0.0-dev", path = "crates/zlayer-hns" }
+zlayer-gcs = { version = "0.0.0-dev", path = "crates/zlayer-gcs" }
+zlayer-overlayd = { version = "0.0.0-dev", path = "crates/zlayer-overlayd" }
+zlayer-vzagent = { version = "0.0.0-dev", path = "crates/zlayer-vzagent" }
+secrets-client-api = { version = "0.0.0-dev", path = "crates/secrets-client-api" }
 zlayer-types = { version = "0.0.0-dev", path = "crates/zlayer-types" }
 
 # Git (gitoxide) — pure-Rust git implementation used by `zlayer-git`.

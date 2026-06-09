@@ -1,0 +1,147 @@
+# kernel-arm64.defconfig — minimal arm64 kernel configuration for the ZLayer
+# macOS Apple-Virtualization (VZ) Linux guest.
+#
+# GPLv2: this is a configuration for the unmodified upstream Linux source (see
+# KERNEL_SOURCE.md). build.sh copies this file to `.config` and runs
+# `ARCH=arm64 make olddefconfig`, which fills every unspecified symbol with its
+# upstream default. Only the options ZLayer's VZ runtime depends on are pinned
+# below; everything else follows the kernel's arm64 defaults.
+#
+# Apple's Virtualization.framework presents virtio devices over BOTH the MMIO
+# and PCI transports depending on the device class, and exposes shared
+# directories (the OCI rootfs) via virtio-fs (FUSE). Both transports plus
+# virtio-fs are therefore built in (=y), never modules — there is no userspace
+# to load modules before the agent has mounted its root.
+
+# --- Base platform / boot ---------------------------------------------------
+CONFIG_64BIT=y
+CONFIG_ARM64=y
+CONFIG_SMP=y
+CONFIG_ARCH_VIRT=y
+CONFIG_PCI=y
+CONFIG_PCI_HOST_GENERIC=y
+CONFIG_ARM_PSCI=y
+CONFIG_ARM_ARCH_TIMER=y
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_TTY=y
+CONFIG_PRINTK=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# --- Initramfs / ramdisk ----------------------------------------------------
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+CONFIG_BLK_DEV=y
+CONFIG_BLK_DEV_RAM=y
+
+# --- virtio core + both transports (MMIO and PCI) ---------------------------
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_PROBE=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_PCI_LEGACY=y
+CONFIG_VIRTIO_BALLOON=y
+CONFIG_VIRTIO_INPUT=y
+
+# virtio-rng: seeds the guest CSPRNG. Without it the guest has no entropy source
+# and /dev/urandom never initializes, so Go's crypto/rand, TLS, and sshd block
+# ~60s+ at startup. The VZ runtime attaches a VZVirtioEntropyDeviceConfiguration.
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
+# --- virtio device drivers --------------------------------------------------
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+
+# --- virtio-vsock (host <-> guest control channel) --------------------------
+CONFIG_VSOCKETS=y
+CONFIG_VSOCKETS_DIAG=y
+CONFIG_VIRTIO_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS_COMMON=y
+
+# --- virtio-fs (host-shared OCI rootfs over FUSE) ---------------------------
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
+
+# --- Overlay / scratch filesystems ------------------------------------------
+CONFIG_OVERLAY_FS=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_UNIX98_PTYS=y
+
+# --- Backing block filesystem (for image layers on a virtio-blk disk) -------
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_USE_FOR_EXT2=y
+
+# --- Networking core + kernel-level DHCP (ip=dhcp) --------------------------
+# CONFIG_NETDEVICES is `default y if UML` in drivers/net/Kconfig — i.e. it
+# defaults to *n* on arm64. CONFIG_VIRTIO_NET, CONFIG_NET_CORE and
+# CONFIG_WIREGUARD all live inside the `if NETDEVICES` block, so without this
+# pinned =y `make olddefconfig` SILENTLY DROPS them and the guest boots with no
+# NIC (only `lo`). This single missing line was the root cause of VZ guests
+# having no network. The build.sh post-olddefconfig guard asserts it stuck.
+CONFIG_NETDEVICES=y
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_IP_PNP=y
+CONFIG_IP_PNP_DHCP=y
+CONFIG_IP_PNP_BOOTP=y
+CONFIG_NET_CORE=y
+
+# --- WireGuard (in-guest overlay netdev; configured over vsock by vzagent) ---
+# Also gated by NETDEVICES. Depends on NET && INET; its crypto libs
+# (curve25519 / chacha20poly1305) are auto-`select`ed by olddefconfig.
+CONFIG_WIREGUARD=y
+
+# --- Namespaces (container isolation) ---------------------------------------
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y
+CONFIG_TIME_NS=y
+
+# --- cgroups (resource control) ---------------------------------------------
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CPUSETS=y
+CONFIG_BLK_CGROUP=y
+
+# --- seccomp (syscall filtering for the workload) ---------------------------
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+
+# --- IPC: System V (shmget/semget/msgget) + POSIX message queues ------------
+# Real workloads need these even though the kernel is minimal: PostgreSQL's
+# bootstrap calls shmget() and fails with "could not create shared memory
+# segment: Function not implemented" (ENOSYS) without CONFIG_SYSVIPC. The IPC
+# namespace (CONFIG_IPC_NS, above) only *isolates* SysV IPC — it does not enable
+# the syscalls. POSIX_MQUEUE backs /dev/mqueue + mq_* for other apps.
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+
+# --- Misc hardening / essentials --------------------------------------------
+CONFIG_MULTIUSER=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_EVENTFD=y
+CONFIG_AIO=y
+CONFIG_ELF_CORE=y

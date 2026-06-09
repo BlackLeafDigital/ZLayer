@@ -909,7 +909,7 @@ fn wire_pull_result_round_trips() {
         "git_url": "https://github.com/user/repo",
         "branch": "main",
         "sha": "deadbeefcafebabe0000000000000000deadbeef",
-        "path": "/tmp/zlayer-projects/proj-1"
+        "path": "/var/lib/zlayer-projects/proj-1"
     }"#;
     let r: WirePullResult = serde_json::from_str(json).unwrap();
     assert_eq!(r.project_id, "proj-1");

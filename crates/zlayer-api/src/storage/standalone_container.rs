@@ -26,6 +26,8 @@ use zlayer_agent::runtime::ContainerId;
 
 use super::StorageError;
 use crate::handlers::containers::StandaloneContainer;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Trait for standalone-container storage backends.
 ///
@@ -258,10 +260,7 @@ impl SqliteStandaloneContainerStorage {
         })?;
         let labels = Self::decode_labels(labels_json)?;
         Ok(StandaloneContainer {
-            container_id: ContainerId {
-                service,
-                replica: replica_u32,
-            },
+            container_id: ContainerId::new(service, replica_u32),
             image,
             name,
             labels,
@@ -384,10 +383,7 @@ mod tests {
 
     fn make_container(service: &str, replica: u32) -> StandaloneContainer {
         StandaloneContainer {
-            container_id: ContainerId {
-                service: service.to_string(),
-                replica,
-            },
+            container_id: ContainerId::new(service.to_string(), replica),
             image: format!("registry.example.com/{service}:latest"),
             name: Some(format!("{service}-{replica}")),
             labels: HashMap::new(),
@@ -492,10 +488,7 @@ mod tests {
             let store = Arc::clone(&store);
             handles.push(tokio::spawn(async move {
                 let container = StandaloneContainer {
-                    container_id: ContainerId {
-                        service: format!("svc-{i}"),
-                        replica: i,
-                    },
+                    container_id: ContainerId::new(format!("svc-{i}"), i),
                     image: "img:latest".to_string(),
                     name: None,
                     labels: HashMap::new(),
@@ -621,7 +614,9 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_persists_across_reopen() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("sqlite-persists-across-reopen-")
+            .unwrap();
         let db_path = temp_dir.path().join("standalone-containers.db");
 
         // Write through one handle...

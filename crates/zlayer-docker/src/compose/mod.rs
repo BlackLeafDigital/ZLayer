@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 pub use convert::{build_image_tag, compose_to_deployment};
 pub use extends::{resolve_extends, ExtendsError};
 pub use include::{resolve_includes, IncludeError};
-pub use merge::{merge_compose_files, merge_values, resolve_paths, MergeError};
+pub use merge::{
+    merge_compose_files, merge_compose_files_to_value, merge_values, resolve_paths, MergeError,
+};
 pub use types::*;
 
 use crate::Result;

@@ -26,11 +26,11 @@
 
 #[cfg(windows)]
 #[allow(unused_imports)]
-pub use self::imp::{run_as_windows_service, SERVICE_NAME};
+pub use self::imp::{display_name, run_as_windows_service, service_name};
 
 #[cfg(not(windows))]
 #[allow(unused_imports)]
-pub use self::stub::{run_as_windows_service, SERVICE_NAME};
+pub use self::stub::{display_name, run_as_windows_service, service_name};
 
 // -----------------------------------------------------------------------
 // Non-Windows stub
@@ -39,11 +39,40 @@ pub use self::stub::{run_as_windows_service, SERVICE_NAME};
 mod stub {
     use anyhow::{bail, Result};
 
-    /// Name of the service registered with SCM. Kept in sync with the
-    /// Windows implementation so the rest of the codebase can reference this
-    /// constant from cross-platform code.
+    /// SCM service name for a given daemon instance.
+    ///
+    /// Preserves legacy `"ZLayerDaemon"` for `daemon_name == "zlayer"` so
+    /// existing installs aren't broken by upgrading. Other names become
+    /// `"ZLayerDaemon-<Suffix>"` with the suffix capitalized.
+    ///
+    /// Mirrors the Windows implementation so cross-platform code (error
+    /// messages, status formatters) can reference the same name regardless of
+    /// target OS.
     #[allow(dead_code)]
-    pub const SERVICE_NAME: &str = "ZLayerDaemon";
+    pub fn service_name(daemon_name: &str) -> String {
+        if daemon_name == "zlayer" {
+            "ZLayerDaemon".to_string()
+        } else {
+            let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+            let mut chars = suffix.chars();
+            let capitalized = match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+            format!("ZLayerDaemon-{capitalized}")
+        }
+    }
+
+    /// Human-readable display name for the SCM service.
+    #[allow(dead_code)]
+    pub fn display_name(daemon_name: &str) -> String {
+        if daemon_name == "zlayer" {
+            "ZLayer Daemon".to_string()
+        } else {
+            let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+            format!("ZLayer Daemon ({suffix})")
+        }
+    }
 
     /// Called when `--service` is set on a non-Windows target. Always errors
     /// out with a helpful message — the flag is only meaningful when SCM
@@ -62,6 +91,7 @@ mod stub {
         _host_network: bool,
         _data_dir: std::path::PathBuf,
         _deployment_name: String,
+        _daemon_name: String,
         _wg_port: Option<u16>,
         _dns_port: Option<u16>,
     ) -> Result<()> {
@@ -88,10 +118,34 @@ mod imp {
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
 
-    /// Name under which SCM knows the daemon service. I-2 (`daemon install`)
-    /// registers this exact name via `sc create`, and I-3..I-5 (`stop`,
-    /// `uninstall`, `status`) look it up by the same string.
-    pub const SERVICE_NAME: &str = "ZLayerDaemon";
+    /// SCM service name for a given daemon instance.
+    ///
+    /// Preserves legacy `"ZLayerDaemon"` for `daemon_name == "zlayer"` so
+    /// existing installs aren't broken by upgrading. Other names become
+    /// `"ZLayerDaemon-<Suffix>"` with the suffix capitalized.
+    pub fn service_name(daemon_name: &str) -> String {
+        if daemon_name == "zlayer" {
+            "ZLayerDaemon".to_string()
+        } else {
+            let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+            let mut chars = suffix.chars();
+            let capitalized = match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+            format!("ZLayerDaemon-{capitalized}")
+        }
+    }
+
+    /// Human-readable display name for the SCM service.
+    pub fn display_name(daemon_name: &str) -> String {
+        if daemon_name == "zlayer" {
+            "ZLayer Daemon".to_string()
+        } else {
+            let suffix = daemon_name.strip_prefix("zlayer-").unwrap_or(daemon_name);
+            format!("ZLayer Daemon ({suffix})")
+        }
+    }
 
     // SCM entry points can only carry process-global state through statics —
     // `ffi_service_main` is called on a thread the dispatcher owns and we
@@ -105,6 +159,7 @@ mod imp {
         host_network: bool,
         data_dir: PathBuf,
         deployment_name: String,
+        daemon_name: String,
         wg_port: Option<u16>,
         dns_port: Option<u16>,
     }
@@ -114,6 +169,12 @@ mod imp {
     /// Entry point called from `main()` when `zlayer serve --service` is
     /// invoked. Blocks until SCM tells the service to stop (via `Stop` or
     /// `Shutdown` control). Returns the exit code the service reported to SCM.
+    ///
+    /// `daemon_name` is the resolved instance name (already resolved by
+    /// `Cli::daemon_name` + `resolve_daemon_name`) and selects the SCM
+    /// service name the dispatcher reports against, so two side-by-side
+    /// installs each show up under their own service in `sc query` and
+    /// the event log.
     ///
     /// # Errors
     ///
@@ -129,11 +190,13 @@ mod imp {
         host_network: bool,
         data_dir: PathBuf,
         deployment_name: String,
+        daemon_name: String,
         wg_port: Option<u16>,
         dns_port: Option<u16>,
     ) -> Result<()> {
         // Stash the serve arguments so `my_service_main` can read them when
         // SCM invokes the dispatched entry point.
+        let daemon_name_for_dispatch = daemon_name.clone();
         {
             let mut slot = SERVICE_ARGS
                 .lock()
@@ -146,23 +209,26 @@ mod imp {
                 host_network,
                 data_dir,
                 deployment_name,
+                daemon_name,
                 wg_port,
                 dns_port,
             });
         }
 
+        let svc_name = service_name(&daemon_name_for_dispatch);
+
         info!(
-            service = SERVICE_NAME,
+            service = %svc_name,
             "Starting Windows Service dispatcher"
         );
 
         // Hand control to SCM. Blocks on the current thread until the
         // service stops.
-        service_dispatcher::start(SERVICE_NAME, ffi_service_main).with_context(|| {
+        service_dispatcher::start(svc_name.as_str(), ffi_service_main).with_context(|| {
             format!(
-                "Failed to start Windows Service dispatcher for '{SERVICE_NAME}'. \
+                "Failed to start Windows Service dispatcher for '{svc_name}'. \
                  This binary must be launched by the Service Control Manager; \
-                 run `zlayer daemon install` then `sc start {SERVICE_NAME}` instead \
+                 run `zlayer daemon install` then `sc start {svc_name}` instead \
                  of invoking `zlayer serve --service` directly."
             )
         })?;
@@ -221,7 +287,19 @@ mod imp {
             }
         };
 
-        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
+        // Snoop the stashed `daemon_name` so the SCM control handler we
+        // register reports back against the right service. Reading from
+        // `SERVICE_ARGS` here (instead of taking) avoids racing the
+        // `args.take()` below; we only need the name string here.
+        let svc_name = {
+            let guard = SERVICE_ARGS
+                .lock()
+                .expect("SERVICE_ARGS mutex poisoned (zlayer service main, svc_name read)");
+            let name = guard.as_ref().map_or("zlayer", |a| a.daemon_name.as_str());
+            service_name(name)
+        };
+
+        let status_handle = service_control_handler::register(svc_name.as_str(), event_handler)
             .context("Failed to register SCM control handler")?;
 
         // Report Running to SCM. We accept Stop and Shutdown — PreShutdown is
@@ -240,7 +318,7 @@ mod imp {
             .context("Failed to report ServiceState::Running to SCM")?;
 
         info!(
-            service = SERVICE_NAME,
+            service = %svc_name,
             "Windows Service reported Running to SCM, starting daemon"
         );
 
@@ -262,6 +340,7 @@ mod imp {
             host_network,
             data_dir,
             deployment_name,
+            daemon_name,
             wg_port,
             dns_port,
         } = args;
@@ -274,6 +353,7 @@ mod imp {
             host_network,
             data_dir,
             deployment_name,
+            daemon_name,
             wg_port,
             dns_port,
             Some(shutdown_rx),
@@ -308,5 +388,35 @@ mod imp {
         info!(clean, "Windows Service reported Stopped to SCM");
 
         serve_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_name_default_is_legacy() {
+        assert_eq!(service_name("zlayer"), "ZLayerDaemon");
+    }
+
+    #[test]
+    fn service_name_dev_is_suffixed() {
+        assert_eq!(service_name("zlayer-dev"), "ZLayerDaemon-Dev");
+    }
+
+    #[test]
+    fn service_name_arbitrary_name() {
+        assert_eq!(service_name("foo"), "ZLayerDaemon-Foo");
+    }
+
+    #[test]
+    fn display_name_default_is_legacy() {
+        assert_eq!(display_name("zlayer"), "ZLayer Daemon");
+    }
+
+    #[test]
+    fn display_name_dev_has_parenthetical() {
+        assert_eq!(display_name("zlayer-dev"), "ZLayer Daemon (dev)");
     }
 }

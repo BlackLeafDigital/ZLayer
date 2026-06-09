@@ -179,10 +179,7 @@ mod tests {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state =
             ContainerApiState::with_daemon_uuid(runtime, "auto-remove-test-uuid".to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new(service.to_string(), 0);
         // We deliberately do NOT call `create_container`/`start_container` on
         // the runtime here. `MockRuntime::stop_container` and
         // `MockRuntime::remove_container` are no-ops on unknown ids (they

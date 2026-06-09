@@ -15,7 +15,16 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands and capabilities
-full = ["docker", "docker-compat", "wasm", "s3", "persistent", "observability", "nat"]
+full = [
+    "docker",
+    "docker-compat",
+    "wasm",
+    "s3",
+    "persistent",
+    "observability",
+    "nat",
+    "youki-runtime",
+]
 
 # WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
 wsl = ["dep:zlayer-wsl"]
@@ -25,6 +34,15 @@ wsl = ["dep:zlayer-wsl"]
 # and forwards the `hcs-runtime` marker feature. Can coexist with `wsl`:
 # WSL2 handles distro bootstrap, HCS handles native Windows containers.
 hcs-runtime = ["dep:zlayer-agent", "zlayer-agent/hcs-runtime"]
+
+# Linux-only `zlayer runtime` runc-compatible CLI surface. Gates both the
+# subcommand tree that `Wsl2DelegateRuntime` shells out to inside the
+# `zlayer` WSL2 distro and the direct dependency on `zlayer-libcontainer`
+# that backs each verb. `zlayer-agent`'s own copy of the libcontainer dep is
+# enabled unconditionally on Unix (see `[target.'cfg(unix)'.dependencies]`
+# below) — this feature only flips on the version compiled INTO the CLI for
+# the runc-compatible verbs.
+youki-runtime = ["dep:libcontainer"]
 
 # Runtime capabilities (forwarded to deps)
 # The `zlayer-api/docker` forwarding enables the Docker-backed
@@ -91,12 +109,22 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 
 # HTTP
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["form"] }
 base64 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+# Self-update: archive extraction and integrity checking. `zip` is Windows-only
+# (see `[target.'cfg(target_os = "windows")'.dependencies]` below).
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+# Temp directory for staged downloads during `zlayer self-update`. Already
+# present in `[dev-dependencies]` for tests; promoted to a regular dep so the
+# `commands::self_update` runtime path can use it without #[cfg(test)] gating.
+tempfile = "3"
 
 # HTTP-over-Unix-socket client (daemon_client)
 hyper = { workspace = true }
@@ -123,6 +151,23 @@ zlayer-client.workspace = true
 # `dep:zlayer-docker` and the serve path references `zlayer_init_actions`.
 zlayer-docker = { workspace = true, optional = true }
 zlayer-init-actions.workspace = true
+ed25519-dalek.workspace = true
+
+# Duration parsing for CLI flags like `--ttl 24h` / `--ttl 30m` (signed
+# cluster join token expiry). Already a transitive workspace dep and used
+# directly by `zlayer-types`, `zlayer-api`, and `zlayer-builder`.
+humantime = "2"
+
+# Wave 4.1: HS256 cluster-join token minting alongside the Ed25519-signed
+# envelope. The leader-side validator in `zlayer-api` already accepts
+# HS256 JWTs with `iss=zlayer-cluster`, `aud=cluster-join`, `jti`, `exp`,
+# `iat`; this dep lets the CLI mint matching tokens without round-tripping
+# through the daemon.
+jsonwebtoken = { workspace = true }
+async-trait.workspace = true
+tonic = "0.14.5"
+openraft = { version = "0.9.24", features = ["serde"] }
+zlayer-overlayd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)
@@ -138,6 +183,8 @@ sd-notify = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 zlayer-wsl = { workspace = true, optional = true }
+# Self-update archive extraction on Windows (zlayer-*-windows-amd64.zip).
+zip = { workspace = true }
 # Optional on Windows: pulled in by the `hcs-runtime` feature when the caller
 # wants the full native Windows runtime embedded in the CLI. The thin-CLI
 # build (`--no-default-features --features wsl`) leaves this off.
@@ -155,6 +202,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = { version = "0.6.1-zlayer.5", package = "zlayer-libcontainer", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

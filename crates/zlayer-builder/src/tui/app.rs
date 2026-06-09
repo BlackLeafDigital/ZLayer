@@ -13,7 +13,7 @@ use zlayer_tui::terminal::{restore_terminal, setup_terminal, POLL_DURATION};
 use zlayer_tui::widgets::scrollable_pane::OutputLine;
 
 use super::build_view::BuildView;
-use super::{BuildEvent, InstructionStatus};
+use super::{BuildEvent, InstructionStatus, PlannedStage};
 
 /// Main TUI application for build progress visualization
 pub struct BuildTui {
@@ -171,32 +171,16 @@ impl BuildTui {
                 self.state.total_instructions = total_instructions;
             }
 
+            BuildEvent::BuildPlan { stages } => {
+                self.populate_from_plan(stages);
+            }
+
             BuildEvent::StageStarted {
                 index,
                 name,
                 base_image,
             } => {
-                // Ensure we have enough stages
-                while self.state.stages.len() <= index {
-                    self.state.stages.push(StageState {
-                        index: self.state.stages.len(),
-                        name: None,
-                        base_image: String::new(),
-                        instructions: Vec::new(),
-                        complete: false,
-                    });
-                }
-
-                // Update the stage
-                self.state.stages[index] = StageState {
-                    index,
-                    name,
-                    base_image,
-                    instructions: Vec::new(),
-                    complete: false,
-                };
-                self.state.current_stage = index;
-                self.state.current_instruction = 0;
+                self.handle_stage_started(index, name, base_image);
             }
 
             BuildEvent::InstructionStarted {
@@ -277,6 +261,80 @@ impl BuildTui {
                 }
             }
         }
+    }
+
+    /// Handle a [`BuildEvent::StageStarted`]: (re)create the stage at `index`
+    /// with an empty instruction list and make it current.
+    ///
+    /// Note: this resets the stage's instructions to empty, which would wipe a
+    /// plan pre-filled by [`BuildEvent::BuildPlan`]. The buildah sidecar
+    /// therefore does NOT emit `StageStarted` after a `BuildPlan`; only the
+    /// native backend (which never sends `BuildPlan`) does.
+    fn handle_stage_started(&mut self, index: usize, name: Option<String>, base_image: String) {
+        // Ensure we have enough stages
+        while self.state.stages.len() <= index {
+            self.state.stages.push(StageState {
+                index: self.state.stages.len(),
+                name: None,
+                base_image: String::new(),
+                instructions: Vec::new(),
+                complete: false,
+            });
+        }
+
+        // Update the stage
+        self.state.stages[index] = StageState {
+            index,
+            name,
+            base_image,
+            instructions: Vec::new(),
+            complete: false,
+        };
+        self.state.current_stage = index;
+        self.state.current_instruction = 0;
+    }
+
+    /// Pre-populate the state's stages/instructions from a [`BuildEvent::BuildPlan`].
+    ///
+    /// One [`StageState`] per planned stage (in order, named, with its base
+    /// image and `complete: false`); each planned instruction becomes a
+    /// `Pending` [`InstructionState`]. `total_stages`/`total_instructions`
+    /// are seeded from the plan only if still `0`. After this, the sidecar
+    /// will NOT send `StageStarted` (which would wipe a stage's instructions);
+    /// it only sends `InstructionStarted`/`InstructionComplete`, whose
+    /// existing handlers update `instructions[index]` in place.
+    fn populate_from_plan(&mut self, stages: Vec<PlannedStage>) {
+        let plan_stage_count = stages.len();
+        let plan_instruction_count: usize = stages.iter().map(|s| s.instructions.len()).sum();
+
+        self.state.stages = stages
+            .into_iter()
+            .enumerate()
+            .map(|(index, planned)| StageState {
+                index,
+                name: planned.name,
+                base_image: planned.base_image,
+                instructions: planned
+                    .instructions
+                    .into_iter()
+                    .map(|text| InstructionState {
+                        text,
+                        status: InstructionStatus::Pending,
+                    })
+                    .collect(),
+                complete: false,
+            })
+            .collect();
+
+        if self.state.total_stages == 0 {
+            self.state.total_stages = plan_stage_count;
+        }
+        if self.state.total_instructions == 0 {
+            self.state.total_instructions = plan_instruction_count;
+        }
+
+        self.state.current_stage = 0;
+        self.state.current_instruction = 0;
     }
 
     /// Handle keyboard input
@@ -442,6 +500,125 @@ mod tests {
         assert_eq!(tui.state.total_instructions(), 7);
         // Current-stage denominator is also populated up-front.
         assert!(tui.state.current_stage_display().contains("Stage 1/2"));
+    }
+
+    #[test]
+    fn build_plan_prefills_pending_instructions() {
+        let (tx, rx) = mpsc::channel();
+        let mut tui = BuildTui::new(rx);
+
+        tx.send(BuildEvent::BuildPlan {
+            stages: vec![
+                PlannedStage {
+                    name: Some("builder".to_string()),
+                    base_image: "node:20-alpine".to_string(),
+                    instructions: vec!["WORKDIR /app".to_string(), "RUN npm ci".to_string()],
+                },
+                PlannedStage {
+                    name: None,
+                    base_image: "alpine".to_string(),
+                    instructions: vec!["COPY --from=builder /app /app".to_string()],
+                },
+            ],
+        })
+        .unwrap();
+
+        drop(tx);
+        tui.process_events();
+
+        // Full plan is present immediately — two stages, three instructions,
+        // all Pending. (This is what unblocks "Waiting for build to start...".)
+        assert_eq!(tui.state.stages.len(), 2);
+        assert_eq!(tui.state.total_stages, 2);
+        assert_eq!(tui.state.total_instructions(), 3);
+        assert_eq!(tui.state.completed_instructions(), 0);
+        assert!(tui
+            .state
+            .stages
+            .iter()
+            .flat_map(|s| &s.instructions)
+            .all(|i| matches!(i.status, InstructionStatus::Pending)));
+        assert_eq!(tui.state.stages[0].instructions[0].text, "WORKDIR /app");
+    }
+
+    #[test]
+    fn build_plan_then_progress_advances_statuses() {
+        // Mirrors what the sidecar backend emits: a BuildPlan, then a
+        // sequence of InstructionStarted/InstructionComplete derived from
+        // buildah's `--> ` commit markers. Statuses must advance
+        // Pending -> Running -> Complete and the counter must track.
+        let (tx, rx) = mpsc::channel();
+        let mut tui = BuildTui::new(rx);
+
+        tx.send(BuildEvent::BuildPlan {
+            stages: vec![PlannedStage {
+                name: None,
+                base_image: "alpine".to_string(),
+                instructions: vec!["RUN echo a".to_string(), "RUN echo b".to_string()],
+            }],
+        })
+        .unwrap();
+
+        // Sidecar marks the first instruction Running up-front.
+        tx.send(BuildEvent::InstructionStarted {
+            stage: 0,
+            index: 0,
+            instruction: "RUN echo a".to_string(),
+        })
+        .unwrap();
+
+        drop(tx);
+        tui.process_events();
+
+        assert!(tui.state.stages[0].instructions[0].status.is_running());
+        assert!(matches!(
+            tui.state.stages[0].instructions[1].status,
+            InstructionStatus::Pending
+        ));
+        assert_eq!(tui.state.completed_instructions(), 0);
+
+        // First `--> ` marker: complete inst 0, start inst 1.
+        let (tx, rx) = mpsc::channel();
+        let mut tui2 = BuildTui::new(rx);
+        tx.send(BuildEvent::BuildPlan {
+            stages: vec![PlannedStage {
+                name: None,
+                base_image: "alpine".to_string(),
+                instructions: vec!["RUN echo a".to_string(), "RUN echo b".to_string()],
+            }],
+        })
+        .unwrap();
+        tx.send(BuildEvent::InstructionStarted {
+            stage: 0,
+            index: 0,
+            instruction: "RUN echo a".to_string(),
+        })
+        .unwrap();
+        tx.send(BuildEvent::InstructionComplete {
+            stage: 0,
+            index: 0,
+            cached: false,
+        })
+        .unwrap();
+        tx.send(BuildEvent::InstructionStarted {
+            stage: 0,
+            index: 1,
+            instruction: "RUN echo b".to_string(),
+        })
+        .unwrap();
+        tx.send(BuildEvent::InstructionComplete {
+            stage: 0,
+            index: 1,
+            cached: true,
+        })
+        .unwrap();
+        drop(tx);
+        tui2.process_events();
+
+        assert!(tui2.state.stages[0].instructions[0].status.is_complete());
+        assert!(tui2.state.stages[0].instructions[1].status.is_complete());
+        assert_eq!(tui2.state.completed_instructions(), 2);
+        assert_eq!(tui2.state.total_instructions(), 2);
     }
 
     #[test]

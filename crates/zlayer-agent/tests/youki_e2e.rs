@@ -27,6 +27,7 @@ use zlayer_agent::{
     ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager, YoukiConfig, YoukiRuntime,
 };
 use zlayer_overlay::DnsServer;
+use zlayer_paths::ZLayerDirs;
 use zlayer_proxy::ServiceRegistry;
 use zlayer_spec::{DeploymentSpec, HealthCheck, ServiceSpec};
 
@@ -46,7 +47,11 @@ macro_rules! with_timeout {
 }
 
 /// E2E test directory prefix
-const E2E_TEST_DIR: &str = "/tmp/zlayer-youki-e2e-test";
+fn e2e_test_dir() -> PathBuf {
+    ZLayerDirs::system_default()
+        .tmp()
+        .join("zlayer-youki-e2e-test")
+}
 
 /// Test images
 const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
@@ -156,7 +161,7 @@ async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), String> {
 
 /// Create a `YoukiRuntime` configured for E2E testing
 async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
-    let test_dir = PathBuf::from(E2E_TEST_DIR);
+    let test_dir = e2e_test_dir();
     let config = YoukiConfig {
         state_dir: test_dir.join("state"),
         rootfs_dir: test_dir.join("rootfs"),
@@ -309,10 +314,7 @@ async fn test_container_lifecycle() {
         };
 
         let service_name = unique_name("lifecycle");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_alpine_spec();
 
         // Setup cleanup guard
@@ -457,10 +459,7 @@ async fn test_health_checks_tcp() {
         };
 
         let service_name = unique_name("health");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let _spec = create_nginx_spec();
 
         // Setup cleanup guard
@@ -574,10 +573,7 @@ async fn test_container_logs() {
         };
 
         let service_name = unique_name("logs");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_alpine_spec();
 
         // Setup cleanup guard
@@ -654,10 +650,7 @@ async fn test_remove_nonexistent_is_idempotent() {
             }
         };
 
-        let id = ContainerId {
-            service: unique_name("nonexistent"),
-            replica: 999,
-        };
+        let id = ContainerId::new(unique_name("nonexistent"), 999);
 
         println!("Attempting to remove non-existent container: {id}");
         let result = runtime.remove_container(&id).await;
@@ -686,10 +679,7 @@ async fn test_error_state_nonexistent() {
             }
         };
 
-        let id = ContainerId {
-            service: unique_name("ghost"),
-            replica: 1,
-        };
+        let id = ContainerId::new(unique_name("ghost"), 1);
 
         let result = runtime.container_state(&id).await;
 
@@ -742,10 +732,7 @@ async fn test_concurrent_containers() {
             let name = base_name.clone();
 
             handles.push(tokio::spawn(async move {
-                let id = ContainerId {
-                    service: format!("{name}-{i}"),
-                    replica: 1,
-                };
+                let id = ContainerId::new(format!("{name}-{i}"), 1);
 
                 let create_result = runtime_clone.create_container(&id, &spec_clone).await;
                 (id, create_result)
@@ -842,10 +829,7 @@ async fn test_cleanup_state_directory() {
         };
 
         let service_name = unique_name("cleanup");
-        let id = ContainerId {
-            service: service_name.clone(),
-            replica: 1,
-        };
+        let id = ContainerId::new(service_name.clone(), 1);
         let spec = create_alpine_spec();
 
         // Pull image
@@ -870,7 +854,12 @@ async fn test_cleanup_state_directory() {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // State directory should exist
-        let state_dir = format!("{E2E_TEST_DIR}/state/{}-{}", id.service, id.replica);
+        let state_dir = format!(
+            "{}/state/{}-{}",
+            e2e_test_dir().display(),
+            id.service,
+            id.replica
+        );
         let exists_before = tokio::fs::metadata(&state_dir).await.is_ok();
         println!("State directory {state_dir} exists before removal: {exists_before}");
 
@@ -903,7 +892,7 @@ async fn create_test_overlay_manager() -> Option<Arc<tokio::sync::RwLock<Overlay
         return None;
     }
 
-    match OverlayManager::new("e2e-test".to_string()).await {
+    match OverlayManager::new("e2e-test".to_string(), "test".to_string()).await {
         Ok(manager) => Some(Arc::new(tokio::sync::RwLock::new(manager))),
         Err(e) => {
             eprintln!("Could not create overlay manager: {e}");

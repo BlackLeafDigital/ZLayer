@@ -25,20 +25,28 @@ type ClusterJoinRequest struct {
 	AdvertiseAddr string `json:"advertise_addr"`
 	// Joining node's API server port
 	ApiPort *int32 `json:"api_port,omitempty"`
+	// CPU architecture of the joining agent. Same legacy semantics as `os`.
+	Arch NullableArchKind `json:"arch,omitempty"`
 	// Total CPU cores on the joining node
 	CpuTotal *float64 `json:"cpu_total,omitempty"`
 	// Total disk in bytes
 	DiskTotal *int64 `json:"disk_total,omitempty"`
 	// Detected GPUs
 	Gpus []GpuInfoSummary `json:"gpus,omitempty"`
+	// Free-form labels advertised by the joining agent, used for `NodeSelector` placement matching. Empty on legacy clients.
+	Labels map[string]string `json:"labels,omitempty"`
 	// Total memory in bytes
 	MemoryTotal *int64 `json:"memory_total,omitempty"`
 	// Node mode: \"full\" or \"replicate\"
 	Mode *string `json:"mode,omitempty"`
+	// Operating system of the joining agent. `None` = legacy client that did not report platform info.
+	Os NullableOsKind `json:"os,omitempty"`
 	// Joining node's overlay port (`WireGuard`)
 	OverlayPort int32 `json:"overlay_port"`
 	// Joining node's Raft RPC port
 	RaftPort int32 `json:"raft_port"`
+	// Joiner's 32-byte X25519 pubkey for sealed-box DEK wrapping. Present on Phase-1+ joiners; absent on legacy clients (in which case the leader treats the node as not eligible to host replicated-secret ciphertext until it re-joins with a pubkey).
+	SecretsPubkey []int32 `json:"secrets_pubkey,omitempty"`
 	// Services to replicate (only if mode == \"replicate\")
 	Services []string `json:"services,omitempty"`
 	// Base64-encoded join token (contains `auth_secret` for validation)
@@ -125,6 +133,48 @@ func (o *ClusterJoinRequest) HasApiPort() bool {
 // SetApiPort gets a reference to the given int32 and assigns it to the ApiPort field.
 func (o *ClusterJoinRequest) SetApiPort(v int32) {
 	o.ApiPort = &v
+}
+
+// GetArch returns the Arch field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinRequest) GetArch() ArchKind {
+	if o == nil || IsNil(o.Arch.Get()) {
+		var ret ArchKind
+		return ret
+	}
+	return *o.Arch.Get()
+}
+
+// GetArchOk returns a tuple with the Arch field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinRequest) GetArchOk() (*ArchKind, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Arch.Get(), o.Arch.IsSet()
+}
+
+// HasArch returns a boolean if a field has been set.
+func (o *ClusterJoinRequest) HasArch() bool {
+	if o != nil && o.Arch.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetArch gets a reference to the given NullableArchKind and assigns it to the Arch field.
+func (o *ClusterJoinRequest) SetArch(v ArchKind) {
+	o.Arch.Set(&v)
+}
+// SetArchNil sets the value for Arch to be an explicit nil
+func (o *ClusterJoinRequest) SetArchNil() {
+	o.Arch.Set(nil)
+}
+
+// UnsetArch ensures that no value is present for Arch, not even an explicit nil
+func (o *ClusterJoinRequest) UnsetArch() {
+	o.Arch.Unset()
 }
 
 // GetCpuTotal returns the CpuTotal field value if set, zero value otherwise.
@@ -223,6 +273,38 @@ func (o *ClusterJoinRequest) SetGpus(v []GpuInfoSummary) {
 	o.Gpus = v
 }
 
+// GetLabels returns the Labels field value if set, zero value otherwise.
+func (o *ClusterJoinRequest) GetLabels() map[string]string {
+	if o == nil || IsNil(o.Labels) {
+		var ret map[string]string
+		return ret
+	}
+	return o.Labels
+}
+
+// GetLabelsOk returns a tuple with the Labels field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ClusterJoinRequest) GetLabelsOk() (map[string]string, bool) {
+	if o == nil || IsNil(o.Labels) {
+		return map[string]string{}, false
+	}
+	return o.Labels, true
+}
+
+// HasLabels returns a boolean if a field has been set.
+func (o *ClusterJoinRequest) HasLabels() bool {
+	if o != nil && !IsNil(o.Labels) {
+		return true
+	}
+
+	return false
+}
+
+// SetLabels gets a reference to the given map[string]string and assigns it to the Labels field.
+func (o *ClusterJoinRequest) SetLabels(v map[string]string) {
+	o.Labels = v
+}
+
 // GetMemoryTotal returns the MemoryTotal field value if set, zero value otherwise.
 func (o *ClusterJoinRequest) GetMemoryTotal() int64 {
 	if o == nil || IsNil(o.MemoryTotal) {
@@ -287,6 +369,48 @@ func (o *ClusterJoinRequest) SetMode(v string) {
 	o.Mode = &v
 }
 
+// GetOs returns the Os field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinRequest) GetOs() OsKind {
+	if o == nil || IsNil(o.Os.Get()) {
+		var ret OsKind
+		return ret
+	}
+	return *o.Os.Get()
+}
+
+// GetOsOk returns a tuple with the Os field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinRequest) GetOsOk() (*OsKind, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Os.Get(), o.Os.IsSet()
+}
+
+// HasOs returns a boolean if a field has been set.
+func (o *ClusterJoinRequest) HasOs() bool {
+	if o != nil && o.Os.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetOs gets a reference to the given NullableOsKind and assigns it to the Os field.
+func (o *ClusterJoinRequest) SetOs(v OsKind) {
+	o.Os.Set(&v)
+}
+// SetOsNil sets the value for Os to be an explicit nil
+func (o *ClusterJoinRequest) SetOsNil() {
+	o.Os.Set(nil)
+}
+
+// UnsetOs ensures that no value is present for Os, not even an explicit nil
+func (o *ClusterJoinRequest) UnsetOs() {
+	o.Os.Unset()
+}
+
 // GetOverlayPort returns the OverlayPort field value
 func (o *ClusterJoinRequest) GetOverlayPort() int32 {
 	if o == nil {
@@ -333,6 +457,39 @@ func (o *ClusterJoinRequest) GetRaftPortOk() (*int32, bool) {
 // SetRaftPort sets field value
 func (o *ClusterJoinRequest) SetRaftPort(v int32) {
 	o.RaftPort = v
+}
+
+// GetSecretsPubkey returns the SecretsPubkey field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ClusterJoinRequest) GetSecretsPubkey() []int32 {
+	if o == nil {
+		var ret []int32
+		return ret
+	}
+	return o.SecretsPubkey
+}
+
+// GetSecretsPubkeyOk returns a tuple with the SecretsPubkey field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ClusterJoinRequest) GetSecretsPubkeyOk() ([]int32, bool) {
+	if o == nil || IsNil(o.SecretsPubkey) {
+		return nil, false
+	}
+	return o.SecretsPubkey, true
+}
+
+// HasSecretsPubkey returns a boolean if a field has been set.
+func (o *ClusterJoinRequest) HasSecretsPubkey() bool {
+	if o != nil && !IsNil(o.SecretsPubkey) {
+		return true
+	}
+
+	return false
+}
+
+// SetSecretsPubkey gets a reference to the given []int32 and assigns it to the SecretsPubkey field.
+func (o *ClusterJoinRequest) SetSecretsPubkey(v []int32) {
+	o.SecretsPubkey = v
 }
 
 // GetServices returns the Services field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -430,6 +587,9 @@ func (o ClusterJoinRequest) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.ApiPort) {
 		toSerialize["api_port"] = o.ApiPort
 	}
+	if o.Arch.IsSet() {
+		toSerialize["arch"] = o.Arch.Get()
+	}
 	if !IsNil(o.CpuTotal) {
 		toSerialize["cpu_total"] = o.CpuTotal
 	}
@@ -439,14 +599,23 @@ func (o ClusterJoinRequest) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.Gpus) {
 		toSerialize["gpus"] = o.Gpus
 	}
+	if !IsNil(o.Labels) {
+		toSerialize["labels"] = o.Labels
+	}
 	if !IsNil(o.MemoryTotal) {
 		toSerialize["memory_total"] = o.MemoryTotal
 	}
 	if !IsNil(o.Mode) {
 		toSerialize["mode"] = o.Mode
 	}
+	if o.Os.IsSet() {
+		toSerialize["os"] = o.Os.Get()
+	}
 	toSerialize["overlay_port"] = o.OverlayPort
 	toSerialize["raft_port"] = o.RaftPort
+	if o.SecretsPubkey != nil {
+		toSerialize["secrets_pubkey"] = o.SecretsPubkey
+	}
 	if o.Services != nil {
 		toSerialize["services"] = o.Services
 	}

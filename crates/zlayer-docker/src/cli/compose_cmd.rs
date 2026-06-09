@@ -31,7 +31,11 @@ use zlayer_client::{default_socket_path, DaemonClient};
 use crate::compose::env_source::collect_env_sources;
 use crate::compose::interpolate::interpolate_yaml_value;
 use crate::compose::profiles::{filter_services_by_profile, select_active_profiles};
-use crate::compose::{compose_to_deployment, parse_compose_with_layers, ComposeFile};
+use crate::compose::{
+    compose_to_deployment, merge_compose_files_to_value, resolve_extends, ComposeFile,
+};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 // ---------------------------------------------------------------------------
 // Subcommand definitions
@@ -40,6 +44,15 @@ use crate::compose::{compose_to_deployment, parse_compose_with_layers, ComposeFi
 /// Docker Compose commands.
 #[derive(Debug, Parser)]
 pub struct ComposeCommands {
+    /// Project-level compose flags accepted *before* the subcommand, the way
+    /// `docker compose [OPTIONS] SUBCOMMAND` (v2) and `docker-compose` (v1)
+    /// expect them. These mirror the per-subcommand [`ComposeContextArgs`]
+    /// (which remain `global = true` for the post-subcommand form), so
+    /// `zlayer docker compose -f a.yml -p web config` parses identically to
+    /// `zlayer docker compose config -f a.yml -p web`.
+    #[clap(flatten)]
+    pub ctx: ComposeContextArgs,
+
     /// Compose subcommand
     #[clap(subcommand)]
     pub command: ComposeSubcommand,
@@ -151,7 +164,7 @@ pub struct ComposeContextArgs {
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ComposeUpArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to start (default: all)
@@ -186,7 +199,7 @@ pub struct ComposeUpArgs {
 /// Arguments for `docker compose down`.
 #[derive(Debug, Parser)]
 pub struct ComposeDownArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Remove named volumes
@@ -214,7 +227,7 @@ pub struct ComposeLsArgs {
 /// Arguments for `docker compose build`.
 #[derive(Debug, Parser)]
 pub struct ComposeBuildArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to build (default: all)
@@ -232,7 +245,7 @@ pub struct ComposeBuildArgs {
 /// Arguments for `docker compose ps`.
 #[derive(Debug, Parser)]
 pub struct ComposePsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to list (default: all)
@@ -246,7 +259,7 @@ pub struct ComposePsArgs {
 /// Arguments for `docker compose logs`.
 #[derive(Debug, Parser)]
 pub struct ComposeLogsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to show logs for (default: all)
@@ -268,7 +281,7 @@ pub struct ComposeLogsArgs {
 /// Arguments for `docker compose exec`.
 #[derive(Debug, Parser)]
 pub struct ComposeExecArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name
@@ -289,7 +302,7 @@ pub struct ComposeExecArgs {
 /// Arguments for `docker compose pull`.
 #[derive(Debug, Parser)]
 pub struct ComposePullArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to pull (default: all)
@@ -299,7 +312,7 @@ pub struct ComposePullArgs {
 /// Arguments for `docker compose push`.
 #[derive(Debug, Parser)]
 pub struct ComposePushArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to push (default: all)
@@ -309,7 +322,7 @@ pub struct ComposePushArgs {
 /// Arguments for `docker compose restart`.
 #[derive(Debug, Parser)]
 pub struct ComposeRestartArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to restart (default: all)
@@ -323,7 +336,7 @@ pub struct ComposeRestartArgs {
 /// Arguments for `docker compose stop`.
 #[derive(Debug, Parser)]
 pub struct ComposeStopArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to stop (default: all)
@@ -337,7 +350,7 @@ pub struct ComposeStopArgs {
 /// Arguments for `docker compose start`.
 #[derive(Debug, Parser)]
 pub struct ComposeStartArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to start (default: all)
@@ -347,7 +360,7 @@ pub struct ComposeStartArgs {
 /// Arguments for `docker compose kill`.
 #[derive(Debug, Parser)]
 pub struct ComposeKillArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to kill (default: all)
@@ -361,7 +374,7 @@ pub struct ComposeKillArgs {
 /// Arguments for `docker compose rm`.
 #[derive(Debug, Parser)]
 pub struct ComposeRmArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to remove (default: all)
@@ -384,7 +397,7 @@ pub struct ComposeRmArgs {
 /// Arguments for `docker compose pause`.
 #[derive(Debug, Parser)]
 pub struct ComposePauseArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to pause (default: all)
@@ -394,7 +407,7 @@ pub struct ComposePauseArgs {
 /// Arguments for `docker compose unpause`.
 #[derive(Debug, Parser)]
 pub struct ComposeUnpauseArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to unpause (default: all)
@@ -405,7 +418,7 @@ pub struct ComposeUnpauseArgs {
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ComposeRunArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name to run.
@@ -439,7 +452,7 @@ pub struct ComposeRunArgs {
 /// Arguments for `docker compose config`.
 #[derive(Debug, Parser)]
 pub struct ComposeConfigArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Print only the service names.
@@ -460,7 +473,7 @@ pub struct ComposeConfigArgs {
 /// Arguments for `docker compose images`.
 #[derive(Debug, Parser)]
 pub struct ComposeImagesArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to inspect (default: all).
@@ -470,7 +483,7 @@ pub struct ComposeImagesArgs {
 /// Arguments for `docker compose port`.
 #[derive(Debug, Parser)]
 pub struct ComposePortArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name.
@@ -487,7 +500,7 @@ pub struct ComposePortArgs {
 /// Arguments for `docker compose top`.
 #[derive(Debug, Parser)]
 pub struct ComposeTopArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to inspect (default: all).
@@ -497,7 +510,7 @@ pub struct ComposeTopArgs {
 /// Arguments for `docker compose events`.
 #[derive(Debug, Parser)]
 pub struct ComposeEventsArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Output events as JSON lines.
@@ -508,7 +521,7 @@ pub struct ComposeEventsArgs {
 /// Arguments for `docker compose cp`.
 #[derive(Debug, Parser)]
 pub struct ComposeCpArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Source path (`<service>:<path>` or local path).
@@ -521,7 +534,7 @@ pub struct ComposeCpArgs {
 /// Arguments for `docker compose wait`.
 #[derive(Debug, Parser)]
 pub struct ComposeWaitArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Services to wait for (default: all).
@@ -531,14 +544,14 @@ pub struct ComposeWaitArgs {
 /// Arguments for `docker compose watch`.
 #[derive(Debug, Parser)]
 pub struct ComposeWatchArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 }
 
 /// Arguments for `docker compose attach`.
 #[derive(Debug, Parser)]
 pub struct ComposeAttachArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Service name to attach to.
@@ -556,7 +569,7 @@ pub struct ComposeVersionArgs {
 /// Arguments for `docker compose alpha publish`.
 #[derive(Debug, Parser)]
 pub struct ComposeAlphaPublishArgs {
-    #[clap(flatten)]
+    #[clap(skip)]
     pub ctx: ComposeContextArgs,
 
     /// Repository to publish to.
@@ -744,26 +757,6 @@ fn derive_project_name(
     "compose".to_string()
 }
 
-/// Build a [`ComposeFile`] from its raw merged YAML form by:
-/// 1. Re-serialising the merged file to a `serde_yaml::Value`.
-/// 2. Interpolating `${VAR...}` expressions against the layered env sources.
-/// 3. Deserialising the result back into [`ComposeFile`].
-///
-/// The two-step (`Value` -> interpolated -> `ComposeFile`) dance is needed
-/// because interpolation must run on raw strings *before* the typed
-/// deserializers (e.g. `deserialize_ports`) try to parse them — `${PORT}`
-/// would otherwise be rejected as an invalid port spec.
-fn interpolate_compose(
-    compose: &ComposeFile,
-    env: &HashMap<String, String>,
-) -> anyhow::Result<ComposeFile> {
-    let mut value = serde_yaml::to_value(compose)
-        .context("failed to project ComposeFile back to YAML for interpolation")?;
-    interpolate_yaml_value(&mut value, env).context("failed to interpolate compose variables")?;
-    serde_yaml::from_value::<ComposeFile>(value)
-        .context("failed to re-deserialize interpolated compose")
-}
-
 /// Apply a `--profile` filter to the in-place service map.
 fn apply_profile_filter(
     compose: &mut ComposeFile,
@@ -800,15 +793,26 @@ pub fn load_project(ctx: &ComposeContextArgs) -> anyhow::Result<LoadedProject> {
     let env = collect_env_sources(&project_dir, &ctx.env_files)
         .context("failed to collect env sources")?;
 
-    // 1. Merge files.
-    let merged = parse_compose_with_layers(&files)
+    // 1. Merge files into a single RAW YAML value (no typed deserialization yet).
+    let base = files.first().and_then(|p| p.parent());
+    let mut value = merge_compose_files_to_value(&files)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
         .with_context(|| format!("failed to merge compose files: {files:?}"))?;
 
-    // 2. Interpolate ${VAR...}.
-    let interpolated = interpolate_compose(&merged, &env)?;
+    // 2. Interpolate ${VAR...} on the raw value, BEFORE the typed deserializers
+    //    run. This is load-bearing: the short-port parser splits on `:`, so an
+    //    un-interpolated `${PORT:-3080}:3000` would be truncated at the `:` in
+    //    `:-`, leaving a brace-less `${PORT` that fails interpolation.
+    interpolate_yaml_value(&mut value, &env).context("failed to interpolate compose variables")?;
 
-    // 3. Apply --profile filter.
-    let mut compose = interpolated;
+    // 3. Deserialize into the typed ComposeFile, then resolve `extends:`.
+    let mut compose: ComposeFile =
+        serde_yaml::from_value(value).context("failed to parse interpolated compose file")?;
+    resolve_extends(&mut compose, base)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .context("failed to resolve compose extends")?;
+
+    // 4. Apply --profile filter.
     apply_profile_filter(&mut compose, &env, &ctx.profiles);
 
     // 4. Resolve final project name.
@@ -842,36 +846,54 @@ async fn connect_daemon() -> anyhow::Result<DaemonClient> {
 /// Returns an error if the compose file cannot be read, parsed, or converted,
 /// or if the daemon request fails.
 pub async fn handle_compose(cmd: ComposeCommands) -> anyhow::Result<()> {
+    // Project-level flags (`-f`, `-p`, `--project-directory`, `--env-file`,
+    // `--profile`) are `global = true` and flattened on the parent
+    // [`ComposeCommands`], so clap collects them whether they appear *before*
+    // or *after* the subcommand (Docker Compose v2 and v1 both allow the
+    // pre-subcommand form). The per-subcommand `ctx` fields are `#[clap(skip)]`
+    // placeholders; we merge the parsed parent `ctx` into each here so the
+    // existing handler bodies (which read `args.ctx`) keep working unchanged.
+    let ctx = cmd.ctx;
+    // Inject the parsed project-level `ctx` into the chosen subcommand's
+    // skipped placeholder, then dispatch. `dispatch!` keeps this terse so the
+    // handler bodies can keep reading `args.ctx` unchanged.
+    macro_rules! dispatch {
+        ($args:ident, $handler:ident) => {{
+            let mut args = $args;
+            args.ctx = ctx;
+            $handler(args).await
+        }};
+    }
     match cmd.command {
-        ComposeSubcommand::Up(args) => handle_up(args).await,
-        ComposeSubcommand::Down(args) => handle_down(args).await,
-        ComposeSubcommand::Ls(args) => handle_ls(args).await,
-        ComposeSubcommand::Build(args) => handle_build(args).await,
-        ComposeSubcommand::Ps(args) => handle_ps(args).await,
-        ComposeSubcommand::Logs(args) => handle_logs(args).await,
-        ComposeSubcommand::Exec(args) => handle_exec(args).await,
-        ComposeSubcommand::Pull(args) => handle_pull(args).await,
-        ComposeSubcommand::Push(args) => handle_push(args).await,
-        ComposeSubcommand::Restart(args) => handle_restart(args).await,
-        ComposeSubcommand::Stop(args) => handle_stop(args).await,
-        ComposeSubcommand::Start(args) => handle_start(args).await,
-        ComposeSubcommand::Kill(args) => handle_kill(args).await,
-        ComposeSubcommand::Rm(args) => handle_rm(args).await,
-        ComposeSubcommand::Pause(args) => handle_pause(args).await,
-        ComposeSubcommand::Unpause(args) => handle_unpause(args).await,
-        ComposeSubcommand::Run(args) => handle_run(args).await,
-        ComposeSubcommand::Config(args) => handle_config(args).await,
-        ComposeSubcommand::Images(args) => handle_images(args).await,
-        ComposeSubcommand::Port(args) => handle_port(args).await,
-        ComposeSubcommand::Top(args) => handle_top(args).await,
-        ComposeSubcommand::Events(args) => handle_events(args).await,
-        ComposeSubcommand::Cp(args) => handle_cp(args).await,
-        ComposeSubcommand::Wait(args) => handle_wait(args).await,
-        ComposeSubcommand::Watch(args) => handle_watch(args).await,
-        ComposeSubcommand::Attach(args) => handle_attach(args).await,
-        ComposeSubcommand::Version(args) => handle_version(args).await,
+        ComposeSubcommand::Up(a) => dispatch!(a, handle_up),
+        ComposeSubcommand::Down(a) => dispatch!(a, handle_down),
+        ComposeSubcommand::Ls(a) => handle_ls(a).await,
+        ComposeSubcommand::Build(a) => dispatch!(a, handle_build),
+        ComposeSubcommand::Ps(a) => dispatch!(a, handle_ps),
+        ComposeSubcommand::Logs(a) => dispatch!(a, handle_logs),
+        ComposeSubcommand::Exec(a) => dispatch!(a, handle_exec),
+        ComposeSubcommand::Pull(a) => dispatch!(a, handle_pull),
+        ComposeSubcommand::Push(a) => dispatch!(a, handle_push),
+        ComposeSubcommand::Restart(a) => dispatch!(a, handle_restart),
+        ComposeSubcommand::Stop(a) => dispatch!(a, handle_stop),
+        ComposeSubcommand::Start(a) => dispatch!(a, handle_start),
+        ComposeSubcommand::Kill(a) => dispatch!(a, handle_kill),
+        ComposeSubcommand::Rm(a) => dispatch!(a, handle_rm),
+        ComposeSubcommand::Pause(a) => dispatch!(a, handle_pause),
+        ComposeSubcommand::Unpause(a) => dispatch!(a, handle_unpause),
+        ComposeSubcommand::Run(a) => dispatch!(a, handle_run),
+        ComposeSubcommand::Config(a) => dispatch!(a, handle_config),
+        ComposeSubcommand::Images(a) => dispatch!(a, handle_images),
+        ComposeSubcommand::Port(a) => dispatch!(a, handle_port),
+        ComposeSubcommand::Top(a) => dispatch!(a, handle_top),
+        ComposeSubcommand::Events(a) => dispatch!(a, handle_events),
+        ComposeSubcommand::Cp(a) => dispatch!(a, handle_cp),
+        ComposeSubcommand::Wait(a) => dispatch!(a, handle_wait),
+        ComposeSubcommand::Watch(a) => dispatch!(a, handle_watch),
+        ComposeSubcommand::Attach(a) => dispatch!(a, handle_attach),
+        ComposeSubcommand::Version(a) => handle_version(a).await,
         ComposeSubcommand::Alpha(sub) => match sub {
-            ComposeAlphaSubcommand::Publish(args) => handle_alpha_publish(args).await,
+            ComposeAlphaSubcommand::Publish(a) => dispatch!(a, handle_alpha_publish),
         },
     }
 }
@@ -2906,7 +2928,9 @@ mod tests {
     #[test]
     fn load_project_merges_two_files_in_order() {
         // Two compose files: the second overrides the first's image and adds a service.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-merges-two-files-in-order-")
+            .unwrap();
         let _ = write_file(
             dir.path(),
             "base.yaml",
@@ -2966,7 +2990,9 @@ services:
     fn load_project_project_name_flag_overrides_default() {
         // Default would derive from the directory basename. Confirm that
         // `--project-name` wins and is sanitised.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-project-name-flag-overrides-default-")
+            .unwrap();
         write_file(
             dir.path(),
             "compose.yaml",
@@ -2999,7 +3025,9 @@ services:
     fn load_project_profile_filter_drops_inactive_services() {
         // `web` has no profiles (always active); `debug` requires the
         // `debug` profile.  Confirm filtering happens during load.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("load-project-profile-filter-drops-inactive-services-")
+            .unwrap();
         write_file(
             dir.path(),
             "compose.yaml",
@@ -3062,7 +3090,9 @@ services:
     async fn persist_lists_and_deletes_via_storage() {
         let storage: Arc<dyn ComposeProjectStorage> =
             Arc::new(InMemoryComposeProjectStorage::new());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("persist-lists-and-deletes-via-storage-")
+            .unwrap();
 
         // 1. compose up persists a record.
         let project = make_loaded("alpha", dir.path());
@@ -3105,7 +3135,9 @@ services:
     async fn persist_overwrites_existing_record() {
         let storage: Arc<dyn ComposeProjectStorage> =
             Arc::new(InMemoryComposeProjectStorage::new());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("persist-overwrites-existing-record-")
+            .unwrap();
         let project = make_loaded("beta", dir.path());
 
         persist_compose_project(&storage, &project, vec!["beta-web-0".to_string()])
@@ -3143,9 +3175,11 @@ services:
     #[test]
     fn parses_stop_subcommand() {
         let cmd = parse_compose(["stop", "-p", "myproj", "web", "db"]);
+        // Project-level flags land on the parent `ctx` (they are `global` and
+        // flattened on `ComposeCommands`), not on the subcommand's skipped one.
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
         match cmd.command {
             ComposeSubcommand::Stop(args) => {
-                assert_eq!(args.ctx.project_name.as_deref(), Some("myproj"));
                 assert_eq!(args.services, vec!["web", "db"]);
                 assert_eq!(args.timeout, 10);
             }
@@ -3156,13 +3190,57 @@ services:
     #[test]
     fn parses_start_subcommand() {
         let cmd = parse_compose(["start", "-p", "myproj"]);
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
         match cmd.command {
             ComposeSubcommand::Start(args) => {
-                assert_eq!(args.ctx.project_name.as_deref(), Some("myproj"));
                 assert!(args.services.is_empty());
             }
             other => panic!("unexpected subcommand: {other:?}"),
         }
+    }
+
+    /// Regression: Docker Compose accepts project-level flags *before* the
+    /// subcommand (`docker compose -f X -p Y config`). clap must collect those
+    /// leading flags into the parent `ctx` rather than rejecting them as
+    /// "unexpected argument", and the value must match the post-subcommand form.
+    #[test]
+    fn parses_pre_subcommand_project_flags() {
+        // Leading -f / -p / --project-directory / --env-file / --profile.
+        let cmd = parse_compose([
+            "-f",
+            "foo.yml",
+            "-p",
+            "myproj",
+            "--project-directory",
+            "/srv/app",
+            "--env-file",
+            ".env.prod",
+            "--profile",
+            "debug",
+            "config",
+            "--services",
+        ]);
+        assert_eq!(cmd.ctx.files, vec![PathBuf::from("foo.yml")]);
+        assert_eq!(cmd.ctx.project_name.as_deref(), Some("myproj"));
+        assert_eq!(
+            cmd.ctx.project_directory.as_deref(),
+            Some(Path::new("/srv/app"))
+        );
+        assert_eq!(cmd.ctx.env_files, vec![PathBuf::from(".env.prod")]);
+        assert_eq!(cmd.ctx.profiles, vec!["debug".to_string()]);
+        assert!(matches!(cmd.command, ComposeSubcommand::Config(_)));
+    }
+
+    /// The pre-subcommand and post-subcommand forms must parse identically:
+    /// `compose -f X config` == `compose config -f X`. Repeated `-f` flags on
+    /// the *same* side of the subcommand collect in order.
+    #[test]
+    fn pre_and_post_subcommand_flags_are_equivalent() {
+        let pre = parse_compose(["-f", "a.yml", "-f", "b.yml", "config"]);
+        let post = parse_compose(["config", "-f", "a.yml", "-f", "b.yml"]);
+        let expected = vec![PathBuf::from("a.yml"), PathBuf::from("b.yml")];
+        assert_eq!(pre.ctx.files, expected);
+        assert_eq!(post.ctx.files, expected);
     }
 
     #[test]

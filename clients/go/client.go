@@ -65,6 +65,8 @@ type APIClient struct {
 
 	CronAPI *CronAPIService
 
+	DaemonAPI *DaemonAPIService
+
 	DeploymentsAPI *DeploymentsAPIService
 
 	EnvironmentsAPI *EnvironmentsAPIService
@@ -142,6 +144,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.ContainersAPI = (*ContainersAPIService)(&c.common)
 	c.CredentialsAPI = (*CredentialsAPIService)(&c.common)
 	c.CronAPI = (*CronAPIService)(&c.common)
+	c.DaemonAPI = (*DaemonAPIService)(&c.common)
 	c.DeploymentsAPI = (*DeploymentsAPIService)(&c.common)
 	c.EnvironmentsAPI = (*EnvironmentsAPIService)(&c.common)
 	c.EventsAPI = (*EventsAPIService)(&c.common)

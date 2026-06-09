@@ -225,11 +225,76 @@ impl CacheType {
     }
 }
 
+/// Build an S3 blob-cache backend from the environment to use as the SHARED
+/// write-through tier behind a fast local cache (see
+/// [`crate::ImagePuller::with_s3_cache`]). Returns `Ok(None)` when no S3 bucket
+/// is configured (`ZLAYER_S3_BUCKET` unset) — distinct from `CacheType::from_env`,
+/// which only yields S3 when `ZLAYER_CACHE_TYPE=s3` and makes it the *primary*
+/// cache. Honors the same `ZLAYER_S3_*` variables as `from_env`.
+///
+/// # Errors
+///
+/// Returns `CacheError` if a bucket is configured but the backend fails to init.
+#[cfg(feature = "s3")]
+pub async fn s3_cache_from_env() -> Result<Option<Arc<Box<dyn BlobCacheBackend>>>, CacheError> {
+    let Ok(bucket) = std::env::var("ZLAYER_S3_BUCKET") else {
+        return Ok(None);
+    };
+    if bucket.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut config = S3CacheConfig::new(bucket);
+    if let Ok(region) = std::env::var("ZLAYER_S3_REGION") {
+        config = config.with_region(region);
+    }
+    if let Ok(endpoint) = std::env::var("ZLAYER_S3_ENDPOINT") {
+        config = config.with_endpoint(endpoint);
+    }
+    if let Ok(prefix) = std::env::var("ZLAYER_S3_PREFIX") {
+        config = config.with_prefix(prefix);
+    }
+    if let Ok(path_style) = std::env::var("ZLAYER_S3_PATH_STYLE") {
+        if path_style.to_lowercase() == "true" || path_style == "1" {
+            config = config.with_path_style();
+        }
+    }
+    let cache = S3BlobCache::new(config).await?;
+    Ok(Some(Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>)))
+}
+
+/// No-op when the `s3` feature is disabled: there is no S3 tier to build.
+///
+/// # Errors
+///
+/// Never errors in this build; the signature mirrors the `s3`-enabled variant
+/// so callers need no `cfg` gating.
+#[cfg(not(feature = "s3"))]
+#[allow(clippy::unused_async)]
+pub async fn s3_cache_from_env() -> Result<Option<Arc<Box<dyn BlobCacheBackend>>>, CacheError> {
+    Ok(None)
+}
+
+/// The last-resort default registry host for bare/unqualified image names,
+/// from `ZLAYER_DEFAULT_REGISTRY` (e.g. `docker.io`, `registry.example.com`).
+///
+/// Returns `None` when unset/empty — in which case a bare name found nowhere in
+/// the resolution chain is an error, NOT a silent docker.io pull. `ZLayer` never
+/// invents a default; the operator opts in explicitly.
+#[must_use]
+pub fn default_registry_from_env() -> Option<String> {
+    std::env::var("ZLAYER_DEFAULT_REGISTRY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+    #[cfg(feature = "persistent")]
+    use zlayer_paths::ZLayerDirs;
 
     /// Environment variable names used by cache configuration
     const ENV_CACHE_TYPE: &str = "ZLAYER_CACHE_TYPE";
@@ -382,7 +447,9 @@ mod tests {
     #[cfg(feature = "persistent")]
     #[tokio::test]
     async fn test_build_persistent_cache() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-build-persistent-cache-")
+            .unwrap();
         let cache_path = temp_dir.path().join("test.sqlite");
 
         let cache_type = CacheType::persistent_at(&cache_path);

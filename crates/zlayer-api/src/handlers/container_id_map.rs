@@ -151,10 +151,7 @@ mod tests {
     use super::*;
 
     fn cid(service: &str, replica: u32) -> ContainerId {
-        ContainerId {
-            service: service.to_string(),
-            replica,
-        }
+        ContainerId::new(service.to_string(), replica)
     }
 
     #[test]

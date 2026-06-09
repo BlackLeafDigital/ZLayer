@@ -2,6 +2,12 @@ name: 'ZLayer CLI'
 description: 'Install and (optionally) run the ZLayer CLI'
 author: 'BlackLeaf Digital'
 
+# NOTE: e2e coverage for this action lives in
+#   /home/zach/github/ZArcRunner/test/e2e-zlayer-action.sh
+# (ZArcRunner owns the Forgejo bring-up harness — see ZLayer plans for
+# context). Example usage in CI workflows may use either `runs-on:` or
+# `container:` blocks; both are supported.
+
 branding:
   icon: 'box'
   color: 'blue'
@@ -40,6 +46,56 @@ inputs:
       (systemd on Linux, launchd on macOS). Default 'false' (sets ZLAYER_NO_SERVICE=1).
     required: false
     default: 'false'
+  start-daemon:
+    description: |
+      Portable mode only. After install, launch `zlayer serve --daemon --bind <bind>`.
+      No-op in system mode (the systemd/launchd unit starts the daemon if install-daemon: true).
+    required: false
+    default: 'false'
+  bind:
+    description: |
+      Daemon bind address.
+      - System mode forwards via ZLAYER_BIND env to install.sh -> `daemon install --bind`.
+      - Portable + start-daemon spawns with `--bind <value>`.
+    required: false
+    default: '127.0.0.1:3669'
+  docker-socket:
+    description: |
+      Enable Docker API socket emulation.
+      - System mode: forwards ZLAYER_DOCKER_SOCKET=1 to install.sh.
+      - Portable + start-daemon: passes --docker-socket to the spawned daemon.
+      Requires a zlayer binary built with the `docker-compat` feature; validated at runtime.
+    required: false
+    default: 'false'
+  enable-completions:
+    description: |
+      Install shell completions. Detects $SHELL.
+      - System mode: `zlayer completions <shell>` piped (with sudo) to the system completion path.
+      - Portable: piped to $RUNNER_TEMP/zlayer-completions/.
+    required: false
+    default: 'false'
+  with-overlay:
+    description: |
+      Enable overlay networking on the daemon. Implies install-daemon: true (system mode) OR
+      start-daemon: true (portable mode). Verifies /dev/net/tun and sudo availability.
+      System mode forwards ZLAYER_WITH_OVERLAY=1 to install.sh; portable currently no-op for the
+      daemon flag (the flag is only honored by `daemon install`).
+    required: false
+    default: 'false'
+  admin-email:
+    description: 'Forwarded via env ZLAYER_BOOTSTRAP_EMAIL (clap env-mapped). System mode.'
+    required: false
+    default: ''
+  admin-password-file:
+    description: |
+      Path to a file containing the admin password. Forwarded via env ZLAYER_ADMIN_PASSWORD_FILE
+      to install.sh, which appends --admin-password-file. System mode.
+    required: false
+    default: ''
+  jwt-secret:
+    description: 'Forwarded via env ZLAYER_JWT_SECRET (clap env-mapped). System mode.'
+    required: false
+    default: ''
 
 outputs:
   version:
@@ -51,10 +107,74 @@ outputs:
   data-dir:
     description: 'Resolved ZLAYER_DATA_DIR (empty when system mode and no override was given).'
     value: ${{ steps.install.outputs.data_dir }}
+  daemon-running:
+    description: |
+      'true' iff start-daemon: true or system-mode daemon install succeeded AND the daemon
+      responds on <bind> (1 retry, 2s connect timeout). Empty string otherwise.
+    value: ${{ steps.daemon.outputs.daemon_running }}
+  socket-path:
+    description: 'UDS socket path if daemon was started.'
+    value: ${{ steps.daemon.outputs.socket_path }}
+  docker-socket-path:
+    description: '/var/run/docker.sock if docker-socket: true and daemon is running, empty otherwise.'
+    value: ${{ steps.daemon.outputs.docker_socket_path }}
 
 runs:
   using: 'composite'
   steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        INSTALL_DIR_INPUT="${{ inputs.install-dir }}"
+        INSTALL_DAEMON_INPUT="${{ inputs.install-daemon }}"
+        START_DAEMON_INPUT="${{ inputs.start-daemon }}"
+        WITH_OVERLAY_INPUT="${{ inputs.with-overlay }}"
+        DOCKER_SOCKET_INPUT="${{ inputs.docker-socket }}"
+        ADMIN_PASSWORD_FILE_INPUT="${{ inputs.admin-password-file }}"
+
+        # Rule 1: with-overlay requires a running daemon
+        if [ "$WITH_OVERLAY_INPUT" = "true" ] \
+           && [ "$START_DAEMON_INPUT" != "true" ] \
+           && [ "$INSTALL_DAEMON_INPUT" != "true" ]; then
+          echo "Error: with-overlay requires a running daemon — set start-daemon: true (portable) or install-daemon: true (system mode)." >&2
+          exit 1
+        fi
+
+        # Rule 2: with-overlay portable mode requires sudo
+        if [ "$WITH_OVERLAY_INPUT" = "true" ] && [ -z "$INSTALL_DIR_INPUT" ]; then
+          if ! command -v sudo >/dev/null 2>&1; then
+            echo "Error: with-overlay in portable mode requires sudo to grant overlay caps." >&2
+            exit 1
+          fi
+        fi
+
+        # Rule 3: with-overlay requires /dev/net/tun
+        if [ "$WITH_OVERLAY_INPUT" = "true" ]; then
+          if [ ! -e /dev/net/tun ]; then
+            echo "Error: kernel TUN device not available; load \`tun\` module or run on a host with TUN support." >&2
+            exit 1
+          fi
+        fi
+
+        # Rule 4: install-daemon requires install-dir
+        if [ "$INSTALL_DAEMON_INPUT" = "true" ] && [ -z "$INSTALL_DIR_INPUT" ]; then
+          echo "Error: install-daemon requires install-dir to be set; portable mode cannot install systemd/launchd units." >&2
+          exit 1
+        fi
+
+        # admin-password-file sanity (path exists if non-empty) — informational only,
+        # don't fail here since the file might be created by a later step in the job
+        # before the daemon actually starts. Echo path (not contents) for traceability.
+        if [ -n "$ADMIN_PASSWORD_FILE_INPUT" ]; then
+          echo "admin-password-file=${ADMIN_PASSWORD_FILE_INPUT}"
+        fi
+
+        # NOTE: Rule 5 (docker-compat feature probe) runs in the install step after
+        # the binary is extracted, since it needs the binary to exist.
+        echo "Validation passed."
+
     - name: Detect platform
       id: platform
       shell: bash
@@ -73,6 +193,7 @@ runs:
           *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
         esac
         echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
+        echo "os=$OS" >> "$GITHUB_OUTPUT"
 
     - name: Install ZLayer
       id: install
@@ -85,6 +206,12 @@ runs:
         INSTALL_DIR_INPUT="${{ inputs.install-dir }}"
         DATA_DIR_INPUT="${{ inputs.data-dir }}"
         INSTALL_DAEMON_INPUT="${{ inputs.install-daemon }}"
+        BIND_INPUT="${{ inputs.bind }}"
+        DOCKER_SOCKET_INPUT="${{ inputs.docker-socket }}"
+        WITH_OVERLAY_INPUT="${{ inputs.with-overlay }}"
+        ADMIN_EMAIL_INPUT="${{ inputs.admin-email }}"
+        ADMIN_PASSWORD_FILE_INPUT="${{ inputs.admin-password-file }}"
+        JWT_SECRET_INPUT="${{ inputs.jwt-secret }}"
 
         if ! command -v jq >/dev/null 2>&1; then
           echo "Error: jq is required but not installed." >&2
@@ -106,6 +233,19 @@ runs:
             exit 1
           fi
         fi
+
+        # Helper: probe binary for --docker-socket support (Rule 5).
+        # Args: $1 = path to zlayer binary
+        probe_docker_compat() {
+          local bin="$1"
+          if [ "$DOCKER_SOCKET_INPUT" != "true" ]; then
+            return 0
+          fi
+          if ! timeout 10s "$bin" daemon install --help 2>&1 | grep -q -- '--docker-socket'; then
+            echo "Error: docker-socket: true but this zlayer binary was not built with the \`docker-compat\` feature." >&2
+            exit 1
+          fi
+        }
 
         if [ -z "$INSTALL_DIR_INPUT" ]; then
           # ---------------- Portable mode ----------------
@@ -149,7 +289,13 @@ runs:
           mkdir -p "$DATA_DIR"
           echo "ZLAYER_DATA_DIR=${DATA_DIR}" >> "$GITHUB_ENV"
 
-          "${BIN_DIR}/zlayer" --version
+          # Rule 5: docker-compat feature probe (uses extracted binary)
+          probe_docker_compat "${BIN_DIR}/zlayer"
+
+          if ! timeout 30s "${BIN_DIR}/zlayer" --version; then
+            echo "Error: zlayer --version hung or failed (likely missing libseccomp.so.2, glibc mismatch, or binary corruption)." >&2
+            exit 1
+          fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
@@ -172,16 +318,36 @@ runs:
           fi
           chmod +x "$INSTALLER"
 
-          if [ "$INSTALL_DAEMON_INPUT" != "true" ]; then
-            ZLAYER_VERSION="$VERSION" \
-            ZLAYER_INSTALL_DIR="$INSTALL_DIR_INPUT" \
-            ZLAYER_NO_SERVICE=1 \
-              bash "$INSTALLER"
-          else
-            ZLAYER_VERSION="$VERSION" \
-            ZLAYER_INSTALL_DIR="$INSTALL_DIR_INPUT" \
-              bash "$INSTALLER"
+          # Build the env forwarding set for install.sh. Each var is exported only if non-empty
+          # (except booleans which we forward verbatim when "true"). install.sh runs with `sudo -E`
+          # internally so these reach the daemon install invocation.
+          INSTALLER_ENV=()
+          INSTALLER_ENV+=("ZLAYER_VERSION=$VERSION")
+          INSTALLER_ENV+=("ZLAYER_INSTALL_DIR=$INSTALL_DIR_INPUT")
+          if [ -n "$BIND_INPUT" ]; then
+            INSTALLER_ENV+=("ZLAYER_BIND=$BIND_INPUT")
           fi
+          if [ "$DOCKER_SOCKET_INPUT" = "true" ]; then
+            INSTALLER_ENV+=("ZLAYER_DOCKER_SOCKET=1")
+          fi
+          if [ "$WITH_OVERLAY_INPUT" = "true" ]; then
+            INSTALLER_ENV+=("ZLAYER_WITH_OVERLAY=1")
+          fi
+          if [ -n "$ADMIN_EMAIL_INPUT" ]; then
+            INSTALLER_ENV+=("ZLAYER_BOOTSTRAP_EMAIL=$ADMIN_EMAIL_INPUT")
+          fi
+          if [ -n "$ADMIN_PASSWORD_FILE_INPUT" ]; then
+            INSTALLER_ENV+=("ZLAYER_ADMIN_PASSWORD_FILE=$ADMIN_PASSWORD_FILE_INPUT")
+          fi
+          if [ -n "$JWT_SECRET_INPUT" ]; then
+            INSTALLER_ENV+=("ZLAYER_JWT_SECRET=$JWT_SECRET_INPUT")
+          fi
+
+          if [ "$INSTALL_DAEMON_INPUT" != "true" ]; then
+            INSTALLER_ENV+=("ZLAYER_NO_SERVICE=1")
+          fi
+
+          env "${INSTALLER_ENV[@]}" bash "$INSTALLER"
 
           BIN_DIR="$INSTALL_DIR_INPUT"
           case "$BIN_DIR" in
@@ -198,11 +364,170 @@ runs:
             echo "ZLAYER_DATA_DIR=${DATA_DIR_INPUT}" >> "$GITHUB_ENV"
           fi
 
-          "${BIN_DIR}/zlayer" --version
+          # Rule 5: docker-compat feature probe (system-installed binary)
+          probe_docker_compat "${BIN_DIR}/zlayer"
+
+          if ! timeout 30s "${BIN_DIR}/zlayer" --version; then
+            echo "Error: zlayer --version hung or failed (likely missing libseccomp.so.2, glibc mismatch, or binary corruption)." >&2
+            exit 1
+          fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "bin_dir=${BIN_DIR}" >> "$GITHUB_OUTPUT"
           echo "data_dir=${DATA_DIR_INPUT}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Start daemon (portable)
+      id: daemon
+      shell: bash
+      if: steps.install.outputs.bin_dir != ''
+      run: |
+        set -euo pipefail
+
+        INSTALL_DIR_INPUT="${{ inputs.install-dir }}"
+        INSTALL_DAEMON_INPUT="${{ inputs.install-daemon }}"
+        START_DAEMON_INPUT="${{ inputs.start-daemon }}"
+        BIND_INPUT="${{ inputs.bind }}"
+        DOCKER_SOCKET_INPUT="${{ inputs.docker-socket }}"
+        BIN_DIR="${{ steps.install.outputs.bin_dir }}"
+        DATA_DIR="${{ steps.install.outputs.data_dir }}"
+
+        DAEMON_RUNNING=""
+        SOCKET_PATH=""
+        DOCKER_SOCKET_PATH=""
+
+        probe_bind() {
+          local addr="$1"
+          local host="${addr%:*}"
+          local port="${addr##*:}"
+          local i
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+                   21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+                   41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+            if timeout 2s bash -c ">/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+              return 0
+            fi
+            sleep 0.5
+          done
+          return 1
+        }
+
+        if [ -z "$INSTALL_DIR_INPUT" ] && [ "$START_DAEMON_INPUT" = "true" ]; then
+          # Portable mode + start-daemon
+          PID_FILE="${RUNNER_TEMP:-/tmp}/zlayer-daemon.pid"
+          LOG_FILE="${RUNNER_TEMP:-/tmp}/zlayer-daemon.log"
+          SPAWN_ARGS=(serve --daemon --bind "$BIND_INPUT")
+          if [ "$DOCKER_SOCKET_INPUT" = "true" ]; then
+            SPAWN_ARGS+=(--docker-socket)
+          fi
+
+          echo "Spawning: ${BIN_DIR}/zlayer ${SPAWN_ARGS[*]}"
+          nohup "${BIN_DIR}/zlayer" "${SPAWN_ARGS[@]}" >"$LOG_FILE" 2>&1 &
+          echo $! > "$PID_FILE"
+          echo "Daemon PID: $(cat "$PID_FILE") (log: $LOG_FILE)"
+
+          if probe_bind "$BIND_INPUT"; then
+            DAEMON_RUNNING="true"
+            if [ -n "$DATA_DIR" ]; then
+              SOCKET_PATH="${DATA_DIR}/run/zlayer.sock"
+            fi
+            if [ "$DOCKER_SOCKET_INPUT" = "true" ]; then
+              DOCKER_SOCKET_PATH="/var/run/docker.sock"
+            fi
+          else
+            echo "Error: daemon did not become reachable on ${BIND_INPUT} within 30s." >&2
+            echo "--- daemon log (last 50 lines) ---" >&2
+            tail -n 50 "$LOG_FILE" >&2 || true
+            exit 1
+          fi
+        elif [ -n "$INSTALL_DIR_INPUT" ] && [ "$INSTALL_DAEMON_INPUT" = "true" ]; then
+          # System mode + install-daemon: install.sh already started the unit.
+          # Probe reachability to confirm.
+          if probe_bind "$BIND_INPUT"; then
+            DAEMON_RUNNING="true"
+            SOCKET_PATH="/var/run/zlayer.sock"
+            if [ "$DOCKER_SOCKET_INPUT" = "true" ]; then
+              DOCKER_SOCKET_PATH="/var/run/docker.sock"
+            fi
+          else
+            echo "Warning: system daemon not reachable on ${BIND_INPUT}; leaving daemon-running empty." >&2
+          fi
+        fi
+
+        echo "daemon_running=${DAEMON_RUNNING}" >> "$GITHUB_OUTPUT"
+        echo "socket_path=${SOCKET_PATH}" >> "$GITHUB_OUTPUT"
+        echo "docker_socket_path=${DOCKER_SOCKET_PATH}" >> "$GITHUB_OUTPUT"
+
+    - name: Install completions
+      shell: bash
+      if: inputs.enable-completions == 'true'
+      run: |
+        set -euo pipefail
+
+        INSTALL_DIR_INPUT="${{ inputs.install-dir }}"
+        BIN_DIR="${{ steps.install.outputs.bin_dir }}"
+        OS_NAME="${{ steps.platform.outputs.os }}"
+
+        # Detect shell. $SHELL on CI runners is often /bin/bash but may be empty;
+        # default to bash to be safe.
+        SHELL_PATH="${SHELL:-/bin/bash}"
+        SHELL_NAME="$(basename "$SHELL_PATH")"
+        case "$SHELL_NAME" in
+          bash|zsh|fish) ;;
+          *) SHELL_NAME="bash" ;;
+        esac
+
+        echo "Installing completions for: $SHELL_NAME"
+
+        if ! COMPLETIONS_OUT="$(timeout 30s "${BIN_DIR}/zlayer" completions "$SHELL_NAME" 2>&1)"; then
+          echo "Error: \`zlayer completions $SHELL_NAME\` hung or failed." >&2
+          printf '%s\n' "$COMPLETIONS_OUT" >&2
+          exit 1
+        fi
+
+        if [ -z "$INSTALL_DIR_INPUT" ]; then
+          # Portable: write to $RUNNER_TEMP/zlayer-completions/
+          COMP_DIR="${RUNNER_TEMP:-/tmp}/zlayer-completions"
+          mkdir -p "$COMP_DIR"
+          case "$SHELL_NAME" in
+            bash) COMP_FILE="${COMP_DIR}/zlayer.bash" ;;
+            zsh)  COMP_FILE="${COMP_DIR}/_zlayer" ;;
+            fish) COMP_FILE="${COMP_DIR}/zlayer.fish" ;;
+          esac
+          printf '%s\n' "$COMPLETIONS_OUT" > "$COMP_FILE"
+          echo "Completions written: $COMP_FILE"
+        else
+          # System: write to canonical completion path with sudo when needed.
+          case "$OS_NAME" in
+            linux)
+              case "$SHELL_NAME" in
+                bash) COMP_FILE="/etc/bash_completion.d/zlayer" ;;
+                zsh)  COMP_FILE="/usr/share/zsh/site-functions/_zlayer" ;;
+                fish) COMP_FILE="/etc/fish/completions/zlayer.fish" ;;
+              esac
+              ;;
+            darwin)
+              case "$SHELL_NAME" in
+                bash) COMP_FILE="/usr/local/etc/bash_completion.d/zlayer" ;;
+                zsh)  COMP_FILE="/usr/local/share/zsh/site-functions/_zlayer" ;;
+                fish) COMP_FILE="/usr/local/share/fish/completions/zlayer.fish" ;;
+              esac
+              ;;
+            *)
+              echo "Warning: unsupported OS for system-mode completion install: $OS_NAME" >&2
+              exit 0
+              ;;
+          esac
+
+          COMP_PARENT="$(dirname "$COMP_FILE")"
+          if [ -w "$COMP_PARENT" ] || [ "$(id -u)" = "0" ]; then
+            mkdir -p "$COMP_PARENT"
+            printf '%s\n' "$COMPLETIONS_OUT" > "$COMP_FILE"
+          else
+            sudo mkdir -p "$COMP_PARENT"
+            printf '%s\n' "$COMPLETIONS_OUT" | sudo tee "$COMP_FILE" >/dev/null
+          fi
+          echo "Completions written: $COMP_FILE"
         fi
 
     - name: Run ZLayer command

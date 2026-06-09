@@ -13,15 +13,33 @@
 #![allow(clippy::missing_errors_doc)]
 
 use windows::core::HSTRING;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::HostComputeSystem::{
-    HcsCreateProcess, HcsGetProcessProperties, HcsModifyProcess, HcsOpenProcess, HcsSignalProcess,
-    HcsTerminateProcess, HCS_PROCESS, HCS_SYSTEM,
+    HcsCreateOperation, HcsCreateProcess, HcsGetProcessProperties, HcsModifyProcess,
+    HcsOpenProcess, HcsSignalProcess, HcsTerminateProcess, HcsWaitForOperationResultAndProcessInfo,
+    HCS_PROCESS, HCS_PROCESS_INFORMATION, HCS_SYSTEM,
 };
 
 use crate::error::{HcsError, HcsResult};
 use crate::handle::{OwnedProcess, SendHandle};
 use crate::operation::run_operation;
 use crate::schema::ProcessParameters;
+
+/// The captured stdout/stderr of a process created via
+/// [`ComputeProcess::create_capturing`].
+///
+/// The HANDLEs are real Win32 pipe read-ends in *this* process, handed back
+/// by HCS in the `HCS_PROCESS_INFORMATION` of the create operation. They are
+/// drained synchronously by [`drain_pipe`] and closed afterwards.
+#[derive(Debug)]
+pub struct CapturedProcess {
+    /// The created process handle.
+    pub process: ComputeProcess,
+    /// Read-end of the process's stdout pipe, or `None` if not requested.
+    stdout: Option<HANDLE>,
+    /// Read-end of the process's stderr pipe, or `None` if not requested.
+    stderr: Option<HANDLE>,
+}
 
 /// Handle to a process running inside an HCS compute system.
 ///
@@ -122,6 +140,111 @@ impl ComputeProcess {
     ) -> HcsResult<Self> {
         let json = serde_json::to_string(params)?;
         Self::create(system, &json).await
+    }
+
+    /// Create a process AND capture the stdout/stderr pipe read-ends HCS
+    /// returns in the create operation's `HCS_PROCESS_INFORMATION`.
+    ///
+    /// Unlike [`Self::create`] (which discards the operation result and never
+    /// requests process info), this drives the create operation to completion
+    /// with [`HcsWaitForOperationResultAndProcessInfo`], which fills an
+    /// `HCS_PROCESS_INFORMATION` whose `StdOutput`/`StdError` fields are real
+    /// Win32 pipe HANDLEs in *this* process. The returned [`CapturedProcess`]
+    /// owns those handles; call [`CapturedProcess::drain`] to read them to EOF
+    /// (after the process exits) and close them.
+    ///
+    /// `params` should set `create_std_out_pipe` / `create_std_err_pipe` so
+    /// HCS actually creates the pipes; otherwise the corresponding handle
+    /// comes back invalid and [`CapturedProcess::drain`] yields an empty
+    /// string for that stream.
+    ///
+    /// The whole call runs on a blocking thread (it uses the synchronous
+    /// `HcsWaitForOperationResultAndProcessInfo`, which blocks until the
+    /// create completes); callers should invoke it from
+    /// `tokio::task::spawn_blocking`.
+    pub fn create_capturing_blocking(
+        system: SendHandle<HCS_SYSTEM>,
+        params: &ProcessParameters,
+    ) -> HcsResult<CapturedProcess> {
+        let json = serde_json::to_string(params)?;
+        let params_w = HSTRING::from(json.as_str());
+
+        // SAFETY: a fresh operation with no completion callback — we drive it
+        // synchronously below via `HcsWaitForOperationResultAndProcessInfo`.
+        let op = unsafe { HcsCreateOperation(None, None) };
+        if op.is_invalid() {
+            return Err(HcsError::Other {
+                hresult: 0,
+                message: "HcsCreateOperation returned an invalid handle".to_string(),
+            });
+        }
+        // Ensure the operation is closed on every exit path.
+        // SAFETY: `op` was just produced by `HcsCreateOperation`.
+        let owned_op = unsafe { crate::handle::OwnedOperation::from_raw(op) };
+
+        // Kick off the create against this operation.
+        // SAFETY: `*system` is a live compute-system handle; `params_w` lives
+        // for the call; `op` is fresh; `None` security descriptor → caller's
+        // default token.
+        let created =
+            match unsafe { HcsCreateProcess(*system, &params_w, *owned_op.as_raw(), None) } {
+                Ok(handle) => handle,
+                Err(e) => return Err(HcsError::from_hresult(e.code(), "HcsCreateProcess")),
+            };
+        if created.is_invalid() {
+            return Err(HcsError::Other {
+                hresult: 0,
+                message: "HcsCreateProcess returned invalid handle".to_string(),
+            });
+        }
+
+        // Wait for the create to complete and pull back the process info
+        // (which carries the StdOutput/StdError pipe handles). A generous
+        // timeout — the create itself is fast; the process then runs.
+        let mut info = HCS_PROCESS_INFORMATION::default();
+        let mut result_doc = windows::core::PWSTR::null();
+        // SAFETY: `op` is live; `info`/`result_doc` are valid out-params; HCS
+        // fills them. We pass `INFINITE`-equivalent large timeout; the create
+        // completion is prompt.
+        let wait = unsafe {
+            HcsWaitForOperationResultAndProcessInfo(
+                *owned_op.as_raw(),
+                30_000,
+                Some(&raw mut info),
+                Some(&raw mut result_doc),
+            )
+        };
+        if let Err(e) = wait {
+            // The process handle may still be valid; wrap it so it is closed.
+            // SAFETY: `created` came from `HcsCreateProcess` above.
+            drop(unsafe { OwnedProcess::from_raw(created) });
+            return Err(HcsError::from_hresult(
+                e.code(),
+                "HcsWaitForOperationResultAndProcessInfo",
+            ));
+        }
+
+        let stdout = (!info.StdOutput.is_invalid()).then_some(info.StdOutput);
+        let stderr = (!info.StdError.is_invalid()).then_some(info.StdError);
+        // We do not use StdInput here; close it immediately if present so the
+        // child does not block waiting on an input pipe we never write.
+        if !info.StdInput.is_invalid() {
+            // SAFETY: `StdInput` is a Win32 handle owned by us per the HCS
+            // process-info contract; closing the write-end signals EOF.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(info.StdInput);
+            }
+        }
+
+        Ok(CapturedProcess {
+            process: Self {
+                // SAFETY: `created` came from `HcsCreateProcess` and ownership
+                // transfers exclusively to the new `OwnedProcess`.
+                inner: unsafe { OwnedProcess::from_raw(created) },
+            },
+            stdout,
+            stderr,
+        })
     }
 
     /// Open an existing process by its `ProcessId` (for example the value
@@ -253,4 +376,92 @@ impl ComputeProcess {
         })
         .await
     }
+}
+
+impl CapturedProcess {
+    /// Borrow the underlying [`ComputeProcess`] (e.g. to poll its exit code).
+    #[must_use]
+    pub fn process(&self) -> &ComputeProcess {
+        &self.process
+    }
+
+    /// Read both captured pipes to EOF and return `(stdout, stderr)` as
+    /// lossily-decoded UTF-8. Consumes the capture and closes both pipe
+    /// handles. Blocks on the synchronous `ReadFile`; call from
+    /// `tokio::task::spawn_blocking`.
+    ///
+    /// EOF arrives when the child closes its write-end (i.e. exits). Callers
+    /// that want the buffered output should ensure the process has exited (or
+    /// will exit) before draining, otherwise the read blocks until it does.
+    #[must_use]
+    pub fn drain(self) -> (String, String) {
+        let out = self.stdout.map(drain_pipe).unwrap_or_default();
+        let err = self.stderr.map(drain_pipe).unwrap_or_default();
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    /// Drain both pipes (blocking until the child closes them / exits) and
+    /// return the drained `(stdout, stderr)` together with the still-live
+    /// [`ComputeProcess`] handle, which the caller can hand back to an async
+    /// context to read the authoritative exit code via
+    /// [`ComputeProcess::properties`].
+    ///
+    /// Splitting it this way lets the heavy blocking pipe reads run inside
+    /// `tokio::task::spawn_blocking` (the pipe `HANDLE`s are `!Send`, so they
+    /// must never cross an `.await`), while the `Send` `ComputeProcess` is
+    /// returned for the exit-code poll. Blocks; call from `spawn_blocking`.
+    #[must_use]
+    pub fn drain_with_process(self) -> (ComputeProcess, String, String) {
+        let out = self.stdout.map(drain_pipe).unwrap_or_default();
+        let err = self.stderr.map(drain_pipe).unwrap_or_default();
+        (
+            self.process,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+}
+
+/// Synchronously read a Win32 pipe handle to EOF, then close it.
+///
+/// EOF (`ReadFile` returning `ERROR_BROKEN_PIPE` / 0 bytes) terminates the
+/// loop. The handle is always closed before returning, even on error.
+fn drain_pipe(handle: HANDLE) -> Vec<u8> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_BROKEN_PIPE};
+    use windows::Win32::Storage::FileSystem::ReadFile;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let mut read: u32 = 0;
+        // SAFETY: `handle` is a live pipe read-end owned by us; `buf` is a
+        // valid writable slice; `read` is a valid out-param.
+        let res = unsafe { ReadFile(handle, Some(&mut buf), Some(&raw mut read), None) };
+        match res {
+            Ok(()) => {
+                if read == 0 {
+                    break; // clean EOF
+                }
+                out.extend_from_slice(&buf[..read as usize]);
+            }
+            Err(e) => {
+                // A broken pipe is the normal EOF signal for an anonymous pipe
+                // once the writer (the child) has exited and all buffered
+                // bytes are consumed. Anything else is unexpected; log it but
+                // still return what we captured.
+                if e.code() != ERROR_BROKEN_PIPE.to_hresult() {
+                    tracing::debug!(error = %e, "drain_pipe: ReadFile ended on a non-EOF error");
+                }
+                break;
+            }
+        }
+    }
+    // SAFETY: `handle` is ours; closing the read-end after draining.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    out
 }

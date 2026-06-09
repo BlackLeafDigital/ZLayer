@@ -327,6 +327,50 @@ pub struct CreateContainerRequest {
     /// matches the historical behavior for callers that omit the field.
     #[serde(default)]
     pub lifecycle: crate::spec::LifecycleSpec,
+
+    // -- Placement ----------------------------------------------------------
+    /// Node selection constraints (required / preferred labels). When set on a
+    /// daemon that has a cluster handle, the leader places the container on a
+    /// node whose labels satisfy the required set; otherwise the field is
+    /// ignored and the container is created locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<crate::spec::NodeSelector>,
+    /// Target platform (OS + arch) the container must run on, e.g.
+    /// `darwin/arm64`. When set on a clustered daemon, the leader places the
+    /// container on a node whose reported platform matches; when no node
+    /// matches, the request is rejected. Ignored on single-node daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<crate::spec::TargetPlatform>,
+
+    // -- Lifecycle: start-on-create -----------------------------------------
+    /// Whether the daemon should start the container immediately after
+    /// creating it.
+    ///
+    /// `None` (the default, and what `..Default::default()` / an omitted wire
+    /// field both produce) and `Some(true)` both mean "create and start",
+    /// preserving the historical `zlayer run`-style one-shot behaviour for the
+    /// native REST API and every existing caller.
+    ///
+    /// The Docker-compat shim sets this to `Some(false)`: Docker's
+    /// `POST /containers/create` is create-only and the client is expected to
+    /// follow up with an explicit `POST /containers/{id}/start`. Without
+    /// honouring this, a Docker `create` would auto-start the container,
+    /// leaving it in `running` state when the Docker contract requires
+    /// `created`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<bool>,
+}
+
+impl CreateContainerRequest {
+    /// Whether the daemon should start the container right after creating it.
+    ///
+    /// Returns `true` unless the request explicitly set `start: false`, so the
+    /// native one-shot behaviour is the default and only the Docker-compat
+    /// create-only path opts out.
+    #[must_use]
+    pub fn should_start_on_create(&self) -> bool {
+        self.start != Some(false)
+    }
 }
 
 /// A request to attach a freshly-created container to a user-defined bridge
@@ -499,10 +543,24 @@ fn default_tail() -> usize {
 }
 
 /// Exec request for running a command in a container
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ContainerExecRequest {
     /// Command and arguments to execute
     pub command: Vec<String>,
+    /// Optional `user[:group]` to run the command as (Docker `--user`). A NAME
+    /// (e.g. `git`) is resolved against the container's `/etc/passwd` by the
+    /// runtime; numeric `uid` / `uid:gid` are used directly. `None` keeps the
+    /// container's configured user (root by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Optional working directory inside the container (Docker `-w`/`--workdir`).
+    /// `None` keeps the container's default workdir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Extra environment variables in `KEY=VALUE` form (Docker `-e`/`--env`),
+    /// merged on top of the container's env (later entries win).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 /// Query parameters for the exec endpoint.
@@ -921,6 +979,116 @@ mod tests {
             image: "nginx:latest".to_string(),
             ..CreateContainerRequest::default()
         }
+    }
+
+    #[test]
+    fn create_request_round_trips_placement_fields() {
+        use crate::spec::{ArchKind, NodeSelector, OsKind, TargetPlatform};
+
+        let mut req = baseline_request();
+        req.platform = Some(TargetPlatform::new(OsKind::Macos, ArchKind::Arm64));
+        req.node_selector = Some(NodeSelector {
+            labels: [("zone".to_string(), "us-east".to_string())]
+                .into_iter()
+                .collect(),
+            prefer_labels: std::collections::HashMap::new(),
+        });
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: CreateContainerRequest =
+            serde_json::from_str(&json).expect("deserialize round-trip");
+
+        let platform = back.platform.expect("platform present");
+        assert_eq!(platform.os, OsKind::Macos);
+        assert_eq!(platform.arch, ArchKind::Arm64);
+        let selector = back.node_selector.expect("node_selector present");
+        assert_eq!(
+            selector.labels.get("zone").map(String::as_str),
+            Some("us-east")
+        );
+
+        // Omitted placement fields must round-trip as None (skip_serializing_if).
+        let bare: CreateContainerRequest =
+            serde_json::from_str(r#"{"image":"nginx:latest"}"#).expect("deserialize bare");
+        assert!(bare.platform.is_none());
+        assert!(bare.node_selector.is_none());
+    }
+
+    #[test]
+    fn start_on_create_defaults_to_true_and_honours_explicit_false() {
+        // Omitted `start` (the common case for native callers and the SDK)
+        // must mean "create and start" — anything else regresses
+        // `zlayer run`-style one-shots.
+        let bare: CreateContainerRequest =
+            serde_json::from_str(r#"{"image":"nginx:latest"}"#).expect("deserialize bare");
+        assert_eq!(bare.start, None);
+        assert!(
+            bare.should_start_on_create(),
+            "omitted start must default to start-on-create"
+        );
+
+        // `..Default::default()` (used by the CLI / compose run paths and by
+        // every in-process struct construction) must also start.
+        let dflt = CreateContainerRequest {
+            image: "nginx:latest".to_string(),
+            ..CreateContainerRequest::default()
+        };
+        assert!(
+            dflt.should_start_on_create(),
+            "Default::default() must default to start-on-create"
+        );
+
+        // Explicit `start: true` starts.
+        let yes: CreateContainerRequest =
+            serde_json::from_str(r#"{"image":"nginx:latest","start":true}"#)
+                .expect("deserialize start=true");
+        assert!(yes.should_start_on_create());
+
+        // Only an explicit `start: false` (the Docker-compat create-only path)
+        // suppresses the auto-start.
+        let no: CreateContainerRequest =
+            serde_json::from_str(r#"{"image":"nginx:latest","start":false}"#)
+                .expect("deserialize start=false");
+        assert_eq!(no.start, Some(false));
+        assert!(
+            !no.should_start_on_create(),
+            "explicit start=false must suppress the auto-start"
+        );
+    }
+
+    #[test]
+    fn buffered_exec_response_parses_native_wire_shape() {
+        // The native buffered exec handler emits
+        // `Json(ContainerExecResponse { exit_code, stdout, stderr })`. Lock the
+        // exact wire shape so a future rename can't silently regress the
+        // `DaemonClient::exec_in_container` parse path (which fails with
+        // "missing field 'exit_code'" when pointed at the wrong endpoint).
+        let resp = ContainerExecResponse {
+            exit_code: 42,
+            stdout: "hello".to_string(),
+            stderr: "oops".to_string(),
+        };
+        let wire = serde_json::to_string(&resp).expect("serialize");
+        assert_eq!(
+            wire, r#"{"exit_code":42,"stdout":"hello","stderr":"oops"}"#,
+            "buffered exec wire shape must stay snake_case exit_code/stdout/stderr"
+        );
+        let back: ContainerExecResponse = serde_json::from_str(&wire).expect("round-trip");
+        assert_eq!(back.exit_code, 42);
+        assert_eq!(back.stdout, "hello");
+        assert_eq!(back.stderr, "oops");
+
+        // Guard the bug we fixed: the *interactive* create-exec endpoint
+        // returns `{"Id":"<64-hex>"}`, which must NOT parse as a buffered
+        // exec result. (This is the `missing field 'exit_code' at line 1
+        // column 73` failure observed when the buffered client pointed at the
+        // create-exec route.)
+        let create_exec_body =
+            r#"{"Id":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}"#;
+        assert!(
+            serde_json::from_str::<ContainerExecResponse>(create_exec_body).is_err(),
+            "create-exec `{{Id}}` body must not deserialize as a buffered exec result"
+        );
     }
 
     #[test]

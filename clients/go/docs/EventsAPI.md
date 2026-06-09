@@ -4,7 +4,7 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
-[**StreamEvents**](EventsAPI.md#StreamEvents) | **Get** /api/v1/events | Stream container lifecycle events as Server-Sent Events.
+[**StreamEvents**](EventsAPI.md#StreamEvents) | **Get** /api/v1/events | Stream daemon lifecycle events as NDJSON.
 
 
 
@@ -12,7 +12,7 @@ Method | HTTP request | Description
 
 > StreamEvents(ctx).Follow(follow).Label(label).Execute()
 
-Stream container lifecycle events as Server-Sent Events.
+Stream daemon lifecycle events as NDJSON.
 
 
 
@@ -25,7 +25,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {

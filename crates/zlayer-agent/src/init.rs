@@ -287,10 +287,7 @@ mod tests {
     use super::*;
 
     fn test_container_id() -> ContainerId {
-        ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        }
+        ContainerId::new("test".to_string(), 1)
     }
 
     #[tokio::test]

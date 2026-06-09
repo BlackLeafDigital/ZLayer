@@ -14,6 +14,7 @@
 //! - [`config`] - Configuration types for overlay networks
 //! - [`dns`] - DNS server for service discovery
 //! - [`error`] - Error types for overlay operations
+//! - [`firewall`] - Inbound firewall-rule management (Windows; stub on other OSes)
 //! - [`health`] - Health checking for peer connectivity
 //! - [`transport`] - Overlay transport (boringtun device management via UAPI)
 //!
@@ -104,8 +105,10 @@ pub mod allocator;
 pub mod bootstrap;
 pub mod config;
 pub mod dns;
+pub mod edge_cache;
 pub mod error;
 pub mod firewall;
+pub mod gossip;
 pub mod health;
 pub mod transport;
 
@@ -127,6 +130,7 @@ pub use bootstrap::{
 pub use config::*;
 pub use dns::*;
 pub use error::{OverlayError, Result};
+pub use gossip::{GossipConfig, GossipPool, TopologyEvent};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};
 pub use ipnet;
 pub use transport::*;

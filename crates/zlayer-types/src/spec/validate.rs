@@ -127,6 +127,30 @@ pub fn validate_memory_option_wrapper(value: &String) -> Result<(), validator::V
     }
 }
 
+/// Convert a memory quantity string (`"512Mi"`, `"1Gi"`, `"2Ti"`, `"256Ki"`)
+/// into a byte count. Suffixes are binary (Ki = 1024, Mi = 1024², …).
+///
+/// Returns `None` if the value is malformed, lacks a recognized suffix, or
+/// overflows `u64`. The accepted grammar matches
+/// [`validate_memory_option_wrapper`]: a positive integer followed by one of
+/// `Ki` / `Mi` / `Gi` / `Ti`.
+#[must_use]
+pub fn memory_string_to_bytes(value: &str) -> Option<u64> {
+    const SUFFIXES: [(&str, u64); 4] = [
+        ("Ki", 1024),
+        ("Mi", 1024 * 1024),
+        ("Gi", 1024 * 1024 * 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+    ];
+    for (suffix, mult) in SUFFIXES {
+        if let Some(numeric) = value.strip_suffix(suffix) {
+            let n = numeric.parse::<u64>().ok()?;
+            return n.checked_mul(mult);
+        }
+    }
+    None
+}
+
 /// Wrapper for `validate_port` for use with validator crate
 /// Note: validator crate passes primitive types by value for custom validators
 ///
@@ -1146,6 +1170,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
             EndpointSpec {
@@ -1157,6 +1182,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Internal,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
         ];
@@ -1181,6 +1207,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
             EndpointSpec {
@@ -1192,6 +1219,7 @@ mod tests {
                 host: None,
                 expose: ExposeType::Public,
                 stream: None,
+                target_role: None,
                 tunnel: None,
             },
         ];

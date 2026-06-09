@@ -4,18 +4,6 @@
 //! HCN + Wintun installed. They create real HCN networks and endpoints;
 //! they are `#[ignore]` by default.
 //!
-//! Style lints that don't fight the architecture are allowed: test bodies
-//! exercising the full HCN setup/teardown sequence naturally exceed the
-//! 100-line limit; `_net` bindings are kept alive as RAII guards; the file
-//! references `PowerShell` / `New-NetRoute` / etc. in plain prose.
-#![allow(
-    clippy::too_many_lines,
-    clippy::used_underscore_binding,
-    clippy::doc_markdown,
-    clippy::single_match_else,
-    clippy::match_wild_err_arm
-)]
-//!
 //! Run with:
 //! ```powershell
 //! cargo test --test windows_overlay_e2e -- --ignored --nocapture
@@ -377,13 +365,16 @@ async fn test_endpoint_policy_json_matches_wire() {
 #[ignore = "requires a live Wintun adapter (zlayer-overlay or equivalent)"]
 async fn test_host_route_install_via_wintun() {
     // 1. Discover a Wintun-ish adapter.
-    let Some(adapter_alias) = find_wintun_adapter_alias().await else {
-        eprintln!(
-            "SKIP: no Wintun adapter (looked for 'zlayer-overlay' or any \
-             InterfaceDescription matching 'Wintun'); start the overlay \
-             transport before re-running this test."
-        );
-        return;
+    let adapter_alias = match find_wintun_adapter_alias().await {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "SKIP: no Wintun adapter (looked for 'zlayer-overlay' or any \
+                 InterfaceDescription matching 'Wintun'); start the overlay \
+                 transport before re-running this test."
+            );
+            return;
+        }
     };
     eprintln!("using wintun adapter: {adapter_alias}");
 

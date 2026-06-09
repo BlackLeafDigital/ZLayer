@@ -29,7 +29,7 @@ use windows::Win32::System::HostComputeNetwork::{
 
 use crate::error::{HnsError, HnsResult};
 use crate::handle::{HcnNetworkHandle, OwnedNetwork};
-use crate::schema::{HostComputeNetwork, Ipam, NetworkType, SchemaVersion, Subnet};
+use crate::schema::{HostComputeNetwork, Ipam, NetworkType, Route, SchemaVersion, Subnet};
 
 /// Owning wrapper around an HCN network. Drop closes (but does not delete)
 /// the underlying handle.
@@ -169,6 +169,16 @@ impl Network {
         subnet: &str,
         uplink_adapter_name: &str,
     ) -> HnsResult<Self> {
+        // Without an explicit gateway in the IPAM subnet, HCN's Transparent
+        // driver picks one itself AND silently reserves additional addresses
+        // beyond the gateway, causing `HcnCreateEndpoint` to reject low-numbered
+        // host addresses (e.g. `.2` on a `/28`) with `HCN_E_ADDR_INVALID_OR_RESERVED`
+        // (`0x803b002f`). Declare the gateway via a default route on the subnet
+        // so HCN treats every other address in the prefix as available.
+        let gateway = first_host_address(subnet).ok_or_else(|| HnsError::Other {
+            hresult: 0,
+            message: format!("create_transparent: invalid subnet CIDR '{subnet}'"),
+        })?;
         let settings = HostComputeNetwork {
             id: None,
             name: name.to_string(),
@@ -180,13 +190,44 @@ impl Network {
                 ty: "Static".to_string(),
                 subnets: vec![Subnet {
                     ip_address_prefix: subnet.to_string(),
-                    routes: Vec::new(),
+                    routes: vec![Route {
+                        next_hop: gateway,
+                        destination_prefix: "0.0.0.0/0".to_string(),
+                        metric: None,
+                    }],
                     policies: Vec::new(),
                 }],
             }],
             flags: 0,
             schema_version: SchemaVersion::default(),
         };
+        Self::create(id, &settings)
+    }
+
+    /// Create an HCN **Internal** network with the given `/slice_prefix` IPv4
+    /// subnet, backed by an internal Hyper-V vSwitch.
+    ///
+    /// Unlike [`Self::create_transparent`], an Internal network binds **no**
+    /// physical host adapter. HCN provisions a dedicated internal vSwitch and
+    /// gives the host a management vNIC at the subnet gateway (`network + 1`).
+    /// Containers attach with their real overlay IPs from the slice and reach
+    /// the rest of the cluster by routing through the host vNIC to the `ZLayer`
+    /// `WireGuard` overlay adapter. This keeps container traffic off the
+    /// operator's physical NIC entirely — the Transparent model bound the
+    /// default-gateway uplink, which on a remotely-administered host is the
+    /// very NIC the operator connects through, so creating that external
+    /// vSwitch could sever the host's own connectivity.
+    ///
+    /// The `subnet` CIDR becomes the network's Static IPAM subnet with a
+    /// default route to the gateway so HCN does not over-reserve low host
+    /// addresses (same `HCN_E_ADDR_INVALID_OR_RESERVED` avoidance as the
+    /// Transparent path).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from `HcnCreateNetwork` or from JSON serialization.
+    pub fn create_internal(id: GUID, name: &str, subnet: &str) -> HnsResult<Self> {
+        let settings = internal_settings(name, subnet)?;
         Self::create(id, &settings)
     }
 
@@ -202,6 +243,61 @@ impl Network {
     pub fn handle(&self) -> &OwnedNetwork {
         &self.handle
     }
+}
+
+/// First usable host address in a CIDR — the conventional default-gateway
+/// address for the subnet (`network + 1`). Returns `None` for malformed CIDR
+/// strings or subnets too small to contain a usable host (`/31`, `/32`).
+fn first_host_address(cidr: &str) -> Option<String> {
+    let net: ipnet::IpNet = cidr.parse().ok()?;
+    let ipnet::IpNet::V4(v4) = net else {
+        // HCN Transparent overlay is IPv4-only in the current schema.
+        return None;
+    };
+    if v4.prefix_len() >= 31 {
+        return None;
+    }
+    let network = u32::from(v4.network());
+    let gateway = std::net::Ipv4Addr::from(network.checked_add(1)?);
+    Some(gateway.to_string())
+}
+
+/// Build the [`HostComputeNetwork`] document for an HCN **Internal** network
+/// (internal vSwitch, no physical-NIC binding). Shared by
+/// [`Network::create_internal`] and the unit tests so the JSON shape can be
+/// asserted without a live HCN. The Static IPAM declares a default route to
+/// the subnet gateway so HCN reserves only the gateway, not a block of low
+/// host addresses (see [`Network::create_transparent`] for the underlying
+/// `HCN_E_ADDR_INVALID_OR_RESERVED` rationale).
+fn internal_settings(name: &str, subnet: &str) -> HnsResult<HostComputeNetwork> {
+    let gateway = first_host_address(subnet).ok_or_else(|| HnsError::Other {
+        hresult: 0,
+        message: format!("create_internal: invalid subnet CIDR '{subnet}'"),
+    })?;
+    Ok(HostComputeNetwork {
+        id: None,
+        name: name.to_string(),
+        // Internal networks carry no physical-uplink binding policy — that is
+        // exactly the point. HCN builds an internal vSwitch + host vNIC.
+        ty: NetworkType::Internal,
+        policies: Vec::new(),
+        mac_pool: None,
+        dns: None,
+        ipams: vec![Ipam {
+            ty: "Static".to_string(),
+            subnets: vec![Subnet {
+                ip_address_prefix: subnet.to_string(),
+                routes: vec![Route {
+                    next_hop: gateway,
+                    destination_prefix: "0.0.0.0/0".to_string(),
+                    metric: None,
+                }],
+                policies: Vec::new(),
+            }],
+        }],
+        flags: 0,
+        schema_version: SchemaVersion::default(),
+    })
 }
 
 /// Build the `NetAdapterName` network policy that binds a Transparent or
@@ -315,7 +411,7 @@ fn classify_error<S: Into<String>>(
 
 #[cfg(test)]
 mod tests {
-    use super::{net_adapter_name_policy, transparent_settings};
+    use super::{internal_settings, net_adapter_name_policy, transparent_settings};
     use serde_json::json;
 
     #[test]
@@ -365,5 +461,56 @@ mod tests {
         );
         assert_eq!(parsed.policies.len(), 1);
         assert_eq!(parsed.policies[0]["Type"], "NetAdapterName");
+    }
+
+    #[test]
+    fn internal_settings_wire_format_has_no_physical_binding() {
+        let settings = internal_settings("zlayer-overlay", "10.220.99.16/28").unwrap();
+        let v = serde_json::to_value(&settings).unwrap();
+
+        assert_eq!(v["Name"], json!("zlayer-overlay"));
+        assert_eq!(v["Type"], json!("Internal"));
+        // The whole point: NO NetAdapterName policy → no external vSwitch on a
+        // physical host NIC. Empty policies serialize away entirely.
+        assert!(
+            v.get("Policies").is_none(),
+            "Internal network must carry no network policies (no physical-NIC binding), got {v}"
+        );
+        assert_eq!(v["Ipams"][0]["Type"], json!("Static"));
+        assert_eq!(
+            v["Ipams"][0]["Subnets"][0]["IpAddressPrefix"],
+            json!("10.220.99.16/28")
+        );
+        // Gateway = network + 1, declared as the default route's next hop.
+        assert_eq!(
+            v["Ipams"][0]["Subnets"][0]["Routes"][0]["NextHop"],
+            json!("10.220.99.17")
+        );
+        assert_eq!(
+            v["Ipams"][0]["Subnets"][0]["Routes"][0]["DestinationPrefix"],
+            json!("0.0.0.0/0")
+        );
+        assert_eq!(v["SchemaVersion"]["Major"], json!(2));
+    }
+
+    #[test]
+    fn internal_settings_rejects_bad_cidr() {
+        assert!(internal_settings("zlayer-overlay", "not-a-cidr").is_err());
+        // /31 has no usable host for a gateway.
+        assert!(internal_settings("zlayer-overlay", "10.0.0.0/31").is_err());
+    }
+
+    #[test]
+    fn internal_settings_round_trip_preserves_shape() {
+        let settings = internal_settings("zlayer-overlay", "10.200.0.0/28").unwrap();
+        let json_str = serde_json::to_string(&settings).unwrap();
+        let parsed: crate::schema::HostComputeNetwork = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.name, "zlayer-overlay");
+        assert!(matches!(parsed.ty, crate::schema::NetworkType::Internal));
+        assert!(parsed.policies.is_empty());
+        assert_eq!(
+            parsed.ipams[0].subnets[0].ip_address_prefix,
+            "10.200.0.0/28"
+        );
     }
 }

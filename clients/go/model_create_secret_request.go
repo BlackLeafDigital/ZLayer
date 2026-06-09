@@ -23,6 +23,8 @@ var _ MappedNullable = &CreateSecretRequest{}
 type CreateSecretRequest struct {
 	// The name of the secret.
 	Name string `json:"name"`
+	// Optional per-secret node affinity. `None` (default) = any node may host the decryptable form. When set, only matching nodes receive a wrap of the DEK material for this row, and the API gate filters reads accordingly. Ignored on standalone (non-clustered) daemons.
+	NodeAffinity NullableNodeAffinity `json:"node_affinity,omitempty"`
 	// Optional explicit scope (legacy form). Mutually exclusive with the `?environment=` query parameter.
 	Scope NullableString `json:"scope,omitempty"`
 	// The secret value (will be encrypted at rest).
@@ -72,6 +74,48 @@ func (o *CreateSecretRequest) GetNameOk() (*string, bool) {
 // SetName sets field value
 func (o *CreateSecretRequest) SetName(v string) {
 	o.Name = v
+}
+
+// GetNodeAffinity returns the NodeAffinity field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateSecretRequest) GetNodeAffinity() NodeAffinity {
+	if o == nil || IsNil(o.NodeAffinity.Get()) {
+		var ret NodeAffinity
+		return ret
+	}
+	return *o.NodeAffinity.Get()
+}
+
+// GetNodeAffinityOk returns a tuple with the NodeAffinity field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateSecretRequest) GetNodeAffinityOk() (*NodeAffinity, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.NodeAffinity.Get(), o.NodeAffinity.IsSet()
+}
+
+// HasNodeAffinity returns a boolean if a field has been set.
+func (o *CreateSecretRequest) HasNodeAffinity() bool {
+	if o != nil && o.NodeAffinity.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetNodeAffinity gets a reference to the given NullableNodeAffinity and assigns it to the NodeAffinity field.
+func (o *CreateSecretRequest) SetNodeAffinity(v NodeAffinity) {
+	o.NodeAffinity.Set(&v)
+}
+// SetNodeAffinityNil sets the value for NodeAffinity to be an explicit nil
+func (o *CreateSecretRequest) SetNodeAffinityNil() {
+	o.NodeAffinity.Set(nil)
+}
+
+// UnsetNodeAffinity ensures that no value is present for NodeAffinity, not even an explicit nil
+func (o *CreateSecretRequest) UnsetNodeAffinity() {
+	o.NodeAffinity.Unset()
 }
 
 // GetScope returns the Scope field value if set, zero value otherwise (both if not set or set to explicit null).
@@ -151,6 +195,9 @@ func (o CreateSecretRequest) MarshalJSON() ([]byte, error) {
 func (o CreateSecretRequest) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	toSerialize["name"] = o.Name
+	if o.NodeAffinity.IsSet() {
+		toSerialize["node_affinity"] = o.NodeAffinity.Get()
+	}
 	if o.Scope.IsSet() {
 		toSerialize["scope"] = o.Scope.Get()
 	}

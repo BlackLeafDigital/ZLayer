@@ -2,6 +2,1110 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.59.0 - 2026-06-08
+
+### Added
+- **zlayer-web: `/install`, `/install.sh`, `/install.ps1`, `/install.py`, and `/latest-{slug}` endpoints.** `GET /install` sniffs the `User-Agent` and returns the matching script body (PowerShell → install.ps1, Python urllib → install.py, everything else → install.sh) so a single magic URL works from any platform's standard installer one-liner. `GET /install.sh|ps1|py` serve each script verbatim (embedded at compile time via `include_str!` from the repo root, single source of truth). `GET /latest-{slug}` resolves a friendly platform name and 302-redirects to the matching GitHub release asset; the latest tag is fetched from `api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest` and cached for 5 minutes. Supported slugs: `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64` plus aliases `linux`, `macos`, `macos-silicon`, `macos-intel`, `macos-arm64`, `macos-amd64`, `windows`. New module `crates/zlayer-web/src/server/install.rs` wired into the axum Router in `crates/zlayer-web/src/server/ui.rs`. Reqwest added as an ssr-only optional dep on zlayer-web (rustls is the reqwest 0.13 default-tls backend so no openssl runtime dep). Install grid on the home page now points at `/install` for the common Linux/macOS/Windows cases.
+- **CI: `.forgejo/workflows/zlayer-web-image.yml` — continuous publish loop for the public landing page image.** On push to `dev` touching `crates/zlayer-web/**` or its container build files (and on manual dispatch), the workflow rebuilds the zlayer-web image from `images/Dockerfile.zlayer-web` and pushes `:latest`, `:dev`, and `:dev-YYYYMMDD-<sha>` to both `forge.blackleafdigital.com/blackleafdigital/zlayer-web` and `registry.blackleafdigital.com/blackleafdigital/zlayer-web`, then optionally POSTs to the Komodo `zlayer-web-redeploy` procedure webhook so the running stack picks up the new digest within a minute. The full release pipeline (`build.yml` → `release.yml`) is workflow_dispatch only and overkill for the public site, where every commit should reach https://zlayer.dev quickly.
+
+### Changed
+- **CI: `release.yml` `docker-push` job now publishes `zlayer-web` to ZRegistry + forge.blackleafdigital.com.** Previously the job's per-image loop explicitly skipped zlayer-web registry pushes (`if [ "$img" != "zlayer-web" ]`), only uploading the OCI tar to Forgejo Packages — so the landing page never had a pullable image and could not be deployed by Komodo. Adds a `Login to ZRegistry` step (token: `ZREGISTRY_ZLAYER_WEB_PUBLISH_TOKEN`, user `zlayer-web-ci`, scope `publish:container:blackleafdigital/zlayer-web`) and an `img == zlayer-web` branch that tags/pushes `:${VERSION}` and `:latest` to both registries. Komodo currently pulls from forge because of an unauthenticated-manifest 404 quirk in ZRegistry's container adapter (`crates/zregistry-protocols/src/container.rs`): the `get_manifest` handler maps an Anonymous → Denied authorize result through `map_err(.., "NAME_UNKNOWN")` → 404, but Docker's resolver expects a 401 + `WWW-Authenticate: Bearer realm=...` so it can fetch a token; without it the resolver bails before auth. Once ZRegistry returns 401-with-challenge for private repos, the Komodo stack's `ZLAYER_WEB_IMAGE` env can swap back to `registry.blackleafdigital.com/blackleafdigital/zlayer-web:latest`.
+
+### Fixed
+- **zlayer-web: navbar still showed a generic cube icon instead of the ZLayer logo.** `crates/zlayer-web/src/app/components/navbar.rs:83` rendered `icons::container_icon("28")` — the prior pass swapped the hero PNG but left the navbar untouched. Replaced with `<img src="/zlayer_logo.png" class="navbar-logo-img" />` (32×32, `object-fit: contain`) and added a `.navbar-logo-img` rule plus a hover-scale rule paired with the existing `.navbar-logo .icon` hover. (`crates/zlayer-web/src/app/components/navbar.rs`, `crates/zlayer-web/src/app/styles.css`)
+- **CI: `build.yml` WSL2 `build-rootfs` "Sanity-check rootfs tarball" step failed with exit 141 (SIGPIPE).** `set -euo pipefail` + `tar tzf zlayer-rootfs.tar.gz | head -20`: once `head` closed its stdin after 20 lines, `tar` got SIGPIPE on the next write, `pipefail` propagated the 141 exit, and `set -e` aborted the step. Rewrote the step to list the archive once into a tempfile (`tar tzf … > "$listing"`) and slice from the file for all four checks — also dedupes four separate `tar tzf` passes into one. (`.forgejo/workflows/build.yml`)
+- **Windows Hyper-V containers: the in-guest GCS never dialed the host bridge ("never-dial"), which blocked all Hyper-V-isolated containers across many prior sessions.** Root cause was in the OCI Windows layer unpacker: `BackupStreamWriter` opened base-layer files with only `GENERIC_WRITE` and called `BackupWrite` with `bProcessSecurity=false`, so the kernel SILENTLY DROPPED each file's `BACKUP_SECURITY_DATA` (owner + DACL) record — every base-layer file (and the UVM hardlinks to them) inherited the host directory's ACL instead of the image's. That inherited ACL omits the `BUILTIN\Users` / `ALL APPLICATION PACKAGES` read+execute grants that services running as `LocalService` need, so `mpssvc` (Windows Firewall) could not read `mpssvc.dll`, failed to start, and the SCM-gated `gcs` service (which depends on `mpssvc`) never started → the guest never dialed the host GCS bridge. Fix: open the backup-write handle with `WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY` AND pass `bProcessSecurity=true` (BOTH are required; `SeRestorePrivilege` is already enabled), mirroring hcsshim's `safefile` open flags, so the image's security descriptors are actually stamped onto the materialized files. With this fix the guest dials and cold-start `NegotiateProtocol`/`Create`/`Start` all succeed on the stock inbox `gcs` dependency chain. (`crates/zlayer-agent/src/windows/layer.rs`)
+- **Windows Hyper-V `configureHvSocketForGCS` was rejected by the guest with `C037010D` (HCS_E_INVALID_JSON).** The external-GCS HvSocket setup wrapped the modification in an extra `GuestRequest` level (`Request: {GuestRequest: {RequestType, ResourceType, Settings}}`). hcsshim's `uvm.modify` unwraps `doc.GuestRequest` and sends the inner object directly via `gc.Modify` (internal/uvm/modify.go); the extra nesting made the guest mis-type `Settings`, fail to marshal the `HvSocketAddress`, and reject `$.ParentAddress`/`$.LocalAddress`. Send the modification directly as the bridge `Request`. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+- **Windows Hyper-V VSMB layer hot-attach failed with `0x80070057` (E_INVALIDARG).** `ComputeSystem::add_vsmb` built the modify `ResourcePath` with a trailing index (`VirtualMachine/Devices/VirtualSmb/Shares/N`); HCS keys VSMB shares by `Name`, so an `Add` must target the collection path (`.../Shares`, no index). Also aligned the share `Name` to `sN` so the Step-6 guest VSMB paths (`\\?\VMSMB\VSMB-{guid}\sN`) match the host share names. (`crates/zlayer-hcs/src/system.rs`, `crates/zlayer-agent/src/runtimes/hcs.rs`)
+- **Windows Hyper-V SCSI scratch hot-attach failed with `0x80070490` (ERROR_NOT_FOUND).** `ComputeSystem::add_scsi` rendered the `ResourcePath` with a bare controller ordinal (`.../Scsi/0/...`), but the UVM doc keys the controller by its GUID (`PRIMARY_SCSI_CTRL_GUID`); HCS resolves the controller by that key, so the resource path must use the GUID. Also attach the backing `sandbox.vhdx` FILE path rather than the host volume-GUID mount path. (`crates/zlayer-hcs/src/system.rs`, `crates/zlayer-agent/src/runtimes/hcs.rs`)
+
+### Changed (cont.)
+- **Windows Hyper-V scratch is now created un-activated for the UVM SCSI path.** The container writable scratch was built via the process-isolated `WritableLayer` (host `ActivateLayer`/`PrepareLayer`), which opens/locks the `sandbox.vhdx` so SCSI-attaching it to the UVM failed with `0x80070020` (sharing violation). Added `scratch::create_unactivated` (format-only, no host mount) and select it for Hyper-V isolation; the scratch is formatted/mounted in-guest instead. Also: `CombineLayersWCOW` now sends the guest-routed `ResourceType:"CombinedLayers"` (not a host `ResourcePath`) with `Layers` as `[]Layer{Id,Path}` objects (not bare strings), and steps 7/9/10 (CombineLayers / RpcCreate / RpcStart) now propagate the guest's HRESULT instead of silently swallowing it. (`crates/zlayer-agent/src/windows/scratch.rs`, `crates/zlayer-agent/src/runtimes/hcs.rs`)
+
+### Added (cont.)
+- **Windows Hyper-V `exec` is now routed over the GCS bridge with an hvsock stdio relay.** `HcsRuntime::exec` detected Hyper-V isolation (`entry.gcs.is_some()`) and dispatched to a new inherent `exec_hyperv` helper; the host `HcsCreateProcess` path is kept verbatim for process isolation. For Hyper-V, exec binds two host hvsock listeners (`HvSockListener::bind(uvm_runtime_id, GUID::from_u128(uuid))`) for stdout/stderr BEFORE sending `RpcExecuteProcess` (the guest dials OUT to them, like the log-forward relay), sets `StdioRelaySettings.{StdOut,StdErr}` to those service GUIDs, drains both streams to EOF concurrently (each accept wrapped in a 120s timeout so a one-stream process doesn't hang), and reads the authoritative exit code via `RpcWaitForProcess`. `ProcessParameters` is the same DOUBLE-ENCODED `AnyInString` JSON the init-process launch uses. Captured stdout/stderr are appended to the container log buffer. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+- **Fixed `StdioRelaySettings` wire field names.** `zlayer_gcs::protocol::StdioRelaySettings` serialized its GUIDs as `StdInPipe`/`StdOutPipe`/`StdErrPipe` (PascalCase of the Rust field names), but hcsshim's `ExecuteProcessStdioRelaySettings` uses the bare `StdIn`/`StdOut`/`StdErr` (each `json:",omitempty"`). The strict inbox guest GCS ignored the mis-named fields, so it never dialed back to the host stdio listeners and exec captured no output. Added `#[serde(rename = "StdIn"/"StdOut"/"StdErr")]` to the three fields. (`crates/zlayer-gcs/src/protocol.rs`)
+- **Windows Hyper-V containers now WORK end-to-end** — the `windows_hcs_hyperv_smoke_create_start_stop_remove` e2e (create → start → run workload → exit → remove) PASSES on a real Server 2025 host. Completing the external-GCS cold-start container path required: (a) the SCSI scratch is mounted in-guest via a guest-routed `MappedVirtualDisk` modify at the hcsshim-style path `c:\mounts\scsi\m%d` (was a fabricated placeholder volume GUID → `CombineLayersWCOW` `0x80070003`); (b) `CombineLayersWCOW` uses that real `ContainerRootPath` with `Layers` objects and no `ScratchPath` (WCOW omits it); (c) the hosted `RpcCreate` config is a `HostedSystem{SchemaVersion:{2,1}, Container:{Storage}}` (a bare `Container` is rejected field-by-field — `$.HostName`/`$.Processor`/`$.Path` — for lack of the schema-version wrapper); (d) `start_container` is a no-op under Hyper-V (the workload is `RpcStart`'d during create; re-running host `HcsStartComputeSystem` on the running UVM returned `0x80370105`); (e) the workload init process is launched over the bridge via `RpcExecuteProcess` (with `ProcessParameters` as an `AnyInString` DOUBLE-ENCODED JSON string — a nested object is rejected at `$`), and a detached `RpcWaitForProcess` waiter records the exit code into the state used by `container_state`. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+
+### Windows Hyper-V containers — all 3 e2e tests pass
+- **All 3 Hyper-V e2e tests now pass**: `windows_hcs_hyperv_smoke_create_start_stop_remove` ✅, `windows_hcs_hyperv_concurrent_pair` ✅ (two independent UVMs in parallel), and `windows_hcs_hyperv_exec_inside_container` ✅ (`cmd /c hostname` → exit 0 with non-empty stdout).
+
+### Changed
+- **Windows Hyper-V: restored the stock inbox `gcs` `DependOnService` chain (dropped the `condrv`+`hvsocketcontrol` strip).** The strip was a workaround for the never-dial that merely traded it for a cold-start Create fault (gcs ran before the firewall/network substrate it needs); with the security-descriptor unpacker fix the stock chain works correctly. The strip is retained as an opt-in debug A/B via `ZLAYER_GCS_STRIP_DEPS=1`. Also added a `ZLAYER_GCS_ACCEPT_TIMEOUT_SECS` knob to hold a UVM open long enough to attach a kernel debugger during diagnosis. (`crates/zlayer-agent/src/runtimes/hcs.rs`)
+
+## 0.58.0 - 2026-06-07
+
+### Fixed
+- **macOS VZ-Linux guest had NO network (only `lo`).** Root cause: `images/vz-linux/kernel-arm64.defconfig` set `CONFIG_VIRTIO_NET=y` but omitted `CONFIG_NETDEVICES=y`. `NETDEVICES` is `default y if UML` (→ `n` on arm64) and `VIRTIO_NET`/`NET_CORE`/`WIREGUARD` live inside its `if NETDEVICES` block, so `make olddefconfig` silently dropped the NIC driver — the guest booted with no `eth0`. Added `CONFIG_NETDEVICES=y` (+ `CONFIG_WIREGUARD=y` for the overlay), plus a `build.sh` post-`olddefconfig` guard that fails the build if any load-bearing symbol (`NETDEVICES`/`VIRTIO_NET`/`VIRTIO_FS`/`VIRTIO_VSOCKETS`/`VIRTIO_BLK`/`WIREGUARD`/`OVERLAY_FS`/`TMPFS`/`NET_CORE`) isn't `=y`. With the NIC present the guest now DHCPs a `192.168.64.x` NAT lease (outbound + host↔guest work). Also: `wait_for_eth` now selects the ARPHRD_ETHER device instead of the kernel's auto-created `sit0` tunnel; `get_container_ip` resolves the real NAT lease (overlay IP → NAT lease → loopback). (`images/vz-linux/{kernel-arm64.defconfig,build.sh}`, `crates/zlayer-vzagent/src/main.rs`, `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+
+### Added
+- **Cross-node WireGuard overlay is now injected into macOS VZ-Linux guests** (previously skipped — a VM has no host PID/netns for the veth-by-PID attach). New `Runtime::overlay_attach_kind()` (`HostNetns`/`HostIp`/`InGuestVsock`) + `Runtime::push_overlay_config()`; `CompositeRuntime` forwards both to its VZ-Linux delegate; VZ `get_container_pid` returns a stable pseudo-PID so PID-gated bookkeeping runs. overlayd gained `AttachHandle::GuestManaged` → `OverlaydResponse::GuestConfig(GuestOverlayConfig)`, which allocates the overlay IP + WireGuard keypair + peer set and registers the guest's public key in the mesh. The host ships it as `proto::Msg::OverlayConfig` (tag 13) over a fresh vsock control connection (reliably: half-close + drain to EOF), and the in-guest agent brings up a **kernel WireGuard** `zl-overlay0` via netlink. (`crates/zlayer-agent/src/{runtime.rs,service.rs,overlay_manager.rs,runtimes/{macos_vz_linux,composite}.rs}`, `crates/zlayer-overlayd/src/server.rs`, `crates/zlayer-types/src/overlayd.rs`, `crates/zlayer-vzagent/src/{proto.rs,main.rs,linux/overlay.rs}`)
+
+### Changed
+- **VZ-Linux boot latency trimmed** (~12.9s → ~6.6s): the guest agent now brings up networking on a background thread overlapping rootfs assembly (joined before `pivot_root`), and the `NETDEVICES` fix lets DHCP succeed in ~1s instead of udhcpc timing out. (`crates/zlayer-vzagent/src/main.rs`)
+
+## 0.57.0 - 2026-06-06
+
+### Changed
+- **`zlayer run` is now a container runner (docker-run semantics) with secret injection; the old local-process-with-secrets runner moved to `zlayer env run`.** Top-level `zlayer run <image> [cmd...]` builds a single-service `DeploymentSpec` from docker-style flags (`-v/--volume`, `-e KEY=VAL` (short-only), `-p/--publish`, `-w/--workdir`, `-it`, `--rm`, `-d/--detach`, `--name`, `--entrypoint`, `--user`, `--memory`, `--cpus`, `--network`) and submits it to the daemon, attaching for `-it` or streaming foreground logs to the container's exit otherwise. `--env <SLUG>` now selects a ZLayer secret-ENVIRONMENT to resolve and inject (with `--merge <slug>`, `--no-global`, `--project`); injected secrets are the base env and individual `-e KEY=VAL` vars override them. The previous behavior (spawn a local process with secrets, `--dry-run`/`--unmask`) is preserved verbatim under `zlayer env run <env_id> -- <cmd...>`. (`bin/zlayer/src/cli.rs`, `bin/zlayer/src/main.rs`, `bin/zlayer/src/commands/run.rs`)
+- **`zlayer-docker` run path refactor.** Extracted `zlayer_docker::cli::run::build_deployment_spec(&RunArgs) -> DeploymentSpec` from `handle_run` (no behavior change to `zlayer docker run`); made `attach_interactive` public and added `stream_until_exit` (non-TTY foreground follow + exit-code propagation) for reuse by the new top-level runner. The docker individual-env flag is now short-only (`-e`); the long `--env` alias was dropped so the top-level `zlayer run --env <slug>` can own it. `RunArgs` and its flatten-group structs are re-exported at `zlayer_docker::cli`. (`crates/zlayer-docker/src/cli/run.rs`, `crates/zlayer-docker/src/cli/mod.rs`)
+
+### Added
+- **macOS VZ-Linux runtime: host-side bind mounts over virtiofs.** `build_config_linux` now attaches one `VZVirtioFileSystemDeviceConfiguration` per host bind mount (tag `zlmnt{i}`, `readOnly` per the mount) in addition to the read-only rootfs share, collecting all devices into the single `setDirectorySharingDevices` array. A new `BindMount { host, tag, target, readonly }` struct + `bind_mounts: Vec<BindMount>` field on `LinuxVmBuildInputs` thread the list through; `derive_bind_mounts(spec)` maps each `StorageSpec::Bind { source, target, readonly }` to a `BindMount` with a sequential `zlmnt{i}` tag (non-`Bind` storage kinds are skipped, so tag indices stay aligned with the attached shares). After writing the `Run` frame and before draining, `run_and_drain` emits one `proto::Msg::Mount { tag, target, readonly }` frame per bind mount (same tag/target/readonly triple as the attached share) so the guest agent mounts each virtiofs share at its target. (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+- **macOS VZ-Linux runtime: `--rm` / `lifecycle.delete_on_exit`.** When a container's spec sets `lifecycle.delete_on_exit`, `start_container` spawns a `watch_for_auto_remove` watcher that waits for the workload to reach a terminal state (captured `RunOutcome` exit/terminal), then runs the shared `teardown_container` to stop+release the VM, abort the drain/port-forward tasks, remove the container record, and delete its state dir (rootfs/overlay + console.log + config.json). The VM does not power itself off on workload exit, so this is what frees the resources. The watcher handle (`cleanup_task`) is tracked on the record and aborted by `stop_container`/`remove_container` so an explicit teardown always wins the race. (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+- **macOS VZ-Linux runtime: stdin host seam.** `run_and_drain` now accepts an optional `mpsc::Receiver<Vec<u8>>` stdin source and forwards each chunk as a `proto::Msg::Stdin` frame (and a final `Msg::StdinEof` on close) on a helper thread alongside the drain loop. The interactive `-it` CLI->daemon->vsock pipeline lands in a later pass; today the call site passes `None`, and wiring a real source needs no further signature change. (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+
+- **Image resolution chain (`ImagePuller`): LOCAL store → local CACHE → shared S3 tier → the ref's own registry (URL) → last-resort default registry.** `pull_manifest_inner` now resolves through ordered tiers with downward propagation (a higher-authority hit warms the lower tiers; a fresh remote pull is written into both the local cache and the shared S3 tier). Mutable tags (`:latest`/`:dev`/…) revalidate against the origin; any upstream-check error serves the copy already held (fail-safe — serving stale beats crashing a redeploy on a Docker Hub 429). Pinned tags / digests are immutable and never re-checked. New `ImagePuller` fields + builders `with_s3_cache`, `with_default_registry`, `with_source_policy`, and the central `ImagePuller::from_env_for_runtime(cache, source)` constructor that wires the S3 tier (`ZLAYER_S3_BUCKET`) + default registry (`ZLAYER_DEFAULT_REGISTRY`) from the environment (runtimes use this single seam rather than re-implementing the wiring). The S3 tier is read/write-through for both manifests and layer blobs (`crates/zlayer-registry/src/client.rs`, `crates/zlayer-registry/src/cache_config.rs`).
+- **Per-image `source_policy` (`ImageSpec.source_policy: Option<SourcePolicy>`).** `LocalFirst` (default — the full chain), `S3First` (probe S3 before the local cache), `RemoteOnly` (skip all local/cached/S3 sources), `LocalOnly` (local store + cache only; never S3/network/fallback). Threaded through the `Runtime::pull_image_with_policy` trait into the puller; compose maps an `x-zlayer-source-policy` service extension onto it. (`crates/zlayer-types/src/spec/types.rs`, `crates/zlayer-docker/src/compose/convert.rs`, `crates/zlayer-agent/...`)
+- **Registry credential passthrough.** `youki` and the macOS VZ-Linux runtime now HONOR the caller-supplied auth (inline spec creds or a daemon-resolved stored credential by host) instead of dropping it — the hostname-based `AuthResolver` is now only the fallback. `zlayer_registry::spec_auth_to_oci` is public so runtimes convert without a `zlayer-api` dependency. (`crates/zlayer-agent/src/runtimes/{youki,macos_vz_linux}.rs`, `crates/zlayer-registry/src/client.rs`)
+- **`zlayer login <registry>`** — ergonomic wrapper over `credential registry add` (reuses the daemon's `/api/v1/credentials/registry`): interactive username + hidden token prompts, `--zauth` mints a registry bearer via a ZAuth OIDC client-credentials exchange and stores it as a token credential, `--default` persists `ZLAYER_DEFAULT_REGISTRY` into the daemon service unit. `zlayer pull` gained `--username`/`--password` (+ `ZLAYER_REGISTRY_USERNAME`/`_PASSWORD`) so the CLI-direct pull is no longer anonymous-only. (`bin/zlayer/src/commands/login.rs`, `cli.rs`, `main.rs`, `commands/registry.rs`, `commands/daemon.rs`)
+- **`list_images` surfaces the user's original ref.** A `manifest-orig:<canonical>` sidecar records the as-typed reference at pull time so `list_images` shows `alpine:latest` rather than the canonical cache key. (`crates/zlayer-registry/src/client.rs`, `crates/zlayer-agent/src/runtimes/youki.rs`)
+- **Interactive `-it` STDIN host→guest pipeline (macOS VZ-Linux).** Host terminal raw-mode stdin → `POST /api/v1/containers/{id}/stdin` → runtime → the existing `run_and_drain` `Msg::Stdin`/`Msg::StdinEof` forwarding (which previously had no host source). New default `Runtime::write_stdin`/`close_stdin` trait methods (only VZ-Linux overrides), `DaemonClient::write_container_stdin`/`close_container_stdin`, and a `RawModeGuard` in the CLI attach loop. (`crates/zlayer-agent/...`, `crates/zlayer-api/...`, `crates/zlayer-client/...`, `crates/zlayer-docker/src/cli/run.rs`)
+
+### Fixed
+- **macOS VZ-Linux runtime: deployment/service containers crash-looped with `spawn /bin/sh: No such file or directory`.** The image rootfs is keyed on disk by `sanitize_image_name(<image>)`. The deployment/service path supplies the user's RAW reference (`ServiceSpec.image.name` is an `ImageRef` preserving the original bytes, e.g. `alpine:latest`) while an explicit `pull_image("docker.io/library/alpine:latest")` supplies the fully-qualified form — producing DIFFERENT keys, so the service path could share an empty `alpine_latest/rootfs` into the guest while the populated rootfs lived under another spelling, and the guest pivot_rooted onto an empty filesystem. The fix keys the store on the **LITERAL** user reference (separators replaced, NO canonicalization — `alpine:latest` → `alpine_latest`, never silently rewritten to docker.io) and resolves an already-extracted rootfs across equivalent spellings at LOOKUP time via `resolve_existing_rootfs` (the prefix-stripping candidate set from the shared `zlayer_types::image_ref_candidates`), so an image extracted under one spelling is reused without rewriting the key. `rootfs_is_populated` means an `IfNotPresent`/`Never` pull no longer treats a bare-existing-but-EMPTY `…/rootfs` (residue of a failed pull) as "present", and `create_container` rejects an empty image rootfs with an actionable error instead of booting a doomed guest. (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`, `crates/zlayer-types/src/lib.rs`)
+- **Bare/unqualified image names are never silently pulled from Docker Hub.** A bare name found nowhere in the resolution chain is an actionable error unless a default registry is explicitly configured (`zlayer login --default <host>` / `ZLAYER_DEFAULT_REGISTRY`). (`crates/zlayer-registry/src/client.rs`)
+## [Unreleased]
+
+### Fixed
+- **`zlayer build --host-network` was ignored for `WORKDIR`, so a build with broken host-level netavark/CNI died on the first `mkdir -p` before any `RUN` executed.** `DockerfileTranslator::with_host_network(true)` injects `--net=host` on every emitted `buildah run` for `Instruction::Run` — but `translate_workdir` emitted `buildah run <container> -- mkdir -p <dir>` through a path that never consulted `self.host_network`. So a stage starting with `WORKDIR /build` went through buildah's default rootless networking → netavark → and on this user's host failed with `setup network: netavark: failed to load network options: IO error: invalid type: sequence, expected a map at line 1 column 101`, killing the build at the very first instruction of stage 1 even though `--host-network` was supposed to bypass netavark entirely. `BuildahCommand` grew `run_exec_with_net` and `run_shell_custom_with_net` helpers that emit `run --net=<mode> <container> -- ...` in the buildah-required arg order; `translate_workdir` now threads `self.host_network.then_some(RunNetwork::Host)` into both, on Linux and Windows. Regression tests pin `--net=host` placement (before the container ID, before `--`) and assert the host_network=false default path still emits no `--net` flag. (`crates/zlayer-builder/src/buildah/mod.rs`)
+- **`zlayer build` with no args ignored `ZImagefile.<suffix>` files and demanded a `Dockerfile`.** Auto-detection in `get_build_output` and `resolve_target_os_and_backend` joined the context with the literal name `"ZImagefile"`, so a repo following the in-tree convention (`ZImagefile.zlayer-node`, `ZImagefile.zataserver`, etc.) fell through to the Dockerfile fallback and errored with `Failed to read build context at './Dockerfile'`. New `find_context_zimagefile` helper resolves in order: literal `ZImagefile` → unique `ZImagefile.<suffix>` → none. Multiple `ZImagefile.<suffix>` matches with no literal tiebreaker now error explicitly listing the candidates and pointing the user at `-z <path>`, instead of silently picking whichever the filesystem listed first. Both call sites (build-time resolution and OS-peek for backend selection) route through the helper. Tests cover literal-wins, unique-suffix, dockerfile-only, ambiguity error, and the `ZImagefile.` empty-suffix edge case. (`crates/zlayer-builder/src/builder.rs`)
+
+## 0.56.0 - 2026-06-05
+
+### Added
+- **buildah-sidecar backend** (`crates/zlayer-builder/src/backend/buildah_sidecar/`): new gRPC-client backend that talks to a Go sidecar (`bin/zlayer-buildd/`) wrapping `imagebuildah.BuildDockerfiles` from `go.podman.io/buildah`. Transport is TCP with mTLS; the daemon spawns a local sidecar bound to `127.0.0.1:<auto-port>` on demand and tears it down after the configurable idle timeout (default 30s). mTLS material is generated on first run under `${ZLAYER_DATA_DIR}/buildd/` via `rcgen`.
+- **`zlayer-buildd` Go sidecar** (`bin/zlayer-buildd/`): standalone daemon shipping the buildah library behind a typed gRPC API. Single-file proto schema at `proto/buildah_sidecar.proto`; cross-arch release builds (linux/amd64 + linux/arm64) via `make release`. Documented system-library requirements (libgpgme, libassuan, libgpg-error, libseccomp) and devicemapper/btrfs graphdriver build-tag exclusions.
+- **`--backend` CLI flag** on `zlayer build`: explicit selection between `buildah-cli`, `buildah-sidecar`, `sandbox`, `hcs`. Defaults to auto-detect.
+- **`ZLAYER_BACKEND` env var**: same values as `--backend`, applied as a global override.
+- **`ZLAYER_BUILDD_BIN` env var**: bypasses sidecar binary discovery and uses the supplied absolute path (useful for development and CI).
+- **`ZLAYER_BUILDD_ADDR` env var** (consumed via `SidecarConfig.addr`): dial a remote `zlayer-buildd` over TCP+mTLS for cross-machine build dispatch.
+- **`zlayer_paths::ZLayerDirs::buildd()`** and **`buildd_bin()`** path helpers: canonical locations for mTLS material (`${data_dir}/buildd/`) and the sidecar binary (`${data_dir}/bin/zlayer-buildd`).
+- **5 RPCs** on the sidecar's `BuildService` beyond `Build`/`Cancel`/`Inspect`: `Push`, `Tag`, `ManifestCreate`, `ManifestAdd`, `ManifestPush` — full parity with the `BuildBackend` trait surface so the sidecar handles every post-build operation the CLI shellout did.
+- End-to-end integration test at `crates/zlayer-builder/tests/buildah_sidecar_e2e.rs` (ignored by default; runs against a real `buildah` install + built sidecar binary).
+- `crates/zlayer-types/src/builder.rs` (new module): `BuilderBackendKind`, `SidecarConfig`, `BuildSidecarRequest`, `BuildSidecarEvent` — shared types per the workspace's types-first rule.
+
+### Changed
+- **Default Linux backend**: `detect_backend(ImageOs::Linux)` on Linux hosts now prefers `BuildahSidecarBackend` over the legacy CLI-shellout `BuildahBackend`, falling back to the CLI when no sidecar binary is reachable. Operators wanting the legacy path explicitly should set `--backend buildah-cli` or `ZLAYER_BACKEND=buildah-cli`.
+- `BuildOptions` now carries `backend_override: Option<BuilderBackendKind>` so library callers can pin backend selection without going through env vars.
+- The Docker-compat socket server (`zlayer_docker::socket::serve`) now takes the daemon's own UDS explicitly and waits for the local daemon on that socket via `try_connect_to` (no auto-spawn), merging the branch's explicit-socket plumbing with dev's generous 300s readiness retry.
+
+### Fixed
+- **`zlayer build` build-args (`--build-arg`, `ZImagefile` vars, pipeline `${VAR}`) were silently dropped on the buildah-CLI backend, so `${FORGEJO_TOKEN}` and friends never resolved on Linux/CI builds.** The macOS sandbox backend expands `${ARG}`/build-args in ENV/RUN/COPY/ADD/WORKDIR/USER/LABEL via `substitute_args`, and the buildah-sidecar backend forwards build-args into the Go `imagebuildah` build — but the `BuildahBackend` (buildah-CLI) walks the Dockerfile instruction-by-instruction emitting `buildah run`/`config`/`copy`, and never consulted `BuildOptions.build_args` nor expanded any variable, so an unqualified `${FORGEJO_TOKEN}` was handed to buildah literally and the build-arg never reached the build. `backend/buildah.rs` now mirrors the sandbox model: a new `expand_instruction` expands `${VAR}`/`$VAR` in each instruction's build-time-expandable fields using per-stage `arg_values` (seeded from `options.build_args` + the global pre-FROM `ARG` defaults, matching Docker's per-stage ARG scoping) and `env_values`, folding `ARG`/`ENV` bindings forward as instructions are walked, all through the **shared** `dockerfile::expand_variables` engine so the CLI and sandbox backends resolve a Dockerfile identically. Regression test (`expand_instruction_resolves_build_args_in_run_env_copy`) covers RUN/ENV/COPY expansion + `ARG`-default precedence. Also silenced 4 pre-existing macOS-only `clippy::unused_async` errors on the `#[cfg(not(feature = "cache"))]` `sandbox_push` stubs (they intentionally keep the async signature of their `cache`-enabled counterparts so call sites `.await` identically regardless of the feature). (`crates/zlayer-builder/src/backend/buildah.rs`, `crates/zlayer-builder/src/backend/sandbox.rs`)
+- **`docker inspect`'s `State.ExitCode`/`State.Status` reported 0/Up for an exited VZ-Linux container even though `docker wait` returned the real code.** A VZ-Linux container running `sh -c "sleep 2 && exit 42"` exits 42; `POST /containers/{id}/wait` correctly returned `{"StatusCode":42}`, but `GET /containers/{id}/json` (inspect) returned `State.ExitCode: 0`. Two gaps were closed without adding a second source of truth — the captured `RunOutcome::exit_code` (surfaced via `container_state` → `ContainerState::Exited { code }`, the same value `wait` reads) is now threaded all the way through inspect. (1) **Native side** (`crates/zlayer-api/src/handlers/containers.rs`): the macOS VZ-Linux runtime does not override `inspect_detailed`, so `inspect.exit_code` is `None`; `get_container`/`list_containers` now reconcile it against the `container_state` result they already fetch via a new `reconcile_exit_code(inspect_exit_code, state)` helper (an explicit runtime value still wins; otherwise the code embedded in `ContainerState::Exited { code }` is used). Net: an exited VZ-Linux container's `ContainerInfo.exit_code == Some(42)` and `state == "exited(42)"`. (2) **Docker-compat** (`crates/zlayer-docker/src/socket/containers.rs`): the inspect handler's hardcoded `"ExitCode": 0` now reads the daemon's real `exit_code`; the `State` block was factored into a pure, unit-tested `build_inspect_state(v, pid)`. `docker_state` was also hardened to strip the `(N)`/`: reason` suffix so the `exited(42)` and `failed: reason` forms map to Docker's `exited`/`dead` states with `Running: false` (an exited workload no longer reports `Up` while the backing VZ VM tears down) instead of falling through the `other` fallback. Tests: `reconcile_exit_code` precedence + a `get_container` integration test (runtime reports `Exited{42}`, `inspect_detailed` defaults to `None` → `exit_code == Some(42)`) in zlayer-api; `build_inspect_state`/`docker_state` mapping tests asserting `ExitCode==42`, `Status=="exited"`, `Running==false` in zlayer-docker. (`crates/zlayer-api/src/handlers/containers.rs`, `crates/zlayer-docker/src/socket/containers.rs`)
+- **macOS container dispatch now routes by a LOCALLY-known image OS and can never be blocked by a live Docker Hub call.** Even with the local-first resolver in place, `CompositeRuntime::inspect_image_os` still fell back to the network (`zlayer_registry::fetch_image_os`) when no configured blob cache resolved the OS — so a Docker Hub 429 on the redundant dispatch-time re-inspection could still error, leave the `image_os` cache empty, and fall a cached Linux image (e.g. `alpine`) through to the Seatbelt sandbox (`DispatchTarget::Primary`), which cannot exec a Linux ELF → exit 127. Three changes make dispatch network-independent: (1) `inspect_image_os` is now **LOCAL-ONLY** — the `fetch_image_os` network fallback is removed; a genuine local miss returns `Ok(None)` and never reaches the wire (`auth` dropped from its signature). (2) Belt-and-suspenders at pull time: the macOS VZ-Linux and Sandbox runtimes now `pull_image_config(...)` after the layer pull, persisting the OCI **config blob** into the same `blobs.redb` the composite inspects — `ImagePuller::pull_image` caches the manifest + layers but NOT the config, and the config's `os` field is exactly what `fetch_image_os_in_cache_only` reads — so a later `create_container` resolves the OS locally with zero network even under a rate-limit. The `create_runtime_for_image` macOS arm was also wired with `with_os_inspect_cache_paths` (the `RuntimeConfig::MacSandbox` arm already had it). (3) `select_for`'s FINAL fallthrough (OS genuinely unknown) now defaults to `VzLinux` on a macOS host (proxied by the presence of a `vz_linux` delegate) instead of `Primary`: almost every registry image is Linux, and a macOS-native rootfs never reaches this branch because it resolves `os == Macos -> Primary` one step earlier — so the only behavior change is for the truly-unknown case, and a native bundle is never sent to the Linux VM. Added composite tests: `pull_image` records `Linux` from a local cache (no network) → `select_for` routes to VZ-Linux; `image_os == Macos` (and a `darwin`-config local-cache pull) → Primary; unknown OS with a `vz_linux` delegate → VzLinux (and without it, the historical primary fallthrough is preserved); and a would-be-429 pull (`*.invalid` registry host) still dispatches the cached Linux image to VZ-Linux purely via the local cache. (`crates/zlayer-agent/src/runtimes/composite.rs`, `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`, `crates/zlayer-agent/src/runtimes/macos_sandbox.rs`, `crates/zlayer-agent/src/lib.rs`)
+- **macOS: hardened the local-only image-OS resolver so a cached image resolves with provably ZERO network calls (the 429 path can never be reached).** `resolve_manifest_local_only` now documents and enforces a strict order: the blob-cache *content* read (`try_cached_manifest` under `IfNotPresent`, canonical key) is tried FIRST and is authoritative; the `local` registry probe runs only after and is treated as a pure hit-or-miss (its bare-name "not found in registry local" outcome is a `None` fall-through, never a propagated error that could short-circuit before the cache hit); a genuine miss returns `Ok(None)` and NEVER falls through to the network. Confirmed `oci_client::Reference::whole()` already normalizes both the bare `alpine:latest` and `index.docker.io/...` to `docker.io/library/alpine:latest`, so the reader/writer keys collide (`registry-1.docker.io` is the only host spelling that would differ, and the pull does not use it). Added a network-call spy (`ImagePuller::network_calls` atomic, bumped at every `self.client` round-trip via `note_network_call`) and regression tests proving `image_os_in_cache_only("alpine:latest")` (BARE) → `Ok(Some(Linux))` and `image_runtime_marker_in_cache_only` resolve from a cache seeded under the qualified key with `network_call_count() == 0`, that a clean local miss stays offline, and that `manifest_cache_key` collides the bare/qualified/literal keys. (`crates/zlayer-registry/src/client.rs`)
+- **macOS: the local-first image-OS resolution still hit the network and 429'd at runtime (alpine never resolved locally).** The previous fix (below) wired `CompositeRuntime` to a persistent blob cache, but two real-world key/store mismatches kept it from ever reading what the pull wrote. (1) **Name normalization:** the VZ-Linux pull persists the manifest under the *qualified* `docker.io/library/alpine:latest`, but `inspect_image_os` is invoked with the *bare* `alpine:latest` (`ImageRef::Display` yields the user-original string). The manifest cache key was the raw image string, so the bare-ref read missed the qualified-keyed entry and fell through to a Docker Hub pull that 429'd. `manifest_cache_key` / `manifest_digest_cache_key` now key on the **canonical** `oci_client::Reference::whole()` form (new `canonical_manifest_ref`), so the qualified writer and the bare reader land on one entry (`crates/zlayer-registry/src/client.rs`). (2) **No-network local resolution + multi-cache fallback:** `fetch_image_os_in_cache` resolved through `pull_manifest_inner`, whose local *miss* falls through to the network — so a cache that simply didn't hold the image triggered a 429 instead of a clean miss. Added `ImagePuller::{image_os_in_cache_only, image_runtime_marker_in_cache_only}` (and standalone `fetch_image_os_in_cache_only` / `fetch_image_runtime_marker_in_cache_only`) backed by a new `resolve_manifest_local_only` that consults only the blob cache + local registry and returns `Ok(None)` on a miss with **zero** network calls; the OS comes from the config blob read by digest (always local). `CompositeRuntime` now takes an *ordered list* of caches (`with_os_inspect_cache_paths`) and probes each local-only before any network call — wired in `create_runtime` to both `{data_dir}/vz/linux/images/blobs.redb` (VZ-Linux) and `{data_dir}/images/blobs.redb` (primary Sandbox), because `pull_image` writes into both and either pull short-circuits under `IfNotPresent` (leaving the manifest/config in only one store). Net: a cached Linux image resolves `Ok(Some(Linux))` with no network even under a rate-limit, so it routes to VZ-Linux; `select_for`'s routing policy is unchanged and the Seatbelt default still wins for unknown/macOS images. Regression tests reproduce both live bugs through the real path: a bare `alpine:latest` resolves from a cache seeded under `docker.io/library/alpine:latest`, resolution succeeds with no network when manifest+config are present under `IfNotPresent`, a clean local miss returns `Ok(None)` (no network), and the agent-level end-to-end `pull_image` → `select_for` routes a bare-ref Linux image (and one whose manifest lives only in the *second* cache) to VZ-Linux. (`crates/zlayer-registry/src/client.rs`, `crates/zlayer-agent/src/runtimes/composite.rs`, `crates/zlayer-agent/src/lib.rs`)
+- **macOS: a Linux workload exited 127 under a Docker Hub rate-limit because image-OS re-inspection needlessly hit the network.** `CompositeRuntime::select_for` routes a Linux image to the VZ-Linux runtime by consulting its `image_os` cache, which is populated from `zlayer_registry::fetch_image_os` during `pull_image*`. `fetch_image_os` built a *bare* `ImagePuller::new(BlobCache::new())` (empty in-memory cache, no local registry) and `ImagePuller::image_os` resolved the manifest with `PullPolicy::Newer`, so every OS inspection re-fetched the manifest over the network — even though the image was already pulled and cached locally. When Docker Hub returned `429`, the fetch errored, the cache was left empty (per its non-fatal contract), and dispatch fell through to the Seatbelt **Primary** sandbox, which cannot exec a Linux ELF → exit 127. Fix (no change to `select_for`'s routing policy): OS/marker inspection is now **local-first**. Added `ImagePuller::image_os_with_policy` / `image_runtime_marker_with_policy` (resolve the manifest via `pull_manifest_inner` under `PullPolicy::IfNotPresent`, so a present cache is authoritative with no mutable-tag HEAD revalidation), plus `zlayer_registry::fetch_image_os_in_cache` / `fetch_image_runtime_marker_in_cache` that take the daemon's persistent blob cache (and optional `LocalRegistry`). `CompositeRuntime` gained `with_os_inspect_cache_path(...)`, wired in `create_runtime` to the VZ-Linux runtime's persistent cache (`{data_dir}/vz/linux/images/blobs.redb` — the exact store the pull writes its manifest + config blob to); `pull_image`/`pull_image_with_policy` now inspect through it. Net effect: an already-cached Linux image resolves `Ok(Some(Linux))` with **no network call**, so it routes to VZ-Linux as designed even under a rate-limit, while the Seatbelt default is unchanged for genuinely-macOS/unknown images. Regression tests resolve OS/marker from a seeded local cache with no network (registry crate) and drive `pull_image` → `select_for` end-to-end so a Linux image whose OS came only from the local persistent cache routes to VZ-Linux (agent crate). (`crates/zlayer-registry/src/client.rs`, `crates/zlayer-agent/src/runtimes/composite.rs`, `crates/zlayer-agent/src/lib.rs`)
+- **macOS Docker-compat `GET /images/json` (and image inspect) returned 500.** The composite runtime's `list_images` propagated the *primary* backend's error via `?`. On macOS the primary (`SandboxRuntime`) does not implement `list_images` (returns `Unsupported`), so every image listing failed with a 500 — which, through the Docker-compat `inspect_image` → `list_images` fallback, also broke `docker pull` verification. `CompositeRuntime::list_images` now fans out over *all* configured backends (primary, libkrun delegate, VZ, and VZ-Linux), de-dups by reference, tolerates per-backend errors, and only fails when *every* backend errors. (`crates/zlayer-agent/src/runtimes/composite.rs`)
+- **macOS: pulled Linux images were not present where they run or in image listings.** `CompositeRuntime::pull_image` / `pull_image_with_policy` only pulled into `primary` + the libkrun `delegate`, never the VZ-Linux runtime that is the default Linux execution path on macOS and owns its own `image_rootfs` store. Pull now also fans out to the VZ and VZ-Linux delegates (errors non-fatal, matching the existing wrong-OS soft-skip), so a pulled image lands where `create_container` dispatches it and shows up in `list_images`/`inspect_image`. (`crates/zlayer-agent/src/runtimes/composite.rs`)
+- **Docker-compat pull progress (`POST /images/create`) streamed no events.** The daemon emits NDJSON pull events as `PullProgressDto`, internally tagged on `kind` (`{"kind":"status",...}` / `{"kind":"done",...}`), but the client-side `zlayer_client::PullProgress` consumer was tagged on `type`, so every real event was rejected by the NDJSON parser (logged "skipping malformed NDJSON line"). The client type is now tagged on `kind` to match the wire shape, restoring Docker-style streamed pull progress. A round-trip regression test serializes the canonical `PullProgressDto` and deserializes it through the client type to prevent future tag drift. (`crates/zlayer-client/src/daemon_client.rs`)
+- **`DockerRuntime::wait_container` failed with an empty error on any non-zero exit.** bollard 0.20's `wait_container` adapter rewrites a `ContainerWaitResponse` whose `status_code > 0` into `Error::DockerContainerWaitError { error, code }` (with `error` usually empty), where `code` is the container's real exit code — it does NOT surface a non-zero exit as `Ok`. The client treated that variant as a fatal wait failure, so any non-zero exit (and, in this version, the normal terminal frame) produced `failed to wait for container: ` with no message. The wait-frame→exit-code mapping is now centralized in `wait_exit_code_from_frame`, which treats both `Ok(resp)` and `DockerContainerWaitError { code, .. }` as successful waits returning the exit code, and only maps a closed stream or other bollard error variants to `AgentError`. Used by `wait_container` and `wait_outcome_with_condition` (and transitively `wait_outcome`). Unit tests cover exit 0, a non-zero error variant (empty and non-empty message), a closed stream, and a non-wait bollard error. (`crates/zlayer-agent/src/runtimes/docker.rs`)
+- **macOS Docker-compat `GET /containers/{id}/logs` and `/stats` returned a swallowed 500.** When the backend that owned a container could not serve the *streaming* read — e.g. the macOS `SandboxRuntime` primary implements `container_logs`/`get_container_stats` but inherits the `Unsupported` default for `logs_stream`/`stats_stream` — the composite forwarded that `Unsupported` straight through, and the native API handler mapped it to `internal_error` (500) with **nothing logged**, so the failure left no daemon-log trail. Fixed on three fronts: (1) `CompositeRuntime::{logs_stream,stats_stream,container_logs,get_logs,get_container_stats}` now build an owner-first fallback chain across every configured backend (mirroring the `list_images` tolerance pattern) — they try the owning backend's streaming read, then fall back to its (and other backends') non-streaming snapshot read and *synthesise* a one-shot stream from it, so a backend that lacks a native stream no longer 500s; only a genuine all-`NotFound` propagates as a 404. (2) The native `get_container_logs`/`get_container_stats` handlers now `tracing::error!` the runtime error at the point it is converted to a 500, so future failures on these paths are diagnosable. (3) Added composite regression tests asserting logs/stats succeed when the owning backend returns `Unsupported`/errors but another backend can serve the read, that routing prefers the owning delegate's native stream, and that a true all-`NotFound` still surfaces `NotFound`. (`crates/zlayer-agent/src/runtimes/composite.rs`, `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`, `crates/zlayer-api/src/handlers/containers.rs`)
+- **macOS VZ-Linux runtime: a container's main workload exited with the wrong code (127) and captured no stdout.** The in-guest `zlayer-vzagent` spawned the workload with `env_clear()` and only the host-forwarded spec env. PID 1 is exec'd by the kernel with an empty environment, so when the spec/image carried no `PATH`, a workload such as `sh -c "sleep 1 && exit 0"` ran `sh` (resolved via the agent's libc default search) but the shell could not find `sleep` on an empty `$PATH`, so it printed `sleep: not found` to stderr and exited **127** before `exit 0` ran — and a command whose only output came after a failed lookup captured nothing. The `exec` path worked because its test commands used shell builtins (`echo`, `exit`) that need no `PATH`. Fix: the guest now injects a Docker-style default `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, matching `wasm.rs`'s `build_env_vars`) into both the `Run` and `Exec` child environments whenever the forwarded env lacks an explicit `PATH` (an explicit `PATH` always wins), so the shell resolves external commands, the workload runs to completion, its true exit code (0 for `exit 0`, the real non-zero otherwise) is reported, and its stdout/stderr stream back as `Stdout`/`Stderr` frames into the captured log buffer. Also hardened the `Run` working-directory handling to Docker `WorkingDir` semantics: an empty/whitespace `cwd` is ignored (no more spurious `ENOENT` spawn failures) and a configured absolute workdir is `mkdir -p`'d before use rather than aborting the spawn. Added pure-logic regression tests for the default-`PATH` injection + explicit-`PATH` override, the `cwd` resolver, the `waitpid`-status→exit-code mapping (exit 0/42/127 pass through, signals map to `128+signum`), and the host-side `capture_chunk` log-capture plumbing. **Guest-image rebuild required:** this changes the in-guest `zlayer-vzagent` binary, so the kernel/initramfs at `~/.zlayer/vz/linux` (built by `images/vz-linux/build.sh`) must be rebuilt and re-staged for the fix to take effect at runtime. (`crates/zlayer-vzagent/src/main.rs`, `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+- **macOS VZ-Linux runtime: a non-zero workload exit code was dropped on the state/inspect path.** A container running e.g. `sh -c "sleep 2 && exit 42"` exited 42, and `wait_container` / `POST /containers/{id}/wait` correctly returned `{"StatusCode":42}` (read from `RunOutcome::exit_code`), but `container_state` (and Docker `inspect`'s `State.ExitCode`) returned `Exited { code: 0 }`. The workload-exit capture in `run_and_drain` writes BOTH the captured `exit_code` (what the wait path reads) and a richer `terminal` state (what the state path reads), but these are two separate mutexes set non-atomically; when `container_state` was consulted in the window where the code was captured but `terminal` was not yet written (and the guest's PID1 workload exit had already powered the VM off → `VZVirtualMachineState::Stopped`), `container_state` read the still-`Running` stored `c.state` and the `Stopped`/`_` reconcile arms fabricated `Exited { code: 0 }`, never consulting the captured `exit_code` — so the real code (42) was dropped while `wait` still reported it. Fix: introduced a single pure `outcome_to_state(exit_code, terminal, fallback)` mapping (precedence: recorded `terminal` → captured `exit_code` as `Exited { code }` → caller fallback) used by both `container_state` and `stop_container`'s teardown so the state path surfaces the SAME captured exit code as the wait path; the live-VM reconcile (including the `Stopped` arm) now runs only when the workload's outcome is genuinely unknown and never overrides a captured non-zero code. The exit-frame capture was also factored into a `record_exit` helper so the "Exited frame → stored outcome" mapping is unit-testable without a live VM. Success (`exit 0` → `Exited { code: 0 }`) and signal death (SIGKILL → `128+9` = 137) map identically to the wait path. Added pure-logic regression tests driving the capture→persist path for codes 42/0/137 and asserting `outcome_to_state` precedence (a captured code overrides the forced-stop `Exited { code: 0 }` / `Running` fallbacks, a `terminal` state wins verbatim, and the fallback is used only when nothing was captured). (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`)
+
+## 0.55.0 - 2026-06-05
+
+### Added
+- **`zlayer import` now accepts Docker archives (`docker save` / `podman save`), not just OCI
+  image layouts.** Previously `import` required an `oci-layout` + `index.json` and failed on the
+  Docker Archive format (a top-level `manifest.json` array with `Config`/`RepoTags`/`Layers`),
+  which is what `podman save` emits by default. The importer now detects the archive format and,
+  for Docker archives, reads the config + layer blobs and synthesizes an equivalent OCI manifest
+  over the stored bytes — labelling each layer `tar` or `tar+gzip` by gzip magic, and resolving
+  the image name/tag from an explicit `--tag`, else the archive's `RepoTags[0]`. The config,
+  layers, and manifest are persisted into the local registry and daemon blob cache identically to
+  a pulled image, so an imported Docker archive is afterwards indistinguishable from a pull.
+  (`crates/zlayer-registry/src/oci_export.rs`; OCI and Docker paths share a `resolve_name_and_tag`
+  helper. Tests cover uncompressed + gzipped layers, RepoTags fallback, and the
+  neither-OCI-nor-Docker error.)
+
+## 0.54.0 - 2026-06-04
+
+### Added
+- **vsock-based host→guest port forwarding for the macOS VZ-Linux runtime.** Published
+  container ports are now reachable from the host over the (already-working) virtio-vsock
+  channel instead of the broken VZ NAT path. New `proto::Msg::Forward { port }` wire variant
+  (appended as tag 9, with a round-trip test) tells the guest agent "splice THIS vsock
+  connection to `127.0.0.1:<port>` inside the guest". The in-guest `zlayer-vzagent` peeks the
+  first frame in `serve_connection`; on `Forward` it opens `TcpStream::connect(("127.0.0.1",
+  port))` and transparently pipes raw bytes between the vsock fd and the TCP stream (one thread
+  per direction, half-close on EOF), concurrent with `Run`/`Exec` and with PID-1 reaper
+  behavior intact. On the host, `start_container` spawns one loopback forwarder per distinct
+  published TCP container port: it binds `127.0.0.1:<container_port>` and, for each accepted
+  connection, opens a fresh vsock connection, writes a `Forward` frame, and bidirectionally
+  copies bytes between the host TCP connection and the vsock connection.
+
+### Changed
+- **`get_container_ip` reports host loopback for live VZ-Linux guests.** Reachability is via the
+  host loopback forwarders (vsock tunnel), not a guest NAT IP, so a running container returns
+  `127.0.0.1` (`Ok(None)` when not running). `port_mappings_container` reports each forwarded
+  port as `127.0.0.1:<container_port>` (host_port == container_port).
+- Removed the dead DHCP-lease poller (`guest_ip` cache, `ip_poll_task`, `resolve_guest_ip`) from
+  the VZ-Linux runtime — the NAT lease never appeared for this process. The NAT network device in
+  `build_config_linux` is retained (harmless) but no longer relied on for reachability.
+
+## 0.53.0 - 2026-06-04
+
+### Added
+- **`zlayer serve --secrets-only` daemon mode.** A lean HA secrets/RBAC service: mounts ONLY
+  `/health`, `/auth`, and `/api/v1/{users,groups,permissions,audit,secrets,environments,cluster}`
+  and skips every orchestration nest (deployments, services, projects, sync, internal agent,
+  tunnel, docker-compat, overlay, container/image/volume/job/cron). The HA secrets-store
+  selection is unchanged — a clustered node with `{secrets_dir}/wrapped_dek.bin` still serves
+  through `RaftSecretsStore`. Flag also settable via `ZLAYER_SECRETS_ONLY`. New
+  `zlayer_api::build_router_secrets_only_base` builds the lean base router; gated in
+  `commands::serve`. This is the daemon behind the `zsecrets` HA deployment.
+- **`zlayer-secrets-client` + `secrets-client-api` crates.** A thin reqwest-based
+  `ZLayerSecretsClient` that reads secrets out of the secrets-only daemon
+  (`GET /api/v1/secrets/{name}?scope=…&reveal=true`, bearer auth, 404→`Ok(None)`), implementing
+  the shared `SecretsClient` trait lifted into the dependency-light `secrets-client-api` crate.
+  Lets consumers (ZBilling, ZRegistry, …) swap an env-var backend for ZLayer Secrets with a
+  one-line change, without a ZBilling→ZLayer dependency edge or the heavy `zlayer-secrets`
+  crypto/sqlx tree.
+- **`zsecrets` deploy artifacts.** `images/Dockerfile.zlayer-secrets` (slim secrets-only image),
+  `zsecrets.zlayer.yml` (2-replica dedicated-node deployment spec), and
+  `docs/RUNBOOK_zsecrets_ha.md` (leader-init / follower-join / sealed-DEK / DNS / auth-bridge
+  bring-up runbook).
+## 0.52.19 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — complete (summary).** With Phase 7 below, the macOS
+  Apple-Virtualization Linux-guest runtime (`VzLinuxRuntime`,
+  `crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`) is feature-complete: it runs OCI Linux
+  containers (`alpine`, etc.) on Apple Silicon by booting a ZLayer-built arm64 kernel `Image` +
+  initramfs through `Virtualization.framework`'s `VZLinuxBootLoader` — no external dylib (distinct
+  from the libkrun `macos_vm.rs` path) and a Linux kernel rather than a macOS bundle (distinct from
+  the macOS-guest `macos_vz.rs` path). The extracted image rootfs is shared into the guest over
+  virtiofs (tag `rootfs`, read-only) and overlaid with a tmpfs upper + `pivot_root`; the in-guest
+  `zlayer-vzagent` (initramfs `/init`, PID 1) speaks the `proto` vsock protocol on `AF_VSOCK` port
+  1024 (`Run`/`Exec`/`Signal` host→guest; `Stdout`/`Stderr`/`Started`/`Exited`/`Error` guest→host);
+  VZ NAT gives the guest a host-reachable `192.168.64.x` lease resolved by MAC from `dhcpd_leases`.
+  On macOS, Linux images route here by default when the runtime is available (libkrun reachable via
+  `com.zlayer.isolation=vm`); also selectable via the `com.zlayer.isolation=vz-linux` label or the
+  `com.zlayer.runtime=vz-linux` manifest marker. Implemented across Phases 0/2–7 (0.52.14–0.52.19);
+  the guest kernel + initramfs are built by `images/vz-linux/build.sh` (GPLv2 source, Linux-only
+  cross-compile; CI `.forgejo/workflows/vz-linux-images.yml`) and resolved at runtime from
+  `ZLAYER_VZ_LINUX_KERNEL`/`ZLAYER_VZ_LINUX_INITRD` or `{data_dir}/vz/linux/kernel/`. Requires the
+  `com.apple.security.virtualization` entitlement (already in `bin/zlayer/zlayer.entitlements`;
+  ad-hoc sign via `scripts/sign-vz.sh`); NAT needs no `com.apple.vm.networking`. Documented in
+  `docs/macos-vz-runtime.md` ("Linux guests"). The per-phase entries below (and in 0.52.14–0.52.18)
+  record how each piece landed.
+- **macOS VZ Linux-guest runtime — Phase 7: lifecycle polish (stop/remove/state/stats/kill/pause).**
+  Every remaining `Runtime` method on `VzLinuxRuntime` now has a real implementation — no method
+  returns an "unimplemented until a later phase" sentinel any longer.
+  - `stop_container(id, timeout)` is **graceful**: when the VM is live and the workload has not
+    already exited, it opens a fresh vsock control connection and sends
+    `proto::Msg::Signal { signum: SIGTERM(15) }` to the guest agent, then polls the shared
+    `RunOutcome` for the agent's `Exited`/`Failed` frame for up to `timeout` before force-stopping the
+    VM via `run_vm_lifecycle(Stop)`. It sets the final `ContainerState` (the recorded real exit code,
+    or `Exited{0}`), aborts the drain / IP-poll / port-forward tasks, clears the cached lease, and
+    releases the live VM (closing its vsock device + fds). Idempotent: stopping an already-stopped or
+    unknown container is `Ok`.
+  - `remove_container(id)` ensures the VM is fully stopped + released, aborts **all** spawned tasks
+    (drain, IP poll, port forwards), deletes the per-container state dir, and drops the record.
+    Idempotent (removing a nonexistent container returns `Ok`).
+  - `get_container_stats(id)` reports the configured allocation (VZ exposes no live per-VM metrics):
+    `memory_limit = ram_mib * 1024 * 1024` and a **non-zero** `memory_bytes` estimate (a quarter of
+    the limit, floored at 1) so `docker_runtime_test::test_container_stats`' `memory_bytes > 0`
+    assertion holds; `cpu_usage_usec` is 0.
+  - `kill_container(id, signal)` delivers a **real** signal: the validated/canonicalised signal name
+    is mapped to its Linux number (`signal_number`, defaulting to `SIGKILL(9)`) and sent to the guest
+    agent over vsock when a live agent exists, then the VM + tasks are torn down via `stop_container`;
+    with no live agent it falls straight through to a forced VM stop.
+  - `pause_container` / `unpause_container` use VZ's native pause/resume via
+    `run_vm_lifecycle(Pause/Resume)`, matching the macOS-guest VZ runtime.
+  - Added the `signal_number` name→Linux-number mapper and `signal_agent` vsock helper; pure unit
+    tests `signal_number_maps_canonical_names_and_defaults_to_sigkill` and
+    `signal_number_roundtrips_validate_signal_output`, plus the `#[ignore]`d end-to-end
+    `vz_linux_full_lifecycle` test (create→start→logs→stats→exec→stop→remove, asserting the state
+    transitions and that `container_state` errors after remove).
+
+## 0.52.18 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 6: NAT networking (guest IP + host-reachable ports).**
+  `build_config_linux` now attaches a `VZVirtioNetworkDeviceConfiguration` with a
+  `VZNATNetworkDeviceAttachment` whose MAC is pinned to the container's per-VM
+  `VZMACAddress` (round-tripped via `initWithString`), so VZ's userspace DHCP server hands the
+  guest a `192.168.64.x` lease that the host-side `/var/db/dhcpd_leases` lookup resolves by MAC
+  (`config.setNetworkDevices(...)`, mirroring the macOS-guest runtime's network device).
+  `VzLinuxRuntime::get_container_ip` is implemented: it reads the cached lease (populated by a
+  background DHCP poller spawned at start, 60 s budget) or polls `dhcpd_leases` by MAC for up to
+  15 s, returning the NAT IP. This is what the daemon's same-service localhost-reachability feature
+  (`service.rs` → `ProxyManager::publish_loopback_for_container`) consumes to publish
+  `127.0.0.1:<port>` → guest_ip:port, so that feature now works for VZ-Linux containers on macOS.
+  `port_mappings_container` reports each published port mapped to the directly-reachable guest IP,
+  plus any spawned fixed-host-port forward. Spec `port_mappings` with a fixed (non-zero) TCP host
+  port get a tokio listener on `127.0.0.1:host_port` that proxies (`copy_bidirectional`) to
+  guest_ip:container_port; the IP poller and all forwarders are tracked on the container and aborted
+  on `stop`/`remove`. Added the `#[ignore]`d integration test
+  `vz_linux_guest_gets_ip_and_port_reachable` (alpine `nc -l` listener on :8080; wait for
+  `get_container_ip`, connect directly to guest_ip:8080, assert the banner; assert
+  `port_mappings_container` reports the guest binding) and the non-ignored unit test
+  `mac_roundtrip_preserves_address_and_rejects_garbage`.
+
+## 0.52.17 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 5: `exec` into a running Linux guest over virtio-vsock.**
+  `VzLinuxRuntime::exec` now opens a **second** vsock connection to the same guest agent
+  (`proto::CONTROL_PORT` 1024, reusing the Phase-4 `connect_vsock` queue/`RcBlock`/dup-fd bridge with
+  its 30 s connect timeout), sends `proto::Msg::Exec { argv, env }` — inheriting the container spec's
+  environment — and drains the reply frames: `Stdout`/`Stderr` accumulate into separate buffers,
+  `Exited{code}` yields the real exit code, and `Error{message}` is surfaced as an `Err`. Returns
+  `(exit_code, stdout, stderr)` per the `Runtime::exec` contract; `exec_stream` uses the trait
+  default over this buffered path. The guest agent enters the running workload's PID namespace
+  (`setns` on `/proc/{pid}/ns/pid`; mount/net are already shared) so the exec'd process sees the
+  container view. `exec` returns a clear error when the container has no live VM/agent connection or
+  its workload has already exited, and the connect timeout prevents a dead guest from hanging the
+  call. Added `#[ignore]`d integration tests `vz_linux_exec_echo` (`sleep 600` workload, then
+  `exec ["echo","hi"]` → `(0, "hi", "")`) and `vz_linux_exec_exit_code` (`sh -c "exit 42"` → 42).
+  networking / stats / IP remain honest later-phase sentinels.
+
+## 0.52.16 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phases 3 & 4: virtiofs rootfs share + in-guest vsock agent
+  (workload runs, logs captured, real exit code).** `build_config_linux` now attaches two devices:
+  a `VZVirtioFileSystemDeviceConfiguration` (tag `rootfs`) that shares the extracted OCI image
+  rootfs into the guest **read-only** as a `VZSingleDirectoryShare` (the guest overlays a tmpfs upper
+  and `pivot_root`s onto it), and a `VZVirtioSocketDeviceConfiguration` for the host↔guest control
+  channel. After the VM reaches Running, `start_container` connects to the guest agent's
+  `AF_VSOCK` port `proto::CONTROL_PORT` (1024) — the connect is issued on the VM's serial dispatch
+  queue, its completion block `dup`s the connected fd and bridges it back over a `std::mpsc` channel
+  (with a ~250 ms retry up to 30 s while the agent finishes booting). A blocking drain task then
+  sends `proto::Msg::Run { argv, env, cwd, uid, gid }` (built from the spec) and streams the reply
+  frames: `Stdout`/`Stderr` are captured into an in-memory buffer **and** mirrored to `console.log`,
+  `Started{pid}` records the workload pid, and `Exited{code}`/`Error{message}` record the terminal
+  state + real exit code on the container. `wait_container` now returns the actual workload exit
+  code (no longer always 0), `container_state` reports the agent-authoritative `Exited{code}` /
+  `Failed{reason}`, and `container_logs`/`get_logs` merge the serial console with the captured
+  workload stdout/stderr. End state: `docker run --rm alpine echo hello` through the daemon yields
+  `hello` in logs and exit 0. Added `zlayer-vzagent` as a path dependency to reuse its `proto` wire
+  types. `exec` / networking / stats / IP remain honest later-phase sentinels.
+
+## 0.52.15 - 2026-06-04
+
+### Added
+- **macOS VZ Linux-guest runtime — Phase 2: boots a real Linux kernel to the serial console.**
+  `VzLinuxRuntime::start_container` now builds a `VZVirtualMachineConfiguration` for a Linux guest
+  (generic platform + `VZLinuxBootLoader` from a kernel `Image` + `initramfs.cpio.gz`, headless,
+  serial console wired to `console.log`) on a dedicated serial dispatch queue, creates the
+  `VZVirtualMachine`, and starts it (uncapped — no macOS 2-VM licensing limit). `stop_container`
+  drives the VZ stop lifecycle and `container_state` reconciles against the live VM state. Kernel
+  artifacts resolve from `ZLAYER_VZ_LINUX_KERNEL` / `ZLAYER_VZ_LINUX_INITRD` (dev override) or the
+  `{data}/vz/linux/kernel/` cache, with a clear error pointing at `images/vz-linux/build.sh` when
+  absent. Boot command line `console=hvc0 rootfstag=rootfs rw` (`rootfstag` is the virtiofs marker
+  Phase 3 mounts as root). exec / stats / IP / vsock remain honest later-phase sentinels.
+
+### Changed
+- Promoted the guest-agnostic VZ config helpers (`clamp_cpu_count`, `clamp_memory_bytes`,
+  `spec_vcpus`, `spec_memory_mib`, `resolve_entrypoint`, `file_url`, `parse_memory_to_mib`) from the
+  macOS-guest runtime into `macos_vz_shared` so both the macOS- and Linux-guest runtimes share one
+  implementation. `spec_vcpus`/`spec_memory_mib` now take explicit default/floor args (macOS guests
+  keep 2 vCPU / 4096 MiB floor 2048; Linux guests use 2 vCPU / 512 MiB floor 128).
+
+## 0.52.14 - 2026-06-04
+
+### Fixed
+- **macOS rootless daemon install crash-loop ("Daemon failed to start within 45s / no job loaded").**
+  The actual root cause: with `--docker-socket`, `serve` spawns the in-process Docker API server, whose
+  `zlayer_docker::socket::serve` called the **auto-starting** `DaemonClient::connect()` before the
+  daemon's own API socket was ready — so it forked a SECOND `zlayer serve` that raced the launchd
+  daemon for the API port/socket, and the freshly-bootstrapped job never stayed loaded. The Docker
+  socket server now waits for the *local* daemon via a non-auto-starting `try_connect` retry loop, never
+  spawning a competitor. (Contributing fixes below were found and corrected along the way.)
+- **`kickstart -k` SIGKILLed the just-bootstrapped daemon.** The plist sets `RunAtLoad=true`, so
+  `bootstrap` already starts the daemon; the post-bootstrap `launchctl kickstart -k` then SIGKILLed it
+  mid-`init_daemon`. Now uses a plain `kickstart` (no `-k`).
+- **Root overlayd IPC socket was not connectable by the per-user daemon.** `zlayer-overlayd` runs as
+  root and bound its IPC socket with default ownership, so the user daemon's `setup_global_overlay`
+  failed with `Permission denied (os error 13)`. The socket is now `0o660` + chowned to the shared
+  `zlayer` group, mirroring the main daemon's API socket policy.
+- **macOS overlay never configured ("Failed to configure global overlay: No such file or directory").**
+  boringtun's `device` feature hardcodes its WireGuard UAPI control socket under `/var/run/wireguard/`
+  and ignores ZLayer's configured `uapi_sock_dir`, so the post-create discovery scan and UAPI `set`
+  looked in the wrong directory and failed `ENOENT`. The transport now resolves the UAPI socket
+  directory to `/var/run/wireguard` on macOS. The overlay now reports `Overlay transport configured
+  and up`.
+- **`install-dev.sh` now builds and stages `zlayer-overlayd`.** The script built only `zlayer` and
+  copied only `zlayer`, so the daemon could neither register the overlay system service (overlayd binary
+  not found next to `zlayer`) nor run a current overlayd. It now `cargo build`s `-p zlayer-overlayd` and
+  installs it next to the main binary.
+
+### Changed
+- **macOS rootless install registers the root overlay service BEFORE starting the main daemon.** The
+  overlayd change-gate + (one) sudo elevation now runs ahead of the daemon bootstrap, so `serve` finds
+  the root overlayd already running and cross-node overlay networking comes up on first boot — instead
+  of the daemon spawning a doomed user-level overlayd that `EPERM`s on the utun and never recovers
+  until a later restart. Per the change-gate: if the overlay service is already current, it is **not
+  touched** (no sudo); only a genuine overlay change elevates (try sudo, prompt once if not root).
+- **`serve` no longer spawns a doomed user-level `zlayer-overlayd` on rootless macOS.** When no root
+  overlayd system service is installed and we are not root, the overlay utun can never be created
+  (it requires root), so the supervisor now logs a single clear degraded-mode line and runs with
+  cross-node overlay networking disabled instead of spawning a child that only `EPERM`s.
+
+### Added
+- **Same-service `localhost:<port>` reachability (`localhost_reachability` on a service).** A service
+  can publish its exposed ports on the node's loopback (`127.0.0.1:<port>`) — the GitHub-Actions
+  "service published to localhost" convention — so a same-node consumer reaches it at `localhost:<port>`.
+  The daemon binds the node loopback port and L4-forwards to wherever the container actually listens
+  (its overlay IP on Linux/VZ/HCS, or `127.0.0.1:<assigned-port>` on the macOS seatbelt/libkrun
+  runtimes); a container's own `127.0.0.1` is never rewritten. Configurable via
+  `localhost_reachability: auto | always | never` (default `auto`, which publishes only for effectively
+  single-member, non-scaled services — a multi-member service stays addressed by overlay DNS name).
+- **macOS VZ Linux-guest runtime scaffold + routing (Phase 0).** A new `VzLinuxRuntime`
+  (`crates/zlayer-agent/src/runtimes/macos_vz_linux.rs`) is wired into the composite runtime as the
+  **default Linux path on macOS**: Linux images, the `com.zlayer.runtime=vz-linux` manifest marker, and
+  the `com.zlayer.isolation=vz-linux` label all route to it, while libkrun stays reachable via the
+  explicit `com.zlayer.isolation=vm` label. Phase 0 implements real OCI image pulling (rootfs extraction)
+  and container-record creation; VM boot, exec, networking, and stats land in later phases (they return
+  honest "not implemented until a later phase" errors for now). Guest-agnostic VZ helpers were extracted
+  into a shared `macos_vz_shared` module reused by both the native-macOS-guest and Linux-guest runtimes.
+  Added the `ZLAYER_RUNTIME_LINUX_VZ` (`"vz-linux"`) registry marker constant.
+
+## 0.52.13 - 2026-06-04
+
+### Fixed
+- **macOS rootless daemon install: reinstall-over-running race.** `daemon install` ran
+  `launchctl bootout` then immediately `launchctl bootstrap` of the same label. `bootout` is
+  asynchronous, so bootstrapping before launchd finished tearing the old job down raced the teardown —
+  the job failed to stay loaded, surfacing as `Daemon failed to start within 45s / no job loaded`
+  (hit most often by `install-dev.sh --replace`, which boots out the running production daemon right
+  before reinstalling). Now waits (bounded) for the label to actually disappear before bootstrapping.
+
+### Changed
+- **macOS rootless install now uses the shared `zlayer` group when available.** The per-user
+  `gui/$uid` LaunchAgent previously emitted `GroupName=zlayer` only when installing as root. It now
+  emits it whenever the `zlayer` group exists **and** the installing user is a member (verified via
+  `id -Gn`) — using an existing group needs no admin; only *creating* it (`dseditgroup`) does. A
+  first-ever rootless install on a host that never provisioned the group still omits `GroupName` (so
+  `launchctl bootstrap` can't fail `EX_CONFIG`).
+
+## 0.52.12 - 2026-06-04
+
+### Added
+- **VZ base-image builder (`zlayer vz build-base`).** New producer for the macOS VZ runtime's base
+  bundles (`crates/zlayer-agent/src/runtimes/macos_vz_build.rs`): drives a macOS `.ipsw` restore image
+  through `VZMacOSRestoreImage` + `VZMacOSInstaller` to mint a Tart-style bundle (`disk.img` +
+  `hardware-model.bin` + `aux.img`) the runtime can pull. Supports `--ipsw <path|url>` or `--latest`
+  (fetch the host's latest supported restore image), with `--disk-size-gib`/`--cpus`/`--memory-mib`
+  overrides. With `--push <ref>` it packs the bundle into a single `tar+zstd` OCI layer
+  (`zlayer-registry::pack::pack_files_tar_zstd`) and publishes it via the new generic
+  `ImagePuller::push_artifact`, stamping the manifest annotation `com.zlayer.runtime=vz`. The install
+  reuses the runtime's proven queue/`build_configuration`/`block2`→channel FFI machinery. Pure helpers
+  are unit-tested; the multi-GB install is an `#[ignore]`d integration test (set `ZLAYER_TEST_IPSW`).
+- **`.forgejo/workflows/macos-vz-images.yml`** — manual (`workflow_dispatch`) pipeline that builds +
+  ad-hoc-signs `zlayer` on a macOS runner and publishes a VZ base bundle to GHCR. Distinct from
+  `macos-images.yml` (which builds Seatbelt sandbox rootfs images).
+
+### Changed
+- **VZ runtime is now preferred automatically for VZ base bundles.** The composite runtime's
+  `select_for` reads the `com.zlayer.runtime=vz` manifest annotation (cached during `pull_image*` via
+  the new `zlayer_registry::fetch_image_runtime_marker`) and routes such images to the VZ runtime —
+  the only runtime that can boot them. This is non-breaking: it fires only for genuine VZ bundles, so
+  Seatbelt-rootfs and Linux images are unaffected (Linux still routes to the libkrun delegate / a
+  peer). The per-service label still wins: `com.zlayer.isolation=vz` forces VZ; `=sandbox`/`=seatbelt`
+  forces the Seatbelt sandbox even for a VZ-annotated image.
+
+### Fixed
+- **Raft `cluster_scaling`: replicas now spread across the cluster on deploy.** The leader's
+  `ServiceManager::scale_service` previously dispatched **all** replicas to itself
+  (`dispatch_scale(self_node_id, …)`, a never-finished "Phase 1" placeholder), so affinity-aware
+  placement never ran on `zlayer deploy` and a 3-replica `affinity: spread` service piled onto node 1.
+  Added `Cluster::dispatch_scale_distributed` — `RaftCluster` computes affinity-aware placement
+  (`place_service_replicas` over live raft node state, honoring `Spread`/`Pack`/`Pin`) and fans out
+  one scale per node with its share (each carrying the spec; the leader's own share short-circuits to a
+  local call). `SingleNodeCluster`/`StaticCluster`/`WorkerTierCluster` keep their dispatch-to-self
+  behavior via the trait's default. (The companion `cluster_upgrade` spec-propagation fix already
+  passes in CI.)
+- **`affinity: spread` now distributes zero-footprint services across uneven nodes.** The bin-packer
+  (`select_for_bin_packing`) ranked nodes by **utilization first** and used same-service anti-affinity
+  only as a tie-break *when utilizations were exactly equal*. But a spread service typically requests no
+  CPU/mem (e.g. the nginx e2e fixture), so per-replica reservation never moves utilization; and real
+  cluster nodes sit at slightly different utilization, so the tie-break never fired and all replicas
+  piled onto the single lowest-utilization node. For `Spread`, same-service replica count is now the
+  **primary** ranking key (utilization is the secondary tie-break), so replicas fan out across distinct
+  nodes regardless of resource requests or uneven load. `Pack`/`Pin` ordering is unchanged. This was the
+  actual `cluster_scaling` ship-blocker (the fan-out above is necessary but was insufficient alone).
+
+## 0.52.11 - 2026-06-04
+
+### Added
+- **VZ runtime: auto-signing + Apple-Silicon auto-detection.** `make build`/`make release` and
+  `scripts/install-dev.sh` now sign the `zlayer` binary on macOS with the
+  `com.apple.security.virtualization` entitlement (`bin/zlayer/zlayer.entitlements` +
+  `scripts/sign-vz.sh`) so the VZ runtime can create/boot guest VMs out of the box — ad-hoc by default
+  (sufficient for local use on the same Mac), or with a Developer ID via `VZ_SIGN_IDENTITY=…` /
+  `make sign-vz` for a distributable build. `VzRuntime::new` now detects Apple Silicon and
+  `VZVirtualMachine::isSupported()`, logging "ready" when usable or an actionable WARN (pointing at
+  `scripts/sign-vz.sh`) when the framework reports unsupported (typically a missing entitlement);
+  `start_container` surfaces the same signing hint. Verified on an Apple M-series host: a signed binary
+  reports the runtime "ready" with `apple_silicon=true`.
+
+## 0.52.10 - 2026-06-03
+
+### Added
+- **macOS Apple-Virtualization (VZ) runtime** (`crates/zlayer-agent/src/runtimes/macos_vz.rs`):
+  ephemeral native-macOS guest VMs via `Virtualization.framework` (the GitHub-runner / Tart model),
+  coexisting with the Seatbelt sandbox (primary) and the libkrun Linux-guest runtime. **Opt-in only** —
+  never selected by `Auto`: choose it node-wide with `--runtime mac-vz`, or per-service with the label
+  `com.zlayer.isolation: "vz"` (routed by the composite runtime's new VZ delegate). Each container is a
+  macOS guest cloned from a base bundle (`disk.img` + `hardware-model.bin` + `aux.img`) via APFS
+  `clonefile` CoW, with a fresh `VZMacMachineIdentifier`, a per-VM random MAC, and an ephemeral SSH
+  keypair. `start_container` builds the full `VZVirtualMachineConfiguration` (Mac platform + boot loader
+  + clamped CPU/RAM + graphics + virtio block/net+NAT + serial→console.log) and runs the VM on a
+  dedicated serial `DispatchQueue`, bridging the framework's `block2` completion handlers to the async
+  runtime. `exec` runs over SSH (system `ssh`, no extra deps); `get_container_ip` parses
+  `/var/db/dhcpd_leases` by MAC; `pause`/`unpause` use real VZ pause/resume. A process-wide 2-VM gate
+  (RAII guard) enforces Apple's concurrent-macOS-guest limit. Deps: `objc2`, `objc2-foundation`,
+  `objc2-virtualization`, `block2`, `dispatch2`. Pure helpers are unit-tested; the VM-boot integration
+  test is `#[ignore]`d (needs the `com.apple.security.virtualization` entitlement + a base bundle). See
+  `docs/macos-vz-runtime.md`.
+
+## 0.52.9 - 2026-06-03
+
+### Changed
+- **Rootless Linux daemon install** (mirrors the macOS rootless model). When `zlayer daemon install`
+  runs as a regular user it now registers a `systemctl --user` unit under `~/.config/systemd/user`
+  (instead of a system unit in `/etc/systemd/system`) and runs the container runtime **rootless**
+  (rootless youki uid/gid mappings from `/etc/subuid`/`/etc/subgid` + cgroup-v2 delegation via the
+  unit's `Delegate=yes`), writing only to user-owned `~/.zlayer`. The blanket up-front `sudo`
+  re-exec is removed on Linux; `unit_path`/`systemctl_args` switch to the per-user manager when
+  non-root; the user unit omits `Group=zlayer` and the overlay capability block (a user unit can't
+  hold caps) and hooks `default.target` instead of `multi-user.target`. The `zlayer-overlayd` system
+  service (which owns the tun adapter) is the only root step: the same change-gate as macOS
+  (installed unit text + binary SHA-256 + `systemctl is-active`) skips it with no sudo when unchanged,
+  else re-execs `daemon _install-overlayd` under `sudo`. The install summary points at
+  `systemctl --user` and suggests `loginctl enable-linger $USER` to keep the daemon running while
+  logged out. A root/system install (`sudo zlayer daemon install`) is unchanged.
+- **Windows is intentionally NOT rootless**: registering a service goes through the SCM
+  (`ServiceManager::local_computer()`), which requires Administrator for the system service database;
+  Windows per-user services would need a separate API path the current SCM code does not implement
+  (HCS, the container runtime, is not the blocker). Windows daemon-management actions still elevate
+  up front.
+
+## 0.52.8 - 2026-06-03
+
+### Changed
+- **Rootless macOS daemon install.** `zlayer daemon install/uninstall/start/stop/restart/reset/migrate`
+  no longer self-elevate on macOS — the main daemon installs as a per-user launchd **Agent**
+  (`gui/$uid`, `~/Library/LaunchAgents`) writing only to user-owned `~/.zlayer`, with `RunAtLoad` +
+  `KeepAlive` so it's owned by launchd (survives closing the shell, auto-restarts, relaunches at
+  login). The plist omits `GroupName` when non-root (a per-user Agent has no shared group; emitting it
+  made `launchctl bootstrap` fail `EX_CONFIG`). Root is now acquired **surgically and only when the
+  overlay system service actually changed**: a new change-gate (`overlayd_service_is_current`) compares
+  the installed `/Library/LaunchDaemons/com.zlayer.overlayd.plist` text + the overlayd binary's
+  SHA-256 + `launchctl print` liveness and skips the step entirely (no sudo) when unchanged; otherwise
+  it re-execs a hidden `daemon _install-overlayd` under `sudo` and caches `{binary_sha256, plist_sha256}`
+  to user-owned `~/.zlayer/overlayd-service.json`. A daemon-only reinstall now prompts for nothing.
+  Installing on a box with a legacy *root* `system/com.zlayer.daemon` is reconciled in one surgical
+  sudo (boot it out, drop its system plist, `chown -R` the data dir back to the user). `uninstall`
+  cleans both the `gui/$uid` Agent and any legacy system daemon (+ the overlayd system service)
+  regardless of euid. (Linux/Windows daemon installs are unchanged in this release.)
+
+### Fixed
+- **`daemon install` readiness probe used the wrong socket.** `wait_for_daemon_ready` always probed
+  the platform-default socket, so installing with a custom `--data-dir`/`--socket` reported a 45s
+  timeout even though the daemon was healthy on its configured socket. It now probes the socket the
+  daemon was actually configured with.
+- **macOS install failure diagnostics name the cause.** On a start timeout the installer now asks
+  launchd why (`launchctl print gui/$uid/<label>`): exit code 78 is reported as `EX_CONFIG`
+  (unwritable log/socket or a stale `GroupName` group), and a same-label job loaded in the other
+  (system) domain is flagged — instead of a generic "failed to start within 45s".
+- **`install-dev.sh`** reclaims ownership of the full `~/.zlayer` (not just `secrets`) for home-based
+  installs, so the rootless daemon can write a tree left root-owned by a prior system install.
+
+## 0.52.7 - 2026-06-03
+
+### Added
+- **Opt-in placement affinity** (`ServiceSpec.affinity`: `spread` | `pack` | `pin`). Wires up the
+  previously-dead `GroupAffinity` so a service can control how its replicas spread across cluster
+  nodes. `spread` = same-service anti-affinity (each replica prefers a node hosting fewer of this
+  service's replicas, so they land on distinct nodes for HA); `pack` (the default, preserving
+  historical shared-mode behavior) bin-packs replicas onto the fewest nodes; `pin("id=N")` /
+  `pin("label=value")` binds all replicas to one node. Also honoured per-`ReplicaGroup`
+  (`place_service_with_groups` no longer ignores `group.affinity`).
+
+### Fixed
+- **`cluster_scaling`: replicas no longer pile onto a single node.** The shared-mode scheduler never
+  consumed a replica's CPU/memory during a placement pass, so `node_has_capacity` always saw the
+  original (empty) usage and the tie-break concentrated every replica on one node. Placement now
+  reserves CPU/memory per replica as it goes (`reserve_node_resources`, restored on a gang rollback),
+  so capacity-driven spread works — a replica that doesn't fit on a node is placed elsewhere — and the
+  new `affinity: spread` distributes same-service replicas across distinct nodes even when they would
+  fit together.
+- **`cluster_upgrade`: a rolling image change now reaches worker containers.** Two gaps: (1)
+  `ServiceManager::upsert_service` only recreated containers on *digest* drift under `Always`/`Newer`,
+  so a tag bump (e.g. `nginx:1.28-alpine` → `1.29-alpine`) under `if_not_present` was silently ignored;
+  it now recreates on any change to the image *reference*, doing so locally via `scale_service_local`
+  to avoid bouncing a worker's recreate back through the leader. (2) Leader→worker scale dispatch
+  carried only `{service, replicas}`, so workers scaled from a stale cached spec; `InternalScaleRequest`
+  now carries the full `ServiceSpec` and the `/internal/scale` handler `upsert`s it before scaling —
+  which both propagates image changes and lets a never-seen-before service run on a fresh worker (so
+  spread replicas can actually start on peer nodes).
+
+## 0.52.6 - 2026-06-03
+
+### Fixed
+- **daemon startup deadlock (ship-blocker for both local installs and `raft-e2e`).** `zlayer serve` would never bind its API listener when stderr is not a TTY (i.e. under launchd/systemd/CI, where stderr is redirected to a file) — manifesting locally as "Daemon failed to start within 45s" and in CI as every raft cluster suite failing "node1 never came up on 127.0.0.1:NNNN". Root cause: commit `51383c54` moved the observability **console** tracing layer from stdout to stderr, but `serve` installs `install_stderr_redirect_to_tracing()` which `dup2`'s fd 2 onto a pipe whose reader re-emits each line as a `tracing::error!`. With the console layer also writing to fd 2, every event looped back through that pipe; once the pipe buffer filled, `write_all` blocked while holding the global stderr mutex and the daemon deadlocked mid-`init` (observed via `sample`: main thread parked in `Stderr::lock` from `StorageBundle::open`). Fix: in `zlayer-observability::init_logging`, the **daemon** arms (those with a file writer — only `zlayer serve` configures file logging) route the console layer to **stdout** (fd 1), keeping it disjoint from the fd-2 stderr capture; the **CLI** arms (no file writer) keep console on **stderr** so command stdout such as `ps --format json` stays clean. Restores the pre-`51383c54` daemon behavior while preserving the JSON-clean-stdout fix for CLI commands.
+- **daemon startup stall on unreachable overlayd.** When `zlayer-overlayd` was missing or could not bind (e.g. a dev box without the staged binary, or before it finishes starting), `OverlayManager::setup_global_overlay` paid the full `connect_with_backoff` retry window (~20 attempts) once per IPC call, stacking to ~35s of synchronous startup stall before the (already non-fatal) overlay setup gave up. Added `OverlaydClient::connect_with_attempts(endpoint, max_attempts)` (the existing `connect_with_backoff` now delegates with `20`; it also no longer sleeps after its final attempt), switched the `OverlayManager` lazy connector to a bounded 6-attempt (~2.5s) dial, and made `setup_global_overlay` establish/cache the connection once up front so a dead overlayd costs a single bounded dial instead of 2-3 full windows. The overlayd supervisor keeps the generous budget for waiting on a freshly-spawned overlayd.
+
+## 0.52.5 - 2026-06-03
+
+### Added
+- hcs (windows-debug): `ZLAYER_GCS_SVCDUMP=1` diagnostic to name *why* the stripped nanoserver UVM's `mpssvc`/`netsetupsvc` never reach Running (the GCS cold-start wall). When set, the create path injects the host `%SystemRoot%\System32\sc.exe` into the UVM at `<os_files>\Windows\System32\sc.exe` (the stripped UVM ships `cmd.exe`/`services.exe` but no `sc.exe`), and `build_uvm_registry_changes` registers an auto-start (`Start`=2, `Type`=0x10, `ErrorControl`=0, no `DependOnService`) SCM service `CurrentControlSet\Services\zlayer-svcdump` whose REG_EXPAND_SZ `ImagePath` loops ~12×/~5s appending `sc queryex mpssvc|netsetupsvc|BFE|RpcSs|nsi|gcs` + `sc qc mpssvc|netsetupsvc` + `sc query` to `C:\zlayer-dbg\svcdump.txt`. Reuses the existing `RegistryValue`/`RegistryKey`/`RegistryHive` schema.
+- hcs (windows-debug): interactive/on-box svcdump capture. After a cold-start accept timeout under `ZLAYER_GCS_SVCDUMP=1` + `ZLAYER_KEEP_UVM_ON_FAILURE=1`, the preserved scratch VHDX is mounted **on the box** (read-only, via `Mount-DiskImage`), `C:\zlayer-dbg\svcdump.txt` is read, and its contents are both folded into the `CreateFailed` error message and echoed to stderr via `step_log!`, so a foreground `cargo test … --nocapture` run streams the service-state dump live without offline-VHDX mounting.
+- hcs: real `container_logs` / `get_logs` for HCS process-isolation. Added `CapturedProcess::create_capturing_blocking` to `zlayer-hcs::process`, which drives `HcsCreateProcess` via `HcsWaitForOperationResultAndProcessInfo` to recover the `HCS_PROCESS_INFORMATION` stdout/stderr pipe HANDLEs, plus a synchronous `drain_pipe`/`drain_with_process` reader. The agent's `exec` path now creates the process capturing, drains the pipes (so `exec` returns real stdout/stderr instead of empty strings), and appends each line to a new per-container in-memory `log_buffer`; `container_logs` returns those `LogEntry`s with tail support (mirroring the youki/WSL2 file-backed log readers).
+
+## 0.52.4 - 2026-06-03
+
+### Fixed
+- raft e2e (agent, health bridge): `cluster_scaling` / `cluster_upgrade` still timed out at stabilization (`web: N/N replicas, healthy=false → 0/N ready`) even with the host-side `command: "true"` health check in place, because nothing bridged the check's result into `ServiceManager`. In `zlayer-agent`'s container-create path (`ServiceInstance::scale_to`), the `HealthMonitor` callback that writes the shared `health_states` map (which `stabilization::wait_for_stabilization` reads) was built **only inside** `if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip)`. In CI the container has no reachable `effective_ip` (degraded overlay) and there is no proxy, so the `if let` was false, no callback was attached, `health_states` was never written, and the service stayed `healthy=false` forever. Restructured so the `health_states` bridge callback is **always** attached to the monitor (`monitor.with_callback(...)` before `monitor.start()`), regardless of proxy/IP. The proxy-specific work (`add_backend` / `update_backend_health`) is now captured into an `Option<(Arc<ProxyManager>, SocketAddr)>` that stays `None` when no proxy + IP exist; the single callback always updates `health_states` and only touches the proxy when that Option is `Some`. Added a regression unit test (`test_health_states_bridge_fires_without_proxy`) that drives the real `scale_to` create path with no proxy_manager and a `Command { command: "true" }` health check, asserting `health_states` receives `Healthy`.
+
+## 0.52.3 - 2026-06-02
+
+### Added
+- ps / API: deployment container listings now surface each running container's **real image reference** and **real lifecycle state**. `runtime::Container` gained an `image: String` field (populated at every construction site from `spec.image.name`), and `ContainerState` gained an `as_str()`/`Display` (`pending`/`initializing`/`running`/`stopping`/`exited`/`failed`). New `ServiceInstance::container_infos()` and `ServiceManager::get_service_container_infos(service) -> Vec<ContainerInfo { id, image, state, pid, overlay_ip }>` read the live containers map. The API `list_containers` handler now reports the real per-container state (was hardcoded `"running"`) and image instead of `None`; `zlayer_types::api::services::ContainerSummary` gained `#[serde(default)] image: String`. The `zlayer ps --containers --format json` output now emits an `image` field per container row (and the table gained an IMAGE column). Enables the raft `cluster_upgrade` e2e to assert containers transition to the new image.
+- hcs (`windows-debug` feature, compiled out by default): in-guest diagnostic exfiltration for the Hyper-V WCOW GCS cold-start failure (the inbox `vmcomputeagent.exe` closes the bridge right after the host's cold-start `Create` RPC). When the feature is on, `hyperv_create_via_gcs` hot-attaches a **writable** `zlayer-debug` VSMB share (backed by `Uvm::debug_dir()`, `options: None` to avoid the HCS PowerOnCold `0x80070057` writable-share trap) at the next free VSMB index after the bridge comes up. A new gated `build_uvm_debug_registry_changes()` (appended to the UVM offline `RegistryChanges` only under the feature) writes two diagnostic mechanisms into the guest hives: (1) **WER `LocalDumps` for `vmcomputeagent.exe`** in the `Software` hive (`DumpFolder` = guest mount `\\?\VMSMB\VSMB-{dcc079ae-…}\zlayer-debug`, `DumpType=2` full, `DumpCount=5`) so a gcs.exe crash leaves a minidump on the share; (2) an auto-start own-process `zlayer-dbg` SCM service in the `System` hive whose `ImagePath` captures `sc query/qc gcs` + the Hyper-V-Compute operational and SCM event logs into the share, catching the clean-exit (strict-JSON-reject) case where no WER dump is produced. The existing step-4 accept-failure arm already reads these back via `read_uvm_debug_dump` and folds them into the `CreateFailed` reason.
+- gcs/hcs (`windows-debug` feature): **guest GCS log forwarding** so the in-guest GCS's OWN log lines reach the host. New `zlayer_gcs::log_forward::LogForwardListener` binds a host-side hvsock listener on `(uvm.runtime_id, WindowsLoggingHvsockServiceID = 172dad59-976d-45f2-8b6c-6d1b13f2ac4d)` — mirroring hcsshim's `internal/uvm/create_wcow.go::makeUtilityVM` `uvm.outputListener`. The ServiceTable entry for that GUID is already in our create-time UVM doc (`build_virtual_machine_doc`). `hyperv_create_via_gcs` binds the listener **before** `HcsStart` (step 3a') and spawns its accept/read loop **after** start (step 3b'); each forwarded chunk (newline-delimited JSON logrus records, per hcsshim's `vmutils.ParseGCSLogrus`) is appended to `gcs-forward.log` in the UVM debug dir (collected by `read_uvm_debug_dump`) and echoed to stderr. The bridge's `accept()` issues the `StartLogForwarding` GCS RPC (`RPCModifyServiceSettings` in hcsshim's `ComputeService` category, `PropertyType: "LogForwardService"`, body `{RPCType:"StartLogForwarding", Settings:""}` — wire shape from `internal/uvm/log_wcow.go` + `internal/gcs/prot/protocol.go::ServiceModificationRequest`) right after negotiate and **before** the cold-start `Create`, so the guest is already streaming its log when the cold-start death occurs. NOTE: hcsshim's host process surfaces these via its logrus→ETW sink (`microsoft.windows.logforwardservice.provider`); a host that does not itself listen on the logging hvsock receives nothing, hence we re-implement the listener rather than relying on that ETW provider. New `RpcMessageType::ModifyServiceSettings` (ComputeService category, wire `0x1020_0101`/`0x2020_0101`) + `HvSockStream::read_some` (open-ended stream read) + `transport::WINDOWS_LOGGING_HVSOCK_SERVICE_ID`.
+
+### Changed
+- hcs: the workload (step 9) GCS `RpcCreate` call site now builds `CreateRequest { container_config: AnyInString::new(create_settings), .. }` to match `zlayer_gcs::protocol::CreateRequest`'s new double-encoded `ContainerConfig` wire field (was `settings: serde_json::Value`).
+- gcs/hcs: the cold-start `Create`'s `TimeZoneInformation` now sends the **real host timezone** (hcsshim's DEFAULT, non-`noInheritHostTimezone` path) instead of the all-zero-transition-date UTC constant. The agent queries the host TZ via a new `crate::windows::timezone::host_timezone_information()` helper (Win32 `GetDynamicTimeZoneInformation`, falling back to `GetTimeZoneInformation`) and renders it as hcsschema `TimeZoneInformation` JSON — PascalCase keys, UTF-16 names trimmed at NUL, `SYSTEMTIME` transition dates as nested `SystemTime` objects, Go `omitempty` semantics (zero ints + all-zero dates omitted). `PendingGcsBridge::accept(timeout, host_tz)` threads the value into `cold_start_create_start`; when `host_tz` is `None` (failed Win32 query / non-windows) it falls back to hcsshim's `noInheritHostTimezone` UTC constant `utcTimezone` (canonical `"Coordinated Universal Time"` names + empty `{}` dates). Hypothesis: the inbox GCS's TZ handling is a fragile critical path and the all-zero transition dates are the fragile input; the real host TZ (with populated DST transitions) is what a production hcsshim host sends.
+- gcs: the diagnostic `ZLAYER_GCS_COLDSTART_DELAY_MS` cold-start settle delay now defaults to `0` (no-op) instead of `1500 ms`; the env override hook is retained for on-box iteration but is off by default.
+- hcs (`windows-debug`): the writable `zlayer-debug` VSMB share now hot-attaches at step 3c' (after `HcsStart`, **before** `accept()`) instead of step 4c (after `accept()`), so it exists during the cold-start window where the guest currently dies and can actually receive WER dumps / `zlayer-dbg` output. Parent-layer VSMB shares (and their guest `sN` paths) shift to base index 1 under the feature to leave index 0 for the debug share.
+- hcs (`windows-debug`): the injected `zlayer-dbg` SCM service is now `Start`=3 (`SERVICE_DEMAND_START`) instead of `Start`=2 (`SERVICE_AUTO_START`) — it no longer runs its `cmd.exe`/`wevtutil` payload during the fragile cold-start boot (a confounder), but the service definition stays in-tree for manual `sc start zlayer-dbg`. The passive WER `LocalDumps` entries are unchanged.
+
+### Fixed
+- raft e2e (CI): the `E2E Tests (Raft)` job had **never passed** because the build step ran `cargo build --release -p zlayer` only, which does **not** build the separate `zlayer-overlayd` binary that `zlayer serve` self-spawns. With the binary absent, every node's `serve` stalled ~35s dialing the overlayd IPC socket (`ensure_overlayd_running` backoff + `setup_global_overlay`) — past the harness's 30s `/health/ready` budget — so all five cluster suites failed at bootstrap. Fixed by building overlayd in CI: `.forgejo/workflows/e2e.yml` + `.github/workflows/e2e.yml` raft jobs now `cargo build --release -p zlayer -p zlayer-overlayd`, `run-suite.py`'s `build_phase` builds both (covering the throwaway/intellitester serve paths), the raft fingerprint `ls-tree` set gained `crates/zlayer-overlayd`, and the per-node bootstrap `/health/ready` wait was bumped 30s→60s as insurance. Verified locally: `cluster_3node`, `cluster_failover`, `cluster_node_upgrade` all PASS with overlayd reachable.
+- raft e2e (specs): the `cluster-specs/*.yaml` fixtures used **unqualified** image names (`nginx:1.28-alpine` / `nginx:1.29-alpine`), which `zlayer-registry` hard-rejects (it refuses to silently route bare names to Docker Hub) — breaking `cluster_scaling` and `cluster_upgrade` before any pull. Qualified all four fixtures to `docker.io/library/nginx:…`. `run-suite.py`'s `cluster_upgrade` `expected_image` was updated to match and now compares via a registry-prefix-tolerant `_norm_image` normaliser (so `nginx:1.29-alpine` and `docker.io/library/nginx:1.29-alpine` match either way). Verified locally that the deploy now resolves the qualified image and reaches container creation (the remaining macOS-only failure is `libkrun is not available`; CI's privileged Linux runner runs the container natively).
+- zlayer-overlayd: fixed a latent **Linux-only** compile error that surfaced once CI started building the crate — the service-bridge release path (`#[cfg(target_os = "linux")]`) called `IpNet::contains(ip)` by value, but `ipnet` implements `Contains<&IpAddr>`, so it must be `contains(&ip)`; also removed an unused `IpAllocator` alias import in `setup_service_overlay_shared` (would trip `clippy -D warnings`). macOS never compiles this path, so it was invisible to the local `cargo build --workspace`.
+- raft e2e (CI, cgroups): once the build + bootstrap were fixed, CI run #1689 confirmed the three pure-raft suites (`cluster_3node`, `cluster_failover`, `cluster_node_upgrade`) pass, but `cluster_scaling` / `cluster_upgrade` fail creating real workload containers — the runner's job container leaves the daemon at the cgroup-v2 root with a read-only `/sys/fs/cgroup` (the daemon's own diagnostic: "no writable cgroup parent"). Added a best-effort prep step to both e2e.yml raft jobs that remounts `/sys/fs/cgroup` rw, delegates a `zlayer-e2e` parent with the cpu/memory/pids/io controllers (the cgroup-v2 ROOT is exempt from the no-internal-process rule), and exports `ZLAYER_CGROUP_PARENT`; it prints full cgroup diagnostics and never fails the job (the pure-raft suites need no cgroups). The runner must launch the job container privileged — which is why the raft job is now **pinned to `runs-on: nvidia`** (the GPU runners MiniBeast/BeastPC reliably honor `--privileged`; the plain `ubuntu-latest` pool also includes `GitRunner`, which does not, and that runner-selection lottery is what made the container suites flake run-to-run).
+- raft e2e (specs, health): with cgroups writable, CI run #1691 created the workload containers and nginx started, but `cluster_scaling` / `cluster_upgrade` still timed out at stabilization (`healthy=false`) — the default `HealthCheck::Tcp { port: 0 }` probes the container's overlay IP, which the host can't reach in the runner. Since these fixtures verify replica scaling + image transition (not endpoint reachability), the four `cluster-specs/*.yaml` now declare a host-side `command: "true"` health check so a replica is healthy as soon as it is running, independent of overlay/HTTP networking.
+- zlayer-tunnel: `AccessSession::is_expired()` / `remaining_ttl()` were time-races — `is_expired` used a strict `Instant::now() > expires_at` and `remaining_ttl` returned `Some(ZERO)` at the exact boundary, so a `with_ttl(Duration::ZERO)` session was only "expired" if the monotonic clock happened to tick between construction and the check. Under the parallel load of a full `cargo test --workspace` this flaked `test_access_session_expired`. Made expiry deterministic: `is_expired` now uses `>=` (a zero-TTL session is expired immediately) and `remaining_ttl` returns `None` for zero/negative remaining.
+- docker compose: `zlayer docker compose` now accepts the project-level flags (`-f/--file`, `-p/--project-name`, `--project-directory`, `--env-file`, `--profile`) **before** the subcommand, matching both `docker compose` (v2) and `docker-compose` (v1) — e.g. `zlayer docker compose -f docker-compose.yml -p web config` previously failed with `error: unexpected argument '-f' found`. The shared `ComposeContextArgs` is now flattened as a `global = true` group on the parent `ComposeCommands` (so clap collects the flags whether they appear before or after the subcommand); each subcommand keeps a `#[clap(skip)]` `ctx` placeholder that `handle_compose` populates from the parsed parent context, so every handler body keeps reading `args.ctx` unchanged and the post-subcommand form (`compose config -f X`) still works exactly as before. Added regression tests asserting the pre-subcommand form captures all five flags and parses identically to the post-subcommand form.
+
+## 0.52.2 - 2026-06-02
+
+### Added
+- **`OverlayMode::Dedicated` per-service overlays are now fully implemented end-to-end (all platforms).** A service with `mode: dedicated` gets its own real `WireGuard` device — separate crypto context, listen port, overlay IP, and subnet — standing *on top of* the always-on global cluster transport, rather than merely having its subnet plumbed onto the shared device's `AllowedIPs` (which remains the `Shared` behavior). Its containers attach to a bridge enslaved to that dedicated device (Linux) / a per-service HCN Internal network (Windows), and the dedicated devices of all nodes hosting the service mesh with each other.
+  - **Contract (`zlayer-types`):** new `overlayd::PeerScope` (`Global` default / `Service { service }`, `#[serde(tag = "scope")]`) added as a `#[serde(default)]` field on the four peer ops (`AddPeer` became a struct variant with `#[serde(flatten)] peer` so on-wire names and pre-Dedicated frames are unchanged → default `Global`). New `overlayd::ServiceOverlayInfo` + `OverlaydResponse::ServiceOverlay` report a dedicated device's identity; new `DedicatedServiceStatus` + `StatusSnapshot.dedicated_services`. `InternalAddPeerRequest` gained optional `service`/`service_subnet`. `OverlayMode::resolve_v0_51` renamed to `resolve`; `Dedicated` now resolves to `Dedicated` (was collapsed to `Shared`), `Auto` still resolves to `Shared` (no telemetry heuristic yet).
+  - **Overlayd server:** new `service_transports: HashMap<String, ServiceTransport>` (the live per-service devices) + `DedicatedPortAllocator` (UDP ports from the band above the global port, rehydrated from the on-disk marker so a service re-binds its exact prior port across restarts). `setup_service_overlay` branches on `mode.resolve()`: `Shared` runs the original path verbatim; `Dedicated` mints/reuses a stable identity (key + port + interface) from the `service:<name>` marker entry, assigns the subnet from the same `ServiceSubnetRegistry`, brings up the dedicated `OverlayTransport`, and attaches it (Linux bridge / Windows per-service HCN Internal network). Cross-platform scope routing via `transport_for_scope(&PeerScope)` resolves `Global` → cluster transport, `Service` → the dedicated transport; the four peer-op bodies were extracted into `*_on(&OverlayTransport)` helpers so the `Global` path is byte-for-byte unchanged. `StatusSnapshot.dedicated_services` is populated with live per-device peer counts. `teardown_service_overlay` tears down the dedicated transport (shutdown + free port + release subnet + drop marker + delete the Windows per-service HCN network); `purge_managed_networks` sweeps `hcn-internal` entries so per-service networks are uninstall-clean.
+  - **Windows:** `ensure_service_network(service, subnet)` creates a per-service **Internal** HCN network (never Transparent — no physical-NIC binding), reused by recorded GUID/name across restarts. `attach_container_windows` selects the per-service network + allocates the container IP from the service subnet for Dedicated services (shared base network otherwise). The agent's `overlayd_attach_windows` now threads the **real** service name (`ContainerId::service`) into `AttachContainer` instead of an empty string — required for correct attachment in BOTH modes.
+  - **Cluster brain:** the agent reads each service's `ServiceSpec.overlay.mode` and threads it into `OverlayManager::setup_service_overlay(name, mode)` (was hardcoding the default); the method now returns `ServiceOverlayInfo`. New service-scoped shims `add_service_peer`/`remove_service_peer` send `scope: Service`-tagged peer ops.
+  - **Cross-node mesh (`crates/zlayer-api/src/handlers/dedicated_mesh.rs`):** after a Dedicated `setup_service_overlay` on the local node, `distribute_dedicated_service` (a) **publishes** the node's per-service endpoint into Raft (`Request::SetServiceOverlayEndpoint { ServiceOverlayEndpoint { node_id, service, wg_public_key, endpoint, overlay_ip, subnet } }`); (b) **learns** every other hosting node's endpoint from `cluster_state.service_overlay_endpoints_for(service)` and adds each as a service-scoped peer; (c) **notifies** the other hosting nodes (`nodes_hosting(service)` ∩ `cluster_state.nodes`) via a fire-and-forget POST to `/api/v1/internal/add-peer` carrying `service`/`service_subnet`. `add_peer_internal` honors `request.service` (routes to `add_service_peer`); new `POST /api/v1/internal/remove-peer` is the scoped-removal analog. `delete_deployment` calls `remove_dedicated_service_endpoint` (proposes `Request::RemoveServiceOverlayEndpoint` + broadcasts scoped removal). The daemon-startup `restore_single_deployment` loop re-runs distribution on every restore, serving as the idempotent reconcile backstop. Raft state gained the replicated `service_overlay_endpoints` map + `nodes_hosting`/`service_overlay_endpoints_for` queries (all `#[serde(default)]`, snapshot-compatible). `DeploymentState::with_dedicated_mesh(raft, internal_token, advertise_addr)` wires the dependencies in `serve.rs`.
+
+### Tested
+- Contract serde roundtrips (scoped peer ops both scopes, scope-less `add_peer` → `Global`, `ServiceOverlay` Shared/Dedicated, `StatusSnapshot.dedicated_services`, `InternalAddPeerRequest`/remove-peer shapes).
+- Overlayd: `DedicatedPortAllocator` distinctness/reuse/reserve/exhaustion, marker wg-field persistence + back-compat, `transport_for_scope` routing/error, dispatch-level `Service`-scope-before-setup error, and a Linux `#[ignore]` (CAP_NET_ADMIN) e2e asserting a Dedicated service yields a distinct-port/interface/key device that a `Service`-scoped `AddPeer` lands on.
+- Agent: `setup_service_overlay` carries the real mode, `add_service_peer`/`remove_service_peer` use `PeerScope::Service`, `peer_spec_from` parity.
+- API: `add_peer_internal` service-scope routing; Raft publish→`service_overlay_endpoints_for`→remove + `nodes_hosting`.
+- Verified green workspace-wide (`fmt`/`clippy -D warnings`/`test`/`build`) on **macOS** and the **Windows Server box** (full `--workspace` clippy + test, including all `#[cfg(windows)]` per-service HCN code, `CLIPPY_RC=0`/`TEST_RC=0`).
+
+### Fixed
+- hcs: `zlayer_hcs::schema::Layer` now serializes its `id`/`path` with `#[serde(skip_serializing_if = "String::is_empty")]` to byte-match hcsshim's `internal/hcs/schema2/layer.go` `,omitempty` tags — the strict inbox Windows GCS unmarshaller (hcsshim #2714) tears down the VM on any unexpected/empty field in the hosted-container `Container` doc. Field name confirmed as `Id` (NOT `ID`) under the struct's `rename_all = "PascalCase"`. Added zlayer-hcs unit tests asserting (a) a default `Container`/`Layer` serializes with no null/empty/zero/empty-array fields and (b) `Layer` emits `"Id"` not `"ID"`. The remaining `Container` doc fields (`GuestOs`/`Storage`/`Networking`/`MappedDirectories`/`MappedPipes`/`Processor`/`Memory`, plus their nested fields including `Memory.SizeInMB`) were audited and already carried correct PascalCase names + omitempty-equivalent skips. **Flagged (not yet fixed):** `ContainerNetworking.dns_search_list` is a `Vec<String>` whereas hcsshim's `DnsSearchList` is a comma-joined `string`; it is always constructed empty today and `skip_serializing_if = "Vec::is_empty"` guarantees it is omitted entirely, so no JSON array reaches the wire — but a non-empty list would require migrating the field to a `String` first.
+
+## 0.52.1 - 2026-06-02
+
+### Added
+- `zlayer-overlayd` is now a complete, compiling overlay daemon (previously lib-only: just the IPC contract + transport + client). New `zlayer_overlayd::server::OverlaydServer` is a 1:1 migration of the *mechanics* half of the agent's `OverlayManager`: it owns the single cluster `WireGuard` `OverlayTransport`, the per-service Linux bridges (Linux) / HCN Internal network + endpoints (Windows), the per-node IP allocator, DNS records, and NAT traversal. `OverlaydServer::handle` dispatches every `OverlaydRequest` variant (`SetLocalNodeId`/`SetLocalWgPubkey`, `SetupGlobalOverlay`/`TeardownGlobalOverlay`, `SetupServiceOverlay`/`TeardownServiceOverlay`, `AllocateIp`/`ReleaseIp`, `AttachContainer`/`DetachContainer` for both `LinuxPid` and `WindowsContainer` handles, `AddPeer`/`RemovePeer`/`AddAllowedIp`/`RemoveAllowedIp`, `RegisterDns`/`UnregisterDns`, `Status`, `NatTick`, `Shutdown`) to the real mechanism. The Windows `AttachContainer{WindowsContainer}` path ensures the HCN Internal overlay network exists (reused via the `agent_network.json` marker), creates the per-container endpoint + namespace via `zlayer_hns::attach::EndpointAttachment::create_overlay`, and returns the bare-lowercase namespace GUID in `AttachResult`.
+- New `src/main.rs` binary target `zlayer-overlayd`: clap `--data-dir` / `--socket` args (socket defaults to the new data-dir-aware `zlayer_paths::ZLayerDirs::default_overlayd_socket_path_for`), tracing-subscriber init, and a `transport::serve` accept loop that runs each connection's request/response loop against an `Arc<Mutex<OverlaydServer>>`, exiting gracefully on a `Shutdown` request.
+- Ported (copied, not moved — the agent originals are untouched) `zlayer_overlayd::network_state` (HCN marker, pure serde/std) and `zlayer_overlayd::netlink` (Linux RTNETLINK helpers for bridges, veth, routes, netns). The libcontainer-backed `move_link_into_netns_fd_and_rename` was rewritten against the `rtnetlink` crate directly (`setns_by_fd` + `name`) since overlayd has no libcontainer dependency. `zlayer_overlayd::server::purge_managed_networks` (Windows) mirrors the agent's full-uninstall HCN network sweep.
+- `zlayer_paths::ZLayerDirs::default_overlayd_socket_path_for` — data-dir-aware overlayd IPC endpoint (`/var/run/zlayer-overlayd.sock` on the Unix system default, `{data_dir}/run/zlayer-overlayd.sock` otherwise, `\\.\pipe\zlayer-overlayd` on Windows).
+- **The main `zlayer` daemon now ensures overlayd is running before using the overlay, and `zlayer daemon install` registers overlayd as its OWN OS service.** New `bin/zlayer/src/commands/overlayd_supervisor.rs::ensure_overlayd_running(data_dir)` is called early in `serve` (only when overlay is enabled, i.e. NOT `host_network`) before `init_daemon` constructs the `OverlayManager` (now an overlayd client): it connects to the overlayd socket; if down, starts the installed OS service (`systemctl start zlayer-overlayd` / `launchctl kickstart com.zlayer.overlayd` / `sc start ZLayerDaemon-Overlayd`); else (dev) spawns `zlayer-overlayd --data-dir <dd> --socket <sock>` detached (`setsid` on Unix, `DETACHED_PROCESS` on Windows), then polls `OverlaydClient::connect_with_backoff` until reachable. `zlayer daemon install` now installs BOTH the main daemon service AND a separate overlayd service: Linux `/etc/systemd/system/zlayer-overlayd.service` (always with the `tun`/`CAP_NET_ADMIN`/`CAP_SYS_ADMIN` capability block since overlayd owns the overlay), macOS `/Library/LaunchDaemons/com.zlayer.overlayd.plist` (or user LaunchAgents when non-root), Windows SCM `ZLayerDaemon-Overlayd` (LocalSystem/AutoStart). The overlayd binary is located next to the running `zlayer` binary and copied into the system bin dir alongside `zlayer` when the main binary is relocated out of a user home. `zlayer daemon uninstall` stops + removes the overlayd service too (and the overlayd binary under `--remove-binary`); the overlay *network* is still removed only on `--purge-data`, never on a plain main-daemon update — so the overlay adapter survives main-binary reinstalls.
+
+### Changed
+- **`zlayer-agent` no longer performs any overlay/network mechanics in-process — it is now an overlayd client.** `zlayer_agent::OverlayManager` was rewritten from a ~2300-line mechanics owner into a thin shim that holds only cluster-brain / cached state (`deployment`, `instance_id`, `local_node_id`, `local_wg_pubkey`, and cached `node_ip`/`dns_server_addr`/`dns_domain`/`cluster_cidr`/`slice_cidr`) plus a lazily-connected `zlayer_overlayd::OverlaydClient`. Every public method keeps its prior signature so callers (`bin/zlayer`, `zlayer-api`) compile unchanged, but the body now builds the matching `OverlaydRequest` and issues `client.call(req)`: `setup_global_overlay`→`SetupGlobalOverlay`, `setup_service_overlay`→`SetupServiceOverlay`, `teardown_service_overlay`→`TeardownServiceOverlay`, `attach_container`→`AttachContainer{LinuxPid}`, `detach_container`→`DetachContainer`, `add_global_peer`→`AddPeer` (converting `PeerInfo`→`PeerSpec`), `cleanup`→`TeardownGlobalOverlay`, `nat_maintenance_tick`→`NatTick`, status getters read a cached `Status` snapshot, and `set_local_node_id`/`set_local_wg_pubkey` forward to overlayd. The migrated `zlayer_agent::netlink` and `zlayer_agent::network_state` modules and the in-process `start_periodic_orphan_sweep`/`IpAllocator`/`OverlayTransport`/`NatTraversal` machinery were removed (they live in `zlayer-overlayd` now).
+- `HcsRuntime` (Windows) delegates HCN networking to overlayd. The runtime gained an `overlayd: Option<Arc<Mutex<OverlaydClient>>>` field (connected from `HcsConfig.data_dir`'s overlayd socket in `HcsRuntime::new`); `create_container` now calls `AttachContainer{WindowsContainer{container_id, ip}}` to create the HCN endpoint + per-container namespace and embeds the returned `AttachResult.namespace_guid` in the compute-system document, and `remove_container` sends `DetachContainer`. The agent-side `ensure_overlay_network`, `OverlayNetwork`, `purge_managed_networks`, the `agent_network.json` marker logic, and the in-process endpoint-reaping `reconcile_orphans` body were removed — overlayd owns that lifecycle. The Hyper-V GCS compartment-attach (step 7.5) resolves the endpoint id from the overlayd-created namespace via `zlayer_hns::namespace::Namespace::list_endpoints`. `OverlayManager::attach_container_hcn` now takes the container id (not a namespace GUID) and returns `(IpAddr, Option<String>)` (IP + namespace GUID).
+- `bin/zlayer daemon uninstall --purge` (Windows) now drives `zlayer_overlayd::server::purge_managed_networks` instead of the removed `zlayer_agent::runtimes::hcs::purge_managed_networks`.
+
+### Tested
+- `crates/zlayer-overlayd/tests/ipc_roundtrip.rs` — cross-platform end-to-end IPC test: a real `OverlaydServer` served over a Unix socket and driven by `OverlaydClient` (`Status` / `SetLocal*` round-trips), proving the length-prefixed-JSON framing + client id-matching + server dispatch work over a live socket.
+- `crates/zlayer-overlayd/tests/windows_hcn_e2e.rs` (Windows, `#[ignore]`) carries the HCN adapter-safety proofs forward into overlayd: `create_internal` yields an `Internal` network with no `NetAdapterName` binding, and `purge_managed_networks` deletes the network + clears the marker. Verified on a live Windows Server 2025 host — both gateway NICs stayed Up with zero external vSwitches.
+
+### Fixed
+- `zlayer-overlayd` now has a real Windows SCM (Service Control Manager) entrypoint. Previously its `main` was a bare `#[tokio::main]` serve loop, so SCM launched it as a plain console process and `sc query ZLayerDaemon-Overlayd` never reported Running. `main` is now a sync `fn` that, on Windows with the new hidden `--service` flag, hands control to a new `#[cfg(windows)] mod service` (mirrors `bin/zlayer/src/daemon_service.rs`): it registers an SCM control handler (Stop/Shutdown → graceful exit), reports `ServiceState::Running` (accepting STOP|SHUTDOWN) then `Stopped`, and drives the serve loop on a tokio runtime it builds itself. The serve body was extracted into `async fn run_overlayd(data_dir, socket, external_shutdown)` shared by the SCM path and the foreground/dev path (now wired to `ctrl_c`); the existing in-band `Shutdown` IPC request still works. `zlayer daemon install` (Windows) now passes `--service` in the overlayd service's launch arguments so SCM enters the dispatcher.
+- Windows-only clippy/test hygiene that surfaced when the overlayd code first compiled on Windows: missing `;` in `tracing!` match arms, `must_use` / `unused_async` / doc-backtick / item-ordering lints, and a parallel-test race on the process-global `ZLAYER_HCN_UPLINK_ADAPTER` env var in `zlayer-hns` (now serialized with a shared mutex). The live-network `zlayer-builder` `sandbox_build_e2e` alpine-pull tests are now `#[ignore]` so `cargo test --workspace` is green offline.
+
+## 0.52.0 - 2026-06-01
+
+### Added
+- Persistent HCN overlay-network lifecycle on Windows. The HCS runtime records the overlay network it creates in a marker file (`{data_dir}/agent_network.json`, new `zlayer_agent::network_state` module + `zlayer_paths::ZLayerDirs::agent_network_state`); `HcsRuntime::ensure_overlay_network` reuses the recorded network by GUID across daemon restarts / binary updates / reinstalls, and `zlayer_agent::runtimes::hcs::purge_managed_networks` — wired into `daemon uninstall --purge` — is the **only** path that deletes it. The overlay network therefore survives updates/reinstalls and is removed only on a full uninstall (previously it was never deleted at all, leaking on every uninstall). `HcsConfig` gained a `data_dir` field (threaded from the daemon's resolved `--data-dir`) to locate the marker. Verified on a live Windows Server 2025 host (ignored e2e `test_purge_managed_networks_deletes_recorded_network`).
+- zlayer-overlay/api/types/client: edge-cache eligibility API. `zlayer-overlay::edge_cache::EdgeCacheRegistry` tracks per-node eligibility and broadcasts via gossip labels (`edge_cache=true`, `edge_cache_cpu=`, `edge_cache_ram_mib=`, `edge_cache_disk_mib=`, `edge_cache_geo=`) by re-announcing the local `gossip::PeerInfo` self-info on each enable/disable. `zlayer-api` exposes `POST /api/v1/nodes/{node_id}/edge-cache`, `DELETE /api/v1/nodes/{node_id}/edge-cache`, `GET /api/v1/nodes/{node_id}/edge-cache/stats` (stats is a placeholder returning `(0, 0)` per spec — Wave 1.3.3.7 integration-test compatibility). `DaemonClient::{enable_edge_cache,disable_edge_cache,edge_cache_stats}` give in-process Rust callers a typed wrapper. Unblocks Zatabase Wave 1.3.3.6.
+- Hyper-V GCS bridge: monotonic per-event timestamps + Hyper-V step mirror to stderr. `crates/zlayer-gcs/src/diagnostics.rs::ts_us()` exposes a process-shared `OnceLock<Instant>` epoch; `crates/zlayer-gcs/src/bridge.rs` prefixes every `gcs-bridge-send` / `gcs-bridge-reader` log with `[t=+Nus]`, and `crates/zlayer-agent/src/runtimes/hcs.rs::hyperv_create_via_gcs` mirrors every `tracing::info!("Hyper-V step N: …")` to stderr through a local `step_log!` macro that calls the same `ts_us`. Lets a reader visually align "Negotiate sent at t=…us, Create sent at t=…us, bridge closed at t=…us" against the guest-side WER 1000/1001 timestamps captured via the writable VSMB share — needed to pin the 0xEF `CRITICAL_PROCESS_DIED` bugcheck to a specific host-side step transition (~0.8 s post-Negotiate, immediately after cold-start `RpcCreate`).
+- Hyper-V e2e harness: host-side HCS ETW capture wired into `scripts/windows/launch_e2e.ps1`. Pre-test `logman create trace HcsTrace` with 13 providers verbatim from hcsshim `internal/vm/vmutils/etw/etw_map.go` (`microsoft.windows.hyperv.compute`, `microsoft-windows-hyper-v-compute`, `microsoft.virtualization.runhcs`, `microsoft.windows.logforwardservice.provider`, `microsoft-windows-hyper-v-crashdump`, `microsoft-windows-crashdump`, `microsoft-windows-hyper-v-worker`, `microsoft-windows-hyper-v-vmms`, `microsoft-windows-hyper-v-hypervisor`, `microsoft-windows-hyper-v-vsmb`, `microsoft-windows-hyper-v-debug`, `microsoft-windows-hyper-v-computelib`, `microsoft-windows-hyper-v-config`), verbose level + all keywords. `wevtutil set-log` enables the Worker Analytic/Operational + Compute Operational channels. Post-test `logman stop` + `tracerpt -of XML -lr` decodes into `hcs.xml`; `wevtutil qe` snapshots Hyper-V-Worker-Operational + Hyper-V-Compute-Operational into `hyperv-worker-op.xml` / `hyperv-compute-op.xml`. `debug_e2e.py`'s existing `scp -r` of the rundir picks all of these up automatically.
+- Hyper-V e2e harness: post-test guest-dump auto-collect. `launch_e2e.ps1`'s detached batch walks `%TEMP%\zlayer-hcs-hyperv-e2e-*\uvms\*` and `xcopy`s each UVM's `debug/` and `crash/` subdirs into per-UVM `guest-<id>-debug/` + `guest-<id>-crash/` subdirs of the run dir, so any future opt-in dump collection (currently disabled — see the `build_virtual_machine_doc` cleanup below) flows back to the dev box on `scp -r` with the rest of the rundir without per-test wiring.
+- `scripts/windows/debug_e2e.py` `--report-dir` default moved off `/tmp/zlayer-debug` (tmpfs / RAM) to `$XDG_CACHE_HOME/zlayer-debug` (or `~/.cache/zlayer-debug` when `XDG_CACHE_HOME` is unset). The runtime artifact is state — `.etl` traces, `eventlogs.txt`, full stdout — that should survive reboot and not consume memory. `ZLAYER_DEBUG_REPORT_DIR` env-var override still wins.
+- Per-UVM virtual COM1 routed to a host named pipe + UEFI POST console redirect for in-guest visibility without modifying the UVM VHDX. `zlayer_hcs::schema` gains `ComPort {NamedPipe, OptimizeForDebugger}` (verbatim from hcsshim `internal/hcs/schema2/com_port.go`), `Devices.ComPorts: BTreeMap<String, ComPort>`, and `Uefi.{EnableDebugger, ApplySecureBootTemplate, SecureBootTemplateId, Console}` (verbatim from `internal/hcs/schema2/uefi.go`). `build_virtual_machine_doc` emits `Devices.ComPorts["0"] = {NamedPipe: "\\\\.\\pipe\\zlayer-uvm-<runtime-guid>-com1", OptimizeForDebugger: true}` per UVM plus `Uefi.Console = "ComPort1"` to route firmware POST output to that pipe. New `scripts/windows/com_pipe_reader.ps1` discovery loop polls `\\.\pipe\` for matching pipes and spawns a per-pipe detached PowerShell child that drains each pipe's read end into `<RunDir>\com-<pipe-leaf>.log`. `launch_e2e.ps1` spawns the reader before cargo and signals teardown via a sentinel file after cargo exits. Designed as the substrate for a follow-on offline BCD patch (`bcdedit /store ... /set debug on /dbgsettings serial debugport:1 baudrate:115200` + `Uefi.ApplySecureBootTemplate="Skip"`) that would enable windbg attach into the in-guest kernel, but already informative on its own as the UEFI firmware writes POST diagnostics here.
+- Windows sandbox-image pipeline reaches macOS parity. `images/windows/` ships a `ZPipeline.yaml` with `REGISTRY` + `LTSC` vars plus 7 ZImagefiles (`base`, `golang`, `rust`, `node`, `python`, `deno`, `bun`) that all use `os: windows` and OS-suffixed tags (`${REGISTRY}/<lang>:windows-${LTSC}`). A new `.forgejo/workflows/windows-images.yml` matrix builds both `ltsc2022` + `ltsc2025` on `windows-latest` and pushes to `ghcr.io/blackleafdigital/zlayer/*`. `crates/zlayer-builder/src/builder.rs` gained `BuildOptions.pipeline_vars` + a free `expand_zimage_vars` helper applied at every ZImagefile read site (3 call sites), and the pipeline executor threads `pipeline.vars` through so `${REGISTRY}` / `${LTSC}` resolve at build time.
+- `crates/zlayer-builder/src/windows_toolchain.rs` (~1540 lines) mirrors `macos_toolchain.rs`: `ToolchainSpec` + constructors for Go/Node/Rust/Python/Deno/Bun, `detect_toolchain(image_ref)`, `provision_toolchain(spec, rootfs_dir, cache_dir, tmp_dir)`. Downloads upstream Windows archives once into `C:\toolchains\<lang>-<ver>-<arch>` and junctions/copies into each build's rootfs. Pure-Rust extraction (zip + tar + flate2), live version resolution (never hardcoded), inner-gated `#![cfg(target_os = "windows")]`.
+- `BuildOptions.windows_ltsc: Option<String>` setter on `crate::builder::BuildOptions` + threading via `pipeline/executor.rs` so `--set LTSC=…` flows from the user invocation into the resolver. `windows_image_resolver::rewrite_image_for_windows(image_ref, ltsc)` returns the appropriate `ghcr.io/blackleafdigital/zlayer/{base|<lang>}:…-windows-<ltsc>` for base distros + toolchains; mirrors `rewrite_image_for_macos` but parameterized.
+
+### Changed
+- **Windows container networking moved off the physical NIC.** `HcsRuntime::ensure_overlay_network` now attaches containers to an HCN **Internal** network (internal vSwitch, no physical-adapter binding) by default, via the new `zlayer_hns::network::Network::create_internal`, instead of a **Transparent** network bound to the host's primary uplink. The old Transparent default created an external Hyper-V vSwitch over the default-gateway NIC — on a remotely-administered host, the very adapter the operator connects through — risking host connectivity. The Internal network touches no physical adapter: container endpoints keep their real overlay IPs and reach other nodes by routing through the host vNIC to the WireGuard overlay adapter. The legacy Transparent path remains available opt-in by setting `ZLAYER_HCN_UPLINK_ADAPTER=<friendly name>` (logs a warning). Verified on a live Windows Server 2025 host: creating the overlay network + endpoint left both gateway NICs Up with zero external vSwitches (new ignored e2e `test_create_internal_network_no_physical_binding`).
+- `scripts/install-dev.sh` now supports macOS in addition to Linux. Mirrors the OS-handling pattern from `install.sh`: skips systemd / SELinux / libseccomp / cgroups-v2 / WireGuard-interface cleanup on Darwin, defaults the dev data dir to `$HOME/.${ZLAYER_DEV_NAME}` (matching `zlayer-paths::platform_default_data_dir`), drops `sudo` for `daemon install` on macOS (registers a per-instance launchd agent under `~/Library/LaunchAgents/com.zlayer.daemon-<suffix>.plist`), and runs the pre-install `daemon stop` without sudo on macOS so the bootout hits the user's `gui/$uid` launchd domain instead of `system/`. Final inspect/stop hints are now OS-aware (`launchctl list` + log tail on macOS, `systemctl status` + `journalctl` on Linux). Hard `uname -s != Linux` check replaced with a Linux/Darwin allowlist that points Windows users at `scripts/install-dev.ps1`.
+- **Windows builder consolidation** — the production HCS build path is now a single canonical builder. `crates/zlayer-builder/src/backend/hcs/mod.rs::HcsBackend::build_image` shrank from ~240 lines to a 36-line delegating shim that constructs a `WindowsBuildConfig` literal and forwards to a new `crate::windows_builder::WindowsBuilder::build_image_for_backend(context, dockerfile, options, event_tx)`. The new method does FROM rewrite (via `rewrite_image_for_windows` + `BuildOptions.windows_ltsc`), toolchain env+PATH injection (`#[cfg(target_os = "windows")] windows_toolchain::detect_toolchain` + idempotency-guarded `KEY=VALUE` push + `;`-separated PATH prepend), the instruction loop with `BuildEvent` emission (`BuildStarted`/`StageStarted`/`InstructionStarted`/`InstructionComplete`/`StageComplete`/`BuildFailed`/`BuildComplete`), `emit_image`, optional push, and the `windows_builder::BuiltImage` → `crate::builder::BuiltImage` type bridge. `BuildSkeleton` gained `provisioned_toolchain_language: Option<String>` (L463) so the per-RUN translator can selectively skip toolchain Linux package names. Pre-Wave-3b the HCS backend was 645 lines and there were two parallel build state machines; post-Wave-3b WindowsBuilder is the single owner.
+- apt→choco translation moved from a 4695-line legacy `WindowsBuilder` helper surface into the canonical `crate::buildah::DockerfileTranslator` so EVERY Windows build (production HCS + tests) routes through one translator. `DockerfileTranslator` gained `translate_run_command(cmd, source_distro, provisioned_toolchain_language: Option<&str>)` + `translate_shell_command(raw, source_distro, provisioned_toolchain_language)` — Linux variants pass through verbatim, Windows variants detect apt/apk/yum/dnf installs and emit `choco install -y …` after resolving each Linux package name through `windows_image_resolver::resolve_chocolatey_packages`. When a toolchain language is in scope (golang/go → Go, nodejs/node → Node, python3/python → Python, rust/rustc/cargo → Rust, deno → Deno, bun → Bun), matching package names are dropped from the choco install list (they're already on PATH via the env injection above). 13 unit tests moved and 5 added.
+- Dead Hyper-V Compute Service submodules deleted: `crates/zlayer-builder/src/backend/hcs/exec.rs` (~485 lines — `run_in_compute_system` superseded by WindowsBuilder's per-instruction commits), `…/layer.rs` (~265 lines — `capture_diff_blob` single-blob model replaced by per-instruction commits), `…/scratch.rs` (~270 lines — `create_writable_layer` dead, `prepare_base_chain` owned by WindowsBuilder). `…/commit.rs` trimmed 738 → 523 lines (dropped `write_oci_artifacts`, `BuildCommitArtifacts`, `compute_base_diff_ids`, `gzip_decode`, unused imports). Net cleanup: ~1600 lines of legacy code removed from the build path. `cargo check --workspace --target x86_64-pc-windows-gnu` reports zero dead-code warnings.
+
+### Fixed
+- `zlayer_hns::schema::HostComputeEndpoint` deserialization is now lenient (`#[serde(default)]` on the container, mirroring `HostComputeNetwork`). HCN's endpoint *query* response for a namespace-attached endpoint omits `Name` / `HostComputeNetwork` / `SchemaVersion` / `IPConfigurations`; the strict struct previously failed `query_properties` with `missing field …`. The create/serialize path is unchanged.
+- `zlayer-builder` package-map cache is now redirectable on every platform via `ZLAYER_PACKAGE_MAP_CACHE_DIR` (honored by `windows_image_resolver::resolve_cache_dir` before `dirs::cache_dir()`). Fixes 4 `buildah::translate_*` unit tests that failed on macOS because `dirs::cache_dir()` ignores `XDG_CACHE_HOME` there, so the hermetic shard fixture was never read and resolution fell through to a (failing, offline) network fetch.
+- `bottle_lockfile::lockfile_path_for_directory` test corrected — it asserted `/var/lib/zlayer-bottles.lock` but `lockfile_path_for` returns `<dir>/zlayer-bottles.lock` for a directory; now uses the OS temp dir, which exists on every platform (incl. Windows, where `/tmp` does not).
+- `zlayer-hcs` integration test compiles again — `Uefi` / `TopologyMemory` struct literals use `..Default::default()` after those schemas gained fields (`enable_debugger` / `console` / `apply_secure_boot_template`, `allow_overcommit` / `enable_hot_hint`).
+- `zlayer-gcs` transport test: Windows-only `manual_let_else` clippy error fixed (`-D warnings`).
+- `windows_builder` COPY/ADD materialization tests (`apply_copy_simple_file_writes_to_scratch`, `apply_copy_directory_recursive`, `apply_add_tarball_extracts`) gated `#[cfg_attr(windows, ignore)]` — they exercise the off-Windows commit-is-a-no-op materialization path; on a real Windows host `execute_instruction` commits via `HcsImportLayer`, which needs a base layer present (covered by the layer e2e).
+- agent/windows/unpacker: hardlink replay now resolves targets against parent-layer Files/ trees (was: only current staging dir). Mirrors hcsshim's `legacyLayerWriter.AddLink` + `legacyLayerWriterWrapper.Close` semantics — deferred link creation until after `wclayer::import_layer` returns, target resolution walks `parents` in reverse order, links materialised in destination layer dir (not staging). Root cause of the entire "gcs.exe never dials" Hyper-V debugging arc: a real `nanoserver:ltsc2022` unpack was dropping ~530 files (~30%), including `\windows\system32\nanocontainersbridge.dll` (the in-guest GCS bridge DLL). Verified by Phase F directory comparison (`~/.cache/zlayer-debug/run-g6/dir-compare-deep.txt`): our unpacker produced 1236 files vs containerd's snapshotter producing 1768 from the same image.
+- gcs: `cargo test` no longer hangs for ~1 hour after a Hyper-V e2e accept-timeout panic. `HvSockListener::accept` previously moved an `Arc<HvSocketInner>` clone into its `spawn_blocking` closure, which kept the socket alive past the outer future being dropped on `tokio::time::timeout`; the blocking-pool thread then sat in the `accept()` syscall forever, blocking tokio runtime shutdown. The blocking task now captures only the raw `SOCKET` value, and `HvSocketInner::Drop` calls `shutdown(SD_BOTH)` before `closesocket` so dropping the listener wakes any in-flight blocking call with `WSAEINTR`/`WSAENOTSOCK` and the runtime can shut down cleanly.
+- hcs: emit `ComputeTopology.Memory.AllowOvercommit=true` and `EnableHotHint=true` to match hcsshim's reference UVM doc (Phase G D-MEM).
+- hcs: pre-authorize `WindowsLoggingHvsockServiceID` (`172dad59-…`) in `HvSocketSystemConfig.service_table` with `D:P(A;;FA;;;SY)(A;;FA;;;BA)` bind+connect SD + `AllowWildcardBinds=true` to match hcsshim's reference UVM doc. The in-guest gcs.exe may abort RpcCreate when the log-forwarder service slot isn't pre-bound (Phase G D-HVSOCK-SVCTABLE).
+- hcs: revert G.3 (DevicePath leading backslash drop) — `\EFI\Microsoft\Boot\bootmgfw.efi` was correct; the prior `prepareConfigDoc` source-dump elided the leading `\` (Go JSON marshalling artifact), but ground-truth ETW capture of containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes shows the leading `\` IS sent. Dropping it caused UEFI's VmbFs path resolver to fail, the UVM kernel never reached gcs.exe, and the bridge accept timed out at 120s. Restored to the original (`r"\EFI\Microsoft\Boot\bootmgfw.efi"`).
+- hcs: revert G.2 (`WindowsLoggingHvsockServiceID` ServiceTable entry) — the entry is only well-formed when paired with a host-side log-forwarding hvsock listener (hcsshim sets both in the same `opts.LogForwardingEnabled` branch in `internal/uvm/create_wcow.go`). Without the listener, the in-guest GCS enumerates the ServiceTable, attempts to dial `WindowsLoggingHvsockServiceID` first, finds no listener, and never proceeds to dial the main GCS bridge — reproducing the never-dial 120s accept timeout regression even after Phase H. Adding LogForwardingEnabled support is a separate feature; for now, just don't pre-register the entry.
+- hcs: REVERT THE REVERT — re-add `HvSocketSystemConfig.service_table["172dad59-…"]` entry. Ground-truth ETW capture of containerd-shim-runhcs-v1's actual `HcsCreateComputeSystem` wire bytes shows runhcs DOES emit this entry. The prior revert reasoning ("only well-formed when paired with a listener") was incorrect — runhcs emits the entry whether or not the listener is up. Restored.
+- hcs: stop emitting `DebugOptions` and `Devices.GuestCrashReporting` blocks unconditionally. Ground-truth ETW capture of runhcs.exe's wire bytes shows runhcs emits NEITHER block by default. A prior attempt (B-5) to remove them caused a never-dial regression, but that test was confounded by COM-pipe additions also being active; with Phase H having reverted those, this is the second attempt — testing whether the originally-flagged "load-bearing" character was actually due to those interactions rather than the blocks themselves.
+- hcs: revert COM-pipe debug scaffolding (Devices.ComPorts emission, Uefi.Console="ComPort1", scripts/windows/com_pipe_reader.ps1, launch_e2e.ps1 COM-pipe spawn/stop blocks). The instrumentation was a dead end — UEFI firmware writes only a 7-byte ANSI clear-screen sequence to the COM redirect without an offline BCD patch, AND the mere presence of Devices.ComPorts in the UVM create-time doc reproduces the gcs.exe never-dial 120s accept-timeout regression that B-5 first showed. Schema definitions for ComPort and Uefi.console KEPT (standard hcsshim fields). Replaced by ground-truth hcsshim JSON-dump methodology (Phase A-F of the gcs-bridge plan).
+- **0xEF `CRITICAL_PROCESS_DIED` bugcheck root cause fixed**: the writable `zlayer-debug` VSMB share at UVM-create time. `crates/zlayer-agent/src/runtimes/hcs.rs::build_virtual_machine_doc` now emits only the `os` boot-files share (read-only `UtilityVM\Files` directory); the previously-attached writable `zlayer-debug` exfil share + the `zlayer-dump` SCM diagnostic service + the WER `LocalDumps` registry block (all three wrote into the same share) are dropped. Parent-layer shares were also moved out of the create-time doc — they hot-attach AFTER the UVM boots via `hyperv_create_via_gcs` Step 5 (`uvm_system.add_vsmb` per layer), mirroring hcsshim's `internal/uvm/create_wcow.go` (UVM-create-time) vs `internal/uvm/vsmb.go::Add` (per-hosted-container hot-add) split. Before this change, 4-of-4 UVMs in every e2e ran into 0xEF ~0.8 s after Negotiate, immediately after the cold-start `RpcCreate` — the in-guest gcs.exe's RpcCreate handler appears to iterate the create-time VSMB shares and crash when it sees a writable one. With the writable share removed the bugcheck is gone (verified in `run-2026-05-30T05-47-41`: zero `id=18590` events across all 4 UVMs). Full bisect narrative in `BlackLeafDocs/zlayer/windowshcs/gcs-bridge-and-0xEF.md §5`. Unit tests `build_virtual_machine_doc_populates_uvm_fields` + `_handles_empty_parent_chain` updated to expect a single share.
+- **`DebugOptions` + `Devices.GuestCrashReporting` no longer emitted unconditionally**. Hcsshim only sets these blocks when the caller supplies `opts.DumpDirectoryPath` AND calls `security.GrantVmGroupAccessWithMask` on it (`create_wcow.go:448-451`, `:456-467`). ZLayer used to emit both on every UVM with paths under `Uvm::crash_dir()` — a directory granted `HcsGrantVmAccess` (per-VM SID) but not VM-group SID. The `.vmrs` saved-state files written there were unusable for `cdb !analyze` anyway (saved-state is not a kernel minidump, and no modern Hyper-V vmrs→dmp converter exists). The host-side ETW capture in `scripts/windows/launch_e2e.ps1` provides bugcheck observability via the `Microsoft-Windows-Hyper-V-Worker-Admin` channel (`id=18590` carries the kernel `ErrorCode0..4`). `Uvm::crash_dir` accessor + per-VM crash-dir creation + grant chain follow next pass if they have no remaining callers.
+- `bin/zlayer/src/commands/node.rs:4222` `handle_node_join_non_admin_errors_early` test now passes the missing 10th positional argument `std::collections::HashMap::new()` for `node_labels`. The production callsite at L696 was already updated when raft `NodeInfo` gained the `labels: HashMap<String, String>` field, but the test had been left at 10 args, breaking `cargo clippy --target x86_64-pc-windows-gnu --all-targets` (and any future `cargo test --workspace` once the Hyper-V e2e harness needed it).
+- `zlayer_gcs::bridge::GcsBridge` reader-exit race fixed. The bridge previously kept `pending: HashMap<u64, oneshot::Sender>` outside any guard against the reader having exited, so an RPC sent after the reader shut down inserted a waiter into a dead map and hung forever on `rx.await`. New `PendingState { closed: bool, waiters: HashMap<…> }` under one `Mutex`; `send_rpc_json` checks `closed` before inserting; the reader sets `closed=true` + clears `waiters` on exit. Test runs that previously sat at the 1200s budget timeout now propagate the bridge error promptly.
+- `scripts/windows/` host-test tooling: `launch_e2e.ps1` (WMI-detached cargo test that survives SSH disconnect), `status_e2e.ps1` (poll sentinel + tail log), `cleanup_hcn.ps1` / `check_hcn.ps1` (idempotent HCN endpoint+network purge / read-only dump), `deep_clean.ps1` (frees ~80 GB of leaked test scratch dirs + stale HCS systems + HCN leftovers), and `debug_e2e.py` (single `uv run`-able harness that drives the full rsync → cleanup → launch → poll → fetch → report cycle in one command). README in the same dir explains the flow.
+- Hyper-V in-guest network compartment attach (`hyperv_create_via_gcs` step 7.5). After `CombineLayersWCOW` and before the hosted-container `RpcCreate`, the host now sends a GCS `ModifySettings({ResourcePath:"Container/Networks", RequestType:"Add", Settings:{NamespaceId, EndpointId, AllocatedIPAddress}})` so the in-guest GCS surfaces the host-side HCN endpoint inside the UVM's network compartment — without this RPC the workload's namespace exists on the host but has no compartment inside the UVM, and the container cannot see the overlay endpoint. Mirrors hcsshim's `internal/hcsoci/network.go::addEndpointsToNS`. The exact JSON shape is derived from a read-only audit of hcsshim and is marked `TODO(B-verify)` pending live ETW capture. The new step propagates failure as `AgentError::CreateFailed { id, reason: "Hyper-V step 7.5 (network compartment attach): ..." }` (including a non-zero guest HRESULT).
+- Hyper-V isolated container boot via GCS bridge (`HcsRuntime::hyperv_create_via_gcs`). `create_container` now branches on isolation: Process isolation keeps the single-doc `HcsCreateComputeSystem` path byte-identical, while Hyper-V isolation orchestrates the full hcsshim-style 11-step boot — UVM-only doc create + start, hvsock GCS bridge connect (using a pre-allocated `Uvm::runtime_id` GUID injected into `VirtualMachine.RuntimeId`), hot-attach of per-layer VSMB shares + per-container SCSI scratch on LUN 1, `CombineLayersWCOW` over `RpcModifySettings`, and `RpcCreate`+`RpcStart` of the hosted container. Each step's failure surfaces as `AgentError::CreateFailed { id, reason: "Hyper-V step N: ..." }`. The live `GcsBridge` is stashed on `ContainerEntry.gcs` for a future patch (B4.3) to route lifecycle through. In-guest VSMB / SCSI paths are placeholders until B4.3 wires the round-trip with the in-guest `MountVSMB` / `AttachSCSI` responses; the wire docs are well-formed today.
+- `VirtualMachine.RuntimeId` field added to the HCS schema. Optional bare-lowercase GUID HCS uses to route hvsock connections into the UVM; mirrors hcsshim's `internal/uvm/runtime_id.go`. The Hyper-V isolation path now pre-allocates this per UVM (`Uvm::runtime_id`) and injects it into the UVM-only compute-system doc, so the host-side GCS bridge can address the guest immediately after `HcsStartComputeSystem`.
+- HCS+HCN doc dumping: `HcsRuntime::create_container` and `EndpointAttachment::create_overlay` write their exact JSON payload to `${ZLAYER_HCS_DOC_DUMP_DIR}` / `${ZLAYER_HCN_DOC_DUMP_DIR}` before each syscall. Lets a debug cycle diff our wire bytes against a containerd-shim-runhcs-v1 reference doc (captured via the `Microsoft-Windows-Hyper-V-Compute` ETW provider).
+- `zlayer-hcs::schema::ModifySettingRequest` + `ModifyRequestType` (`Add`/`Remove`/`Update`) — typed `HcsModifyComputeSystem` payload matching hcsshim's `internal/hcs/schema2/modify_setting_request.go`. `ComputeSystem::modify` now takes `&ModifySettingRequest` (the prior raw-JSON variant is preserved as `modify_raw_json` for shapes we haven't typed yet). Two convenience helpers built on top: `ComputeSystem::add_vsmb(share_index, &VirtualSmbShare)` and `ComputeSystem::add_scsi(controller_index, lun, &ScsiAttachment)` build the standard `VirtualMachine/Devices/...` resource paths for hot-add.
+
+- Cross-node, platform-aware container create. `POST /api/v1/containers` (and `CreateContainerRequest`) now accept `node_selector` and `platform`. On a clustered daemon the leader places the one-off container on a node that satisfies the platform / labels / CPU+memory requests and forwards the create to that node's internal dispatch endpoint (`POST /api/v1/containers/_dispatch`, internal-token auth, loop-guarded via the `X-ZLayer-Placed` header); a follower first forwards to the leader. Single-node / non-clustered daemons ignore the fields and create locally (unchanged behavior). New `zlayer_scheduler::cluster::Cluster::place_container` + `placement::place_single_container` carry the decision, reusing the same filters as service placement.
+- `zlayer node join --labels k=v,k=v` advertises node labels at registration; they flow into the raft node record and are honored by `NodeSelector` placement matching.
+
+### Fixed
+- System-spec-aware placement: `can_place_on_node` in `NodeMode::Shared` (the default) now honors a workload's CPU/memory requests against the node's *remaining* capacity instead of unconditionally returning `true`. Nodes that never reported specs (legacy registrations, `*_total == 0`) stay wildcard so a rolling upgrade doesn't strand them. `no_suitable_node_reason` now explains capacity exhaustion.
+- Node labels now reach the scheduler. The raft `NodeInfo`, `AddMemberParams`, and `Request::RegisterNode` carry a `labels` map, the cluster-join path threads `ClusterJoinRequest.labels` through, and `cluster_nodes_to_node_states` propagates them — previously the conversion hardcoded an empty label map, making `node_selector` label matching a silent no-op across the whole cluster.
+- OpenAPI: registered the `ContainerLogFormat` query-param enum as a component schema (it was referenced but never defined, producing a dangling `$ref`) and added an SPDX `license.identifier`, so the spec validates and the Go SDK can be regenerated.
+- HCN Transparent network: `Network::create_transparent` now declares the subnet's default gateway as a `Routes` entry on the IPAM subnet, derived from the first usable host address (`network + 1`). Without this, HCN's Transparent driver auto-reserves additional low-numbered host addresses beyond the gateway and rejects subsequent `HcnCreateEndpoint` calls for those IPs with `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)`. `ipnet` added as a `zlayer-hns` dep for the IPv4 CIDR helper.
+- Per-container HCN namespace (Type=`Host`) replaces the legacy `HostDefault` singleton attach. Containerd-shim-runhcs-v1 creates a fresh `Host` namespace for every process-isolated WCOW container (verified via ETW capture of `Microsoft-Windows-Hyper-V-Compute`); HCS `Construct` rejects compute-system docs that reference `HostDefault` with `E_INVALIDARG (0x80070057)`. `EndpointAttachment::teardown` now deletes the per-container namespace on container removal (safe — guarded against the legacy singleton ID `910f7d92-…`). `NamespaceType::Host` variant added to `zlayer_hns::schema`.
+- HCS compute-system doc: added `Container.GuestOs { HostName }` to the schema (matches hcsshim `internal/hcs/schema2/container.go`), populated only when `Spec.Hostname` is set (matches `hcsdoc_wcow.go:218`). `Container.HostName` at the top level was the wrong location per hcsshim and is removed. `ShouldTerminateOnLastHandleClosed` restored on `ComputeSystem` (verified present in every containerd-shim doc via ETW); `Container.Processor` is now always emitted as an empty `{}` when no CPU constraints are requested; `Networking.AllowUnqualifiedDnsQuery: true` is set on every container with networking (all three match the containerd-shim wire format).
+- Overlay endpoint attach is no longer best-effort. The three "silent degrade" arms in `HcsRuntime::create_container`'s `create_overlay` match (failed `ensure_overlay_network`, failed `HcnCreateEndpoint`, missing slice/IP) now return `AgentError::CreateFailed { id, reason }` instead of `warn!`-and-continue with `network_attachment = None`. Container creation either gets a real overlay endpoint or fails with a clear reason — never a ghost-quiet `get_container_ip` returning `None`.
+- Parent (read-only) image layers are now `wclayer::ActivateLayer`d before being referenced in `Container.Storage.Layers`; deactivated on `remove_container`. Per hcsshim's snapshotter, parents only need `ActivateLayer` (NO `PrepareLayer` — that's for the writable scratch only). Drop-guard ensures partially-activated layers roll back on mid-create failure.
+- `HcsRuntime` now owns an `IpAllocator` over `config.slice_cidr` (gateway `.1` reserved at construction). `create_container` self-allocates an IP per container when no IP has been stashed; `remove_container` releases the IP back to the allocator after teardown.
+- Re-runnability: `composite_dispatch_e2e` cleanup now enumerates HCN networks via `zlayer_hns::network::list` and deletes the test's `zlayer-overlay` network in the always-run cleanup path, so a second invocation starts from a clean slate.
+- HCS `Construct` `E_INVALIDARG (0x80070057)` for process-isolated WCOW containers traced to endpoint policies on Transparent networks. `EndpointAttachment::create_overlay` now leaves `policies` empty on Transparent endpoints. `HcnCreateEndpoint` accepts `OutBoundNAT`+`ACL(RuleType=Switch)` at create time, but `HcsCreateComputeSystem`'s async `Construct` step rejects the endpoint with `E_INVALIDARG` inside `vmcompute.exe!networkutilities.cpp(450)` (verified May 2026 via ETW capture on 10.0.26100 — containerd-shim-runhcs-v1 emits no policies on its Transparent endpoints). Transparent networks bind to the host's physical NIC and have no vSwitch port for a Switch-tier ACL or in-stack SNAT engine for `OutBoundNAT`; cluster-CIDR isolation is enforced by the WireGuard host route. With this fix `composite_dispatch_e2e`'s 5 tests pass and the Windows test reports a real overlay IP (`10.220.99.2`) — back-to-back runs both green.
+- `HcsRuntime::create_container` now tears down the HCN endpoint and releases the IP allocation when `HcsCreateComputeSystem` fails. Previously the endpoint leaked on every HCS-create failure; subsequent test runs/deploys that tried to claim the same IP hit `HCN_E_ADDR_INVALID_OR_RESERVED (0x803b002f)` because the orphan owned it.
+- `Container.GuestOs.HostName` is now always populated on process-isolated WCOW containers, defaulting to the netbios-safe form of the container id when the spec omits `hostname`. hcsshim's `internal/hcsoci/hcsdoc_wcow.go:218` only emits `GuestOs` when `Spec.Hostname != ""`, but its production callers (containerd-shim-runhcs-v1, CRI, Docker) always default `Spec.Hostname` to a non-empty value (first 12 chars of the container id), so the gate is never taken in practice.
+
+### Changed
+- Regenerated the Go SDK (`clients/go`) with `node_selector` / `platform` on `CreateContainerRequest` (plus `NodeSelector` / `TargetPlatform` / `OsKind` / `ArchKind` models). `scripts/generate-clients.sh` now passes `enumClassPrefix=true` to the Go generator so enum constants are type-prefixed and don't collide across schemas — the generated SDK now `go build`s clean (previously bare `PENDING` / `FAILED` / `USER` / `CREATE` constants clashed).
+- Build-tool callsites in `zlayer-builder` (`windows_builder.rs`, `backend/hcs/exec.rs`) and the `zlayer-hcs` integration tests updated for the new schema shape (top-level `HostName` removed, `GuestOs.HostName` added).
+- `CLAUDE.md`: explicit "NEVER DEFER OR DECLARE WORK OUT OF SCOPE" rule. Past sessions repeatedly hid hard remainders behind `#[allow(dead_code)]` and "C6 / not implemented" labels — banned, in writing.
+
+## 0.51.3 - 2026-05-27
+
+### Fixed
+- Windows HCN endpoint policies are now the set a **Transparent** network actually accepts. Bisected against a live Transparent HCN network: `OutBoundNAT` and `ACL` are accepted, but `SDNRoute` is rejected with `HCN policy rejected: HcnCreateEndpoint` (it is an SDN/Overlay construct the Transparent driver refuses). `EndpointAttachment::create_overlay` now applies only `[OutBoundNAT, ACL]` and drops `SDNRoute` (cluster-CIDR routing is handled by the WireGuard host route, not an in-container HCN route). Additionally, the `EndpointPolicy::acl_in_allow` builder now always sets `RuleType="Switch"` and `Priority=65500`; a Transparent-network endpoint rejects an ACL that omits either, taking down the whole `HcnCreateEndpoint` with `HCN policy rejected`.
+- `HcnModifyNamespace` endpoint-attach now uses the hcsshim wire format. `ModifyNamespaceSettingRequest.resource_type` was the integer `1` but HCN's `NamespaceResourceType` is the string `"Endpoint"`; and the `EndpointId` was the brace-wrapped upper-case `{:?}` GUID where HCN wants a bare lower-case GUID (`aabbccdd-...`). Both made `HcnModifyNamespace` fail (`HCN call failed: HcnModifyNamespace`), which previously left `network_attachment = None` so `get_container_ip` returned `None`.
+- HCS compute-system doc: `Container.Networking.Namespace` is now serialized as a **single** GUID string instead of a JSON array. `ContainerNetworking.namespace` was `Vec<String>` (emitting `["{GUID}"]`), which `HcsCreateComputeSystem` rejected with `0xC037010D Invalid JSON document`. The field is now `Option<String>` per `hcsshim/internal/hcs/schema2/networking.go` (`Namespace string`), and the namespace GUID is written in the bare lower-case form HCS resolves against HCN during its `Construct` step (the brace-wrapped form caused `0x80070490 ERROR_NOT_FOUND`).
+- Windows HCS overlay networking now survives daemon restarts and crashed prior runs. `HcsRuntime::ensure_overlay_network` previously checked only its in-memory cache and then blindly called `HcnCreateNetwork`; if a `zlayer-overlay` network with the same name/subnet already existed on the host (crash leftover or restart with an empty cache), the create failed with a name/subnet conflict HRESULT, the container got no HCN endpoint, and `get_container_ip` returned `None` with the warning swallowed. The function now enumerates host networks via `zlayer_hns::network::list("{}")`, opens each (`Network::open`) and queries its name (`query("{}")`), and reuses the matching network (caching its owned handle + GUID) instead of recreating. The HCN syscalls run on `spawn_blocking` to match the existing create path.
+- `zlayer_hns::schema::HostComputeNetwork` deserialization is now lenient (`#[serde(default)]` on the container). Querying arbitrary host networks (WSL, Default Switch, ICS, etc.) no longer fails with `missing field 'SchemaVersion'` — absent fields fall back to their defaults. The serialize/create path is unchanged and still emits `SchemaVersion`.
+
+## 0.51.2 - 2026-05-26
+
+### Fixed
+- `zlayer build -t NAME:TAG` now stores the local-registry entry under the literal `NAME` the user typed. The previous behaviour (introduced in `b1ab19a0`) routed the `-t` value through `oci_client::Reference` on the import path, which silently rewrote unqualified names to `docker.io/library/NAME` — buildah's namespace default, unrelated to user intent. Any client that then asked for the bare name (e.g. ZArcRunner deploying `image: zarcrunner-executor:latest`) missed the local entry and fell through to the unqualified-name guard with `unqualified image not found locally`. Storage now preserves the original name; only the tag suffix (`:TAG` or `@sha256:…`) is split off. Lookup-side `local_image_ref_candidates` is unchanged — the unqualified-name guard at `client.rs:970` continues to refuse silent Docker Hub fallback for bare names.
+
+## 0.51.1 - 2026-05-26
+
+### Fixed
+- Windows HCS runtime no longer invokes `vmcompute.dll!ProcessBaseImage` on non-Windows images. `CompositeRuntime::pull_image` fans out to both the HCS primary and the WSL2 delegate; when an alpine/linux image landed on the HCS path, the unpacker called `ProcessBaseLayer` against a layer chain that has no `Hives/` / `UtilityVM/` / `Files/Windows/System32/` layout, returning `ERROR_PATH_NOT_FOUND (0x80070003)` and failing the whole composite pull. `HcsRuntime::do_pull` now inspects the OCI image config's `os` field via `ImagePuller::image_os` before invoking the unpacker; non-Windows images bail early with the new `AgentError::WrongPlatform { runtime, expected, actual, image }` variant. `CompositeRuntime::pull_image` / `pull_image_with_policy` treat that specific variant as a soft skip, log at debug, and let the delegate's parallel pull own the image. Other primary errors still propagate as `PullFailed`.
+- Image resolution no longer silently routes unqualified names (e.g. `zarcrunner-executor:latest`) to Docker Hub. ZLayer now resolves locally-built images first, with multiple name forms (bare, `library/<bare>`, `docker.io/library/<bare>`), so an image built via `zlayer build -t myapp:latest` is found regardless of how the reference normalized in spec parsing. If an unqualified name is not present locally, the pull fails with a clear error directing the user to use a full registry URL or run `zlayer build` — no more 401s from `index.docker.io` for images that were never on Docker Hub.
+- `PullPolicy::IfNotPresent` now matches Docker/Kubernetes semantics literally: when the image is present locally, no manifest revalidation against the remote registry is attempted, regardless of whether the tag is `:latest`. The previous behaviour silently upgraded `IfNotPresent` → `Newer` for `:latest` images, which broke deploys of locally-built artifacts against unreachable/auth-walled registries. Users who want redeploy-picks-up-new-`:latest` behaviour must now set `pull_policy: newer` explicitly.
+- `ImageRef` wrapper type added to `zlayer-types` so the user's original image string survives round-trips through the spec, API, and Docker-compatibility surfaces (no more silent `docker.io/library/` prepending). The parsed canonical form is still available via `.parsed()` for equality / dedup. Compose, Swarm, and API DTOs now preserve verbatim what the user wrote.
+- Registry `pull_manifest_with_policy`, `pull_image_with_policy`, and `pull_image_config_with_policy` now take a typed `PullPolicy` instead of `force_refresh: bool`, so `IfNotPresent` / `Never` can short-circuit remote checks at the cache layer rather than only inverting at the runtime layer.
+
+### Changed
+- Local-registry lookup in `zlayer-registry` (`try_local_registry`) now tries multiple name forms in priority order: the normalized name first, then `docker.io/` / `docker.io/library/` / `library/` strips, then the bare last segment, with deduplication. Logs a debug line when a non-primary candidate is the one that hit.
+## 0.51.0 - 2026-05-24
+
+### Changed
+- Overlay: per-service WireGuard TUN devices replaced with a single per-cluster WireGuard interface (`zl-overlay0`) carrying multiple service subnets as multi-CIDR `AllowedIPs`. Each service now has a per-node Linux bridge (`br-svc-<hash>`) for container attachment. Reduces interface count from O(services × nodes) to O(services + 1) per node and aligns with CNI conventions (Cilium/Calico/Flannel). See `docs/overlay-architecture.md`.
+- Service-subnet assignment is now Raft-propagated via new `AssignServiceSubnet` / `ReleaseServiceSubnet` commands so every node knows which subnet routes to which node.
+- openraft pin tightened from `"0.9"` to `"0.9.24"`.
+- Added `OverlayMode { Auto (default), Shared, Dedicated }` enum + `overlay: { mode, parent }` spec/node/cluster config fields. `Auto` is the default and currently resolves to `Shared` (no telemetry inputs yet to decide otherwise). `Shared` is fully implemented. `Dedicated` is reserved for a future round (bandwidth opt-out via per-service WG) and currently warns + falls back to `Shared`. Non-cluster `parent` values also fall back with a warning.
+- New HTTP endpoints `GET /api/v1/overlay/services/{name}` and `GET /api/v1/overlay/services/{name}/bridges/{node_id}` expose `BridgeInfo` / `ServiceOverlayStatus` (defined in `zlayer-types::api::overlay`). Stubs today; populated by `OverlayManager` once the scheduler client is plumbed.
+
+### Fixed
+- Windows HCS unpacker: deep nanoserver layer paths (`Files/Windows/WinSxS/<long SxS component>/<long filename>.dll`) no longer fail `CreateFileW` with `ERROR_PATH_NOT_FOUND` (0x80070003). Added `to_extended_wide` helper in `crates/zlayer-agent/src/windows/layer.rs` that applies the `\\?\` / `\\?\UNC\` extended-length-path prefix and is now used by every `CreateFileW` call site (`BackupStreamWriter::create`, `BackupStreamReader::open`, `open_sandbox_vhd`). Added `create_long_path_file` to replace the `std::fs::File::create` calls in `unpacker.rs` and `BackupStreamWriter::create_new`, since std's file APIs do not auto-prefix. Unblocks the `windows_hcs_hyperv_smoke_create_start_stop_remove`, `windows_hcs_hyperv_exec_inside_container`, and `windows_hcs_hyperv_concurrent_pair` e2e tests against `mcr.microsoft.com/windows/nanoserver:ltsc2022`.
+- cgroup v2: per-controller errno-tolerant `subtree_control` writes match runc/crun behavior (ZLayer's `zlayer-libcgroups` 0.6.1-zlayer.5). Fixes startup failure on rootless setups where systemd does not delegate all controllers (e.g. `hugetlb`) to `user@.service`. Previously aborted on `ENOENT` for unsupported controllers; now silently skips per-controller with `{EROFS, EACCES, ENOENT, EPERM, EOPNOTSUPP, EBUSY}` matching crun's allowlist.
+- ForgejoRunner workflow `container.options` (`--privileged`, `--cgroupns`) are now honored. Patched the runner's vendored act source (separate repo).
+- Latent bug: `internal.rs` peer-add path was constructing an ad-hoc `OverlayTransport::new()` detached from the live cluster transport. Fix infrastructure (handler dual-path, `with_overlay_manager` builder) landed; production wire-up in `serve.rs` is pending (`OverlayManager` → `InternalState`).
+
+## [0.50.4] - 2026-05-23
+
+### Fixed
+
+- Capability survey no longer reports `Full` mode when `CAP_NET_ADMIN` or `/dev/net/tun` are absent — the classifier now requires all four signals (not nested, writable cgroup root, `CAP_NET_ADMIN`, `/dev/net/tun`) before claiming `Full`.
+- `probe_can_write_cgroup_root` now uses `access(2)` with `W_OK` instead of an inode mode-bit check, so it correctly sees mount-level read-only cgroup filesystems (e.g. cgroupns=private inside a container).
+- Container creation now fails fast with a structured error when no writable cgroup parent exists (cgroup root read-only and `/proc/self/cgroup` reports root), naming the three remediation options instead of EROFS-ing deep inside libcontainer.
+- Raft E2E runner now gets `--cgroupns=host` so the daemon's `/proc/self/cgroup` reports a real parent cgroup and the auto-detect finds it.
+- Windows HCS / HCS Hyper-V `Compute step fingerprint` now runs after the `Setup Shell` action, so `shell: bash` resolves to Git Bash instead of WSL (WSL is unavailable on LocalSystem runners and was failing with `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`).
+
+## [0.50.3] - 2026-05-23
+
+### Added
+- Daemon capability survey at startup. `zlayer_agent::capability::DaemonCapabilities` probes the runtime environment (uid, nesting via `/proc/self/cgroup`, cgroup-root writability, `CAP_NET_ADMIN`, `/dev/net/tun` availability) and derives a coarse `DaemonMode` (`Full` / `NestedAdaptive` / `Degraded`). `init_daemon` in `bin/zlayer/src/daemon.rs` seeds the process-wide memoised survey (`DaemonCapabilities::get() -> &'static`), logs a structured `INFO` banner with every bit, and persists `data/daemon_capabilities.json` for post-mortem. New `GET /api/v1/daemon/capabilities` endpoint exposes the survey via the existing axum router; registered in OpenAPI as the new `Daemon` tag. The survey makes ZLayer-in-ZLayer (running a daemon inside another container) a first-class scenario rather than a series of opaque libcontainer failures.
+- `crates/zlayer-agent/src/capability.rs` consolidates the cgroup-v2 path helper (`current_cgroup_v2_path`, moved out of `bundle.rs`) and exposes `parse_cgroup_v2_line` to a single owner.
+
+### Changed
+- `bundle.rs::build_linux_config` now logs the selected `cgroup_parent` source (`spec` / `env` / `auto` / `none`) and the final path at `INFO` level for every container build. Previously the 3-tier `or_else` chain silently fell through, masking misconfigurations until libcontainer aborted at cgroup-write time. A diagnostic `WARN` fires when the capability survey says the daemon is nested but the per-build resolution can't find a parent.
+- Overlay-interface creation in `bin/zlayer/src/commands/node.rs` is now gated on `capabilities.has_cap_net_admin && capabilities.tun_device_available`. When either is missing, the daemon skips the boringtun device creation, logs a single structured `WARN`, and proceeds — the existing `overlay_bootstrap.json` save path still runs so a subsequent restart with restored caps picks up the network. Previously the daemon always tried, always logged the same generic CAP_NET_ADMIN hint, and the failure path duplicated work.
+
+### Fixed
+- `cluster_scaling` and `cluster_upgrade` raft e2e suites no longer fail at first container deploy with `cgroup error: io error: failed to open /sys/fs/cgroup/cgroup.subtree_control: Read-only file system (os error 30)`. Root cause was in our youki fork's `crates/libcgroups/src/v2/manager.rs::create_unified_cgroup`, which unconditionally wrote controllers to the cgroup v2 ROOT regardless of whether the requested `cgroup_path` was nested. Inside the runner container (`--privileged --cgroupns=host`), the root is owned by host systemd and read-only to the container — the write failed with EROFS and aborted the function before the nested-directory walk could create the per-container cgroup. The fork now skips the unconditional root write and, in the dir walk, swallows EROFS on pre-existing ancestors (parent cgroup managers have already enabled controllers there — otherwise our process wouldn't be executing inside that hierarchy). Newly-created paths still get strict writes. Bumped `zlayer-libcontainer` / `zlayer-libcgroups` to `0.6.1-zlayer.3`.
+- Windows HCS E2E and HCS Hyper-V E2E workflow jobs no longer fail at the "Compute step fingerprint" step with `CouldNotAutoLoadModule`. The step uses bash command substitution (`SRC_HASH=$(git ls-tree ... | sha256sum | cut -c1-16)`); on Ubuntu/macOS `run:` defaults to bash, but on Windows it defaults to PowerShell which interprets the bash assignment as a module load. Added `shell: bash` to both Windows fingerprint steps (lines 873 and 977 of `.forgejo/workflows/e2e.yml`).
+
+## [0.50.2] - 2026-05-18
+
+### Added
+- Per-endpoint `target_role` filtering for the agent proxy (P2.4-full). When an `EndpointSpec.target_role` is set, the proxy backend pool for that endpoint now contains only containers whose `ContainerId.role` matches; endpoints without `target_role` keep the legacy behavior (all containers eligible). Implementation: the proxy `ServiceRegistry` gained `update_backends_for_endpoint(service, endpoint, addrs)` and a new `endpoint_lb_key(service, endpoint)` helper; `RouteEntry::from_endpoint` now sets `resolved.name` to that composite key so the load balancer maintains one backend group per `(service, endpoint)` pair. The agent's `ProxyManager` registers a per-endpoint LB group at `add_service` time, exposes `update_endpoint_backends`, and fans `add_backend` / `remove_backend` / `update_backend_health` / `update_backends` out to every per-endpoint group for legacy callers. `ServiceManager` iterates endpoints in `update_proxy_backends` and `update_stream_backends`, collecting role-filtered backends per endpoint via the new `collect_endpoint_backends(instance, endpoint)` helper (replaces the old service-wide `collect_backend_addrs`). New unit tests: `routes::tests::test_update_backends_for_endpoint_isolates_endpoints` and `routes::tests::test_endpoint_lb_key_format` in `zlayer-proxy`, and `service::tests::test_collect_endpoint_backends_respects_target_role` in `zlayer-agent` (postgres-style spec with `primary × 1` and `read × 2` replica groups, asserts each endpoint receives only matching containers).
+
+## [0.50.1] - 2026-05-15
+
+### Added
+- `run-suite.py --overlay-mode container` is now wired end-to-end. The Wave-10 scaffolding (image `images/ZImagefile.zlayer-e2e-node`, argparse flag, `ZLAYER_E2E_PRIVILEGED=1` env-var gate, doc at `docs/operating/e2e-privileged.md`) had been bailing with `--overlay-mode container is scaffolded but not yet fully wired`. The driver now boots N cluster nodes as independent privileged containers (`--privileged --cap-add=NET_ADMIN --device=/dev/net/tun`) attached to a `ZLAYER_E2E_NETWORK` bridge with static IPs from a `10.99.99.0/24` subnet, with `ZLAYER_E2E_IMAGE` defaulting to `zlayer/zlayer-e2e-node:latest`. All 5 cluster suites (`run_cluster_3node` / `_failover` / `_scaling` / `_upgrade` / `_node_upgrade`) gained `*_container` variants that mirror the loopback control flow but use `docker/podman exec` against the leader container for CLI commands (e.g. `zlayer deploy`, `zlayer node generate-join-token`) and poll `http://<container_ip>:<api_port>/health/ready` from the host. `ZLAYER_E2E_KEEP_CONTAINERS=1` preserves containers post-suite for postmortem. Container runtime auto-detect prefers podman, falls back to docker. Host-mode (`--overlay-mode loopback`) is unchanged — each cluster suite function has a single early-return line at the top.
+
+### Fixed
+- Raft RPC server now binds to `advertise_addr` instead of the overlay IP, fixing inter-node `Unreachable node: ... /raft/append` errors when those two addresses diverge. The cluster topology stores each node's `address` as `{advertise_addr}:{raft_port}` (line 1171 of `bin/zlayer/src/daemon.rs`), so peers look up that exact pair when connecting. Previously the listener was bound to the overlay IP (line ~1252) — in normal production deployments these align because `advertise_addr` IS the overlay IP, but in any setup where they differ (e.g. e2e harness using `--advertise-addr 127.0.0.1` for loopback testing, or operators advertising a public IP while running on overlay) peers connected to a port no one was listening on. The new code parses `node_config.advertise_addr` and binds raft there; falls back to `127.0.0.1` with a `warn!` if the parse fails.
+- `zlayer-agent` now emits a User namespace + uid/gid mappings in the OCI runtime spec when the daemon is running as a non-root user. Previously `build_linux_config` in `crates/zlayer-agent/src/bundle.rs` hardcoded only Pid/Ipc/Uts/Mount (+ conditional Network) namespaces, and libcontainer's `validate_spec_for_new_user_ns` rejected the spec with `NoUserNamespace` whenever `geteuid() != 0`, blocking the `cluster_scaling` and `cluster_upgrade` e2e suites when the harness ran daemons without sudo. New `read_subid_range` helper parses `/etc/subuid` / `/etc/subgid` for the daemon user; `build_rootless_id_mappings` always emits a single-id mapping (container 0 → host euid, size 1) and, when a subid range is allocated, an additional range mapping (container 1..N → range start..end) so workloads using non-zero UIDs (postgres, nginx workers) work. Conditional on `!euid.is_root()` so root-running daemons (CI's `--privileged` container) keep the legacy no-userns spec bit-identically. Three new unit tests for `read_subid_range`.
+- Manager `/permissions` page no longer panics under SSR with `Tried to access a reactive value that has already been disposed`. In addition to the `forward_raw` ResponseOptions capture fix, `crates/zlayer-manager/src/app/pages/permissions.rs` was the only page chaining `Signal::derive` over `users.get()` + `groups.get()` into another `Resource::new`'s source closure. Under SSR the dependent resource's source re-ran across suspense boundaries and read upstream Resources whose owners had been disposed, panicking inside `reactive_graph::traits::Get::get`. Replaced with a single `Resource::new(|| (), …)` whose async body fetches users + groups inline (`manager_list_users` + `manager_list_groups`), matching the pattern every other page in `crates/zlayer-manager/src/app/pages/` already uses (users.rs, groups.rs, audit.rs, workflows.rs). Documented inline so the chained-Resource pattern doesn't get re-introduced.
+- E2E cluster suites locally no longer collide with a running `zlayer.service` system daemon. `CLUSTER_NODES` overlay UDP ports in `crates/zlayer-manager/tests/e2e/scripts/run-suite.py` moved from 51410/51420/51430 to 59410/59420/59430 — far from the production daemon's 5141x–5143x default range and from WireGuard's 51820 default. Previously node2's 51420 collided with the local daemon's overlay socket, and node2's "stale boringtun" sweep SIGKILLed the shared port.
+- E2E cluster suites' `zlayer deploy …` calls in `run-suite.py` now pass `--detach` so the deploy command exits after the deployment becomes ready instead of sitting in foreground tail mode (`Press Ctrl+C to detach`) until `subprocess.run(check=True)` SIGKILLs it. All 5 deploy callsites in `run_cluster_scaling` and `run_cluster_upgrade` updated.
+- E2E `--sudo-daemon` flag now actually wraps the cluster-suite daemons (`_spawn_node_serve`) in `sudo -E env …`, not just the manager-suite single daemon. `_bootstrap_3node_cluster`, `_cleanup_cluster`, the `run_cluster_failover` worker-restart path, and all five cluster suite entrypoints (`run_cluster_3node` / `run_cluster_failover` / `run_cluster_scaling` / `run_cluster_upgrade` / `run_cluster_node_upgrade`) thread `sudo=args.sudo_daemon` through to `_spawn_node_serve` and `_kill_pg`. Without this the flag was a no-op on the suites that needed it most.
+- Cross-node Raft RPCs now authenticate correctly. `internal_token`
+  was random per-process and broke multi-node clusters whenever the
+  daemons ran in separate OS processes; it's now derived
+  deterministically from the cluster `join_secret` (propagated to
+  joiners via the join response).
+- `zlayer node join` now accepts the Wave-3+ signed envelope (`SignedClusterJoinToken` v=1 and v=2) that `zlayer node generate-join-token` has been emitting by default. Previously `parse_cluster_join_token` only knew the legacy plaintext flat-JSON shape and bailed with `Invalid join token: not valid JSON: missing field 'api_endpoint'` when handed a freshly-minted signed token — the CLI was rejecting its own output. The parser now tries the signed envelope first (lifting `api_endpoint`/`raft_endpoint`/`leader_wg_pubkey`/`overlay_cidr` out of `claims`, and using `claims.iat` as the legacy `created_at` field) and falls back to the legacy shape on parse failure. Signature verification stays on the leader — the joiner does not hold the verifying key. Regression-tested by `test_parse_signed_envelope_join_token`. Unblocks the `cluster_3node` / `cluster_failover` / `cluster_scaling` / `cluster_upgrade` / `cluster_node_upgrade` e2e suites.
+- E2E `login.test.yaml` final `waitForSelector` now names the specific Dashboard heading (`{ role: heading, name: "Dashboard" }`) instead of the ambiguous `{ role: heading }` that violated Playwright strict mode (Dashboard renders 3 `<h*>` tags).
+- `raft-e2e-tests` workflow step in `.forgejo/workflows/e2e.yml` no longer silently swallows per-suite failures. The cluster-suite loop previously used `if ! cmd; then rc=$?; …` which always captured `$?` as `0` (the negated test) so `worst` never accumulated a non-zero exit code; rewritten as `if cmd; then …; else rc=$?; worst=$rc; fi` and explicit `set -eo pipefail` at the top of the script.
+- `run_intellitester` in `crates/zlayer-manager/tests/e2e/scripts/run-suite.py` now passes `--silent` before `dlx` (`pnpm --silent dlx <pkg> …`) instead of after. Modern pnpm parses post-`dlx` args strictly as `<package> [args]`, so the old `pnpm dlx --silent intellitester …` made `--silent` the package name and 404'd against npm.
+- `zlayer node join` no longer produces malformed URLs when `ClusterJoinClaims.api_endpoint` carries a scheme. The e2e harness mints tokens with `generate-join-token -a http://127.0.0.1:19110`; that string round-tripped verbatim through the signed envelope, and the joiner's `format!("http://{}/api/v1/cluster/join", api_endpoint)` produced `http://http://127.0.0.1:19110/api/v1/cluster/join` — reqwest then DNS-resolved `http` and failed with `Temporary failure in name resolution`. New `normalize_api_endpoint` helper strips a leading `http://` / `https://` (case-insensitive) and trailing `/`; applied at both the mint site (`build_cluster_join_token_from_disk`) and both lifts in `parse_cluster_join_token` so freshly-minted tokens AND any older tokens with a scheme baked in resolve to bare `host:port`. Covered by new `test_normalize_api_endpoint` and an updated `test_parse_signed_envelope_join_token`. Unblocks the `cluster_node_upgrade` e2e suite.
+- E2E `nav-smoke.test.yaml` (23 selectors) and `stale-session-setup.test.yaml` (1 selector) had the same Playwright strict-mode bug as `login.test.yaml` — `target: { role: heading }` matched 3 elements on every page (the `<h1>` page title plus card `<h2>`s). Switched all 24 to `target: { css: "h1" }`, which uniquely matches the page-title heading on every Manager route and tolerates page renames.
+- Cluster e2e suites (`cluster_3node` / `cluster_failover` / `cluster_scaling` / `cluster_upgrade` / `cluster_node_upgrade`) no longer contaminate each other when run back-to-back. All five share ports 19110/19120/19130 and run serially in the raft-e2e workflow loop; previously `_cleanup_cluster` SIGTERMed each daemon's process group and returned immediately, with no wait for the kernel to release the listeners. If a daemon survived (or its TIME_WAIT lingered), the next suite's `_spawn_node_serve` failed to bind but `_wait_http_ok` was fooled by the leftover daemon, and `generate-join-token` then ran against the new suite's empty data-dir → `Error: join secret not found at .../node1/data/join_secret`. `_cleanup_cluster` now waits up to 10s for the kernel to release the ports, then escalates to `fuser -k` / `lsof + kill` if a process is still bound. `_bootstrap_3node_cluster` does the same pre-flight at the top so a missed cleanup (CI worker died, `KEEP_E2E_ARTIFACTS=1`, manual rerun) fails loudly instead of producing the misleading downstream error. `psmisc` and `lsof` are added to the `raft-e2e-tests` apt package list to power the force-kill path inside the container.
+- `manager-intellitester-tests` no longer crashes the Leptos SSR runtime when Playwright loads `/permissions`. `forward_raw` in `crates/zlayer-manager/src/app/server_fns.rs` awaited the upstream daemon HTTP call and THEN called `propagate_set_cookies`, which internally read `leptos_axum::ResponseOptions` via `use_context()`. The request-scoped reactive `Owner` was disposed across the await, so the context read panicked with `Tried to access a reactive value that has already been disposed` in `reactive_graph-0.2.13/src/traits.rs:394`. `forward_raw` now captures `use_context::<ResponseOptions>()` BEFORE the await and passes the captured `Option<&ResponseOptions>` into `propagate_set_cookies` as a parameter; the helper no longer reads context itself. Every server-fn that forwards through `forward_raw` benefits — `/permissions` is just the first route that fanned out enough server-fn calls to trip it.
+- `cluster_node_upgrade` Raft propose-write no longer crashes the openraft core with `when Read Logs: std::io::error::Error: UnsupportedDeserAny`. `SecretsRaftOp` (the AppData payload for the secrets-register flow that fires on successful cluster-join) had `#[serde(tag = "op", rename_all = "snake_case")]` — an internally-tagged enum that requires `deserialize_any` to peek at the tag during decode. The Raft log uses postcard2 (`crates/zlayer-consensus/src/storage/redb_store.rs`) and postcard2 explicitly does not implement `deserialize_any`. Switched to serde's default externally-tagged encoding (dropped `tag = "op"`, kept `rename_all = "snake_case"`); the wire format becomes `{"register_node": {...}}` instead of `{"op": "register_node", ...}`. No HTTP handler deserializes `SecretsRaftOp` from a user-supplied body (every cluster.rs callsite constructs the enum via Rust constructors and passes to `raft.propose_secrets_op`), so the wire change is contained to the consensus log. Covered by new `secrets_raft_op_roundtrips_through_postcard` test in `crates/zlayer-scheduler/src/raft.rs`. Unblocks the `cluster_node_upgrade` e2e suite.
+
+### Added
+- `--daemon-name <NAME>` is now a top-level global flag on `zlayer` (in addition to the `daemon` subcommand wrapper). The running daemon process can read its own instance identity at runtime — required so per-instance HCS owner tags and HCN overlay-network names actually scope to the instance. The flag remains optional everywhere; default resolution is `current_exe()` filename → `"zlayer"` fallback. A binary copied as `/usr/local/bin/zlayer-dev` auto-defaults to `--daemon-name zlayer-dev`. Plumbed end-to-end: `Cli.daemon_name` → `serve_with_external_shutdown` → `DaemonConfig.daemon_name` → `HcsConfig.daemon_name` (Windows runtime) → `hcs::owner_tag(daemon_name)` / `hcs::overlay_network_name(daemon_name)`. macOS launchd install (plist label, socket path, all `launchctl` invocations), Windows SCM install (`CreateServiceW` name, display name, `sc.exe failure`, `manager.open_service`, dispatcher `service_dispatcher::start`), and the Linux systemd install path are all derived from `daemon_name`. Legacy parity preserved: `daemon_name == "zlayer"` produces the exact strings that prior installs were using (`com.zlayer.daemon`, `ZLayerDaemon`, `zlayer-overlay`, `zlayer`). The shared `zlayer` unix group is intentionally not parameterized — group membership is access-control, not identity. Covered by new unit tests on the helpers in `daemon_service.rs` (5 tests for `service_name` / `display_name`) and gated tests on `plist_label` / `owner_tag` / `overlay_network_name`.
+- `daemon install --socket <PATH>` flag — when set, appends `--socket <PATH>` to the installed systemd unit's `ExecStart` (Linux), the launchd plist `ProgramArguments` (macOS), and the Windows SCM service launch argv. Default is `/var/run/<daemon-name>.sock` on Linux and the platform analog elsewhere.
+- `daemon uninstall --remove-binary` / `--remove-completions` / `--purge-data` flags. Today `daemon uninstall` only stops the service and removes the unit/plist/SCM entry. With the new flags, a single `zlayer daemon uninstall --remove-binary --remove-completions --purge-data` fully tears the install down on Linux, macOS, and Windows. `--purge-data` is destructive (deletes containers, secrets, raft state) and prints a 3-second warning banner before wiping. All three flags default to `false`; calling `daemon uninstall` with no flags behaves bit-identically to before.
+- `scripts/install-dev.sh` — installs a locally-built `target/release/zlayer` as a side-by-side dev daemon. Builds the binary (unless `ZLAYER_DEV_SKIP_BUILD=1`), copies to `/usr/local/bin/zlayer-dev` (override with `ZLAYER_DEV_BIN_DIR`), runs SELinux relabel + libseccomp + cgroups-v2 checks, lays out `${ZLAYER_DEV_DATA_DIR:-/var/lib/zlayer-dev}/`, and installs shell completions under the `zlayer-dev` name. **Systemd registration is now opt-in via `ZLAYER_DEV_REGISTER=1`** — the default behavior is "put the binary on the system, set up the data dir, install completions; do NOT touch systemd". Operators can then run the binary manually with `sudo /usr/local/bin/zlayer-dev --data-dir /var/lib/zlayer-dev --daemon-name zlayer-dev serve --bind 0.0.0.0:3669`, or re-run the installer with `ZLAYER_DEV_REGISTER=1` to register and start the systemd unit. `ZLAYER_DEV_NAME` overrides the daemon name (defaults to `zlayer-dev`) — multiple coexisting dev daemons can be installed with different names.
+- `scripts/uninstall-dev.sh` — companion teardown script. Stops manually-launched serve processes, removes stale WireGuard interfaces matching `zl-${ZLAYER_DEV_NAME}-*`, and delegates to `daemon uninstall --remove-binary --remove-completions` (adding `--purge-data` when `ZLAYER_DEV_WIPE_DATA=1`). Falls back to direct filesystem cleanup if the dev binary is already missing.
+
+### Changed
+- Every Linux job in `.forgejo/workflows/e2e.yml` (`e2e-tests`, `wasm-e2e-tests`, `docker-e2e-tests`, `manager-tests`, `manager-intellitester-tests`, `raft-e2e-tests`, `scheduler-unit-tests`) now runs inside a privileged `node:20-bullseye` container with `--privileged --cap-add=NET_ADMIN --device=/dev/net/tun`. The Node-based image is required so `actions/checkout@v4` (a JavaScript action) can execute; the same image is already used by `build.yml`. Each job's inline `apt-get update && apt-get install -y …` was replaced with the shared `setup-system-deps@main` composite action (matching `build.yml` / `publish-sdks.yml` convention) and `sudo` was added to every package list as a defensive no-op so anything downstream that shells out to `sudo` keeps working in the sudo-less base image. The throwaway daemon's overlay/TUN init no longer degrades to `Global overlay failed (cross-node networking disabled)`. `docker-e2e-tests` additionally mounts `/var/run/docker.sock` and installs `docker.io`. The `macos-sandbox-e2e` and `dispatch-build` jobs are unchanged. Sudo prefixes were dropped from steps that run as root in the container, and the now-obsolete "Fix permissions after sudo test" step in `e2e-tests` was removed. Per-test-node container mode (`run-suite.py --overlay-mode container`) remains scaffolded — see `docs/operating/e2e-privileged.md`.
+
+## [0.50.0] - 2026-05-15
+
+### Fixed
+- `WipeJoinSecret` Raft op now triggers a local filesystem delete of `{data_dir}/join_secret` on every node when it applies (resolves the Known Limitation called out in v0.16.0). The Raft apply wrapper in `zlayer_scheduler::raft::ClusterState` fires `zlayer_secrets::NodeSideEffects::fire_wipe_join_secret` on a successful apply; the daemon spawns a watcher in `zlayer serve` that drains the notify and runs the wipe (sub-second on the leader, propagates to followers as the op replicates). A boot-time reconcile in `zlayer serve` additionally consults `SecretsState::join_secret_wiped_at` at startup and forces the delete if `Some(_)`, covering the snapshot-restore path on followers that joined after the original apply. End-to-end idempotent; replaying the op preserves the first-applied timestamp for audit. `zlayer serve --vacuum-secrets` remains as an out-of-band escape hatch for operator-driven cleanup.
+
+### Added
+- `zlayer_secrets::NodeSideEffects` — first cross-cutting channel for Raft ops that need per-node filesystem/network effects. The handle is plumbed through the new `RaftCoordinator::with_auth_secrets_and_effects` constructor; existing constructors (`new`, `with_auth`, `with_auth_and_secrets`) delegate with `None` for backwards compatibility. Future ops needing similar behavior should add a matching `tokio::sync::Notify` field plus `fire_…` / `wait_…` accessors here rather than fanning out into per-op types.
+
+## [0.16.0] - 2026-05-14
+
+### Added
+- HS256 → EdDSA-JWT migration path. New cluster-wide `jwt_algorithm` policy (`hs256` | `both` | `eddsa`) replicated via Raft, defaulting to `both` for safe in-place migration. EdDSA-JWT validator joins the existing HS256 validator and the Wave-3 signed-envelope validator in `cluster_join`'s dispatch, gated by the active policy. Operators run `zlayer cluster migrate-jwt-to-eddsa` to flip to `both`, then `zlayer cluster decommission-hs256 [--vacuum-secret]` to flip to `eddsa`-only (and optionally schedule a cluster-wide wipe of `{data_dir}/join_secret`). New endpoints `POST/GET /api/v1/cluster/{jwt-algorithm,jwt-status,wipe-join-secret}` (admin auth) + matching CLI commands + `zlayer cluster jwt-status`.
+
+### Known limitations
+- The `WipeJoinSecret` Raft op records the wipe instant in the state machine but does NOT yet trigger a local filesystem delete on each node — operators can still use `zlayer serve --vacuum-secrets` (Wave 6) for the actual file cleanup. Wiring the filesystem effect to the apply path is a follow-up.
+
+## [0.15.0] - 2026-05-14
+
+### Added
+- Privileged-container e2e runner scaffolding. New image `images/ZImagefile.zlayer-e2e-node` (registered in `ZPipeline.yaml`) for tests that exercise the real boringtun overlay. `run-suite.py --overlay-mode container` is the entry-point flag (gated by `ZLAYER_E2E_PRIVILEGED=1`); the container-launch driver itself is scoped for a follow-up iteration — today the flag exits cleanly with an actionable message. See `docs/operating/e2e-privileged.md` for the operator runbook.
+- Cluster CA + SPIFFE-style federation (Wave 9). Each cluster generates a long-lived `cluster_ca.key` at first daemon start (never rotated). Tokens may be minted as `v=2` carrying a `ca_chain` (`CaCert`) signed by the cluster CA, binding the per-rotation `kid` to a `cluster_domain`. Operators export this cluster's `TrustBundle` (CA pubkey + domain) via `GET /api/v1/cluster/trust-bundle` (unauthed by design), transport it out-of-band, and `zlayer cluster trust-bundle import <FILE-OR-URL>` it into a peer cluster. Imports replicate via Raft (`SecretsRaftOp::ImportTrustBundle` / `RemoveTrustBundle`). Validators now accept v=2 tokens whose `kid` is unknown locally if `ca_chain.cluster_domain` is in the imported trusted-bundles set and the CaCert verifies under that bundle's CA pubkey. New endpoints: `POST /api/v1/cluster/trust-imports`, `GET /api/v1/cluster/trust-bundles`, `DELETE /api/v1/cluster/trust-imports/{cluster_domain}` (all admin auth). New CLI: `zlayer cluster trust-bundle {export, import, list, remove}`. HTTPS-only fetch when importing from URLs.
+
+## [0.14.0] - 2026-05-14
+
+### Added
+- Cluster-wide token revocation list (Wave 7). New `POST /api/v1/cluster/revoke-token` and `GET /api/v1/cluster/revocations` endpoints (both admin auth) plus matching CLI commands `zlayer cluster revoke-token <token-or-hash> [--reason ...]` and `zlayer cluster list-revocations`. Revocations replicate through Raft via the new `SecretsRaftOp::RevokeToken`; entries auto-prune at apply time so the table stays bounded by the un-expired token horizon. Token hashes (lowercase hex SHA-256 of the b64 envelope) are the replicated identifier — raw token bytes never enter cluster state. Applies to both Ed25519-signed and HS256-JWT tokens — the check runs in `cluster_join` before format-specific validators.
+- `SigningBackend` trait + `FileBackend` adapter in `zlayer-secrets` (Wave 8, minimal). Abstracts the cluster signing keystore behind a trait so future TPM/YubiHSM/KMS impls can swap in without touching call sites. Current shipping implementation is the existing JSON keystore on disk (`FileBackend`); the trait reports `is_hardware_backed() = false`. Hardware-backed impls (TPM 2.0, YubiHSM 2) are deliberately deferred — the trait is the extension point only.
+
+## [0.13.0] - 2026-05-14
+
+### Removed
+- Plaintext cluster join token format. Servers no longer accept tokens with `auth_secret` baked into the body; CLI no longer emits them. Re-issue any plaintext tokens by running `zlayer node generate-join-token`. Ed25519-signed and HS256 formats are unaffected.
+- `--legacy-plaintext` CLI flag on `zlayer node generate-join-token` (was an emergency rollback escape hatch in v0.12.0).
+
+### Added
+- `--vacuum-secrets` flag on `zlayer serve`. When set at startup, wipes `{data_dir}/join_secret` so the HS256 HMAC key regenerates. Use after suspected symmetric-secret leak. Default off.
+
+### Migration
+- Before upgrading: have all clients re-issue join tokens using `zlayer node generate-join-token` from a v0.12.x daemon. The output's signed and HS256 tokens both validate against v0.13.0 servers. Plaintext tokens issued under v0.11.x or earlier MUST be re-issued.
+
+## [0.12.0] - 2026-05-14
+
+### Added
+- Begin signed-join-token work — added `ed25519-dalek = "2"` to workspace deps (no behavior change yet; Wave 1 will introduce the signing keypair). See docs/adr/0001-signed-join-tokens.md.
+- `zlayer node generate-join-token --ttl <DURATION>` (default `24h`,
+  humantime syntax accepted). Drives the new Wave-3 signed cluster join
+  token's `exp` claim (`now() + ttl`). The handler now emits a signed
+  token (Ed25519, recommended) alongside the existing legacy plaintext
+  token (deprecated; removed in Wave 6). Legacy token unchanged. The
+  signed-token issuer (`iss`) is the local node UUID from
+  `node_config.json`; the signer is loaded from
+  `{data_dir}/cluster_signing.key` (same path as the daemon).
+- Ed25519-signed cluster join tokens (Wave 3). New `zlayer node generate-join-token --ttl <duration>` mints a signed token with explicit expiration; default ttl is 24h. The signed format coexists with the existing HS256-JWT and plaintext formats; servers try Ed25519 → HS256 → plaintext.
+- TLS for the daemon API listener (Wave 2). New `--api-tls-cert`/`--api-tls-key` flags load static PEM certs; `--api-tls-acme` delegates to the proxy's ACME-capable `CertManager`. Default off.
+- `GET /api/v1/cluster/signing-pubkey` endpoint (Wave 1, unauthenticated by design). Returns the cluster's active Ed25519 verifying key + kid for joining nodes to fetch.
+
+### Changed
+- `zlayer node generate-join-token` no longer emits the legacy plaintext token by default (Wave 4). Pass `--legacy-plaintext` if you specifically need it for backward compat with un-upgraded peers; the flag is deprecated and removed in v0.13.0.
+
+### Deprecated
+- Plaintext join tokens. Servers still accept them but now emit a warning both server-side (`tracing::warn`) and in the API response body. Removal scheduled for v0.13.0 (Wave 6).
+
+## [0.11.24] - 2026-05-12
+
+### Added
+- `cluster_node_upgrade` e2e suite in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. Boots a real
+  3-node loopback cluster, posts `/api/v1/cluster/upgrade` with a
+  nonexistent target version, and verifies: (a) a follower-targeted
+  POST returns 421 + `X-Leader-Addr`, (b) the leader orchestrator
+  walks every follower and records an error for each, (c) the
+  cluster survives the failed upgrade with all 3 nodes still ready.
+  Surfaced via the new `raft-e2e:cluster_node_upgrade` dropdown
+  option on both `.forgejo/workflows/e2e.yml` and
+  `.github/workflows/e2e.yml`.
+- `zlayer node upgrade` — leader-driven rolling daemon-binary upgrade
+  across the cluster. The CLI POSTs `/api/v1/cluster/upgrade` to the
+  local daemon; if it isn't the leader the daemon returns
+  `421 Misdirected Request` with an `X-Leader-Addr` response header
+  and the CLI re-targets the leader automatically. The leader
+  iterates followers in stable `node_id` order: it POSTs
+  `/api/v1/internal/upgrade/start` against each follower (using the
+  internal-cluster `X-ZLayer-Internal-Token` header), waits for
+  `/health/ready` to flap (drop, come back), then sleeps
+  `--cooldown-secs` (default 30s) before the next node. Followers
+  shell out to `zlayer self-update --yes [--version <v>]` from the
+  endpoint handler, write a `{data_dir}/run/zlayer.restart` sentinel,
+  and exit code 75 (EX_TEMPFAIL) so a supervisor respawns them on the
+  new binary. After every follower has come back healthy, the CLI
+  POSTs `/api/v1/cluster/upgrade-self` on the leader to schedule its
+  own self-upgrade and polls `/health/ready` to confirm the leader
+  came back on the new binary. Flags: `--version vX.Y.Z`,
+  `--cooldown-secs N`, `--strict` (abort on the first follower
+  failure), `--skip-leader` (don't auto-upgrade the leader — useful
+  when timing a deliberate failover), `-y/--yes`.
+- `POST /api/v1/cluster/upgrade-self` endpoint (admin auth). Used by
+  `zlayer node upgrade` after followers report healthy to schedule
+  the leader's own self-upgrade. Two-step orchestration: (1) the
+  handler picks a healthy follower (`status == "ready"`, fresh
+  heartbeat) and POSTs `/api/v1/internal/raft/trigger-elect` to it
+  so that follower campaigns immediately via `Raft::trigger().elect()`
+  instead of the cluster waiting for heartbeat-loss after the leader
+  drops; we poll `raft.metrics().current_leader` for up to 5s to
+  confirm leadership flipped, then (2) re-enter
+  `internal_upgrade_start` over a loopback request with the configured
+  `X-ZLayer-Internal-Token` so authn/authz semantics stay identical
+  to the follower path. If the trigger-elect handoff fails or times
+  out we still proceed — the worst case is one heartbeat-loss window
+  of leaderlessness, which is what the previous behavior had anyway.
+- `POST /api/v1/internal/raft/trigger-elect` (internal-token auth).
+  Calls `RaftCoordinator::trigger_elect()` which wraps
+  `Raft::trigger().elect()` from openraft 0.9. Only available on
+  clustered daemons; returns 503 otherwise. Plumbing: `InternalState`
+  gained an `Option<Arc<RaftCoordinator>>` field wired in
+  `bin/zlayer/src/commands/serve.rs` when `_raft` is `Some`.
+- Supervisor-respawn coverage matrix for `zlayer serve
+  --restart-on-exit` (exit code 75) — the path used by self-update
+  and `zlayer node upgrade`:
+  - **Linux systemd**: unit generated by `zlayer daemon install`
+    gains `SuccessExitStatus=75` and `RestartForceExitStatus=75`.
+    Belt-and-suspenders: even if the operator switches to
+    `Restart=on-failure`, exit 75 still triggers a restart instead
+    of being treated as a clean exit. Existing `Restart=always`
+    semantics unchanged.
+  - **macOS launchd**: `KeepAlive=true` already respawns on any
+    exit. `zlayer daemon install` and `zlayer self-update --restart`
+    additionally fire `launchctl kickstart -k <label>` (resolved via
+    the same `system/...` vs `gui/<uid>/...` scope logic the install
+    path uses) so the running daemon is forcibly replaced with the
+    freshly-installed binary instead of racing on whatever
+    `ThrottleInterval` happens to be configured.
+  - **Windows SCM**: `zlayer daemon install` now follows
+    `CreateServiceW` with `sc.exe failure <name> reset= 86400
+    actions= restart/5000/restart/5000/restart/5000` so SCM respawns
+    the daemon up to three times after non-zero exit. Previously SCM
+    ignored the exit and left the service stopped.
+- `ApiError::NotLeader { leader_addr: Option<String> }` variant
+  mapping to HTTP `421 Misdirected Request`. Includes a
+  `LEADER_ADDR_HEADER` constant (`X-Leader-Addr`) so the response
+  carries the leader's API endpoint when known. First use is the new
+  `cluster_upgrade` handler; eventually every leader-only endpoint
+  should return this instead of generic 503s.
+- `POST /api/v1/cluster/upgrade` and `POST /api/v1/internal/upgrade/start`
+  + `GET /api/v1/internal/upgrade/{id}` endpoints. Internal endpoints
+  reuse the existing `InternalAuth` extractor + `X-ZLayer-Internal-Token`
+  header pattern. Status polling follows the 202-Accepted + UUID-id
+  convention from `start_build`.
+- `zlayer serve --restart-on-exit` (also `ZLAYER_RESTART_ON_EXIT`)
+  flag. After clean shutdown, exits with code 75 (`EX_TEMPFAIL`)
+  instead of 0 so a supervisor (`systemd Restart=on-failure`, runit,
+  etc.) respawns the daemon. Used by `zlayer node upgrade`'s
+  follower-self-update path.
+- `zlayer self-update` subcommand. Downloads a newer zlayer release
+  tarball from GitHub (`BlackLeafDigital/ZLayer`), optionally verifies
+  a SHA-256 sidecar when present (skips silently when absent so
+  current releases keep working), extracts the binary, and
+  atomic-renames it onto the running executable. Linux/macOS support
+  the in-place rename because the kernel keeps the old text segment
+  alive via the open fd. Windows falls back to writing
+  `zlayer.exe.new` adjacent to the current exe with a clear restart
+  message. Flags: `--version vX.Y.Z` to target a specific tag,
+  `--yes` to skip the prompt, `--restart` to re-exec the new binary
+  after install, `--repo owner/name` (hidden) for test/mirror
+  overrides.
+- `cluster_scaling` and `cluster_upgrade` suites in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. Both suites
+  stand up a real 3-node loopback cluster via
+  `_bootstrap_3node_cluster` and exercise
+  `zlayer deploy`/`zlayer ps --containers --format json` against the
+  leader. `cluster_scaling` deploys a single nginx replica, scales to
+  3 (asserting replicas land on at least 2 distinct nodes), then
+  scales back to 1. `cluster_upgrade` deploys
+  `nginx:1.28-alpine` × 3, redeploys with `nginx:1.29-alpine`, and
+  asserts every running replica's image field transitions to the v2
+  tag within 180s.
+- Three deployment fixtures under
+  `crates/zlayer-manager/tests/e2e/cluster-specs/`
+  (`nginx-v1-1r.yaml`, `nginx-v1-3r.yaml`, `nginx-v2-3r.yaml`) used
+  by the two new suites. All three share `deployment: e2e-cluster-app`
+  so re-applying triggers in-place updates rather than fresh
+  deployments.
+- `raft-e2e` / `raft-e2e:<suite>` and `scheduler-unit` dropdown
+  options on both `.forgejo/workflows/e2e.yml` and
+  `.github/workflows/e2e.yml`. New `raft-e2e-tests` job dispatches
+  the four cluster suites (`cluster_3node`, `cluster_failover`,
+  `cluster_scaling`, `cluster_upgrade`) via the existing
+  `run-suite.py` harness. New `scheduler-unit-tests` job runs
+  `cargo nextest run -p zlayer-scheduler --features test-skip-http`
+  — gives GitHub parity with Forgejo's `ci.yaml` raft coverage.
+- Raft RPC transport upgraded to HTTP/2 prior-knowledge (h2c). Both
+  `RaftHttpClient` reqwest clients now call `.http2_prior_knowledge()`
+  with a 10s keepalive ping interval, and the server-side bind in
+  `crates/zlayer-scheduler/src/raft_service.rs` switched from
+  `axum::serve` to `hyper-util`'s `auto::Builder` so the same socket
+  accepts both HTTP/1.1 and HTTP/2. Multiplexed streams replace the
+  per-RPC connection churn that the previous HTTP/1.1
+  `pool_max_idle_per_host(10)` ceiling caused.
+- `X-ZLayer-Raft-Protocol: 1` header on every Raft RPC, validated by a
+  new middleware in
+  `crates/zlayer-consensus/src/network/http_service.rs`. Mismatched
+  versions return `426 Upgrade Required` with an
+  `X-ZLayer-Raft-Protocol-Supported` response header. A missing header
+  forwards unchanged so peers that don't yet emit it stay compatible.
+- `DELETE /api/v1/cluster/nodes/{id}`, `PUT /api/v1/cluster/nodes/{id}/mode`,
+  `PUT /api/v1/cluster/nodes/{id}/drain`, and
+  `PUT /api/v1/cluster/nodes/{id}/undrain` endpoints. Previously the
+  CLI commands `zlayer node remove`, `zlayer node set-mode`, and
+  `zlayer node drain` 404'd silently; they now reach real handlers
+  that propose the corresponding Raft state changes.
+- `Request::UpdateNodeMode { node_id, mode }` Raft state-machine
+  variant. Appended last to preserve postcard2 discriminant stability
+  for the pre-existing variants.
+- `--api-port`, `--raft-port`, and `--overlay-port` flags on
+  `zlayer node join` for parity with `zlayer node init`. Lets multiple
+  nodes coexist on the same machine, enabling loopback clustering for
+  tests and dev.
+- In-process multi-node Raft test harness under
+  `crates/zlayer-scheduler/tests/` with `common/mod.rs` exposing
+  `spawn_node`, `wait_for_leader`, `wait_for_apply`, and
+  `shutdown_node`. New integration tests: `single_node_bootstrap`,
+  `two_node_cluster` (validates the 1-voter + 1-learner 2-node
+  guarantee from the README), `three_node_replication` (replicates
+  100 entries plus installs a snapshot to a lagging follower),
+  `leader_failover` (kills the leader and asserts a new one wins
+  election), and `allocation_modes` (validates the shared / dedicated
+  / exclusive node-allocation modes from README "Node Allocation
+  Modes").
+- `cluster_3node` and `cluster_failover` suites in
+  `crates/zlayer-manager/tests/e2e/scripts/run-suite.py`. They spawn
+  three real `zlayer serve` processes on loopback, validate the
+  cluster forms, and confirm the leader recovers from a worker
+  kill+restart.
+- `docs/rolling-upgrade.md` operator runbook covering drain → swap
+  binary → restart, the protocol-version handshake's role in
+  preventing cross-version corruption, and rollback semantics.
+
+### Changed
+- `RedbStateMachine::apply`, `RedbStateMachine::install_snapshot`,
+  `RedbLogStore::save_vote`, `save_committed`, `append`, `truncate`,
+  and `purge` now run their synchronous redb transactions inside
+  `tokio::task::spawn_blocking` so fsync no longer pins a tokio worker
+  thread. In-memory state-machine cache updates stay in the async
+  context and only run after the redb commit succeeds.
+- `RaftHttpClient` precomputes per-connection URL strings as
+  `Arc<str>` and the `Authorization` header as a
+  `reqwest::header::HeaderValue` (built once, marked sensitive).
+  Eliminates two `String` allocations and one header-value rebuild
+  per Raft RPC.
+- `zlayer node list` now displays the server-computed `role` field
+  (`Leader` / `Voter` / `Worker`) instead of deriving the column from
+  the local `node_config.is_leader` bool. Status is shown next to the
+  role (e.g. `Worker (draining)` or `Worker [DEAD]`).
+- Lowered `pool_max_idle_per_host` from 10/5 (RPC/snapshot) to 2/2.
+  HTTP/2 multiplexes, so idle TCP connections aren't useful for raft.
+
+### Fixed
+- `ZLayerDirs::default_data_dir` now honors `$ZLAYER_DATA_DIR` as the
+  highest-precedence source. Previously the env var was only read by
+  `zlayer serve`'s `--data-dir` clap arg, so CLI subcommands like
+  `zlayer user create` that dispatch through `DaemonClient::connect()`
+  without threading `cli.effective_data_dir()` silently dialed
+  `$HOME/.zlayer/run/zlayer.sock` instead of the throwaway daemon's
+  socket. Surfaced when the manager-intellitester e2e harness ran
+  `user create` against a `--data-dir`-scoped daemon in CI.
+- Manager e2e harness (`crates/zlayer-manager/tests/e2e/scripts/run-suite.py`)
+  now echoes captured stdout/stderr to `sys.stderr` when a
+  `capture_output=True, check=True` subprocess fails. Previously a CLI
+  failure showed only `CalledProcessError: returned non-zero exit
+  status 1` in the CI log with no underlying message.
+- Manager e2e harness polls `/health/ready` (the actual handler in
+  `crates/zlayer-api/src/handlers/health.rs`) instead of the
+  nonexistent `/healthz`. The `/` fallback in `_wait_http_ok` was
+  masking the misnamed endpoint.
+- Dead `peers: RwLock<HashMap<NodeId, String>>` field and its three
+  unused accessor methods removed from `HttpNetwork` -- the field was
+  never read by any caller in the workspace.
+
+### Internal
+- `crates/zlayer-scheduler/src/lib.rs::build_node_states` extracted to
+  a free helper `cluster_nodes_to_node_states` so the
+  `status == "ready"` filter behind README "Node Status" is now
+  guarded by a unit test (`build_node_states_excludes_non_ready`).
+
+## [0.11.23] - 2026-05-12
+
+### Changed
+- Scratch storage (Docker build contexts, OCI image tarballs, S3 layer staging,
+  SQLite replicator caches, git clones, in-memory store fixtures) now lives
+  under `{data_dir}/tmp` instead of the OS temp dir. Avoids putting large
+  scratch data on `tmpfs` (RAM-backed `/tmp` on most Linux distros), preventing
+  OOM on memory-tight nodes during big builds or layer uploads. New types
+  `zlayer_types::Scratch` and `zlayer_types::ScratchFile` (RAII guards), plus
+  helpers `ZLayerDirs::scratch_dir(prefix)` / `ZLayerDirs::scratch_file(prefix)`
+  in `zlayer-paths`. Project git clones moved from `${TMPDIR}/zlayer-projects`
+  to `{data_dir}/projects` (new `ZLayerDirs::projects()` accessor), so they
+  survive daemon restarts. Shell scripts (`build-macos-images.sh`,
+  `run_dev.sh`, `Makefile`, `docker-compat-local.sh`) now anchor scratch dirs
+  at `${ZLAYER_DATA_DIR:-$HOME/.zlayer}/tmp/...` for the same reason.
+
 ## [0.11.22] - 2026-05-11
 
 ### Added
@@ -67,6 +1171,25 @@ All notable changes to this project will be documented in this file.
   `ZLAYER_E2E_WG_PORT`, `ZLAYER_E2E_DNS_PORT`) are env-overridable.
 
 ### Changed
+- The manager e2e harness (`crates/zlayer-manager/tests/e2e/scripts/
+  run-suite.sh`) now defaults to running against the user's locally-
+  installed zlayer daemon: it resolves the daemon's Unix socket
+  (`/var/run/zlayer.sock` or `~/.zlayer/run/zlayer.sock`), creates a
+  scoped fixture admin via `zlayer user create` (using the auto-
+  injected `local-admin` bearer that the daemon mints for any UDS
+  connection), drives the login UI through intellitester, and deletes
+  the fixture user on exit. The stale-session regression replaces its
+  `sqlite3 DELETE FROM users` step with `zlayer user delete <id>
+  --yes` and now asserts a redirect to `/login` (other users still
+  exist in the host daemon's user table). A new `--throwaway` flag
+  (also `ZLAYER_E2E_THROWAWAY=1`) keeps the previous behaviour of
+  spinning up an isolated daemon for clean CI runners. Removes the
+  `sqlite3` PATH dependency from the harness. The obsolete
+  `bootstrap.test.yaml`, `logout.test.yaml`,  `auth.workflow.yaml`,
+  and `scripts/reset-data-dir.sh` files are deleted — the suite now
+  exercises the login flow (which is the bug regression we actually
+  care about) and signup is exercised every time someone installs
+  zlayer.
 - The `BlackLeafDigital/ZLayer` composite action (`action.yml`) is now
   CI-safe and supports both portable and system installs. Three new
   inputs: `install-dir` (empty = portable temp install to
@@ -84,8 +1207,62 @@ All notable changes to this project will be documented in this file.
   composite sub-steps) has been replaced with a bash-internal guard, so
   empty-command invocations install-only instead of hanging on the
   implicit TUI.
+- The manager e2e harness has been rewritten from bash to Python
+  (`run-suite.py`, stdlib only, invoked via `uv run`). The bash version
+  (`run-suite.sh`) is deleted in the same commit. Same flags
+  (`--throwaway`, `--only`, `--no-build`), same yamls, same login-based
+  flow — none of the bash-shaped failure modes (subshell-scope loss of
+  `DAEMON_PID`, env-prefix parameter expansion, `trap`-on-`$()` cleanup
+  drops, tmpfs orphans, CLI silently hitting the wrong daemon). The
+  throwaway daemon's data dir moved from `mktemp /tmp/zlayer-e2e-*` to
+  `target/zlayer-e2e/<suite-id>/` (gitignored, swept by `cargo clean`,
+  user-owned). A new `--sudo-daemon` flag is available as an escape
+  hatch in case the daemon's overlay init ever starts demanding
+  CAP_NET_ADMIN at startup — today the overlay manager logs a
+  permission warning and degrades to "cross-node networking disabled",
+  which is harmless for the auth/manager flow the suite exercises, so
+  no part of the local or CI invocation runs under sudo. CI workflows
+  (`.github/workflows/e2e.yml` and `.forgejo/workflows/e2e.yml`)
+  install uv via `astral-sh/setup-uv@v6` and invoke
+  `uv run …/run-suite.py --throwaway`.
+- The `test` `workflow_dispatch` dropdown in both e2e workflows now
+  gates every e2e job, not just the intellitester sub-suite. Options
+  are `youki`, `wasm`, `docker`, `manager-unit`,
+  `manager-intellitester`, `manager-intellitester:<yaml>`, and
+  `macos-sandbox` (plus `macos-unit` on GitHub). Empty value runs all
+  jobs as before. The release dispatch gate
+  (`dispatch-build` on Forgejo, `trigger-release` on GitHub) now
+  additionally requires `inputs.test == ''` so a partial e2e run can
+  never short-circuit into a release with the other suites skipped.
+  Dead `bootstrap.test.yaml`, `logout.test.yaml`, and
+  `auth.workflow.yaml` dropdown options (the underlying files were
+  deleted earlier in 0.11.22) are removed.
 
 ### Fixed
+- The daemon's `AuthActor` extractor now prefers a session cookie
+  over a Bearer token when both are present on the same request.
+  Previously the Bearer always won, which meant any user-facing call
+  the manager proxied to the daemon **over the Unix socket** would
+  be auth'd as the auto-injected `local-admin` instead of the real
+  logged-in user. `/auth/me` would then look up `local-admin` in
+  the user store, find nothing, and return `401 "User no longer
+  exists"` — so the manager's `AuthGuard` bounced every logged-in
+  request back to `/login`. The bug was latent in TCP-transported
+  manager → daemon setups (the auto-bearer middleware is
+  Unix-socket-only) but blocked any deployment that pointed
+  `ZLAYER_SOCKET` at the daemon — including the e2e harness. CLI /
+  service auth (Bearer-only, no cookie) is unchanged: cookie
+  extraction fails, the extractor falls through to Bearer, and
+  `local-admin` continues to drive the request.
+- `DELETE /api/v1/users/{id}` is now properly idempotent: deleting an
+  id that no longer exists returns `204 No Content` instead of
+  `404 Not Found`, matching REST DELETE semantics. The underlying
+  `IdentityManager::delete_user` signature changed from
+  `Result<StoredUser, IdentityError>` to
+  `Result<Option<StoredUser>, IdentityError>` (`Ok(None)` = already
+  gone, `Ok(Some(u))` = deleted). Removes the need for `zlayer user
+  delete <id> --yes || true` wrappers in cleanup scripts and trap
+  handlers.
 - `zlayer` (no subcommand) and `zlayer tui` now refuse to launch the
   Ratatui TUI when stdin or stdout is not a terminal, exiting 1 with a
   clear error pointing at `zlayer --help`. Previously a non-TTY caller
@@ -623,7 +1800,7 @@ All notable changes to this project will be documented in this file.
 ## [0.11.4]
 
 ### Fixed
-- **`zlayer-types` is publishable to crates.io again.** Proprietary-branch (`zlayer-zql`) config had leaked into the public manifest: `crates/zlayer-types/Cargo.toml` carried a hardcoded `version = "0.1.0"`, an `authors` line, and `publish = ["forgejo"]`, while the workspace dep alias in the root `Cargo.toml` (`zlayer-types = { path = ... }`) was missing a version requirement. As a result, `cargo publish -p zlayer-spec` failed with `dependency \`zlayer-types\` does not specify a version` mid-release. Switched `zlayer-types` to workspace inheritance (`version.workspace = true`, etc.), added `version = "0.0.0-dev"` to the workspace alias, and converted every consumer (`zlayer-agent`, `zlayer-api`, `zlayer-builder`, `zlayer-client`, `zlayer-core`) from `path = "../zlayer-types"` to `zlayer-types.workspace = true` so `sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml` in `.forgejo/workflows/release.yml` substitutes the release version uniformly. Files: `Cargo.toml`, `crates/zlayer-types/Cargo.toml`, `crates/zlayer-{agent,api,builder,client,core}/Cargo.toml`.
+- **`zlayer-types` is publishable to crates.io again.** Stale private-branch config had leaked into the public manifest: `crates/zlayer-types/Cargo.toml` carried a hardcoded `version = "0.1.0"`, an `authors` line, and `publish = ["forgejo"]`, while the workspace dep alias in the root `Cargo.toml` (`zlayer-types = { path = ... }`) was missing a version requirement. As a result, `cargo publish -p zlayer-spec` failed with `dependency \`zlayer-types\` does not specify a version` mid-release. Switched `zlayer-types` to workspace inheritance (`version.workspace = true`, etc.), added `version = "0.0.0-dev"` to the workspace alias, and converted every consumer (`zlayer-agent`, `zlayer-api`, `zlayer-builder`, `zlayer-client`, `zlayer-core`) from `path = "../zlayer-types"` to `zlayer-types.workspace = true` so `sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml` in `.forgejo/workflows/release.yml` substitutes the release version uniformly. Files: `Cargo.toml`, `crates/zlayer-types/Cargo.toml`, `crates/zlayer-{agent,api,builder,client,core}/Cargo.toml`.
 
 ## [0.11.0]
 
@@ -666,11 +1843,34 @@ All notable changes to this project will be documented in this file.
 - **`install.ps1`: removed dead `zlayer-linux` binary fetch; added proactive WSL2 install.** Pre-F-7a the installer staged a Linux `zlayer` binary in `$LOCALAPPDATA\ZLayer\bin\zlayer-linux` for when the Windows CLI proxied commands to a zlayer daemon inside WSL2. After F-7a / Phase G, the `Wsl2DelegateRuntime` invokes `youki` (a separate binary that lives inside the distro) via `wsl.exe -d <distro> -- youki …` — nothing in the runtime ever references `zlayer-linux`. Stripped the 30-line "Download WSL2 support files" block. In its place, the installer now probes `wsl.exe --status`; when WSL2 is absent, it fires `Start-Process wsl.exe -ArgumentList --install,--no-distribution -Verb RunAs -Wait` (UAC is the consent gate). Declined UAC or a non-zero exit prints an actionable retry command and moves on without failing the install — Windows-native containers (HCS) still work without WSL2.
 - **CI: dropped redundant "default features" Windows runs.** `.forgejo/workflows/ci.yaml::check-windows` ran `cargo check` and `cargo clippy` twice on Windows — once on default features and again on `hcs-runtime,wsl`; `test-windows` likewise ran `cargo test --workspace --lib` twice. `build.yml:326` always ships `--no-default-features --features hcs-runtime,wsl` (thin-CLI Windows was retired in F-7a), so the default-features runs were validating a build no downstream consumer uses and doubling MiniWindows-runner time. Dropped the default-features steps from both jobs and from `scripts/windows-remote-check.sh`; only the composite `hcs-runtime,wsl` runs remain.
 - **CI: `build.yml::build-linux-arm64` no longer fails at apt install.** The `runs-on: arm64` self-hosted label is a macOS arm64 host, and the job had no `container:` key, so the `setup-system-deps` action hit `apt-get is only available on Linux`. Added `container: node:20-bullseye` to the job (multi-arch manifest list — resolves to the native arm64 variant on the arm64 host, no cross-build — matches the in-repo `publish-sdks.yml:110-111` precedent that already pairs `runs-on: arm64` with a Linux container, and mirrors `build-linux-amd64` in the same file). Also aligned the apt package list with the amd64 job (`protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git`) so the container has the full toolchain both jobs need.
-- **Release pipeline unblocked — three publish-time bugs.** (1) `crates/zlayer-agent/Cargo.toml` was `publish = false`, which made `cargo-publish-workspace` filter the crate out of the topological publish order. But `zlayer-builder` has a `cfg(target_os = "windows")` dep on `zlayer-agent`, and cargo validates target-gated deps against the registry at package time regardless of host — so `publish-all-crates` died on `zlayer-builder` with `no matching package named zlayer-agent found`. The comment block on zlayer-agent (re: `youki-runtime` being off-by-default so the crate publishes cleanly) had always intended for it to publish; the `publish = false` line was a stale leftover. Removed — letting it default to unrestricted. (2) `publish-py-binding-build-linux-{x86_64,aarch64}` in `.forgejo/workflows/publish-sdks.yml` ran inside stock `quay.io/pypa/manylinux_2_28_*` containers which lack `node`, so `actions/checkout@v4` (a `node20` JS action) failed before any step ran. Added a `Bootstrap Node.js for actions (manylinux)` step as the first step of each job that installs node via the NodeSource RPM repo (`curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && yum install -y nodejs`); a bare `run:` step doesn't need node, so the bootstrap works on a node-less container and every subsequent JS action then works. Pattern lifted from `Blazen/.forgejo/workflows/build-artifacts.yaml:76-92`. (3) `crates/zlayer-api/Cargo.toml` declared `readme = "README.md"` but the file didn't exist, which made `uvx maturin sdist` (run from `zlayer-py`) fail with `readme path ... does not exist or is invalid` while walking the workspace dep graph. Created `crates/zlayer-api/README.md` with a short description and links to the public CLI and generated clients. Same README mirrored into the proprietary fork (`zlayer-zql/crates/zlayer-api/README.md`) since the sdist build would hit the same failure once that pipeline reaches the step.
-- **Release pipeline unblocked — `zlayer-proxy` / `zlayer-secrets` `publish = false` + Windows wheel `maturin: command not found`.** Two follow-ups to the prior publish-time fix bullet. (1) `crates/zlayer-proxy/Cargo.toml` and `crates/zlayer-secrets/Cargo.toml` were both `publish = false`, but `crates/zlayer-agent/Cargo.toml` declares versioned workspace deps on both (`zlayer-proxy.workspace = true`, `zlayer-secrets.workspace = true`). `cargo-publish-workspace` filtered both crates out of the topo order, so when the agent's own `cargo publish` ran it died with `no matching package named zlayer-proxy found` (and the same trap was waiting for `zlayer-secrets`). Removed the `publish = false` line from each — defaults to publishable, both crates already carry the metadata crates.io needs (name, version, description, license, repository). The Kahn topo-sort in the action now publishes proxy and secrets ahead of agent. (2) `.forgejo/workflows/publish-sdks.yml::publish-py-binding-build-windows-x86_64` was the lone wheel-build job still using the `uv tool install maturin` + bare `maturin build` two-step pattern — `uv tool install` drops the binary in `%USERPROFILE%\.local\bin`, which is not on PATH in the next `shell: bash` step, so the build died with `maturin: command not found` (exit 127). Replaced with a single `uvx maturin build --release --out dist` step matching the linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, and sdist jobs already in this file. `uv` itself is provisioned on the MiniWindows runner via the chocolatey safety net in `ci.yaml::check-windows`, so no additional setup is needed here. Mirror: same `uvx maturin` rewrite applied to `zlayer-zql/.forgejo/workflows/publish-sdks.yml` in three jobs (macos-x86_64, macos-aarch64, windows-x86_64) for consistency, even though the macOS jobs may have intermittently worked depending on PATH.
-- **OpenAPI Go client now publishable from a release.** `clients/go/` was generated with module path `github.com/BlackLeafDigital/zlayer-go` — that path is a 404 on GitHub, so `go get` could not resolve it. Every Go consumer (notably ZArcRunner) was masking this with a local `replace github.com/BlackLeafDigital/zlayer-go => ../ZLayer/clients/go` directive that never survives a container build. Fix mirrors the existing `publish-plugin-sdk-go` pattern at `.forgejo/workflows/publish-sdks.yml:653`: renamed the module to `github.com/BlackLeafDigital/ZLayer/clients/go` (`clients/go/go.mod`, the 34 `clients/go/test/api_*_test.go` import lines, the user-facing examples in `clients/README.md`, and the generated `clients/go/README.md` placeholder + per-API `clients/go/docs/*.md` `GIT_USER_ID/GIT_REPO_ID` placeholders); patched `scripts/generate-clients.sh::generate_go` so future regenerations emit the correct module path AND pass `gitUserId=BlackLeafDigital,gitRepoId=ZLayer/clients/go` so the README import snippet stays correct; switched `packageVersion` from a hardcoded `0.1.0` (already drifting — repo is on 0.10.x) to a `0.0.0-dev` sentinel that the new publish job stamps to the real version at tag time. New `publish-openapi-go` job in `.forgejo/workflows/publish-sdks.yml` (immediately after `publish-plugin-sdk-go`) seds `0.0.0-dev` → `inputs.version` across `clients/go/**.{go,md}`, runs `go vet` on the stamped tree, makes a one-off detached-HEAD commit, tags `clients/go/v<VERSION>` against that commit, pushes only the tag (Forgejo + GitHub mirror via `GH_ACCESS_TOKEN` with the same `*zdb*` safety guard as `publish-plugin-sdk-go`); the branch never moves and the dev sentinel stays in tree. Registered as `sdks/openapi-go` in `.forgejo/build-config.yaml` (no `registry:` block — same as `plugin-sdk-go`, idempotency via `ci-step-status` markers). Deleted `clients/go/git_push.sh` (a generator-emitted helper for pushing a generated client to its own standalone git repo — meaningless for a monorepo subpath publish) and added it to `clients/go/.openapi-generator-ignore` so it doesn't come back. Consumer migration in ZArcRunner is a separate follow-up: drop the local `replace`, pin `github.com/BlackLeafDigital/ZLayer/clients/go v<VERSION>`, project-wide rename `import "github.com/BlackLeafDigital/zlayer-go"` → `import "github.com/BlackLeafDigital/ZLayer/clients/go"`. Mirror: `zlayer-zql/scripts/generate-clients.sh::generate_go` updated identically but with module path `forge.blackleafdigital.com/BlackLeafDigital/zlayer-zql/clients/zdb-go` and no GitHub-mirror push (zlayer-zql is Forgejo-only by policy; no OpenAPI Go client is currently committed there, so no workflow / build-config changes needed yet — the script fix prevents drift when one is.)
+- **Release pipeline unblocked — three publish-time bugs.** (1) `crates/zlayer-agent/Cargo.toml` was `publish = false`, which made `cargo-publish-workspace` filter the crate out of the topological publish order. But `zlayer-builder` has a `cfg(target_os = "windows")` dep on `zlayer-agent`, and cargo validates target-gated deps against the registry at package time regardless of host — so `publish-all-crates` died on `zlayer-builder` with `no matching package named zlayer-agent found`. The comment block on zlayer-agent (re: `youki-runtime` being off-by-default so the crate publishes cleanly) had always intended for it to publish; the `publish = false` line was a stale leftover. Removed — letting it default to unrestricted. (2) `publish-py-binding-build-linux-{x86_64,aarch64}` in `.forgejo/workflows/publish-sdks.yml` ran inside stock `quay.io/pypa/manylinux_2_28_*` containers which lack `node`, so `actions/checkout@v4` (a `node20` JS action) failed before any step ran. Added a `Bootstrap Node.js for actions (manylinux)` step as the first step of each job that installs node via the NodeSource RPM repo (`curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && yum install -y nodejs`); a bare `run:` step doesn't need node, so the bootstrap works on a node-less container and every subsequent JS action then works. Pattern lifted from `Blazen/.forgejo/workflows/build-artifacts.yaml:76-92`. (3) `crates/zlayer-api/Cargo.toml` declared `readme = "README.md"` but the file didn't exist, which made `uvx maturin sdist` (run from `zlayer-py`) fail with `readme path ... does not exist or is invalid` while walking the workspace dep graph. Created `crates/zlayer-api/README.md` with a short description and links to the public CLI and generated clients.
+- **Release pipeline unblocked — `zlayer-proxy` / `zlayer-secrets` `publish = false` + Windows wheel `maturin: command not found`.** Two follow-ups to the prior publish-time fix bullet. (1) `crates/zlayer-proxy/Cargo.toml` and `crates/zlayer-secrets/Cargo.toml` were both `publish = false`, but `crates/zlayer-agent/Cargo.toml` declares versioned workspace deps on both (`zlayer-proxy.workspace = true`, `zlayer-secrets.workspace = true`). `cargo-publish-workspace` filtered both crates out of the topo order, so when the agent's own `cargo publish` ran it died with `no matching package named zlayer-proxy found` (and the same trap was waiting for `zlayer-secrets`). Removed the `publish = false` line from each — defaults to publishable, both crates already carry the metadata crates.io needs (name, version, description, license, repository). The Kahn topo-sort in the action now publishes proxy and secrets ahead of agent. (2) `.forgejo/workflows/publish-sdks.yml::publish-py-binding-build-windows-x86_64` was the lone wheel-build job still using the `uv tool install maturin` + bare `maturin build` two-step pattern — `uv tool install` drops the binary in `%USERPROFILE%\.local\bin`, which is not on PATH in the next `shell: bash` step, so the build died with `maturin: command not found` (exit 127). Replaced with a single `uvx maturin build --release --out dist` step matching the linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, and sdist jobs already in this file. `uv` itself is provisioned on the MiniWindows runner via the chocolatey safety net in `ci.yaml::check-windows`, so no additional setup is needed here.
+- **OpenAPI Go client now publishable from a release.** `clients/go/` was generated with module path `github.com/BlackLeafDigital/zlayer-go` — that path is a 404 on GitHub, so `go get` could not resolve it. Every Go consumer (notably ZArcRunner) was masking this with a local `replace github.com/BlackLeafDigital/zlayer-go => ../ZLayer/clients/go` directive that never survives a container build. Fix mirrors the existing `publish-plugin-sdk-go` pattern at `.forgejo/workflows/publish-sdks.yml:653`: renamed the module to `github.com/BlackLeafDigital/ZLayer/clients/go` (`clients/go/go.mod`, the 34 `clients/go/test/api_*_test.go` import lines, the user-facing examples in `clients/README.md`, and the generated `clients/go/README.md` placeholder + per-API `clients/go/docs/*.md` `GIT_USER_ID/GIT_REPO_ID` placeholders); patched `scripts/generate-clients.sh::generate_go` so future regenerations emit the correct module path AND pass `gitUserId=BlackLeafDigital,gitRepoId=ZLayer/clients/go` so the README import snippet stays correct; switched `packageVersion` from a hardcoded `0.1.0` (already drifting — repo is on 0.10.x) to a `0.0.0-dev` sentinel that the new publish job stamps to the real version at tag time. New `publish-openapi-go` job in `.forgejo/workflows/publish-sdks.yml` (immediately after `publish-plugin-sdk-go`) seds `0.0.0-dev` → `inputs.version` across `clients/go/**.{go,md}`, runs `go vet` on the stamped tree, makes a one-off detached-HEAD commit, tags `clients/go/v<VERSION>` against that commit, pushes only the tag (Forgejo + GitHub mirror via `GH_ACCESS_TOKEN`, allowlist-guarded like `publish-plugin-sdk-go`); the branch never moves and the dev sentinel stays in tree. Registered as `sdks/openapi-go` in `.forgejo/build-config.yaml` (no `registry:` block — same as `plugin-sdk-go`, idempotency via `ci-step-status` markers). Deleted `clients/go/git_push.sh` (a generator-emitted helper for pushing a generated client to its own standalone git repo — meaningless for a monorepo subpath publish) and added it to `clients/go/.openapi-generator-ignore` so it doesn't come back. Consumer migration in ZArcRunner is a separate follow-up: drop the local `replace`, pin `github.com/BlackLeafDigital/ZLayer/clients/go v<VERSION>`, project-wide rename `import "github.com/BlackLeafDigital/zlayer-go"` → `import "github.com/BlackLeafDigital/ZLayer/clients/go"`.
 - **`zlayer-types` refactor follow-up: Linux/Windows runtime callsites now stringify `ImageSpec.name`.** The `e0ad80f Add zlayer-types` + `71cdcbc Fold zlayer-spec` refactor changed `ImageSpec.name: String` → `ImageReference` (re-export of `oci_client::Reference`) but only updated callsites that compile on macOS, where the refactor was performed. Platform-gated runtime code (`crates/zlayer-agent/src/runtimes/youki.rs` on Linux, `hcs.rs` and `wsl2_delegate.rs` on Windows) and the cross-platform `crates/zlayer-agent/tests/composite_dispatch_e2e.rs` integration test still passed `&spec.image.name` (now `&ImageReference`) to functions and `HashMap<String, _>` lookups that take `&str` — every Linux and Windows CI job failed with `expected &str, found &Reference` / `the trait Borrow<Reference> is not implemented for String`. Fix introduces a single `let image_name = spec.image.name.to_string();` local at the top of each affected function (matching the pattern already used by `macos_sandbox.rs:1622`, `wasm.rs:1035`, `service.rs:119`, `composite.rs:190`) and rewrites the in-function callsites to take `&image_name`. The `Runtime::pull_image(&self, image: &str)` trait contract and the `images: HashMap<String, CachedImage>` cache key types are unchanged. The README example in `crates/zlayer-agent/README.md` is updated to match. Verified against the live MiniWindows host via `scripts/windows-remote-check.sh`.
 - **Windows build + clippy iteration against MiniWindows (rounds 1–5).** Resolved the Windows `Send`/`Sync`, `cfg`-gate, export-visibility, dependency-placement, and clippy issues surfaced by the `scripts/windows-remote-check.sh` validation loop across five rounds. Round 1: `unsafe impl Sync` added to `OwnedSystem` / `OwnedOperation` / `OwnedProcess` in `crates/zlayer-hcs/src/handle.rs` and `OwnedNetwork` / `OwnedEndpoint` / `OwnedNamespace` in `crates/zlayer-hns/src/handle.rs` (handles are documented thread-safe; the `Send`-only posture was breaking 56 `*mut c_void cannot be shared/sent between threads safely` errors once async paths held them across `.await`); `crates/zlayer-agent/src/bundle.rs` split `get_device_major_minor` / `get_device_type` cleanly via `#[cfg(unix)]` with a Windows `Unsupported` stub, and the rootfs symlink at line 371 now picks `tokio::fs::symlink` (Unix) vs `tokio::fs::symlink_dir` (Windows — `CreateSymbolicLinkW` with the directory flag); `crates/zlayer-agent/src/runtimes/hcs.rs::inspect_detailed` restructured to clone the `Arc<RwLock<Option<i32>>>` out of the container entry before awaiting, eliminating an E0597 borrow-across-await; `crates/zlayer-agent/src/overlay_manager.rs::attach_to_interface` and the `std::os::fd::AsFd` import are now `#[cfg(target_os = "linux")]`-gated, and the non-Linux netlink stubs in `crates/zlayer-agent/src/netlink.rs` restricted to Unix-non-Linux (macOS) so the `OwnedFd` / `BorrowedFd` signatures no longer break Windows. Round 2: introduced `SendHandle<T>(pub T)` in `crates/zlayer-hcs/src/handle.rs` — a `#[repr(transparent)]` `Copy` newtype with `unsafe impl Send + Sync` and `Deref<Target = T>`, re-exported from `lib.rs` — because async bodies still held RAW `HCS_SYSTEM` / `HCS_OPERATION` / `HCS_PROCESS` (which are `!Send + !Sync` and blocked by the orphan rule) across `.await`; async paths in `operation.rs`, `system.rs`, `process.rs`, `enumerate.rs`, and `handle.rs` refactored to wrap locals in `SendHandle`. Round 3: `OwnedSystem::as_raw()` / `OwnedProcess::as_raw()` / `OwnedOperation::as_raw()` and the `ComputeSystem::raw()` / `ComputeProcess::raw()` pass-throughs now return `SendHandle<T>` at source — Rust 2021 disjoint-field captures meant `handle.0` inside a `move` closure captured only the inner `!Send` field and defeated the wrapper; closures now deref via `*handle` (forcing whole-variable capture) and FFI call sites deref with `*handle` when passing to the `Hcs*` C APIs, clearing the 14 remaining E0277 `Send` and 2 `Sync` errors. Round 4: ungated 17 top-level `Commands::*` variants in `bin/zlayer/src/cli.rs` (`Project`, `Env`, `Task`, `Workflow`, `User`, `Sync`, `Notifier`, `Variable`, `Group`, `Auth`, `RegistryCredential`, `Permission`, `GitCredential`, `Credential`, `Webhook`, `Audit`, `GroupMember`) plus their sub-enums and `CliBuildKind` / `CliUserRole` helpers — every handler dispatches over cross-platform HTTP so the `#[cfg(unix)]` gates were wrong; replaced the `_assert_signature` helper in `bin/zlayer/src/commands/join.rs:805` (its `impl Future<Output = Result<()>>` bound conflicted with `join`'s HRTB `for<'a> fn(&'a Cli, ...) -> _`) with a direct fn-pointer let-binding; promoted `zlayer_paths::is_root` to `pub` at crate root with Unix/Windows/fallback bodies (unblocking 5 `bin/zlayer` call sites) and declared `pub mod firewall;` in `zlayer-overlay/src/lib.rs` (unblocking 3 call sites) — both landed in H-5/H-6 but their exports were unreachable on Windows; moved `zlayer-init-actions` and `zlayer-docker` out of `[target.'cfg(unix)'.dependencies]` in `bin/zlayer/Cargo.toml` into top-level `[dependencies]` (both are cross-platform — init-actions uses only reqwest/tokio, docker only gates its `socket/` module on `cfg(unix)`) so the Windows build resolves them; added the missing `Win32_NetworkManagement_WindowsFirewall` and `Win32_System_Com` feature flags on the `zlayer-overlay` `windows` dep so H-6's `INetFwPolicy2` COM bindings link on Windows. Round 5: re-applied the G-6 WSL2 consent API (`ensure_wsl_backend_ready_with_consent` and `WslError::{InstallRefused, RebootRequired}`) that an earlier parallel-agent race had lost — consumer code in `node.rs` / `join.rs` already expected this API. Finally, two clippy sweeps: scoped `#[allow(unsafe_code)]` at the crate/module level on `zlayer-hcs`, `zlayer-hns`, and the Windows-only modules in `zlayer-overlay` (they exist specifically to wrap unsafe HCS/HCN/Wintun APIs, while the workspace-wide `-W unsafe-code` policy remains in force everywhere else) and fixed 7 `doc_markdown`, 1 `single_match_else`, and 1 `borrow_as_ptr` regression; cleaned up stylistic lints in `bin/zlayer` (3 × `used_underscore_binding`, 2 × `no_effect_underscore_binding`, 3 × `needless_return` in `views/dashboard.rs`, 1 × `doc_markdown`). `cargo clippy --workspace --all-targets -- -D warnings` is now clean on MiniWindows.
+## [0.11.0]
+
+### Fixed
+- CI: `check-windows` job in `.forgejo/workflows/ci.yaml` was failing at the `Export PROTOC env` step with `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED` because the Forgejo runner service runs as `LocalSystem` and `shell: bash` fell back to `wsl.exe bash` when Git Bash wasn't on `PATH`. Now installs Git Bash via the shared `Public/actions/install-git-bash@main` action before the bash-shelled env export, matching the pattern `build.yml` already uses for its Windows jobs.
+
+### Added
+- **H-1: `zlayer node init` works on Windows.** `bin/zlayer/src/commands/node.rs::handle_node_init` no longer bails on Windows. Admin check via `zlayer_paths::is_root()`, consent-gated WSL2 install via G-6, overlay + Raft bootstrap (cross-platform), GPU detect via H-4, firewall rules via H-6. Configs persist under `%ProgramData%\ZLayer\`.
+- **H-2: `zlayer node join` works on Windows.** `bin/zlayer/src/commands/node.rs::handle_node_join` mirrors H-1's flow for the join path: admin check, WSL2 consent, HTTP join to leader, persist configs, Wintun interface via existing OverlayTransport, GPU detect, firewall rules.
+- **H-3: `zlayer join <url>` works on Windows.** `bin/zlayer/src/commands/join.rs` no longer bails on Windows. Admin check, consent-gated WSL2 install via G-6, OverlayManager + ServiceManager init (cross-platform), GPU detect via H-4, firewall rules via H-6. Supports the user-facing join flow without requiring `zlayer node join`.
+- **G-3: Real exec streaming in WSL2 delegate.** `exec_stream` in `crates/zlayer-agent/src/runtimes/wsl2_delegate.rs` now spawns `wsl.exe` with piped stdout/stderr and streams `ExecEvent::{Stdout, Stderr, Exit}` line-by-line via `BufReader`, replacing the buffered synthetic wrapper.
+- **G-4: Youki log path plumbed through WSL2 delegate.** Container invocations pass `--log <path>` to youki inside the distro; `container_logs` streams from the in-distro log via `\\wsl$\<distro>\<path>` UNC (or `wsl.exe -- tail -f` fallback). Replaces the hardcoded `/var/log/youki/<slug>.stdout.log` placeholder.
+- **G-5: Config-driven WSL2 delegate.** `RuntimeConfig::Wsl2Delegate` (or `Wsl2DelegateConfig`) accepts distro name + optional youki path + bundle root. `try_new` resolves youki via `wsl.exe -d <distro> -- which youki`, returning an actionable error when absent. Removes the hardcoded `"zlayer"` distro name + `$PATH` youki reliance.
+- **G-6: WSL2 auto-install consent flow.** `crates/zlayer-wsl/src/setup.rs::ensure_wsl_backend_ready_with_consent()` now auto-installs WSL2 (elevated `wsl --install --no-distribution` via `ShellExecuteExW "runas"`) when the user consents, rather than hard-bailing. New helper `bin/zlayer/src/ui/consent.rs::wsl2_install_consent(ConsentMode)` encapsulates the Y/n prompt with TTY detection. New CLI flag `--install-wsl <yes|no|ask>` (default `ask`, env `ZLAYER_INSTALL_WSL`) exposed via a shared `InstallWslArgs` ClapArgs group on `node init`, `node join`, `join <url>`, `daemon install`. Non-TTY stdin with Ask mode returns an error pointing at the flag. Reboot-required exit code surfaces a clear "please reboot and re-run" message.
+- **G-2: WSL2 delegate `create_container` writes real OCI bundles.** `crates/zlayer-agent/src/runtimes/wsl2_delegate.rs::create_container` no longer returns `AgentError::Unsupported`. Uses `bundle::BundleBuilder::build_spec_only()` (G-1) to generate the `oci_spec::runtime::Spec` on the Windows host, then streams `config.json` into the WSL2 distro via `wsl.exe -- tee <bundle_dir>/config.json`. Rootfs extraction: Linux image layers are pulled on the Windows host through `zlayer_registry::ImagePuller`, cached per-image on the delegate alongside the `ImageConfig`, decompressed in-process (gzip/zstd via `flate2`/`zstd`, magic-byte fallback for untyped blobs), and each plain tar stream piped through `wsl.exe -d zlayer -- sh -c 'cd <bundle_dir>/rootfs && tar -xf - --no-same-owner'` via a new `wsl_stdin_pipe` helper that uses `tokio::process::Command` with a live stdin (the existing `zlayer_wsl::distro::wsl_exec` only does `Command::output`). After the bundle is materialized, `youki create --bundle <bundle_dir> <id>` runs inside the distro so `start_container` has something to drive. `pull_image_with_policy` is also rewritten to populate the per-image cache instead of shelling out to the non-existent `youki pull` subcommand. `remove_container` cleans up the in-distro bundle dir on tear-down. `\\wsl$\<distro>` path conversion remains available via `zlayer_wsl::paths::windows_to_wsl` for future per-container host-visible bind-mounts; this commit stays on in-distro storage, which is the most portable layout and keeps WSL as the single source of truth for the container rootfs.
+- **H-6: Windows Firewall rules.** New `crates/zlayer-overlay/src/firewall/` module manages inbound Windows Firewall rules (`ensure_overlay_rules` / `remove_overlay_rules`) for the overlay UDP port, API TCP port, and Raft TCP port via `INetFwPolicy2`. Idempotent, scoped to Private + Domain profiles. Called from `zlayer node init` / `zlayer node join` on Windows.
+- **L-6: OS-aware builder backend routing.** New `ImageOs { Linux, Windows }` enum in `crates/zlayer-builder/src/backend/mod.rs` plus a `FromStr` impl that accepts `linux`/`windows`/`linux/amd64`/`windows/amd64`. `detect_backend()` gained a `target_os: ImageOs` parameter and returns actionable errors on unsupported host/target combinations. Unblocks Phase L-1/L-2/L-4/L-7 parallel work. All current call sites pass `ImageOs::Linux` until Phase L-2 threads the user-specified OS from the CLI/ZImagefile.
+- **L-7: Pipeline mixed-OS waves.** `crates/zlayer-builder/src/pipeline/executor.rs` now selects a per-image builder backend based on the image's target OS (parsed from `PipelineImage.platforms`). Linux and Windows images can coexist in the same pipeline; each routes through its own `detect_backend(target_os)`. Per-image backend errors isolate to that image without failing the whole wave. Mixed-OS `platforms` on a single image (e.g. `[linux/amd64, windows/amd64]`) is rejected at parse with a clear error — split into separate PipelineImage entries.
+- **L-2: `os:` field on ZImagefile + `--platform` flag on `zlayer build`.** `ZImage` and `ZStage` gained an optional `os: Option<ImageOs>` field that takes precedence over the existing `platform:` field for target-OS determination. New CLI flag `--platform <linux[/amd64]|windows[/amd64]>` on `zlayer build`. Priority resolves as: CLI flag → `os:` field → OS inferred from `platform:` → default Linux. Pipeline executor (L-7) reads `PipelineImage.os:` as the primary target-OS source.
+- **H-4: Windows GPU detection.** `crates/zlayer-agent/src/gpu_detector.rs` gained a Windows branch layering NVML (via `nvml-wrapper`) + WMI `Win32_VideoController` (via `wmi` crate) + AMD VRAM correction via `windows-registry`. Windows nodes now report real NVIDIA / AMD / Intel GPUs to the scheduler instead of an empty vec.
+- **H-5: Windows admin check.** `zlayer_paths::is_root()` now returns true on Windows when the process has administrator privileges (via `IsUserAnAdmin`). Enables cluster bootstrap + service install paths to gate privileged operations correctly.
+
+### Changed
+- **G-1: Cross-platform OCI spec generation.** `crates/zlayer-agent/src/bundle.rs` split so `build_spec_only()` is callable from Windows code paths. Filesystem-write helpers remain `#[cfg(unix)]`-gated. Unblocks the WSL2 delegate's `create_container` path (Phase G-2).
 
 ## [0.10.86]
 

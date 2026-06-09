@@ -51,5 +51,8 @@ config.workspace = true
 # HTTP types for propagation
 http = "1"
 
+[dev-dependencies]
+zlayer-paths.workspace = true
+
 [lints]
 workspace = true

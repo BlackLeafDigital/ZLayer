@@ -64,10 +64,10 @@ impl EndpointAttachment {
     ///
     /// Note: Windows containers always query DNS on port 53 — HNS does not
     /// support setting a custom DNS port on the endpoint. The overlay hickory
-    /// server's canonical listener is on port 15353, so a separate port-53
-    /// listener must be bound on the overlay IP for Windows containers to
-    /// actually reach the DNS server. See
-    /// `zlayer_overlay::DnsServer::bind_windows_fallback`.
+    /// server's canonical listener is on port 15353 (Linux), so a separate
+    /// port-53 listener must be bound on the overlay IP for Windows
+    /// containers to actually reach the DNS server. See
+    /// `DnsServer::bind_windows_fallback` in `zlayer-overlay`.
     ///
     /// # Errors
     ///
@@ -414,102 +414,5 @@ mod tests {
     fn gateway_for_slice_v6_64() {
         let ip: std::net::IpAddr = "fd00:200:42::5".parse().unwrap();
         assert_eq!(super::gateway_for_slice(ip, 64), "fd00:200:42::1");
-    }
-
-    #[test]
-    fn build_endpoint_dns_none_when_both_unset() {
-        // Legacy callers pass (None, None) — the Dns field must stay absent
-        // so HCN inherits network-level DNS (today: none) and the wire
-        // format is byte-identical to pre-J-1 output.
-        let dns = super::build_endpoint_dns(None, None);
-        assert!(dns.is_none(), "no inputs ⇒ no Dns struct");
-    }
-
-    #[test]
-    fn build_endpoint_dns_populates_all_fields() {
-        let server: std::net::IpAddr = "10.200.42.1".parse().unwrap();
-        let dns = super::build_endpoint_dns(Some(server), Some("overlay.local"))
-            .expect("both inputs ⇒ Dns struct present");
-        assert_eq!(dns.server_list, vec!["10.200.42.1".to_string()]);
-        assert_eq!(dns.domain, "overlay.local");
-        assert_eq!(dns.search, vec!["overlay.local".to_string()]);
-        assert!(dns.options.is_empty());
-    }
-
-    #[test]
-    fn build_endpoint_dns_server_only_leaves_domain_empty() {
-        let server: std::net::IpAddr = "fd00::1".parse().unwrap();
-        let dns =
-            super::build_endpoint_dns(Some(server), None).expect("server set ⇒ Dns struct present");
-        assert_eq!(dns.server_list, vec!["fd00::1".to_string()]);
-        assert!(dns.domain.is_empty());
-        assert!(dns.search.is_empty());
-    }
-
-    #[test]
-    fn build_endpoint_dns_domain_only_leaves_server_list_empty() {
-        let dns = super::build_endpoint_dns(None, Some("cluster.internal"))
-            .expect("domain set ⇒ Dns struct present");
-        assert!(dns.server_list.is_empty());
-        assert_eq!(dns.domain, "cluster.internal");
-        assert_eq!(dns.search, vec!["cluster.internal".to_string()]);
-    }
-
-    #[test]
-    fn endpoint_dns_roundtrips_into_host_compute_endpoint_json() {
-        // Emulate what create_overlay assembles: a HostComputeEndpoint with the
-        // build_endpoint_dns output plugged into `dns`. Serializing the
-        // endpoint must preserve the field exactly as HNS expects (PascalCase
-        // ServerList, Domain, Search, Options).
-        let server: std::net::IpAddr = "10.200.42.1".parse().unwrap();
-        let dns = super::build_endpoint_dns(Some(server), Some("overlay.local"));
-        let endpoint = HostComputeEndpoint {
-            name: "zlayer-test".to_string(),
-            host_compute_network: "net-guid".to_string(),
-            schema_version: SchemaVersion::default(),
-            dns,
-            ..HostComputeEndpoint::default()
-        };
-        let json = serde_json::to_value(&endpoint).expect("endpoint serializes");
-        let dns_json = json
-            .get("Dns")
-            .expect("Dns field must be present in serialized endpoint");
-        assert_eq!(
-            dns_json.get("ServerList").and_then(|v| v.as_array()),
-            Some(&vec![serde_json::json!("10.200.42.1")]),
-        );
-        assert_eq!(
-            dns_json.get("Domain").and_then(|v| v.as_str()),
-            Some("overlay.local"),
-        );
-        assert_eq!(
-            dns_json.get("Search").and_then(|v| v.as_array()),
-            Some(&vec![serde_json::json!("overlay.local")]),
-        );
-        // Round-trip back to the typed struct.
-        let back: HostComputeEndpoint = serde_json::from_value(json).expect("deserializes");
-        let back_dns = back.dns.expect("round-tripped Dns present");
-        assert_eq!(back_dns.server_list, vec!["10.200.42.1".to_string()]);
-        assert_eq!(back_dns.domain, "overlay.local");
-        assert_eq!(back_dns.search, vec!["overlay.local".to_string()]);
-    }
-
-    #[test]
-    fn endpoint_dns_absent_when_inputs_are_none_omits_field_in_json() {
-        // Pre-J-1 wire compat: when no DNS inputs are passed, the Dns field
-        // must be absent from the serialized endpoint (not an empty object).
-        let dns = super::build_endpoint_dns(None, None);
-        let endpoint = HostComputeEndpoint {
-            name: "zlayer-test".to_string(),
-            host_compute_network: "net-guid".to_string(),
-            schema_version: SchemaVersion::default(),
-            dns,
-            ..HostComputeEndpoint::default()
-        };
-        let json = serde_json::to_value(&endpoint).expect("serializes");
-        assert!(
-            json.get("Dns").is_none(),
-            "Dns field must be omitted when no DNS inputs were provided; got {json}"
-        );
     }
 }

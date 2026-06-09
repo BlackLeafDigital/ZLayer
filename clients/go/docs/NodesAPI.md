@@ -7,7 +7,6 @@ Method | HTTP request | Description
 [**GenerateJoinToken**](NodesAPI.md#GenerateJoinToken) | **Post** /api/v1/nodes/join-token | Generate a join token for new nodes to join the cluster.
 [**GetNode**](NodesAPI.md#GetNode) | **Get** /api/v1/nodes/{id} | Get detailed information about a specific node.
 [**ListNodes**](NodesAPI.md#ListNodes) | **Get** /api/v1/nodes | List all nodes in the cluster.
-[**UpdateNodeLabels**](NodesAPI.md#UpdateNodeLabels) | **Post** /api/v1/nodes/{id}/labels | Update labels on a node.
 
 
 
@@ -28,7 +27,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -89,7 +88,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -159,7 +158,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID/zlayer"
 )
 
 func main() {
@@ -196,78 +195,6 @@ Other parameters are passed through a pointer to a apiListNodesRequest struct vi
 ### HTTP request headers
 
 - **Content-Type**: Not defined
-- **Accept**: application/json
-
-[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
-[[Back to Model list]](../README.md#documentation-for-models)
-[[Back to README]](../README.md)
-
-
-## UpdateNodeLabels
-
-> UpdateLabelsResponse UpdateNodeLabels(ctx, id).UpdateLabelsRequest(updateLabelsRequest).Execute()
-
-Update labels on a node.
-
-
-
-### Example
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"os"
-	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
-)
-
-func main() {
-	id := int64(789) // int64 | Node identifier
-	updateLabelsRequest := *openapiclient.NewUpdateLabelsRequest(map[string]string{"key": "Inner_example"}, []string{"Remove_example"}) // UpdateLabelsRequest | 
-
-	configuration := openapiclient.NewConfiguration()
-	apiClient := openapiclient.NewAPIClient(configuration)
-	resp, r, err := apiClient.NodesAPI.UpdateNodeLabels(context.Background(), id).UpdateLabelsRequest(updateLabelsRequest).Execute()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error when calling `NodesAPI.UpdateNodeLabels``: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
-	}
-	// response from `UpdateNodeLabels`: UpdateLabelsResponse
-	fmt.Fprintf(os.Stdout, "Response from `NodesAPI.UpdateNodeLabels`: %v\n", resp)
-}
-```
-
-### Path Parameters
-
-
-Name | Type | Description  | Notes
-------------- | ------------- | ------------- | -------------
-**ctx** | **context.Context** | context for authentication, logging, cancellation, deadlines, tracing, etc.
-**id** | **int64** | Node identifier | 
-
-### Other Parameters
-
-Other parameters are passed through a pointer to a apiUpdateNodeLabelsRequest struct via the builder pattern
-
-
-Name | Type | Description  | Notes
-------------- | ------------- | ------------- | -------------
-
- **updateLabelsRequest** | [**UpdateLabelsRequest**](UpdateLabelsRequest.md) |  | 
-
-### Return type
-
-[**UpdateLabelsResponse**](UpdateLabelsResponse.md)
-
-### Authorization
-
-[bearer_auth](../README.md#bearer_auth)
-
-### HTTP request headers
-
-- **Content-Type**: application/json
 - **Accept**: application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)

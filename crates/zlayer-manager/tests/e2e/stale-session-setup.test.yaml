@@ -1,52 +1,45 @@
-name: Stale-session setup (bootstrap + login + persist state)
+name: Stale-session setup (login + persist state)
 platform: web
 variables:
   ADMIN_EMAIL: admin@e2e.local
   ADMIN_PASSWORD: e2e-test-password-1234
-  ADMIN_DISPLAY: E2E Admin
 
 # This test produces a Playwright storageState file
-# (.stale-session.state.json) that captures the logged-in admin's
-# cookies — including the HttpOnly zlayer_session JWT. run-suite.sh
-# loads that state into the next intellitester run with
-# `--storage-state` after wiping the user row from users.db, which
-# reproduces the "browser still holds valid-looking cookies that the
-# server now rejects" condition Part A's fix is supposed to handle.
+# (.stale-session.state.json) that captures the logged-in fixture
+# admin's cookies — including the HttpOnly zlayer_session JWT.
+# run-suite.sh loads that state into the next intellitester run with
+# `--storage-state` after deleting the fixture user via `zlayer user
+# delete`, which reproduces the "browser still holds valid-looking
+# cookies that the server now rejects" condition Part A's fix is
+# supposed to handle.
 
 steps:
   - type: navigate
-    value: /
+    value: /login
 
   - type: wait
-    target: { css: "#bs-email" }
+    target: { css: "#login-email" }
     timeout: 15000
 
   - type: input
-    target: { css: "#bs-email" }
+    target: { css: "#login-email" }
     value: ${ADMIN_EMAIL}
 
   - type: input
-    target: { css: "#bs-display-name" }
-    value: ${ADMIN_DISPLAY}
-
-  - type: input
-    target: { css: "#bs-password" }
-    value: ${ADMIN_PASSWORD}
-
-  - type: input
-    target: { css: "#bs-confirm" }
+    target: { css: "#login-password" }
     value: ${ADMIN_PASSWORD}
 
   - type: tap
-    target: { role: button, name: "Create admin account" }
+    target: { role: button, name: "Sign in" }
 
+  # Successful login lands on "/" with the dashboard shell loaded.
   - type: waitForSelector
-    target: { role: heading }
+    target: { css: "h1" }
     state: visible
     timeout: 15000
 
   # Confirm the session cookies actually landed before we persist
-  # state. If bootstrap silently failed, saving an empty cookie jar
+  # state. If login silently failed, saving an empty cookie jar
   # would mask the regression.
   - type: assertCookies
     has:

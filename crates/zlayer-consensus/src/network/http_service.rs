@@ -31,6 +31,7 @@ use openraft::storage::Snapshot;
 use openraft::{BasicNode, Raft, RaftTypeConfig, SnapshotMeta, Vote};
 use tracing::{debug, error, warn};
 
+use crate::network::http_client::RAFT_PROTOCOL_VERSION;
 use crate::types::NodeId;
 
 /// Application state shared with Axum handlers.
@@ -66,7 +67,7 @@ where
         .route("/raft/full-snapshot", post(handle_full_snapshot::<C>))
         .with_state(state);
 
-    if let Some(token) = auth_token {
+    let router = if let Some(token) = auth_token {
         let expected = Arc::new(token);
         router.layer(middleware::from_fn(move |req, next| {
             let expected = Arc::clone(&expected);
@@ -74,6 +75,29 @@ where
         }))
     } else {
         router
+    };
+    router.layer(middleware::from_fn(check_protocol_version_middleware))
+}
+
+/// Middleware that validates the `X-ZLayer-Raft-Protocol` header.
+async fn check_protocol_version_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let header = req
+        .headers()
+        .get("X-ZLayer-Raft-Protocol")
+        .and_then(|v| v.to_str().ok());
+    match header {
+        None => next.run(req).await,
+        Some(v) if v == RAFT_PROTOCOL_VERSION => next.run(req).await,
+        Some(other) => {
+            tracing::warn!(received = %other, supported = RAFT_PROTOCOL_VERSION,
+                "rejecting raft RPC with unknown protocol version");
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                [("X-ZLayer-Raft-Protocol-Supported", RAFT_PROTOCOL_VERSION)],
+                "raft protocol version mismatch",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -252,5 +276,15 @@ where
             error!("install_full_snapshot failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Vec::new())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raft_protocol_version_constant_is_one() {
+        assert_eq!(RAFT_PROTOCOL_VERSION, "1");
     }
 }

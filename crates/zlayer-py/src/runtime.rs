@@ -365,10 +365,7 @@ impl Runtime {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = inner.read().await;
 
-            let container_id = ContainerId {
-                service: service.clone(),
-                replica,
-            };
+            let container_id = ContainerId::new(service.clone(), replica);
 
             // Verify the container exists by checking its state
             inner

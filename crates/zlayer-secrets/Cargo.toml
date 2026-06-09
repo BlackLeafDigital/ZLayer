@@ -48,6 +48,12 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = tru
 vaultrs = { version = "0.7", optional = true }
 zlayer-paths.workspace = true
 zlayer-types.workspace = true
+ed25519-dalek = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser.workspace = true
+time.workspace = true
+postcard2.workspace = true
+rustls-pki-types = "1.14.1"
 
 [features]
 default = ["persistent"]

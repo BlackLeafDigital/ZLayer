@@ -9,6 +9,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 use crate::logs::{LogEntry, LogQuery, LogSource, LogStream};
 
@@ -146,7 +148,7 @@ mod tests {
 
     /// Helper: write lines to a temporary file and return its path.
     fn write_temp_file(name: &str, content: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
+        let mut path = ZLayerDirs::system_default().tmp();
         // Include thread id and a suffix to avoid collisions with parallel tests.
         path.push(format!(
             "zlayer_log_reader_test_{}_{}",

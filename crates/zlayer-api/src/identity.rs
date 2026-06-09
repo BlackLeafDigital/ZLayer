@@ -18,6 +18,8 @@ use tracing::{error, info, warn};
 use crate::storage::{
     OidcIdentity, OidcIdentityStorage, StorageError, StoredUser, UserRole, UserStorage,
 };
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 use zlayer_secrets::{CredentialStore, PersistentSecretsStore, SecretsError};
 
 /// Error surface for [`IdentityManager`] operations.
@@ -163,20 +165,18 @@ impl IdentityManager {
 
     /// Remove a user account: deletes the credential hash (idempotent — skips
     /// if absent so stale rows don't block cleanup), then the profile row.
-    /// Returns the deleted [`StoredUser`].
+    /// Idempotent — returns `Ok(None)` if no row has this id; returns
+    /// `Ok(Some(user))` when a row was actually deleted.
     ///
     /// # Errors
     ///
-    /// * [`IdentityError::NotFound`] when no row has this id.
     /// * [`IdentityError::UserStore`] / [`IdentityError::Credentials`] on
     ///   backing-store failures. Credential deletion happens first — if it
     ///   fails, the user row is left intact so the caller can retry.
-    pub async fn delete_user(&self, id: &str) -> Result<StoredUser, IdentityError> {
-        let user = self
-            .users
-            .get(id)
-            .await?
-            .ok_or_else(|| IdentityError::NotFound(id.to_string()))?;
+    pub async fn delete_user(&self, id: &str) -> Result<Option<StoredUser>, IdentityError> {
+        let Some(user) = self.users.get(id).await? else {
+            return Ok(None);
+        };
 
         if self.credentials.exists(&user.email).await? {
             self.credentials.delete_api_key(&user.email).await?;
@@ -184,11 +184,11 @@ impl IdentityManager {
 
         let deleted = self.users.delete(id).await?;
         if !deleted {
-            return Err(IdentityError::NotFound(id.to_string()));
+            return Ok(None);
         }
 
         info!(user_id = %user.id, email = %user.email, "IdentityManager: user deleted");
-        Ok(user)
+        Ok(Some(user))
     }
 
     /// Change a user's role in both the profile row AND the credential's
@@ -366,9 +366,9 @@ mod tests {
         Arc<IdentityManager>,
         Arc<dyn UserStorage>,
         Arc<CredentialStore<Arc<PersistentSecretsStore>>>,
-        tempfile::TempDir,
+        zlayer_types::Scratch,
     ) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ZLayerDirs::system_default().scratch_dir("mk-").unwrap();
         let users: Arc<dyn UserStorage> = Arc::new(InMemoryUserStore::new());
         let secrets = Arc::new(
             PersistentSecretsStore::open(
@@ -443,17 +443,18 @@ mod tests {
             .await
             .unwrap();
 
-        identity.delete_user(&user.id).await.unwrap();
+        let deleted = identity.delete_user(&user.id).await.unwrap();
+        assert!(deleted.is_some());
 
         assert_eq!(users.count().await.unwrap(), 0);
         assert!(!creds.exists("bob@example.com").await.unwrap());
     }
 
     #[tokio::test]
-    async fn delete_user_errors_on_missing_id() {
+    async fn delete_user_is_idempotent_on_missing_id() {
         let (identity, _users, _creds, _tmp) = mk().await;
-        let err = identity.delete_user("nope-nope-nope").await.unwrap_err();
-        assert!(matches!(err, IdentityError::NotFound(_)));
+        let result = identity.delete_user("nope-nope-nope").await.unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -467,7 +468,8 @@ mod tests {
             UserRole::User,
         );
         users.store(&orphan).await.unwrap();
-        identity.delete_user(&orphan.id).await.unwrap();
+        let deleted = identity.delete_user(&orphan.id).await.unwrap();
+        assert!(deleted.is_some());
         assert_eq!(users.count().await.unwrap(), 0);
     }
 
@@ -510,7 +512,7 @@ mod tests {
         Arc<IdentityManager>,
         Arc<dyn UserStorage>,
         Arc<dyn OidcIdentityStorage>,
-        tempfile::TempDir,
+        zlayer_types::Scratch,
     ) {
         let (_i, users, creds, tmp) = mk().await;
         let oidc: Arc<dyn OidcIdentityStorage> =

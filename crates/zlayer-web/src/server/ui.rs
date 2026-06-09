@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::app::{app_css, App};
+use crate::server::install;
 use crate::server::state::WebState;
 
 /// HTML shell wrapper that includes CSS and hydration scripts.
@@ -148,6 +149,18 @@ pub async fn start_ui_server(
         .route(
             "/api/leptos/{*fn_name}",
             axum::routing::post(server_fn_handler),
+        )
+        // Install endpoints — see crates/zlayer-web/src/server/install.rs.
+        // `/install` UA-sniffs the client; the explicit suffixes (.sh/.ps1/.py)
+        // serve the matching script verbatim; `/latest-{slug}` 302s to the
+        // newest GitHub release asset for that platform.
+        .route("/install", axum::routing::get(install::install_detect))
+        .route("/install.sh", axum::routing::get(install::install_sh))
+        .route("/install.ps1", axum::routing::get(install::install_ps1))
+        .route("/install.py", axum::routing::get(install::install_py))
+        .route(
+            "/latest-{slug}",
+            axum::routing::get(install::latest_redirect),
         )
         // Serve the WASM package directory for client-side hydration
         .nest_service("/pkg", ServeDir::new(&pkg_dir))

@@ -19,7 +19,7 @@ import (
 // checks if the TagImageRequest type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &TagImageRequest{}
 
-// TagImageRequest Request body for [`tag_image_handler`]. Matches Docker-compat `docker tag` semantics: create a new reference (`target`) pointing at an already-cached image (`source`).
+// TagImageRequest Request body for the tag-image handler. Matches Docker-compat `docker tag` semantics: create a new reference (`target`) pointing at an already-cached image (`source`).
 type TagImageRequest struct {
 	// Existing image reference to tag (e.g. `myapp:latest`).
 	Source string `json:"source"`

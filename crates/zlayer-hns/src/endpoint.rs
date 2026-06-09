@@ -37,6 +37,7 @@ use windows::Win32::System::HostComputeNetwork::{
 
 use crate::error::{HnsError, HnsResult};
 use crate::handle::{HcnEndpointHandle, OwnedEndpoint};
+use crate::network::Network;
 use crate::schema::{EndpointStats, HostComputeEndpoint};
 
 /// Owning wrapper around an HCN endpoint.
@@ -57,11 +58,14 @@ impl Endpoint {
     /// `network_id` so the JSON references the correct network regardless of
     /// what the caller pre-populated.
     ///
-    /// The first argument to `HcnCreateEndpoint` (`network` handle) is passed
-    /// as null here, matching hcsshim's default `CreateEndpoint` path: HCN
-    /// identifies the target network from the `HostComputeNetwork` field in
-    /// the settings JSON. A future API variant may accept an already-opened
-    /// [`crate::handle::OwnedNetwork`] directly.
+    /// `HcnCreateEndpoint` requires a **valid open network handle** as its
+    /// first argument — passing null is rejected with `E_INVALIDARG`
+    /// (`0x80070057`). We therefore open the target network here (via
+    /// [`Network::open`]) and pass its raw `HCN_NETWORK` handle. This mirrors
+    /// hcsshim's `createEndpoint` path, which calls `hcnOpenNetwork` then
+    /// `hcnCreateEndpoint(networkHandle, ...)` (hcn/hcnendpoint.go). The
+    /// opened [`Network`] is kept alive across the create call and dropped
+    /// afterwards (its `Drop` calls `HcnCloseNetwork`).
     pub fn create(
         network_id: GUID,
         endpoint_id: GUID,
@@ -73,6 +77,11 @@ impl Endpoint {
         let settings_json = serde_json::to_string(&ep_settings)?;
         let settings_hstring = HSTRING::from(settings_json);
 
+        // Open the target network so we can hand its handle to
+        // HcnCreateEndpoint. Propagate any open error (mapped via the same
+        // classify_error/HnsError path used elsewhere in this crate).
+        let network = Network::open(network_id)?;
+
         // HCN's out-param is `*mut *mut c_void`; our stable handle alias is
         // `*const c_void` (see handle.rs). Keep a local `*mut c_void` for the
         // round-trip and cast when handing off to `OwnedEndpoint::from_raw`.
@@ -81,7 +90,7 @@ impl Endpoint {
 
         unsafe {
             HcnCreateEndpoint(
-                core::ptr::null(),
+                network.handle().as_raw(),
                 &endpoint_id,
                 &settings_hstring,
                 &mut raw,
@@ -89,6 +98,10 @@ impl Endpoint {
             )
             .map_err(|e| classify_error(e.code(), err_record, "HcnCreateEndpoint"))?;
         }
+
+        // Keep `network` alive until after HcnCreateEndpoint returns; drop it
+        // now (HcnCloseNetwork) since the endpoint no longer needs it.
+        drop(network);
 
         if raw.is_null() {
             return Err(HnsError::Other {

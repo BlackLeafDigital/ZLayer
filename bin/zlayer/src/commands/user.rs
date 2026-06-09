@@ -251,6 +251,7 @@ fn print_users_table(users: &[UserView]) {
 mod tests {
     use super::resolve_new_password;
     use std::io::Write;
+    use zlayer_paths::ZLayerDirs;
 
     #[test]
     fn inline_password_returned_as_is() {
@@ -262,7 +263,9 @@ mod tests {
 
     #[test]
     fn password_file_is_read_and_trimmed() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_file("password-file-is-read-and-trimmed-")
+            .unwrap();
         writeln!(tmp.as_file(), "filesecret123").unwrap();
         let (pw, generated) = resolve_new_password(None, Some(tmp.path()), false).unwrap();
         assert_eq!(pw, "filesecret123");
@@ -271,7 +274,9 @@ mod tests {
 
     #[test]
     fn password_file_empty_errors() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = ZLayerDirs::system_default()
+            .scratch_file("password-file-empty-errors-")
+            .unwrap();
         let err = resolve_new_password(None, Some(tmp.path()), false).unwrap_err();
         assert!(err.to_string().contains("empty"), "unexpected: {err}");
     }

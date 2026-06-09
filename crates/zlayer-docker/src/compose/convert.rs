@@ -9,7 +9,7 @@ use zlayer_spec::{
     DeploymentSpec, DeviceSpec, EndpointSpec, ErrorsSpec, ExposeType, GpuSpec, HealthCheck,
     HealthSpec, ImageSpec, InitSpec, LifecycleSpec, NetworkMode, NodeMode, Protocol, PullPolicy,
     ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec, ServiceType,
-    StorageSpec, StorageTier, TimeoutAction, UlimitSpec,
+    SourcePolicy, StorageSpec, StorageTier, TimeoutAction, UlimitSpec,
 };
 
 use super::types::{
@@ -17,6 +17,8 @@ use super::types::{
     EnvFileEntry, VolumeType,
 };
 use crate::DockerError;
+#[cfg(test)]
+use zlayer_paths::ZLayerDirs;
 
 /// Compose-style image name produced for a service that ships a `build:`
 /// directive but no explicit `image:`. Mirrors Docker Compose's
@@ -111,9 +113,16 @@ fn convert_service(
         .map(super::types::StringOrList::into_list)
         .unwrap_or_default();
 
+    let source_policy = svc
+        .extensions
+        .get("x-zlayer-source-policy")
+        .and_then(serde_yaml::Value::as_str)
+        .and_then(parse_source_policy);
+
     let image = ImageSpec {
         name: image.name,
         pull_policy: pull_policy.unwrap_or(image.pull_policy),
+        source_policy,
     };
 
     // Plumb additional groups (`group_add:`) into `extra_groups`.
@@ -152,6 +161,7 @@ fn convert_service(
         privileged: svc.privileged,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,
@@ -192,6 +202,10 @@ fn convert_service(
         userns_mode: svc.userns_mode.clone(),
         cgroup_parent: svc.cgroup_parent.clone(),
         expose,
+        replica_groups: None,
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     })
 }
 
@@ -340,6 +354,10 @@ fn enrich_resources_with_gpus_short(
         scheduling: None,
         distributed: None,
         sharing: None,
+        mps_pipe_dir: None,
+        mps_log_dir: None,
+        time_slice_index: None,
+        time_slicing_config_path: None,
     });
     spec
 }
@@ -398,6 +416,7 @@ fn convert_image(project: &str, svc_name: &str, svc: &ComposeService) -> crate::
                 ))
             })?,
             pull_policy: PullPolicy::IfNotPresent,
+            source_policy: None,
         });
     }
 
@@ -422,6 +441,7 @@ fn convert_image(project: &str, svc_name: &str, svc: &ComposeService) -> crate::
             ))
         })?,
         pull_policy: PullPolicy::IfNotPresent,
+        source_policy: None,
     })
 }
 
@@ -488,6 +508,7 @@ fn convert_ports(ports: &[super::types::ComposePort]) -> crate::Result<Vec<Endpo
             expose: ExposeType::Public,
             stream: None,
             tunnel: None,
+            target_role: None,
         });
     }
 
@@ -891,6 +912,10 @@ fn enrich_resources_with_gpu(
             scheduling: None,
             distributed: None,
             sharing: None,
+            mps_pipe_dir: None,
+            mps_log_dir: None,
+            time_slice_index: None,
+            time_slicing_config_path: None,
         });
         break;
     }
@@ -1034,6 +1059,25 @@ fn parse_pull_policy(s: Option<&str>) -> Option<PullPolicy> {
         "build" => None,
         other => {
             warn!(value = other, "unknown compose pull_policy; ignoring");
+            None
+        }
+    }
+}
+
+/// Parse the `x-zlayer-source-policy` extension value into a [`SourcePolicy`].
+/// Accepts both `snake_case` and kebab-case spellings, case-insensitively:
+/// `local_first`/`local-first`, `s3_first`/`s3-first`,
+/// `remote_only`/`remote-only`, `local_only`/`local-only`. Unknown values are
+/// warned about and ignored.
+fn parse_source_policy(s: &str) -> Option<SourcePolicy> {
+    let s = s.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "local_first" | "local-first" => Some(SourcePolicy::LocalFirst),
+        "s3_first" | "s3-first" => Some(SourcePolicy::S3First),
+        "remote_only" | "remote-only" => Some(SourcePolicy::RemoteOnly),
+        "local_only" | "local-only" => Some(SourcePolicy::LocalOnly),
+        other => {
+            warn!(value = other, "unknown x-zlayer-source-policy; ignoring");
             None
         }
     }
@@ -1244,7 +1288,7 @@ volumes:
         assert_eq!(spec.services.len(), 2);
 
         let web = &spec.services["web"];
-        assert_eq!(web.image.name.to_string(), "docker.io/library/nginx:latest");
+        assert_eq!(web.image.name.to_string(), "nginx:latest");
         assert_eq!(web.endpoints.len(), 1);
         assert_eq!(web.endpoints[0].port, 8080);
         assert_eq!(web.endpoints[0].target_port, Some(80));
@@ -1252,7 +1296,7 @@ volumes:
         assert_eq!(web.env.get("FOO").unwrap(), "bar");
 
         let db = &spec.services["db"];
-        assert_eq!(db.image.name.to_string(), "docker.io/library/postgres:16");
+        assert_eq!(db.image.name.to_string(), "postgres:16");
         assert_eq!(db.endpoints.len(), 1);
         assert_eq!(db.endpoints[0].port, 5432);
         assert_eq!(db.endpoints[0].protocol, Protocol::Tcp);
@@ -1284,10 +1328,7 @@ services:
 
         let app = &spec.services["app"];
         // Compose-style tag: `<project>-<service>:latest`.
-        assert_eq!(
-            app.image.name.to_string(),
-            "docker.io/library/build-test-app:latest",
-        );
+        assert_eq!(app.image.name.to_string(), "build-test-app:latest");
         assert_eq!(app.image.pull_policy, PullPolicy::IfNotPresent);
     }
 
@@ -1305,7 +1346,7 @@ services:
         let api = &spec.services["api"];
         assert_eq!(
             api.image.name.to_string(),
-            "docker.io/library/myproj-api:latest",
+            "myproj-api:latest",
             "short-form `build:` must produce <project>-<service>:latest",
         );
         // Confirm the helper emits the same un-canonicalised form too.
@@ -1338,10 +1379,7 @@ services:
         let compose = parse_compose(yaml).unwrap();
         let spec = compose_to_deployment(&compose, "fullbuild").unwrap();
         let worker = &spec.services["worker"];
-        assert_eq!(
-            worker.image.name.to_string(),
-            "docker.io/library/fullbuild-worker:latest",
-        );
+        assert_eq!(worker.image.name.to_string(), "fullbuild-worker:latest");
 
         // The build directive itself stays attached to the compose model so
         // `compose build` can read it; assert via the parsed compose, not the
@@ -1972,7 +2010,9 @@ services:
     /// with inline `environment` overriding file entries.
     #[test]
     fn test_silent_drop_env_file_forwarding() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = ZLayerDirs::system_default()
+            .scratch_dir("test-silent-drop-env-file-forwarding-")
+            .expect("tempdir");
         let env_path = dir.path().join("svc.env");
         std::fs::write(
             &env_path,

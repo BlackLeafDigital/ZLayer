@@ -232,10 +232,17 @@ type ApiPullImageHandlerRequest struct {
 	ctx context.Context
 	ApiService *ImagesAPIService
 	pullImageRequest *PullImageRequest
+	stream *bool
 }
 
 func (r ApiPullImageHandlerRequest) PullImageRequest(pullImageRequest PullImageRequest) ApiPullImageHandlerRequest {
 	r.pullImageRequest = &pullImageRequest
+	return r
+}
+
+// When &#x60;true&#x60;, stream NDJSON &#x60;PullProgressDto&#x60; events instead of a single JSON response. Defaults to &#x60;false&#x60; (snapshot pull).
+func (r ApiPullImageHandlerRequest) Stream(stream bool) ApiPullImageHandlerRequest {
+	r.stream = &stream
 	return r
 }
 
@@ -246,11 +253,19 @@ func (r ApiPullImageHandlerRequest) Execute() (*PullImageResponse, *http.Respons
 /*
 PullImageHandler Pull an OCI image into the runtime's local cache.
 
-This is a blocking pull: the handler returns only after the image is
-resolved and stored locally (or the pull fails). When `pull_policy` is
-omitted the default is `"always"`, matching Docker-compat semantics for
-`POST /images/create`. On success, the response echoes the reference and
-best-effort `digest`/`size_bytes` resolved via `list_images()`.
+Two behaviours, selected by the `stream` query parameter:
+
+- `stream=false` (default): blocking pull. The handler returns only
+  after the image is resolved and stored locally (or the pull fails).
+  Response is `{"reference":"...","digest":"...","size_bytes":...}`
+  ([`PullImageResponse`]).
+- `stream=true`: NDJSON stream of [`PullProgressDto`] events. Each
+  `Status { ... }` becomes one JSON line; the final `Done { ... }`
+  becomes one line and the stream closes. Errors mid-pull surface as
+  a single `{"error":"..."}` line and terminate the stream.
+
+When `pull_policy` is omitted the default is `"always"`, matching
+Docker-compat semantics for `POST /images/create`.
 
 # Errors
 
@@ -291,6 +306,9 @@ func (a *ImagesAPIService) PullImageHandlerExecute(r ApiPullImageHandlerRequest)
 		return localVarReturnValue, nil, reportError("pullImageRequest is required and must be specified")
 	}
 
+	if r.stream != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "stream", r.stream, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{"application/json"}
 

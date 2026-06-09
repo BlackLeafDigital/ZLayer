@@ -14,19 +14,171 @@
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, LUID};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    BackupRead, BackupWrite, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    BackupRead, BackupWrite, CreateDirectoryW, CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+/// Convert a path to a UTF-16 null-terminated buffer suitable for
+/// `CreateFileW`, with the Windows extended-length-path prefix
+/// (`\\?\` or `\\?\UNC\`) applied so the call works for paths
+/// longer than `MAX_PATH` (260 chars).
+///
+/// Required for unpacking deep Windows container layers
+/// (e.g. `Files/Windows/WinSxS/…/<60-char SxS component>/<long filename>.dll`)
+/// where the post-canonicalization absolute path easily exceeds 260 chars.
+/// Without this prefix `CreateFileW` returns `ERROR_PATH_NOT_FOUND` (0x80070003)
+/// even when `create_dir_all` has materialized every parent directory.
+///
+/// # Errors
+///
+/// Returns the OS error if the path cannot be made absolute (extremely rare —
+/// typically only happens if `current_dir()` itself fails for a relative input).
+pub(crate) fn to_extended_wide(path: &Path) -> io::Result<Vec<u16>> {
+    // Hoisted constants so clippy::items_after_statements doesn't complain
+    // about declaring `const` items mid-function. These describe the three
+    // path prefixes Windows treats specially:
+    //   * `\\?\`  - verbatim (skip kernel path normalisation, ~32k limit)
+    //   * `\\.\`  - device namespace (e.g. `\\.\PhysicalDrive0`)
+    //   * `\\`    - generic UNC (`\\server\share\...`)
+    const VERBATIM_PREFIX: &[u16] = &['\\' as u16, '\\' as u16, '?' as u16, '\\' as u16];
+    const DEVICE_PREFIX: &[u16] = &['\\' as u16, '\\' as u16, '.' as u16, '\\' as u16];
+    const UNC_PREFIX: &[u16] = &['\\' as u16, '\\' as u16];
+
+    // Resolve to an absolute path. Prefer `canonicalize` (resolves symlinks
+    // and produces a verbatim form) when the path exists; fall back to
+    // `std::path::absolute` (stable since 1.79) which only normalises
+    // lexically, so it works for not-yet-created targets like the file we're
+    // about to open with `CREATE_ALWAYS`. Last resort: join CWD by hand.
+    let abs: PathBuf = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => match std::path::absolute(path) {
+            Ok(p) => p,
+            Err(_) => {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(path)
+                }
+            }
+        },
+    };
+
+    let wide_in: Vec<u16> = abs.as_os_str().encode_wide().collect();
+
+    // If already prefixed with `\\?\` or `\\.\`, pass through unchanged
+    // (just null-terminate).
+    if wide_in.starts_with(VERBATIM_PREFIX) || wide_in.starts_with(DEVICE_PREFIX) {
+        let mut out = wide_in;
+        out.push(0);
+        return Ok(out);
+    }
+
+    // UNC path `\\server\share\...` -> `\\?\UNC\server\share\...`
+    let mut out: Vec<u16>;
+    if wide_in.starts_with(UNC_PREFIX) {
+        out = Vec::with_capacity(wide_in.len() + 6);
+        out.extend("\\\\?\\UNC".encode_utf16());
+        // Drop the leading single backslash from `\\server\share\path` so we
+        // end up with `\\?\UNC\server\share\path`.
+        out.extend_from_slice(&wide_in[1..]);
+    } else {
+        // Local path -> `\\?\C:\path`.
+        out = Vec::with_capacity(wide_in.len() + 4);
+        out.extend("\\\\?\\".encode_utf16());
+        out.extend_from_slice(&wide_in);
+    }
+    out.push(0);
+    Ok(out)
+}
+
+/// Create (or truncate) a file at `path` using `CreateFileW(CREATE_ALWAYS)`
+/// with the extended-length-path prefix so it works for paths longer than
+/// `MAX_PATH`. Returns an owned [`std::fs::File`] wrapping the resulting
+/// handle so the caller can `write_all` / `io::copy` into it without
+/// re-opening the path through a non-long-path-aware API.
+///
+/// Used by the OCI Windows layer unpacker for non-`Files/` payloads
+/// (`Hives/`, `tombstones.txt`, `UtilityVM/`) and as the inner implementation
+/// of [`BackupStreamWriter::create_new`] (which immediately drops the
+/// returned file and re-opens via `BACKUP_SEMANTICS`).
+///
+/// `std::fs::File::create` is intentionally avoided because it does not apply
+/// the long-path prefix automatically, so it fails with
+/// `ERROR_PATH_NOT_FOUND` (0x80070003) for the deep `WinSxS` paths that appear
+/// in `mcr.microsoft.com/windows/nanoserver` layers.
+///
+/// # Errors
+///
+/// Returns the OS error from `CreateFileW`.
+pub(crate) fn create_long_path_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    let wide = to_extended_wide(path)?;
+    // SAFETY: `wide` is a valid null-terminated UTF-16 buffer that outlives
+    // the call. All other arguments are plain values.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("CreateFileW(CREATE_ALWAYS): {e}")))?;
+    // SAFETY: `handle` was just returned by a successful `CreateFileW` (so it
+    // is non-null and a real Win32 file handle), and no other owner exists.
+    // Transferring ownership to `std::fs::File` is sound; the `File`'s Drop
+    // will call `CloseHandle` for us.
+    let file = unsafe { std::fs::File::from_raw_handle(handle.0.cast()) };
+    Ok(file)
+}
+
+/// Create a single directory at `path` using `CreateDirectoryW` with the
+/// extended-length-path prefix so it works for paths longer than `MAX_PATH`.
+/// `ERROR_ALREADY_EXISTS` is treated as success (matches `std::fs::create_dir`
+/// behaviour when paired with `create_dir_all`-style walks).
+///
+/// Used by the OCI Windows layer unpacker's `create_long_path_dir_all`
+/// fallback when `std::fs::create_dir_all` returns `ERROR_PATH_NOT_FOUND`
+/// (`0x80070003`) on the deep `WinSxS` / `Catroot` directory chains embedded
+/// in `mcr.microsoft.com/windows/nanoserver` layers.
+///
+/// # Errors
+///
+/// Returns the OS error from `CreateDirectoryW` (except for
+/// `ERROR_ALREADY_EXISTS`, which is swallowed).
+pub(crate) fn create_long_path_dir(path: &Path) -> io::Result<()> {
+    let wide = to_extended_wide(path)?;
+    // SAFETY: `wide` is a valid null-terminated UTF-16 buffer that outlives
+    // the call. `lpsecurityattributes = None` requests default ACLs.
+    let res = unsafe { CreateDirectoryW(PCWSTR::from_raw(wide.as_ptr()), None) };
+    if let Err(e) = res {
+        // Idempotent: already-exists is fine for a create_dir_all-style walk.
+        // windows-rs returns a `windows::core::Error` whose `code()` is the
+        // HRESULT-wrapped Win32 status; check both flavours.
+        #[allow(clippy::cast_sign_loss)]
+        let raw = e.code().0 as u32;
+        let already_exists_hresult = 0x8007_0000u32 | (ERROR_ALREADY_EXISTS.0 & 0xFFFF);
+        if raw == already_exists_hresult || raw == ERROR_ALREADY_EXISTS.0 {
+            return Ok(());
+        }
+        return Err(io::Error::other(format!("CreateDirectoryW: {e}")));
+    }
+    Ok(())
+}
 
 /// Enable `SeBackupPrivilege` and `SeRestorePrivilege` on the current process
 /// token. `HcsImportLayer` (and any `BackupWrite` into a system-protected path)
@@ -123,15 +275,31 @@ impl BackupStreamWriter {
     ///
     /// Returns the OS error from `CreateFileW` if the target can't be opened.
     pub fn create(path: &Path) -> io::Result<Self> {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        // CRITICAL: `BackupWrite` applies the `BACKUP_SECURITY_DATA` stream
+        // (owner + DACL + SACL) ONLY for the access rights the handle was
+        // opened with. Plain `GENERIC_WRITE` lacks `WRITE_DAC`/`WRITE_OWNER`/
+        // `ACCESS_SYSTEM_SECURITY`, so the kernel SILENTLY DROPS the security
+        // descriptor and the materialized file inherits the host directory's
+        // ACL instead of the image's. That ACL omits the BUILTIN\Users (BU) /
+        // ALL APPLICATION PACKAGES (AC) read+execute grants that in-guest
+        // services running as LocalService (e.g. `mpssvc`, the Windows
+        // Firewall) need to load their DLLs — so `mpssvc` fails to start, the
+        // SCM-gated `gcs` service that depends on it never starts, and the UVM
+        // never dials the host GCS bridge (the "never-dial" bug). Request the
+        // security-bearing rights explicitly; the already-enabled
+        // `SeRestorePrivilege` + `FILE_FLAG_BACKUP_SEMANTICS` let `CreateFileW`
+        // grant them. Mirrors hcsshim's `safefile` open flags for layer writes.
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const WRITE_OWNER: u32 = 0x0008_0000;
+        const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+        // `to_extended_wide` adds the `\\?\` prefix so we can open paths
+        // longer than MAX_PATH (260 chars) — see the helper's doc comment.
+        let wide = to_extended_wide(path)?;
+        let desired_access = GENERIC_WRITE.0 | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
         let handle = unsafe {
             CreateFileW(
                 PCWSTR::from_raw(wide.as_ptr()),
-                GENERIC_WRITE.0,
+                desired_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -151,19 +319,26 @@ impl BackupStreamWriter {
     ///
     /// This is the variant used by the OCI Windows layer unpacker: tar
     /// entries name files that don't yet exist on disk, so we first materialize
-    /// an empty file via `File::create` (which maps to `CREATE_ALWAYS` on
-    /// Windows) and then reopen it with the `BACKUP_SEMANTICS` flag via
-    /// [`Self::create`]. The two-step dance avoids threading a creation-mode
-    /// parameter through the raw `CreateFileW` call.
+    /// an empty file via [`create_long_path_file`] (a `CreateFileW(CREATE_ALWAYS)`
+    /// with the `\\?\` long-path prefix) and then reopen it with the
+    /// `BACKUP_SEMANTICS` flag via [`Self::create`]. The two-step dance
+    /// avoids threading a creation-mode parameter through the raw
+    /// `CreateFileW` call.
+    ///
+    /// `std::fs::File::create` is intentionally avoided here because it does
+    /// not apply the extended-length-path prefix, so it fails with
+    /// `ERROR_PATH_NOT_FOUND` (0x80070003) for the deep `WinSxS` paths that
+    /// appear in `mcr.microsoft.com/windows/nanoserver` layers.
     ///
     /// # Errors
     ///
-    /// Returns the OS error from either the initial `File::create` or the
-    /// subsequent `CreateFileW` open.
+    /// Returns the OS error from either the initial `CreateFileW(CREATE_ALWAYS)`
+    /// or the subsequent `CreateFileW(OPEN_EXISTING)` open.
     pub fn create_new(path: &Path) -> io::Result<Self> {
-        // Touch the file so `CreateFileW(OPEN_EXISTING, ...)` below succeeds.
-        // Drop the handle immediately — we only need the inode to exist.
-        drop(std::fs::File::create(path)?);
+        // Touch the file via the long-path-aware helper. We immediately drop
+        // the returned `File` (closing the write handle) and re-open the same
+        // path with `BACKUP_SEMANTICS` via `Self::create`.
+        drop(create_long_path_file(path)?);
         Self::create(path)
     }
 }
@@ -176,8 +351,17 @@ impl Write for BackupStreamWriter {
                 self.handle,
                 buf,
                 &mut bytes_written,
-                false,
-                false,
+                false, // bAbort
+                // bProcessSecurity MUST be TRUE for the kernel to apply the
+                // `BACKUP_SECURITY_DATA` stream (owner + DACL + SACL) to the
+                // file. With FALSE the security stream is parsed but its ACL is
+                // DISCARDED — the file keeps the host directory's inherited ACL,
+                // which omits the BUILTIN\Users / ALL APPLICATION PACKAGES read
+                // grants that in-guest services running as LocalService (e.g.
+                // `mpssvc`) need to load their DLLs. Pairs with the
+                // WRITE_DAC/WRITE_OWNER/ACCESS_SYSTEM_SECURITY handle rights in
+                // `create` — both are required, neither alone applies the SD.
+                true, // bProcessSecurity
                 &mut self.context,
             )
         }
@@ -231,11 +415,9 @@ impl BackupStreamReader {
     ///
     /// Returns the OS error from `CreateFileW`.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        // `to_extended_wide` adds the `\\?\` prefix so we can open paths
+        // longer than MAX_PATH (260 chars) — see the helper's doc comment.
+        let wide = to_extended_wide(path)?;
         let handle = unsafe {
             CreateFileW(
                 PCWSTR::from_raw(wide.as_ptr()),
@@ -290,5 +472,61 @@ impl Drop for BackupStreamReader {
             );
             let _ = CloseHandle(self.handle);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for pure helpers — no Win32 calls, safe to run on any Windows host
+// (and they only operate on string-level path transformations, so they don't
+// need real files to exist).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: render a wide buffer back to `String`, stripping the trailing
+    /// null terminator that `to_extended_wide` always appends.
+    fn render(wide: &[u16]) -> String {
+        let nul_pos = wide
+            .iter()
+            .position(|&c| c == 0)
+            .expect("to_extended_wide must null-terminate");
+        String::from_utf16(&wide[..nul_pos]).expect("valid UTF-16")
+    }
+
+    #[test]
+    fn extended_wide_prefixes_local_absolute_path() {
+        // Use a path that almost certainly does not exist so we exercise the
+        // `std::path::absolute` fallback rather than `canonicalize`.
+        let p = Path::new(r"C:\foo\bar\does-not-exist-zlayer-test");
+        let wide = to_extended_wide(p).expect("absolutize ok");
+        let s = render(&wide);
+        assert_eq!(s, r"\\?\C:\foo\bar\does-not-exist-zlayer-test");
+        assert_eq!(*wide.last().unwrap(), 0u16, "must be null-terminated");
+    }
+
+    #[test]
+    fn extended_wide_converts_unc_path_to_unc_verbatim() {
+        let p = Path::new(r"\\server\share\baz\zlayer-test");
+        let wide = to_extended_wide(p).expect("absolutize ok");
+        let s = render(&wide);
+        assert_eq!(s, r"\\?\UNC\server\share\baz\zlayer-test");
+    }
+
+    #[test]
+    fn extended_wide_passes_through_already_verbatim_prefix() {
+        let p = Path::new(r"\\?\C:\already\zlayer-test");
+        let wide = to_extended_wide(p).expect("absolutize ok");
+        let s = render(&wide);
+        assert_eq!(s, r"\\?\C:\already\zlayer-test");
+    }
+
+    #[test]
+    fn extended_wide_passes_through_device_prefix() {
+        let p = Path::new(r"\\.\PhysicalDrive0");
+        let wide = to_extended_wide(p).expect("absolutize ok");
+        let s = render(&wide);
+        assert_eq!(s, r"\\.\PhysicalDrive0");
     }
 }

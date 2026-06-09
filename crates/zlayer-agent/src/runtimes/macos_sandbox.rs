@@ -1456,8 +1456,13 @@ impl SandboxRuntime {
 impl Runtime for SandboxRuntime {
     /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            image,
+            zlayer_spec::PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     /// Pull an image to local storage with a specific policy.
@@ -1477,6 +1482,7 @@ impl Runtime for SandboxRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);
@@ -1534,7 +1540,10 @@ impl Runtime for SandboxRuntime {
             })?;
 
         let puller = zlayer_registry::ImagePuller::with_cache(blob_cache);
-        let auth = zlayer_registry::RegistryAuth::Anonymous;
+        // Honor ~/.docker/config.json (AuthConfig default = DockerConfig) so
+        // `zlayer login` creds / Docker Hub auth apply instead of anonymous.
+        let auth =
+            zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()).resolve(image);
 
         let layers = puller
             .pull_image(image, &auth)
@@ -1543,6 +1552,25 @@ impl Runtime for SandboxRuntime {
                 image: image.to_string(),
                 reason: format!("Failed to pull image layers: {e}"),
             })?;
+
+        // Persist the OCI image CONFIG blob into the same `blobs.redb` while we
+        // still have the network. `pull_image` caches the manifest + layers but
+        // NOT the config blob, and the config's `os` field is what the
+        // composite's LOCAL-ONLY dispatch inspection
+        // (`fetch_image_os_in_cache_only`) reads to route an image correctly on a
+        // later `create_container` with NO network. Caching it here is what lets
+        // a macOS-native bundle pulled through the sandbox resolve `os=darwin`
+        // locally (so it never gets mis-routed to the Linux VM) even under a
+        // Docker Hub rate-limit. Non-fatal: a config-blob miss only costs the
+        // local OS hint.
+        if let Err(e) = puller.pull_image_config(image, &auth).await {
+            tracing::debug!(
+                image = %image,
+                error = %e,
+                "sandbox: failed to cache OCI config blob for local OS inspection; \
+                 dispatch will rely on its fallthrough",
+            );
+        }
 
         tracing::info!(
             image = %image,

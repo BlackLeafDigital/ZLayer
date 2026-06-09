@@ -1,0 +1,171 @@
+name: VZ Linux Guest Images
+
+# Builds the Linux **guest** kernel `Image` + initramfs that the macOS Apple-
+# Virtualization (VZ) runtime boots to run OCI Linux containers on Apple Silicon
+# (crates/zlayer-agent/src/runtimes/macos_vz_linux.rs + crates/zlayer-vzagent). The
+# initramfs `/init` is the static-musl `zlayer-vzagent` PID1 agent; see
+# images/vz-linux/{build.sh,kernel-arm64.defconfig,README.md,KERNEL_SOURCE.md}.
+#
+# Manual / opt-in only: this cross-compiles an arm64 kernel (slow) and is not
+# something every push needs. Trigger it via the Actions "Run workflow" button
+# (workflow_dispatch), or by pushing a commit whose message contains the
+# `[vz-build]` marker. A plain push WITHOUT that marker does nothing here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Kernel version to build (empty = pinned LTS in build.sh)'
+        required: false
+        type: string
+        default: ''
+      busybox_version:
+        description: 'busybox version (empty = pinned default in build.sh)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches: [dev]
+    # Only react to pushes that touch this subsystem AND carry the [vz-build]
+    # opt-in marker (gated in the job below) — keeps the slow kernel build off
+    # the hot path of ordinary pushes.
+    paths:
+      - 'images/vz-linux/**'
+      - 'crates/zlayer-vzagent/**'
+      - '.forgejo/workflows/vz-linux-images.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build VZ Linux kernel + initramfs
+    runs-on: ubuntu-latest
+    # Honour the global `[skip]` marker (in addition to the `[vz-build]` opt-in
+    # gate below) so a `[skip]` push spins up no job at all.
+    if: ${{ !contains(github.event.head_commit.message, '[skip]') }}
+    timeout-minutes: 90
+    env:
+      # Same Cargo sparse-registry override the other image workflows use so the
+      # agent's workspace deps resolve against the Forgejo registry.
+      FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate on [vz-build] marker (push only)
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — building."
+            exit 0
+          fi
+          MSG=$(git log -1 --pretty=%B)
+          if [[ "$MSG" == *"[vz-build]"* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "[vz-build] marker present — building."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No [vz-build] marker on this push — skipping the kernel build."
+          fi
+
+      - name: Install build dependencies
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # build-essential + libelf/flex/bison for the kernel; the aarch64 GNU
+          # cross toolchain for the kernel Image; busybox-static is a host
+          # convenience (build.sh still cross-builds its own static busybox);
+          # cpio/gzip for the initramfs; zig for cargo-zigbuild.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            busybox-static cpio gzip xz-utils curl python3
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        if: steps.gate.outputs.run == 'true'
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cargo-zigbuild
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-zigbuild gives us a hermetic x86_64 -> aarch64-musl cross
+          # without juggling musl cross packages. Verify the latest at
+          #   gh release list -R rust-cross/cargo-zigbuild --limit 1
+          # Pinned + --locked so a fresh release can't silently change behavior.
+          pip3 install --user ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+          # Make the pip-installed `zig` shim discoverable as `zig`.
+          ZIG_DIR=$(python3 -c 'import ziglang, os; print(os.path.dirname(ziglang.__file__))')
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/zig" "$@"\n' "$ZIG_DIR" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+
+      - name: Build kernel + initramfs
+        if: steps.gate.outputs.run == 'true'
+        id: build
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+          BUSYBOX_VERSION: ${{ inputs.busybox_version }}
+          OUT_DIR: ${{ github.workspace }}/dist/vz-linux
+        run: |
+          set -euo pipefail
+          # Empty inputs fall through to the pinned defaults inside build.sh.
+          [ -n "${KERNEL_VERSION}" ] && export KERNEL_VERSION || unset KERNEL_VERSION
+          [ -n "${BUSYBOX_VERSION}" ] && export BUSYBOX_VERSION || unset BUSYBOX_VERSION
+          bash images/vz-linux/build.sh
+          echo "out_dir=${OUT_DIR}" >> "$GITHUB_OUTPUT"
+          KV=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["kernel_version"])' "${OUT_DIR}/manifest.json")
+          echo "kernel_version=${KV}" >> "$GITHUB_OUTPUT"
+
+      # ---- CI artifact (short-lived, for inspection / downstream jobs) -------
+      - name: Upload VZ Linux artifact
+        if: steps.gate.outputs.run == 'true'
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: vz-linux-aarch64
+          path: ${{ steps.build.outputs.out_dir }}
+          retention-days: 7
+
+      # ---- Durable publish: Forgejo generic package (host-consumable) -------
+      # Mirrors the generic-package PUT pattern used by publish-sdks.yml /
+      # release.yml. Version-pinned by kernel version, treated as immutable.
+      - name: Publish to Forgejo Packages
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          OUT_DIR: ${{ steps.build.outputs.out_dir }}
+          KV: ${{ steps.build.outputs.kernel_version }}
+        run: |
+          set -euo pipefail
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          BASE="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/vz-linux/${KV}"
+          for f in Image initramfs.cpio.gz manifest.json; do
+            local_path="${OUT_DIR}/${f}"
+            [ -f "${local_path}" ] || { echo "::error::missing ${local_path}"; exit 1; }
+            url="${BASE}/${f}"
+            # Immutable-by-version: skip if already present (see publish-sdks.yml
+            # rationale — tar/gzip are not byte-reproducible, so size-compare is
+            # unreliable; presence alone means done).
+            remote_size=$(curl -sI --user "${AUTH}" "${url}" 2>/dev/null \
+              | grep -i content-length | tail -1 | tr -dc '0-9') || true
+            if [ -n "${remote_size}" ] && [ "${remote_size}" -gt 0 ]; then
+              echo "Skipping ${f} (already uploaded at ${url})"
+              continue
+            fi
+            echo "Uploading ${f}..."
+            curl --fail --max-time 900 --connect-timeout 30 --retry 3 --retry-delay 10 \
+              --user "${AUTH}" --upload-file "${local_path}" "${url}"
+          done
+          echo "Published VZ Linux ${KV} bundle to ${BASE}"

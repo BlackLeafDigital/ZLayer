@@ -166,6 +166,11 @@ async fn inspect_image(
     State(state): State<SocketState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Docker clients inspect by the bare name they were given (`alpine:latest`);
+    // normalize to `docker.io/library/...` so the lookup matches what the
+    // compat pull/create paths store (and so it doesn't hit the native strict
+    // unqualified-name guard).
+    let name = super::normalize_compat_image(&name);
     if let Ok(value) = state.client.inspect_image_native(&name).await {
         return Ok(Json(value));
     }
@@ -408,6 +413,10 @@ async fn pull_image(
     let reference =
         resolve_pull_reference(q.from_image.as_deref(), q.tag.as_deref(), q.repo.as_deref())
             .ok_or_else(|| ApiError::bad_request("missing fromImage query parameter"))?;
+    // Docker resolves bare names against Docker Hub's library namespace; the
+    // compat socket must do the same so `docker pull alpine` works (the native
+    // daemon path deliberately refuses unqualified names).
+    let reference = super::normalize_compat_image(&reference);
 
     let auth = decode_x_registry_auth(&headers)
         .map_err(|e| ApiError::bad_request(format!("invalid X-Registry-Auth header: {e}")))?;

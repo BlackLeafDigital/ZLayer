@@ -8,14 +8,15 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Request to scale a service
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct InternalScaleRequest {
-    /// Service name to scale
-    pub service: String,
-    /// Target replica count
-    pub replicas: u32,
-}
+/// Re-export the wire-level scale request from `crate::cluster`.
+///
+/// `InternalScaleRequest` was moved to `zlayer_types::cluster` so the same
+/// Rust type can be shared between the HTTP fan-out path (in
+/// `zlayer-scheduler::cluster`) and the `/internal/scale` handler in
+/// `zlayer-api`. This re-export preserves the original
+/// `zlayer_types::api::internal::InternalScaleRequest` path for downstream
+/// callers (and `pub use ...::internal::*` consumers).
+pub use crate::cluster::{InternalScaleRequest, ScaleAssignment};
 
 /// Response from internal scale operation
 #[derive(Debug, Serialize, ToSchema)]
@@ -51,6 +52,13 @@ pub struct InternalAddPeerRequest {
     pub overlay_ip: String,
     /// New peer's `WireGuard` endpoint (e.g. "203.0.113.5:51820")
     pub endpoint: String,
+    /// When set, this peer is for the named service's *dedicated* overlay
+    /// rather than the global cluster overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// Service subnet to plumb into the dedicated peer's `AllowedIPs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_subnet: Option<String>,
 }
 
 /// Response from internal add-peer operation
@@ -72,7 +80,7 @@ pub struct InternalAddPeerResponse {
 /// [`crate::storage::ReplicatedSecret`] so the wire shape is identical to
 /// the stored shape.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum SecretsRaftOp {
     /// Register a new node. Triggers an automatic re-wrap of the current
     /// DEK so the new node can decrypt secrets going forward.
@@ -108,4 +116,59 @@ pub enum SecretsRaftOp {
         /// `"{scope}:{name}"` storage key, same shape as elsewhere.
         storage_key: String,
     },
+
+    /// Revoke a specific issued join token (cannot be unrevoked).
+    ///
+    /// The token is identified by `token_hash`, which is the lowercase
+    /// hex SHA-256 of the full token envelope b64 string (same hash form
+    /// regardless of token format — Ed25519-signed envelope, HS256-JWT,
+    /// or future EdDSA-JWT). The entry auto-expires at `expires_at` so
+    /// the revocation table stays bounded by the un-expired token horizon.
+    RevokeToken {
+        /// Lowercase hex SHA-256 of the full token b64 envelope string.
+        token_hash: String,
+        /// Wall-clock instant at which the revocation entry may be pruned.
+        /// Should match the token's own `exp` claim so the entry is no
+        /// longer needed once the token would have expired anyway.
+        #[schema(value_type = String, format = "date-time")]
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// Import a foreign cluster's trust bundle so its tokens can be
+    /// accepted by validators on this cluster.
+    ///
+    /// Idempotent: re-importing the same `cluster_domain` overwrites
+    /// the previous entry. Keyed by `cluster_domain` to enforce one
+    /// trust relationship per foreign cluster.
+    ImportTrustBundle {
+        /// The bundle to record in `SecretsState::trusted_bundles`.
+        bundle: crate::api::cluster::TrustBundle,
+    },
+
+    /// Remove a previously-imported trust bundle.
+    ///
+    /// No-op if `cluster_domain` was not present. Used by the operator
+    /// when revoking trust in a federated cluster.
+    RemoveTrustBundle {
+        /// Cluster domain of the bundle to remove.
+        cluster_domain: String,
+    },
+
+    /// Set the cluster-wide JWT algorithm policy.
+    ///
+    /// Replicated through Raft so every node enforces the same policy
+    /// within one commit. Idempotent — re-applying with the same value
+    /// is a no-op.
+    SetJwtAlgorithm {
+        /// New policy.
+        algorithm: crate::api::cluster::JwtAlgorithm,
+    },
+
+    /// Mark `{data_dir}/join_secret` as wiped on every node.
+    ///
+    /// Operator-driven cleanup after migrating to `eddsa`. The actual
+    /// file-system delete happens locally on each node when this op
+    /// applies; the state machine records the wipe timestamp so
+    /// re-applies are no-ops. Idempotent.
+    WipeJoinSecret,
 }

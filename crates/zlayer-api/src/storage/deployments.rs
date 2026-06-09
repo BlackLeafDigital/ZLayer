@@ -261,6 +261,7 @@ mod tests {
     use super::*;
     use crate::storage::DeploymentStatus;
     use std::collections::HashMap;
+    use zlayer_paths::ZLayerDirs;
     use zlayer_spec::{DeploymentSpec, ImageSpec, ServiceSpec};
 
     fn create_test_spec(name: &str) -> DeploymentSpec {
@@ -273,6 +274,7 @@ mod tests {
                 image: ImageSpec {
                     name: "test:latest".parse().expect("valid image reference"),
                     pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
+                    source_policy: None,
                 },
                 resources: zlayer_spec::ResourcesSpec::default(),
                 env: HashMap::default(),
@@ -280,6 +282,7 @@ mod tests {
                 network: zlayer_spec::ServiceNetworkSpec::default(),
                 endpoints: vec![],
                 scale: zlayer_spec::ScaleSpec::default(),
+                replica_groups: None,
                 depends: vec![],
                 health: zlayer_spec::HealthSpec {
                     start_grace: None,
@@ -299,6 +302,7 @@ mod tests {
                 privileged: false,
                 node_mode: zlayer_spec::NodeMode::default(),
                 node_selector: None,
+                affinity: None,
                 platform: None,
                 service_type: zlayer_spec::ServiceType::default(),
                 wasm: None,
@@ -326,6 +330,9 @@ mod tests {
                 userns_mode: None,
                 cgroup_parent: None,
                 expose: Vec::new(),
+                isolation: None,
+                overlay: None,
+                localhost_reachability: zlayer_spec::LocalhostReachability::default(),
             },
         );
 
@@ -545,7 +552,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlx_persistent_storage() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = ZLayerDirs::system_default()
+            .scratch_dir("test-sqlx-persistent-storage-")
+            .unwrap();
         let db_path = temp_dir.path().join("test.db");
 
         // Create and populate database

@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 
@@ -366,6 +367,112 @@ func (a *ClusterAPIService) ClusterJoinExecute(r ApiClusterJoinRequest) (*Cluste
 	return localVarReturnValue, localVarHTTPResponse, nil
 }
 
+type ApiClusterListGossipPeersRequest struct {
+	ctx context.Context
+	ApiService *ClusterAPIService
+}
+
+func (r ApiClusterListGossipPeersRequest) Execute() ([]GossipPeerSummary, *http.Response, error) {
+	return r.ApiService.ClusterListGossipPeersExecute(r)
+}
+
+/*
+ClusterListGossipPeers `GET /api/v1/cluster/gossip/peers` — list peers known via the gossip pool.
+
+Returns an empty list when the daemon has no gossip pool configured
+(single-node, raft-only, static, or worker-tier without gossip enabled).
+
+# Errors
+
+Currently infallible — `GossipPool::peers()` can't fail today. The
+return type stays `Result<_>` so a future fallible implementation
+doesn't need a signature change.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiClusterListGossipPeersRequest
+*/
+func (a *ClusterAPIService) ClusterListGossipPeers(ctx context.Context) ApiClusterListGossipPeersRequest {
+	return ApiClusterListGossipPeersRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return []GossipPeerSummary
+func (a *ClusterAPIService) ClusterListGossipPeersExecute(r ApiClusterListGossipPeersRequest) ([]GossipPeerSummary, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  []GossipPeerSummary
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ClusterAPIService.ClusterListGossipPeers")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/cluster/gossip/peers"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiClusterListNodesRequest struct {
 	ctx context.Context
 	ApiService *ClusterAPIService
@@ -432,6 +539,490 @@ func (a *ClusterAPIService) ClusterListNodesExecute(r ApiClusterListNodesRequest
 	if localVarHTTPHeaderAccept != "" {
 		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
 	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiClusterListWorkersRequest struct {
+	ctx context.Context
+	ApiService *ClusterAPIService
+}
+
+func (r ApiClusterListWorkersRequest) Execute() ([]WorkerSummary, *http.Response, error) {
+	return r.ApiService.ClusterListWorkersExecute(r)
+}
+
+/*
+ClusterListWorkers `GET /api/v1/cluster/workers` — list currently-leased worker-tier workers.
+
+Returns an empty list when this node is not running a worker-tier
+dispatcher (e.g., single-node, raft-only, static, or a worker-tier
+worker-role daemon).
+
+# Errors
+
+Never errors today — `known_workers()` is infallible. The result type
+stays `Result<_>` so a future fallible implementation doesn't need a
+signature change.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiClusterListWorkersRequest
+*/
+func (a *ClusterAPIService) ClusterListWorkers(ctx context.Context) ApiClusterListWorkersRequest {
+	return ApiClusterListWorkersRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return []WorkerSummary
+func (a *ClusterAPIService) ClusterListWorkersExecute(r ApiClusterListWorkersRequest) ([]WorkerSummary, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  []WorkerSummary
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ClusterAPIService.ClusterListWorkers")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/cluster/workers"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiClusterSetNodeLabelsRequest struct {
+	ctx context.Context
+	ApiService *ClusterAPIService
+	id int64
+	updateLabelsRequest *UpdateLabelsRequest
+}
+
+func (r ApiClusterSetNodeLabelsRequest) UpdateLabelsRequest(updateLabelsRequest UpdateLabelsRequest) ApiClusterSetNodeLabelsRequest {
+	r.updateLabelsRequest = &updateLabelsRequest
+	return r
+}
+
+func (r ApiClusterSetNodeLabelsRequest) Execute() (*UpdateLabelsResponse, *http.Response, error) {
+	return r.ApiService.ClusterSetNodeLabelsExecute(r)
+}
+
+/*
+ClusterSetNodeLabels Set or remove labels on a node, persisted in raft cluster state so the scheduler's `NodeSelector` placement honors them. `labels` entries are inserted/overwritten; `remove` keys are deleted.
+
+# Errors
+Returns `ServiceUnavailable` if the local Raft coordinator is not running,
+or `Internal` on propose failure.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param id Raft node id
+ @return ApiClusterSetNodeLabelsRequest
+*/
+func (a *ClusterAPIService) ClusterSetNodeLabels(ctx context.Context, id int64) ApiClusterSetNodeLabelsRequest {
+	return ApiClusterSetNodeLabelsRequest{
+		ApiService: a,
+		ctx: ctx,
+		id: id,
+	}
+}
+
+// Execute executes the request
+//  @return UpdateLabelsResponse
+func (a *ClusterAPIService) ClusterSetNodeLabelsExecute(r ApiClusterSetNodeLabelsRequest) (*UpdateLabelsResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *UpdateLabelsResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ClusterAPIService.ClusterSetNodeLabels")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/cluster/nodes/{id}/labels"
+	localVarPath = strings.Replace(localVarPath, "{"+"id"+"}", url.PathEscape(parameterValueToString(r.id, "id")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.id < 0 {
+		return localVarReturnValue, nil, reportError("id must be greater than 0")
+	}
+	if r.updateLabelsRequest == nil {
+		return localVarReturnValue, nil, reportError("updateLabelsRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.updateLabelsRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiClusterUpgradeRequest struct {
+	ctx context.Context
+	ApiService *ClusterAPIService
+	clusterUpgradeRequest *ClusterUpgradeRequest
+}
+
+func (r ApiClusterUpgradeRequest) ClusterUpgradeRequest(clusterUpgradeRequest ClusterUpgradeRequest) ApiClusterUpgradeRequest {
+	r.clusterUpgradeRequest = &clusterUpgradeRequest
+	return r
+}
+
+func (r ApiClusterUpgradeRequest) Execute() (*ClusterUpgradeResult, *http.Response, error) {
+	return r.ApiService.ClusterUpgradeExecute(r)
+}
+
+/*
+ClusterUpgrade Drive a rolling daemon-binary upgrade across every follower.
+
+`POST /api/v1/cluster/upgrade`
+
+Returns `421 Misdirected Request` (with an `X-Leader-Addr` header) when
+called on a follower; the CLI should redirect to the leader. The leader
+upgrades followers in ascending `node_id` order; it does NOT upgrade
+itself in this handler — the caller is expected to invoke
+`/api/v1/internal/upgrade/start` against the leader after followers are
+done (or step down first), so the leader process can restart cleanly.
+
+# Errors
+
+Returns `ServiceUnavailable` if no Raft coordinator is wired,
+`NotLeader` if this node is not the leader, or `Internal` if cluster
+state cannot be read.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiClusterUpgradeRequest
+*/
+func (a *ClusterAPIService) ClusterUpgrade(ctx context.Context) ApiClusterUpgradeRequest {
+	return ApiClusterUpgradeRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return ClusterUpgradeResult
+func (a *ClusterAPIService) ClusterUpgradeExecute(r ApiClusterUpgradeRequest) (*ClusterUpgradeResult, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *ClusterUpgradeResult
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ClusterAPIService.ClusterUpgrade")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/cluster/upgrade"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.clusterUpgradeRequest == nil {
+		return localVarReturnValue, nil, reportError("clusterUpgradeRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.clusterUpgradeRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiClusterUpgradeSelfRequest struct {
+	ctx context.Context
+	ApiService *ClusterAPIService
+	clusterUpgradeSelfRequest *ClusterUpgradeSelfRequest
+}
+
+func (r ApiClusterUpgradeSelfRequest) ClusterUpgradeSelfRequest(clusterUpgradeSelfRequest ClusterUpgradeSelfRequest) ApiClusterUpgradeSelfRequest {
+	r.clusterUpgradeSelfRequest = &clusterUpgradeSelfRequest
+	return r
+}
+
+func (r ApiClusterUpgradeSelfRequest) Execute() (*UpgradeStartResponse, *http.Response, error) {
+	return r.ApiService.ClusterUpgradeSelfExecute(r)
+}
+
+/*
+ClusterUpgradeSelf Trigger a daemon-binary self-upgrade on the local (leader) node.
+
+`POST /api/v1/cluster/upgrade-self`
+
+Two-step orchestration:
+
+1. **Leader handoff via `trigger_elect`**: pick a healthy follower
+   (status == `"ready"`, fresh heartbeat) and POST to its
+   `/api/v1/internal/raft/trigger-elect`. That follower campaigns
+   immediately — Raft safety guarantees only an up-to-date candidate
+   wins, so a stale callee just loses the term and a better-up-to-date
+   follower wins the next. We then poll our own `raft.metrics()`
+   until `current_leader != local_node_id` (timeout 5s). If the
+   handoff fails or times out, we still proceed; the worst case is
+   the cluster waits one heartbeat-loss window for a new leader.
+
+2. **Local self-upgrade**: re-enter `POST /api/v1/internal/upgrade/start`
+   against `127.0.0.1` so the (now-former) leader's daemon downloads
+   the target release, writes the restart sentinel, and exits with
+   code 75 — the OS supervisor (launchd / systemd / SCM) respawns it
+   on the new binary and it rejoins as a voter.
+
+# Errors
+
+Returns `ServiceUnavailable` if Raft or the internal token are
+unconfigured, `Internal` if the leader's own `advertise_addr` /
+`api_port` cannot be resolved from cluster state, or `Internal` if
+the localhost upgrade-start call fails.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiClusterUpgradeSelfRequest
+*/
+func (a *ClusterAPIService) ClusterUpgradeSelf(ctx context.Context) ApiClusterUpgradeSelfRequest {
+	return ApiClusterUpgradeSelfRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return UpgradeStartResponse
+func (a *ClusterAPIService) ClusterUpgradeSelfExecute(r ApiClusterUpgradeSelfRequest) (*UpgradeStartResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *UpgradeStartResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ClusterAPIService.ClusterUpgradeSelf")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/cluster/upgrade-self"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.clusterUpgradeSelfRequest == nil {
+		return localVarReturnValue, nil, reportError("clusterUpgradeSelfRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.clusterUpgradeSelfRequest
 	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
 	if err != nil {
 		return localVarReturnValue, nil, err

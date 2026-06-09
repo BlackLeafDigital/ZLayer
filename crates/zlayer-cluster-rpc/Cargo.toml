@@ -1,0 +1,24 @@
+[package]
+name = "zlayer-cluster-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost = "0.14.3"
+prost-types = "0.14.3"
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots", "transport", "router"] }
+tonic-prost = "0.14.5"
+zlayer-types.workspace = true
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tonic-build = "0.14.5"
+tonic-prost-build = "0.14.5"

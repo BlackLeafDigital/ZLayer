@@ -24,6 +24,7 @@ impl ZLayerDirs {
 
     /// Platform-aware default data directory.
     ///
+    /// - `$ZLAYER_DATA_DIR` (if set and non-empty) overrides every other source.
     /// - macOS: `~/.zlayer`
     /// - Linux (root): `/var/lib/zlayer`
     /// - Linux (user): `~/.zlayer`
@@ -31,22 +32,12 @@ impl ZLayerDirs {
     ///   fallback. HCS-backed nodes run as SYSTEM so the system-wide
     ///   `ProgramData` location is the right default.
     pub fn default_data_dir() -> PathBuf {
-        #[cfg(target_os = "macos")]
-        {
-            home_dir_or_tmp().join(".zlayer")
-        }
-        #[cfg(target_os = "windows")]
-        {
-            windows_program_data_root()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            if is_root() {
-                PathBuf::from("/var/lib/zlayer")
-            } else {
-                home_dir_or_tmp().join(".zlayer")
+        if let Some(env_dir) = std::env::var_os("ZLAYER_DATA_DIR") {
+            if !env_dir.is_empty() {
+                return PathBuf::from(env_dir);
             }
         }
+        platform_default_data_dir()
     }
 
     /// Detect the data directory of an existing installation.
@@ -93,7 +84,7 @@ impl ZLayerDirs {
     /// `{data_dir}/run`. This preserves the FHS layout for stock installs while
     /// letting `--data-dir /tmp/foo` get a fully isolated runtime directory.
     pub fn default_run_dir_for(data_dir: &Path) -> PathBuf {
-        let system_default = Self::default_data_dir();
+        let system_default = platform_default_data_dir();
         if data_dir == system_default.as_path() {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -123,7 +114,7 @@ impl ZLayerDirs {
     /// `{data_dir}/logs`. This preserves the FHS layout for stock installs
     /// while letting `--data-dir /tmp/foo` get a fully isolated log directory.
     pub fn default_log_dir_for(data_dir: &Path) -> PathBuf {
-        let system_default = Self::default_data_dir();
+        let system_default = platform_default_data_dir();
         if data_dir == system_default.as_path() {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -162,7 +153,7 @@ impl ZLayerDirs {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let system_default = Self::default_data_dir();
+            let system_default = platform_default_data_dir();
             if data_dir == system_default.as_path() {
                 #[cfg(target_os = "macos")]
                 {
@@ -177,11 +168,61 @@ impl ZLayerDirs {
                     return "/var/run/zlayer.sock".to_string();
                 }
             }
-            data_dir
+            let natural = data_dir
                 .join("run")
                 .join("zlayer.sock")
                 .to_string_lossy()
-                .into_owned()
+                .into_owned();
+            if natural.len() <= SUN_PATH_MAX {
+                natural
+            } else {
+                socket_safe_fallback(data_dir, "daemon")
+            }
+        }
+    }
+
+    /// Data-dir-aware default `zlayer-overlayd` IPC socket path.
+    ///
+    /// `zlayer-overlayd` is the standalone overlay daemon; the main daemon
+    /// drives it over this endpoint. Mirrors [`Self::default_socket_path_for`]:
+    ///
+    /// - Windows: always `\\.\pipe\zlayer-overlayd` (named pipe, not a file).
+    /// - Unix, default data dir: `/var/run/zlayer-overlayd.sock`.
+    /// - Unix, overridden data dir: `{data_dir}/run/zlayer-overlayd.sock`
+    ///   (falling back to a length-safe path if that would exceed `SUN_PATH`).
+    pub fn default_overlayd_socket_path_for(data_dir: &Path) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = data_dir;
+            r"\\.\pipe\zlayer-overlayd".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let system_default = platform_default_data_dir();
+            if data_dir == system_default.as_path() {
+                #[cfg(target_os = "macos")]
+                {
+                    return system_default
+                        .join("run")
+                        .join("zlayer-overlayd.sock")
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return "/var/run/zlayer-overlayd.sock".to_string();
+                }
+            }
+            let natural = data_dir
+                .join("run")
+                .join("zlayer-overlayd.sock")
+                .to_string_lossy()
+                .into_owned();
+            if natural.len() <= SUN_PATH_MAX {
+                natural
+            } else {
+                socket_safe_fallback(data_dir, "overlayd")
+            }
         }
     }
 
@@ -201,27 +242,43 @@ impl ZLayerDirs {
         {
             #[cfg(target_os = "macos")]
             {
-                Self::default_data_dir()
+                let path = Self::default_data_dir()
                     .join("run")
                     .join("docker.sock")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned();
+                if path.len() <= SUN_PATH_MAX {
+                    path
+                } else {
+                    socket_safe_fallback(&Self::default_data_dir(), "docker")
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
                 if is_root() {
                     "/var/run/zlayer/docker.sock".to_string()
                 } else if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-                    let mut p = PathBuf::from(xdg);
+                    let xdg_path = PathBuf::from(&xdg);
+                    let mut p = xdg_path.clone();
                     p.push("zlayer");
                     p.push("docker.sock");
-                    p.to_string_lossy().into_owned()
+                    let path = p.to_string_lossy().into_owned();
+                    if path.len() <= SUN_PATH_MAX {
+                        path
+                    } else {
+                        socket_safe_fallback(&xdg_path, "docker")
+                    }
                 } else {
-                    Self::default_data_dir()
+                    let path = Self::default_data_dir()
                         .join("run")
                         .join("docker.sock")
                         .to_string_lossy()
-                        .into_owned()
+                        .into_owned();
+                    if path.len() <= SUN_PATH_MAX {
+                        path
+                    } else {
+                        socket_safe_fallback(&Self::default_data_dir(), "docker")
+                    }
                 }
             }
         }
@@ -284,6 +341,12 @@ impl ZLayerDirs {
         self.data_dir.join("volumes")
     }
 
+    /// Project git clones directory (`{data}/projects`). Persistent state —
+    /// per-project working copies live at `{data}/projects/{project_id}`.
+    pub fn projects(&self) -> PathBuf {
+        self.data_dir.join("projects")
+    }
+
     /// WASM module cache directory (`{data}/wasm`).
     pub fn wasm(&self) -> PathBuf {
         self.data_dir.join("wasm")
@@ -342,6 +405,17 @@ impl ZLayerDirs {
         self.data_dir.join("agent_ipam.json")
     }
 
+    /// Path to the agent's managed-network marker file
+    /// (`{data}/agent_network.json`).
+    ///
+    /// Records the host-level networks ZLayer creates (e.g. the Windows HCN
+    /// overlay network) so they can be reused across daemon restarts/updates
+    /// and torn down **only** on a full uninstall (`daemon uninstall --purge`),
+    /// not on every restart/reinstall.
+    pub fn agent_network_state(&self) -> PathBuf {
+        self.data_dir.join("agent_network.json")
+    }
+
     /// Logs subdirectory under data_dir (`{data}/logs`).
     /// Used on macOS where logs live under the user data dir.
     pub fn logs(&self) -> PathBuf {
@@ -365,6 +439,23 @@ impl ZLayerDirs {
         self.data_dir.join("bin")
     }
 
+    /// Canonical install path for the `zlayer-buildd` sidecar binary:
+    /// `{data}/bin/zlayer-buildd`. Resolved by the buildah-sidecar
+    /// backend's discovery logic and written by the `zlayer install
+    /// --sidecar` installer.
+    #[must_use]
+    pub fn buildd_bin(&self) -> PathBuf {
+        self.bin().join("zlayer-buildd")
+    }
+
+    /// Directory holding sidecar mTLS material: `{data}/buildd`. Contains
+    /// `ca.pem`, `cert.pem`, and `key.pem` consumed by both ends of the
+    /// `zlayer-buildd` gRPC channel.
+    #[must_use]
+    pub fn buildd(&self) -> PathBuf {
+        self.data_dir.join("buildd")
+    }
+
     /// Toolchain download cache directory (`{data}/toolchain-cache`).
     pub fn toolchain_cache(&self) -> PathBuf {
         self.data_dir.join("toolchain-cache")
@@ -375,7 +466,45 @@ impl ZLayerDirs {
         self.data_dir.join("tmp")
     }
 
-    /// Data-dir-aware WireGuard UAPI socket directory.
+    /// Create a uniquely-named scratch directory under `{data}/tmp`.
+    ///
+    /// Returns a [`zlayer_types::Scratch`] RAII guard — the directory is
+    /// removed when the guard is dropped. Use this instead of
+    /// `tempfile::tempdir()` so scratch data lives on the configured data
+    /// filesystem rather than `/tmp`, which is tmpfs (RAM-backed) on most
+    /// modern Linux distros and risks OOM for large scratch data
+    /// (build contexts, image tarballs, layer staging, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying filesystem error if `{data}/tmp` can't be
+    /// created or the unique subdirectory can't be allocated.
+    pub fn scratch_dir(&self, prefix: &str) -> std::io::Result<zlayer_types::Scratch> {
+        std::fs::create_dir_all(self.tmp())?;
+        let td = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(self.tmp())?;
+        Ok(zlayer_types::Scratch::from_tempdir(td))
+    }
+
+    /// Create a uniquely-named scratch file under `{data}/tmp`.
+    ///
+    /// Returns a [`zlayer_types::ScratchFile`] RAII guard. Same rationale
+    /// as [`Self::scratch_dir`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying filesystem error if `{data}/tmp` can't be
+    /// created or the unique file can't be allocated.
+    pub fn scratch_file(&self, prefix: &str) -> std::io::Result<zlayer_types::ScratchFile> {
+        std::fs::create_dir_all(self.tmp())?;
+        let nf = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempfile_in(self.tmp())?;
+        Ok(zlayer_types::ScratchFile::from_named(nf))
+    }
+
+    /// Data-dir-aware `WireGuard` UAPI socket directory.
     ///
     /// When `data_dir == Self::default_data_dir()`, returns
     /// `/var/run/wireguard` (FHS default — also where `wg(8)` looks).
@@ -387,17 +516,22 @@ impl ZLayerDirs {
     /// since the FHS path doesn't apply.
     pub fn wireguard(&self) -> PathBuf {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            // No FHS convention; always derive.
-            self.data_dir.join("run").join("wireguard")
-        }
+        let natural = self.data_dir.join("run").join("wireguard");
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            if self.data_dir == Self::default_data_dir() {
-                PathBuf::from("/var/run/wireguard")
-            } else {
-                self.data_dir.join("run").join("wireguard")
-            }
+        let natural = if self.data_dir == Self::default_data_dir() {
+            PathBuf::from("/var/run/wireguard")
+        } else {
+            self.data_dir.join("run").join("wireguard")
+        };
+        // 1 byte separator + IFNAMSIZ (15) + ".sock" (5) = 21
+        const WG_DIR_MAX: usize = SUN_PATH_MAX - 21;
+        if natural.to_string_lossy().len() <= WG_DIR_MAX {
+            natural
+        } else {
+            PathBuf::from(format!(
+                "/tmp/zlayer-wg-{:016x}",
+                hash_for_socket(&self.data_dir, "wg")
+            ))
         }
     }
 }
@@ -410,11 +544,83 @@ pub fn default_admin_bearer_path() -> PathBuf {
 
 // -- Internal helpers --------------------------------------------------------
 
+/// Platform-default data directory, ignoring `$ZLAYER_DATA_DIR`.
+///
+/// Mirrors [`ZLayerDirs::default_data_dir`] but skips the env-var override so
+/// `default_run_dir_for` / `default_log_dir_for` / `default_socket_path_for`
+/// can compare a caller-supplied `data_dir` against the platform-hardcoded
+/// default rather than against whatever the env var currently resolves to
+/// (which would make both sides of the comparison identical when the env var
+/// is set, falsely triggering the FHS branch).
+pub(crate) fn platform_default_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir_or_fallback().join(".zlayer")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_program_data_root()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if is_root() {
+            PathBuf::from("/var/lib/zlayer")
+        } else {
+            home_dir_or_fallback().join(".zlayer")
+        }
+    }
+}
+
+/// Max usable bytes in `sockaddr_un.sun_path` across our supported Unix
+/// targets. Linux's `sun_path` is `char[108]`; macOS's is `char[104]`.
+/// Pick the lower bound and reserve one byte for the trailing NUL so the
+/// check is trivial on both platforms.
+const SUN_PATH_MAX: usize = 103;
+
+/// FNV-1a hash of `data_dir`'s bytes plus a label. Dependency-free and
+/// deterministic across processes (unlike `DefaultHasher` which is
+/// keyed per-process). The daemon and any CLI client passing the same
+/// `data_dir` resolve to byte-identical paths.
+fn hash_for_socket(data_dir: &Path, label: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data_dir.to_string_lossy().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    for b in label.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Short, deterministic UDS path for callers whose natural
+/// `{data_dir}/run/...` path would overflow `sun_path`.
+///
+/// **Scope guardrail:** `/tmp` is acceptable here ONLY because a UDS
+/// endpoint file is just an inode (kernel metadata, no payload). Daemon
+/// state — databases, logs, blob caches, image rootfs, anything the
+/// daemon reads back later — must NEVER use `/tmp`, even as a fallback.
+/// Most modern Linux distros mount `/tmp` as tmpfs (RAM-backed) and
+/// silently landing state there courts OOM under load. Sockets are the
+/// narrow exception because the file itself stores ~256 bytes of inode
+/// metadata.
 #[cfg(not(target_os = "windows"))]
-fn home_dir_or_tmp() -> PathBuf {
+fn socket_safe_fallback(data_dir: &Path, label: &str) -> String {
+    format!(
+        "/tmp/zlayer-{label}-{:016x}.sock",
+        hash_for_socket(data_dir, label)
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn home_dir_or_fallback() -> PathBuf {
+    // Falls back to the FHS system data dir rather than /tmp because /tmp is
+    // tmpfs (RAM-backed) on most modern Linux distros and silently landing
+    // daemon state there courts OOM.
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/zlayer"))
 }
 
 /// Resolve the Windows system-wide ZLayer data root.
@@ -447,8 +653,21 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Returns `true` when the current process is running with superuser /
-/// Administrator privileges.
+/// Windows analogue of the Unix `is_root()` check.
+///
+/// Returns `true` when the current process token carries administrator
+/// privileges (elevated or running as LocalSystem). Backed by
+/// `IsUserAnAdmin` from `shell32`, which is the cheapest call that
+/// covers both interactive elevation and service-account scenarios.
+///
+/// The name `is_root()` is retained deliberately: callers across the
+/// workspace gate privileged filesystem/network setup on this
+/// function, and "admin" is the closest semantic analogue on Windows.
+///
+/// Exposed as `pub` so the Windows cluster-bootstrap CLI
+/// (`zlayer node init` / `zlayer node join` / `zlayer join`) can gate
+/// privileged subsystem setup (service-manager registration, firewall
+/// rules, Wintun adapter creation) on elevation before attempting them.
 #[cfg(windows)]
 #[must_use]
 pub fn is_root() -> bool {
@@ -468,12 +687,12 @@ pub fn is_root() -> bool {
 mod tests {
     use super::*;
 
-    // Windows tests below mutate the `PROGRAMDATA` env var to exercise
-    // platform-default path resolution. Cargo runs tests concurrently,
-    // so readers (`system_default`, `default_admin_bearer_path`) must
-    // serialize against the mutators or they race and observe a mix of
-    // pre- and post-mutation env state.
-    #[cfg(target_os = "windows")]
+    // Tests below mutate environment variables (`PROGRAMDATA` on Windows,
+    // `ZLAYER_DATA_DIR` on Linux/macOS) to exercise platform-default and
+    // env-override path resolution. Cargo runs tests concurrently, so
+    // readers (`system_default`, `default_admin_bearer_path`, the
+    // `default_*_for` helpers) must serialize against the mutators or
+    // they race and observe a mix of pre- and post-mutation env state.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -502,6 +721,11 @@ mod tests {
         assert_eq!(dirs.images(), PathBuf::from("/test/data/images"));
         assert_eq!(dirs.bin(), PathBuf::from("/test/data/bin"));
         assert_eq!(
+            dirs.buildd_bin(),
+            PathBuf::from("/test/data/bin/zlayer-buildd")
+        );
+        assert_eq!(dirs.buildd(), PathBuf::from("/test/data/buildd"));
+        assert_eq!(
             dirs.toolchain_cache(),
             PathBuf::from("/test/data/toolchain-cache")
         );
@@ -510,7 +734,6 @@ mod tests {
 
     #[test]
     fn system_default_uses_default_data_dir() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
@@ -518,16 +741,15 @@ mod tests {
 
     #[test]
     fn admin_bearer_path_is_under_data_dir() {
-        let dirs = ZLayerDirs::new(PathBuf::from("/tmp/zlayer-test"));
+        let dirs = ZLayerDirs::new(PathBuf::from("/var/lib/zlayer-test"));
         assert_eq!(
             dirs.admin_bearer_path(),
-            PathBuf::from("/tmp/zlayer-test/admin_bearer.token")
+            PathBuf::from("/var/lib/zlayer-test/admin_bearer.token")
         );
     }
 
     #[test]
     fn default_admin_bearer_path_matches_system_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         assert_eq!(
             default_admin_bearer_path(),
@@ -567,7 +789,6 @@ mod tests {
 
     #[test]
     fn default_log_dir_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_log_dir_for(&system_default);
@@ -576,6 +797,7 @@ mod tests {
 
     #[test]
     fn default_log_dir_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_log_dir_for(&custom);
@@ -586,7 +808,6 @@ mod tests {
 
     #[test]
     fn default_run_dir_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_run_dir_for(&system_default);
@@ -595,6 +816,7 @@ mod tests {
 
     #[test]
     fn default_run_dir_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_run_dir_for(&custom);
@@ -604,7 +826,6 @@ mod tests {
 
     #[test]
     fn default_socket_path_for_returns_system_path_when_data_dir_is_default() {
-        #[cfg(target_os = "windows")]
         let _env_guard = ENV_LOCK.lock().unwrap();
         let system_default = ZLayerDirs::default_data_dir();
         let result = ZLayerDirs::default_socket_path_for(&system_default);
@@ -614,6 +835,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn default_socket_path_for_returns_data_subdir_when_data_dir_overridden() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("create tempdir");
         let custom = tmp.path().to_path_buf();
         let result = ZLayerDirs::default_socket_path_for(&custom);
@@ -637,6 +859,48 @@ mod tests {
             ZLayerDirs::default_socket_path_for(&custom),
             "tcp://127.0.0.1:3669"
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_uses_data_subdir_when_env_var_overrides() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("ZLAYER_DATA_DIR");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let custom = tmp.path().to_path_buf();
+        std::env::set_var("ZLAYER_DATA_DIR", &custom);
+
+        let result = ZLayerDirs::default_socket_path();
+        let expected = custom
+            .join("run")
+            .join("zlayer.sock")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(result, expected);
+
+        match prev {
+            Some(v) => std::env::set_var("ZLAYER_DATA_DIR", v),
+            None => std::env::remove_var("ZLAYER_DATA_DIR"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_socket_path_uses_data_subdir_when_env_var_overrides() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        // On Windows the socket is always TCP loopback regardless of
+        // `ZLAYER_DATA_DIR`.
+        let prev = std::env::var_os("ZLAYER_DATA_DIR");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let custom = tmp.path().to_path_buf();
+        std::env::set_var("ZLAYER_DATA_DIR", &custom);
+
+        assert_eq!(ZLayerDirs::default_socket_path(), "tcp://127.0.0.1:3669");
+
+        match prev {
+            Some(v) => std::env::set_var("ZLAYER_DATA_DIR", v),
+            None => std::env::remove_var("ZLAYER_DATA_DIR"),
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -708,5 +972,76 @@ mod tests {
         let dirs = ZLayerDirs::system_default();
         let expected = ZLayerDirs::default_data_dir().join("run").join("wireguard");
         assert_eq!(dirs.wireguard(), expected);
+    }
+
+    #[test]
+    fn scratch_dir_under_data_tmp() {
+        let parent = tempfile::tempdir().expect("parent");
+        let dirs = ZLayerDirs::new(parent.path());
+        let s = dirs.scratch_dir("zlayer-test-").expect("scratch_dir");
+        assert!(s.path().starts_with(dirs.tmp()));
+        assert!(s.path().is_dir());
+        let kept = s.path().to_path_buf();
+        drop(s);
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn scratch_file_under_data_tmp() {
+        let parent = tempfile::tempdir().expect("parent");
+        let dirs = ZLayerDirs::new(parent.path());
+        let f = dirs.scratch_file("zlayer-test-").expect("scratch_file");
+        assert!(f.path().starts_with(dirs.tmp()));
+        assert!(f.path().is_file());
+        let kept = f.path().to_path_buf();
+        drop(f);
+        assert!(!kept.exists());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_for_falls_back_when_path_too_long() {
+        let deep = PathBuf::from(
+            "/var/lib/forgejo-runner/workdir/9dbc274201705d7d/hostexecutor/target/zlayer-e2e/cluster_3node/node1/data",
+        );
+        let result = ZLayerDirs::default_socket_path_for(&deep);
+        assert!(
+            result.len() <= SUN_PATH_MAX,
+            "fallback path overflows sun_path: len={} path={}",
+            result.len(),
+            result,
+        );
+        // Determinism.
+        assert_eq!(result, ZLayerDirs::default_socket_path_for(&deep));
+        // Distinct from another data_dir.
+        let other = deep.parent().unwrap().to_path_buf();
+        assert_ne!(result, ZLayerDirs::default_socket_path_for(&other));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_socket_path_for_keeps_natural_path_when_short() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let short = tmp.path().to_path_buf();
+        assert!(short.to_string_lossy().len() < 80);
+        let result = ZLayerDirs::default_socket_path_for(&short);
+        assert!(result.ends_with("/run/zlayer.sock"));
+        assert!(result.starts_with(&*short.to_string_lossy()));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn wireguard_dir_falls_back_when_path_too_long() {
+        let deep = PathBuf::from(
+            "/var/lib/forgejo-runner/workdir/9dbc274201705d7d/hostexecutor/target/zlayer-e2e/cluster_3node/node1/data",
+        );
+        let dirs = ZLayerDirs::new(&deep);
+        let wg = dirs.wireguard();
+        // 21 = "/" + IFNAMSIZ(15) + ".sock"(5)
+        assert!(
+            wg.to_string_lossy().len() + 21 <= SUN_PATH_MAX,
+            "wireguard dir + ifname overflows: dir={}",
+            wg.display(),
+        );
     }
 }

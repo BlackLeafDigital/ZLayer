@@ -61,6 +61,12 @@ impl RouteEntry {
     ///
     /// Fields that cannot be derived from the spec alone (backends, TLS,
     /// SNI) are given sensible defaults and can be overridden after construction.
+    ///
+    /// `resolved.name` uses the composite key form
+    /// [`endpoint_lb_key`]`(service_name, endpoint.name)` so that the
+    /// load balancer can maintain a distinct backend group per endpoint,
+    /// which is required for `target_role` filtering (different endpoints
+    /// on the same service may target different replica groups).
     #[must_use]
     pub fn from_endpoint(service_name: &str, endpoint: &EndpointSpec) -> Self {
         let path_prefix = endpoint.path.clone().unwrap_or_else(|| "/".to_string());
@@ -72,7 +78,7 @@ impl RouteEntry {
             host: endpoint.host.clone(),
             path_prefix: path_prefix.clone(),
             resolved: ResolvedService {
-                name: service_name.to_string(),
+                name: endpoint_lb_key(service_name, &endpoint.name),
                 backends: Vec::new(),
                 use_tls: endpoint.protocol == Protocol::Https,
                 sni_hostname: String::new(),
@@ -178,6 +184,26 @@ impl ServiceRegistry {
         }
     }
 
+    /// Replace the backend list only for routes matching both `service_name`
+    /// and `endpoint_name`.
+    ///
+    /// This is used by the agent's proxy manager to apply
+    /// `EndpointSpec.target_role` filtering: different endpoints of the same
+    /// service may have different filtered backend sets.
+    pub async fn update_backends_for_endpoint(
+        &self,
+        service_name: &str,
+        endpoint_name: &str,
+        backends: Vec<SocketAddr>,
+    ) {
+        let mut routes = self.routes.write().await;
+        for entry in routes.iter_mut() {
+            if entry.service_name == service_name && entry.endpoint_name == endpoint_name {
+                entry.resolved.backends.clone_from(&backends);
+            }
+        }
+    }
+
     /// Append a single backend address to every route belonging to `service_name`.
     pub async fn add_backend(&self, service_name: &str, addr: SocketAddr) {
         let mut routes = self.routes.write().await;
@@ -224,6 +250,19 @@ impl ServiceRegistry {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+
+/// Build the composite load-balancer key for a service endpoint.
+///
+/// The agent's proxy manager keys backend groups by `{service}#{endpoint}`
+/// so that endpoints with different `target_role` values maintain
+/// independent backend pools. `RouteEntry::from_endpoint` sets
+/// `ResolvedService.name` to this same key so that
+/// `LoadBalancer::select(&resolved.name)` resolves to the correct
+/// per-endpoint group at request time.
+#[must_use]
+pub fn endpoint_lb_key(service_name: &str, endpoint_name: &str) -> String {
+    format!("{service_name}#{endpoint_name}")
+}
 
 /// Transform `path` by optionally stripping `prefix`.
 ///
@@ -557,6 +596,7 @@ mod tests {
             expose: ExposeType::Public,
             stream: None,
             tunnel: None,
+            target_role: None,
         };
 
         let entry = RouteEntry::from_endpoint("my-service", &endpoint);
@@ -564,11 +604,48 @@ mod tests {
         assert_eq!(entry.endpoint_name, "http");
         assert!(entry.host.is_none());
         assert_eq!(entry.path_prefix, "/api");
-        assert_eq!(entry.resolved.name, "my-service");
+        // resolved.name is the composite per-endpoint key used by the LB
+        // (see `endpoint_lb_key`).
+        assert_eq!(entry.resolved.name, endpoint_lb_key("my-service", "http"));
         assert_eq!(entry.resolved.protocol, Protocol::Http);
         assert_eq!(entry.resolved.expose, ExposeType::Public);
         assert_eq!(entry.resolved.target_port, 8080);
         assert!(!entry.resolved.use_tls);
         assert!(entry.resolved.backends.is_empty());
+    }
+
+    #[test]
+    fn test_endpoint_lb_key_format() {
+        assert_eq!(endpoint_lb_key("api", "http"), "api#http");
+        assert_eq!(endpoint_lb_key("postgres", "read"), "postgres#read");
+    }
+
+    #[tokio::test]
+    async fn test_update_backends_for_endpoint_isolates_endpoints() {
+        // Two endpoints on the same service should maintain independent
+        // backend pools when updated via update_backends_for_endpoint.
+        let reg = ServiceRegistry::new();
+
+        let mut http_entry = make_entry("postgres", None, "/write", vec![]);
+        http_entry.endpoint_name = "write".to_string();
+        let mut read_entry = make_entry("postgres", None, "/read", vec![]);
+        read_entry.endpoint_name = "read".to_string();
+
+        reg.register(http_entry).await;
+        reg.register(read_entry).await;
+
+        let primary: SocketAddr = "10.0.0.1:5432".parse().unwrap();
+        let replica: SocketAddr = "10.0.0.2:5432".parse().unwrap();
+
+        reg.update_backends_for_endpoint("postgres", "write", vec![primary])
+            .await;
+        reg.update_backends_for_endpoint("postgres", "read", vec![replica])
+            .await;
+
+        let write_resolved = reg.resolve(None, "/write").await.unwrap();
+        assert_eq!(write_resolved.backends, vec![primary]);
+
+        let read_resolved = reg.resolve(None, "/read").await.unwrap();
+        assert_eq!(read_resolved.backends, vec![replica]);
     }
 }

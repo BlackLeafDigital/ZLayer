@@ -262,10 +262,24 @@ impl ComputeSystem {
         .await
     }
 
-    /// Apply a modification to a running compute system.
+    /// Apply a modification to a running compute system. Submits
+    /// `HcsModifyComputeSystem` with the JSON serialisation of `request`.
+    /// Matches hcsshim's `internal/hcs/system.go::HcsSystem::Modify`.
+    ///
+    /// Most callers should prefer this typed entry point over
+    /// [`Self::modify_raw_json`]; the raw variant is reserved for
+    /// modification shapes we have not yet typed in
+    /// [`crate::schema::ModifySettingRequest`].
+    pub async fn modify(&self, request: &crate::schema::ModifySettingRequest) -> HcsResult<()> {
+        let json = serde_json::to_string(request)?;
+        self.modify_raw_json(&json).await
+    }
+
+    /// Raw-JSON variant of [`Self::modify`] for callers that need a
+    /// `ModifySettingRequest` shape this crate does not yet expose typed.
     /// `modification_json` is a JSON `ModifySettingRequest` document per
     /// the hcsshim schema.
-    pub async fn modify(&self, modification_json: &str) -> HcsResult<()> {
+    pub async fn modify_raw_json(&self, modification_json: &str) -> HcsResult<()> {
         let mod_w = HSTRING::from(modification_json);
         let handle = self.inner.as_raw();
         run_operation(move |op| {
@@ -275,5 +289,47 @@ impl ComputeSystem {
         })
         .await?;
         Ok(())
+    }
+
+    /// Convenience: hot-add a `VirtualSMB` share to a running VM.
+    ///
+    /// The resource path is the share COLLECTION
+    /// (`"VirtualMachine/Devices/VirtualSmb/Shares"`), NOT an indexed element:
+    /// HCS keys VSMB shares by their `Name`, so an `Add` targets the collection
+    /// and HCS appends. Including a trailing `/<index>` makes the modify fail
+    /// with `0x80070057` (`E_INVALIDARG`). Mirrors hcsshim's
+    /// `resourcepaths.VSMBShareResourcePath`.
+    pub async fn add_vsmb(&self, share: &crate::schema::VirtualSmbShare) -> HcsResult<()> {
+        let req = crate::schema::ModifySettingRequest {
+            resource_path: "VirtualMachine/Devices/VirtualSmb/Shares".to_string(),
+            request_type: crate::schema::ModifyRequestType::Add,
+            settings: Some(serde_json::to_value(share)?),
+            guest_request: None,
+        };
+        self.modify(&req).await
+    }
+
+    /// Convenience: hot-add a SCSI attachment to a running VM.
+    /// `controller_guid` is the SCSI controller's GUID key — the SAME string the
+    /// create-time doc keys `Devices.Scsi` by. HCS resolves the controller by
+    /// that key, NOT a bare ordinal, so a numeric index yields
+    /// `ERROR_NOT_FOUND` (`0x80070490`). `lun` is the LUN under that controller.
+    /// Matches hcsshim's `resourcepaths.SCSIResourceFormat` (controller GUID +
+    /// LUN).
+    pub async fn add_scsi(
+        &self,
+        controller_guid: &str,
+        lun: usize,
+        attachment: &crate::schema::ScsiAttachment,
+    ) -> HcsResult<()> {
+        let req = crate::schema::ModifySettingRequest {
+            resource_path: format!(
+                "VirtualMachine/Devices/Scsi/{controller_guid}/Attachments/{lun}"
+            ),
+            request_type: crate::schema::ModifyRequestType::Add,
+            settings: Some(serde_json::to_value(attachment)?),
+            guest_request: None,
+        };
+        self.modify(&req).await
     }
 }

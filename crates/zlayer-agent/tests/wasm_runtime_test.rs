@@ -18,13 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
 use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_paths::ZLayerDirs;
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, PullPolicy,
     ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
 };
+use zlayer_types::Scratch;
 
 // =============================================================================
 // Test WASM Modules (WAT - WebAssembly Text Format)
@@ -169,12 +170,14 @@ fn compile_wat(wat: &str) -> Vec<u8> {
 }
 
 /// Create a temporary cache directory for testing
-fn create_test_cache_dir() -> TempDir {
-    tempfile::tempdir().expect("Failed to create temp directory")
+fn create_test_cache_dir() -> Scratch {
+    ZLayerDirs::system_default()
+        .scratch_dir("create-test-cache-dir-")
+        .expect("Failed to create temp directory")
 }
 
 /// Create a `WasmConfig` for testing
-fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
+fn create_test_config(cache_dir: &Scratch) -> WasmConfig {
     WasmConfig {
         cache_dir: cache_dir.path().to_path_buf(),
         enable_epochs: true,
@@ -200,10 +203,7 @@ fn unique_instance_name(prefix: &str) -> String {
 
 /// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
-    ContainerId {
-        service: unique_instance_name(prefix),
-        replica: 1,
-    }
+    ContainerId::new(unique_instance_name(prefix), 1)
 }
 
 /// Create a minimal `ServiceSpec` for WASM testing
@@ -214,6 +214,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         image: ImageSpec {
             name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::Never, // We're using local WASM files
+            source_policy: None,
         },
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
@@ -221,6 +222,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
+        replica_groups: None,
         depends: vec![],
         health: HealthSpec {
             start_grace: None,
@@ -240,6 +242,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        affinity: None,
         service_type: zlayer_spec::ServiceType::Standard,
         wasm: None,
         logs: None,
@@ -267,11 +270,14 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         userns_mode: None,
         cgroup_parent: None,
         expose: Vec::new(),
+        isolation: None,
+        overlay: None,
+        localhost_reachability: zlayer_spec::LocalhostReachability::default(),
     }
 }
 
 /// Write a WASM binary to the cache directory and return the "image" path
-fn write_wasm_to_cache(cache_dir: &TempDir, name: &str, wasm_bytes: &[u8]) -> String {
+fn write_wasm_to_cache(cache_dir: &Scratch, name: &str, wasm_bytes: &[u8]) -> String {
     let cache_key = name.replace(['/', ':', '@'], "_");
     let cache_path = cache_dir.path().join(format!("{cache_key}.wasm"));
     std::fs::write(&cache_path, wasm_bytes).expect("Failed to write WASM to cache");
@@ -837,10 +843,7 @@ mod state_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "nonexistent".to_string(),
-            replica: 999,
-        };
+        let id = ContainerId::new("nonexistent".to_string(), 999);
 
         let state = runtime.container_state(&id).await;
         assert!(state.is_err(), "Should fail for nonexistent instance");
@@ -951,10 +954,7 @@ mod logs_stats_tests {
             .await
             .expect("Failed to create runtime");
 
-        let id = ContainerId {
-            service: "ghost".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("ghost".to_string(), 1);
 
         let stats = runtime.get_container_stats(&id).await;
         assert!(stats.is_err(), "Should fail for nonexistent instance");
@@ -1106,10 +1106,7 @@ mod instance_id_tests {
 
     #[test]
     fn test_container_id_display() {
-        let id = ContainerId {
-            service: "myservice".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("myservice".to_string(), 1);
 
         let display = format!("{id}");
         assert_eq!(display, "myservice-rep-1");

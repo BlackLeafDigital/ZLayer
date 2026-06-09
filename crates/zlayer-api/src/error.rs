@@ -1,12 +1,20 @@
 //! API error types
 
 use axum::{
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Response header that carries the cluster leader's HTTP base URL when a
+/// follower returns `421 Misdirected Request` on a leader-only endpoint.
+///
+/// Clients (CLI, manager UI, other followers initiating a rollout) should
+/// honour this header by retrying the same request against the advertised
+/// address.
+pub const LEADER_ADDR_HEADER: &str = "X-Leader-Addr";
 
 /// API error type
 #[derive(Debug, Error)]
@@ -40,6 +48,16 @@ pub enum ApiError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    /// This node is not the cluster Raft leader, so the requested
+    /// leader-only operation cannot be executed here. The optional
+    /// `leader_addr` field, when present, is the HTTP base URL of the
+    /// current leader; clients should redirect the request there.
+    ///
+    /// Maps to `421 Misdirected Request` and also sets an
+    /// `X-Leader-Addr` response header (see [`LEADER_ADDR_HEADER`]).
+    #[error("Not the cluster leader (leader: {leader_addr:?})")]
+    NotLeader { leader_addr: Option<String> },
 }
 
 /// JSON error response body
@@ -53,6 +71,29 @@ pub struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // `NotLeader` is special-cased because:
+        //   1. its status code (`421 Misdirected Request`) is not in the
+        //      usual table, and
+        //   2. it needs a structured `details` block AND a side-channel
+        //      `X-Leader-Addr` response header so HTTP clients can perform
+        //      a transparent redirect without re-parsing the JSON body.
+        if let ApiError::NotLeader { leader_addr } = &self {
+            let message =
+                format!("Request must be sent to the cluster leader (leader: {leader_addr:?})");
+            let body = ErrorResponse {
+                error: "not_leader".to_string(),
+                message,
+                details: Some(serde_json::json!({ "leader_addr": leader_addr })),
+            };
+            let mut response = (StatusCode::MISDIRECTED_REQUEST, Json(body)).into_response();
+            if let Some(addr) = leader_addr {
+                if let Ok(hv) = HeaderValue::from_str(addr) {
+                    response.headers_mut().insert(LEADER_ADDR_HEADER, hv);
+                }
+            }
+            return response;
+        }
+
         let (status, error_type) = match &self {
             ApiError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
@@ -66,6 +107,8 @@ impl IntoResponse for ApiError {
             }
             ApiError::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation_error"),
             ApiError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, "not_implemented"),
+            // Covered above — keep the match exhaustive.
+            ApiError::NotLeader { .. } => unreachable!("handled in the early-return branch above"),
         };
 
         let body = ErrorResponse {

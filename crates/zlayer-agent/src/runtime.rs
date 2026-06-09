@@ -35,22 +35,158 @@ pub enum ContainerState {
     Failed { reason: String },
 }
 
-/// Container identifier
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl ContainerState {
+    /// Stable lowercase string representation of the state.
+    ///
+    /// Used when surfacing container state through the API / `ps` output.
+    /// `Running` stringifies to `"running"` (matched case-insensitively by the
+    /// raft e2e harness when counting healthy replicas).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Initializing => "initializing",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Exited { .. } => "exited",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ContainerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Container identifier.
+///
+/// Identifies a container by `(service, replica)` for the legacy single-group
+/// case, and extends with `role` + `node_id` for cluster-aware
+/// multi-group services and cross-node identification.
+///
+/// Defaults: `role = "default"`, `node_id = 0`. Existing constructors
+/// (`ContainerId::new(service, replica)`) produce these defaults. Use
+/// `ContainerId::with_role_and_node(...)` when the new fields matter.
+///
+/// Display:
+/// - With defaults: `{service}-rep-{replica}` (backward compat).
+/// - Otherwise: `{service}-{role}-{replica}-on-{node_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ContainerId {
     pub service: String,
     pub replica: u32,
+    /// Role within `replica_groups`. `"default"` for services without groups.
+    #[serde(default = "default_container_role")]
+    pub role: String,
+    /// Cluster node that owns this container. `0` in single-node deployments
+    /// or before the cluster is initialized.
+    #[serde(default)]
+    pub node_id: u64,
+}
+
+fn default_container_role() -> String {
+    "default".to_string()
+}
+
+impl ContainerId {
+    /// Build a legacy `{service, replica}` `ContainerId` with default `role`
+    /// and `node_id`. Used by all existing callsites — behavior is unchanged.
+    #[must_use]
+    pub fn new(service: impl Into<String>, replica: u32) -> Self {
+        Self {
+            service: service.into(),
+            replica,
+            role: default_container_role(),
+            node_id: 0,
+        }
+    }
+
+    /// Build a cluster-aware `ContainerId` with explicit `role` and `node_id`.
+    /// Used by `ServiceManager` when a service has `replica_groups` or when
+    /// the daemon participates in a multi-node cluster.
+    #[must_use]
+    pub fn with_role_and_node(
+        service: impl Into<String>,
+        replica: u32,
+        role: impl Into<String>,
+        node_id: u64,
+    ) -> Self {
+        Self {
+            service: service.into(),
+            replica,
+            role: role.into(),
+            node_id,
+        }
+    }
+
+    /// True when both `role` and `node_id` are at their defaults — i.e.
+    /// this is a legacy-shape `ContainerId`.
+    #[must_use]
+    pub fn is_legacy_shape(&self) -> bool {
+        self.role == "default" && self.node_id == 0
+    }
+
+    /// Parse a `ContainerId` back from its [`Display`](std::fmt::Display) form.
+    ///
+    /// This is the exact inverse of `Display`:
+    /// - `"{service}-rep-{replica}"` (legacy shape) → `ContainerId::new`.
+    /// - `"{service}-{role}-{replica}-on-{node_id}"` (cluster shape) →
+    ///   `ContainerId::with_role_and_node`.
+    ///
+    /// The service name may itself contain `-`, so parsing anchors on the
+    /// rightmost structural markers (`-on-` then the trailing `-rep-`/`-{role}-`
+    /// segment) rather than splitting left-to-right. Returns `None` for any
+    /// string that does not match either shape (e.g. a hex id or a bare name).
+    #[must_use]
+    pub fn parse_display(s: &str) -> Option<Self> {
+        // Cluster shape: `{service}-{role}-{replica}-on-{node_id}`.
+        if let Some((head, node_str)) = s.rsplit_once("-on-") {
+            let node_id: u64 = node_str.parse().ok()?;
+            // `head` = `{service}-{role}-{replica}`. The replica is the last
+            // `-`-segment; the role is the segment before it; everything left
+            // of that is the (possibly hyphenated) service.
+            let (service_role, replica_str) = head.rsplit_once('-')?;
+            let replica: u32 = replica_str.parse().ok()?;
+            let (service, role) = service_role.rsplit_once('-')?;
+            if service.is_empty() || role.is_empty() {
+                return None;
+            }
+            return Some(Self::with_role_and_node(service, replica, role, node_id));
+        }
+        // Legacy shape: `{service}-rep-{replica}`.
+        if let Some((service, replica_str)) = s.rsplit_once("-rep-") {
+            let replica: u32 = replica_str.parse().ok()?;
+            if service.is_empty() {
+                return None;
+            }
+            return Some(Self::new(service, replica));
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for ContainerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-rep-{}", self.service, self.replica)
+        if self.is_legacy_shape() {
+            write!(f, "{}-rep-{}", self.service, self.replica)
+        } else {
+            write!(
+                f,
+                "{}-{}-{}-on-{}",
+                self.service, self.role, self.replica, self.node_id
+            )
+        }
     }
 }
 
 /// Container handle
 pub struct Container {
     pub id: ContainerId,
+    /// Image reference this container was created from (canonical form, e.g.
+    /// `docker.io/library/nginx:1.29-alpine`). Surfaced through the API/`ps`.
+    pub image: String,
     pub state: ContainerState,
     pub pid: Option<u32>,
     pub task: Option<JoinHandle<std::io::Result<()>>>,
@@ -957,6 +1093,25 @@ pub enum LoadProgress {
 /// [`Runtime::load_images`].
 pub type LoadProgressStream = Pin<Box<dyn Stream<Item = Result<LoadProgress>> + Send + 'static>>;
 
+/// How a runtime joins a container to the cross-node `WireGuard` overlay.
+///
+/// The overlay can be attached three ways depending on whether the container is
+/// a host process, a Windows compute system, or a full VM:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAttachKind {
+    /// Linux host process: overlayd enters `/proc/<pid>/ns/net` and plumbs a
+    /// veth into the container's network namespace (the default).
+    HostNetns,
+    /// Windows: the HCN endpoint + namespace were created at container-create
+    /// time; the agent only registers the assigned IP.
+    HostIp,
+    /// A VM guest with no host-visible netns/PID (macOS VZ-Linux): overlayd
+    /// allocates the overlay identity and the agent pushes it into the guest
+    /// over vsock, where a kernel `WireGuard` device is brought up. See
+    /// [`Runtime::push_overlay_config`].
+    InGuestVsock,
+}
+
 /// Abstract container runtime trait
 ///
 /// This trait abstracts over different container runtimes (containerd, CRI-O, etc.)
@@ -977,11 +1132,18 @@ pub trait Runtime: Send + Sync {
     /// store by hostname, and inline auth is primarily a Docker-backend
     /// concern. Ignoring it is safe: callers that need inline auth should use
     /// the Docker runtime.
+    ///
+    /// `source` is the per-image [`zlayer_spec::SourcePolicy`] selecting which
+    /// tiers (local store, S3, remote registry) the pull may consult and in
+    /// what order. Runtimes that build the `zlayer-registry` `ImagePuller`
+    /// chain (youki, macOS VZ-Linux) honor it; runtimes that delegate to an
+    /// external daemon (Docker/WSL/HCS) accept but ignore it.
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: PullPolicy,
         auth: Option<&RegistryAuth>,
+        source: zlayer_spec::SourcePolicy,
     ) -> Result<()>;
 
     /// Create a container
@@ -1004,6 +1166,27 @@ pub trait Runtime: Send + Sync {
 
     /// Execute command in container
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)>;
+
+    /// Execute a command in a container with Docker `exec` options (`--user`,
+    /// `-w`/`--workdir`, `-e`/`--env`) applied.
+    ///
+    /// The default implementation ignores the user/cwd/env overrides and
+    /// delegates to [`Runtime::exec`], so runtimes that don't (yet) plumb them
+    /// keep working unchanged. Runtimes that can honour them — notably the macOS
+    /// VZ-Linux runtime, which drives the in-guest agent over vsock — override
+    /// this to drop to the requested uid/gid, chdir, and inject env before exec.
+    ///
+    /// `opts.command` is the argv (`command[0]` is the binary); `opts.user`,
+    /// `opts.working_dir`, and `opts.env` carry the Docker overrides. The
+    /// `tty`/`attach_*`/`privileged` fields of [`ExecOptions`] are not consulted
+    /// by this buffered entry point.
+    async fn exec_with_opts(
+        &self,
+        id: &ContainerId,
+        opts: &ExecOptions,
+    ) -> Result<(i32, String, String)> {
+        self.exec(id, &opts.command).await
+    }
 
     /// Execute a command in a container and stream stdout / stderr / exit
     /// events as they are produced.
@@ -1159,6 +1342,37 @@ pub trait Runtime: Send + Sync {
     /// Used for overlay network attachment and process management.
     async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>>;
 
+    /// How this runtime joins a container to the cross-node overlay network.
+    ///
+    /// Defaults to [`OverlayAttachKind::HostNetns`] (the Linux veth-by-PID path).
+    /// VM runtimes with no host netns (macOS VZ-Linux) override this to
+    /// [`OverlayAttachKind::InGuestVsock`], which makes the service layer push a
+    /// host-allocated overlay config into the guest via [`push_overlay_config`]
+    /// instead of attaching a veth by PID.
+    ///
+    /// [`push_overlay_config`]: Runtime::push_overlay_config
+    fn overlay_attach_kind(&self) -> OverlayAttachKind {
+        OverlayAttachKind::HostNetns
+    }
+
+    /// Push a host-allocated overlay (`WireGuard`) config into a guest that manages
+    /// its own overlay interface ([`OverlayAttachKind::InGuestVsock`]).
+    ///
+    /// The service layer obtains `config` from overlayd (which allocated the
+    /// address + keypair and registered the public key in the mesh) and calls
+    /// this so the runtime can deliver it to the guest (over vsock) and bring up
+    /// the in-guest interface. Runtimes that attach by netns/PID never call this
+    /// and use the default, which errors.
+    async fn push_overlay_config(
+        &self,
+        _id: &ContainerId,
+        _config: &zlayer_types::overlayd::GuestOverlayConfig,
+    ) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "push_overlay_config is not supported by this runtime".to_string(),
+        ))
+    }
+
     /// Get the IP address of a container
     ///
     /// Returns:
@@ -1264,17 +1478,43 @@ pub trait Runtime: Send + Sync {
     /// runtime falls back to its credential-store lookup keyed by registry
     /// hostname (matching the semantics of [`Runtime::pull_image_with_policy`]).
     ///
-    /// The default implementation returns [`AgentError::Unsupported`].
     /// Backends override this with their native streaming pull
     /// (bollard's `create_image` for Docker, `zlayer-registry` for Youki).
+    ///
+    /// The default implementation performs a BLOCKING pull via
+    /// [`Runtime::pull_image_with_policy`] and then synthesizes a minimal
+    /// Docker-style progress stream (a `Status` line + a terminal `Done`). This
+    /// keeps the streaming `POST /images/create` (e.g. `docker pull` through
+    /// the `zlayer-docker` compat socket) working on runtimes that lack a native
+    /// streaming pull — notably the macOS sandbox. The streaming form means
+    /// "make this image available now", so it pulls if not already present.
     async fn pull_image_stream(
         &self,
-        _image: &str,
-        _auth: Option<&RegistryAuth>,
+        image: &str,
+        auth: Option<&RegistryAuth>,
     ) -> Result<PullProgressStream> {
-        Err(AgentError::Unsupported(
-            "pull_image_stream is not supported by this runtime".into(),
-        ))
+        self.pull_image_with_policy(
+            image,
+            PullPolicy::IfNotPresent,
+            auth,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await?;
+        let reference = image.to_string();
+        let events: Vec<Result<PullProgress>> = vec![
+            Ok(PullProgress::Status {
+                id: None,
+                status: format!("Pulling from {reference}"),
+                progress: None,
+                current: None,
+                total: None,
+            }),
+            Ok(PullProgress::Done {
+                reference,
+                digest: None,
+            }),
+        ];
+        Ok(Box::pin(futures_util::stream::iter(events)))
     }
 
     /// List all images managed by this runtime's image storage.
@@ -1321,6 +1561,35 @@ pub trait Runtime: Send + Sync {
     async fn kill_container(&self, _id: &ContainerId, _signal: Option<&str>) -> Result<()> {
         Err(AgentError::Unsupported(
             "kill_container is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Write a chunk of stdin to a running container's main process.
+    ///
+    /// Powers the host→guest direction of interactive (`-it`) sessions: the
+    /// daemon's `POST /api/v1/containers/{id}/stdin` endpoint forwards raw
+    /// terminal bytes here, which the runtime relays to the workload (for the
+    /// macOS VZ-Linux backend, as `Msg::Stdin` frames to the in-guest agent).
+    ///
+    /// The default implementation returns [`AgentError::Unsupported`] so
+    /// non-interactive backends keep compiling.
+    async fn write_stdin(&self, _id: &ContainerId, _data: &[u8]) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "write_stdin is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Signal end-of-input (close stdin) for a running container.
+    ///
+    /// Powers Ctrl-D / detach for interactive sessions: the daemon's
+    /// `DELETE /api/v1/containers/{id}/stdin` endpoint calls this, which causes
+    /// the runtime to stop forwarding stdin and emit a final close marker (for
+    /// the macOS VZ-Linux backend, `Msg::StdinEof` to the in-guest agent).
+    ///
+    /// The default implementation returns [`AgentError::Unsupported`].
+    async fn close_stdin(&self, _id: &ContainerId) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "close_stdin is not supported by this runtime".into(),
         ))
     }
 
@@ -1791,8 +2060,13 @@ impl Default for MockRuntime {
 #[async_trait::async_trait]
 impl Runtime for MockRuntime {
     async fn pull_image(&self, _image: &str) -> Result<()> {
-        self.pull_image_with_policy(_image, PullPolicy::IfNotPresent, None)
-            .await
+        self.pull_image_with_policy(
+            _image,
+            PullPolicy::IfNotPresent,
+            None,
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await
     }
 
     async fn pull_image_with_policy(
@@ -1800,18 +2074,20 @@ impl Runtime for MockRuntime {
         _image: &str,
         _policy: PullPolicy,
         _auth: Option<&RegistryAuth>,
+        _source: zlayer_spec::SourcePolicy,
     ) -> Result<()> {
         // Mock: always succeeds
         tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(())
     }
 
-    async fn create_container(&self, id: &ContainerId, _spec: &ServiceSpec) -> Result<()> {
+    async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let mut containers = self.containers.write().await;
         containers.insert(
             id.clone(),
             Container {
                 id: id.clone(),
+                image: spec.image.name.to_string(),
                 state: ContainerState::Pending,
                 pid: None,
                 task: None,
@@ -2080,10 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_runtime() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "test".to_string(),
-            replica: 1,
-        };
+        let id = ContainerId::new("test".to_string(), 1);
 
         runtime.pull_image("test:latest").await.unwrap();
         runtime.create_container(&id, &mock_spec()).await.unwrap();
@@ -2091,6 +2364,49 @@ mod tests {
 
         let state = runtime.container_state(&id).await.unwrap();
         assert_eq!(state, ContainerState::Running);
+    }
+
+    #[test]
+    fn parse_display_round_trips_cluster_shape() {
+        // The exact id the deployment-run path surfaces: service=alpine,
+        // role=default, replica=1, node_id=1 → `alpine-default-1-on-1`.
+        let cid = ContainerId::with_role_and_node("alpine", 1, "default", 1);
+        let s = cid.to_string();
+        assert_eq!(s, "alpine-default-1-on-1");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_round_trips_legacy_shape() {
+        let cid = ContainerId::new("alpine", 3);
+        let s = cid.to_string();
+        assert_eq!(s, "alpine-rep-3");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_handles_hyphenated_service() {
+        // A service name containing `-` must round-trip: the parser anchors on
+        // the rightmost structural markers, not a left-to-right split.
+        let cid = ContainerId::with_role_and_node("my-web-app", 2, "read", 7);
+        let s = cid.to_string();
+        assert_eq!(s, "my-web-app-read-2-on-7");
+        assert_eq!(ContainerId::parse_display(&s), Some(cid));
+    }
+
+    #[test]
+    fn parse_display_rejects_non_ids() {
+        // A 64-char hex id, a bare name, and obvious garbage must not parse.
+        assert_eq!(ContainerId::parse_display("alpine"), None);
+        assert_eq!(
+            ContainerId::parse_display(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ),
+            None
+        );
+        assert_eq!(ContainerId::parse_display("alpine-default-x-on-1"), None);
+        assert_eq!(ContainerId::parse_display("alpine-default-1-on-y"), None);
+        assert_eq!(ContainerId::parse_display(""), None);
     }
 
     #[test]
@@ -2138,10 +2454,7 @@ mod tests {
     #[tokio::test]
     async fn mock_kill_container_defaults_to_sigkill() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "kill-me".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("kill-me".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2215,10 +2528,7 @@ mod tests {
     #[tokio::test]
     async fn default_wait_outcome_delegates_to_wait_container() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "wait-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("wait-test".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2233,10 +2543,7 @@ mod tests {
     #[tokio::test]
     async fn mock_kill_container_rejects_bogus_signal() {
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "kill-me".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("kill-me".to_string(), 0);
         runtime.create_container(&id, &mock_spec()).await.unwrap();
         runtime.start_container(&id).await.unwrap();
 
@@ -2250,17 +2557,18 @@ mod tests {
         );
     }
 
-    // The default trait impls of `logs_stream`, `stats_stream`, and
-    // `pull_image_stream` still return `AgentError::Unsupported`. `MockRuntime`
+    // The default trait impls of `logs_stream` and `stats_stream` still return
+    // `AgentError::Unsupported`; `pull_image_stream` now performs a blocking
+    // pull and synthesizes a Status+Done progress stream. `MockRuntime`
     // overrides all three so tests can pre-script stream output (see
     // `mock_logs_stream_yields_queued_items_in_order` and friends below).
     // A trivial `BareRuntime` exercises the default trait impls without
     // dragging in MockRuntime's overrides.
 
     /// Minimal `Runtime` implementation used to exercise the default trait
-    /// impls of `logs_stream` / `stats_stream` / `pull_image_stream`. Every
-    /// non-default method panics — the bare runtime is only ever called for
-    /// the three streaming methods the tests care about.
+    /// impls of `logs_stream` / `stats_stream` / `pull_image_stream`. Most
+    /// methods panic, but `pull_image_with_policy` returns `Ok(())` so the
+    /// default `pull_image_stream` (which delegates to it) can be exercised.
     struct BareRuntime;
 
     #[async_trait::async_trait]
@@ -2273,8 +2581,11 @@ mod tests {
             _image: &str,
             _policy: PullPolicy,
             _auth: Option<&RegistryAuth>,
+            _source: zlayer_spec::SourcePolicy,
         ) -> Result<()> {
-            unimplemented!()
+            // The default `pull_image_stream` delegates here; return Ok so the
+            // streaming default can be exercised without a real registry.
+            Ok(())
         }
         async fn create_container(&self, _id: &ContainerId, _spec: &ServiceSpec) -> Result<()> {
             unimplemented!()
@@ -2317,10 +2628,7 @@ mod tests {
     #[tokio::test]
     async fn default_logs_stream_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "stream-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stream-test".to_string(), 0);
         // The success-side `LogsStream` is not `Debug`, so we can't call
         // `unwrap_err`; pattern-match on the Result directly instead.
         match runtime.logs_stream(&id, LogsStreamOptions::default()).await {
@@ -2333,10 +2641,7 @@ mod tests {
     #[tokio::test]
     async fn default_stats_stream_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "stream-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stream-test".to_string(), 0);
         match runtime.stats_stream(&id).await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2345,22 +2650,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_pull_image_stream_is_unsupported() {
+    async fn default_pull_image_stream_synthesizes_progress() {
+        use futures_util::StreamExt as _;
+
+        // The default `pull_image_stream` now performs a blocking pull (via
+        // `pull_image_with_policy`, which `BareRuntime` answers with `Ok`) and
+        // synthesizes a Status + Done progress stream.
         let runtime = BareRuntime;
-        match runtime.pull_image_stream("alpine:latest", None).await {
-            Err(AgentError::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err(Unsupported), got Ok"),
-        }
+        let stream = runtime
+            .pull_image_stream("alpine:latest", None)
+            .await
+            .expect("default pull_image_stream should succeed when the pull succeeds");
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 2, "expected a Status then a Done event");
+        assert!(
+            matches!(events[0], Ok(PullProgress::Status { .. })),
+            "first event should be a Status line, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(events[1], Ok(PullProgress::Done { .. })),
+            "second event should be the terminal Done, got {:?}",
+            events[1]
+        );
     }
 
     #[tokio::test]
     async fn default_archive_get_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         match runtime.archive_get(&id, "/etc/hosts").await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2371,10 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn default_archive_put_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         let err = runtime
             .archive_put(
                 &id,
@@ -2390,10 +2705,7 @@ mod tests {
     #[tokio::test]
     async fn default_archive_head_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "archive-test".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("archive-test".to_string(), 0);
         let err = runtime.archive_head(&id, "/etc/hosts").await.unwrap_err();
         assert!(matches!(err, AgentError::Unsupported(_)));
     }
@@ -2401,10 +2713,7 @@ mod tests {
     #[tokio::test]
     async fn default_exec_pty_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "exec-pty".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("exec-pty".to_string(), 0);
         // The success-side `ExecHandle` is not `Debug`, so we can't call
         // `unwrap_err`; pattern-match on the Result directly instead.
         match runtime.exec_pty(&id, ExecOptions::default()).await {
@@ -2472,10 +2781,7 @@ mod tests {
     #[tokio::test]
     async fn default_export_container_fs_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "export".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("export".to_string(), 0);
         match runtime.export_container_fs(&id).await {
             Err(AgentError::Unsupported(_)) => {}
             Err(other) => panic!("expected Unsupported, got {other:?}"),
@@ -2486,10 +2792,7 @@ mod tests {
     #[tokio::test]
     async fn default_commit_container_is_unsupported() {
         let runtime = BareRuntime;
-        let id = ContainerId {
-            service: "commit".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("commit".to_string(), 0);
         let err = runtime
             .commit_container(&id, &CommitOptions::default())
             .await
@@ -2539,10 +2842,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "logs-order".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("logs-order".to_string(), 0);
 
         let make_chunk = |s: &str, ch: LogChannel| LogChunk {
             stream: ch,
@@ -2590,10 +2890,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "logs-empty".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("logs-empty".to_string(), 0);
 
         let opts = LogsStreamOptions {
             follow: false,
@@ -2618,10 +2915,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let runtime = MockRuntime::new();
-        let id = ContainerId {
-            service: "stats-order".to_string(),
-            replica: 0,
-        };
+        let id = ContainerId::new("stats-order".to_string(), 0);
 
         let now = chrono::Utc::now();
         let mk = |cpu: u64| StatsSample {

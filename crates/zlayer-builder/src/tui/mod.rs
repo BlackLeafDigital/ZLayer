@@ -125,6 +125,33 @@ pub enum BuildEvent {
         /// Error message
         error: String,
     },
+
+    /// Pre-populates the instruction list up-front (from the parsed
+    /// Dockerfile) so backends that can't emit live per-instruction
+    /// `StageStarted`/`InstructionStarted` events (the buildah sidecar)
+    /// still show the full plan; instructions land as `Pending` and are
+    /// advanced to `Running`/`Complete` as progress arrives.
+    BuildPlan {
+        /// The full set of planned stages, in Dockerfile order.
+        stages: Vec<PlannedStage>,
+    },
+}
+
+/// A pre-parsed build stage used to pre-populate the TUI instruction list.
+///
+/// Carried by [`BuildEvent::BuildPlan`] so backends that cannot emit live
+/// per-instruction events (the buildah sidecar) can still render the full
+/// instruction plan up-front. `instructions` exclude the `FROM` line —
+/// they match the per-instruction text the native backend emits via
+/// `InstructionStarted` (rendered with `format!("{instruction:?}")`).
+#[derive(Debug, Clone)]
+pub struct PlannedStage {
+    /// Optional stage name (from `AS name`).
+    pub name: Option<String>,
+    /// Base image for this stage.
+    pub base_image: String,
+    /// Instruction text for each instruction in this stage (excluding `FROM`).
+    pub instructions: Vec<String>,
 }
 
 /// Status of an instruction during build

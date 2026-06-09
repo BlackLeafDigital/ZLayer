@@ -654,10 +654,7 @@ mod tests {
     use super::*;
 
     fn cid(service: &str, replica: u32) -> ContainerId {
-        ContainerId {
-            service: service.to_string(),
-            replica,
-        }
+        ContainerId::new(service.to_string(), replica)
     }
 
     fn sample_options() -> ExecOptions {
@@ -803,10 +800,7 @@ mod tests {
     async fn state_with_container(service: &str) -> (ContainerApiState, String) {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state = ContainerApiState::with_daemon_uuid(runtime, "test-daemon-uuid".to_string());
-        let cid = ContainerId {
-            service: service.to_string(),
-            replica: 0,
-        };
+        let cid = ContainerId::new(service.to_string(), 0);
         let standalone = StandaloneContainer {
             container_id: cid.clone(),
             image: "alpine:latest".to_string(),
@@ -892,10 +886,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-resize-unstarted".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-resize-unstarted".to_string(), 0),
                 sample_options(),
             )
             .await;
@@ -925,10 +916,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-resize-active".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-resize-active".to_string(), 0),
                 sample_options(),
             )
             .await;
@@ -963,10 +951,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-resize-bad".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-resize-bad".to_string(), 0),
                 sample_options(),
             )
             .await;
@@ -1021,10 +1006,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-inspect".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-inspect".to_string(), 0),
                 sample_options(),
             )
             .await;
@@ -1099,10 +1081,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-router-mount".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-router-mount".to_string(), 0),
                 sample_options(),
             )
             .await;
@@ -1149,10 +1128,7 @@ mod tests {
         let inst = state
             .exec_instances
             .create(
-                ContainerId {
-                    service: "standalone-start".to_string(),
-                    replica: 0,
-                },
+                ContainerId::new("standalone-start".to_string(), 0),
                 sample_options(),
             )
             .await;

@@ -580,6 +580,252 @@ impl NodeSliceAllocator {
     }
 }
 
+/// Tracks per-service-per-node subnet assignments carved from the cluster
+/// CIDR. Each `(service_name, node_id)` pair gets its own slice of size
+/// `slice_prefix` (default `/28`). Assignments are deterministic — the same
+/// `(service, node)` pair always maps to the same starting slot via FNV
+/// hash, with linear probing on collision. Mirrors `NodeSliceAllocator`'s
+/// pattern; see that type for the rationale (in particular the choice of
+/// FNV over `DefaultHasher` for cross-process reproducibility).
+///
+/// Snapshot/restore is wired the same way `NodeSliceAllocator` does it, so
+/// the scheduler's Raft state can persist + replay assignments. The
+/// snapshot's `Vec<((String, String), IpNet)>` is the wire-stable shape:
+/// avoid `HashMap` here because non-deterministic map ordering would yield
+/// unstable serialized bytes under postcard/serde.
+///
+/// Node IDs are stored as `String` (matching `NodeSliceAllocator`); the
+/// scheduler converts its own `NodeId` to/from `String` at the boundary.
+#[derive(Debug, Clone)]
+pub struct ServiceSubnetRegistry {
+    cluster_cidr: IpNet,
+    slice_prefix: u8,
+    /// Map from `(service_name, node_id)` -> assigned slice.
+    assignments: HashMap<(String, String), IpNet>,
+}
+
+/// Persistent snapshot of a `ServiceSubnetRegistry` for raft/disk persistence.
+///
+/// Uses a `Vec` of pairs (rather than a `HashMap`) so the serialized byte
+/// layout is deterministic when Raft replicates / snapshots this state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceSubnetRegistrySnapshot {
+    pub cluster_cidr: IpNet,
+    pub slice_prefix: u8,
+    pub assignments: Vec<((String, String), IpNet)>,
+}
+
+/// Deterministic FNV-1a 64-bit hash over a `(service, node)` pair.
+///
+/// Uses the same FNV constants as `hash_node_id` so the two allocators have
+/// matching reproducibility guarantees. The pair is hashed by feeding the
+/// service bytes, a single `0x1f` (ASCII unit-separator) delimiter, then
+/// the node bytes — the delimiter prevents the pair `("ab", "c")` from
+/// hashing identically to `("a", "bc")`.
+fn hash_service_node(service: &str, node: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in service.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash ^= 0x1f_u64;
+    hash = hash.wrapping_mul(FNV_PRIME);
+    for &b in node.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+impl ServiceSubnetRegistry {
+    /// Create a new service subnet registry that carves `/slice_prefix`-sized
+    /// slices out of `cluster_cidr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::InvalidCidr` if `slice_prefix` is not strictly
+    /// more specific than `cluster_cidr.prefix_len()`, or if it exceeds the
+    /// address family's maximum prefix length.
+    pub fn new(cluster_cidr: IpNet, slice_prefix: u8) -> Result<Self> {
+        if slice_prefix <= cluster_cidr.prefix_len() {
+            return Err(OverlayError::InvalidCidr(format!(
+                "slice prefix /{} must be more specific than cluster prefix /{}",
+                slice_prefix,
+                cluster_cidr.prefix_len()
+            )));
+        }
+        if slice_prefix > cluster_cidr.max_prefix_len() {
+            return Err(OverlayError::InvalidCidr(format!(
+                "slice prefix /{} exceeds address family max /{}",
+                slice_prefix,
+                cluster_cidr.max_prefix_len()
+            )));
+        }
+        Ok(Self {
+            cluster_cidr,
+            slice_prefix,
+            assignments: HashMap::new(),
+        })
+    }
+
+    /// Assign (or return an existing) subnet for `(service, node)`.
+    ///
+    /// Idempotent: repeated calls with the same key return the same slice
+    /// without re-assigning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::NoAvailableIps` if every slice in the cluster
+    /// CIDR is already assigned to some other `(service, node)` pair.
+    pub fn assign(&mut self, service: &str, node: &str) -> Result<IpNet> {
+        let key = (service.to_string(), node.to_string());
+        if let Some(existing) = self.assignments.get(&key) {
+            return Ok(*existing);
+        }
+
+        let num_slices = self.num_slices();
+        if num_slices == 0 {
+            return Err(OverlayError::NoAvailableIps);
+        }
+
+        let taken: HashSet<IpNet> = self.assignments.values().copied().collect();
+        let start = hash_service_node(service, node) % num_slices;
+
+        for i in 0..num_slices {
+            let idx = (start + i) % num_slices;
+            let slice = self.slice_at_index(idx);
+            if !taken.contains(&slice) {
+                self.assignments.insert(key, slice);
+                return Ok(slice);
+            }
+        }
+
+        Err(OverlayError::NoAvailableIps)
+    }
+
+    /// Release the subnet for `(service, node)`. Returns the freed slice if
+    /// one was assigned, `None` otherwise.
+    pub fn release(&mut self, service: &str, node: &str) -> Option<IpNet> {
+        let key = (service.to_string(), node.to_string());
+        self.assignments.remove(&key)
+    }
+
+    /// Look up the current assignment for `(service, node)`, if any.
+    #[must_use]
+    pub fn get(&self, service: &str, node: &str) -> Option<IpNet> {
+        let key = (service.to_string(), node.to_string());
+        self.assignments.get(&key).copied()
+    }
+
+    /// Number of currently-assigned `(service, node)` pairs.
+    #[must_use]
+    pub fn assigned_count(&self) -> usize {
+        self.assignments.len()
+    }
+
+    /// Total number of slices the cluster CIDR can hold at the configured
+    /// slice prefix.
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.num_slices()
+    }
+
+    /// Cluster CIDR the registry operates over.
+    #[must_use]
+    pub fn cluster_cidr(&self) -> IpNet {
+        self.cluster_cidr
+    }
+
+    /// Slice prefix length (e.g. `28` for `/28` slices).
+    #[must_use]
+    pub fn slice_prefix(&self) -> u8 {
+        self.slice_prefix
+    }
+
+    /// Build a persistable snapshot for Raft / durable leader state.
+    ///
+    /// The returned snapshot has assignments sorted by `(service, node)` so
+    /// the serialized bytes are deterministic across processes — important
+    /// when Raft compares snapshots by hash.
+    #[must_use]
+    pub fn snapshot(&self) -> ServiceSubnetRegistrySnapshot {
+        let mut assignments: Vec<((String, String), IpNet)> = self
+            .assignments
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        assignments.sort_by(|a, b| a.0.cmp(&b.0));
+        ServiceSubnetRegistrySnapshot {
+            cluster_cidr: self.cluster_cidr,
+            slice_prefix: self.slice_prefix,
+            assignments,
+        }
+    }
+
+    /// Rebuild a registry from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::InvalidCidr` if the snapshot's slice prefix is
+    /// inconsistent with its assignments, or if any assigned slice is not
+    /// contained in the cluster CIDR.
+    pub fn restore(snapshot: ServiceSubnetRegistrySnapshot) -> Result<Self> {
+        let mut registry = Self::new(snapshot.cluster_cidr, snapshot.slice_prefix)?;
+        for (key, slice) in snapshot.assignments {
+            if slice.prefix_len() != snapshot.slice_prefix {
+                return Err(OverlayError::InvalidCidr(format!(
+                    "assigned slice {slice} does not match configured prefix /{}",
+                    snapshot.slice_prefix
+                )));
+            }
+            if !snapshot.cluster_cidr.contains(&slice.network()) {
+                return Err(OverlayError::InvalidCidr(format!(
+                    "assigned slice {slice} is not contained in cluster CIDR {}",
+                    snapshot.cluster_cidr
+                )));
+            }
+            registry.assignments.insert(key, slice);
+        }
+        Ok(registry)
+    }
+
+    fn num_slices(&self) -> u64 {
+        let bits = self.slice_prefix - self.cluster_cidr.prefix_len();
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            1u64 << bits
+        }
+    }
+
+    fn slice_at_index(&self, idx: u64) -> IpNet {
+        let shift = u32::from(self.cluster_cidr.max_prefix_len() - self.slice_prefix);
+        match self.cluster_cidr {
+            IpNet::V4(v4) => {
+                let base = u32::from(v4.network());
+                #[allow(clippy::cast_possible_truncation)]
+                let offset = (idx as u32).wrapping_shl(shift);
+                let slice_addr = Ipv4Addr::from(base.wrapping_add(offset));
+                IpNet::V4(
+                    Ipv4Net::new(slice_addr, self.slice_prefix)
+                        .expect("slice_prefix validated in constructor"),
+                )
+            }
+            IpNet::V6(v6) => {
+                let base = u128::from(v6.network());
+                let offset = u128::from(idx).wrapping_shl(shift);
+                let slice_addr = Ipv6Addr::from(base.wrapping_add(offset));
+                IpNet::V6(
+                    Ipv6Net::new(slice_addr, self.slice_prefix)
+                        .expect("slice_prefix validated in constructor"),
+                )
+            }
+        }
+    }
+}
+
 /// Helper function to get the first usable IP from a CIDR
 ///
 /// Supports both IPv4 and IPv6 CIDR notation.
@@ -1234,5 +1480,160 @@ mod tests {
         let slice = allocator.assign("node-a").unwrap();
         assert_eq!(slice.prefix_len(), 64);
         assert!(cluster_v6.contains(&slice.network()));
+    }
+
+    // ========================
+    // ServiceSubnetRegistry tests
+    // ========================
+
+    #[test]
+    fn service_subnet_assign_is_idempotent() {
+        let mut reg = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let first = reg.assign("svc-a", "node-1").unwrap();
+        let second = reg.assign("svc-a", "node-1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(reg.assigned_count(), 1);
+        assert_eq!(reg.get("svc-a", "node-1"), Some(first));
+    }
+
+    #[test]
+    fn service_subnet_two_services_disjoint() {
+        let mut reg = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let a = reg.assign("svc-a", "node-1").unwrap();
+        let b = reg.assign("svc-b", "node-1").unwrap();
+        assert_ne!(a, b);
+        // Slices must be disjoint (neither contains the other's network address).
+        assert!(!a.contains(&b.network()));
+        assert!(!b.contains(&a.network()));
+    }
+
+    #[test]
+    fn service_subnet_same_service_two_nodes_disjoint() {
+        let mut reg = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let a = reg.assign("svc-a", "node-1").unwrap();
+        let b = reg.assign("svc-a", "node-2").unwrap();
+        assert_ne!(a, b);
+        assert!(!a.contains(&b.network()));
+        assert!(!b.contains(&a.network()));
+    }
+
+    #[test]
+    fn service_subnet_release_reclaims_slot() {
+        let mut reg = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let first = reg.assign("svc-a", "node-1").unwrap();
+        let released = reg.release("svc-a", "node-1");
+        assert_eq!(released, Some(first));
+        assert_eq!(reg.get("svc-a", "node-1"), None);
+        assert_eq!(reg.assigned_count(), 0);
+
+        // Re-assign should land on the same slot because the hash is
+        // deterministic and no other assignment is occupying it.
+        let again = reg.assign("svc-a", "node-1").unwrap();
+        assert_eq!(again, first);
+
+        // Releasing an unknown key returns None.
+        assert_eq!(reg.release("svc-z", "node-z"), None);
+    }
+
+    #[test]
+    fn service_subnet_snapshot_restore_roundtrip() {
+        let mut reg = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let a = reg.assign("svc-a", "node-1").unwrap();
+        let b = reg.assign("svc-a", "node-2").unwrap();
+        let c = reg.assign("svc-b", "node-1").unwrap();
+        let d = reg.assign("svc-b", "node-2").unwrap();
+
+        let snapshot = reg.snapshot();
+
+        // Round-trip through JSON to mimic the Raft serialization boundary.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let snapshot_restored: ServiceSubnetRegistrySnapshot = serde_json::from_str(&json).unwrap();
+
+        // Snapshot ordering must be deterministic — re-snapshotting the same
+        // state must serialize to the same bytes (critical for Raft hashing).
+        let json2 = serde_json::to_string(&reg.snapshot()).unwrap();
+        assert_eq!(json, json2);
+
+        let restored = ServiceSubnetRegistry::restore(snapshot_restored).unwrap();
+        assert_eq!(restored.get("svc-a", "node-1"), Some(a));
+        assert_eq!(restored.get("svc-a", "node-2"), Some(b));
+        assert_eq!(restored.get("svc-b", "node-1"), Some(c));
+        assert_eq!(restored.get("svc-b", "node-2"), Some(d));
+        assert_eq!(restored.assigned_count(), 4);
+        assert_eq!(restored.slice_prefix(), 28);
+        assert_eq!(restored.cluster_cidr(), cluster());
+        assert_eq!(restored.capacity(), 4096);
+    }
+
+    #[test]
+    fn service_subnet_exhaustion_errors() {
+        // /29 with /30 slices → 2 slots total.
+        let small: IpNet = "10.200.0.0/29".parse().unwrap();
+        let mut reg = ServiceSubnetRegistry::new(small, 30).unwrap();
+        assert_eq!(reg.capacity(), 2);
+
+        reg.assign("svc-a", "node-1").unwrap();
+        reg.assign("svc-a", "node-2").unwrap();
+        assert_eq!(reg.assigned_count(), 2);
+
+        let err = reg.assign("svc-a", "node-3").unwrap_err();
+        assert!(matches!(err, OverlayError::NoAvailableIps));
+
+        // But re-assigning an existing pair still succeeds (idempotent).
+        let existing = reg.get("svc-a", "node-1").unwrap();
+        assert_eq!(reg.assign("svc-a", "node-1").unwrap(), existing);
+    }
+
+    #[test]
+    fn service_subnet_rejects_bad_prefix() {
+        // slice prefix equal to cluster prefix.
+        let err = ServiceSubnetRegistry::new(cluster(), 16).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+        // slice prefix shorter than cluster prefix.
+        let err = ServiceSubnetRegistry::new(cluster(), 8).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+        // slice prefix beyond max for family.
+        let err = ServiceSubnetRegistry::new(cluster(), 33).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn service_subnet_hash_is_deterministic_across_instances() {
+        // Two registries built fresh must assign the same (service, node)
+        // pair to the same starting slot — same guarantee as
+        // `NodeSliceAllocator::test_slice_hash_is_deterministic`.
+        let mut a = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let mut b = ServiceSubnetRegistry::new(cluster(), 28).unwrap();
+        let slice_a = a.assign("svc-x", "node-x").unwrap();
+        let slice_b = b.assign("svc-x", "node-x").unwrap();
+        assert_eq!(slice_a, slice_b);
+    }
+
+    #[test]
+    fn service_subnet_restore_rejects_mismatched_prefix() {
+        let snapshot = ServiceSubnetRegistrySnapshot {
+            cluster_cidr: "10.200.0.0/16".parse().unwrap(),
+            slice_prefix: 28,
+            assignments: vec![(
+                ("svc-a".to_string(), "node-1".to_string()),
+                "10.200.0.0/24".parse().unwrap(),
+            )],
+        };
+        let err = ServiceSubnetRegistry::restore(snapshot).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn service_subnet_restore_rejects_out_of_cluster() {
+        let snapshot = ServiceSubnetRegistrySnapshot {
+            cluster_cidr: "10.200.0.0/16".parse().unwrap(),
+            slice_prefix: 28,
+            assignments: vec![(
+                ("svc-a".to_string(), "node-1".to_string()),
+                "10.201.0.0/28".parse().unwrap(),
+            )],
+        };
+        let err = ServiceSubnetRegistry::restore(snapshot).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
     }
 }

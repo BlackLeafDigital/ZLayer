@@ -1,5 +1,7 @@
 // Cross-platform commands
 pub mod build;
+#[cfg(target_os = "macos")]
+pub mod buildd_manager;
 pub mod completions;
 pub mod lifecycle;
 pub mod manager;
@@ -13,8 +15,19 @@ pub mod wasm;
 #[cfg(all(target_os = "windows", feature = "wsl"))]
 pub mod windows;
 
+// macOS-only Apple-Virtualization (VZ) base-image tooling (`zlayer vz`).
+#[cfg(target_os = "macos")]
+pub mod vz;
+
+// Linux-only `zlayer runtime` runc-compatible CLI surface used by
+// `Wsl2DelegateRuntime` to drive containers inside the `zlayer` WSL2 distro.
+// Hidden from top-level `--help`; not a user-facing surface.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
+pub mod runtime;
+
 pub mod audit_cmd;
 pub mod auth;
+pub mod cluster;
 pub mod container;
 pub mod credential;
 pub mod daemon;
@@ -25,15 +38,18 @@ pub mod group;
 pub mod image;
 pub mod job;
 pub mod join;
+pub mod login;
 pub mod network;
 pub mod node;
 pub mod notifier;
+pub mod overlayd_supervisor;
 pub mod permission;
 pub mod project;
 pub mod ps;
 pub mod resolver;
 pub mod run;
 pub mod secret;
+pub mod self_update;
 pub mod serve;
 pub mod sync_cmd;
 pub mod system;
@@ -42,4 +58,5 @@ pub mod token;
 pub mod user;
 pub mod variable;
 pub mod volume;
+pub mod worker;
 pub mod workflow;
