@@ -8,20 +8,30 @@ use crate::app::server_fns::{
 };
 
 /// Default example specification
-const DEFAULT_SPEC: &str = r"apiVersion: zlayer.dev/v1
-kind: Container
-metadata:
-  name: example
-  namespace: default
-spec:
-  image: nginx:alpine
-  resources:
-    cpu: 1
-    memory: 256Mi
-  network:
-    ports:
-      - containerPort: 80
-        hostPort: 8080
+const DEFAULT_SPEC: &str = r"version: v1
+deployment: example
+
+services:
+  web:
+    rtype: service
+    image:
+      name: nginx:alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 256Mi
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        host: example.com
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 2
 ";
 
 /// Default Hello World WAT example
@@ -207,7 +217,7 @@ pub fn PlaygroundPage() -> impl IntoView {
                     <div class="playground-header">
                         <h1 class="playground-title">"ZLayer Playground"</h1>
                         <p class="playground-description">
-                            "Validate container specifications or execute WebAssembly code in real-time."
+                            "Validate ZLayer deployment specs against the real `zlayer-spec` parser, or execute WebAssembly modules against the embedded wasmtime runtime ZLayer uses for WASM workloads alongside containers."
                         </p>
                     </div>
 
@@ -231,7 +241,7 @@ pub fn PlaygroundPage() -> impl IntoView {
                             }
                             on:click=move |_| active_tab.set(PlaygroundTab::WasmPlayground)
                         >
-                            "WASM Playground"
+                            "WASM (wasmtime)"
                         </button>
                     </div>
 
@@ -257,7 +267,7 @@ fn ContainerSpecTab() -> impl IntoView {
     let editor_content = RwSignal::new(DEFAULT_SPEC.to_string());
     // Output/result signal
     let output = RwSignal::new(String::from(
-        "Click 'Validate' to check your specification.",
+        "Click Validate to run the real zlayer-spec parser server-side.",
     ));
     // Loading state
     let is_validating = RwSignal::new(false);
@@ -395,6 +405,11 @@ fn WasmPlaygroundTab() -> impl IntoView {
 
     view! {
         <div class="wasm-playground">
+            <div class="wasm-explainer">
+                <p>
+                    "ZLayer embeds "<a href="https://wasmtime.dev" target="_blank" rel="noopener noreferrer"><code>"wasmtime"</code></a>" so you can deploy "<code>".wasm"</code>" workloads next to containers in the same spec. WASI is enabled by default. The samples below are in "<code>"WAT"</code>" (WebAssembly Text) — you'd normally compile from Rust ("<code>"cargo build --target wasm32-wasip1"</code>"), AssemblyScript, or TinyGo, then publish the binary."
+                </p>
+            </div>
             // Examples panel
             <div class="wasm-examples">
                 <h3 class="wasm-examples-title">"Examples"</h3>

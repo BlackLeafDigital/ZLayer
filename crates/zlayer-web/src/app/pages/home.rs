@@ -4,7 +4,7 @@ use leptos::prelude::*;
 
 use crate::app::components::{CodeBlock, CodeEditor, Footer, Navbar};
 use crate::app::icons;
-use crate::app::server_fns::execute_wasm;
+use crate::app::server_fns::validate_spec;
 
 /// Feature card component
 #[component]
@@ -31,26 +31,47 @@ fn FeatureCard(
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn HomePage() -> impl IntoView {
-    // Example YAML specification
-    const EXAMPLE_SPEC: &str = r"apiVersion: zlayer.dev/v1
-kind: Container
-metadata:
-  name: my-app
-  namespace: production
-spec:
-  image: ghcr.io/myorg/myapp:latest
-  resources:
-    cpu: 2
-    memory: 512Mi
-  network:
-    overlay: my-network
-    ports:
-      - containerPort: 8080
-        hostPort: 80
-  env:
-    - name: DATABASE_URL
-      valueFrom:
-        secretRef: db-credentials";
+    // Example YAML specification (real ZLayer spec format)
+    const EXAMPLE_SPEC: &str = r#"version: v1
+deployment: my-app
+
+services:
+  web:
+    rtype: service
+    image:
+      name: ghcr.io/myorg/web:latest
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 512Mi
+
+    env:
+      DATABASE_URL: "postgres://db:5432/app"
+      RUST_LOG: "info"
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 3000
+        host: app.example.com
+        expose: public
+
+    scale:
+      mode: adaptive
+      min_replicas: 2
+      max_replicas: 10
+      target_cpu_percent: 70
+
+    health:
+      start_grace: 15s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: tcp
+        port: 3000
+"#;
 
     view! {
         <div class="page-layout">
@@ -62,7 +83,7 @@ spec:
                     <div class="container hero-content">
                         <div class="hero-logo">
                             <img
-                                src="/assets/zlayer_logo.png"
+                                src="/zlayer_logo.png"
                                 alt="ZLayer Logo"
                                 class="hero-logo-img"
                             />
@@ -76,9 +97,9 @@ spec:
                             <span class="highlight">"Orchestration"</span>
                         </h1>
                         <p class="hero-description">
-                            "Lightweight Kubernetes-like container orchestration for Linux, macOS, and Windows. "
-                            "Native runtimes on every platform, encrypted overlay networking, and a single binary "
-                            "with no daemons to babysit."
+                            "Run containers natively on Linux (libcontainer), macOS (Apple Containerization), "
+                            "and Windows (Hyper-V HCS plus a WSL2 delegate). Encrypted overlay networking, "
+                            "a built-in image builder, and a Raft-backed scheduler — in a single binary, no daemon."
                         </p>
                         <div class="hero-buttons">
                             <a href="/docs" class="btn btn-primary">
@@ -90,6 +111,55 @@ spec:
                                 {icons::arrow_right_icon("18")}
                             </a>
                         </div>
+                    </div>
+                </section>
+
+                // Install Section
+                <section class="install install-section">
+                    <div class="container">
+                        <div class="section-header">
+                            <h2 class="section-title">"Install"</h2>
+                            <p class="section-description">
+                                "One binary. No daemon. Pick your platform."
+                            </p>
+                        </div>
+                        <div class="install-grid">
+                            <div class="install-card">
+                                <h3 class="install-platform">"Linux / macOS"</h3>
+                                <CodeBlock
+                                    code="curl -fsSL https://zlayer.dev/install.sh | bash"
+                                    title=Some("Linux / macOS")
+                                    language="bash"
+                                />
+                            </div>
+                            <div class="install-card">
+                                <h3 class="install-platform">"Windows (PowerShell)"</h3>
+                                <CodeBlock
+                                    code="irm https://zlayer.dev/install.ps1 | iex"
+                                    title=Some("Windows (PowerShell)")
+                                    language="powershell"
+                                />
+                            </div>
+                            <div class="install-card">
+                                <h3 class="install-platform">"From source (Cargo)"</h3>
+                                <CodeBlock
+                                    code="cargo install --git https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer zlayer"
+                                    title=Some("From source (Cargo)")
+                                    language="bash"
+                                />
+                            </div>
+                            <div class="install-card">
+                                <h3 class="install-platform">"Python installer"</h3>
+                                <CodeBlock
+                                    code="curl -sSL https://zlayer.dev/install.py | python3"
+                                    title=Some("Python installer")
+                                    language="bash"
+                                />
+                            </div>
+                        </div>
+                        <p class="install-verify">
+                            "After install, run "<code>"zlayer --version"</code>" to verify."
+                        </p>
                     </div>
                 </section>
 
@@ -144,14 +214,13 @@ spec:
                         <div class="section-header">
                             <h2 class="section-title">"Simple Configuration"</h2>
                             <p class="section-description">
-                                "Define your containers with familiar YAML syntax. "
-                                "Everything you need in one declarative file."
+                                "This is the actual spec format the "<code>"zlayer deploy"</code>" CLI consumes — not a Kubernetes-style approximation."
                             </p>
                         </div>
                         <div class="code-block-wrapper">
                             <CodeBlock
                                 code=EXAMPLE_SPEC
-                                title=Some("container.yaml")
+                                title=Some("my-app.zlayer.yml")
                                 language="yaml"
                             />
                         </div>
@@ -186,61 +255,55 @@ spec:
     }
 }
 
-/// Mini Hello World WAT for the try-it-now section
-const MINI_HELLO_WAT: &str = r#"(module
-  (import "wasi_snapshot_preview1" "fd_write"
-    (func $fd_write (param i32 i32 i32 i32) (result i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 8) "Hello from ZLayer WASM!\n")
-  (func (export "_start")
-    (i32.store (i32.const 0) (i32.const 8))
-    (i32.store (i32.const 4) (i32.const 24))
-    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100)))
-  )
-)"#;
+/// Mini `ZLayer` deployment spec for the Try It Now validator demo
+const MINI_DEMO_SPEC: &str = r"version: v1
+deployment: demo
 
-/// Try It Now section with mini WASM playground
+services:
+  api:
+    rtype: service
+    image:
+      name: ghcr.io/myorg/api:latest
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 3
+";
+
+/// Try It Now section — deployment-spec validator demo
 #[component]
 fn TryItNowSection() -> impl IntoView {
-    let editor_content = RwSignal::new(MINI_HELLO_WAT.to_string());
+    let editor_content = RwSignal::new(MINI_DEMO_SPEC.to_string());
     let output = RwSignal::new(String::new());
     let is_running = RwSignal::new(false);
     let has_run = RwSignal::new(false);
 
-    // Execution action
-    let execute_action = Action::new(move |code: &String| {
-        let code = code.clone();
-        async move { execute_wasm(code, "wat".to_string()).await }
+    // Validation action — calls the real zlayer-spec parser on the server
+    let validate_action = Action::new(move |yaml: &String| {
+        let yaml = yaml.clone();
+        async move { validate_spec(yaml).await }
     });
 
-    // Handle run button click
+    // Handle validate button click
     let on_run = move |_| {
         is_running.set(true);
         has_run.set(true);
-        execute_action.dispatch(editor_content.get());
+        validate_action.dispatch(editor_content.get());
     };
 
-    // Update output when execution completes
+    // Update output when validation completes
     Effect::new(move |_| {
-        if let Some(result) = execute_action.value().get() {
+        if let Some(result) = validate_action.value().get() {
             is_running.set(false);
             match result {
-                Ok(res) => {
-                    if !res.stdout.is_empty() {
-                        output.set(res.stdout);
-                    } else if let Some(info) = res.info {
-                        output.set(format!(
-                            "Executed successfully in {}ms\n{}",
-                            res.execution_time_ms, info
-                        ));
-                    } else {
-                        output.set(format!(
-                            "Executed successfully (exit code: {})",
-                            res.exit_code
-                        ));
-                    }
-                }
-                Err(e) => output.set(format!("Error: {e}")),
+                Ok(msg) => output.set(msg),
+                Err(e) => output.set(format!("{e}")),
             }
         }
     });
@@ -249,29 +312,30 @@ fn TryItNowSection() -> impl IntoView {
         <section class="try-it-now">
             <div class="container">
                 <div class="section-header">
-                    <h2 class="section-title">"Try It Now"</h2>
+                    <h2 class="section-title">"Validate a deployment"</h2>
                     <p class="section-description">
-                        "Execute WebAssembly code directly in your browser. "
-                        "Click Run to see it in action."
+                        "Paste a ZLayer deployment spec. We run the actual zlayer-spec parser on "
+                        "the server and tell you exactly what's wrong — same code path as "
+                        <code>"zlayer deploy"</code>". Includes a WebAssembly runtime — see the Playground for that."
                     </p>
                 </div>
 
                 <div class="try-it-container">
                     <div class="try-it-editor">
                         <div class="try-it-header">
-                            <span class="try-it-label">"WebAssembly (WAT)"</span>
+                            <span class="try-it-label">"Container Spec (YAML)"</span>
                             <button
                                 class="btn btn-gradient try-it-run-btn"
                                 on:click=on_run
                                 disabled=move || is_running.get()
                             >
-                                {move || if is_running.get() { "Running..." } else { "Run" }}
+                                {move || if is_running.get() { "Validating..." } else { "Validate" }}
                             </button>
                         </div>
                         <div class="try-it-code">
                             <CodeEditor
-                                initial_content=MINI_HELLO_WAT.to_string()
-                                placeholder="WAT code...".to_string()
+                                initial_content=MINI_DEMO_SPEC.to_string()
+                                placeholder="ZLayer spec YAML...".to_string()
                                 read_only=false
                                 content=editor_content
                             />
@@ -280,7 +344,7 @@ fn TryItNowSection() -> impl IntoView {
 
                     <div class="try-it-output">
                         <div class="try-it-header">
-                            <span class="try-it-label">"Output"</span>
+                            <span class="try-it-label">"Validation"</span>
                         </div>
                         <div class="try-it-result">
                             {move || {
@@ -289,11 +353,11 @@ fn TryItNowSection() -> impl IntoView {
 
                                 if out.is_empty() && !ran {
                                     view! {
-                                        <span class="try-it-placeholder">"Click Run to execute"</span>
+                                        <span class="try-it-placeholder">"Click Validate to check the spec"</span>
                                     }.into_any()
                                 } else if out.is_empty() && ran {
                                     view! {
-                                        <span class="try-it-placeholder">"Running..."</span>
+                                        <span class="try-it-placeholder">"Validating..."</span>
                                     }.into_any()
                                 } else {
                                     view! {

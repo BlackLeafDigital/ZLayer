@@ -474,6 +474,14 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
 
+      # ZRegistry receives zlayer-web specifically (the public landing page
+      # image). The publish token's scope is
+      # `publish:container:blackleafdigital/zlayer-web`, minted via
+      # ZREGISTRY_ADMIN_TOKEN against /v1/tokens.
+      - name: Login to ZRegistry
+        if: steps.check.outputs.completed != 'true'
+        run: echo "${{ secrets.ZREGISTRY_ZLAYER_WEB_PUBLISH_TOKEN }}" | sudo buildah login -u zlayer-web-ci --password-stdin registry.blackleafdigital.com
+
       - name: Download binary archive for CLI image
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -507,7 +515,26 @@ jobs:
             fi
             echo "Loaded image ID: ${IMAGE_ID}"
 
-            # zlayer-web only goes to Forgejo, others go to Docker Hub + GHCR
+            # zlayer-web also goes to ZRegistry (the public landing page is
+            # the dogfood case for our own multi-protocol registry). Komodo
+            # currently pulls from forge.blackleafdigital.com because of an
+            # un-authenticated-manifest 404 quirk in ZRegistry's container
+            # adapter; once fixed, the Komodo stack can switch its image URL
+            # back to registry.blackleafdigital.com/blackleafdigital/zlayer-web.
+            if [ "$img" = "zlayer-web" ]; then
+              sudo buildah tag ${IMAGE_ID} registry.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION}
+              sudo buildah tag ${IMAGE_ID} registry.blackleafdigital.com/blackleafdigital/zlayer-web:latest
+              sudo buildah push registry.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION}
+              sudo buildah push registry.blackleafdigital.com/blackleafdigital/zlayer-web:latest
+
+              # forge.blackleafdigital.com is Komodo's current pull source.
+              sudo buildah tag ${IMAGE_ID} forge.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION}
+              sudo buildah tag ${IMAGE_ID} forge.blackleafdigital.com/blackleafdigital/zlayer-web:latest
+              sudo buildah push forge.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION}
+              sudo buildah push forge.blackleafdigital.com/blackleafdigital/zlayer-web:latest
+            fi
+
+            # zlayer-web only goes to Forgejo/ZRegistry, others go to Docker Hub + GHCR
             if [ "$img" != "zlayer-web" ]; then
               # Tag for Docker Hub and GHCR
               sudo buildah tag ${IMAGE_ID} zachhandley/${img}:${VERSION}

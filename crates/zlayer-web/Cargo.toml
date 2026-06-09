@@ -118,6 +118,11 @@ output-name = "zlayer-web"
 site-root = "target/site"
 # Package directory for WASM artifacts
 site-pkg-dir = "pkg"
+# Static assets directory — cargo-leptos copies its contents directly into
+# site-root, so a file at `assets/zlayer_logo.png` is served at
+# `/zlayer_logo.png` at runtime. Without this, the contents are never
+# copied and references 404.
+assets-dir = "assets"
 # Enable hash-based filenames
 hash-files = true
 # Browser reload on change
