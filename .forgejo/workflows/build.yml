@@ -846,18 +846,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # List the archive once into a temp file — piping `tar tzf` into
+          # `head` under `set -o pipefail` causes tar to receive SIGPIPE
+          # (exit 141) once head closes its stdin, which aborts the step.
+          listing=$(mktemp)
+          trap 'rm -f "$listing"' EXIT
+          tar tzf zlayer-rootfs.tar.gz > "$listing"
           echo "=== first 20 entries ==="
-          tar tzf zlayer-rootfs.tar.gz | head -20
+          head -20 "$listing"
           echo "=== zlayer binary presence ==="
-          count=$(tar tzf zlayer-rootfs.tar.gz | grep -cE '(^|/)usr/local/bin/zlayer$' || true)
+          count=$(grep -cE '(^|/)usr/local/bin/zlayer$' "$listing" || true)
           if [ "$count" != "1" ]; then
             echo "::error::expected exactly 1 usr/local/bin/zlayer entry, got ${count}"
             exit 1
           fi
           echo "=== version marker ==="
-          tar tzf zlayer-rootfs.tar.gz | grep -E '(^|/)etc/zlayer-rootfs-version$'
+          grep -E '(^|/)etc/zlayer-rootfs-version$' "$listing"
           echo "=== iproute2/iptables presence ==="
-          tar tzf zlayer-rootfs.tar.gz | grep -E '(^|/)sbin/(ip|iptables)$' | head -5
+          grep -E '(^|/)sbin/(ip|iptables)$' "$listing" | head -5 || true
       - name: Upload rootfs artifact
         if: steps.check.outputs.completed != 'true'
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
