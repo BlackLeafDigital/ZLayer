@@ -899,8 +899,14 @@ jobs:
   # Trigger GitHub release
   # ===========================================
   trigger-github:
-    needs: [detect, upload-binaries]
-    if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
+    # MUST wait for merge-to-main: that job force-pushes Forgejo `main` to
+    # the release-tag commit AND mirror-pushes to GitHub `main`. If we
+    # dispatch GitHub's e2e.yml before that push lands, it runs the STALE
+    # GitHub-main copy of the workflow (which can still reference removed
+    # things like the self-hosted `nvidia` raft runner). Symptom: job
+    # queues waiting for `Requested labels: nvidia` forever.
+    needs: [detect, upload-binaries, merge-to-main]
+    if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success' && needs.merge-to-main.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger GitHub E2E + Release
