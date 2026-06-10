@@ -1,0 +1,45 @@
+name: Force Release (bypass e2e)
+
+# One-click manual release path. Skips the entire e2e gate and dispatches
+# release.yml directly, which downloads artifacts from Forgejo Packages and
+# publishes them as the GitHub release.
+#
+# Use when raft-e2e (or any other e2e job) is environmentally broken on
+# GitHub but the Forgejo side has already published all artifacts for the
+# version. Verify on Forgejo Packages first:
+#   https://forge.blackleafdigital.com/BlackLeafDigital/-/packages/generic/zlayer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g., 0.12.1)'
+        required: true
+        type: string
+
+jobs:
+  dispatch:
+    name: Dispatch release.yml
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          echo "Dispatching release.yml with version=${VERSION}"
+          curl -fsSL -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/release.yml/dispatches" \
+            -d "$(jq -nc --arg v "$VERSION" '{ref:"main", inputs:{version:$v}}')"
+
+      - name: Summary
+        run: |
+          echo "## Force Release Dispatched" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: release.yml on main" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Watch the resulting run: https://github.com/${{ github.repository }}/actions/workflows/release.yml" >> $GITHUB_STEP_SUMMARY

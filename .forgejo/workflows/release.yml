@@ -12,9 +12,23 @@ on:
         required: false
         type: string
       artifact_base_url:
-        description: 'Base URL for temp artifact packages from build workflow'
-        required: true
+        description: |
+          Base URL for temp artifact packages from build workflow. Optional —
+          the pre-check job auto-discovers a matching temp package by scanning
+          zlayer-temp/*/version.txt for one whose contents equal `version`.
+          Only pass explicitly to override the discovery (e.g. when re-using
+          a specific build's artifacts).
+        required: false
         type: string
+        default: ''
+      force_rebuild:
+        description: |
+          Re-run every step regardless of existing artifacts / ci-status
+          markers. Requires a discoverable temp build (or an explicit
+          artifact_base_url) — typically dispatch build.yml first.
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -114,11 +128,143 @@ jobs:
           fi
 
   # ===========================================
+  # Pre-check: discover what's already published, resolve temp URL
+  #
+  # Outputs:
+  #   artifacts_complete   - 'true' when every expected file is on the
+  #                          permanent zlayer/${VERSION}/ namespace. When true,
+  #                          downstream upload/push steps no-op.
+  #   resolved_temp_url    - The temp packages base URL to use for any step
+  #                          that needs to (re-)pull the build artifacts.
+  #                          Sources in order: inputs.artifact_base_url (if
+  #                          explicitly passed) > auto-discovery via
+  #                          zlayer-temp/<run_id>/version.txt > empty.
+  #
+  # Fail-fast: when artifacts_complete=false AND resolved_temp_url='' AND
+  # force_rebuild=false, the job dies in ~5s with a clear error instead of
+  # cascading into a dozen confusing downstream failures.
+  #
+  # force_rebuild=true override: artifacts_complete is forced to 'false' AND
+  # we call ci-step-status purge-version so every per-step idempotency marker
+  # is cleared. (Still needs a resolved_temp_url; if missing, fail fast.)
+  # ===========================================
+  pre-check:
+    needs: [detect]
+    if: needs.detect.outputs.binary == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      artifacts_complete: ${{ steps.decide.outputs.artifacts_complete }}
+      resolved_temp_url: ${{ steps.decide.outputs.resolved_temp_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          sparse-checkout: scripts/check-existing-packages.sh
+      - name: Ensure jq
+        shell: bash
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+      - name: Probe permanent + auto-discover temp
+        id: decide
+        shell: bash
+        env:
+          AUTH: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          EXPLICIT_TEMP: ${{ inputs.artifact_base_url }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/check-existing-packages.sh
+          # Probe permanent namespace.
+          ARTIFACTS_COMPLETE=false
+          if [ "$(./scripts/check-existing-packages.sh "$VERSION" "$AUTH" | tail -1)" = "false" ]; then
+            ARTIFACTS_COMPLETE=true
+          fi
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "force_rebuild=true — treating permanent artifacts as missing"
+            ARTIFACTS_COMPLETE=false
+          fi
+
+          # Resolve temp URL.
+          RESOLVED_TEMP=""
+          if [ -n "$EXPLICIT_TEMP" ]; then
+            echo "Using explicitly-passed artifact_base_url"
+            RESOLVED_TEMP="$EXPLICIT_TEMP"
+          else
+            echo "Auto-discovering temp package for version ${VERSION}..."
+            # List every zlayer-temp generic package. Forgejo's packages API
+            # returns one entry per (package, version) — version here is the
+            # build's github.run_id. Walk newest-first and match by
+            # version.txt contents (stamped by build.yml's upload-temp-packages).
+            LIST_URL="https://forge.blackleafdigital.com/api/v1/packages/BlackLeafDigital?type=generic&q=zlayer-temp&page=1&limit=50"
+            if PKG_JSON="$(curl -fsSL --connect-timeout 10 --max-time 30 --user "$AUTH" "$LIST_URL")"; then
+              # Sort by created_at desc; iterate.
+              RUN_IDS="$(printf '%s' "$PKG_JSON" \
+                | jq -r 'sort_by(.created_at) | reverse | .[] | select(.name=="zlayer-temp") | .version')"
+              for run_id in $RUN_IDS; do
+                CAND_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${run_id}"
+                # Match by version.txt contents.
+                STAMP="$(curl -fsSL --connect-timeout 5 --max-time 15 \
+                  --user "$AUTH" "${CAND_URL}/version.txt" 2>/dev/null | tr -d '\r\n' || true)"
+                if [ -n "$STAMP" ] && [ "$STAMP" = "$VERSION" ]; then
+                  echo "  matched: ${CAND_URL} (run_id=${run_id})"
+                  RESOLVED_TEMP="$CAND_URL"
+                  break
+                fi
+              done
+              if [ -z "$RESOLVED_TEMP" ]; then
+                echo "  no matching temp package (scanned $(printf '%s\n' "$RUN_IDS" | wc -l) candidates)"
+              fi
+            else
+              echo "  failed to list zlayer-temp packages"
+            fi
+          fi
+
+          echo "Result: artifacts_complete=${ARTIFACTS_COMPLETE} resolved_temp_url=${RESOLVED_TEMP:+<set>}"
+          echo "artifacts_complete=${ARTIFACTS_COMPLETE}" >> "$GITHUB_OUTPUT"
+          echo "resolved_temp_url=${RESOLVED_TEMP}" >> "$GITHUB_OUTPUT"
+
+          # Fail-fast: if we need a temp URL but don't have one and aren't
+          # force-rebuilding from source.
+          if [ "$ARTIFACTS_COMPLETE" = "false" ] && [ -z "$RESOLVED_TEMP" ]; then
+            echo "::error::Version ${VERSION} has missing artifacts on Forgejo Packages and no matching temp build was found."
+            echo "::error::Either dispatch build.yml first (auto-dispatches release.yml when done), pass artifact_base_url explicitly, or re-run with force_rebuild: true after a build."
+            exit 1
+          fi
+      - name: Purge ci-status markers (force_rebuild)
+        if: inputs.force_rebuild == true
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: purge-version
+          version: ${{ needs.detect.outputs.version }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          keep-markers: ''
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Pre-check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.detect.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **artifacts_complete**: ${{ steps.decide.outputs.artifacts_complete }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.decide.outputs.resolved_temp_url }}" ]; then
+            echo "- **resolved_temp_url**: \`${{ steps.decide.outputs.resolved_temp_url }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **resolved_temp_url**: (not needed)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **force_rebuild**: ${{ inputs.force_rebuild }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================
   # Upload binaries to registry (download from temp packages)
   # ===========================================
   upload-binaries:
-    needs: [detect]
-    if: needs.detect.outputs.binary == 'true'
+    needs: [detect, pre-check]
+    if: needs.detect.outputs.binary == 'true' && needs.pre-check.outputs.artifacts_complete != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,7 +285,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          BASE_URL="${{ inputs.artifact_base_url }}"
+          BASE_URL="${{ needs.pre-check.outputs.resolved_temp_url }}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
@@ -435,7 +581,12 @@ jobs:
   # Docker Push (uses pre-built images from build workflow)
   # ===========================================
   docker-push:
-    needs: [detect, merge-to-main]
+    # `pre-check` is a dependency only for `resolved_temp_url`; the existing
+    # per-step `ci-step-status check` is the actual idempotency mechanism
+    # (Forgejo permanent having the OCI tarballs does NOT imply Docker Hub /
+    # GHCR / ZRegistry have the images, so we can't gate on artifacts_complete
+    # here).
+    needs: [detect, pre-check, merge-to-main]
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -461,7 +612,7 @@ jobs:
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Downloading ${img}-oci.tar..."
             curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
-              "${{ inputs.artifact_base_url }}/${img}-oci.tar" \
+              "${{ needs.pre-check.outputs.resolved_temp_url }}/${img}-oci.tar" \
               --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
               -o "${img}-oci.tar"
             echo "OK ${img}-oci.tar downloaded"
@@ -474,7 +625,7 @@ jobs:
           set -euo pipefail
           echo "Downloading zlayer-rootfs.tar.gz..."
           curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
-            "${{ inputs.artifact_base_url }}/zlayer-rootfs.tar.gz" \
+            "${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-rootfs.tar.gz" \
             --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
             -o "zlayer-rootfs.tar.gz"
           ls -la zlayer-rootfs.tar.gz
@@ -508,7 +659,7 @@ jobs:
           curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
             --user "$AUTH" \
             -o "zlayer-linux-amd64.tar.gz" \
-            "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz"
+            "${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-amd64.tar.gz"
 
       - name: Load, tag, and push images
         if: steps.check.outputs.completed != 'true'
@@ -938,13 +1089,26 @@ jobs:
   # Cleanup temp packages (runs after all jobs)
   # ===========================================
   cleanup:
-    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, trigger-sdk-publish, create-forgejo-release, trigger-github, macos-sandbox-images]
+    needs: [detect, pre-check, upload-binaries, merge-to-main, docker-push, publish-all-crates, trigger-sdk-publish, create-forgejo-release, trigger-github, macos-sandbox-images]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Cleanup temp packages
+        shell: bash
         run: |
-          RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
+          # Use the resolved temp URL (auto-discovered or explicitly passed).
+          # When artifacts were already on permanent and no temp was needed,
+          # resolved_temp_url is empty — nothing to clean.
+          RESOLVED="${{ needs.pre-check.outputs.resolved_temp_url }}"
+          if [ -z "$RESOLVED" ]; then
+            echo "No temp packages to clean (release re-used already-published artifacts)."
+            exit 0
+          fi
+          RUN_ID="$(printf '%s' "$RESOLVED" | grep -oP 'zlayer-temp/\K[^/]+' || true)"
+          if [ -z "$RUN_ID" ]; then
+            echo "Could not parse run_id from resolved temp URL: ${RESOLVED}"
+            exit 0
+          fi
           echo "Cleaning up temp packages for run_id: ${RUN_ID}"
           curl -X DELETE \
             --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \

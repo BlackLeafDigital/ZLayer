@@ -1124,6 +1124,14 @@ jobs:
           echo "=== Downloaded artifacts ==="
           find artifacts -type f -ls
 
+      - name: Stamp version marker into artifacts
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # Lets release.yml auto-discover the matching temp package by version.
+          # See .forgejo/workflows/release.yml pre-check job.
+          printf '%s\n' "${{ needs.check-existing.outputs.version }}" > artifacts/version.txt
+
       - name: Upload to temp packages
         if: steps.check.outputs.completed != 'true'
         shell: bash

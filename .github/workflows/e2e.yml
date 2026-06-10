@@ -38,6 +38,11 @@ on:
           - scheduler-unit
           - macos-unit
           - macos-sandbox
+      force_release:
+        description: 'When version is set, fire the GitHub release even if some e2e jobs failed (use to push through known-bad environmental flakes).'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -338,10 +343,16 @@ jobs:
   # ===========================================
   raft-e2e-tests:
     name: E2E Tests (Raft)
-    # The Forgejo twin pins to the self-hosted `nvidia` label for privileged
-    # cgroups; GitHub Actions has no such runner pool, so use the stock
-    # ubuntu-latest hosted runner here.
+    # The cluster_scaling / cluster_upgrade / cluster_node_upgrade suites
+    # create real workload containers via libcontainer, which requires a
+    # writable cgroup-v2 subtree + CAP_NET_ADMIN + /dev/net/tun. Bare
+    # ubuntu-latest as the unprivileged runner user cannot remount cgroup2
+    # rw, so we run the job inside a privileged node:20-bullseye container
+    # to match the Forgejo twin (.forgejo/workflows/e2e.yml).
     runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun
     if: |
       inputs.test == '' ||
       inputs.test == 'raft-e2e' ||
@@ -366,8 +377,12 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          # Inside node:20-bullseye, steps run as root — no sudo needed.
+          # psmisc (fuser) + lsof power the port-clearing fallback in
+          # run-suite.py that prevents cross-suite contamination between
+          # the five cluster suites sharing ports 19110/19120/19130.
+          apt-get update
+          apt-get install -y protobuf-compiler libseccomp-dev psmisc lsof
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
@@ -410,25 +425,44 @@ jobs:
 
       - name: Run raft cluster suite(s)
         run: |
+          set -eo pipefail
           YAML="${{ inputs.test }}"
           case "$YAML" in
             raft-e2e:*) SUITE="${YAML#raft-e2e:}" ;;
             *) SUITE="cluster_3node" ;;
           esac
           # For the bare `raft-e2e` option (or an empty test input meaning
-          # "run everything"), iterate all four cluster suites. Otherwise
-          # run the single suite resolved above.
+          # "run everything"), iterate all five cluster suites and surface
+          # the worst rc at the end so a single bad suite doesn't truncate
+          # the rest of the run (parity with .forgejo/workflows/e2e.yml).
           if [ "$YAML" = "raft-e2e" ] || [ -z "$YAML" ]; then
+            worst=0
             for s in cluster_3node cluster_failover cluster_scaling cluster_upgrade cluster_node_upgrade; do
               echo "=== Running suite: $s ==="
-              uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"
+              if uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$s"; then
+                echo "=== Suite $s OK ==="
+              else
+                rc=$?
+                echo "=== Suite $s FAILED (rc=$rc) ==="
+                worst=$rc
+              fi
             done
+            exit $worst
           else
             uv run crates/zlayer-manager/tests/e2e/scripts/run-suite.py --throwaway --suite "$SUITE"
           fi
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: info
+
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raft-e2e-${{ github.run_id }}
+          path: target/zlayer-e2e/**
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ===========================================
   # Scheduler Unit Tests
@@ -567,10 +601,14 @@ jobs:
     # Release dispatch requires `inputs.test == ''` so partial e2e runs
     # (e.g. `test: manager-intellitester`) never short-circuit into a
     # release — the other suites would be skipped, not passed.
+    # `force_release: true` bypasses the failure gate so a known-bad
+    # environmental flake (e.g. raft-e2e cgroup setup) doesn't permanently
+    # block the release. The release.yml downstream still pulls artifacts
+    # from Forgejo's package registry, which has its own validation.
     if: |
       (github.event.client_payload.version != '' || inputs.version != '') &&
       (inputs.test == null || inputs.test == '') &&
-      !failure() && !cancelled()
+      ((!failure() && !cancelled()) || inputs.force_release == true)
     steps:
       - name: Determine version
         id: version
