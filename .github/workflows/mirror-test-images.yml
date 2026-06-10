@@ -23,6 +23,10 @@ jobs:
         image:
           - upstream: docker.io/library/alpine:latest
             mirror: ghcr.io/blackleafdigital/zlayer-test-alpine:latest
+    env:
+      # skopeo's default auth path is /run/containers/$UID/auth.json which
+      # is not writable in the Actions container. Point it at a tempfile.
+      REGISTRY_AUTH_FILE: /tmp/skopeo-auth.json
     steps:
       - name: Install skopeo
         run: |
@@ -30,16 +34,23 @@ jobs:
           sudo apt-get install -y skopeo
 
       - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: |
+          install -m 600 /dev/null "$REGISTRY_AUTH_FILE"
+          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin \
+            --authfile "$REGISTRY_AUTH_FILE"
 
       - name: Copy ${{ matrix.image.upstream }} -> ${{ matrix.image.mirror }}
         run: |
           set -euo pipefail
           echo "Copying all platforms from ${{ matrix.image.upstream }} to ${{ matrix.image.mirror }}"
           skopeo copy --all \
+            --dest-authfile "$REGISTRY_AUTH_FILE" \
             docker://${{ matrix.image.upstream }} \
             docker://${{ matrix.image.mirror }}
 
       - name: Verify mirror is pullable
         run: |
-          skopeo inspect docker://${{ matrix.image.mirror }} | head -40
+          skopeo inspect \
+            --authfile "$REGISTRY_AUTH_FILE" \
+            docker://${{ matrix.image.mirror }} | head -40
