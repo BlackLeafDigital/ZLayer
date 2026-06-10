@@ -816,6 +816,13 @@ jobs:
             -e 's|github.com/GIT_USER_ID/GIT_REPO_ID/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
             -e 's|github.com/BlackLeafDigital/ZLayer/clients/go/zlayer|github.com/BlackLeafDigital/ZLayer/clients/go|g' \
             {} +
+          # OpenAPI Generator's `test/*_test.go` files self-import the module
+          # path (`openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"`),
+          # which Go rejects as "no required module provides package …" when the
+          # tests live INSIDE the module they're testing. The generated tests
+          # are pure boilerplate (`assert.NotNil(apiClient)` shells); strip them
+          # so `go vet ./...` and downstream consumers can compile the module.
+          rm -rf clients/go/test
           # Sanity: confirm the stamp actually landed in UserAgent.
           grep -q "OpenAPI-Generator/${VER}/go" clients/go/configuration.go
           # Build to catch any syntax fallout from the substitution.
