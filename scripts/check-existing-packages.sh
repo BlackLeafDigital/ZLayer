@@ -30,8 +30,14 @@ missing=0
 found=0
 
 for artifact in "${BINARIES[@]}" "${IMAGES[@]}"; do
-  http_code=$(curl -sI -o /dev/null -w "%{http_code}" --user "$AUTH" "${PKG_URL}/${artifact}" 2>/dev/null) || http_code="000"
-  if [ "$http_code" = "200" ]; then
+  # 1-byte ranged GET, NOT HEAD. Forgejo's generic-packages router does
+  # not register a HEAD handler — chi returns 405 (Method Not Allowed)
+  # for every HEAD probe, so the old `curl -sI` flow counted every
+  # artifact as "MISSING" regardless of whether it was published. A
+  # ranged GET returns 206 for present, 404 for missing, 405-free.
+  # Same pattern the verify-artifact action uses.
+  http_code=$(curl -s --range 0-0 -o /dev/null -w "%{http_code}" --user "$AUTH" "${PKG_URL}/${artifact}" 2>/dev/null) || http_code="000"
+  if [ "$http_code" = "200" ] || [ "$http_code" = "206" ]; then
     echo "  EXISTS ${artifact}"
     found=$((found + 1))
   else

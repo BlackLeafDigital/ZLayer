@@ -123,8 +123,9 @@ jobs:
         working-directory: crates/zlayer-py
         run: uvx maturin build --release --target x86_64-unknown-linux-gnu --manylinux 2_28 --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: wheels-linux-x86_64
           path: crates/zlayer-py/dist/*.whl
           retention-days: 7
@@ -191,8 +192,9 @@ jobs:
         working-directory: crates/zlayer-py
         run: uvx maturin build --release --target aarch64-unknown-linux-gnu --manylinux 2_28 --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: wheels-linux-aarch64
           path: crates/zlayer-py/dist/*.whl
           retention-days: 7
@@ -237,8 +239,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '10.13'
         run: uvx maturin build --release --target x86_64-apple-darwin --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: wheels-macos-x86_64
           path: crates/zlayer-py/dist/*.whl
           retention-days: 7
@@ -281,8 +284,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: uvx maturin build --release --target aarch64-apple-darwin --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: wheels-macos-aarch64
           path: crates/zlayer-py/dist/*.whl
           retention-days: 7
@@ -334,8 +338,9 @@ jobs:
         working-directory: crates/zlayer-py
         run: uvx maturin build --release --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: wheels-windows-x86_64
           path: crates/zlayer-py/dist/*.whl
           retention-days: 7
@@ -373,8 +378,9 @@ jobs:
         working-directory: crates/zlayer-py
         run: uvx maturin sdist --out dist
 
-      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: sdist
           path: crates/zlayer-py/dist/*.tar.gz
           retention-days: 7
@@ -411,8 +417,9 @@ jobs:
 
       - name: Download all wheel artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/download-artifacts@main
+        uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           path: dist
           merge-multiple: true
 

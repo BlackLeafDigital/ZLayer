@@ -199,15 +199,17 @@ jobs:
         run: tar czf "zlayer-completions.tar.gz" completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
           retention-days: 1
       - name: Upload completions artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-completions
           path: zlayer-completions.tar.gz
           retention-days: 1
@@ -341,8 +343,9 @@ jobs:
             -C "target/x86_64-unknown-linux-musl/release" zlayer
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-linux-amd64-musl
           path: zlayer-linux-amd64-musl.tar.gz
           retention-days: 1
@@ -435,8 +438,9 @@ jobs:
           tar czf "zlayer-darwin-arm64.tar.gz" -C "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
           retention-days: 1
@@ -561,15 +565,17 @@ jobs:
           cp target/release/zlayer.exe hcs-artifact/zlayer-windows-amd64-hcs.exe
       - name: Upload artifact (primary)
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-windows-amd64
           path: zlayer-windows-amd64.zip
           retention-days: 1
       - name: Upload artifact (-hcs.exe compat alias)
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-windows-amd64-hcs
           path: hcs-artifact/zlayer-windows-amd64-hcs.exe
           retention-days: 1
@@ -620,8 +626,9 @@ jobs:
           cross-platform: 'true'
       - name: Download zlayer
         if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/download-artifacts@main
+        uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-linux-amd64
       - name: Install zlayer
         if: steps.check.outputs.completed != 'true'
@@ -651,8 +658,9 @@ jobs:
 
       - name: Upload image artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: container-images
           path: |
             zlayer-node-oci.tar
@@ -722,8 +730,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends curl ca-certificates python3-yaml tar gzip
       - name: Download zlayer linux-amd64 (musl static) artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/download-artifacts@main
+        uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-linux-amd64-musl
       - name: Look up current Alpine minirootfs version
         if: steps.check.outputs.completed != 'true'
@@ -894,8 +903,9 @@ jobs:
           grep -E '(^|/)sbin/(ip|iptables)$' "$listing" | head -5 || true
       - name: Upload rootfs artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-rootfs
           path: zlayer-rootfs.tar.gz
           retention-days: 1
@@ -969,8 +979,9 @@ jobs:
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
       - name: Download shell completions
         if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/download-artifacts@main
+        uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-completions
       - name: Unpack completions
         if: steps.check.outputs.completed != 'true'
@@ -987,8 +998,9 @@ jobs:
         run: tar czf "zlayer-darwin-amd64.tar.gz" -C "$CARGO_TARGET_DIR/x86_64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
           retention-days: 1
@@ -1106,8 +1118,9 @@ jobs:
         run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer zlayer-buildd completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
           retention-days: 1
@@ -1167,17 +1180,18 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
-      # Sequential downloader (concurrency=1) — sidesteps the 30 s
-      # per-request timeout hardcoded in @actions/artifact's
-      # streamExtractExternal that trips when N parallel streams share
-      # the runner's bandwidth and the slowest one (container-images,
-      # 226 MB) can't finish in time. With concurrency=1 each stream
-      # gets the full link and the largest artifact finishes in a
-      # handful of seconds.
+      # Bulk download of every artifact the build jobs uploaded for this
+      # run via `Public/actions/upload-artifact` into the Forgejo generic-
+      # package zlayer-artifacts/<run_id>/. No `name:` = enumerate every
+      # file in this run's package version and extract each into
+      # artifacts/<name>/. Bypasses the Forgejo Actions Artifact API
+      # entirely (which is incompatible with @actions/artifact v2+ and
+      # has a 30s per-request timeout that flakes on big artifacts).
       - name: Download all artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/download-artifacts@main
+        uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main
         with:
+          token: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           path: artifacts
 
       - name: List artifacts for debugging
