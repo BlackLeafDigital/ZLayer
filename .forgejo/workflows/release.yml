@@ -642,15 +642,16 @@ jobs:
             url="${PKG_URL}/${file}"
             local_size=$(stat -c%s "$file")
 
-            # Version-pinned OCI archives are immutable. The previous
-            # size-match check kept triggering a DELETE + re-PUT on re-runs
-            # because buildah's OCI tar output isn't byte-reproducible
-            # (embedded layer timestamps). Forgejo's 409 on the re-PUT was
-            # the visible symptom. Treat any existing remote file as done.
-            remote_size=$(curl -sI --user "$AUTH" "$url" 2>/dev/null \
-              | grep -i content-length | tail -1 | tr -dc '0-9') || true
-            if [ -n "$remote_size" ] && [ "$remote_size" -gt 0 ]; then
-              echo "= Skipping $file (already uploaded, ${remote_size} bytes remote vs ${local_size} bytes local — treating as immutable)"
+            # Version-pinned OCI archives are immutable. Forgejo's generic
+            # packages endpoint rejects HEAD with HTTP 405 (allow: GET, PUT,
+            # DELETE), so the prior `curl -sI` returned empty headers and
+            # the skip check always fell through → PUT → 409. Use a tiny
+            # ranged GET instead: 200/206 = file exists, 404 = doesn't.
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+              --request GET --range 0-0 --max-time 30 --connect-timeout 10 \
+              --user "$AUTH" "$url" 2>/dev/null || echo "000")
+            if [ "$http_code" = "200" ] || [ "$http_code" = "206" ]; then
+              echo "= Skipping $file (already uploaded, HTTP $http_code, ${local_size} bytes local)"
               continue
             fi
 

@@ -71,12 +71,35 @@ jobs:
       - name: Install system deps (yum, inside manylinux)
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          # `protobuf-devel` ships /usr/include/google/protobuf/*.proto, which
-          # tonic-prost-build needs when cluster.proto does
-          # `import "google/protobuf/timestamp.proto"`. The bare
-          # `protobuf-compiler` package only installs the protoc binary.
-          packages: 'protobuf-compiler protobuf-devel pkg-config openssl-devel libseccomp-devel clang-devel'
+          # AlmaLinux 8's `protobuf-devel` (a) lives in the CRB repo which
+          # manylinux images don't enable, and (b) splits well-known .proto
+          # files into a non-standard search path that protoc 3.x from the
+          # RPM doesn't auto-include. Use the official protobuf release
+          # below for protoc + the bundled well-known protos.
+          packages: 'pkg-config openssl-devel libseccomp-devel clang-devel unzip'
           cross-platform: 'true'
+
+      - name: Install protoc from official release
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pin to the latest protoc release; the zip bundles
+          # `include/google/protobuf/*.proto` which protoc's default search
+          # path (`<exe>/../include`) covers. That resolves the
+          # `import "google/protobuf/timestamp.proto"` in cluster.proto
+          # without any extra -I flags from build.rs.
+          PROTOC_TAG=$(curl -sSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | grep -oE '"tag_name":\s*"v[0-9.]+"' | grep -oE '[0-9.]+')
+          if [ -z "${PROTOC_TAG}" ]; then
+            echo "Failed to resolve latest protoc tag" >&2
+            exit 1
+          fi
+          echo "Installing protoc v${PROTOC_TAG} (linux-x86_64)"
+          curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_TAG}/protoc-${PROTOC_TAG}-linux-x86_64.zip"
+          unzip -o /tmp/protoc.zip -d /usr/local
+          chmod +x /usr/local/bin/protoc
+          /usr/local/bin/protoc --version
+          ls /usr/local/include/google/protobuf/timestamp.proto
+          echo "PROTOC=/usr/local/bin/protoc" >> "${GITHUB_ENV}"
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
@@ -125,10 +148,27 @@ jobs:
       - name: Install system deps (yum, inside manylinux)
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          # See comment on the x86_64 job above — `protobuf-devel` provides
-          # the well-known .proto headers tonic-prost-build needs.
-          packages: 'protobuf-compiler protobuf-devel pkg-config openssl-devel libseccomp-devel clang-devel'
+          # See the x86_64 job above for why we install protoc from the
+          # official protobuf release rather than via `protobuf-devel`.
+          packages: 'pkg-config openssl-devel libseccomp-devel clang-devel unzip'
           cross-platform: 'true'
+
+      - name: Install protoc from official release
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_TAG=$(curl -sSL https://api.github.com/repos/protocolbuffers/protobuf/releases/latest | grep -oE '"tag_name":\s*"v[0-9.]+"' | grep -oE '[0-9.]+')
+          if [ -z "${PROTOC_TAG}" ]; then
+            echo "Failed to resolve latest protoc tag" >&2
+            exit 1
+          fi
+          echo "Installing protoc v${PROTOC_TAG} (linux-aarch_64)"
+          curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_TAG}/protoc-${PROTOC_TAG}-linux-aarch_64.zip"
+          unzip -o /tmp/protoc.zip -d /usr/local
+          chmod +x /usr/local/bin/protoc
+          /usr/local/bin/protoc --version
+          ls /usr/local/include/google/protobuf/timestamp.proto
+          echo "PROTOC=/usr/local/bin/protoc" >> "${GITHUB_ENV}"
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
@@ -872,18 +912,16 @@ jobs:
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-sdk-c/${VERSION}/${TARBALL}"
           local_size=$(stat -c%s "${TARBALL}")
-          # Version-pinned artifacts are supposed to be immutable — if ANY file
-          # is already uploaded at this URL, treat it as "done" rather than
-          # comparing sizes. Size comparison would be reliable only if `tar`
-          # produced byte-identical archives, and it doesn't (mtime, ownership,
-          # and the gzip header all shift run-to-run). The previous size-match
-          # approach therefore hit the DELETE branch on every re-run, and
-          # Forgejo's generic-package DELETE is racy enough that the follow-up
-          # PUT landed a 409. Immutable-by-version is the correct contract.
-          remote_size=$(curl -sI --user "${AUTH}" "${URL}" 2>/dev/null \
-            | grep -i content-length | tail -1 | tr -dc '0-9') || true
-          if [ -n "${remote_size}" ] && [ "${remote_size}" -gt 0 ]; then
-            echo "= Skipping ${TARBALL} (already uploaded at ${URL}, ${remote_size} bytes remote vs ${local_size} bytes local — treating as immutable)"
+          # Version-pinned artifacts are immutable. Forgejo's generic-packages
+          # endpoint rejects HEAD with HTTP 405 (allow: GET, PUT, DELETE), so
+          # `curl -sI` returns empty headers and the size-check falls through →
+          # PUT → 409. Use a tiny ranged GET instead: 200/206 = file exists,
+          # 404 = doesn't.
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --request GET --range 0-0 --max-time 30 --connect-timeout 10 \
+            --user "${AUTH}" "${URL}" 2>/dev/null || echo "000")
+          if [ "${http_code}" = "200" ] || [ "${http_code}" = "206" ]; then
+            echo "= Skipping ${TARBALL} (already uploaded at ${URL}, HTTP ${http_code}, ${local_size} bytes local)"
             exit 0
           fi
           echo "Uploading ${TARBALL} (${local_size} bytes)..."
