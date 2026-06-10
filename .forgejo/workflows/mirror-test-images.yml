@@ -35,7 +35,10 @@ jobs:
 
       - name: Login to GHCR
         run: |
-          install -m 600 /dev/null "$REGISTRY_AUTH_FILE"
+          # skopeo reads the authfile before login to merge with existing entries.
+          # An empty file fails JSON parse, so seed with "{}".
+          umask 077
+          printf '{}' > "$REGISTRY_AUTH_FILE"
           echo "${{ secrets.GH_ACCESS_TOKEN }}" | skopeo login ghcr.io \
             -u "${{ github.actor }}" --password-stdin \
             --authfile "$REGISTRY_AUTH_FILE"
