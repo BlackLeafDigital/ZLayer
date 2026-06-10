@@ -59,7 +59,9 @@ async fn ensure_test_image(runtime: &DockerRuntime) {
     match tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("Failed to pre-pull {TEST_IMAGE}: {e}"),
-        Err(_) => panic!("Timed out pulling {TEST_IMAGE} after {LONG_TIMEOUT:?}"),
+        Err(elapsed) => {
+            panic!("Timed out pulling {TEST_IMAGE} after {LONG_TIMEOUT:?}: {elapsed}")
+        }
     }
 }
 
