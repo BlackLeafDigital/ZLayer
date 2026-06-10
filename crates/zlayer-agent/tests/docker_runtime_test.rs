@@ -28,8 +28,13 @@ use zlayer_spec::{
 // Test Configuration
 // =============================================================================
 
-/// Test image - alpine is small and fast to pull
-const TEST_IMAGE: &str = "alpine:latest";
+/// Test image — our GHCR mirror of `docker.io/library/alpine:latest`, refreshed
+/// monthly by `.forgejo/workflows/mirror-test-images.yml` (and the matching
+/// `.github/workflows/mirror-test-images.yml`). Using a self-hosted mirror
+/// avoids Docker Hub anonymous rate limits (100 pulls / 6h / source IP) that
+/// caused the runner to silently 429 and the suite to fail with cryptic
+/// "No such image" errors.
+const TEST_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer-test-alpine:latest";
 
 /// Timeout for operations that might take a while (like pulling images)
 const LONG_TIMEOUT: Duration = Duration::from_secs(120);
@@ -44,6 +49,18 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Attempt to connect to Docker. Returns None if Docker is not available.
 async fn skip_if_no_docker() -> Option<DockerRuntime> {
     DockerRuntime::new(None).await.ok()
+}
+
+/// Ensure `TEST_IMAGE` is present locally, panicking with a clear message if
+/// the pull fails. Replaces the older `let _ = pull_image(...).await;` pattern
+/// that swallowed registry errors and made every downstream `create_container`
+/// fail with a misleading 404.
+async fn ensure_test_image(runtime: &DockerRuntime) {
+    match tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("Failed to pre-pull {TEST_IMAGE}: {e}"),
+        Err(_) => panic!("Timed out pulling {TEST_IMAGE} after {LONG_TIMEOUT:?}"),
+    }
 }
 
 /// Generate a unique container name with random suffix to avoid conflicts
@@ -275,7 +292,7 @@ async fn test_pull_image_if_not_present() {
 
     // First, ensure the image exists by pulling it
     println!("Ensuring image exists: {TEST_IMAGE}");
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     // Now pull with IfNotPresent - this should be instant since image exists
     println!("Testing IfNotPresent policy (should skip pull)");
@@ -320,7 +337,7 @@ async fn test_container_lifecycle() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("lifecycle");
     let spec = create_sleep_spec(300); // Sleep for 5 minutes (we'll stop it early)
@@ -405,7 +422,7 @@ async fn test_container_logs() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("logs");
     let test_message = "Hello from ZLayer Docker test!";
@@ -477,7 +494,7 @@ async fn test_container_exec() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("exec");
     let spec = create_sleep_spec(300); // Long-running container
@@ -549,7 +566,7 @@ async fn test_container_stats() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("stats");
     let spec = create_sleep_spec(300); // Long-running container
@@ -610,7 +627,7 @@ async fn test_wait_container_success() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("wait-success");
     let _guard = ContainerGuard::new(runtime.clone(), id.clone());
@@ -656,7 +673,7 @@ async fn test_wait_container_failure() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("wait-nonzero");
     let _guard = ContainerGuard::new(runtime.clone(), id.clone());
@@ -729,7 +746,7 @@ async fn test_wait_container_timing() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("wait-brief");
     let _guard = ContainerGuard::new(runtime.clone(), id.clone());
@@ -777,7 +794,7 @@ async fn test_concurrent_containers() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let container_count = 3;
     let mut guards = Vec::new();
@@ -976,7 +993,7 @@ async fn test_container_with_env() {
     let runtime = Arc::new(runtime);
 
     // Ensure image is available
-    let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
+    ensure_test_image(&runtime).await;
 
     let id = unique_container_id("env");
     let mut spec = create_test_spec(TEST_IMAGE);

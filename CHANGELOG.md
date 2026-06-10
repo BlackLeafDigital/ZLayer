@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.59.1 - 2026-06-10
+
+### Added
+- **CI: `mirror-test-images.yml` workflow on both Forgejo and GitHub Actions.** Monthly cron (`0 6 1 * *`) plus `workflow_dispatch` mirrors `docker.io/library/alpine:latest` to `ghcr.io/blackleafdigital/zlayer-test-alpine:latest` via `skopeo copy --all` (preserves the multi-arch manifest in one pass). Eliminates Docker Hub anonymous rate limits (100 pulls / 6h / source IP) as a flake source for the e2e suite on GHA runners with shared IP pools. (`.forgejo/workflows/mirror-test-images.yml`, `.github/workflows/mirror-test-images.yml`)
+
+### Changed
+- **Agent e2e tests now use the GHCR mirror.** `crates/zlayer-agent/tests/docker_runtime_test.rs` (TEST_IMAGE) and `crates/zlayer-agent/tests/youki_e2e.rs` (ALPINE_IMAGE) switched from `alpine:latest` / `docker.io/library/alpine:latest` to `ghcr.io/blackleafdigital/zlayer-test-alpine:latest`. The bundled deployment-spec YAML in `youki_e2e.rs` was updated to match.
+
+### Fixed
+- **Docker e2e tests now panic with a clear message when the test image cannot be pulled.** 10 of the `docker_runtime_test.rs` tests did `let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;` and then expected the image to exist — a Docker Hub 429 (rate-limited) silently produced `Failed to create container: ... No such image: alpine:latest` from the next `create_container` call instead of pointing at the actual cause. Hoisted the pull-and-assert into a single `ensure_test_image()` helper that maps `Err` and timeout to explicit panics, and replaced every `let _` call site with `ensure_test_image(&runtime).await;`. Combined with the GHCR mirror above, the test suite is no longer subject to Docker Hub rate limits in the common path and surfaces a usable error if the mirror is ever unreachable. (`crates/zlayer-agent/tests/docker_runtime_test.rs`)
+
 ## 0.59.0 - 2026-06-08
 
 ### Added

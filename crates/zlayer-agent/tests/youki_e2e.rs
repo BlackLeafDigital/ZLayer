@@ -53,8 +53,11 @@ fn e2e_test_dir() -> PathBuf {
         .join("zlayer-youki-e2e-test")
 }
 
-/// Test images
-const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
+/// Test image — our GHCR mirror of `docker.io/library/alpine:latest`, refreshed
+/// monthly by `.forgejo/workflows/mirror-test-images.yml` and the matching
+/// `.github/workflows/mirror-test-images.yml`. Avoids Docker Hub anonymous
+/// rate limits on shared runner IPs.
+const ALPINE_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer-test-alpine:latest";
 
 // =============================================================================
 // Skip Mechanism
@@ -219,7 +222,7 @@ services:
   alpine:
     rtype: service
     image:
-      name: docker.io/library/alpine:latest
+      name: ghcr.io/blackleafdigital/zlayer-test-alpine:latest
     endpoints:
       - name: dummy
         protocol: tcp

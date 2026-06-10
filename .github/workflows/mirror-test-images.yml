@@ -1,0 +1,45 @@
+name: Mirror Test Images
+
+# Mirror upstream test images we use in the e2e suite to our own GHCR
+# namespace so CI doesn't depend on Docker Hub rate limits. Refreshed
+# monthly so the mirror stays close to upstream :latest.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 1 * *'  # 1st of each month at 06:00 UTC
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: Mirror ${{ matrix.image.upstream }} -> ${{ matrix.image.mirror }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - upstream: docker.io/library/alpine:latest
+            mirror: ghcr.io/blackleafdigital/zlayer-test-alpine:latest
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy ${{ matrix.image.upstream }} -> ${{ matrix.image.mirror }}
+        run: |
+          set -euo pipefail
+          echo "Copying all platforms from ${{ matrix.image.upstream }} to ${{ matrix.image.mirror }}"
+          skopeo copy --all \
+            docker://${{ matrix.image.upstream }} \
+            docker://${{ matrix.image.mirror }}
+
+      - name: Verify mirror is pullable
+        run: |
+          skopeo inspect docker://${{ matrix.image.mirror }} | head -40
