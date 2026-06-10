@@ -382,13 +382,30 @@ impl BuildBackend for BuildahBackend {
         // Initialize the layer cache tracker for this build session.
         let mut cache_tracker = LayerCacheTracker::new();
 
+        // An empty host directory used as the source for `buildah copy` when
+        // translating WORKDIR instructions. `buildah copy <ctr> <empty>/.
+        // <dir>` materializes `<dir>` in the rootfs without running a process
+        // inside the container, so WORKDIR works on `gcr.io/distroless/*`,
+        // `scratch`, and other shell-less bases that the legacy
+        // `buildah run -- mkdir -p` path can't handle. Held for the entire
+        // build; dropped (auto-removed) when this function returns. The
+        // directory MUST stay empty — never write into it.
+        let workdir_empty_src = tempfile::Builder::new()
+            .prefix("zlayer-workdir-mkdir-")
+            .tempdir()
+            .map_err(BuildError::from)?;
+
         // Build a translator configured for this build. The BuildahBackend is
         // always Linux-targeted (Windows builds dispatch through HcsBackend),
         // so we pin `ImageOs::Linux` here. `host_network` is forwarded from
         // `BuildOptions` so the `--host-network` CLI flag actually reaches
         // every translated `RUN` as `--net=host` on the buildah invocation.
-        let translator =
-            DockerfileTranslator::new(ImageOs::Linux).with_host_network(options.host_network);
+        // `with_empty_src_dir` routes WORKDIR through `buildah copy` instead
+        // of `buildah run -- mkdir -p` so the build works on shell-less
+        // bases (distroless, scratch).
+        let translator = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(options.host_network)
+            .with_empty_src_dir(workdir_empty_src.path().to_path_buf());
 
         for (stage_idx, stage) in stages.iter().enumerate() {
             let is_final_stage = stage_idx == stages.len() - 1;

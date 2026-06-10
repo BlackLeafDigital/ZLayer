@@ -42,6 +42,7 @@ use crate::dockerfile::{
 };
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Default shell used for `RUN <cmd>` (shell form) on Linux targets.
 ///
@@ -506,6 +507,35 @@ impl BuildahCommand {
         cmd.arg(dest)
     }
 
+    /// Materialize a directory in the container rootfs without running a
+    /// process inside the container.
+    ///
+    /// Emits `buildah copy <container> <empty_src>/. <dest>` where
+    /// `empty_src` is an empty host directory. `buildah copy` creates
+    /// `<dest>` (and its parents) in the rootfs as part of the copy, and
+    /// because the source has no entries nothing is actually copied —
+    /// the net effect is `mkdir -p <dest>` on the rootfs, but executed by
+    /// buildah's filesystem code, not by a shell inside the container.
+    ///
+    /// This is the shell-free equivalent of
+    /// `BuildahCommand::run_exec_with_net(ctr, &["mkdir","-p", dir], …)`,
+    /// usable on distroless / scratch / any base image that lacks
+    /// `mkdir` / `/bin/sh`. Callers MUST keep the host source directory
+    /// alive (and empty) for the lifetime of this command's execution.
+    #[must_use]
+    pub fn copy_empty_dir(container: &str, empty_src: &Path, dest: &str) -> Self {
+        // `<empty_src>/.` (note trailing `/.`) tells buildah to copy the
+        // contents of the source, not the directory entry itself. With no
+        // entries this is a no-op materialization that still creates the
+        // destination path in the rootfs.
+        let mut src = empty_src.to_string_lossy().into_owned();
+        if !src.ends_with('/') {
+            src.push('/');
+        }
+        src.push('.');
+        Self::new("copy").arg(container).arg(src).arg(dest)
+    }
+
     /// Copy with all options from `CopyInstruction`
     #[must_use]
     pub fn copy_instruction(container: &str, copy: &CopyInstruction) -> Self {
@@ -916,6 +946,15 @@ pub struct DockerfileTranslator {
     /// buildah's CNI/netavark plumbing entirely (the container shares the
     /// host's network namespace).
     host_network: bool,
+    /// Path to an empty host directory the translator can point `buildah
+    /// copy` at to materialize a `WORKDIR` directory in the container
+    /// rootfs without running a process inside the container. Required for
+    /// images whose base lacks a shell (`gcr.io/distroless/*`, `scratch`).
+    /// When `None`, [`Self::translate_workdir`] falls back to the legacy
+    /// `buildah run -- mkdir -p <dir>` path, which only works on bases
+    /// that ship `mkdir`. Production callers (the `BuildahBackend`) MUST
+    /// set this; tests and doc snippets can leave it unset.
+    empty_src_dir: Option<PathBuf>,
 }
 
 impl DockerfileTranslator {
@@ -926,7 +965,25 @@ impl DockerfileTranslator {
             target_os,
             shell_override: None,
             host_network: false,
+            empty_src_dir: None,
         }
+    }
+
+    /// Point `WORKDIR` translation at an empty host directory used as the
+    /// source for `buildah copy`, which materializes the workdir in the
+    /// container rootfs without executing a process inside the container.
+    ///
+    /// Without this, `WORKDIR` falls back to `buildah run -- mkdir -p <dir>`,
+    /// which fails on distroless / scratch images that lack a shell.
+    /// Production callers (the `BuildahBackend`'s build loop) should create
+    /// a `TempDir` for the lifetime of the build and pass its path here.
+    /// The translator does NOT own the directory's lifecycle — callers
+    /// must keep it alive (and empty) until every translated WORKDIR
+    /// `buildah copy` command has finished executing.
+    #[must_use]
+    pub fn with_empty_src_dir(mut self, dir: PathBuf) -> Self {
+        self.empty_src_dir = Some(dir);
+        self
     }
 
     /// Force every translated `RUN` instruction to use host networking.
@@ -1107,14 +1164,29 @@ impl DockerfileTranslator {
         let net = self.host_network.then_some(RunNetwork::Host);
         match self.target_os {
             ImageOs::Linux => {
-                vec![
-                    BuildahCommand::run_exec_with_net(
-                        container,
-                        &["mkdir".to_string(), "-p".to_string(), dir.to_string()],
-                        net,
-                    ),
-                    BuildahCommand::config_workdir(container, dir),
-                ]
+                // Prefer the shell-free `buildah copy` path when the caller
+                // supplied an empty source directory. `buildah copy <ctr>
+                // <empty>/. <dir>` materializes `<dir>` in the rootfs
+                // without running anything inside the container, so this
+                // works on distroless / scratch / any base lacking
+                // `/bin/sh` / `mkdir`. Falls back to the legacy
+                // `buildah run -- mkdir -p` path when no source dir is
+                // configured (tests, docs, callers that haven't migrated).
+                if let Some(empty_src) = self.empty_src_dir.as_deref() {
+                    vec![
+                        BuildahCommand::copy_empty_dir(container, empty_src, dir),
+                        BuildahCommand::config_workdir(container, dir),
+                    ]
+                } else {
+                    vec![
+                        BuildahCommand::run_exec_with_net(
+                            container,
+                            &["mkdir".to_string(), "-p".to_string(), dir.to_string()],
+                            net,
+                        ),
+                        BuildahCommand::config_workdir(container, dir),
+                    ]
+                }
             }
             ImageOs::Windows => {
                 // Quote the path so paths with spaces (e.g. `C:\Program Files\app`)
@@ -2440,6 +2512,45 @@ mod tests {
         let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].args, vec!["run", "c1", "--", "mkdir", "-p", "/app"]);
+        assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_linux_with_empty_src_dir() {
+        // When configured with an empty source directory (the production
+        // BuildahBackend path), WORKDIR translates to `buildah copy
+        // <empty>/. <dir>` instead of `buildah run -- mkdir -p <dir>`.
+        // That's the shell-free path that works on distroless / scratch /
+        // any base lacking `/bin/sh`.
+        let empty = std::path::PathBuf::from("/tmp/zlayer-empty-test");
+        let mut t = DockerfileTranslator::new(ImageOs::Linux).with_empty_src_dir(empty);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0].args,
+            vec!["copy", "c1", "/tmp/zlayer-empty-test/.", "/app"],
+            "WORKDIR with empty_src_dir must emit `buildah copy <empty>/. <dir>` to materialize the dir without running a shell",
+        );
+        assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_linux_with_empty_src_dir_ignores_host_network() {
+        // `buildah copy` never executes anything inside the container, so
+        // `--net=host` is irrelevant to it. The host_network flag should
+        // affect RUN translations only, not the COPY-based WORKDIR path.
+        let empty = std::path::PathBuf::from("/var/tmp/empty");
+        let mut t = DockerfileTranslator::new(ImageOs::Linux)
+            .with_host_network(true)
+            .with_empty_src_dir(empty);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            !cmds[0].args.iter().any(|a| a.starts_with("--net")),
+            "buildah copy must never carry --net flags, got: {:?}",
+            cmds[0].args
+        );
+        assert_eq!(cmds[0].args[0], "copy");
         assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
     }
 

@@ -152,6 +152,22 @@ fi
 sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
 sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
+# Install zlayer-buildd alongside zlayer when the tarball ships it. The Go
+# sidecar provides the native `imagebuildah.BuildDockerfiles` code path
+# that handles WORKDIR against shell-less bases (distroless, scratch);
+# without it, `zlayer build` falls back to `buildah run -- mkdir -p` which
+# can't execute against a distroless rootfs. discover()
+# (crates/zlayer-builder/src/backend/buildah_sidecar/discover.rs) searches
+# $PATH for `zlayer-buildd`, so dropping it next to `zlayer` lights up the
+# sidecar automatically. The conditional keeps install.sh backward-
+# compatible with older tarballs that didn't ship buildd.
+BUILDD_PATH="$(find "$TMPDIR" -name "zlayer-buildd" -type f | head -1)"
+if [ -n "$BUILDD_PATH" ]; then
+    sudo cp "$BUILDD_PATH" "${INSTALL_DIR}/zlayer-buildd"
+    sudo chmod +x "${INSTALL_DIR}/zlayer-buildd"
+    echo "Installed zlayer-buildd (buildah sidecar) to ${INSTALL_DIR}/zlayer-buildd"
+fi
+
 # --- SELinux: relabel binary so systemd's init_t can exec it ---
 # Files under /var/lib inherit var_lib_t, which init_t cannot exec as a
 # service entrypoint. Set bin_t via semanage (persistent) + restorecon,

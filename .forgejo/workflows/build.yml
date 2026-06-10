@@ -140,7 +140,10 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git'
+          # libgpgme-dev / libassuan-dev / libgpg-error-dev are added so the
+          # `zlayer-buildd` cgo build below links against the system gpgme
+          # stack (buildah needs it for signed-image flows).
+          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git libgpgme-dev libassuan-dev libgpg-error-dev'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -151,6 +154,26 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer || cargo build --release --package zlayer
+      - name: Set up Go (for zlayer-buildd sidecar)
+        if: steps.check.outputs.completed != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Build zlayer-buildd sidecar
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        working-directory: bin/zlayer-buildd
+        # Cross-builds to `release/zlayer-buildd-linux-amd64`. Bundling this
+        # binary alongside `zlayer` in the tarball makes the sidecar
+        # auto-discoverable via `$PATH` (see
+        # `backend/buildah_sidecar/discover.rs`), so `zlayer build` on any
+        # CI runner that installed this tarball gets the native
+        # `imagebuildah.BuildDockerfiles` path that handles distroless
+        # WORKDIR correctly.
+        run: |
+          set -euo pipefail
+          make release-amd64
+          test -x release/zlayer-buildd-linux-amd64
       - name: Generate shell completions
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -165,7 +188,12 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: |
           cp -r completions "$CARGO_TARGET_DIR/release/completions"
-          tar czf "zlayer-linux-amd64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer completions
+          # Drop the buildd binary next to `zlayer` under its canonical name
+          # so `discover()` finds it via `$PATH` after `install.sh` extracts
+          # everything in the tarball into `/usr/local/bin/`.
+          cp bin/zlayer-buildd/release/zlayer-buildd-linux-amd64 "$CARGO_TARGET_DIR/release/zlayer-buildd"
+          chmod +x "$CARGO_TARGET_DIR/release/zlayer-buildd"
+          tar czf "zlayer-linux-amd64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer zlayer-buildd completions
       - name: Package completions (standalone)
         if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-completions.tar.gz" completions
@@ -1023,7 +1051,10 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git'
+          # libgpgme-dev / libassuan-dev / libgpg-error-dev are added so the
+          # `zlayer-buildd` cgo build below links against the system gpgme
+          # stack (buildah needs it for signed-image flows).
+          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git libgpgme-dev libassuan-dev libgpg-error-dev'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -1034,6 +1065,26 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer
+      - name: Set up Go (for zlayer-buildd sidecar)
+        if: steps.check.outputs.completed != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Build zlayer-buildd sidecar
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        working-directory: bin/zlayer-buildd
+        # Native arm64 runner: `make release-arm64` detects `uname -m`
+        # and uses the host `cc`, no cross-compiler needed. Bundling this
+        # binary alongside `zlayer` in the tarball makes the sidecar
+        # auto-discoverable on any CI runner that installs the tarball,
+        # so `WORKDIR` against distroless bases hits the native
+        # `imagebuildah.BuildDockerfiles` path instead of the broken
+        # `buildah run -- mkdir` fallback.
+        run: |
+          set -euo pipefail
+          make release-arm64
+          test -x release/zlayer-buildd-linux-arm64
       - name: Generate shell completions
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -1046,9 +1097,13 @@ jobs:
           "$CARGO_TARGET_DIR/release/zlayer" completions powershell > completions/zlayer.ps1
           "$CARGO_TARGET_DIR/release/zlayer" completions elvish > completions/zlayer.elv
           cp -r completions "$CARGO_TARGET_DIR/release/completions"
+          # Drop the buildd binary next to `zlayer` under its canonical name
+          # so `discover()` finds it on `$PATH` after install.
+          cp bin/zlayer-buildd/release/zlayer-buildd-linux-arm64 "$CARGO_TARGET_DIR/release/zlayer-buildd"
+          chmod +x "$CARGO_TARGET_DIR/release/zlayer-buildd"
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer completions
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer zlayer-buildd completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
