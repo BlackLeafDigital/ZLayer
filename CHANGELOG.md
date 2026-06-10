@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.59.2 - 2026-06-10
+
+### Fixed
+- **CI: artifact download in `upload-temp-packages` and adjacent jobs was flaking with "Artifact download failed after 5 retries" since v0.12.1.** Root cause: `@actions/artifact`'s `streamExtractExternal` (called by `christopherhx/gitea-download-artifact@v4`) has a hardcoded 30 s per-request timeout, and the underlying `downloadArtifact()` fires all artifacts in parallel. With 10 artifacts in flight against a self-hosted Forgejo on an asymmetric link, the largest (`container-images`, 226 MB) couldn't sustain ~7.5 MB/s × 30 s while sharing bandwidth with 9 other streams, tripped the timeout, burned through its 5-retry budget, then took the other in-flight streams down with it. v0.12.1's zlayer-buildd bundling (~30-40 MB added to each linux tarball) pushed the cohort over the cliff. Fixed by writing a new `download-artifacts` action at `forge.blackleafdigital.com/Public/actions/download-artifacts@main` that mirrors `actions/download-artifact@v4`'s input surface but executes downloads **sequentially** by default (configurable via `concurrency` input). Each artifact alone owns the full link bandwidth and finishes well inside the 30 s ceiling. Swapped all 4 `christopherhx/gitea-download-artifact@v4` call sites in `.forgejo/workflows/build.yml` plus the one in `publish-sdks.yml:414`. On-disk layout matches the prior action so downstream `scripts/upload-packages.sh` keeps working unchanged. (`.forgejo/workflows/build.yml`, `.forgejo/workflows/publish-sdks.yml`, new action in `Public/actions/download-artifacts/`)
+
 ## 0.59.1 - 2026-06-10
 
 ### Added
