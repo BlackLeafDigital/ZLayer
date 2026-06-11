@@ -92,10 +92,14 @@ done
 for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.zip "${ARTIFACTS_DIR}"/*.zip "${ARTIFACTS_DIR}"/*/*.zip; do
   [ -f "$artifact" ] && files+=("$artifact")
 done
-# Windows .exe compat alias (zlayer-windows-amd64-hcs.exe); drop after next release.
-for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.exe "${ARTIFACTS_DIR}"/*.exe "${ARTIFACTS_DIR}"/*/*.exe; do
+# Windows .exe compat alias (zlayer-windows-amd64-hcs.exe).
+# `find` handles arbitrary depth — older upload-artifact wrappers nested the
+# .exe under the caller's path prefix (e.g. zlayer-X/hcs-artifact/Y.exe), so
+# a depth-2 glob would miss it. Sticking with `find -type f` covers every
+# upload-artifact behaviour past and present without hardcoding depths.
+while IFS= read -r artifact; do
   [ -f "$artifact" ] && files+=("$artifact")
-done
+done < <(find "$ARTIFACTS_DIR" -type f -name '*.exe' 2>/dev/null)
 # Container images
 for archive in "${ARTIFACTS_DIR}"/container-images/*.tar; do
   [ -f "$archive" ] && files+=("$archive")
