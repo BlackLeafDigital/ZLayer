@@ -1923,9 +1923,11 @@ impl Runtime for SandboxRuntime {
     ///   reference recorded by `pull_image_with_policy`) when that file is
     ///   present and non-empty, otherwise the sanitized directory name (older
     ///   images pulled before the `ref` file existed).
-    /// - `size_bytes` is the LOGICAL byte sum of the directory tree (see
-    ///   [`Self::dir_size_bytes`]; APFS copy-on-write sharing means the true
-    ///   on-disk footprint may be smaller).
+    /// - `size_bytes` is the LOGICAL byte sum of the extracted `rootfs/` tree
+    ///   (see [`Self::dir_size_bytes`]); metadata files like `ref` are excluded
+    ///   so the value reflects the image payload. APFS copy-on-write sharing
+    ///   means the true on-disk footprint may be smaller, and an image
+    ///   directory missing its `rootfs/` reports `Some(0)`.
     /// - `digest` is the registry digest recorded under the manifest-digest
     ///   cache key for the resolved reference, when the `blobs.redb` cache opens
     ///   and the entry is present. Any cache failure or miss leaves it `None`.
@@ -2006,9 +2008,12 @@ impl Runtime for SandboxRuntime {
                 Err(_) => name.clone(),
             };
 
-            // LOGICAL size of the rootfs tree (APFS CoW caveat documented on
-            // `dir_size_bytes`).
-            let size_bytes = Some(Self::dir_size_bytes(&dir).await);
+            // LOGICAL byte sum of the extracted `rootfs/` tree only; metadata
+            // files like `ref` are deliberately excluded so the reported size
+            // matches the image payload (APFS CoW caveat documented on
+            // `dir_size_bytes`). A directory without a `rootfs/` reports
+            // `Some(0)` (read_dir error on the missing path is skipped).
+            let size_bytes = Some(Self::dir_size_bytes(&dir.join("rootfs")).await);
 
             // Best-effort registry digest from the manifest-digest cache key.
             // The key canonicalizes the reference internally, matching what the
