@@ -149,6 +149,11 @@ if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
     sleep 3
 fi
 
+# Remove the old binary BEFORE copying so the destination gets a fresh
+# inode. macOS caches a signed executable's code-directory hash per vnode
+# after exec; cp'ing new content over the exec'd binary in place leaves
+# that cache stale and the kernel SIGKILLs the next exec ("Killed: 9").
+sudo rm -f "${INSTALL_DIR}/${BINARY}"
 sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
 sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
@@ -163,6 +168,8 @@ sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 # compatible with older tarballs that didn't ship buildd.
 BUILDD_PATH="$(find "$TMPDIR" -name "zlayer-buildd" -type f | head -1)"
 if [ -n "$BUILDD_PATH" ]; then
+    # Fresh inode for the same macOS signature-cache reason as above.
+    sudo rm -f "${INSTALL_DIR}/zlayer-buildd"
     sudo cp "$BUILDD_PATH" "${INSTALL_DIR}/zlayer-buildd"
     sudo chmod +x "${INSTALL_DIR}/zlayer-buildd"
     echo "Installed zlayer-buildd (buildah sidecar) to ${INSTALL_DIR}/zlayer-buildd"

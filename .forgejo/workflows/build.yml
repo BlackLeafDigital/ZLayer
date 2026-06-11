@@ -435,7 +435,9 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: |
           cp -r completions "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/completions"
-          tar czf "zlayer-darwin-arm64.tar.gz" -C "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" zlayer completions
+          # COPYFILE_DISABLE stops bsdtar embedding AppleDouble ._* entries
+          # (com.apple.provenance xattrs) in the tarball.
+          COPYFILE_DISABLE=1 tar czf "zlayer-darwin-arm64.tar.gz" -C "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main
@@ -995,7 +997,8 @@ jobs:
           cp -r completions "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/completions"
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-darwin-amd64.tar.gz" -C "$CARGO_TARGET_DIR/x86_64-apple-darwin/release" zlayer completions
+        # COPYFILE_DISABLE: no AppleDouble ._* entries in the tarball.
+        run: COPYFILE_DISABLE=1 tar czf "zlayer-darwin-amd64.tar.gz" -C "$CARGO_TARGET_DIR/x86_64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/upload-artifact@main

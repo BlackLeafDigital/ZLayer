@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.59.3 - 2026-06-11
+
+### Fixed
+- **install.sh: upgrading on macOS killed the freshly-installed binary with SIGKILL (`Killed: 9`).** The script `sudo cp`'d the new binary over the existing `/usr/local/bin/zlayer` in place — same inode — right after exec'ing the old binary (`--version` probe, `daemon uninstall`). macOS caches a signed executable's code-directory hash per vnode, so the overwrite left a stale cache and the kernel SIGKILLed the very next exec (`zlayer daemon install`). Same bug class as golang/go#42684. install.sh now `rm -f`s the destination before each copy (zlayer and zlayer-buildd) so the new binary lands on a fresh inode. The released darwin binaries themselves were verified correctly ad-hoc signed (`LC_CODE_SIGNATURE` present); only the install path was at fault. (`install.sh`)
+- **macOS release tarballs no longer ship AppleDouble `._*` junk.** `zlayer-darwin-{arm64,amd64}.tar.gz` contained `._zlayer` / `completions/._*` entries (bsdtar encoding `com.apple.provenance` xattrs). Both Package steps now run tar with `COPYFILE_DISABLE=1`. (`.forgejo/workflows/build.yml`)
+
 ## 0.59.2 - 2026-06-10
 
 ### Fixed
