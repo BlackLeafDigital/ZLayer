@@ -201,7 +201,7 @@ pub async fn list_images_handler(
         .runtime
         .list_images()
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to list images: {e}")))?;
+        .map_err(|e| map_image_err("failed to list images", e))?;
     Ok(Json(images.into_iter().map(image_info_dto_from).collect()))
 }
 
@@ -237,7 +237,7 @@ pub async fn remove_image_handler(
         .runtime
         .remove_image(&image, q.force)
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to remove image: {e}")))?;
+        .map_err(|e| map_image_err("failed to remove image", e))?;
 
     state.event_bus.publish_image_deleted(image);
 
@@ -269,7 +269,7 @@ pub async fn prune_images_handler(
         .runtime
         .prune_images()
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to prune images: {e}")))?;
+        .map_err(|e| map_image_err("failed to prune images", e))?;
     Ok(Json(prune_result_dto_from(result)))
 }
 
@@ -529,16 +529,9 @@ pub async fn tag_image_handler(
         .runtime
         .tag_image(&source_str, &target_str)
         .await
-        .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { reason, .. } => {
-                ApiError::NotFound(format!("Source image not found: {reason}"))
-            }
-            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
-            zlayer_agent::AgentError::Unsupported(reason) => {
-                ApiError::Internal(format!("Runtime does not support tagging: {reason}"))
-            }
-            other => ApiError::Internal(format!("Failed to tag image: {other}")),
-        })?;
+        // `InvalidSpec` (malformed target reference → 400) and `Unsupported`
+        // (→ 501) are both routed by the shared helper, which also logs.
+        .map_err(|e| map_image_err("failed to tag image", e))?;
 
     state.event_bus.publish_image_tagged(source_str, target_str);
 
@@ -587,7 +580,7 @@ pub async fn inspect_image_handler(
         .runtime
         .inspect_image_native(&image)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to inspect image", e))?;
 
     let mut config = serde_json::Map::new();
     config.insert(
@@ -681,7 +674,7 @@ pub async fn image_history_handler(
         .runtime
         .image_history(&image)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to get image history", e))?;
     Ok(Json(history.into_iter().map(history_dto_from).collect()))
 }
 
@@ -702,7 +695,7 @@ pub async fn search_images_handler(
         .runtime
         .search_images(&q.term, q.limit)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to search images", e))?;
     Ok(Json(results.into_iter().map(search_dto_from).collect()))
 }
 
@@ -728,7 +721,7 @@ pub async fn save_images_handler(
         .runtime
         .save_images(&q.names)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to save images", e))?;
     let body_stream = stream.map(|res| match res {
         Ok(bytes) => Ok::<Bytes, std::io::Error>(bytes),
         Err(e) => Err(std::io::Error::other(format!("{e}"))),
@@ -772,7 +765,7 @@ pub async fn load_images_handler(
         .runtime
         .load_images(body, q.quiet)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to load images", e))?;
 
     let body_stream = stream.map(
         |res| -> std::result::Result<Bytes, std::convert::Infallible> {
@@ -831,7 +824,7 @@ pub async fn import_image_handler(
         .runtime
         .import_image(body, q.repo.as_deref(), q.tag.as_deref())
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to import image", e))?;
     Ok(Json(ImportImageResponse { id }))
 }
 
@@ -866,7 +859,7 @@ pub async fn commit_container_handler(
         .runtime
         .commit_container(&id, &opts)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to commit container", e))?;
     Ok(Json(CommitContainerResponse { id: outcome.id }))
 }
 
@@ -884,17 +877,34 @@ fn parse_container_id(raw: &str) -> zlayer_agent::runtime::ContainerId {
     zlayer_agent::runtime::ContainerId::new(raw.to_string(), 0)
 }
 
-/// Map an [`zlayer_agent::AgentError`] from an image method into the API's
-/// canonical error variants. Centralised so all the new handlers route
-/// `NotFound`, `Unsupported`, and `InvalidSpec` cleanly.
-fn map_image_err(err: zlayer_agent::AgentError) -> ApiError {
+/// Map a runtime [`zlayer_agent::AgentError`] from an image method into the
+/// API's canonical error variants, logging the underlying error (image handlers
+/// previously swallowed it into an unlogged 500).
+///
+/// `context` is a short human-readable label for the failing operation (e.g.
+/// `"failed to prune images"`). It is woven into the resulting message and also
+/// emitted as a structured field on the `error` trace event so an operator can
+/// correlate the 404/400/501/500 returned to the caller with a log line.
+///
+/// Routing:
+/// - [`zlayer_agent::AgentError::NotFound`] → `404 not_found`.
+/// - [`zlayer_agent::AgentError::InvalidSpec`] → `400 bad_request` (the bare
+///   reason is preserved so malformed-reference messages reach the caller intact).
+/// - [`zlayer_agent::AgentError::Unsupported`] → `501 not_implemented` (the
+///   runtime backend genuinely does not implement this operation — not a server
+///   fault).
+/// - everything else → `500 internal_error`.
+fn map_image_err(context: &str, err: zlayer_agent::AgentError) -> ApiError {
+    tracing::error!(error = %err, context, "image operation failed");
     match err {
-        zlayer_agent::AgentError::NotFound { reason, .. } => ApiError::NotFound(reason),
+        zlayer_agent::AgentError::NotFound { reason, .. } => {
+            ApiError::NotFound(format!("{context}: {reason}"))
+        }
         zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
         zlayer_agent::AgentError::Unsupported(reason) => {
-            ApiError::Internal(format!("Runtime does not support this operation: {reason}"))
+            ApiError::NotImplemented(format!("{context}: {reason}"))
         }
-        other => ApiError::Internal(format!("{other}")),
+        other => ApiError::Internal(format!("{context}: {other}")),
     }
 }
 
@@ -938,7 +948,7 @@ pub async fn export_container_handler(
         .runtime
         .export_container_fs(&id)
         .await
-        .map_err(map_image_err)?;
+        .map_err(|e| map_image_err("failed to export container", e))?;
     let body_stream = stream.map(|res| match res {
         Ok(bytes) => Ok::<Bytes, std::io::Error>(bytes),
         Err(e) => Err(std::io::Error::other(format!("{e}"))),
@@ -959,6 +969,132 @@ pub async fn export_container_handler(
 mod tests {
     use super::*;
     use crate::auth::Claims;
+
+    /// A runtime whose image operations are unsupported.
+    ///
+    /// `MockRuntime` overrides `prune_images`/`tag_image` to return `Ok`, so it
+    /// cannot exercise the `Unsupported` → 501 mapping. This wrapper delegates
+    /// every *required* `Runtime` method to an inner `MockRuntime` but leaves
+    /// the image-management methods (`prune_images`, `tag_image`, …) to the
+    /// trait defaults, which return [`zlayer_agent::AgentError::Unsupported`].
+    struct UnsupportedRuntime {
+        inner: zlayer_agent::MockRuntime,
+    }
+
+    impl UnsupportedRuntime {
+        fn new() -> Self {
+            Self {
+                inner: zlayer_agent::MockRuntime::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for UnsupportedRuntime {
+        async fn pull_image(&self, image: &str) -> zlayer_agent::Result<()> {
+            self.inner.pull_image(image).await
+        }
+
+        async fn pull_image_with_policy(
+            &self,
+            image: &str,
+            policy: PullPolicy,
+            auth: Option<&zlayer_spec::RegistryAuth>,
+            source: zlayer_spec::SourcePolicy,
+        ) -> zlayer_agent::Result<()> {
+            self.inner
+                .pull_image_with_policy(image, policy, auth, source)
+                .await
+        }
+
+        async fn create_container(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+            spec: &zlayer_spec::ServiceSpec,
+        ) -> zlayer_agent::Result<()> {
+            self.inner.create_container(id, spec).await
+        }
+
+        async fn start_container(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<()> {
+            self.inner.start_container(id).await
+        }
+
+        async fn stop_container(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+            timeout: std::time::Duration,
+        ) -> zlayer_agent::Result<()> {
+            self.inner.stop_container(id, timeout).await
+        }
+
+        async fn remove_container(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<()> {
+            self.inner.remove_container(id).await
+        }
+
+        async fn container_state(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<zlayer_agent::runtime::ContainerState> {
+            self.inner.container_state(id).await
+        }
+
+        async fn container_logs(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+            tail: usize,
+        ) -> zlayer_agent::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.container_logs(id, tail).await
+        }
+
+        async fn exec(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+            cmd: &[String],
+        ) -> zlayer_agent::Result<(i32, String, String)> {
+            self.inner.exec(id, cmd).await
+        }
+
+        async fn get_container_stats(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<zlayer_agent::cgroups_stats::ContainerStats> {
+            self.inner.get_container_stats(id).await
+        }
+
+        async fn wait_container(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<i32> {
+            self.inner.wait_container(id).await
+        }
+
+        async fn get_logs(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            self.inner.get_logs(id).await
+        }
+
+        async fn get_container_pid(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<Option<u32>> {
+            self.inner.get_container_pid(id).await
+        }
+
+        async fn get_container_ip(
+            &self,
+            id: &zlayer_agent::runtime::ContainerId,
+        ) -> zlayer_agent::Result<Option<std::net::IpAddr>> {
+            self.inner.get_container_ip(id).await
+        }
+    }
 
     /// Build an `AuthUser` with the operator role for direct handler tests.
     fn operator_user() -> AuthUser {
@@ -1213,17 +1349,20 @@ mod tests {
     }
 
     /// `inspect_image_handler` against a runtime with no native inspect
-    /// (the mock backend) returns the canonical 500 wrapping the
+    /// (the mock backend) returns a `501 not_implemented` wrapping the
     /// `Unsupported` error from the runtime.
     #[tokio::test]
-    async fn inspect_image_handler_unsupported_runtime_returns_500() {
+    async fn inspect_image_handler_unsupported_runtime_returns_501() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
         let state = ImageState::new(runtime);
         let result =
             inspect_image_handler(State(state), operator_user(), Path("alpine".to_string())).await;
         let err = result.expect_err("mock runtime should not implement inspect_image_native");
-        // Map should produce an Internal error since runtime returns Unsupported.
-        assert!(matches!(err, ApiError::Internal(_)));
+        // Map should produce a NotImplemented error since runtime returns Unsupported.
+        assert!(
+            matches!(err, ApiError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
     }
 
     /// Empty `term` yields a clean 400 from the search handler.
@@ -1239,12 +1378,12 @@ mod tests {
         // terms the runtime layer's `InvalidSpec` maps to 400.
         let res = search_images_handler(State(state), operator_user(), Query(q)).await;
         let err = res.expect_err("empty term must error");
-        // Mock is Unsupported (mapped to 500). Production runtime would
-        // return InvalidSpec (mapped to 400). We only assert the handler
+        // Mock is Unsupported (mapped to 501 NotImplemented). Production runtime
+        // would return InvalidSpec (mapped to 400). We only assert the handler
         // surfaces *some* error, not which one — proves the wiring runs.
         assert!(matches!(
             err,
-            ApiError::Internal(_) | ApiError::BadRequest(_)
+            ApiError::NotImplemented(_) | ApiError::BadRequest(_)
         ));
     }
 
@@ -1287,7 +1426,8 @@ mod tests {
     }
 
     /// `image_history_handler` against the mock runtime maps Unsupported
-    /// to a 500 (runtime can't report history). Smoke test of the wiring.
+    /// to a 501 `NotImplemented` (runtime can't report history). Smoke test
+    /// of the wiring.
     #[tokio::test]
     async fn history_handler_routes_runtime_errors() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
@@ -1295,6 +1435,57 @@ mod tests {
         let res =
             image_history_handler(State(state), operator_user(), Path("alpine".to_string())).await;
         let err = res.expect_err("mock runtime returns Unsupported");
-        assert!(matches!(err, ApiError::Internal(_)));
+        assert!(
+            matches!(err, ApiError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+    }
+
+    /// A runtime that does not support pruning surfaces as `501 not_implemented`
+    /// (not the old unlogged 500). Guards the `Unsupported` → `NotImplemented`
+    /// routing added to `prune_images_handler`.
+    #[tokio::test]
+    async fn prune_handler_unsupported_runtime_returns_501() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(UnsupportedRuntime::new());
+        let state = ImageState::new(runtime);
+        let res = prune_images_handler(State(state), operator_user()).await;
+        let err = res.expect_err("unsupported runtime must error on prune");
+        assert!(
+            matches!(err, ApiError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        // The 501 maps to the `not_implemented` wire code.
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("error body is JSON");
+        assert_eq!(
+            parsed.get("error").and_then(|v| v.as_str()),
+            Some("not_implemented")
+        );
+    }
+
+    /// A runtime that does not support tagging surfaces as `501 not_implemented`
+    /// — the old `tag_image_handler` wrongly mapped `Unsupported` to 500 despite
+    /// declaring a 501 response.
+    #[tokio::test]
+    async fn tag_handler_unsupported_runtime_returns_501() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(UnsupportedRuntime::new());
+        let state = ImageState::new(runtime);
+        let request = TagImageRequest {
+            source: ImageReference::from_str("alpine:latest").expect("valid reference"),
+            target: ImageReference::from_str("alpine:tagged").expect("valid reference"),
+        };
+        let res = tag_image_handler(State(state), operator_user(), Json(request)).await;
+        let err = res.expect_err("unsupported runtime must error on tag");
+        assert!(
+            matches!(err, ApiError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

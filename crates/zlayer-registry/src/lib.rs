@@ -14,6 +14,7 @@ pub mod client;
 pub mod error;
 pub mod image_config;
 pub mod pack;
+pub mod prune;
 pub mod unpack;
 pub mod wasm;
 
@@ -41,6 +42,7 @@ pub use client::*;
 pub use error::*;
 pub use image_config::{ImageConfig, ImageHealthcheck};
 pub use pack::pack_files_tar_zstd;
+pub use prune::prune_dangling_blobs;
 pub use unpack::*;
 
 /// OCI manifest annotation key marking an image as a runtime-specific bundle.

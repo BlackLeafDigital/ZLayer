@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **`zlayer system prune` returned an unlogged `500 internal_error` on macOS — and `zlayer image ls` / `zlayer rmi` were broken the same way.** The macOS sandbox runtime implemented none of `prune_images` / `list_images` / `remove_image`, so all three fell through to the trait defaults returning `AgentError::Unsupported`, which the image API handlers mapped to a 500 without logging the underlying error (hence the empty daemon.log). The sandbox runtime now implements all three: prune removes unreferenced `{data_dir}/images/*/rootfs` trees (in-use set = in-memory containers ∪ on-disk `containers/*/config.json`, so a prune right after daemon restart is safe), evicts pruned images' manifest entries from `blobs.redb`, and garbage-collects the now-dangling layer blobs; `list_images` reports the original pulled reference (recorded in a new per-image `ref` file at pull time) with logical on-disk size and best-effort digest; `remove_image` refuses in-use images without `--force` and leaves shared layer blobs to the next prune. Reported `space_reclaimed` is the logical byte sum — APFS copy-on-write sharing means actual disk freed may be less. (`crates/zlayer-agent/src/runtimes/macos_sandbox.rs`)
+- **Image API handlers now return the right status codes and log the underlying runtime error.** All image handlers route through one consolidated `map_image_err`: `Unsupported` → 501 `not_implemented` (previously a silent 500, contradicting the handlers' own OpenAPI annotations), `NotFound` → 404, `InvalidSpec` → 400, everything else → 500 — and every mapped error is now `tracing::error!`-logged so daemon.log actually explains failures. (`crates/zlayer-api/src/handlers/images.rs`)
+- **Composite runtime no longer fails `prune_images` outright when the primary runtime doesn't support pruning** — if a delegate exists, the primary's `Unsupported` is tolerated and the delegate's prune result is returned, matching the existing `remove_image`/`tag_image` fallback semantics. (`crates/zlayer-agent/src/runtimes/composite.rs`)
+
+### Added
+- `zlayer_registry::prune_dangling_blobs` — shared blob-cache garbage collection (deletes `sha256:` blobs unreferenced by any cached `manifest:` entry), extracted from the youki runtime's prune and now used by both the youki and macOS sandbox runtimes. (`crates/zlayer-registry/src/prune.rs`)
+
 ## 0.59.3 - 2026-06-11
 
 ### Fixed

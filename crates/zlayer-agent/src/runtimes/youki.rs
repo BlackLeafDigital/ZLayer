@@ -2181,56 +2181,10 @@ impl Runtime for YoukiRuntime {
     }
 
     async fn prune_images(&self) -> Result<PruneResult> {
-        // 1. Collect all digests referenced by remaining manifests.
-        let manifest_keys = self
-            .blob_cache
-            .keys_with_prefix("manifest:")
-            .await
-            .map_err(|e| AgentError::Internal(format!("failed to list manifests: {e}")))?;
-
-        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for key in &manifest_keys {
-            let Ok(Some(bytes)) = self.blob_cache.get(key).await else {
-                continue;
-            };
-            let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&bytes) else {
-                continue;
-            };
-            referenced.insert(manifest.config.digest.clone());
-            for layer in &manifest.layers {
-                referenced.insert(layer.digest.clone());
-            }
-        }
-
-        // 2. Walk all sha256:* blob keys and delete those not referenced.
-        let all_blob_keys = self
-            .blob_cache
-            .keys_with_prefix("sha256:")
-            .await
-            .map_err(|e| AgentError::Internal(format!("failed to list blobs: {e}")))?;
-
-        let mut deleted = Vec::new();
-        let mut space_reclaimed: u64 = 0;
-
-        for key in all_blob_keys {
-            if referenced.contains(&key) {
-                continue;
-            }
-            // Grab the blob size before deleting (best-effort).
-            if let Ok(Some(bytes)) = self.blob_cache.get(&key).await {
-                space_reclaimed = space_reclaimed.saturating_add(bytes.len() as u64);
-            }
-            if let Err(e) = self.blob_cache.delete(&key).await {
-                tracing::warn!(
-                    digest = %key,
-                    error = %e,
-                    "failed to delete orphaned blob during prune"
-                );
-                continue;
-            }
-            deleted.push(key);
-        }
-
+        let (deleted, space_reclaimed) =
+            zlayer_registry::prune_dangling_blobs(self.blob_cache.as_ref().as_ref())
+                .await
+                .map_err(|e| AgentError::Internal(format!("failed to prune image blobs: {e}")))?;
         Ok(PruneResult {
             deleted,
             space_reclaimed,

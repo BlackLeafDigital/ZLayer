@@ -38,9 +38,9 @@
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
-use crate::runtime::{ContainerId, ContainerState, Runtime};
+use crate::runtime::{ContainerId, ContainerState, ImageInfo, PruneResult, Runtime};
 use crate::MacSandboxConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
+use zlayer_registry::BlobCacheBackend;
 use zlayer_spec::{RegistryAuth, ServiceSpec};
 
 // ---------------------------------------------------------------------------
@@ -1446,6 +1447,111 @@ impl SandboxRuntime {
 
         Ok(())
     }
+
+    /// Collect the set of sanitized image directory names that are still
+    /// referenced by a container.
+    ///
+    /// The union of two sources is returned, using the identical derivation as
+    /// `create_container` (`sanitize_image_name(&spec.image.name.to_string())`):
+    /// 1. Every in-memory container in the `containers` map.
+    /// 2. Every on-disk `containers/{dir}/config.json` (containers are not
+    ///    restored into memory on daemon restart, so the on-disk specs are the
+    ///    authoritative in-use set after a restart).
+    ///
+    /// Best-effort for source (2): a missing or unparseable `config.json` is
+    /// logged at `warn` and skipped (it is treated as referencing nothing). A
+    /// missing `containers/` directory contributes an empty set with no warning.
+    async fn referenced_image_dirs(&self) -> HashSet<String> {
+        let mut referenced = HashSet::new();
+
+        // Source 1: in-memory containers.
+        {
+            let containers = self.containers.read().await;
+            for container in containers.values() {
+                referenced.insert(sanitize_image_name(&container.spec.image.name.to_string()));
+            }
+        }
+
+        // Source 2: on-disk container config.json files.
+        let containers_dir = self.config.data_dir.join("containers");
+        match tokio::fs::read_dir(&containers_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let dir_name = entry.file_name();
+                    let config_path = path.join("config.json");
+                    let bytes = match tokio::fs::read(&config_path).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(
+                                container = %dir_name.to_string_lossy(),
+                                error = %e,
+                                "prune: failed to read container config.json; \
+                                 not counting it as referencing any image"
+                            );
+                            continue;
+                        }
+                    };
+                    match serde_json::from_slice::<ServiceSpec>(&bytes) {
+                        Ok(spec) => {
+                            referenced.insert(sanitize_image_name(&spec.image.name.to_string()));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                container = %dir_name.to_string_lossy(),
+                                error = %e,
+                                "prune: failed to parse container config.json; \
+                                 not counting it as referencing any image"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Missing containers dir => nothing referenced from disk.
+            }
+        }
+
+        referenced
+    }
+
+    /// Sum the LOGICAL byte size of every file under `path` (recursively).
+    ///
+    /// This is the sum of file lengths, NOT the number of physical blocks freed.
+    /// Image rootfs directories are APFS copy-on-write clones, so multiple
+    /// containers/images may share the same underlying blocks; the actual disk
+    /// space reclaimed by deleting `path` can therefore be less than the value
+    /// returned here. It is used only to populate `PruneResult::space_reclaimed`
+    /// as a best-effort estimate.
+    ///
+    /// Best-effort: any `read_dir`/`metadata` error is silently skipped.
+    async fn dir_size_bytes(path: &Path) -> u64 {
+        let mut total: u64 = 0;
+        let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    if let Ok(meta) = entry.metadata().await {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+
+        total
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,6 +1601,19 @@ impl Runtime for SandboxRuntime {
             zlayer_spec::PullPolicy::IfNotPresent => {
                 if rootfs_dir.exists() {
                     tracing::debug!(image = %image, "Image already present, skipping pull");
+                    // Backfill the ref file for pre-existing images so a later
+                    // `list_images` shows the real reference. Best-effort and only
+                    // when missing, so this stays a cheap no-op on the hot path.
+                    let ref_path = image_dir.join("ref");
+                    if matches!(ref_path.try_exists(), Ok(false)) {
+                        if let Err(e) = tokio::fs::write(&ref_path, image.as_bytes()).await {
+                            tracing::debug!(
+                                image = %image,
+                                error = %e,
+                                "sandbox: failed to backfill image ref file"
+                            );
+                        }
+                    }
                     // Ensure it is tracked
                     let mut images = self.image_rootfs.write().await;
                     images.insert(safe_name, rootfs_dir);
@@ -1526,6 +1645,19 @@ impl Runtime for SandboxRuntime {
                 image: image.to_string(),
                 reason: format!("Failed to create rootfs dir: {e}"),
             })?;
+
+        // Record the ORIGINAL image reference alongside the sanitized rootfs so a
+        // later `list_images` can display the real reference instead of the
+        // sanitized directory name. Best-effort: a write failure never fails the
+        // pull (the image is still usable, just shows its dir name).
+        let ref_path = image_dir.join("ref");
+        if let Err(e) = tokio::fs::write(&ref_path, image.as_bytes()).await {
+            tracing::debug!(
+                image = %image,
+                error = %e,
+                "sandbox: failed to write image ref file; list_images will fall back to dir name"
+            );
+        }
 
         // Use zlayer-registry to pull and extract OCI image layers.
         // Build a blob cache in the images directory for layer deduplication.
@@ -1598,6 +1730,432 @@ impl Runtime for SandboxRuntime {
             "Image pulled successfully"
         );
 
+        Ok(())
+    }
+
+    /// Prune unused image rootfs directories and dangling blob-cache entries.
+    ///
+    /// An image directory under `{data_dir}/images/` is removed when no
+    /// container references it (see [`Self::referenced_image_dirs`]). The
+    /// `blobs.redb` dedup cache is preserved as a directory entry and never
+    /// itself pruned as an image; after the rootfs sweep a secondary best-effort
+    /// pass first removes the cached manifest entries (manifest, digest, and
+    /// original-ref keys) belonging to each pruned image — read from that
+    /// image's `ref` file before its directory was deleted — so the layer blobs
+    /// those manifests pinned become unreferenced, then garbage-collects every
+    /// blob no longer referenced by any remaining cached manifest. Images
+    /// pulled before the `ref` file existed cannot have their manifests
+    /// identified, so their manifest entries are left in place (their blobs
+    /// simply aren't reclaimed this pass).
+    ///
+    /// `space_reclaimed` is a best-effort LOGICAL byte estimate (see
+    /// [`Self::dir_size_bytes`]); APFS copy-on-write sharing means the actual
+    /// disk freed may be smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Internal`] if the images directory exists but
+    /// cannot be enumerated. Per-image removal failures and the blob-cache pass
+    /// are best-effort: they are logged and never fail the call. A missing
+    /// images directory yields an empty [`PruneResult`].
+    async fn prune_images(&self) -> Result<PruneResult> {
+        let referenced = self.referenced_image_dirs().await;
+
+        let images_dir = self.images_dir();
+        let mut entries = match tokio::fs::read_dir(&images_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PruneResult::default());
+            }
+            Err(e) => {
+                return Err(AgentError::Internal(format!(
+                    "failed to read images dir {}: {e}",
+                    images_dir.display()
+                )));
+            }
+        };
+
+        let mut deleted: Vec<String> = Vec::new();
+        let mut space_reclaimed: u64 = 0;
+        // Original image references of pruned dirs, read from each `{dir}/ref`
+        // before deletion, used to evict their manifest cache entries below.
+        let mut pruned_refs: Vec<String> = Vec::new();
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Preserve the dedup blob cache and any non-directory entries.
+            if name == "blobs.redb" {
+                continue;
+            }
+            match entry.file_type().await {
+                Ok(ft) if ft.is_dir() => {}
+                _ => continue,
+            }
+
+            // Skip images still referenced by a container.
+            if referenced.contains(&name) {
+                continue;
+            }
+
+            let path = entry.path();
+            let size = Self::dir_size_bytes(&path).await;
+
+            // Capture the ORIGINAL image reference (written by
+            // `pull_image_with_policy`) before the directory is removed, so the
+            // secondary cache pass can drop this image's manifest entries and
+            // let its layer blobs become reclaimable. Best-effort: a missing or
+            // unreadable `ref` file (images pulled before that file existed)
+            // just means this image's manifests aren't GC'd this pass.
+            let ref_path = path.join("ref");
+            match tokio::fs::read_to_string(&ref_path).await {
+                Ok(contents) => {
+                    let r = contents.trim();
+                    if r.is_empty() {
+                        tracing::debug!(
+                            image = %name,
+                            "prune: empty ref file; manifest entries not reclaimable"
+                        );
+                    } else {
+                        pruned_refs.push(r.to_string());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        image = %name,
+                        error = %e,
+                        "prune: no readable ref file; manifest entries not reclaimable"
+                    );
+                }
+            }
+
+            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                tracing::warn!(
+                    image = %name,
+                    error = %e,
+                    "prune: failed to remove unused image rootfs; skipping"
+                );
+                continue;
+            }
+
+            tracing::info!(
+                image = %name,
+                bytes = size,
+                "prune: removed unused image rootfs"
+            );
+            deleted.push(name);
+            space_reclaimed = space_reclaimed.saturating_add(size);
+        }
+
+        // Drop pruned images from the in-memory rootfs tracking map.
+        if !deleted.is_empty() {
+            let mut images = self.image_rootfs.write().await;
+            for name in &deleted {
+                images.remove(name);
+            }
+        }
+
+        // Secondary best-effort pass: garbage-collect dangling blobs from the
+        // dedup cache. Never fails the prune call.
+        let cache_path = images_dir.join("blobs.redb");
+        if matches!(cache_path.try_exists(), Ok(true)) {
+            match zlayer_registry::CacheType::persistent_at(&cache_path)
+                .build()
+                .await
+            {
+                Ok(cache) => {
+                    // Evict the manifest entries of every pruned image first so
+                    // the blobs they pinned become unreferenced and the GC below
+                    // can reclaim them. All three keys canonicalize the ref
+                    // internally, so the original reference maps to exactly the
+                    // keys the pull wrote. Delete failures are non-fatal.
+                    for r in &pruned_refs {
+                        for key in [
+                            zlayer_registry::manifest_cache_key(r),
+                            zlayer_registry::manifest_digest_cache_key(r),
+                            zlayer_registry::manifest_orig_cache_key(r),
+                        ] {
+                            if let Err(e) = cache.delete(&key).await {
+                                tracing::warn!(
+                                    image = %r,
+                                    key = %key,
+                                    error = %e,
+                                    "prune: failed to evict manifest cache entry; continuing"
+                                );
+                            }
+                        }
+                    }
+
+                    match zlayer_registry::prune_dangling_blobs(cache.as_ref().as_ref()).await {
+                        Ok((blob_deleted, blob_bytes)) => {
+                            deleted.extend(blob_deleted);
+                            space_reclaimed = space_reclaimed.saturating_add(blob_bytes);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "prune: failed to garbage-collect dangling blobs; skipping"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "prune: failed to open blob cache for blob GC; skipping"
+                    );
+                }
+            }
+        }
+
+        Ok(PruneResult {
+            deleted,
+            space_reclaimed,
+        })
+    }
+
+    /// List the images stored under `{data_dir}/images/`.
+    ///
+    /// Each image is one subdirectory named after the sanitized reference
+    /// (see [`sanitize_image_name`]); the `blobs.redb` dedup cache and any
+    /// non-directory entries are skipped. For each image:
+    /// - `reference` is the trimmed contents of `{dir}/ref` (the original
+    ///   reference recorded by `pull_image_with_policy`) when that file is
+    ///   present and non-empty, otherwise the sanitized directory name (older
+    ///   images pulled before the `ref` file existed).
+    /// - `size_bytes` is the LOGICAL byte sum of the directory tree (see
+    ///   [`Self::dir_size_bytes`]; APFS copy-on-write sharing means the true
+    ///   on-disk footprint may be smaller).
+    /// - `digest` is the registry digest recorded under the manifest-digest
+    ///   cache key for the resolved reference, when the `blobs.redb` cache opens
+    ///   and the entry is present. Any cache failure or miss leaves it `None`.
+    ///
+    /// The blob cache is opened once before the loop (best-effort); if it
+    /// cannot be opened, every entry's `digest` is `None`. Entries are returned
+    /// in directory-iteration order (the youki backend does not sort either).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Internal`] if the images directory exists but
+    /// cannot be enumerated. A missing images directory yields an empty list.
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        let images_dir = self.images_dir();
+        let mut entries = match tokio::fs::read_dir(&images_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(AgentError::Internal(format!(
+                    "failed to read images dir {}: {e}",
+                    images_dir.display()
+                )));
+            }
+        };
+
+        // Open the dedup cache once before the loop. Best-effort: when it is
+        // absent or fails to open, every image's digest is left as `None`.
+        let cache_path = images_dir.join("blobs.redb");
+        let cache: Option<Arc<Box<dyn BlobCacheBackend>>> =
+            if matches!(cache_path.try_exists(), Ok(true)) {
+                match zlayer_registry::CacheType::persistent_at(&cache_path)
+                    .build()
+                    .await
+                {
+                    Ok(cache) => Some(cache),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "list_images: failed to open blob cache; digests will be None"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        let mut images = Vec::new();
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip the dedup blob cache and any non-directory entries.
+            if name == "blobs.redb" {
+                continue;
+            }
+            match entry.file_type().await {
+                Ok(ft) if ft.is_dir() => {}
+                _ => continue,
+            }
+
+            let dir = entry.path();
+
+            // Prefer the ORIGINAL image reference recorded at pull time; fall
+            // back to the sanitized directory name for images pulled before the
+            // `ref` file existed.
+            let reference = match tokio::fs::read_to_string(dir.join("ref")).await {
+                Ok(contents) => {
+                    let r = contents.trim();
+                    if r.is_empty() {
+                        name.clone()
+                    } else {
+                        r.to_string()
+                    }
+                }
+                Err(_) => name.clone(),
+            };
+
+            // LOGICAL size of the rootfs tree (APFS CoW caveat documented on
+            // `dir_size_bytes`).
+            let size_bytes = Some(Self::dir_size_bytes(&dir).await);
+
+            // Best-effort registry digest from the manifest-digest cache key.
+            // The key canonicalizes the reference internally, matching what the
+            // pull wrote. Any failure or miss leaves the digest `None`.
+            let digest = match cache.as_ref() {
+                Some(cache) => cache
+                    .get(&zlayer_registry::manifest_digest_cache_key(&reference))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+                None => None,
+            };
+
+            images.push(ImageInfo {
+                reference,
+                digest,
+                size_bytes,
+            });
+        }
+
+        Ok(images)
+    }
+
+    /// Remove an image's rootfs directory and its dangling manifest cache
+    /// entries.
+    ///
+    /// The image directory is `{data_dir}/images/{sanitize_image_name(image)}`.
+    /// Before deleting it, the image's `ref` file is read so the cache-cleanup
+    /// pass can evict the manifest entries for both the supplied `image`
+    /// argument and the recorded original reference.
+    ///
+    /// When the image is still referenced by a container (see
+    /// [`Self::referenced_image_dirs`]) and `force` is `false`, the removal is
+    /// refused. The directory is then removed with `remove_dir_all`, the image
+    /// is dropped from the in-memory rootfs tracking map, and a best-effort
+    /// cache pass deletes the three manifest keys (manifest, digest, and
+    /// original-ref) for each candidate reference. Layer blobs are deliberately
+    /// NOT deleted here: a blob can be shared by several images, so deleting it
+    /// directly could corrupt an unrelated image. Orphaned blobs left behind by
+    /// the evicted manifests are reclaimed by the next [`Self::prune_images`].
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentError::NotFound`] if no image directory exists for `image`.
+    /// - [`AgentError::InvalidSpec`] if the image is in use by a container and
+    ///   `force` is `false`.
+    /// - [`AgentError::Internal`] if the image directory exists but cannot be
+    ///   removed.
+    ///
+    /// The blob-cache cleanup is best-effort: failures are logged and never
+    /// fail the call.
+    async fn remove_image(&self, image: &str, force: bool) -> Result<()> {
+        let safe = sanitize_image_name(image);
+        let dir = self.images_dir().join(&safe);
+
+        if !matches!(dir.try_exists(), Ok(true)) {
+            return Err(AgentError::NotFound {
+                container: image.to_string(),
+                reason: format!("image '{image}' not found"),
+            });
+        }
+
+        // Refuse to remove an image still referenced by a container unless the
+        // caller forces it. An in-use conflict is a client-state issue, so map
+        // it to InvalidSpec (400) rather than Internal (500).
+        if !force && self.referenced_image_dirs().await.contains(&safe) {
+            return Err(AgentError::InvalidSpec(format!(
+                "image '{image}' is in use by a container; pass --force to remove it"
+            )));
+        }
+
+        // Capture the ORIGINAL image reference (written by
+        // `pull_image_with_policy`) before deleting the directory, so the cache
+        // pass can evict this image's manifest entries under the recorded ref as
+        // well as the supplied argument.
+        let ref_file = match tokio::fs::read_to_string(dir.join("ref")).await {
+            Ok(contents) => {
+                let r = contents.trim();
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.to_string())
+                }
+            }
+            Err(_) => None,
+        };
+
+        tokio::fs::remove_dir_all(&dir).await.map_err(|e| {
+            AgentError::Internal(format!("failed to remove image dir {}: {e}", dir.display()))
+        })?;
+
+        // Drop the image from the in-memory rootfs tracking map.
+        {
+            let mut images = self.image_rootfs.write().await;
+            images.remove(&safe);
+        }
+
+        // Best-effort cache cleanup: evict the manifest entries that pinned this
+        // image's layer blobs. We deliberately do NOT delete the layer blobs
+        // directly — a blob can be shared across multiple images, so removing it
+        // here could corrupt an unrelated image. Once the manifests are evicted,
+        // the now-orphaned blobs are reclaimed by the next `prune_images` GC.
+        let cache_path = self.images_dir().join("blobs.redb");
+        if matches!(cache_path.try_exists(), Ok(true)) {
+            match zlayer_registry::CacheType::persistent_at(&cache_path)
+                .build()
+                .await
+            {
+                Ok(cache) => {
+                    // Dedupe {image arg, ref-file content}: when the ref file
+                    // equals the argument we only evict once.
+                    let mut candidates: Vec<String> = vec![image.to_string()];
+                    if let Some(r) = ref_file {
+                        if !candidates.contains(&r) {
+                            candidates.push(r);
+                        }
+                    }
+                    for r in &candidates {
+                        // All three keys canonicalize the ref internally, so the
+                        // reference maps to exactly the keys the pull wrote.
+                        for key in [
+                            zlayer_registry::manifest_cache_key(r),
+                            zlayer_registry::manifest_digest_cache_key(r),
+                            zlayer_registry::manifest_orig_cache_key(r),
+                        ] {
+                            if let Err(e) = cache.delete(&key).await {
+                                tracing::warn!(
+                                    image = %r,
+                                    key = %key,
+                                    error = %e,
+                                    "remove_image: failed to evict manifest cache entry; continuing"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "remove_image: failed to open blob cache for manifest eviction; skipping"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(image = %image, "Removed image (sandbox)");
         Ok(())
     }
 
@@ -2663,5 +3221,196 @@ impl Runtime for SandboxRuntime {
         Err(AgentError::Unsupported(
             "tag_image is not supported by the macOS sandbox runtime".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `SandboxRuntime` rooted at a fresh temp `data_dir`.
+    ///
+    /// Returns `(runtime, tempdir)`; the [`tempfile::TempDir`] must be kept
+    /// alive for the lifetime of the test so the directory is not removed out
+    /// from under the runtime. `new()` pre-creates `images/` and `containers/`
+    /// under the data dir.
+    fn runtime() -> (SandboxRuntime, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let config = MacSandboxConfig {
+            data_dir: tmp.path().join("data"),
+            log_dir: tmp.path().join("logs"),
+            gpu_access: false,
+        };
+        let rt = SandboxRuntime::new(config, None).expect("construct SandboxRuntime");
+        (rt, tmp)
+    }
+
+    /// Create `{images}/{dir}/rootfs/{file_name}` with `contents`.
+    fn write_image_file(rt: &SandboxRuntime, dir: &str, file_name: &str, contents: &[u8]) {
+        let rootfs = rt.images_dir().join(dir).join("rootfs");
+        std::fs::create_dir_all(&rootfs).expect("create rootfs dir");
+        std::fs::write(rootfs.join(file_name), contents).expect("write image file");
+    }
+
+    /// Write `{images}/{dir}/ref` containing `reference`.
+    fn write_ref_file(rt: &SandboxRuntime, dir: &str, reference: &str) {
+        let image_dir = rt.images_dir().join(dir);
+        std::fs::create_dir_all(&image_dir).expect("create image dir");
+        std::fs::write(image_dir.join("ref"), reference).expect("write ref file");
+    }
+
+    /// Write `{containers}/{name}/config.json` holding a minimal [`ServiceSpec`]
+    /// whose image sanitizes to `image` (chosen so `sanitize == raw`).
+    ///
+    /// Serialized exactly like `create_container` does
+    /// (`serde_json::to_string_pretty`), so the byte content matches what the
+    /// daemon writes and what `referenced_image_dirs` reads back.
+    fn write_container_config(rt: &SandboxRuntime, name: &str, image: &str) {
+        let spec = ServiceSpec::minimal(name, image);
+        // The image must round-trip to its raw form so the sanitized directory
+        // name equals `image`. A bare lowercase name has no '/', ':', or '@'.
+        assert_eq!(
+            sanitize_image_name(&spec.image.name.to_string()),
+            image,
+            "test image must sanitize to its raw directory name"
+        );
+        let dir = rt.config.data_dir.join("containers").join(name);
+        std::fs::create_dir_all(&dir).expect("create container dir");
+        let json = serde_json::to_string_pretty(&spec).expect("serialize spec");
+        std::fs::write(dir.join("config.json"), json).expect("write config.json");
+    }
+
+    #[tokio::test]
+    async fn prune_removes_unreferenced_image_dirs() {
+        let (rt, _tmp) = runtime();
+
+        // imgA is referenced by an on-disk container; imgB is dangling.
+        let imgb_contents = b"imgB-rootfs-bytes";
+        write_image_file(&rt, "imga", "file", b"imgA-rootfs-bytes");
+        write_image_file(&rt, "imgb", "file", imgb_contents);
+        write_container_config(&rt, "svc-0", "imga");
+
+        let result = rt.prune_images().await.expect("prune succeeds");
+
+        assert_eq!(result.deleted, vec!["imgb".to_string()]);
+        assert_eq!(result.space_reclaimed, imgb_contents.len() as u64);
+        assert!(
+            rt.images_dir().join("imga").is_dir(),
+            "referenced image must survive prune"
+        );
+        assert!(
+            !rt.images_dir().join("imgb").exists(),
+            "unreferenced image must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_missing_images_dir_returns_default() {
+        let (rt, _tmp) = runtime();
+
+        // `new()` pre-creates `images/`; remove it to exercise the NotFound path.
+        std::fs::remove_dir_all(rt.images_dir()).expect("remove images dir");
+        assert!(!rt.images_dir().exists());
+
+        let result = rt.prune_images().await.expect("prune succeeds");
+
+        assert!(result.deleted.is_empty());
+        assert_eq!(result.space_reclaimed, 0);
+    }
+
+    #[tokio::test]
+    async fn list_images_prefers_ref_file() {
+        let (rt, _tmp) = runtime();
+
+        // One image with a `ref` file (trailing newline must be trimmed), one
+        // without (falls back to the sanitized directory name).
+        write_image_file(&rt, "withref", "layer", b"abc");
+        write_ref_file(&rt, "withref", "alpine:latest\n");
+        write_image_file(&rt, "noref", "layer", b"de");
+
+        let mut images = rt.list_images().await.expect("list succeeds");
+        images.sort_by(|a, b| a.reference.cmp(&b.reference));
+
+        assert_eq!(images.len(), 2);
+
+        let by_ref = |r: &str| {
+            images
+                .iter()
+                .find(|i| i.reference == r)
+                .unwrap_or_else(|| panic!("missing image with reference {r}"))
+                .clone()
+        };
+
+        let withref = by_ref("alpine:latest");
+        assert_eq!(withref.reference, "alpine:latest");
+        assert_eq!(withref.size_bytes, Some(3));
+
+        let noref = by_ref("noref");
+        assert_eq!(noref.reference, "noref");
+        assert_eq!(noref.size_bytes, Some(2));
+
+        // No `blobs.redb` cache exists, so digests are best-effort `None`.
+        assert!(withref.digest.is_none());
+        assert!(noref.digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_image_not_found() {
+        let (rt, _tmp) = runtime();
+
+        let err = rt
+            .remove_image("does-not-exist", false)
+            .await
+            .expect_err("missing image must error");
+        assert!(
+            matches!(err, AgentError::NotFound { .. }),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_image_in_use_requires_force() {
+        let (rt, _tmp) = runtime();
+
+        write_image_file(&rt, "imga", "file", b"imgA-rootfs-bytes");
+        write_container_config(&rt, "svc-0", "imga");
+
+        // Without force: in-use conflict -> InvalidSpec.
+        let err = rt
+            .remove_image("imga", false)
+            .await
+            .expect_err("in-use image without force must error");
+        assert!(
+            matches!(err, AgentError::InvalidSpec(_)),
+            "expected InvalidSpec, got {err:?}"
+        );
+        assert!(
+            rt.images_dir().join("imga").is_dir(),
+            "image must remain after a refused removal"
+        );
+
+        // With force: removal succeeds and the directory is gone.
+        rt.remove_image("imga", true)
+            .await
+            .expect("forced removal succeeds");
+        assert!(
+            !rt.images_dir().join("imga").exists(),
+            "forced removal must delete the image dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn dir_size_bytes_sums_recursively() {
+        let (_rt, tmp) = runtime();
+
+        let root = tmp.path().join("tree");
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::write(root.join("top.bin"), vec![0u8; 10]).expect("write top file");
+        std::fs::write(root.join("a").join("mid.bin"), vec![0u8; 20]).expect("write mid file");
+        std::fs::write(nested.join("leaf.bin"), vec![0u8; 30]).expect("write leaf file");
+
+        let total = SandboxRuntime::dir_size_bytes(&root).await;
+        assert_eq!(total, 60);
     }
 }

@@ -1257,7 +1257,22 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn prune_images(&self) -> Result<PruneResult> {
-        let mut result = self.primary.prune_images().await?;
+        // Symmetric with `remove_image` / `tag_image`: a primary that does not
+        // implement pruning (e.g. a cache-less backend that returns
+        // `Unsupported`) must not 501 the whole call when a delegate exists and
+        // could still reclaim space. Only a primary `Unsupported` is tolerated;
+        // any other primary error still propagates.
+        let mut result = match self.primary.prune_images().await {
+            Ok(r) => r,
+            Err(AgentError::Unsupported(reason)) if self.delegate.is_some() => {
+                tracing::debug!(
+                    %reason,
+                    "primary runtime does not support prune_images; relying on delegate",
+                );
+                PruneResult::default()
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(delegate) = &self.delegate {
             match delegate.prune_images().await {
                 Ok(extra) => {
@@ -1372,6 +1387,11 @@ mod tests {
         /// owns the container but cannot report stats at all. Forces the
         /// composite to fall back to another backend.
         stats_snapshot_unsupported: bool,
+        /// `prune_images` response. `None` models a backend that does not
+        /// implement pruning (returns `AgentError::Unsupported`, like the trait
+        /// default); `Some(result)` models a backend that prunes and reports
+        /// the given [`PruneResult`].
+        prune_images_response: Option<PruneResult>,
     }
 
     impl MockRuntime {
@@ -1387,6 +1407,7 @@ mod tests {
                 reads_not_found: false,
                 logs_response: Vec::new(),
                 stats_snapshot_unsupported: false,
+                prune_images_response: None,
             }
         }
 
@@ -1411,6 +1432,12 @@ mod tests {
         /// Snapshot `get_container_stats` returns `Unsupported` (a soft miss).
         fn with_stats_snapshot_unsupported(mut self) -> Self {
             self.stats_snapshot_unsupported = true;
+            self
+        }
+
+        /// `prune_images` succeeds and reports the given [`PruneResult`].
+        fn with_prune_result(mut self, result: PruneResult) -> Self {
+            self.prune_images_response = Some(result);
             self
         }
 
@@ -1594,6 +1621,16 @@ mod tests {
                 return Err(AgentError::Unsupported(msg.clone()));
             }
             Ok(self.list_images_response.clone())
+        }
+
+        async fn prune_images(&self) -> Result<PruneResult> {
+            self.record("prune_images", None);
+            match &self.prune_images_response {
+                Some(result) => Ok(result.clone()),
+                None => Err(AgentError::Unsupported(
+                    "mock runtime does not support prune_images".into(),
+                )),
+            }
         }
     }
 
@@ -2601,6 +2638,62 @@ services:
         assert!(
             matches!(err, AgentError::Unsupported(_)),
             "all-backends-fail should surface Unsupported, got {err:?}",
+        );
+    }
+
+    /// When the PRIMARY does not implement `prune_images` (returns
+    /// `AgentError::Unsupported`) but a delegate does, the composite must
+    /// tolerate the primary miss and return the delegate's result — symmetric
+    /// with how `remove_image` / `tag_image` tolerate a primary failure when a
+    /// delegate exists. A future cache-less primary must not 501 the whole call.
+    #[tokio::test]
+    async fn prune_images_tolerates_primary_unsupported_and_uses_delegate() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        // Primary leaves `prune_images_response` as `None` → returns Unsupported.
+        let primary = MockRuntime::new(Role::Primary, Arc::clone(&calls));
+        let delegate =
+            MockRuntime::new(Role::Delegate, Arc::clone(&calls)).with_prune_result(PruneResult {
+                deleted: vec![
+                    "docker.io/library/alpine:3.19".to_string(),
+                    "docker.io/library/nginx:1.25".to_string(),
+                ],
+                space_reclaimed: 4096,
+            });
+
+        let rt = CompositeRuntime::new(
+            Arc::new(primary) as Arc<dyn Runtime>,
+            Some(Arc::new(delegate) as Arc<dyn Runtime>),
+        );
+
+        let result = rt
+            .prune_images()
+            .await
+            .expect("primary Unsupported must not fail the composite prune_images");
+        assert_eq!(
+            result.deleted,
+            vec![
+                "docker.io/library/alpine:3.19".to_string(),
+                "docker.io/library/nginx:1.25".to_string(),
+            ],
+            "should return the delegate's deleted images, got {:?}",
+            result.deleted,
+        );
+        assert_eq!(
+            result.space_reclaimed, 4096,
+            "should return the delegate's reclaimed bytes",
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            role_for(&calls, "prune_images"),
+            Some(Role::Primary),
+            "primary prune_images must still be attempted first",
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(role, m, _)| *role == Role::Delegate && m == "prune_images"),
+            "delegate prune_images must be invoked after the primary miss",
         );
     }
 
