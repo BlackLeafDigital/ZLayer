@@ -83,10 +83,13 @@ jobs:
           # cross toolchain for the kernel Image; busybox-static is a host
           # convenience (build.sh still cross-builds its own static busybox);
           # cpio/gzip for the initramfs; zig for cargo-zigbuild.
+          # buildah/podman + ca-certificates so we can also publish the bundle
+          # as a scratch OCI image to GHCR (see the GHCR publish step below).
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            busybox-static cpio gzip xz-utils curl python3
+            busybox-static cpio gzip xz-utils curl python3 \
+            buildah podman ca-certificates
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         if: steps.gate.outputs.run == 'true'
@@ -169,3 +172,59 @@ jobs:
               --user "${AUTH}" --upload-file "${local_path}" "${url}"
           done
           echo "Published VZ Linux ${KV} bundle to ${BASE}"
+
+      # ---- Durable publish: GHCR OCI image (daemon-consumable) --------------
+      # Also ship the bundle as an OCI image to the same ghcr namespace as every
+      # other ZLayer base image (ghcr.io/blackleafdigital/zlayer/*), so the
+      # daemon can pull/refresh it through the normal image machinery. The
+      # daemon's ensure_linux_kernel() pulls the rolling :arm64 tag and refreshes
+      # whenever its digest changes; the :<kernel_version>-arm64 tag is the
+      # immutable pin. Mirrors buildd-image.yml exactly: same GHCR login (buildah
+      # login with secrets.GH_ACCESS_TOKEN), same buildah tooling.
+      #
+      # NOTE: after the FIRST publish, the GHCR package
+      # `blackleafdigital/zlayer/vz-linux` defaults to internal/private — flip it
+      # to PUBLIC once in the GitHub UI so anonymous daemon pulls succeed.
+      - name: Login to GHCR
+        if: steps.gate.outputs.run == 'true'
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build + push VZ Linux bundle to GHCR
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          OUT_DIR: ${{ steps.build.outputs.out_dir }}
+          KV: ${{ steps.build.outputs.kernel_version }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/blackleafdigital/zlayer/vz-linux"
+          # The bundle is arm64-only (VZ runtime = Apple Silicon). Build a
+          # minimal scratch image whose filesystem holds the three bundle files
+          # at a stable /vz-linux/ path; no entrypoint (it's a pure file bundle
+          # the daemon pulls and unpacks, never executes).
+          for f in Image initramfs.cpio.gz manifest.json; do
+            [ -f "${OUT_DIR}/${f}" ] || { echo "::error::missing ${OUT_DIR}/${f}"; exit 1; }
+          done
+          cf="$(mktemp)"
+          cat > "${cf}" <<EOF
+          FROM scratch
+          COPY Image /vz-linux/Image
+          COPY initramfs.cpio.gz /vz-linux/initramfs.cpio.gz
+          COPY manifest.json /vz-linux/manifest.json
+          LABEL org.opencontainers.image.source="https://github.com/BlackLeafDigital/ZLayer"
+          LABEL org.opencontainers.image.title="ZLayer VZ Linux guest bundle (kernel Image + initramfs)"
+          LABEL org.opencontainers.image.licenses="MIT"
+          LABEL org.opencontainers.image.version="${KV}"
+          EOF
+          # Push BOTH tags: :arm64 is the rolling latest the daemon tracks;
+          # :<kernel_version>-arm64 is the immutable per-version pin.
+          buildah bud --platform linux/arm64 -f "${cf}" \
+            -t "${REPO}:arm64" \
+            -t "${REPO}:${KV}-arm64" \
+            "${OUT_DIR}"
+          rm -f "${cf}"
+          for TAG in arm64 "${KV}-arm64"; do
+            echo "Pushing ${REPO}:${TAG}"
+            buildah push "${REPO}:${TAG}" "docker://${REPO}:${TAG}"
+          done
+          echo "Published VZ Linux ${KV} bundle to GHCR ${REPO} {arm64, ${KV}-arm64}"

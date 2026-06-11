@@ -144,6 +144,9 @@ echo "  Daemon name: ${ZLAYER_DEV_NAME}"
 echo "  Binary dir: ${ZLAYER_DEV_BIN_DIR}"
 echo "  Data dir: ${ZLAYER_DEV_DATA_DIR}"
 echo "  Skip build: ${ZLAYER_DEV_SKIP_BUILD:-no}"
+if [ -n "$REPLACE" ]; then
+    echo "  Mode: replace (daemon name 'zlayer', will take over /var/run/docker.sock)"
+fi
 echo ""
 
 # --- Build ---
@@ -250,7 +253,6 @@ if [ -n "$REPLACE" ] && [ "$OS" = "linux" ]; then
     sudo rm -f "${REPLACE_PROD_DATA_DIR}/daemon.json" 2>/dev/null || true
     sudo rm -f /var/run/zlayer.sock 2>/dev/null || true
     sudo rm -f "${REPLACE_PROD_DATA_DIR}/run/zlayer.pid" 2>/dev/null || true
-    sleep 3
 fi
 if [ -n "$REPLACE" ] && [ "$OS" = "darwin" ]; then
     rm -f "${REPLACE_PROD_DATA_DIR}/daemon.json" 2>/dev/null || true
@@ -467,6 +469,37 @@ if [ -n "${ZLAYER_DEV_REGISTER:-}" ]; then
                 DOCKER_SOCKET_TARGET="${REPLACE_PROD_DATA_DIR}/run/docker.sock"
                 ;;
         esac
+
+        # Wait for the freshly-installed daemon to actually come up before we
+        # repoint /var/run/docker.sock at its Docker socket. `daemon install`
+        # returns once the service is registered/launched, but the daemon may
+        # still be initializing; taking over the docker socket before it's
+        # listening leaves a dangling symlink. Poll `status` (exit 0 == the
+        # daemon answered) every 1s, up to 30s, before touching the socket.
+        echo ""
+        echo "Waiting for ${ZLAYER_DEV_NAME} daemon to become ready..."
+        daemon_ready=""
+        for _ in $(seq 1 30); do
+            case "$OS" in
+                linux)  status_cmd=(sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" status) ;;
+                darwin) status_cmd=("${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" status) ;;
+            esac
+            if "${status_cmd[@]}" >/dev/null 2>&1; then
+                daemon_ready=1
+                break
+            fi
+            sleep 1
+        done
+        if [ -z "$daemon_ready" ]; then
+            echo "Error: ${ZLAYER_DEV_NAME} daemon did not become ready within 30s." >&2
+            echo "Refusing to take over /var/run/docker.sock. Check logs:" >&2
+            case "$OS" in
+                linux)  echo "    sudo journalctl -fu ${ZLAYER_DEV_NAME}" >&2 ;;
+                darwin) echo "    tail -f ${ZLAYER_DEV_DATA_DIR}/logs/daemon.log" >&2 ;;
+            esac
+            exit 1
+        fi
+
         echo ""
         echo "Fixing /var/run/docker.sock symlink (target: ${DOCKER_SOCKET_TARGET})..."
         if ! sudo "${ZLAYER_DEV_BIN_DIR}/${ZLAYER_DEV_NAME}" docker install \

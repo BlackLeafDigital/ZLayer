@@ -165,6 +165,21 @@ pub enum Msg {
         /// Optional overlay DNS search domain.
         dns_domain: Option<String>,
     },
+    /// Host → guest: (re)set the guest wall clock to `unix_secs` seconds since
+    /// the Unix epoch.
+    ///
+    /// A VZ Linux guest has no RTC and gets its clock seeded exactly once at
+    /// boot from the `zlayer.boottime=` kernel arg. Apple Virtualization guests
+    /// do not resynchronize after the host sleeps, so a long-lived VM's clock
+    /// drifts (potentially days) stale, which breaks x509 cert validity windows
+    /// and any time-aware workload. The host sends this after a VM resume and
+    /// periodically thereafter; the guest calls `settimeofday`. Fire-and-forget
+    /// like [`Msg::OverlayConfig`]: no reply is expected, and a failure is
+    /// logged on the guest rather than aborting the agent.
+    SetTime {
+        /// Wall-clock time to set, in seconds since the Unix epoch.
+        unix_secs: i64,
+    },
 }
 
 /// A single `WireGuard` peer for [`Msg::OverlayConfig`]. Mirrors the host-side
@@ -200,6 +215,7 @@ impl Msg {
             Msg::Stdin(_) => 11,
             Msg::StdinEof => 12,
             Msg::OverlayConfig { .. } => 13,
+            Msg::SetTime { .. } => 14,
         }
     }
 }
@@ -297,7 +313,7 @@ pub fn decode(body: &[u8]) -> Result<Msg> {
     let (&tag, payload) = body.split_first().ok_or(ProtoError::EmptyFrame)?;
     // Validate the tag up front so we surface a clear error instead of letting
     // postcard choke on a bad enum discriminant.
-    if !(1..=13).contains(&tag) {
+    if !(1..=14).contains(&tag) {
         return Err(ProtoError::UnknownTag(tag));
     }
     let msg: Msg = postcard::from_bytes(payload)?;
@@ -454,6 +470,10 @@ mod tests {
                 dns_server: None,
                 dns_domain: None,
             },
+            Msg::SetTime {
+                unix_secs: 1_749_600_000,
+            },
+            Msg::SetTime { unix_secs: -1 }, // pre-epoch / negative is a valid i64
         ]
     }
 
@@ -476,6 +496,29 @@ mod tests {
             let mut cursor = Cursor::new(buf);
             let got = read_frame(&mut cursor).expect("read Forward");
             assert_eq!(got, msg, "Forward frame round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn set_time_frame_roundtrips() {
+        for unix_secs in [0i64, 1_749_600_000, -1, i64::MAX, i64::MIN] {
+            let msg = Msg::SetTime { unix_secs };
+            // Tag is the appended discriminant (14), kept stable.
+            assert_eq!(msg.tag(), 14, "SetTime must use the appended tag 14");
+
+            // encode/decode round-trip.
+            let frame = encode(&msg).expect("encode SetTime");
+            assert_eq!(frame[4], 14, "framing tag byte must be 14");
+            let decoded = decode(&frame[4..]).expect("decode SetTime");
+            assert_eq!(decoded, msg, "SetTime encode/decode mismatch");
+
+            // read_frame/write_frame round-trip over a stream, including
+            // negative and extreme `unix_secs` values.
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &msg).expect("write SetTime");
+            let mut cursor = Cursor::new(buf);
+            let got = read_frame(&mut cursor).expect("read SetTime");
+            assert_eq!(got, msg, "SetTime frame round-trip mismatch");
         }
     }
 

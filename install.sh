@@ -175,6 +175,24 @@ if [ -n "$BUILDD_PATH" ]; then
     echo "Installed zlayer-buildd (buildah sidecar) to ${INSTALL_DIR}/zlayer-buildd"
 fi
 
+# Install zlayer-overlayd alongside zlayer when the tarball ships it.
+# zlayer-overlayd is the root-privileged overlay network daemon that
+# `zlayer daemon install` registers as a system service. The main daemon
+# resolves it by looking next to the zlayer binary (see overlayd path
+# resolution in crates/zlayer-paths), so dropping it into the same install
+# dir as `zlayer` is what makes the overlay service start. It's only
+# relevant on Linux (overlay networking is Linux-native), but the block is
+# kept platform-unconditional like the buildd one above — a harmless no-op
+# when the tarball doesn't carry it (older artifacts, darwin/windows).
+OVERLAYD_PATH="$(find "$TMPDIR" -name "zlayer-overlayd" -type f | head -1)"
+if [ -n "$OVERLAYD_PATH" ]; then
+    # Fresh inode for the same macOS signature-cache reason as above.
+    sudo rm -f "${INSTALL_DIR}/zlayer-overlayd"
+    sudo cp "$OVERLAYD_PATH" "${INSTALL_DIR}/zlayer-overlayd"
+    sudo chmod +x "${INSTALL_DIR}/zlayer-overlayd"
+    echo "Installed zlayer-overlayd (overlay network daemon) to ${INSTALL_DIR}/zlayer-overlayd"
+fi
+
 # --- SELinux: relabel binary so systemd's init_t can exec it ---
 # Files under /var/lib inherit var_lib_t, which init_t cannot exec as a
 # service entrypoint. Set bin_t via semanage (persistent) + restorecon,

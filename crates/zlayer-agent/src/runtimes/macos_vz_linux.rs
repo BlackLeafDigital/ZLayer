@@ -60,14 +60,18 @@
 //!
 //! Guest kernel artifacts are resolved by [`VzLinuxRuntime::ensure_linux_kernel`]
 //! from the `ZLAYER_VZ_LINUX_KERNEL` / `ZLAYER_VZ_LINUX_INITRD` dev-override env
-//! vars or the on-disk `{data_dir}/vz/linux/kernel/` cache.
+//! vars, else by pulling the published bundle image
+//! `ghcr.io/blackleafdigital/zlayer/vz-linux:arm64` through the normal image
+//! machinery (digest-compared against, and installed into, the on-disk
+//! `{data_dir}/vz/linux/kernel/` cache), else by serving that cache directly
+//! when the registry is unreachable.
 //!
 //! ## Directory layout
 //!
 //! ```text
 //! {data_dir}/vz/linux/
 //!   images/{sanitized_image}/rootfs/   -- extracted OCI image layers (shared)
-//!   kernel/                            -- guest kernel cache (Image + initramfs.cpio.gz)
+//!   kernel/                            -- guest kernel cache (Image + initramfs.cpio.gz + manifest.json + digest)
 //!   cache/                             -- blob/registry cache
 //!   {service}-{replica}/               -- per-container state
 //!     rootfs/                          -- per-container rootfs (clone of base)
@@ -220,6 +224,13 @@ pub(crate) struct VzLinuxContainer {
     /// state dir. Aborted on `stop`/`remove` so an explicit teardown wins the
     /// race and the watcher can't double-free.
     cleanup_task: Option<JoinHandle<()>>,
+    /// Handle to the periodic wall-clock resync task. Every
+    /// [`SETTIME_RESYNC_INTERVAL`] it pushes a [`Msg::SetTime`](proto::Msg::SetTime)
+    /// to the guest so a long-lived VM's clock doesn't drift after host sleeps
+    /// (a VZ guest has no RTC and never resyncs on its own). Tied to VM lifetime:
+    /// aborted on `stop`/`remove` (same as the drain/cleanup tasks) so it exits
+    /// cleanly when the VM stops and never outlives the live VM it pushes to.
+    settime_task: Option<JoinHandle<()>>,
     /// Host loopback forwarders for the container's published/exposed ports.
     /// Each binds `127.0.0.1:<container_port>` and tunnels every connection over
     /// a fresh vsock `Forward` to the guest agent. Tracked so `stop`/`remove`
@@ -495,19 +506,35 @@ impl VzLinuxRuntime {
     ///
     /// Resolution order:
     /// 1. The `ZLAYER_VZ_LINUX_KERNEL` + `ZLAYER_VZ_LINUX_INITRD` env vars
-    ///    (the working dev override — both must be set and exist).
-    /// 2. The on-disk cache at `{data_dir}/vz/linux/kernel/` containing the
-    ///    files `Image` and `initramfs.cpio.gz`.
-    ///
-    /// Downloading a published CI artifact into the cache is a later concern;
-    /// for now an operator runs `images/vz-linux/build.sh` and drops the two
-    /// files into the cache, or points the env vars at a local build.
+    ///    (the working dev override — both must be set and exist). Checked FIRST
+    ///    and short-circuits before any network so a local build is always
+    ///    honored.
+    /// 2. A normally-pulled OCI image, [`VZ_LINUX_BUNDLE_IMAGE`] (rolling
+    ///    `arm64`, `FROM scratch`, members `vz-linux/Image`,
+    ///    `vz-linux/initramfs.cpio.gz`, `vz-linux/manifest.json`). Pulled through
+    ///    the SAME image machinery as every other image
+    ///    ([`zlayer_registry::ImagePuller`] over the persistent `blobs.redb` blob
+    ///    cache, with the default hostname-based [`zlayer_core::AuthResolver`] —
+    ///    anonymous GHCR works once the package is public). The pulled manifest
+    ///    digest (read back from the blob cache under
+    ///    [`zlayer_registry::manifest_digest_cache_key`]) is compared against a
+    ///    `digest` file in [`kernel_cache_dir`](Self::kernel_cache_dir): on a
+    ///    mismatch (or when the cached artifacts are missing) the new layers are
+    ///    unpacked and `Image` + `initramfs.cpio.gz` are atomically installed
+    ///    into the cache (write-to-`.tmp` + rename), `manifest.json` is copied
+    ///    alongside, and the new digest is recorded; on a match the existing
+    ///    cache is reused as-is.
+    /// 3. On a pull FAILURE (offline / 401 / registry down) the existing on-disk
+    ///    cache is served with a warning when present (it may be stale); only
+    ///    when NO cache exists does this fail, naming the env-override and
+    ///    `images/vz-linux/build.sh` escape hatches plus the GHCR ref.
     ///
     /// # Errors
-    /// Returns [`AgentError::Configuration`] when neither source yields both
-    /// artifacts.
-    fn ensure_linux_kernel(&self) -> Result<LinuxKernel> {
-        // 1. Dev override via env.
+    /// Returns [`AgentError::Configuration`] when neither the env override, a
+    /// successful pull/refresh, nor a pre-existing cache yields both artifacts.
+    async fn ensure_linux_kernel(&self) -> Result<LinuxKernel> {
+        // 1. Dev override via env. Checked FIRST and unchanged: a local build
+        //    always wins and we never touch the network.
         let env_kernel = std::env::var_os("ZLAYER_VZ_LINUX_KERNEL").map(PathBuf::from);
         let env_initrd = std::env::var_os("ZLAYER_VZ_LINUX_INITRD").map(PathBuf::from);
         if let (Some(image), Some(initramfs)) = (env_kernel, env_initrd) {
@@ -521,28 +548,224 @@ impl VzLinuxRuntime {
             }
             tracing::warn!(
                 "vz-linux: ZLAYER_VZ_LINUX_KERNEL/_INITRD set but a path does not exist; \
-                 falling back to the on-disk cache"
+                 falling back to the pulled bundle / on-disk cache"
             );
         }
 
-        // 2. On-disk cache.
         let cache = self.kernel_cache_dir();
         let image = cache.join("Image");
         let initramfs = cache.join("initramfs.cpio.gz");
-        if image.exists() && initramfs.exists() {
-            tracing::info!(
-                kernel = %image.display(),
-                initramfs = %initramfs.display(),
-                "vz-linux: using kernel from on-disk cache"
-            );
-            return Ok(LinuxKernel { image, initramfs });
+
+        // 2. Pull/refresh the published bundle through the normal image machinery.
+        match self.pull_kernel_bundle(&cache).await {
+            Ok(kernel) => return Ok(kernel),
+            Err(e) => {
+                // 3. Pull failed: serve a pre-existing cache (possibly stale) if
+                //    present, otherwise fall through to the clear error below.
+                if image.exists() && initramfs.exists() {
+                    tracing::warn!(
+                        kernel = %image.display(),
+                        initramfs = %initramfs.display(),
+                        error = %e,
+                        bundle = VZ_LINUX_BUNDLE_IMAGE,
+                        "vz-linux: registry unreachable; using cached kernel bundle \
+                         (which may be stale)"
+                    );
+                    return Ok(LinuxKernel { image, initramfs });
+                }
+                tracing::warn!(
+                    error = %e,
+                    bundle = VZ_LINUX_BUNDLE_IMAGE,
+                    "vz-linux: kernel-bundle pull failed and no cache present"
+                );
+            }
         }
 
         Err(AgentError::Configuration(format!(
-            "vz-linux kernel artifact not found; set ZLAYER_VZ_LINUX_KERNEL/_INITRD or run \
-             images/vz-linux/build.sh and place Image+initramfs.cpio.gz in {}",
-            cache.display()
+            "vz-linux kernel artifact not found; the bundle image {bundle} could not be pulled \
+             (the GHCR package must be public) — set ZLAYER_VZ_LINUX_KERNEL/_INITRD or run \
+             images/vz-linux/build.sh and place Image+initramfs.cpio.gz in {cache}",
+            bundle = VZ_LINUX_BUNDLE_IMAGE,
+            cache = cache.display(),
         )))
+    }
+
+    /// Pull (or refresh) [`VZ_LINUX_BUNDLE_IMAGE`] and install its
+    /// `Image` + `initramfs.cpio.gz` (+ `manifest.json`) into `cache_dir`.
+    ///
+    /// Pulls through the persistent `blobs.redb` blob cache with the default
+    /// hostname-based auth resolver (anonymous GHCR), reads the resulting
+    /// manifest digest back out of the blob cache, and — only when that digest
+    /// differs from the recorded one or the cached files are missing — unpacks
+    /// the layer(s) to a temp dir and atomically installs the two artifacts plus
+    /// the manifest. A digest match is a no-op that reuses the cache as-is.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::PullFailed`] when the registry pull fails (so the
+    /// caller can fall back to a stale cache), and [`AgentError::Configuration`]
+    /// when the pull succeeds but the extracted bundle is missing an artifact.
+    async fn pull_kernel_bundle(&self, cache_dir: &std::path::Path) -> Result<LinuxKernel> {
+        let image = VZ_LINUX_BUNDLE_IMAGE;
+
+        tokio::fs::create_dir_all(cache_dir)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("create kernel cache dir: {e}"),
+            })?;
+
+        // Persistent blob cache — same convention this runtime uses for every
+        // other image pull (`{data_dir}/vz/linux/images/blobs.redb`). Held as a
+        // cloneable Arc so we can read the manifest digest back out after the
+        // pull (`from_env_for_runtime` takes its own clone of the Arc).
+        let cache_path = self.images_dir().join("blobs.redb");
+        let blob_cache = zlayer_registry::CacheType::persistent_at(&cache_path)
+            .build()
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("open blob cache: {e}"),
+            })?;
+
+        // Default hostname-based auth (DockerConfig → ~/.docker/config.json,
+        // degrading to anonymous): the published GHCR package is public.
+        let pull_auth = Self::resolve_pull_auth(None, image);
+
+        // `Newer` so a rolling tag is revalidated against the origin each boot.
+        let mut puller = zlayer_registry::ImagePuller::from_env_for_runtime(
+            Arc::clone(&blob_cache),
+            zlayer_spec::SourcePolicy::default(),
+        )
+        .await;
+        if let Some(reg) = self.open_local_registry().await {
+            puller = puller.with_local_registry(reg);
+        }
+
+        let layers =
+            puller
+                .pull_image(image, &pull_auth)
+                .await
+                .map_err(|e| AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!("pull kernel bundle layers: {e}"),
+                })?;
+
+        // The registry digest is cached under `manifest_digest_cache_key` by the
+        // pull (same convention youki's `list_images` reads). Read it back so we
+        // can decide whether the on-disk cache is already current.
+        let digest_key = zlayer_registry::manifest_digest_cache_key(image);
+        let remote_digest = blob_cache
+            .get(&digest_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+
+        let kernel_path = cache_dir.join("Image");
+        let initrd_path = cache_dir.join("initramfs.cpio.gz");
+        let digest_path = cache_dir.join("digest");
+
+        let cached_digest = tokio::fs::read_to_string(&digest_path)
+            .await
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        let need_extract = kernel_bundle_needs_extract(
+            remote_digest.as_deref(),
+            cached_digest.as_deref(),
+            kernel_path.exists(),
+            initrd_path.exists(),
+        );
+
+        if !need_extract {
+            tracing::info!(
+                kernel = %kernel_path.display(),
+                initramfs = %initrd_path.display(),
+                digest = remote_digest.as_deref().unwrap_or("<unknown>"),
+                "vz-linux: kernel bundle already current; using on-disk cache"
+            );
+            return Ok(LinuxKernel {
+                image: kernel_path,
+                initramfs: initrd_path,
+            });
+        }
+
+        tracing::info!(
+            image = %image,
+            layer_count = layers.len(),
+            digest = remote_digest.as_deref().unwrap_or("<unknown>"),
+            "vz-linux: extracting kernel bundle layers"
+        );
+
+        // Unpack into a scratch dir under the cache so the atomic renames stay on
+        // the same filesystem. Cleared first to avoid stale members.
+        let staging = cache_dir.join(".extract.tmp");
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        let mut unpacker = zlayer_registry::LayerUnpacker::new(staging.clone());
+        unpacker
+            .unpack_layers(&layers)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("extract kernel bundle: {e}"),
+            })?;
+
+        let src_kernel = staging.join("vz-linux").join("Image");
+        let src_initrd = staging.join("vz-linux").join("initramfs.cpio.gz");
+        let src_manifest = staging.join("vz-linux").join("manifest.json");
+
+        if !src_kernel.exists() || !src_initrd.exists() {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(AgentError::Configuration(format!(
+                "vz-linux bundle image {image} is missing vz-linux/Image or \
+                 vz-linux/initramfs.cpio.gz after extraction"
+            )));
+        }
+
+        // Atomically install each artifact: copy to a `.tmp` sibling, then rename
+        // over the live name (rename within a dir is atomic on the same fs).
+        install_atomically(&src_kernel, &kernel_path).await?;
+        install_atomically(&src_initrd, &initrd_path).await?;
+        if src_manifest.exists() {
+            // manifest.json is informational; a copy failure must not abort boot.
+            let manifest_path = cache_dir.join("manifest.json");
+            if let Err(e) = install_atomically(&src_manifest, &manifest_path).await {
+                tracing::debug!(error = %e, "vz-linux: failed to install bundle manifest.json (non-fatal)");
+            }
+        }
+
+        // Record the digest LAST so a crash mid-install never marks the cache
+        // current. Skipped when the registry gave us no digest (e.g. an
+        // anonymous pull served purely from cache) — the files are installed
+        // either way; the next boot just re-checks.
+        if let Some(digest) = remote_digest.as_deref() {
+            let tmp_digest = cache_dir.join("digest.tmp");
+            tokio::fs::write(&tmp_digest, digest.as_bytes())
+                .await
+                .map_err(|e| AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!("write kernel digest: {e}"),
+                })?;
+            tokio::fs::rename(&tmp_digest, &digest_path)
+                .await
+                .map_err(|e| AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!("install kernel digest: {e}"),
+                })?;
+        }
+
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+
+        tracing::info!(
+            kernel = %kernel_path.display(),
+            initramfs = %initrd_path.display(),
+            digest = remote_digest.as_deref().unwrap_or("<unknown>"),
+            "vz-linux: kernel bundle pulled and installed"
+        );
+        Ok(LinuxKernel {
+            image: kernel_path,
+            initramfs: initrd_path,
+        })
     }
 
     /// `{data_dir}/vz/linux/{service}-{replica}/` — per-container state.
@@ -850,6 +1073,64 @@ fn rootfs_is_populated(rootfs_dir: &std::path::Path) -> bool {
     std::fs::read_dir(rootfs_dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// Decide whether the VZ-Linux kernel bundle must be (re-)extracted into the
+/// on-disk cache, given the freshly-pulled manifest `remote_digest`, the
+/// `cached_digest` recorded alongside the last install, and whether the cached
+/// `Image` / `initramfs.cpio.gz` files are present.
+///
+/// Pure (paths-resolved booleans + digest strings in, decision out) so the
+/// refresh policy is unit-testable without a registry or filesystem:
+/// - Missing either artifact ⇒ extract (the cache is incomplete).
+/// - Both present AND the remote digest equals the recorded one ⇒ reuse.
+/// - A differing digest ⇒ extract (the rolling tag moved).
+/// - An UNKNOWN remote digest (anonymous/offline pull served from cache with no
+///   digest sidecar) with both files present ⇒ reuse (don't churn what we have).
+fn kernel_bundle_needs_extract(
+    remote_digest: Option<&str>,
+    cached_digest: Option<&str>,
+    kernel_present: bool,
+    initrd_present: bool,
+) -> bool {
+    if !kernel_present || !initrd_present {
+        return true;
+    }
+    match (remote_digest, cached_digest) {
+        // Remote digest known: extract only when it differs from the record
+        // (a missing record counts as different).
+        (Some(remote), cached) => cached != Some(remote),
+        // No remote digest available but both files exist: reuse the cache.
+        (None, _) => false,
+    }
+}
+
+/// Atomically install `src` at `dst` by copying to a `dst.tmp` sibling and then
+/// renaming over `dst` (a rename within one directory on the same filesystem is
+/// atomic). Used to publish the kernel/initramfs into the cache without ever
+/// exposing a half-written file to a concurrent boot.
+async fn install_atomically(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    let tmp = match dst.file_name() {
+        Some(name) => {
+            let mut t = name.to_os_string();
+            t.push(".tmp");
+            dst.with_file_name(t)
+        }
+        None => dst.with_extension("tmp"),
+    };
+    tokio::fs::copy(src, &tmp)
+        .await
+        .map_err(|e| AgentError::PullFailed {
+            image: VZ_LINUX_BUNDLE_IMAGE.to_string(),
+            reason: format!("stage {}: {e}", dst.display()),
+        })?;
+    tokio::fs::rename(&tmp, dst)
+        .await
+        .map_err(|e| AgentError::PullFailed {
+            image: VZ_LINUX_BUNDLE_IMAGE.to_string(),
+            reason: format!("install {}: {e}", dst.display()),
+        })?;
+    Ok(())
+}
+
 /// Pull the OCI image config and persist its runtime defaults
 /// (Entrypoint/Cmd/Env/WorkingDir/User) as an `image-config.json` sidecar in
 /// `image_dir` (the parent of the extracted `rootfs`).
@@ -924,6 +1205,18 @@ fn read_image_config_sidecar(rootfs_dir: &std::path::Path) -> Option<zlayer_regi
     }
 }
 
+/// OCI image holding the published VZ-Linux guest kernel bundle.
+///
+/// CI publishes this rolling `arm64` image (FROM scratch) with exactly three
+/// members under `/vz-linux/`: `Image` (the raw arm64 Linux kernel),
+/// `initramfs.cpio.gz`, and `manifest.json`. The daemon pulls it through the
+/// SAME image machinery the sandbox/youki runtimes use for every other image.
+///
+/// Used as a LITERAL reference everywhere (stored/looked up under exactly this
+/// string per the codebase's no-canonicalization rule — see
+/// [`sanitize_image_name`] / [`resolve_existing_rootfs`]).
+const VZ_LINUX_BUNDLE_IMAGE: &str = "ghcr.io/blackleafdigital/zlayer/vz-linux:arm64";
+
 /// Default Linux-guest kernel command line.
 ///
 /// `console=hvc0` routes the kernel console to the virtio serial port wired to
@@ -932,6 +1225,27 @@ fn read_image_config_sidecar(rootfs_dir: &std::path::Path) -> Option<zlayer_regi
 /// (the agent mounts virtiofs `rootfs` as `/`), replacing the placeholder
 /// `root=/dev/vda` block-device path. Until then the initramfs runs from RAM.
 const LINUX_CMDLINE: &str = "console=hvc0 rootfstag=rootfs rw";
+
+/// Build the Linux-guest kernel command line, appending the host wall-clock
+/// epoch as `zlayer.boottime=<unix_secs>` so the guest can seed its clock at
+/// boot.
+///
+/// A VZ Linux guest has no RTC and starts at epoch 0 (1970), which breaks TLS
+/// cert validity windows, build timestamps, and anything time-aware. The
+/// in-guest `zlayer-vzagent` reads `zlayer.boottime=` from `/proc/cmdline` and
+/// `settimeofday`s before serving. If the host clock is somehow unavailable
+/// (a pre-1970 system clock — `duration_since(UNIX_EPOCH)` errs), we fall back
+/// to the static [`LINUX_CMDLINE`] and let the guest start at epoch (a later
+/// [`Msg::SetTime`](proto::Msg::SetTime) resync corrects it).
+///
+/// Factored out of [`build_config_linux`] (which constructs queue-affine VZ
+/// objects and can't run off-macOS) so the cmdline string is unit-testable.
+fn build_linux_cmdline(now: std::time::SystemTime) -> String {
+    now.duration_since(std::time::UNIX_EPOCH).map_or_else(
+        |_| LINUX_CMDLINE.to_string(),
+        |d| format!("{LINUX_CMDLINE} zlayer.boottime={}", d.as_secs()),
+    )
+}
 
 /// Virtiofs share tag the guest agent mounts as the container rootfs lower.
 /// MUST match the `rootfstag=` value in [`LINUX_CMDLINE`] and the tag the
@@ -945,6 +1259,12 @@ const VSOCK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause between vsock connect attempts.
 const VSOCK_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the per-VM background task re-pushes the host wall clock to the
+/// guest via [`Msg::SetTime`](proto::Msg::SetTime). Apple Virtualization guests
+/// have no RTC and never resync after a host sleep, so a long-lived VM drifts;
+/// a periodic resync keeps x509 validity windows and time-aware workloads sane.
+const SETTIME_RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Round-trip a MAC string through `VZMACAddress` (parse then re-stringify),
 /// returning the framework's canonical spelling or `None` when the string is
@@ -1058,14 +1378,9 @@ pub(crate) fn build_config_linux(
         // boot. A VZ Linux guest has no RTC and starts at epoch 0 (1970), which
         // breaks TLS cert validity, build timestamps, and anything time-aware.
         // The vzagent reads `zlayer.boottime=<unix_secs>` from /proc/cmdline and
-        // `settimeofday`s before serving. Falls back to a static cmdline if the
-        // clock is somehow unavailable.
-        let cmdline_str = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or_else(
-                |_| LINUX_CMDLINE.to_string(),
-                |d| format!("{LINUX_CMDLINE} zlayer.boottime={}", d.as_secs()),
-            );
+        // `settimeofday`s before serving. `build_linux_cmdline` falls back to a
+        // static cmdline if the clock is somehow unavailable.
+        let cmdline_str = build_linux_cmdline(std::time::SystemTime::now());
         let cmdline = NSString::from_str(&cmdline_str);
         linux_boot.setCommandLine(&cmdline);
         let boot: Retained<VZBootLoader> = Retained::into_super(linux_boot);
@@ -1793,6 +2108,60 @@ fn push_overlay_agent(live: &LiveVm, msg: &proto::Msg) -> std::result::Result<bo
     Ok(saw_eof)
 }
 
+/// Send a [`Msg::SetTime`](proto::Msg::SetTime) to a live guest agent, seeding
+/// the guest wall clock to the host's current epoch seconds.
+///
+/// Mirrors [`push_overlay_agent`]: opens a fresh vsock control connection to the
+/// guest, writes the single frame, then drains until EOF (bounded by a 5s read
+/// timeout) so we can report whether the guest actually consumed the frame
+/// (`Ok(true)`) vs. a timeout/reset (`Ok(false)`).
+///
+/// Fire-and-forget by design — a VZ guest has no RTC and never resyncs its
+/// clock after the host sleeps, so the host re-pushes the wall clock on resume
+/// and on a periodic tick. Callers treat any failure as warn-level and keep
+/// going; the next tick retries.
+///
+/// **Stale-guest safety:** an old guest binary built before tag 14 existed runs
+/// a [`proto::decode`] whose range check rejected tag 14
+/// ([`proto::ProtoError::UnknownTag(14)`](proto::ProtoError::UnknownTag)). On
+/// that path the guest logs the unknown tag and closes the connection without
+/// applying anything — it never crashes. Host-side we only *write* the frame
+/// here, so the worst case is the guest dropping it and us observing a reset
+/// (`Ok(false)`) or a write error (returned as `Err`, logged warn by the
+/// caller). Either way the host is never wedged or aborted by an out-of-range
+/// tag at the guest.
+fn push_settime(live: &LiveVm) -> std::result::Result<bool, String> {
+    use std::io::Read as _;
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            // `as` on a u64 -> i64: epoch seconds won't overflow i64 until the
+            // year ~292 billion, so this is lossless for any real wall clock.
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
+        })
+        .map_err(|e| format!("host clock before UNIX_EPOCH: {e}"))?;
+    let msg = proto::Msg::SetTime { unix_secs };
+    let mut stream = connect_vsock(live)?;
+    proto::write_frame(&mut stream, &msg).map_err(|e| format!("send SetTime failed: {e}"))?;
+    // Bound the post-write wait like `push_overlay_agent`: the guest reads the
+    // frame, applies `settimeofday`, then its next read hits EOF and it closes.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut sink = [0u8; 256];
+    let mut saw_eof = false;
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => {
+                saw_eof = true;
+                break;
+            }
+            Ok(_) => {}      // drain any reply bytes, keep reading
+            Err(_) => break, // timeout / reset: don't wedge the caller
+        }
+    }
+    Ok(saw_eof)
+}
+
 /// Derive the VZ NAT gateway for a guest from its leased address: the `.1` of
 /// its IPv4 `/24`. VZ NAT is a `192.168.64.0/24` with the host at `.1`, but
 /// deriving it from the lease keeps us correct if the subnet ever differs. IPv6
@@ -2149,6 +2518,7 @@ impl Runtime for VzLinuxRuntime {
             outcome: Arc::new(RunOutcome::default()),
             drain_task: None,
             cleanup_task: None,
+            settime_task: None,
             port_forwards: Vec::new(),
             stdin_tx: None,
             overlay_ip: None,
@@ -2162,8 +2532,9 @@ impl Runtime for VzLinuxRuntime {
     async fn start_container(&self, id: &ContainerId) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
-        // Resolve the guest kernel + initramfs (env override or on-disk cache).
-        let kernel = self.ensure_linux_kernel()?;
+        // Resolve the guest kernel + initramfs (env override, then a normal pull
+        // of the published bundle image, falling back to the on-disk cache).
+        let kernel = self.ensure_linux_kernel().await?;
 
         // Snapshot the Send build inputs without holding the lock across the
         // blocking queue work.
@@ -2249,6 +2620,12 @@ impl Runtime for VzLinuxRuntime {
             queue: live.queue.clone(),
             vm: Arc::clone(&live.vm),
         };
+        // A second queue-handle clone for the periodic wall-clock resync task,
+        // taken here before `live` is moved into the container record below.
+        let live_for_settime = LiveVm {
+            queue: live.queue.clone(),
+            vm: Arc::clone(&live.vm),
+        };
 
         // Build the `Run` message + bind-mount list + capture handles, then
         // record the running VM. The bind mounts are derived from the SAME spec
@@ -2306,6 +2683,57 @@ impl Runtime for VzLinuxRuntime {
             if let Some(c) = guard.get_mut(&dir_name) {
                 c.drain_task = Some(drain);
                 c.stdin_tx = Some(stdin_tx);
+            }
+        }
+
+        // Spawn the periodic wall-clock resync task. A VZ guest has no RTC and
+        // never resyncs after a host sleep, so a long-lived VM's clock drifts
+        // (breaking x509 validity windows + time-aware workloads). Every
+        // `SETTIME_RESYNC_INTERVAL` we push the host's current epoch as a
+        // `Msg::SetTime`. The vsock connect + frame write are blocking, so each
+        // tick runs them via `spawn_blocking`. The handle is tied to VM lifetime:
+        // `stop`/`remove` abort it (alongside the drain/cleanup tasks), so it
+        // exits cleanly when the VM stops and never pushes to a dead VM.
+        let dir_for_settime = dir_name.clone();
+        let settime = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SETTIME_RESYNC_INTERVAL);
+            // Skip the immediate tick `interval` fires at t=0: the guest already
+            // seeded its clock from `zlayer.boottime=` at boot, so the first
+            // resync should wait a full interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let live = LiveVm {
+                    queue: live_for_settime.queue.clone(),
+                    vm: Arc::clone(&live_for_settime.vm),
+                };
+                match tokio::task::spawn_blocking(move || push_settime(&live)).await {
+                    Ok(Ok(acked)) => tracing::debug!(
+                        container = %dir_for_settime,
+                        guest_acked = acked,
+                        "vz-linux: periodic wall-clock resync pushed to guest"
+                    ),
+                    Ok(Err(e)) => tracing::warn!(
+                        container = %dir_for_settime,
+                        error = %e,
+                        "vz-linux: periodic wall-clock resync failed; retrying next tick"
+                    ),
+                    Err(e) => tracing::warn!(
+                        container = %dir_for_settime,
+                        error = %e,
+                        "vz-linux: wall-clock resync task panicked; retrying next tick"
+                    ),
+                }
+            }
+        });
+        {
+            let mut guard = self.containers.write().await;
+            if let Some(c) = guard.get_mut(&dir_name) {
+                c.settime_task = Some(settime);
+            } else {
+                // Container vanished between the drain spawn and here: don't leak
+                // the resync task.
+                settime.abort();
             }
         }
 
@@ -2423,9 +2851,9 @@ impl Runtime for VzLinuxRuntime {
         }
 
         // Teardown phase: take the live VM + tasks out of the record, set the
-        // final state, abort the drain + port-forward + cleanup tasks, then
-        // force the VM down and release it.
-        let (live, drain, cleanup) = {
+        // final state, abort the drain + port-forward + cleanup + resync tasks,
+        // then force the VM down and release it.
+        let (live, drain, cleanup, settime) = {
             let mut guard = self.containers.write().await;
             let Some(c) = guard.get_mut(&dir_name) else {
                 // Vanished mid-stop: nothing more to do.
@@ -2443,8 +2871,18 @@ impl Runtime for VzLinuxRuntime {
             for f in std::mem::take(&mut c.port_forwards) {
                 f.task.abort();
             }
-            (c.live.take(), c.drain_task.take(), c.cleanup_task.take())
+            (
+                c.live.take(),
+                c.drain_task.take(),
+                c.cleanup_task.take(),
+                c.settime_task.take(),
+            )
         };
+        // Abort the periodic wall-clock resync task so it can't push to the VM
+        // we're about to tear down.
+        if let Some(settime) = settime {
+            settime.abort();
+        }
         // Abort the delete_on_exit watcher so an explicit stop wins the race and
         // the watcher can't race this teardown / double-free the record.
         if let Some(cleanup) = cleanup {
@@ -2473,7 +2911,7 @@ impl Runtime for VzLinuxRuntime {
         // Remove the record outright, taking ownership of its VM + every spawned
         // task. Removing an unknown container is Ok (idempotent) — this matches
         // docker_runtime_test::test_remove_nonexistent_container.
-        let (state_dir, live, drain, cleanup, forwards) = {
+        let (state_dir, live, drain, cleanup, settime, forwards) = {
             let mut guard = self.containers.write().await;
             match guard.remove(&dir_name) {
                 Some(c) => (
@@ -2481,11 +2919,17 @@ impl Runtime for VzLinuxRuntime {
                     c.live,
                     c.drain_task,
                     c.cleanup_task,
+                    c.settime_task,
                     c.port_forwards,
                 ),
                 None => return Ok(()),
             }
         };
+        // Abort the periodic wall-clock resync task so it can't race this
+        // explicit removal / push to a torn-down VM.
+        if let Some(settime) = settime {
+            settime.abort();
+        }
         // Abort the delete_on_exit watcher (if any) so it can't race this
         // explicit removal.
         if let Some(cleanup) = cleanup {
@@ -3268,10 +3712,39 @@ impl Runtime for VzLinuxRuntime {
                 reason: "not running".to_string(),
             });
         };
+        // A second queue-handle clone so we can re-seed the guest clock after the
+        // resume without moving `live` out of the resume op.
+        let live_for_settime = LiveVm {
+            queue: live.queue.clone(),
+            vm: Arc::clone(&live.vm),
+        };
         tokio::task::spawn_blocking(move || run_vm_lifecycle(&live, VmLifecycleOp::Resume))
             .await
             .map_err(|e| AgentError::Internal(format!("resume task: {e}")))?
-            .map_err(|e| AgentError::Internal(format!("resume: {e}")))
+            .map_err(|e| AgentError::Internal(format!("resume: {e}")))?;
+
+        // Best-effort wall-clock resync right after resume. A paused/resumed VZ
+        // guest's clock froze while paused (and never resyncs on its own), so
+        // the host re-seeds it immediately rather than waiting for the next
+        // periodic tick. Failures are warn-level — the periodic task retries.
+        match tokio::task::spawn_blocking(move || push_settime(&live_for_settime)).await {
+            Ok(Ok(acked)) => tracing::debug!(
+                container = %dir_name,
+                guest_acked = acked,
+                "vz-linux: pushed wall-clock resync to guest after resume"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                container = %dir_name,
+                error = %e,
+                "vz-linux: post-resume wall-clock resync failed; periodic task will retry"
+            ),
+            Err(e) => tracing::warn!(
+                container = %dir_name,
+                error = %e,
+                "vz-linux: post-resume wall-clock resync task panicked; periodic task will retry"
+            ),
+        }
+        Ok(())
     }
 }
 
@@ -3409,6 +3882,55 @@ mod tests {
         assert!(LINUX_CMDLINE.contains("console=hvc0"));
         assert!(LINUX_CMDLINE.contains("rootfstag=rootfs"));
         assert!(!LINUX_CMDLINE.contains("root=/dev/vda"));
+    }
+
+    #[test]
+    fn linux_cmdline_injects_recent_boottime() {
+        // The guest has no RTC and seeds its clock from `zlayer.boottime=` at
+        // boot, so the built cmdline must carry the host's current epoch. Build
+        // it from `now` and assert the embedded value is a fresh epoch.
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host clock is after UNIX_EPOCH")
+            .as_secs();
+
+        let cmdline = build_linux_cmdline(now);
+        // The static base must still be present (the boottime is appended).
+        assert!(
+            cmdline.contains("console=hvc0"),
+            "cmdline lost its static base: {cmdline}"
+        );
+
+        // Parse the `zlayer.boottime=<unix_secs>` token's value.
+        let token = cmdline
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("zlayer.boottime="))
+            .unwrap_or_else(|| panic!("cmdline missing zlayer.boottime=: {cmdline}"));
+        let boottime: u64 = token
+            .parse()
+            .unwrap_or_else(|e| panic!("zlayer.boottime not an integer ({token:?}): {e}"));
+
+        // It must equal the epoch we passed in (within a tight window — the
+        // helper reads no clock of its own, but allow a small slack for the
+        // `SystemTime::now()` captured above vs. this assert).
+        let drift = boottime.abs_diff(now_secs);
+        assert!(
+            drift <= 300,
+            "boottime {boottime} drifted {drift}s from now {now_secs} (>300s)"
+        );
+    }
+
+    #[test]
+    fn linux_cmdline_falls_back_when_clock_pre_epoch() {
+        // A system clock before 1970 makes `duration_since(UNIX_EPOCH)` err; the
+        // helper must then fall back to the static cmdline (no boottime token)
+        // rather than panic — the guest stays at epoch and a later `Msg::SetTime`
+        // resync corrects it.
+        let pre_epoch = std::time::UNIX_EPOCH - Duration::from_secs(1);
+        let cmdline = build_linux_cmdline(pre_epoch);
+        assert_eq!(cmdline, LINUX_CMDLINE);
+        assert!(!cmdline.contains("zlayer.boottime="));
     }
 
     #[test]
@@ -3763,13 +4285,16 @@ mod tests {
         assert!(LINUX_CMDLINE.contains(&format!("rootfstag={VIRTIOFS_ROOTFS_TAG}")));
     }
 
-    #[test]
-    fn ensure_linux_kernel_errors_clearly_when_absent() {
-        // With neither the env override nor a populated cache, the error must
-        // name both escape hatches and the cache directory.
+    #[tokio::test]
+    async fn ensure_linux_kernel_errors_clearly_when_absent() {
+        // With neither the env override, a successful pull, nor a populated
+        // cache, the error must name both escape hatches, the cache directory,
+        // and the GHCR bundle ref (the new pull-based path).
         let rt = VzLinuxRuntime::new(None).expect("construct VzLinuxRuntime");
         // Guard against a populated cache or env on the dev box: only assert the
-        // error shape when resolution actually fails.
+        // error shape when resolution actually fails. (A reachable network with a
+        // public bundle would also succeed; in that case skip — we only assert
+        // the failure wording.)
         if std::env::var_os("ZLAYER_VZ_LINUX_KERNEL").is_some()
             && std::env::var_os("ZLAYER_VZ_LINUX_INITRD").is_some()
         {
@@ -3779,13 +4304,66 @@ mod tests {
         if cache.join("Image").exists() && cache.join("initramfs.cpio.gz").exists() {
             return;
         }
-        match rt.ensure_linux_kernel() {
+        match rt.ensure_linux_kernel().await {
             Err(AgentError::Configuration(msg)) => {
                 assert!(msg.contains("ZLAYER_VZ_LINUX_KERNEL/_INITRD"));
                 assert!(msg.contains("Image+initramfs.cpio.gz"));
+                assert!(msg.contains(VZ_LINUX_BUNDLE_IMAGE));
+                assert!(msg.contains("must be public"));
             }
-            other => panic!("expected Configuration error, got {other:?}"),
+            // A reachable, public bundle pulled successfully — nothing to assert.
+            Ok(_) => {}
+            other => panic!("expected Configuration error or Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn kernel_bundle_needs_extract_decision_matrix() {
+        // Missing either artifact always forces an extract, regardless of digest.
+        assert!(kernel_bundle_needs_extract(
+            Some("sha256:a"),
+            Some("sha256:a"),
+            false,
+            true
+        ));
+        assert!(kernel_bundle_needs_extract(
+            Some("sha256:a"),
+            Some("sha256:a"),
+            true,
+            false
+        ));
+        assert!(kernel_bundle_needs_extract(None, None, false, false));
+
+        // Both present + matching digest ⇒ reuse.
+        assert!(!kernel_bundle_needs_extract(
+            Some("sha256:a"),
+            Some("sha256:a"),
+            true,
+            true
+        ));
+
+        // Both present + differing (or missing) recorded digest ⇒ extract.
+        assert!(kernel_bundle_needs_extract(
+            Some("sha256:b"),
+            Some("sha256:a"),
+            true,
+            true
+        ));
+        assert!(kernel_bundle_needs_extract(
+            Some("sha256:b"),
+            None,
+            true,
+            true
+        ));
+
+        // Unknown remote digest but both files present ⇒ reuse (don't churn).
+        assert!(!kernel_bundle_needs_extract(
+            None,
+            Some("sha256:a"),
+            true,
+            true
+        ));
+        assert!(!kernel_bundle_needs_extract(None, None, true, true));
     }
 
     #[test]

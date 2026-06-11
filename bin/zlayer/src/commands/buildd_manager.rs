@@ -14,6 +14,12 @@
 //!    with the gRPC port published to host loopback, the persistent
 //!    storage volume, the shared mTLS directory, and a **build-context
 //!    bind mount** so build inputs are visible to the in-guest buildah.
+//!    Once up (warm-reuse or fresh-start) two guest-side preconditions are
+//!    enforced before the handle is returned, both hard-failing:
+//!    **clock sync** (`date -u -s` to host UTC — the VZ-Linux VM boots with a
+//!    stale cached-initramfs clock that otherwise breaks TLS pulls with
+//!    "certificate not yet valid") and **fuse prerequisites** (`/dev/fuse`
+//!    node + the `fuse-overlayfs` binary the context mount needs).
 //!
 //! 2. **Stage context** — copy a build context tree into a unique subdir
 //!    of the shared context dir so the in-guest buildah sees it at
@@ -155,7 +161,14 @@ pub async fn ensure_buildd() -> Result<BuilddHandle> {
     let serving = probe_health(&handle).await;
     if serving && guest_has_context_mount().await {
         info!(addr = %handle.addr, "reusing running zlayer-buildd (context mount present)");
-        ensure_dev_fuse().await;
+        // The reused container was started by an earlier invocation; we don't
+        // track which image it ran, so report the configured/ghcr default as
+        // the best-effort descriptor in any failure message.
+        let reused_image = buildd_image();
+        // The VM may have been up for a while with clock drift; resync before
+        // any pulls. Hard-fail: a stale clock breaks TLS pulls.
+        ensure_guest_time().await?;
+        ensure_dev_fuse(&reused_image).await?;
         return Ok(handle);
     }
 
@@ -198,11 +211,17 @@ pub async fn ensure_buildd() -> Result<BuilddHandle> {
     };
     info!(image = %used_image, "zlayer-buildd container up");
 
+    // The VZ-Linux VM boots from a cached initramfs with a stale clock; sync it
+    // to host UTC before any registry pulls, or TLS validation fails with
+    // "certificate not yet valid". Hard-fail on skew.
+    ensure_guest_time().await?;
+
     // buildah overlay-mounts the build-context dir via fuse-overlayfs, which
     // needs `/dev/fuse`. VZ-Linux containers don't get one by default, so
-    // create the device node now. The guest kernel has the `fuse` module
-    // loaded (visible in /proc/filesystems); only the node is missing.
-    ensure_dev_fuse().await;
+    // create the device node now (the guest kernel has the `fuse` module
+    // loaded — only the node is missing), then verify fuse-overlayfs is
+    // present. Hard-fail if the image lacks the prerequisites.
+    ensure_dev_fuse(&used_image).await?;
 
     info!(addr = %handle.addr, "zlayer-buildd ready (context-mounted)");
     Ok(handle)
@@ -343,29 +362,158 @@ pub async fn prune_build_storage(_handle: &BuilddHandle) {
 }
 
 /// Create `/dev/fuse` (char 10:229) inside the buildd container if missing,
-/// so buildah's fuse-overlayfs context mount works. Idempotent + best-effort
-/// (a pre-existing node makes `mknod` fail harmlessly).
-async fn ensure_dev_fuse() {
-    let Ok(exe) = zlayer_exe() else {
-        return;
-    };
-    let out = tokio::process::Command::new(&exe)
+/// so buildah's fuse-overlayfs context mount works, then verify the image
+/// actually has the fuse prerequisites (`/dev/fuse` node + the
+/// `fuse-overlayfs` binary on `PATH`).
+///
+/// The `mknod` exec is retried up to 3 times with a short backoff: the gRPC
+/// `Health = SERVING` gate proves the buildd server is up, but it does NOT
+/// guarantee the vsock `zlayer exec` channel into the guest is ready yet, so
+/// the first exec after start can transiently fail.
+///
+/// Hard-fails (returns `Err`) instead of warning: an image without
+/// `/dev/fuse` or `fuse-overlayfs` cannot mount the build context, so the
+/// build would die later with an opaque fuse error. `image` is the active
+/// buildd image (ghcr default or local fallback) and is named in the error so
+/// the operator knows which image lacks the prerequisites.
+async fn ensure_dev_fuse(image: &str) -> Result<()> {
+    let exe = zlayer_exe()?;
+
+    // Retry the mknod: the exec channel into the freshly-started guest may not
+    // be ready the instant Health flips to SERVING.
+    let mut last_err = String::new();
+    let mut made = false;
+    for attempt in 1..=3u32 {
+        let out = tokio::process::Command::new(&exe)
+            .arg("exec")
+            .arg(BUILDD_NAME)
+            .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg("test -e /dev/fuse || mknod -m 666 /dev/fuse c 10 229")
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                made = true;
+                break;
+            }
+            Ok(o) => {
+                last_err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+        if attempt < 3 {
+            warn!(
+                attempt,
+                "ensuring /dev/fuse in {BUILDD_NAME} failed ({last_err}); retrying"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    if !made {
+        bail!(
+            "could not create /dev/fuse in {BUILDD_NAME} (image {image}) after 3 attempts: \
+             {last_err} — image lacks fuse prerequisites for the build-context mount"
+        );
+    }
+
+    // Final verification: the node exists AND fuse-overlayfs is installed.
+    let check = tokio::process::Command::new(&exe)
         .arg("exec")
         .arg(BUILDD_NAME)
         .arg("--")
         .arg("sh")
         .arg("-c")
-        .arg("test -e /dev/fuse || mknod -m 666 /dev/fuse c 10 229")
+        .arg("test -e /dev/fuse && command -v fuse-overlayfs")
         .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => warn!(
-            "could not ensure /dev/fuse in {BUILDD_NAME}: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => warn!("exec mknod /dev/fuse failed: {e}"),
+        .await
+        .context("verifying /dev/fuse + fuse-overlayfs in zlayer-buildd")?;
+    if !check.status.success() {
+        bail!(
+            "zlayer-buildd image {image} is missing fuse prerequisites \
+             (/dev/fuse node or the fuse-overlayfs binary): {}",
+            String::from_utf8_lossy(&check.stderr).trim()
+        );
     }
+    Ok(())
+}
+
+/// Set the buildd guest's wall clock to the host's current UTC time, then read
+/// it back and verify it landed within ~60s of host now.
+///
+/// The VZ-Linux build VM boots from a cached initramfs and comes up with a
+/// stale clock (observed days behind). A skewed clock makes every TLS pull
+/// fail x509 validation with "certificate not yet valid", and the sidecar's
+/// own mTLS health probe fails the same way. The guest has `CAP_SYS_TIME`, so
+/// `date -u -s` inside the container is sufficient (proven in production).
+///
+/// Hard-fails (returns `Err`) instead of warning: a stale clock silently
+/// breaks all registry pulls, so the operator must know up front.
+async fn ensure_guest_time() -> Result<()> {
+    let exe = zlayer_exe()?;
+
+    let host_now = chrono::Utc::now();
+    let stamp = host_now.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Set the guest clock to host UTC now.
+    let set = tokio::process::Command::new(&exe)
+        .arg("exec")
+        .arg(BUILDD_NAME)
+        .arg("--")
+        .arg("date")
+        .arg("-u")
+        .arg("-s")
+        .arg(&stamp)
+        .output()
+        .await
+        .context("invoking `date -u -s` inside zlayer-buildd")?;
+    if !set.status.success() {
+        bail!(
+            "buildd guest clock could not be set — TLS pulls will fail with \
+             'certificate not yet valid'; `date -u -s \"{stamp}\"` in {BUILDD_NAME} failed: {}",
+            String::from_utf8_lossy(&set.stderr).trim()
+        );
+    }
+
+    // Read the guest clock back as epoch seconds and verify it tracks host now.
+    let read = tokio::process::Command::new(&exe)
+        .arg("exec")
+        .arg(BUILDD_NAME)
+        .arg("--")
+        .arg("date")
+        .arg("-u")
+        .arg("+%s")
+        .output()
+        .await
+        .context("reading back guest clock via `date -u +%s` in zlayer-buildd")?;
+    if !read.status.success() {
+        bail!(
+            "buildd guest clock could not be verified — TLS pulls will fail with \
+             'certificate not yet valid'; `date -u +%s` in {BUILDD_NAME} failed: {}",
+            String::from_utf8_lossy(&read.stderr).trim()
+        );
+    }
+    let out = String::from_utf8_lossy(&read.stdout);
+    let guest_epoch: i64 = out.trim().parse().with_context(|| {
+        format!(
+            "parsing guest epoch seconds from `date -u +%s` output {:?} in {BUILDD_NAME}",
+            out.trim()
+        )
+    })?;
+
+    let skew = (guest_epoch - chrono::Utc::now().timestamp()).abs();
+    if skew > 60 {
+        bail!(
+            "buildd guest clock is still skewed by {skew}s after `date -u -s` — \
+             TLS pulls will fail with 'certificate not yet valid' (set to \"{stamp}\", \
+             guest reads epoch {guest_epoch})"
+        );
+    }
+    info!(skew_secs = skew, "buildd guest clock synced to host UTC");
+    Ok(())
 }
 
 /// True if the running buildd container has the `/context` virtiofs mount.

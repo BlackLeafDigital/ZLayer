@@ -1687,6 +1687,22 @@ mod linux {
                         );
                     }
                 }
+                Msg::SetTime { unix_secs } => {
+                    // Host-driven wall-clock resync (after VM resume and
+                    // periodically). A VZ guest has no RTC and does not
+                    // resynchronize across host sleeps, so without this the
+                    // clock drifts stale and x509 validation fails. Like
+                    // `OverlayConfig`, this is fire-and-forget: success is
+                    // logged, failure is reported but never aborts the agent.
+                    match set_wall_clock(unix_secs) {
+                        Ok(()) => {
+                            eprintln!("zlayer-vzagent: guest clock resynced to epoch {unix_secs}");
+                        }
+                        Err(e) => {
+                            eprintln!("zlayer-vzagent: warning: SetTime({unix_secs}): {e}");
+                        }
+                    }
+                }
                 // Guest→host-only messages are never expected from the host;
                 // reply with an error rather than silently dropping them.
                 other => {
@@ -1705,6 +1721,29 @@ mod linux {
     // ----------------------------------------------------------------------
     // Entry point
     // ----------------------------------------------------------------------
+
+    /// Set the guest wall clock to `secs` seconds since the Unix epoch via
+    /// `settimeofday(2)`.
+    ///
+    /// Shared by the boot-time seeding path ([`set_guest_clock_from_cmdline`])
+    /// and the host-driven resync path ([`Msg::SetTime`](crate::proto::Msg::SetTime)).
+    /// Returns the `errno`-tagged [`Error`] on syscall failure so each caller
+    /// can log it in its own idiom.
+    fn set_wall_clock(secs: i64) -> Result<()> {
+        let tv = libc::timeval {
+            // musl `time_t` is 64-bit (i64), matching `secs` — direct assignment
+            // avoids both the deprecated-alias warning and a useless conversion.
+            tv_sec: secs,
+            tv_usec: 0,
+        };
+        // SAFETY: `tv` is a valid timeval; a null timezone pointer is allowed.
+        let rc = unsafe { libc::settimeofday(&raw const tv, std::ptr::null()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(errno(&format!("settimeofday({secs})")))
+        }
+    }
 
     /// Full PID1 bring-up sequence followed by the control loop.
     /// Set the guest wall clock from the `zlayer.boottime=<unix_secs>` kernel
@@ -1727,21 +1766,9 @@ mod linux {
         else {
             return;
         };
-        let tv = libc::timeval {
-            // musl `time_t` is 64-bit (i64), matching `secs` — direct assignment
-            // avoids both the deprecated-alias warning and a useless conversion.
-            tv_sec: secs,
-            tv_usec: 0,
-        };
-        // SAFETY: `tv` is a valid timeval; a null timezone pointer is allowed.
-        let rc = unsafe { libc::settimeofday(&raw const tv, std::ptr::null()) };
-        if rc == 0 {
-            eprintln!("zlayer-vzagent: guest clock set to epoch {secs}");
-        } else {
-            eprintln!(
-                "zlayer-vzagent: warning: settimeofday({secs}): {}",
-                std::io::Error::last_os_error()
-            );
+        match set_wall_clock(secs) {
+            Ok(()) => eprintln!("zlayer-vzagent: guest clock set to epoch {secs}"),
+            Err(e) => eprintln!("zlayer-vzagent: warning: {e}"),
         }
     }
 

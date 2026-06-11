@@ -2046,39 +2046,10 @@ async fn install(
         }
     }
 
-    #[cfg(feature = "docker-compat")]
-    if docker_socket {
-        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
-        if !shim_dir.exists() {
-            let _ = std::fs::create_dir_all(&shim_dir);
-        }
-        for (name, target) in [
-            ("docker", "zlayer docker"),
-            ("docker-compose", "zlayer docker compose"),
-        ] {
-            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
-                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
-                    println!("Installed shim: {} -> {target}", p.display());
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
-                    println!(
-                        "Installed shim: {} -> {target} (backed up existing file to {})",
-                        shim.display(),
-                        backup.display()
-                    );
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
-                    println!("Shim already installed: {}", p.display());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: could not install {name} shim in {}: {e}",
-                        shim_dir.display()
-                    );
-                }
-            }
-        }
-    }
+    // `--docker-socket` enables only the Docker-compatible socket. The
+    // `docker`/`docker-compose` CLI shims are installed exclusively via
+    // `zlayer docker install` (which has its own `--no-shim` opt-out), never
+    // as a side effect of daemon install.
 
     Ok(())
 }
@@ -3234,40 +3205,10 @@ WantedBy={wanted_by}
         eprintln!("Warning: could not create {}: {e}", log_dir.display());
     }
 
-    // Install Docker + Docker Compose CLI shims when docker-compat is enabled
-    #[cfg(feature = "docker-compat")]
-    if docker_socket {
-        let shim_dir = pick_system_binary_path(daemon_name)
-            .parent()
-            .unwrap_or(std::path::Path::new("/usr/local/bin"))
-            .to_path_buf();
-        for (name, target) in [
-            ("docker", "zlayer docker"),
-            ("docker-compose", "zlayer docker compose"),
-        ] {
-            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
-                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
-                    println!("Installed shim: {} -> {target}", p.display());
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
-                    println!(
-                        "Installed shim: {} -> {target} (backed up existing file to {})",
-                        shim.display(),
-                        backup.display()
-                    );
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
-                    println!("Shim already installed: {}", p.display());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: could not install {name} shim in {}: {e}",
-                        shim_dir.display()
-                    );
-                }
-            }
-        }
-    }
+    // `--docker-socket` enables only the Docker-compatible socket. The
+    // `docker`/`docker-compose` CLI shims are installed exclusively via
+    // `zlayer docker install` (which has its own `--no-shim` opt-out), never
+    // as a side effect of daemon install.
 
     if !no_start {
         // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
@@ -4300,39 +4241,10 @@ async fn install(
         install_overlayd_service(data_dir, &overlayd_bin, no_start).await;
     }
 
-    #[cfg(feature = "docker-compat")]
-    if docker_socket {
-        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
-        if !shim_dir.exists() {
-            let _ = std::fs::create_dir_all(&shim_dir);
-        }
-        for (name, target) in [
-            ("docker", "zlayer docker"),
-            ("docker-compose", "zlayer docker compose"),
-        ] {
-            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
-                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
-                    println!("Installed shim: {} -> {target}", p.display());
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
-                    println!(
-                        "Installed shim: {} -> {target} (backed up existing file to {})",
-                        shim.display(),
-                        backup.display()
-                    );
-                }
-                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
-                    println!("Shim already installed: {}", p.display());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: could not install {name} shim in {}: {e}",
-                        shim_dir.display()
-                    );
-                }
-            }
-        }
-    }
+    // `--docker-socket` enables only the Docker-compatible socket. The
+    // `docker`/`docker-compose` CLI shims are installed exclusively via
+    // `zlayer docker install` (which has its own `--no-shim` opt-out), never
+    // as a side effect of daemon install.
 
     Ok(())
 }
