@@ -12652,6 +12652,7 @@ dependencies = [
  "rand 0.9.2",
  "ratatui",
  "reqwest 0.13.2",
+ "rustls 0.23.37",
  "sd-notify",
  "secrecy",
  "serde",

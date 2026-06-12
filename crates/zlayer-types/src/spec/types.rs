@@ -1005,15 +1005,63 @@ pub enum IsolationMode {
 }
 
 /// Per-process resource limit (Docker `--ulimit` style).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+///
+/// # Default-fill rules (mirrors Docker `--ulimit`)
+///
+/// Docker requires `soft` and lets `hard` default to `soft`. We are liberal in
+/// what we accept so that an omitted bound never yields the footgun of
+/// `hard < soft` (which makes `setrlimit` fail with `EINVAL`, or pins the hard
+/// cap at `0`):
+///
+/// * both present  → used as-is.
+/// * `hard` absent  → `hard = soft` (Docker's documented behavior).
+/// * `soft` absent  → `soft = hard` (a lone bound applies to both; never
+///   produces `soft > hard`).
+/// * both absent    → both `0` (preserves the `Default` shape).
+///
+/// The public fields stay `soft: i64, hard: i64`; the fill happens during
+/// deserialization so consumers always see a fully-populated, consistent pair.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UlimitSpec {
-    /// Soft limit.
+    /// Soft limit. If omitted in the input, defaults to `hard` (or `0` when
+    /// both are omitted).
     #[serde(default)]
     pub soft: i64,
-    /// Hard limit.
+    /// Hard limit. If omitted in the input, defaults to `soft` (Docker's
+    /// `--ulimit` behavior), so an omitted hard cap never falls below the soft
+    /// limit.
     #[serde(default)]
     pub hard: i64,
+}
+
+impl<'de> Deserialize<'de> for UlimitSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Shadow of [`UlimitSpec`] with optional bounds so we can tell an
+        /// omitted field apart from an explicit `0` and apply the Docker-style
+        /// default-fill rules afterwards.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Shadow {
+            #[serde(default)]
+            soft: Option<i64>,
+            #[serde(default)]
+            hard: Option<i64>,
+        }
+
+        let Shadow { soft, hard } = Shadow::deserialize(deserializer)?;
+        Ok(match (soft, hard) {
+            (Some(soft), Some(hard)) => Self { soft, hard },
+            // `hard` omitted: mirror Docker — hard defaults to soft.
+            (Some(soft), None) => Self { soft, hard: soft },
+            // `soft` omitted: a lone bound applies to both (never soft > hard).
+            (None, Some(hard)) => Self { soft: hard, hard },
+            (None, None) => Self::default(),
+        })
+    }
 }
 
 /// Per-service specification
@@ -4197,6 +4245,90 @@ services:
         let yaml = serde_yaml::to_string(&u).expect("serialize");
         let parsed: UlimitSpec = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(u, parsed);
+    }
+
+    #[test]
+    fn ulimit_spec_full_form() {
+        let parsed: UlimitSpec =
+            serde_yaml::from_str("soft: 100000\nhard: 200000\n").expect("parse");
+        assert_eq!(
+            parsed,
+            UlimitSpec {
+                soft: 100_000,
+                hard: 200_000,
+            }
+        );
+    }
+
+    #[test]
+    fn ulimit_spec_soft_only_defaults_hard_to_soft() {
+        // The reported footgun: `{ nofile: { soft: 100000 } }` must NOT yield
+        // hard = 0 (which is < soft and breaks setrlimit). Mirror Docker:
+        // omitted hard defaults to soft.
+        let parsed: UlimitSpec = serde_yaml::from_str("soft: 100000\n").expect("parse");
+        assert_eq!(
+            parsed,
+            UlimitSpec {
+                soft: 100_000,
+                hard: 100_000,
+            }
+        );
+    }
+
+    #[test]
+    fn ulimit_spec_hard_only_defaults_soft_to_hard() {
+        // A lone bound applies to both; never produces soft > hard.
+        let parsed: UlimitSpec = serde_yaml::from_str("hard: 100000\n").expect("parse");
+        assert_eq!(
+            parsed,
+            UlimitSpec {
+                soft: 100_000,
+                hard: 100_000,
+            }
+        );
+    }
+
+    #[test]
+    fn ulimit_spec_both_absent_is_zero() {
+        let parsed: UlimitSpec = serde_yaml::from_str("{}\n").expect("parse");
+        assert_eq!(parsed, UlimitSpec { soft: 0, hard: 0 });
+    }
+
+    #[test]
+    fn ulimit_spec_explicit_zero_hard_is_preserved() {
+        // An explicit `hard: 0` is distinct from an omitted hard and is kept
+        // as-is (the caller asked for an unlimited/zero hard cap on purpose).
+        let parsed: UlimitSpec = serde_yaml::from_str("soft: 100000\nhard: 0\n").expect("parse");
+        assert_eq!(
+            parsed,
+            UlimitSpec {
+                soft: 100_000,
+                hard: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn ulimit_spec_in_service_map_soft_only() {
+        // End-to-end through the ServiceSpec.ulimits map, matching the YAML
+        // shape `ulimits: { nofile: { soft: 100000 } }`.
+        #[derive(Deserialize)]
+        struct Wrap {
+            ulimits: std::collections::HashMap<String, UlimitSpec>,
+        }
+        let yaml = r"
+ulimits:
+  nofile:
+    soft: 100000
+";
+        let parsed: Wrap = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(
+            parsed.ulimits.get("nofile"),
+            Some(&UlimitSpec {
+                soft: 100_000,
+                hard: 100_000,
+            })
+        );
     }
 
     #[test]

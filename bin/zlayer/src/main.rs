@@ -57,6 +57,16 @@ fn main() -> ExitCode {
     // real fd 2 -> journald / unified log / Event Log.
     let cli = Cli::parse();
 
+    // rustls 0.23 dropped the "pick a default at compile time" behavior; the
+    // process must install a CryptoProvider explicitly before the first
+    // ServerConfig/ClientConfig is built or the proxy/H2 paths panic with
+    // "Could not automatically determine the process-level CryptoProvider".
+    // We bind aws-lc-rs unconditionally — it's already in the dep graph via
+    // reqwest's default features, so this adds no compile-time surface.
+    // `install_default` returns `Err` if a provider was already installed,
+    // which is fine to ignore (e.g. when called twice in a test).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Propagate the effective data dir to the process environment so that
     // DaemonClient::default_socket_path() resolves to the matching per-data-dir
     // socket (and any auto-spawned daemon inherits the same root via clap's

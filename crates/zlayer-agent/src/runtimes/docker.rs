@@ -20,7 +20,7 @@ use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, Star
 use bollard::models::{
     ContainerCreateBody, ContainerStatsResponse, ContainerUpdateBody, ContainerWaitResponse,
     CreateImageInfo, DeviceMapping, DeviceRequest, ExecInspectResponse, HostConfig, ImageInspect,
-    PortBinding, RestartPolicy, RestartPolicyNameEnum,
+    PortBinding, ResourcesUlimits, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
@@ -567,7 +567,43 @@ fn build_host_config(
     // delay — Docker uses its own exponential backoff starting at 100ms.
     let restart_policy = spec.restart_policy.as_ref().map(translate_restart_policy);
 
+    // Per-process ulimits (`spec.ulimits`, Docker `--ulimit name=soft:hard`
+    // style). ulimits are process-level and independent of network mode, so
+    // we apply them regardless of `host_network`.
+    //
+    // Unlike the youki/OCI path in `bundle.rs` — which must clamp negatives
+    // with `.max(0)` because OCI rlimits are `u64` — bollard's
+    // `ResourcesUlimits.{soft,hard}` are `Option<i64>`, matching dockerd's
+    // wire type. We therefore pass the spec's `i64` soft/hard through
+    // UNCLAMPED and let the daemon validate them. This deliberately preserves
+    // Docker's per-ulimit `-1`/unlimited semantics (e.g. `core=-1` means
+    // unlimited, while `nofile=-1` is rejected by dockerd) instead of
+    // silently rewriting `-1` to `0` as the OCI path is forced to do.
+    //
+    // The name is lowercased and passed through verbatim — dockerd speaks
+    // Docker ulimit names natively (nofile, nproc, core, …) and validates
+    // them itself, so we do NOT replicate `bundle.rs`'s OCI enum mapping.
+    //
+    // `HashMap` iteration order is nondeterministic, so we sort by name to
+    // keep container configs reproducible (and tests deterministic).
+    let ulimits = if spec.ulimits.is_empty() {
+        None
+    } else {
+        let mut entries: Vec<ResourcesUlimits> = spec
+            .ulimits
+            .iter()
+            .map(|(name, limit)| ResourcesUlimits {
+                name: Some(name.to_lowercase()),
+                soft: Some(limit.soft),
+                hard: Some(limit.hard),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(entries)
+    };
+
     HostConfig {
+        ulimits,
         port_bindings: Some(port_bindings),
         privileged: Some(spec.privileged),
         memory,
@@ -4034,6 +4070,63 @@ mod tests {
         spec.privileged = true;
         let host_config = build_host_config(&spec, None, None);
         assert_eq!(host_config.privileged, Some(true));
+    }
+
+    /// `spec.ulimits` must be translated into `HostConfig.ulimits`, sorted by
+    /// name for deterministic output, with soft/hard values passed through
+    /// UNCLAMPED (negatives preserved so dockerd applies Docker's per-ulimit
+    /// `-1`/unlimited semantics — unlike the OCI path which must clamp to 0).
+    #[test]
+    fn test_build_host_config_translates_ulimits() {
+        use zlayer_spec::UlimitSpec;
+
+        let mut spec = create_test_spec(vec![]);
+        spec.ulimits.insert(
+            "nofile".to_string(),
+            UlimitSpec {
+                soft: 100_000,
+                hard: 200_000,
+            },
+        );
+        spec.ulimits
+            .insert("core".to_string(), UlimitSpec { soft: -1, hard: -1 });
+
+        let host_config = build_host_config(&spec, None, None);
+        let ulimits = host_config
+            .ulimits
+            .expect("non-empty spec.ulimits must produce Some");
+
+        assert_eq!(ulimits.len(), 2, "both ulimits must be present");
+
+        // Sorted by name: "core" precedes "nofile".
+        assert_eq!(ulimits[0].name.as_deref(), Some("core"));
+        assert_eq!(
+            ulimits[0].soft,
+            Some(-1),
+            "negatives passed through unclamped"
+        );
+        assert_eq!(
+            ulimits[0].hard,
+            Some(-1),
+            "negatives passed through unclamped"
+        );
+
+        assert_eq!(ulimits[1].name.as_deref(), Some("nofile"));
+        assert_eq!(ulimits[1].soft, Some(100_000));
+        assert_eq!(ulimits[1].hard, Some(200_000));
+    }
+
+    /// Empty `spec.ulimits` must produce `None`, not `Some(empty vec)`, to keep
+    /// the wire payload minimal and let dockerd apply its defaults.
+    #[test]
+    fn test_build_host_config_omits_ulimits_when_empty() {
+        let spec = create_test_spec(vec![]);
+        assert!(
+            spec.ulimits.is_empty(),
+            "test fixture starts with no ulimits"
+        );
+        let host_config = build_host_config(&spec, None, None);
+        assert!(host_config.ulimits.is_none());
     }
 
     /// Empty `spec.labels` must produce `None`, not an empty map. Bollard's

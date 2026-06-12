@@ -448,6 +448,20 @@ async fn cleanup_stale_daemon(
         if std::net::UdpSocket::bind(wg_addr).is_err() {
             // Port is occupied — try to identify and clean up the holder.
             match find_udp_port_holder(wg_port).await {
+                // Sister service: post-`eef1a829`, `zlayer-overlayd` runs as
+                // its own systemd unit and OWNS the WireGuard UDP port. The
+                // main daemon connects to it via the overlayd Unix socket;
+                // it MUST NOT treat overlayd as a stale leftover and SIGTERM
+                // it — that's a guaranteed crash loop (overlayd dies, main
+                // daemon aborts on the missing socket, systemd restarts,
+                // repeat). Skip the entire stale-kill + free-poll path.
+                Some((pid, ref name)) if is_overlayd_port_holder(name) => {
+                    info!(
+                        port = wg_port,
+                        pid = pid,
+                        "WireGuard UDP port held by zlayer-overlayd sister service — main daemon will connect via overlayd socket, not rebind the port"
+                    );
+                }
                 Some((pid, ref name))
                     if (name.contains("zlayer") || name.contains("boringtun")) && pid != my_pid =>
                 {
@@ -484,6 +498,31 @@ async fn cleanup_stale_daemon(
                         );
                         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
                     }
+
+                    // Safety-net passive poll: 5 attempts at 100ms (500ms
+                    // total). Only meaningful after a kill — overlayd-held
+                    // ports return early above.
+                    let mut wg_free = false;
+                    for attempt in 1..=5 {
+                        if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                            if attempt > 1 {
+                                info!(
+                                    port = wg_port,
+                                    attempts = attempt,
+                                    "WireGuard UDP port is now free"
+                                );
+                            }
+                            wg_free = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    if !wg_free {
+                        warn!(
+                            port = wg_port,
+                            "WireGuard UDP port still in use after cleanup — overlay may fail"
+                        );
+                    }
                 }
                 Some((pid, ref name)) => {
                     warn!(
@@ -499,29 +538,6 @@ async fn cleanup_stale_daemon(
                         "WireGuard UDP port in use but holder could not be identified"
                     );
                 }
-            }
-
-            // Safety-net passive poll: 5 attempts at 100ms (500ms total).
-            let mut wg_free = false;
-            for attempt in 1..=5 {
-                if std::net::UdpSocket::bind(wg_addr).is_ok() {
-                    if attempt > 1 {
-                        info!(
-                            port = wg_port,
-                            attempts = attempt,
-                            "WireGuard UDP port is now free"
-                        );
-                    }
-                    wg_free = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            if !wg_free {
-                warn!(
-                    port = wg_port,
-                    "WireGuard UDP port still in use after cleanup — overlay may fail"
-                );
             }
         }
     }
@@ -620,6 +636,24 @@ fn load_overlay_port(data_dir: &std::path::Path) -> u16 {
         .and_then(serde_json::Value::as_u64)
         .and_then(|p| u16::try_from(p).ok())
         .unwrap_or(zlayer_core::DEFAULT_WG_PORT)
+}
+
+/// True if `name` (a process name as reported by `ps -o comm=`) identifies the
+/// `zlayer-overlayd` sister service that legitimately owns the `WireGuard` UDP
+/// port — in which case the main daemon must NOT treat it as a stale holder.
+///
+/// `ps -o comm=` reads the kernel `comm` field, which is `TASK_COMM_LEN - 1`
+/// = 15 chars wide. The overlayd binary is named `zlayer-overlayd`, which is
+/// EXACTLY 15 chars, so it survives the comm truncation intact and matches by
+/// exact equality. We deliberately do NOT use a looser `starts_with("zlayer")`
+/// here: the broader kill arm already keys off `name.contains("zlayer")`, and
+/// this guard's whole job is to carve out the one process that must be spared.
+///
+/// Only the `#[cfg(unix)]` stale-holder cleanup path calls this; on Windows the
+/// port-scan does a passive poll and never inspects holder names.
+#[cfg(unix)]
+fn is_overlayd_port_holder(name: &str) -> bool {
+    name == "zlayer-overlayd"
 }
 
 /// Attempt to find the process holding a UDP port.
@@ -3439,6 +3473,42 @@ async fn build_bridge_network_state() -> BridgeNetworkApiState {
 mod tests {
     use super::{container_reachable_api_url, parse_dns_upstreams, read_daemon_metadata};
     use zlayer_paths::ZLayerDirs;
+
+    // `is_overlayd_port_holder` is `#[cfg(unix)]`; mirror that on its tests so
+    // the import doesn't dangle on non-unix builds.
+    #[cfg(unix)]
+    use super::is_overlayd_port_holder;
+
+    #[cfg(unix)]
+    #[test]
+    fn overlayd_holder_matches_exact_comm_name() {
+        // The overlayd binary is named `zlayer-overlayd` (exactly 15 chars),
+        // which is the full string `ps -o comm=` reports (TASK_COMM_LEN-1=15,
+        // no truncation for a 15-char name). This is the only name that must
+        // be spared the stale-kill path.
+        assert!(is_overlayd_port_holder("zlayer-overlayd"));
+        assert_eq!("zlayer-overlayd".len(), 15);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlayd_holder_rejects_main_daemon_and_boringtun() {
+        // The main daemon (`zlayer`) and boringtun must NOT match — they belong
+        // to the broader contains("zlayer")/contains("boringtun") kill arm.
+        assert!(!is_overlayd_port_holder("zlayer"));
+        assert!(!is_overlayd_port_holder("boringtun"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlayd_holder_rejects_comm_truncation_collisions() {
+        // A hypothetical 16+-char binary like `zlayer-overlaydX` truncates to
+        // `zlayer-overlayd` under comm, so it would (correctly) match — but the
+        // shorter `zlayer-overlay` (14 chars, e.g. a stray crate binary) must
+        // NOT, since it is a distinct, non-owning process.
+        assert!(!is_overlayd_port_holder("zlayer-overlay"));
+        assert!(!is_overlayd_port_holder("zlayer-overlayd-stale"));
+    }
 
     #[test]
     fn parse_dns_upstreams_ip_port() {

@@ -168,6 +168,7 @@ async-trait.workspace = true
 tonic = "0.14.5"
 openraft = { version = "0.9.24", features = ["serde"] }
 zlayer-overlayd.workspace = true
+rustls.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

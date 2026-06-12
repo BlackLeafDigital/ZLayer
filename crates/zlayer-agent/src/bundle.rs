@@ -12,7 +12,8 @@ use oci_spec::runtime::{
     Capability, Hook, HookBuilder, Hooks, HooksBuilder, LinuxBuilder, LinuxCapabilitiesBuilder,
     LinuxCpuBuilder, LinuxDeviceBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType,
     LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, LinuxResourcesBuilder, Mount,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
+    MountBuilder, PosixRlimit, PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder,
+    Spec, SpecBuilder, UserBuilder,
 };
 // `LinuxIdMappingBuilder` is only used by the unix-gated rootless user-namespace
 // helpers below; importing it unconditionally trips dead-code lints on Windows.
@@ -306,6 +307,59 @@ fn get_device_major_minor(_path: &str) -> std::io::Result<(i64, i64)> {
         std::io::ErrorKind::Unsupported,
         "device-cgroup probes require Unix",
     ))
+}
+
+/// Translate the Docker `--ulimit <name>` style key into the OCI
+/// `PosixRlimitType` enum. Returns `None` for unknown names so the caller
+/// can surface a clean error.
+fn ulimit_name_to_posix(name: &str) -> Option<PosixRlimitType> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "cpu" => PosixRlimitType::RlimitCpu,
+        "fsize" => PosixRlimitType::RlimitFsize,
+        "data" => PosixRlimitType::RlimitData,
+        "stack" => PosixRlimitType::RlimitStack,
+        "core" => PosixRlimitType::RlimitCore,
+        "rss" => PosixRlimitType::RlimitRss,
+        "nproc" => PosixRlimitType::RlimitNproc,
+        "nofile" => PosixRlimitType::RlimitNofile,
+        "memlock" => PosixRlimitType::RlimitMemlock,
+        "as" => PosixRlimitType::RlimitAs,
+        "locks" => PosixRlimitType::RlimitLocks,
+        "sigpending" => PosixRlimitType::RlimitSigpending,
+        "msgqueue" => PosixRlimitType::RlimitMsgqueue,
+        "nice" => PosixRlimitType::RlimitNice,
+        "rtprio" => PosixRlimitType::RlimitRtprio,
+        "rttime" => PosixRlimitType::RlimitRttime,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod ulimit_translation_tests {
+    use super::{ulimit_name_to_posix, PosixRlimitType};
+
+    #[test]
+    fn known_names_map() {
+        assert_eq!(
+            ulimit_name_to_posix("nofile"),
+            Some(PosixRlimitType::RlimitNofile)
+        );
+        assert_eq!(
+            ulimit_name_to_posix("NOFILE"),
+            Some(PosixRlimitType::RlimitNofile)
+        );
+        assert_eq!(
+            ulimit_name_to_posix("nproc"),
+            Some(PosixRlimitType::RlimitNproc)
+        );
+        assert_eq!(ulimit_name_to_posix("as"), Some(PosixRlimitType::RlimitAs));
+    }
+
+    #[test]
+    fn unknown_names_return_none() {
+        assert!(ulimit_name_to_posix("not_a_real_ulimit").is_none());
+        assert!(ulimit_name_to_posix("").is_none());
+    }
 }
 
 /// Detect device type from path
@@ -1089,6 +1143,34 @@ impl BundleBuilder {
         // Set capabilities if we have them
         if let Some(caps) = capabilities {
             process_builder = process_builder.capabilities(caps);
+        }
+
+        // Translate `spec.ulimits` (Docker --ulimit style, lowercase keys) into
+        // OCI `process.rlimits`. Without this libcontainer never calls
+        // setrlimit and the container inherits the launching daemon's
+        // defaults — typically nofile=1024, which saturates sharded-storage
+        // workloads (PlatformStore, etc.) within seconds of boot.
+        let mut rlimits: Vec<PosixRlimit> = Vec::with_capacity(spec.ulimits.len());
+        for (name, limit) in &spec.ulimits {
+            let typ = ulimit_name_to_posix(name).ok_or_else(|| {
+                AgentError::InvalidSpec(format!(
+                    "unknown ulimit name `{name}` (expected one of: cpu, fsize, data, stack, \
+                     core, rss, nproc, nofile, memlock, as, locks, sigpending, msgqueue, nice, \
+                     rtprio, rttime)"
+                ))
+            })?;
+            let entry = PosixRlimitBuilder::default()
+                .typ(typ)
+                .soft(u64::try_from(limit.soft.max(0)).unwrap_or(0))
+                .hard(u64::try_from(limit.hard.max(0)).unwrap_or(0))
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build rlimit `{name}`: {e}"))
+                })?;
+            rlimits.push(entry);
+        }
+        if !rlimits.is_empty() {
+            process_builder = process_builder.rlimits(rlimits);
         }
 
         let process = process_builder
@@ -3043,6 +3125,103 @@ services:
         // Check memory
         let memory = resources.memory().as_ref().unwrap();
         assert_eq!(memory.limit(), Some(512 * 1024 * 1024)); // 512Mi
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_translates_ulimits() {
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_spec();
+        spec.ulimits.insert(
+            "nofile".to_string(),
+            UlimitSpec {
+                soft: 100_000,
+                hard: 200_000,
+            },
+        );
+        // Negative limits must clamp to 0 (matches the `.max(0)` conversion).
+        spec.ulimits
+            .insert("nproc".to_string(), UlimitSpec { soft: -1, hard: -5 });
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+
+        let oci_spec = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let process = oci_spec.process().as_ref().expect("process present");
+        let rlimits = process.rlimits().as_ref().expect("rlimits present");
+
+        // Exactly one nofile entry: our override fully replaces the oci
+        // default (1024), it does not append a duplicate the kernel would
+        // resolve ambiguously.
+        let nofile: Vec<_> = rlimits
+            .iter()
+            .filter(|r| r.typ() == PosixRlimitType::RlimitNofile)
+            .collect();
+        assert_eq!(nofile.len(), 1, "nofile must not be duplicated");
+        assert_eq!(nofile[0].soft(), 100_000);
+        assert_eq!(nofile[0].hard(), 200_000);
+
+        let nproc = rlimits
+            .iter()
+            .find(|r| r.typ() == PosixRlimitType::RlimitNproc)
+            .expect("nproc rlimit present");
+        assert_eq!(nproc.soft(), 0, "negative soft clamps to 0");
+        assert_eq!(nproc.hard(), 0, "negative hard clamps to 0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_rejects_unknown_ulimit() {
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_spec();
+        spec.ulimits.insert(
+            "not_a_real_ulimit".to_string(),
+            UlimitSpec { soft: 1, hard: 1 },
+        );
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+
+        let err = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .expect_err("unknown ulimit name must be rejected");
+        assert!(
+            err.to_string().contains("not_a_real_ulimit"),
+            "error should name the unknown ulimit: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_keeps_oci_default_rlimits_when_ulimits_empty() {
+        // When `spec.ulimits` is empty we must NOT touch the process builder's
+        // rlimits — the OCI default (`ProcessBuilder::default()` ships a single
+        // `RLIMIT_NOFILE` of 1024, the kernel default). This documents the
+        // exact baseline the ulimits override replaces, so a regression that
+        // wipes the default (or, worse, our override) is caught here.
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_spec();
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+
+        let oci_spec = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let process = oci_spec.process().as_ref().expect("process present");
+        let rlimits = process
+            .rlimits()
+            .as_ref()
+            .expect("oci default rlimits present");
+        let nofile = rlimits
+            .iter()
+            .find(|r| r.typ() == PosixRlimitType::RlimitNofile)
+            .expect("default nofile rlimit present");
+        // The oci-spec default the daemon would otherwise leak into the
+        // container: 1024 — the exact value that EMFILE'd PlatformStore.
+        assert_eq!(nofile.soft(), 1024);
+        assert_eq!(nofile.hard(), 1024);
     }
 
     #[cfg(target_os = "linux")]
