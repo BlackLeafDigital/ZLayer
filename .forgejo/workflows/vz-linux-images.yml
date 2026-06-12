@@ -85,10 +85,13 @@ jobs:
           # cpio/gzip for the initramfs; zig for cargo-zigbuild.
           # buildah/podman + ca-certificates so we can also publish the bundle
           # as a scratch OCI image to GHCR (see the GHCR publish step below).
+          # python3-venv (unversioned metapackage tracking the distro python)
+          # so the cargo-zigbuild step can `python3 -m venv` for ziglang — bare
+          # Ubuntu has no ensurepip without it (apt error: install python3-venv).
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libelf-dev libssl-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            busybox-static cpio gzip xz-utils curl python3 \
+            busybox-static cpio gzip xz-utils curl python3 python3-venv \
             buildah podman ca-certificates
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
