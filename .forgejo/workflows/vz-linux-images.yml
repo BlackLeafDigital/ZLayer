@@ -105,12 +105,27 @@ jobs:
           # without juggling musl cross packages. Verify the latest at
           #   gh release list -R rust-cross/cargo-zigbuild --limit 1
           # Pinned + --locked so a fresh release can't silently change behavior.
-          pip3 install --user ziglang
+          #
+          # `ziglang` is PyPI-only (not in apt), so we install it into a
+          # dedicated venv built from the APT python explicitly. The nvidia
+          # runners (BeastPC) put Homebrew's python (/home/linuxbrew/.linuxbrew/
+          # bin) ahead of apt's on PATH, and that interpreter is PEP-668
+          # "externally-managed" — a bare `pip3 install --user` aborts with
+          # `externally-managed-environment`. A venv is never externally
+          # managed, so its pip works regardless of PATH order (same
+          # /usr/bin/python3 pinning house pattern as build.yml's Alpine step).
+          # NOTE: --break-system-packages is deliberately NOT used.
+          ZIG_VENV="$HOME/.zig-venv"
+          /usr/bin/python3 -m venv "${ZIG_VENV}"
+          "${ZIG_VENV}/bin/pip" install --upgrade pip
+          "${ZIG_VENV}/bin/pip" install ziglang
+          mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild
-          # Make the pip-installed `zig` shim discoverable as `zig`.
-          ZIG_DIR=$(python3 -c 'import ziglang, os; print(os.path.dirname(ziglang.__file__))')
-          mkdir -p "$HOME/.local/bin"
+          # Make the venv-installed `zig` shim discoverable as `zig`. Resolve
+          # the bundled zig dir with the venv's own python so it can see the
+          # ziglang package we just installed.
+          ZIG_DIR=$("${ZIG_VENV}/bin/python" -c 'import ziglang, os; print(os.path.dirname(ziglang.__file__))')
           printf '#!/usr/bin/env bash\nexec "%s/zig" "$@"\n' "$ZIG_DIR" > "$HOME/.local/bin/zig"
           chmod +x "$HOME/.local/bin/zig"
 
