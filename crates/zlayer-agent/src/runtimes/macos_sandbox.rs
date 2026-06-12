@@ -1474,45 +1474,42 @@ impl SandboxRuntime {
 
         // Source 2: on-disk container config.json files.
         let containers_dir = self.config.data_dir.join("containers");
-        match tokio::fs::read_dir(&containers_dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if !path.is_dir() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&containers_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let dir_name = entry.file_name();
+                let config_path = path.join("config.json");
+                let bytes = match tokio::fs::read(&config_path).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %dir_name.to_string_lossy(),
+                            error = %e,
+                            "prune: failed to read container config.json; \
+                             not counting it as referencing any image"
+                        );
                         continue;
                     }
-                    let dir_name = entry.file_name();
-                    let config_path = path.join("config.json");
-                    let bytes = match tokio::fs::read(&config_path).await {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(
-                                container = %dir_name.to_string_lossy(),
-                                error = %e,
-                                "prune: failed to read container config.json; \
-                                 not counting it as referencing any image"
-                            );
-                            continue;
-                        }
-                    };
-                    match serde_json::from_slice::<ServiceSpec>(&bytes) {
-                        Ok(spec) => {
-                            referenced.insert(sanitize_image_name(&spec.image.name.to_string()));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                container = %dir_name.to_string_lossy(),
-                                error = %e,
-                                "prune: failed to parse container config.json; \
-                                 not counting it as referencing any image"
-                            );
-                        }
+                };
+                match serde_json::from_slice::<ServiceSpec>(&bytes) {
+                    Ok(spec) => {
+                        referenced.insert(sanitize_image_name(&spec.image.name.to_string()));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %dir_name.to_string_lossy(),
+                            error = %e,
+                            "prune: failed to parse container config.json; \
+                             not counting it as referencing any image"
+                        );
                     }
                 }
             }
-            Err(_) => {
-                // Missing containers dir => nothing referenced from disk.
-            }
+        } else {
+            // Missing containers dir => nothing referenced from disk.
         }
 
         referenced
@@ -1758,6 +1755,10 @@ impl Runtime for SandboxRuntime {
     /// cannot be enumerated. Per-image removal failures and the blob-cache pass
     /// are best-effort: they are logged and never fail the call. A missing
     /// images directory yields an empty [`PruneResult`].
+    // Linear prune pipeline (build in-use set, scan images dir, remove unused,
+    // GC shared blobs); splitting the stages into helpers would scatter the
+    // sequential bookkeeping without aiding readability.
+    #[allow(clippy::too_many_lines)]
     async fn prune_images(&self) -> Result<PruneResult> {
         let referenced = self.referenced_image_dirs().await;
 

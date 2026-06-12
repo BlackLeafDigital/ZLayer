@@ -604,6 +604,10 @@ impl VzLinuxRuntime {
     /// Returns [`AgentError::PullFailed`] when the registry pull fails (so the
     /// caller can fall back to a stale cache), and [`AgentError::Configuration`]
     /// when the pull succeeds but the extracted bundle is missing an artifact.
+    // Sequential pull/digest-check/unpack/atomic-install pipeline; the stages
+    // share a pile of intermediate paths and the cache-hit early return, so
+    // extracting helpers would obscure the flow more than it shortens it.
+    #[allow(clippy::too_many_lines)]
     async fn pull_kernel_bundle(&self, cache_dir: &std::path::Path) -> Result<LinuxKernel> {
         let image = VZ_LINUX_BUNDLE_IMAGE;
 
