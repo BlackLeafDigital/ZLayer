@@ -179,6 +179,50 @@ fn container_name(id: &ContainerId) -> String {
     format!("zlayer-{}-{}", id.service, id.replica)
 }
 
+/// Validate a container rename target client-side before handing it to Docker.
+///
+/// Docker rejects empty, whitespace-only, and malformed names with an HTTP 400
+/// that bollard surfaces as a generic server error. That is the wrong taxonomy
+/// for what is really bad caller input, so we reject those cases up front as
+/// [`AgentError::InvalidSpec`].
+///
+/// The rules mirror Docker's documented constraint
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]+`): the name must be non-empty after trimming,
+/// every character must be in `[a-zA-Z0-9_.-]`, and the first character must be
+/// alphanumeric (Docker rejects leading `-`, `.`, etc.).
+///
+/// Returns the trimmed, validated name on success so callers can use it
+/// directly.
+fn validate_rename_target(name: &str) -> Result<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(AgentError::InvalidSpec(
+            "new container name must not be empty".to_string(),
+        ));
+    }
+
+    if let Some(bad) = trimmed
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    {
+        return Err(AgentError::InvalidSpec(format!(
+            "new container name '{trimmed}' contains invalid character '{bad}'; \
+             only characters in [a-zA-Z0-9_.-] are allowed"
+        )));
+    }
+
+    // SAFETY: non-empty checked above, so `chars().next()` yields a character.
+    let first = trimmed.chars().next().unwrap_or_default();
+    if !first.is_ascii_alphanumeric() {
+        return Err(AgentError::InvalidSpec(format!(
+            "new container name '{trimmed}' must start with an alphanumeric \
+             character (got '{first}')"
+        )));
+    }
+
+    Ok(trimmed)
+}
+
 /// Split an incoming chunk of exec output into lines and emit one
 /// [`ExecEvent`] per complete line through `tx`.
 ///
@@ -1847,10 +1891,15 @@ impl Runtime for DockerRuntime {
         )
     )]
     async fn rename_container(&self, id: &ContainerId, new_name: &str) -> Result<()> {
+        // Reject empty/whitespace-only and malformed names client-side as
+        // `InvalidSpec` rather than letting Docker bounce them back as an
+        // opaque HTTP 400 (which maps to `AgentError::Internal`).
+        let target = validate_rename_target(new_name)?;
+
         let current = container_name(id);
 
         let options = RenameContainerOptionsBuilder::default()
-            .name(new_name)
+            .name(target)
             .build();
 
         self.docker
@@ -3704,6 +3753,72 @@ mod tests {
     fn test_container_name() {
         let id = ContainerId::new("myservice".to_string(), 1);
         assert_eq!(container_name(&id), "zlayer-myservice-1");
+    }
+
+    #[test]
+    fn validate_rename_target_rejects_empty() {
+        assert!(matches!(
+            validate_rename_target(""),
+            Err(AgentError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rename_target_rejects_whitespace_only() {
+        assert!(matches!(
+            validate_rename_target("   "),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_rename_target("\t\n "),
+            Err(AgentError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rename_target_rejects_invalid_charset() {
+        assert!(matches!(
+            validate_rename_target("bad name!"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_rename_target("name/slash"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rename_target_rejects_leading_dash() {
+        assert!(matches!(
+            validate_rename_target("-foo"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_rename_target(".hidden"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rename_target_accepts_valid_names() {
+        assert_eq!(validate_rename_target("web-1").unwrap(), "web-1");
+        assert_eq!(validate_rename_target("a.b_c-d").unwrap(), "a.b_c-d");
+        assert_eq!(validate_rename_target("x").unwrap(), "x");
+        assert_eq!(validate_rename_target("7").unwrap(), "7");
+        // The patch's happy-path and missing-container names must pass.
+        assert_eq!(
+            validate_rename_target("zlayer-zql-renamed-123").unwrap(),
+            "zlayer-zql-renamed-123"
+        );
+        assert_eq!(
+            validate_rename_target("anything-else").unwrap(),
+            "anything-else"
+        );
+    }
+
+    #[test]
+    fn validate_rename_target_trims_surrounding_whitespace() {
+        assert_eq!(validate_rename_target("  web-1  ").unwrap(), "web-1");
     }
 
     #[test]
