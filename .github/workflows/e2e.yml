@@ -430,6 +430,21 @@ jobs:
       - name: Build zlayer
         run: cargo build --release -p zlayer -p zlayer-overlayd
 
+      - name: Authenticate to container registries
+        # The raft cluster suites pull nginx test images via libcontainer.
+        # ZLayer's AuthResolver defaults to AuthSource::DockerConfig and reads
+        # ~/.docker/config.json directly (no docker CLI needed in the job
+        # container). Seed both registries: the Docker Hub entry is defensive
+        # cover for any residual docker.io refs, and the ghcr.io entry lets the
+        # suites pull ghcr.io/blackleafdigital/zlayer-test-nginx even while that
+        # package's visibility is still internal (anonymous pull -> 401). It is
+        # harmless once the package goes public.
+        run: |
+          mkdir -p ~/.docker
+          HUB_AUTH=$(printf '%s' "zachhandley:${{ secrets.DOCKERHUB_TOKEN }}" | base64 -w0)
+          GHCR_AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"},"ghcr.io":{"auth":"%s"}}}\n' "$HUB_AUTH" "$GHCR_AUTH" > ~/.docker/config.json
+
       - name: Run raft cluster suite(s)
         run: |
           set -eo pipefail

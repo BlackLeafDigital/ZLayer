@@ -2347,7 +2347,7 @@ def run_cluster_upgrade_container(args: argparse.Namespace) -> int:
             ],
             check=True,
         )
-        expected_image = "docker.io/library/nginx:1.29-alpine"
+        expected_image = "ghcr.io/blackleafdigital/zlayer-test-nginx:1.29-alpine"
         log(f"cluster_upgrade(container): waiting for 3 containers on {expected_image}")
         _container_wait_image_transition(
             runtime, leader, CLUSTER_APP_DEPLOYMENT,
@@ -3510,7 +3510,7 @@ def run_cluster_upgrade(args: argparse.Namespace) -> int:
                     sys.stderr.write(f"--- deploy stderr ---\n{exc.stderr}\n")
                 raise
 
-            expected_image = "docker.io/library/nginx:1.29-alpine"
+            expected_image = "ghcr.io/blackleafdigital/zlayer-test-nginx:1.29-alpine"
             log(
                 f"cluster_upgrade: waiting for 3 containers on {expected_image}"
             )
