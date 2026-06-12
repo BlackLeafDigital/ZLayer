@@ -186,6 +186,21 @@ pub async fn detect_physical_egress() -> Result<PhysicalEgress, OverlayError> {
 /// for lack of privilege (`EPERM`), [`OverlayError::InterfaceNotFound`] if the
 /// named interface does not exist (`ENODEV` / unknown index), and
 /// [`OverlayError::NetworkConfig`] for any other `setsockopt` failure.
+///
+/// # Platform note (cfg split)
+///
+/// This function is `cfg`-split into two implementations sharing the one public
+/// name and call-site ergonomics:
+///
+/// - On **unix** (`#[cfg(unix)]`) it takes `S: std::os::fd::AsRawFd` — the
+///   `std::os::fd` module exists only on unix — and performs the real
+///   `setsockopt` (Linux `SO_BINDTODEVICE`, macOS `IP_BOUND_IF`), honouring the
+///   `PermissionDenied`-degrade contract documented above. On a unix target that
+///   is neither Linux nor macOS it is a no-op `Ok(())`.
+/// - On **non-unix** (`#[cfg(not(unix))]`, e.g. Windows) it is a no-op `Ok(())`
+///   with no `AsRawFd` bound, because `std::os::fd` does not exist there and
+///   interface pinning is handled elsewhere (see [`detect_physical_egress`]).
+#[cfg(unix)]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos")),
     allow(unused_variables)
@@ -206,11 +221,24 @@ where
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // Windows and anything else: no-op. (On Windows the `AsRawFd` bound is
-        // not even satisfiable for std sockets, but this branch keeps the
-        // signature uniform for cross-platform callers that gate on cfg.)
+        // A unix that is neither Linux nor macOS: no-op. (`as_raw_fd` is still
+        // satisfiable here via the `AsRawFd` bound, but we have no portable
+        // interface-pinning syscall to call.)
         Ok(())
     }
+}
+
+/// Non-unix (Windows and anything else) variant of [`bind_to_device`]: a no-op
+/// `Ok(())`.
+///
+/// `std::os::fd` does not exist off unix, so this overload drops the `AsRawFd`
+/// bound entirely and keeps the signature uniform for cross-platform callers
+/// that gate on cfg. Interface pinning on Windows is handled elsewhere (see
+/// [`detect_physical_egress`]).
+#[cfg(not(unix))]
+#[allow(clippy::missing_errors_doc)]
+pub fn bind_to_device<S>(_socket: &S, _interface: &str) -> Result<(), OverlayError> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

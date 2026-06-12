@@ -481,6 +481,11 @@ impl Scheduler {
         // (first deploy on a fresh worker) or update (image change → rolling
         // recreate) the service before scaling. Without this, workers scale
         // from a stale cached spec and never pick up a new image.
+        //
+        // Only needed when we actually dispatch over HTTP; under
+        // `test-skip-http` the per-node request is compiled out, so binding
+        // this would be an unused read of the spec map.
+        #[cfg(not(feature = "test-skip-http"))]
         let dispatch_spec = self.service_specs.read().await.get(service_name).cloned();
 
         for (node_id, containers) in node_assignments {
