@@ -93,7 +93,10 @@ fn udp_connect_local_ipv4() -> std::result::Result<IpAddr, std::io::Error> {
 
 /// Discover the local IPv6 address via the UDP-connect trick (v6 variant of
 /// [`udp_connect_local_ipv4`], connecting to Google's public DNS over v6).
-#[cfg(any(target_os = "linux", test))]
+///
+/// Only the Linux egress path (`mod linux`) consumes this; gate it exactly to
+/// that consumer so non-Linux test builds don't flag it as dead code.
+#[cfg(target_os = "linux")]
 fn udp_connect_local_ipv6() -> std::result::Result<IpAddr, std::io::Error> {
     let socket = std::net::UdpSocket::bind("[::]:0")?;
     socket.connect("[2001:4860:4860::8888]:80")?;
@@ -599,7 +602,7 @@ mod macos {
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         // SAFETY: `getifaddrs` writes a heap-allocated linked list into `head`
         // on success; we free it with `freeifaddrs` before returning.
-        let rc = unsafe { libc::getifaddrs(&mut head) };
+        let rc = unsafe { libc::getifaddrs(&raw mut head) };
         if rc != 0 {
             return Err(OverlayError::NetworkConfig(format!(
                 "getifaddrs failed: {}",
@@ -628,15 +631,21 @@ mod macos {
 
             // SAFETY: `ifa_addr` points at a `sockaddr`; we read `sa_family`
             // then re-interpret as the matching `sockaddr_in`/`sockaddr_in6`.
-            let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+            let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
             let ip = match family {
                 libc::AF_INET => {
-                    let sin = unsafe { &*(ifa.ifa_addr.cast::<libc::sockaddr_in>()) };
+                    // `read_unaligned` copies the value out by-bytes, so it makes
+                    // no alignment assumption about the kernel's sockaddr storage.
+                    let sin = unsafe {
+                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>())
+                    };
                     let raw = u32::from_be(sin.sin_addr.s_addr);
                     Some(IpAddr::V4(Ipv4Addr::from(raw)))
                 }
                 libc::AF_INET6 => {
-                    let sin6 = unsafe { &*(ifa.ifa_addr.cast::<libc::sockaddr_in6>()) };
+                    let sin6 = unsafe {
+                        std::ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>())
+                    };
                     Some(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
                 }
                 _ => None,
@@ -672,7 +681,8 @@ mod macos {
             return Err(OverlayError::InterfaceNotFound(interface.to_string()));
         }
 
-        let idx = idx as libc::c_int;
+        let idx = libc::c_int::try_from(idx)
+            .map_err(|_| OverlayError::InterfaceNotFound(interface.to_string()))?;
         // SAFETY: `fd` is a valid socket fd; we pass a pointer/len pair to a
         // local `c_int` holding the interface scope index, which the kernel copies.
         let rc = unsafe {
@@ -681,7 +691,12 @@ mod macos {
                 libc::IPPROTO_IP,
                 libc::IP_BOUND_IF,
                 std::ptr::addr_of!(idx).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                // `size_of::<c_int>()` is 4 on every supported target and always
+                // fits in `socklen_t` (u32); the conversion cannot truncate.
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t
+                },
             )
         };
 
