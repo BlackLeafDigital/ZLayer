@@ -141,6 +141,49 @@ pub(crate) fn detect_local_ip() -> String {
     }
 }
 
+/// Resolve the address advertised to peers on the zero-config first-init path.
+///
+/// Precedence:
+/// 1. `override_addr` — the `--advertise-addr` flag / `ZLAYER_ADVERTISE_ADDR`.
+///    Used verbatim (empty strings are treated as "unset" and fall through).
+/// 2. [`zlayer_overlay::detect_physical_egress`] — resolves the real NIC,
+///    skipping mesh/VPN interfaces (`wt*`/`wg*`/`utun*`/`nb*`/…). On success the
+///    interface name is logged.
+/// 3. [`detect_local_ip`] — the bare UDP-connect-to-8.8.8.8 default-route trick.
+///    Only reached if egress detection errors out; logs a `warn!` so operators
+///    can see the resolver fell back to the default-route source IP (which may
+///    be a mesh address on a VPN-joined host).
+async fn resolve_advertise_addr(override_addr: Option<String>) -> String {
+    if let Some(addr) = override_addr {
+        let addr = addr.trim();
+        if !addr.is_empty() {
+            info!(advertise_addr = %addr, "Using advertise address from --advertise-addr / ZLAYER_ADVERTISE_ADDR");
+            return addr.to_string();
+        }
+    }
+
+    match zlayer_overlay::detect_physical_egress().await {
+        Ok(egress) => {
+            info!(
+                interface = %egress.interface,
+                ip = %egress.ip,
+                "Resolved advertise address from physical egress NIC"
+            );
+            egress.ip.to_string()
+        }
+        Err(e) => {
+            let ip = detect_local_ip();
+            tracing::warn!(
+                error = %e,
+                resolved_ip = %ip,
+                "physical-egress detection failed; falling back to the default-route \
+                 UDP-connect trick (advertise address may be a VPN/mesh IP)"
+            );
+            ip
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -243,6 +286,18 @@ pub struct DaemonConfig {
     /// node-to-node tunnels. Mirrors `node_config.node_id` but is exposed
     /// separately so tests can override it.
     pub node_name: Option<String>,
+
+    /// Explicit override for the address advertised to peers, resolved from
+    /// `--advertise-addr` / `ZLAYER_ADVERTISE_ADDR` in `serve()`. When `Some`,
+    /// the zero-config first-init path uses it verbatim instead of running
+    /// physical-egress detection. `None` = auto-detect.
+    pub advertise_addr_override: Option<String>,
+
+    /// Explicit upstream resolvers for non-overlay DNS forwarding, resolved and
+    /// parsed from `--dns-upstreams` / `ZLAYER_DNS_UPSTREAMS` in `serve()`. When
+    /// `Some`, Phase 4 creates the overlay DNS server with these upstreams
+    /// instead of auto-detecting from `/etc/resolv.conf`. `None` = auto-detect.
+    pub dns_upstreams: Option<Vec<SocketAddr>>,
 }
 
 impl Default for DaemonConfig {
@@ -267,6 +322,8 @@ impl Default for DaemonConfig {
             nat: NatConfig::default(),
             tunnel: TunnelDaemonConfig::default(),
             node_name: None,
+            advertise_addr_override: None,
+            dns_upstreams: None,
         }
     }
 }
@@ -437,6 +494,26 @@ pub struct TunnelHandles {
 ///   auto-detects the machine IP, generates a `WireGuard` keypair, sets
 ///   `is_leader = true`, writes the file and returns the config.
 pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Result<NodeConfig> {
+    load_or_init_node_config_with_advertise(data_dir, None).await
+}
+
+/// Like [`load_or_init_node_config`], but lets the zero-config `serve` path pass
+/// an explicit advertised-address override.
+///
+/// When `node_config.json` already exists this is identical to
+/// [`load_or_init_node_config`] — the override only affects first-time init.
+///
+/// First-init advertised-address precedence:
+/// 1. `advertise_override` (the `--advertise-addr` flag / `ZLAYER_ADVERTISE_ADDR`).
+/// 2. [`zlayer_overlay::detect_physical_egress`] — prefers the physical NIC over
+///    mesh/VPN interfaces (its own internal fallbacks may still land on the
+///    default-route source IP, but only after exhausting physical candidates).
+/// 3. [`detect_local_ip`] — the bare UDP-connect-to-8.8.8.8 default-route trick,
+///    used only if egress detection errors out entirely. A warning is logged.
+pub(crate) async fn load_or_init_node_config_with_advertise(
+    data_dir: &std::path::Path,
+    advertise_override: Option<String>,
+) -> Result<NodeConfig> {
     let config_path = data_dir.join("node_config.json");
 
     if config_path.exists() {
@@ -457,7 +534,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 
     let node_id = generate_node_id();
     let raft_node_id: u64 = 1;
-    let advertise_addr = detect_local_ip();
+    let advertise_addr = resolve_advertise_addr(advertise_override).await;
     let api_port: u16 = 3669;
     let raft_port: u16 = 9000;
     let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
@@ -783,10 +860,28 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 4: DNS server
     // -----------------------------------------------------------------------
+    // The overlay resolver IP we successfully bound on port 53, if any. Threaded
+    // into the `ServiceManager` (Phase 8) so containers get it injected into
+    // their resolv.conf. `None` when the overlay is down or port 53 could not be
+    // bound (unprivileged daemon) — containers then keep inheriting the host
+    // resolv.conf and DNS injection is simply unavailable.
+    let mut container_dns: Option<IpAddr> = None;
     let (dns, dns_handle) = {
         let dns_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.dns_port);
         let zone = format!("{}.local.", config.deployment_name);
-        match DnsServer::new(dns_addr, &zone) {
+        // Explicit `--dns-upstreams` pins the non-overlay forwarders verbatim;
+        // otherwise `DnsServer::new` auto-detects from /etc/resolv.conf.
+        let dns_result = match &config.dns_upstreams {
+            Some(upstreams) => {
+                info!(
+                    upstreams = ?upstreams,
+                    "Using explicit DNS upstreams from --dns-upstreams / ZLAYER_DNS_UPSTREAMS"
+                );
+                DnsServer::new_with_upstreams(dns_addr, &zone, upstreams.clone())
+            }
+            None => DnsServer::new(dns_addr, &zone),
+        };
+        match dns_result {
             Ok(dns) => {
                 let dns = Arc::new(dns);
                 match dns.start_background().await {
@@ -831,6 +926,36 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                                         %guest_dns_addr,
                                         "failed to bind overlay DNS listener on node IP \
                                          (VZ-guest service-name DNS will be unavailable): {e}"
+                                    ),
+                                }
+
+                                // Container DNS injection: resolv.conf
+                                // `nameserver` and Docker `--dns` carry no port
+                                // (always 53), so the guest/overlay-port listener
+                                // above is unusable for native Linux containers.
+                                // Bind a THIRD listener on `<node_ip>:53` (same
+                                // authority + upstream forwarder) so the daemon
+                                // can inject `<node_ip>` into container resolv.conf.
+                                // Port 53 needs root/CAP_NET_BIND_SERVICE; on
+                                // failure we warn and proceed — containers keep
+                                // inheriting the host resolv.conf and DNS injection
+                                // is simply unavailable (NOT a fatal daemon error).
+                                let port53_addr = SocketAddr::new(node_ip, 53);
+                                match dns.bind_secondary(port53_addr).await {
+                                    Ok(_) => {
+                                        info!(
+                                            %port53_addr,
+                                            "overlay DNS listener bound on node IP port 53 \
+                                             (container resolv.conf injection enabled)"
+                                        );
+                                        container_dns = Some(node_ip);
+                                    }
+                                    Err(e) => warn!(
+                                        %port53_addr,
+                                        "failed to bind overlay DNS on node IP port 53 \
+                                         (needs root/CAP_NET_BIND_SERVICE); container DNS \
+                                         injection unavailable — containers keep inheriting \
+                                         the host resolv.conf: {e}"
                                     ),
                                 }
                             } else {
@@ -923,6 +1048,13 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
 
     if let Some(dns_ref) = &dns {
         builder = builder.dns_server(Arc::clone(dns_ref));
+    }
+
+    // Thread the port-53-bound overlay resolver IP (if any) so the service
+    // manager injects it into each container's resolv.conf, replacing the
+    // host's hijacked resolver. `None` => containers inherit host resolv.conf.
+    if let Some(ip) = container_dns {
+        builder = builder.container_dns(ip);
     }
 
     let manager = Arc::new(builder.build());
@@ -1120,7 +1252,11 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 13: Node configuration (auto-init if first run)
     // -----------------------------------------------------------------------
-    let mut node_config = load_or_init_node_config(&config.data_dir).await?;
+    let mut node_config = load_or_init_node_config_with_advertise(
+        &config.data_dir,
+        config.advertise_addr_override.clone(),
+    )
+    .await?;
 
     // Sync node_config.api_port with the actual bind port. Without this,
     // a node auto-initialised with hardcoded 3669 (or loaded with a stale

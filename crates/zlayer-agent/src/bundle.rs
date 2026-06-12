@@ -217,6 +217,33 @@ const ALL_CAPABILITIES: &[Capability] = &[
 /// assert_eq!(parse_memory_string("2G").unwrap(), 2 * 1000 * 1000 * 1000);
 /// ```
 ///
+/// Render the contents of an `/etc/resolv.conf` for the given resolver
+/// addresses.
+///
+/// One `nameserver <ip>` line per entry, in order, followed by a single
+/// `options edns0` line (enables EDNS(0) so larger UDP responses — e.g. the
+/// overlay resolver forwarding A/AAAA records — are not truncated). The output
+/// is deliberately minimal: no `search`/`domain` directives, which would
+/// otherwise be inherited from the (hijacked) host resolv.conf we are
+/// replacing.
+///
+/// This exists because youki/libcontainer performs NO resolv.conf handling of
+/// its own — without an explicit bind mount the container sees only whatever
+/// `/etc/resolv.conf` shipped in the image (often empty or absent). The caller
+/// writes this string into the bundle directory and bind-mounts it read-only at
+/// `/etc/resolv.conf`.
+#[must_use]
+pub fn generate_resolv_conf(nameservers: &[String]) -> String {
+    let mut out = String::new();
+    for ns in nameservers {
+        out.push_str("nameserver ");
+        out.push_str(ns);
+        out.push('\n');
+    }
+    out.push_str("options edns0\n");
+    out
+}
+
 /// # Errors
 /// Returns an error if the string cannot be parsed as a memory size.
 pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
@@ -1095,6 +1122,48 @@ impl BundleBuilder {
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()
                     .expect("valid socket mount"),
+            );
+        }
+
+        // Container DNS resolver injection.
+        //
+        // youki/libcontainer does no resolv.conf handling on its own: the
+        // container sees whatever `/etc/resolv.conf` the image shipped (often
+        // empty/absent). When the spec carries explicit resolver addresses
+        // (`spec.dns`, populated upstream in `ServiceManager` with the overlay
+        // resolver's node-IP — the host's own resolv.conf is unusable because
+        // the netbird `~.` systemd-resolved hijack swallows container queries),
+        // we materialize a minimal resolv.conf alongside the bundle and
+        // bind-mount it read-only at `/etc/resolv.conf`.
+        //
+        // The `resolv.conf` `nameserver` directive has no port syntax (always
+        // port 53), which is exactly why the overlay DNS server must already be
+        // bound on `<node_ip>:53` for this address to be useful.
+        //
+        // Host-network containers share the host's `/etc/resolv.conf` directly,
+        // so we skip injection for them (matching the Docker runtime). On the
+        // WSL2-on-Windows render path `build_spec_only` is called without an
+        // on-disk bundle directory; the `bundle_dir.exists()` guard skips the
+        // file write + mount there, preserving today's behavior.
+        if !spec.host_network && !spec.dns.is_empty() && self.bundle_dir.exists() {
+            let resolv_path = self.bundle_dir.join("resolv.conf");
+            let contents = generate_resolv_conf(&spec.dns);
+            fs::write(&resolv_path, contents).await.map_err(|e| {
+                AgentError::InvalidSpec(format!(
+                    "failed to write resolv.conf to bundle at {}: {e}",
+                    resolv_path.display()
+                ))
+            })?;
+            mounts.push(
+                MountBuilder::default()
+                    .destination("/etc/resolv.conf".to_string())
+                    .typ("bind")
+                    .source(resolv_path.to_string_lossy().to_string())
+                    .options(vec!["rbind".to_string(), "ro".to_string()])
+                    .build()
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!("failed to build resolv.conf mount: {e}"))
+                    })?,
             );
         }
 
@@ -2818,6 +2887,91 @@ services:
         assert!(parse_memory_string("").is_err());
         assert!(parse_memory_string("abc").is_err());
         assert!(parse_memory_string("12.5Mi").is_err());
+    }
+
+    #[test]
+    fn test_generate_resolv_conf_single_nameserver() {
+        let out = generate_resolv_conf(&["10.42.0.1".to_string()]);
+        assert_eq!(out, "nameserver 10.42.0.1\noptions edns0\n");
+    }
+
+    #[test]
+    fn test_generate_resolv_conf_two_nameservers() {
+        let out = generate_resolv_conf(&["10.42.0.1".to_string(), "fd00::1".to_string()]);
+        assert_eq!(
+            out,
+            "nameserver 10.42.0.1\nnameserver fd00::1\noptions edns0\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_injects_resolv_conf_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_spec();
+        spec.dns = vec!["10.42.0.1".to_string()];
+        let builder = BundleBuilder::new(dir.path().to_path_buf());
+
+        let oci_spec = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        let resolv_mount = mounts
+            .iter()
+            .find(|m| m.destination() == Path::new("/etc/resolv.conf"))
+            .expect("resolv.conf mount injected");
+        let source = resolv_mount.source().as_ref().unwrap();
+        let written = std::fs::read_to_string(source).unwrap();
+        assert_eq!(written, "nameserver 10.42.0.1\noptions edns0\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_no_resolv_conf_when_dns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ContainerId::new("test".to_string(), 1);
+        let spec = mock_spec(); // spec.dns defaults to empty
+        let builder = BundleBuilder::new(dir.path().to_path_buf());
+
+        let oci_spec = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.destination() == Path::new("/etc/resolv.conf")),
+            "no resolv.conf mount should be injected for empty spec.dns"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_build_oci_spec_no_resolv_conf_when_host_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ContainerId::new("test".to_string(), 1);
+        let mut spec = mock_spec();
+        spec.dns = vec!["10.42.0.1".to_string()];
+        spec.host_network = true;
+        let builder = BundleBuilder::new(dir.path().to_path_buf());
+
+        let oci_spec = builder
+            .build_spec_only(&id, &spec, &std::collections::HashMap::new())
+            .await
+            .unwrap();
+
+        let mounts = oci_spec.mounts().as_ref().expect("mounts present");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.destination() == Path::new("/etc/resolv.conf")),
+            "host_network containers must inherit the host resolv.conf"
+        );
     }
 
     #[test]

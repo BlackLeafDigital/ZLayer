@@ -497,6 +497,11 @@ fn build_host_config(
 
     // --dns / --add-host wiring. When host_network is set the container
     // inherits the host's resolv.conf and /etc/hosts, so we skip both fields.
+    //
+    // Overlay-resolver injection happens upstream in `ServiceManager`
+    // (service.rs): when container DNS is available it pre-populates
+    // `spec.dns`, which then flows into `HostConfig.dns` below — no
+    // Docker-specific handling is needed here.
     let (dns, extra_hosts) = if spec.host_network {
         (None, None)
     } else {

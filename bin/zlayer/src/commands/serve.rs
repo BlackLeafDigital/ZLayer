@@ -981,6 +981,90 @@ fn take_pending_secrets_only() -> bool {
     PENDING_SECRETS_ONLY.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Pending `--advertise-addr <IP>` override.
+///
+/// When set (or `ZLAYER_ADVERTISE_ADDR` is exported), the zero-config
+/// first-init path in [`crate::daemon::load_or_init_node_config`] uses this
+/// value verbatim as the advertised address instead of auto-detecting it.
+///
+/// Stored in a process-global slot so `main.rs` can stash the parsed CLI value
+/// before delegating to `serve()` / `serve_with_nat_overrides()` /
+/// `serve_with_external_shutdown()` (whose public signature is pinned by the
+/// Windows Service host in `daemon_service.rs`).
+static PENDING_ADVERTISE_ADDR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_advertise_addr(addr: Option<String>) {
+    if let Ok(mut slot) = PENDING_ADVERTISE_ADDR.lock() {
+        *slot = addr;
+    }
+}
+
+fn take_pending_advertise_addr() -> Option<String> {
+    PENDING_ADVERTISE_ADDR
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
+/// Pending `--dns-upstreams <ADDR,ADDR>` override.
+///
+/// Comma-separated upstream resolvers for non-overlay DNS forwarding. When set
+/// (or `ZLAYER_DNS_UPSTREAMS` is exported), the parsed list overrides
+/// `/etc/resolv.conf` auto-detection and the overlay DNS server is created via
+/// `DnsServer::new_with_upstreams`.
+///
+/// Stored in a process-global slot for the same reason as the slots above
+/// (`serve_with_external_shutdown`'s signature is pinned).
+static PENDING_DNS_UPSTREAMS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[allow(dead_code)]
+pub(crate) fn set_pending_dns_upstreams(upstreams: Option<String>) {
+    if let Ok(mut slot) = PENDING_DNS_UPSTREAMS.lock() {
+        *slot = upstreams;
+    }
+}
+
+fn take_pending_dns_upstreams() -> Option<String> {
+    PENDING_DNS_UPSTREAMS
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
+/// Parse a comma-separated upstream-resolver string into socket addresses.
+///
+/// Each entry is tried as a [`std::net::SocketAddr`] first; if that fails it is
+/// parsed as a bare [`std::net::IpAddr`] and port `53` is appended. Empty
+/// entries (e.g. a trailing comma) are skipped. An entry that is neither a
+/// valid `ip:port` nor a bare IP is a hard error naming the bad entry — it is
+/// never silently dropped.
+///
+/// # Errors
+///
+/// Returns an error naming the first entry that fails to parse.
+fn parse_dns_upstreams(raw: &str) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Ok(sa) = entry.parse::<SocketAddr>() {
+            out.push(sa);
+        } else if let Ok(ip) = entry.parse::<IpAddr>() {
+            out.push(SocketAddr::new(ip, 53));
+        } else {
+            anyhow::bail!(
+                "invalid --dns-upstreams entry '{entry}': expected `ip:port` or a bare IP address"
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Idempotently delete `{data_dir}/join_secret`.
 ///
 /// Used by three call sites: the `--vacuum-secrets` flag at startup, the
@@ -1473,6 +1557,27 @@ pub(crate) async fn serve_with_external_shutdown(
     // bootstrap consumes the resolved value via `config.dns_port`.
     let resolved_dns_port = dns_port.unwrap_or(zlayer_overlay::DEFAULT_DNS_PORT);
 
+    // Pick up the `--advertise-addr` override (or `ZLAYER_ADVERTISE_ADDR`).
+    // When present, the zero-config first-init path uses it verbatim instead of
+    // running physical-egress detection. Empty / unset = auto-detect.
+    let advertise_addr_override = take_pending_advertise_addr();
+
+    // Pick up the `--dns-upstreams` override (or `ZLAYER_DNS_UPSTREAMS`). Parse
+    // it into socket addresses up-front so an invalid entry fails startup loudly
+    // rather than silently falling back to resolv.conf detection.
+    let dns_upstreams = match take_pending_dns_upstreams() {
+        Some(raw) => {
+            let parsed = parse_dns_upstreams(&raw)
+                .context("Failed to parse --dns-upstreams / ZLAYER_DNS_UPSTREAMS")?;
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        }
+        None => None,
+    };
+
     let config = DaemonConfig {
         host_network,
         deployment_name,
@@ -1492,6 +1597,8 @@ pub(crate) async fn serve_with_external_shutdown(
         #[cfg(feature = "nat")]
         nat: nat_config,
         tunnel: tunnel_config,
+        advertise_addr_override,
+        dns_upstreams,
         ..Default::default()
     };
 
@@ -3330,8 +3437,72 @@ async fn build_bridge_network_state() -> BridgeNetworkApiState {
 
 #[cfg(test)]
 mod tests {
-    use super::{container_reachable_api_url, read_daemon_metadata};
+    use super::{container_reachable_api_url, parse_dns_upstreams, read_daemon_metadata};
     use zlayer_paths::ZLayerDirs;
+
+    #[test]
+    fn parse_dns_upstreams_ip_port() {
+        let got = parse_dns_upstreams("192.168.1.1:53").expect("parse");
+        assert_eq!(got, vec!["192.168.1.1:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn parse_dns_upstreams_bare_ip_gets_port_53() {
+        let got = parse_dns_upstreams("1.1.1.1").expect("parse");
+        assert_eq!(got, vec!["1.1.1.1:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn parse_dns_upstreams_multiple_mixed() {
+        let got = parse_dns_upstreams("192.168.1.1:53,1.1.1.1,8.8.8.8:5353").expect("parse");
+        assert_eq!(
+            got,
+            vec![
+                "192.168.1.1:53".parse().unwrap(),
+                "1.1.1.1:53".parse().unwrap(),
+                "8.8.8.8:5353".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_dns_upstreams_ipv6_bracketed_with_port() {
+        let got = parse_dns_upstreams("[2001:4860:4860::8888]:53").expect("parse");
+        assert_eq!(got, vec!["[2001:4860:4860::8888]:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn parse_dns_upstreams_ipv6_bare_gets_port_53() {
+        let got = parse_dns_upstreams("2001:4860:4860::8888").expect("parse");
+        assert_eq!(got, vec!["[2001:4860:4860::8888]:53".parse().unwrap()]);
+    }
+
+    #[test]
+    fn parse_dns_upstreams_skips_empty_entries_and_trims() {
+        // Leading/trailing/internal empties from stray commas + surrounding
+        // whitespace must be ignored, not error.
+        let got = parse_dns_upstreams(" 1.1.1.1 , ,8.8.8.8:53,").expect("parse");
+        assert_eq!(
+            got,
+            vec!["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap(),]
+        );
+    }
+
+    #[test]
+    fn parse_dns_upstreams_invalid_entry_errors() {
+        let err = parse_dns_upstreams("1.1.1.1,not-an-ip").expect_err("should error");
+        assert!(
+            err.to_string().contains("not-an-ip"),
+            "error should name the bad entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dns_upstreams_bad_port_errors() {
+        // `:99999` is out of u16 range, so neither SocketAddr nor IpAddr parse.
+        let err = parse_dns_upstreams("1.1.1.1:99999").expect_err("should error");
+        assert!(err.to_string().contains("1.1.1.1:99999"));
+    }
 
     #[test]
     fn read_daemon_metadata_missing_file_is_none() {

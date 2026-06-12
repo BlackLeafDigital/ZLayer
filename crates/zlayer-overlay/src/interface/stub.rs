@@ -30,6 +30,10 @@ impl InterfaceOps for StubOps {
         Err(OverlayError::NetworkConfig(UNSUPPORTED_MSG.to_string()))
     }
 
+    async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), OverlayError> {
+        Err(OverlayError::NetworkConfig(UNSUPPORTED_MSG.to_string()))
+    }
+
     async fn add_address(
         &self,
         _name: &str,

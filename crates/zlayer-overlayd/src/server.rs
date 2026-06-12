@@ -589,7 +589,25 @@ impl OverlaydServer {
 
         let node_ip = self.ip_allocator.allocate()?;
         self.transport_public_key = Some(public_key.clone());
-        let config = self.build_config(private_key, public_key, node_ip, 16, self.overlay_port);
+        let physical_egress_ip = match zlayer_overlay::detect_physical_egress().await {
+            Ok(egress) => Some(egress.ip),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to detect physical egress; WireGuard local_endpoint \
+                     will bind UNSPECIFIED for the global overlay"
+                );
+                None
+            }
+        };
+        let config = self.build_config(
+            private_key,
+            public_key,
+            node_ip,
+            16,
+            self.overlay_port,
+            physical_egress_ip,
+        );
         let mut transport = OverlayTransport::new(config, interface_name);
 
         transport
@@ -910,12 +928,25 @@ impl OverlaydServer {
         // 4. Build + bring up the dedicated transport. The device's overlay CIDR
         //    is the service subnet (so boringtun routes that subnet over THIS
         //    device), and its listen port is the dedicated port.
+        let physical_egress_ip = match zlayer_overlay::detect_physical_egress().await {
+            Ok(egress) => Some(egress.ip),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    service = %service,
+                    "failed to detect physical egress; WireGuard local_endpoint \
+                     will bind UNSPECIFIED for the dedicated overlay"
+                );
+                None
+            }
+        };
         let config = self.build_config(
             private_key.clone(),
             public_key.clone(),
             overlay_ip,
             subnet.prefix_len(),
             listen_port,
+            physical_egress_ip,
         );
         let mut transport = OverlayTransport::new(config, iface_hint);
         transport.create_interface().await.map_err(|e| {
@@ -2545,10 +2576,42 @@ impl OverlaydServer {
         ip: IpAddr,
         mask: u8,
         listen_port: u16,
+        physical_egress_ip: Option<IpAddr>,
     ) -> OverlayConfig {
-        let local_addr = match ip {
+        // Pick the source/advertised address for the WireGuard endpoint.
+        //
+        // Default is the family-matched UNSPECIFIED (`0.0.0.0` / `::`), which lets
+        // the kernel pick a source per outgoing packet. When the caller resolved a
+        // physical-egress IP (see `detect_physical_egress`) *and* its family
+        // matches the overlay IP's family, we pin `local_endpoint` to that IP so
+        // boringtun's data socket sources from — and advertises — the real NIC
+        // rather than whatever the default route (possibly a VPN mesh) would pick.
+        //
+        // Family mismatch (e.g. physical egress is v4 but this overlay is v6) is
+        // unusable for source selection, so we warn and fall back to UNSPECIFIED.
+        //
+        // boringtun limitation: boringtun 0.7's `DeviceConfig` exposes no way to
+        // inject or pin the WireGuard DATA socket (its `uapi_fd` is the UAPI
+        // CONTROL socket only), so `SO_BINDTODEVICE` on the data socket is
+        // impossible today. Setting `local_endpoint` to the physical IP governs
+        // source-address selection and the advertised endpoint, which is the
+        // realistic scope of control we have.
+        let unspecified = match ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let local_addr = match physical_egress_ip {
+            Some(egress) if egress.is_ipv4() == ip.is_ipv4() => egress,
+            Some(egress) => {
+                tracing::warn!(
+                    physical_egress_ip = %egress,
+                    overlay_ip = %ip,
+                    "physical egress IP family does not match overlay IP family; \
+                     falling back to UNSPECIFIED for WireGuard local_endpoint"
+                );
+                unspecified
+            }
+            None => unspecified,
         };
         let mut config = OverlayConfig {
             local_endpoint: SocketAddr::new(local_addr, listen_port),
@@ -2971,6 +3034,61 @@ latest_handshake=0
             now_unix()
         ));
         OverlaydServer::new(dir)
+    }
+
+    #[test]
+    fn build_config_uses_matching_physical_egress_ipv4() {
+        let server = test_server();
+        let overlay_ip: IpAddr = "10.200.0.1".parse().unwrap();
+        let egress: IpAddr = "192.0.2.10".parse().unwrap();
+        let config = server.build_config(
+            "priv".to_string(),
+            "pub".to_string(),
+            overlay_ip,
+            16,
+            51820,
+            Some(egress),
+        );
+        assert_eq!(config.local_endpoint, SocketAddr::new(egress, 51820));
+    }
+
+    #[test]
+    fn build_config_falls_back_to_unspecified_when_none() {
+        let server = test_server();
+        let overlay_ip: IpAddr = "10.200.0.1".parse().unwrap();
+        let config = server.build_config(
+            "priv".to_string(),
+            "pub".to_string(),
+            overlay_ip,
+            16,
+            51820,
+            None,
+        );
+        assert_eq!(
+            config.local_endpoint,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 51820)
+        );
+    }
+
+    #[test]
+    fn build_config_falls_back_to_unspecified_on_family_mismatch() {
+        let server = test_server();
+        // Overlay is v6 but the resolved physical egress is v4: unusable for
+        // source selection, so we must fall back to the v6 UNSPECIFIED address.
+        let overlay_ip: IpAddr = "fd00::1".parse().unwrap();
+        let egress: IpAddr = "192.0.2.10".parse().unwrap();
+        let config = server.build_config(
+            "priv".to_string(),
+            "pub".to_string(),
+            overlay_ip,
+            64,
+            51820,
+            Some(egress),
+        );
+        assert_eq!(
+            config.local_endpoint,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 51820)
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,12 @@ impl InterfaceOps for LinuxNetlinkOps {
             .map_err(netlink_err_to_overlay)
     }
 
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), OverlayError> {
+        crate::netlink::set_link_mtu_by_name(name, mtu)
+            .await
+            .map_err(netlink_err_to_overlay)
+    }
+
     async fn add_address(
         &self,
         name: &str,

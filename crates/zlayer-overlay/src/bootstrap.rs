@@ -633,6 +633,10 @@ impl OverlayBootstrap {
             zone: zone.to_string(),
             port,
             bind_addr: self.config.node_ip,
+            // Auto-detect upstreams from the host resolver at server start
+            // (filtered for loopback/stub); operators can override via the
+            // `DnsConfig` directly when constructing it explicitly.
+            upstreams: None,
         });
         Ok(self)
     }

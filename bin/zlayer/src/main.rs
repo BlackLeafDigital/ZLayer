@@ -775,6 +775,8 @@ async fn run(
             restart_on_exit,
             vacuum_secrets,
             secrets_only,
+            advertise_addr,
+            dns_upstreams,
             ..
         } => {
             let socket_path = cli.effective_socket_path();
@@ -843,6 +845,14 @@ async fn run(
             // `serve_with_external_shutdown` signature (pinned by the Windows
             // Service host) untouched. Consumed exactly once per process.
             commands::serve::set_pending_secrets_only(*secrets_only);
+
+            // Stash the `--advertise-addr` override (or `ZLAYER_ADVERTISE_ADDR`)
+            // and the `--dns-upstreams` list (or `ZLAYER_DNS_UPSTREAMS`) so the
+            // daemon boot path (`serve_with_external_shutdown`) picks them up
+            // without changing its pinned signature. Same process-global-slot
+            // pattern as the tunnel / API-TLS / vacuum / secrets-only flags.
+            commands::serve::set_pending_advertise_addr(advertise_addr.clone());
+            commands::serve::set_pending_dns_upstreams(dns_upstreams.clone());
 
             // Resolve the daemon instance name from the top-level
             // `--daemon-name` flag (with current_exe fallback) so the

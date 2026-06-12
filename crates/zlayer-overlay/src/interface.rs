@@ -55,6 +55,15 @@ pub(crate) trait InterfaceOps: Send + Sync {
     /// Bring a network interface administratively up.
     async fn set_link_up(&self, name: &str) -> Result<(), OverlayError>;
 
+    /// Set the MTU on the interface.
+    ///
+    /// The overlay TUN device carries WireGuard-in-WireGuard traffic over
+    /// a mesh, so its MTU must be tuned below the physical link MTU or
+    /// oversized packets silently blackhole. The error is returned to the
+    /// caller, which decides whether an MTU failure is fatal — a transport
+    /// degraded by an un-tuned MTU is still preferable to a dead overlay.
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), OverlayError>;
+
     /// Assign an IP with prefix length to the interface.
     async fn add_address(
         &self,

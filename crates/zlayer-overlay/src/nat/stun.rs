@@ -5,6 +5,7 @@
 //! vs symmetric). No external STUN crate required.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -12,6 +13,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 
 use super::config::StunServerConfig;
+use crate::dns::{build_forward_resolver, resolve_upstreams, DnsConfig, RESOLV_CONF_PATH};
 
 // ---- STUN protocol constants (RFC 5389) ------------------------------------
 
@@ -105,6 +107,19 @@ impl StunClient {
     /// Creates an ephemeral UDP socket, sends a Binding Request, and waits up
     /// to 3 seconds for a Binding Response.
     ///
+    /// # Interface pinning
+    ///
+    /// When `egress_iface` is a non-empty interface name, the UDP socket is
+    /// pinned to that physical NIC via [`crate::egress::bind_to_device`] before
+    /// any packet is sent. This stops the STUN probe from egressing through a
+    /// mesh VPN tunnel (netbird `wt0`, Tailscale `utun`, …) that has captured
+    /// the host's default route — which would otherwise make the discovered
+    /// reflexive address the *tunnel's* mapping rather than the real NIC's.
+    /// Pinning is Unix-only (the `AsRawFd` bound is unsatisfiable on Windows)
+    /// and degrades to a warning on `PermissionDenied` / `InterfaceNotFound` /
+    /// any other error rather than failing the probe (per `egress.rs`'s
+    /// documented contract).
+    ///
     /// # Errors
     ///
     /// Returns [`StunError::Io`] on socket failures, [`StunError::Timeout`] if
@@ -114,6 +129,7 @@ impl StunClient {
         &self,
         server_addr: SocketAddr,
         server_name: &str,
+        egress_iface: &str,
     ) -> Result<ReflexiveAddress, StunError> {
         // Create UDP socket via socket2 so we can bind to port 0 (ephemeral)
         let domain = if server_addr.is_ipv4() {
@@ -123,6 +139,38 @@ impl StunClient {
         };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_nonblocking(true)?;
+
+        // Pin to the physical egress NIC before binding/sending so the probe
+        // never leaks through a mesh-VPN default route. Unix-only: the
+        // `AsRawFd` bound `bind_to_device` requires is unsatisfiable on Windows.
+        #[cfg(unix)]
+        {
+            if !egress_iface.is_empty() {
+                match crate::egress::bind_to_device(&socket, egress_iface) {
+                    Ok(()) => {}
+                    Err(crate::error::OverlayError::PermissionDenied(msg)) => {
+                        tracing::warn!(
+                            interface = %egress_iface,
+                            error = %msg,
+                            "STUN socket could not be pinned to physical NIC (insufficient \
+                             privilege); continuing unpinned"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            interface = %egress_iface,
+                            error = %e,
+                            "STUN socket could not be pinned to physical NIC; \
+                             continuing unpinned"
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = egress_iface;
+        }
 
         let bind_addr: SocketAddr = if server_addr.is_ipv4() {
             SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
@@ -168,6 +216,26 @@ impl StunClient {
     /// Returns all successfully discovered reflexive addresses and the inferred
     /// NAT behavior. If all servers fail, returns the last error.
     ///
+    /// # Surviving a netbird-style host takeover
+    ///
+    /// This function is hardened against a mesh VPN (netbird, Tailscale, …) that
+    /// has captured the host: both the default route *and* the system DNS
+    /// resolver (a `~.` systemd-resolved catch-all). Two defenses run per pass:
+    ///
+    /// 1. **Egress pinning.** [`crate::egress::detect_physical_egress`] resolves
+    ///    the real NIC once up front; its name is threaded into every
+    ///    [`Self::query_server`] call so each STUN probe egresses through the
+    ///    physical interface rather than the mesh tunnel. If detection fails
+    ///    (empty interface name or error), pinning is skipped with a warning.
+    /// 2. **Resolver bypass.** STUN server hostnames are resolved through the
+    ///    *same* upstream resolvers the overlay DNS forwarder uses
+    ///    ([`build_forward_resolver`] over auto-detected, stub-filtered
+    ///    upstreams) instead of the poisoned host resolver. Literal
+    ///    `ip:port` addresses short-circuit DNS entirely. Only if the upstream
+    ///    resolver errors do we fall back to [`tokio::net::lookup_host`] (the
+    ///    host resolver may still work, and a broken fallback is no worse than
+    ///    the pre-hardening behaviour). The resolver is built once per pass.
+    ///
     /// # Errors
     ///
     /// Returns [`StunError::NoServers`] if no servers are configured, or the
@@ -176,6 +244,27 @@ impl StunClient {
         if self.servers.is_empty() {
             return Err(StunError::NoServers);
         }
+
+        // Detect the physical egress NIC once for this discovery pass. An empty
+        // interface name (or a detection error) means "pin nothing" — the
+        // probes then fall back to the OS default route, which is no worse than
+        // the pre-hardening behaviour.
+        let egress_iface = match crate::egress::detect_physical_egress().await {
+            Ok(egress) => egress.interface,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not detect physical egress NIC; STUN probes will not be \
+                     pinned to a physical interface"
+                );
+                String::new()
+            }
+        };
+
+        // Build the resolver-bypass once per pass: forward STUN hostname lookups
+        // through the overlay's own upstreams (stub/loopback filtered) rather
+        // than the host resolver a mesh VPN may have hijacked.
+        let bypass_resolver = build_bypass_resolver();
 
         let mut set = tokio::task::JoinSet::new();
 
@@ -186,24 +275,15 @@ impl StunClient {
                 .clone()
                 .unwrap_or_else(|| server_cfg.address.clone());
 
-            // Resolve hostname -> SocketAddr
-            let resolved = match tokio::net::lookup_host(&address_str).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        addr
-                    } else {
-                        tracing::warn!(server = %address_str, "DNS returned no addresses");
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(server = %address_str, error = %e, "DNS resolution failed");
-                    continue;
-                }
+            // Resolve hostname -> SocketAddr without trusting the host resolver.
+            let Some(resolved) = resolve_stun_address(&address_str, bypass_resolver.as_ref()).await
+            else {
+                continue;
             };
 
             // We need a fresh client reference per task; clone the necessary data
             let label_clone = label.clone();
+            let iface_clone = egress_iface.clone();
             // Build a minimal single-server client for the spawned task
             let servers_clone = vec![StunServerConfig {
                 address: address_str,
@@ -212,7 +292,9 @@ impl StunClient {
 
             set.spawn(async move {
                 let client = StunClient::new(servers_clone);
-                client.query_server(resolved, &label_clone).await
+                client
+                    .query_server(resolved, &label_clone, &iface_clone)
+                    .await
             });
         }
 
@@ -432,6 +514,145 @@ fn detect_nat_behavior(results: &[ReflexiveAddress]) -> NatBehavior {
         NatBehavior::EndpointIndependent
     } else {
         NatBehavior::Symmetric
+    }
+}
+
+/// Classification of a STUN server `address` string for resolution purposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StunAddress {
+    /// The address already parses as a `SocketAddr` (literal `ip:port`,
+    /// including bracketed IPv6 like `[::1]:3478`); no DNS is needed.
+    Literal(SocketAddr),
+    /// A `host:port` pair whose host part must be resolved via DNS.
+    HostPort { host: String, port: u16 },
+    /// The address has no usable `host:port` shape (no port, empty host, …).
+    Invalid,
+}
+
+/// Classify a STUN server address string into the resolution path it needs.
+///
+/// A literal `SocketAddr` (v4 `1.2.3.4:3478`, bracketed v6 `[2001:db8::1]:3478`)
+/// short-circuits DNS. A `host:port` whose host part is a DNS name needs
+/// resolution. Anything else is `Invalid`.
+///
+/// The host part is split off the rightmost colon. A residual colon in the host
+/// means the input was an *unbracketed* IPv6 literal (e.g. `2001:db8::1`): such
+/// a string is rejected as `Invalid` rather than being misparsed as
+/// `host="2001:db8:" port=1`, because an unbracketed v6 literal is not a valid
+/// `host:port` string (a DNS hostname / IPv4 never contains a colon).
+fn classify_stun_address(address: &str) -> StunAddress {
+    if let Ok(sock) = SocketAddr::from_str(address) {
+        return StunAddress::Literal(sock);
+    }
+
+    // Split host:port on the *last* colon so ordinary hostnames work.
+    let Some((host, port_str)) = address.rsplit_once(':') else {
+        return StunAddress::Invalid;
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    // A non-empty host containing a colon is an unbracketed IPv6 leftover, not a
+    // resolvable DNS name — reject it. (Bracketed v6 literals already matched the
+    // `SocketAddr` parse above.)
+    if host.is_empty() || host.contains(':') {
+        return StunAddress::Invalid;
+    }
+    match port_str.parse::<u16>() {
+        Ok(port) => StunAddress::HostPort {
+            host: host.to_string(),
+            port,
+        },
+        Err(_) => StunAddress::Invalid,
+    }
+}
+
+/// Build the resolver-bypass used to look up STUN server hostnames without
+/// trusting the host resolver.
+///
+/// Auto-detects upstreams the same way [`crate::dns::DnsServer::new`] does — a
+/// [`DnsConfig`] with `upstreams: None` parsed against the production
+/// [`RESOLV_CONF_PATH`], with loopback/systemd-resolved-stub entries filtered
+/// out and a public fallback. Returns `None` if no resolver can be built (the
+/// caller then leans on the [`tokio::net::lookup_host`] fallback).
+fn build_bypass_resolver() -> Option<hickory_server::resolver::TokioAsyncResolver> {
+    // A zone/bind_addr is required to construct DnsConfig but is irrelevant to
+    // upstream detection (only `upstreams: None` + the resolv.conf path matter).
+    let config = DnsConfig::new("overlay.local.", Ipv4Addr::UNSPECIFIED.into());
+    let upstreams = resolve_upstreams(&config, RESOLV_CONF_PATH);
+    match build_forward_resolver(&upstreams) {
+        Ok(resolver) => Some(resolver),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not build STUN resolver-bypass; falling back to host resolver"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve a STUN server `address` to a `SocketAddr` without trusting the host
+/// resolver where avoidable.
+///
+/// Resolution order:
+/// 1. Literal `ip:port` → returned directly, no DNS.
+/// 2. `host:port` → resolved through `bypass` (the overlay upstream resolver).
+/// 3. Only if the bypass lookup errors (or no bypass resolver exists) →
+///    [`tokio::net::lookup_host`], with a warning.
+///
+/// Returns `None` (with a warning) when the address is unparseable or every
+/// resolution path yields no address.
+async fn resolve_stun_address(
+    address: &str,
+    bypass: Option<&hickory_server::resolver::TokioAsyncResolver>,
+) -> Option<SocketAddr> {
+    let (host, port) = match classify_stun_address(address) {
+        StunAddress::Literal(sock) => return Some(sock),
+        StunAddress::HostPort { host, port } => (host, port),
+        StunAddress::Invalid => {
+            tracing::warn!(server = %address, "STUN server address is not a valid host:port");
+            return None;
+        }
+    };
+
+    // Preferred path: resolve through the overlay's own upstreams.
+    if let Some(resolver) = bypass {
+        match resolver.lookup_ip(host.as_str()).await {
+            Ok(lookup) => {
+                if let Some(ip) = lookup.iter().next() {
+                    return Some(SocketAddr::new(ip, port));
+                }
+                tracing::warn!(
+                    server = %address,
+                    "STUN hostname resolved to no addresses via overlay upstreams; \
+                     trying host resolver"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    server = %address,
+                    error = %e,
+                    "STUN hostname lookup via overlay upstreams failed; \
+                     falling back to host resolver"
+                );
+            }
+        }
+    }
+
+    // Fallback: the host resolver. It may still work, and a broken fallback is
+    // no worse than the pre-hardening behaviour.
+    match tokio::net::lookup_host((host.clone(), port)).await {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                Some(addr)
+            } else {
+                tracing::warn!(server = %address, "DNS returned no addresses");
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!(server = %address, error = %e, "DNS resolution failed");
+            None
+        }
     }
 }
 
@@ -927,5 +1148,127 @@ mod tests {
         let mut value = [0u8; 10];
         value[1] = 0x02; // IPv6 family
         assert!(parse_mapped_address(&value).is_none());
+    }
+
+    // ---- STUN address classification (resolution-order helper) --------------
+
+    #[test]
+    fn test_classify_stun_address_ipv4_literal() {
+        // A literal v4 ip:port short-circuits DNS.
+        let addr = classify_stun_address("203.0.113.5:3478");
+        assert_eq!(
+            addr,
+            StunAddress::Literal(SocketAddr::new(Ipv4Addr::new(203, 0, 113, 5).into(), 3478))
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_ipv6_bracketed_literal() {
+        // A bracketed v6 literal with port parses directly as SocketAddr.
+        let addr = classify_stun_address("[2001:db8::1]:3478");
+        assert_eq!(
+            addr,
+            StunAddress::Literal(SocketAddr::new(
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1).into(),
+                3478
+            ))
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_ipv6_loopback_bracketed_literal() {
+        let addr = classify_stun_address("[::1]:5000");
+        assert_eq!(
+            addr,
+            StunAddress::Literal(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5000))
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_hostname_port() {
+        // A hostname:port needs DNS resolution.
+        let addr = classify_stun_address("stun.example.com:3478");
+        assert_eq!(
+            addr,
+            StunAddress::HostPort {
+                host: "stun.example.com".to_string(),
+                port: 3478,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_hostname_default_stun_port() {
+        let addr = classify_stun_address("stun.l.google.com:19302");
+        assert_eq!(
+            addr,
+            StunAddress::HostPort {
+                host: "stun.l.google.com".to_string(),
+                port: 19302,
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_no_port_is_invalid() {
+        // Bare hostname with no port has no usable host:port shape.
+        assert_eq!(
+            classify_stun_address("stun.example.com"),
+            StunAddress::Invalid
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_unbracketed_ipv6_is_invalid() {
+        // An unbracketed v6 literal is not a valid host:port string: it neither
+        // parses as a SocketAddr nor splits cleanly on a single trailing port.
+        assert_eq!(classify_stun_address("2001:db8::1"), StunAddress::Invalid);
+    }
+
+    #[test]
+    fn test_classify_stun_address_non_numeric_port_is_invalid() {
+        assert_eq!(
+            classify_stun_address("stun.example.com:notaport"),
+            StunAddress::Invalid
+        );
+    }
+
+    #[test]
+    fn test_classify_stun_address_empty_host_is_invalid() {
+        // ":3478" has an empty host part.
+        assert_eq!(classify_stun_address(":3478"), StunAddress::Invalid);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stun_address_literal_skips_dns() {
+        // A literal ip:port must resolve without any resolver (passing None for
+        // the bypass and never reaching the host-resolver fallback proves the
+        // literal short-circuit fires first).
+        let resolved = resolve_stun_address("198.51.100.7:3478", None).await;
+        assert_eq!(
+            resolved,
+            Some(SocketAddr::new(Ipv4Addr::new(198, 51, 100, 7).into(), 3478))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stun_address_bracketed_ipv6_literal_skips_dns() {
+        let resolved = resolve_stun_address("[2001:db8::42]:19302", None).await;
+        assert_eq!(
+            resolved,
+            Some(SocketAddr::new(
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x42).into(),
+                19302
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stun_address_invalid_returns_none() {
+        // Unparseable address yields None without panicking or hitting the
+        // network (no resolver supplied).
+        assert!(resolve_stun_address("not-a-valid-address", None)
+            .await
+            .is_none());
     }
 }

@@ -106,6 +106,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod dns;
 pub mod edge_cache;
+pub mod egress;
 pub mod error;
 pub mod firewall;
 pub mod gossip;
@@ -129,6 +130,7 @@ pub use bootstrap::{
 // without needing their own direct dependency.
 pub use config::*;
 pub use dns::*;
+pub use egress::{bind_to_device, detect_physical_egress, is_virtual_interface, PhysicalEgress};
 pub use error::{OverlayError, Result};
 pub use gossip::{GossipConfig, GossipPool, TopologyEvent};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};

@@ -13,7 +13,7 @@ use crate::overlay_manager::OverlayManager;
 use crate::proxy_manager::ProxyManager;
 use crate::runtime::{Container, ContainerId, ContainerState, Runtime};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -34,6 +34,11 @@ pub struct ServiceInstance {
     proxy_manager: Option<Arc<ProxyManager>>,
     /// DNS server for service discovery (optional)
     dns_server: Option<Arc<DnsServer>>,
+    /// Container-injectable overlay resolver IP (optional). When set, this
+    /// node's overlay DNS server is reachable on `<ip>:53` and we inject it
+    /// into the container's resolv.conf so workloads resolve through the
+    /// overlay instead of inheriting the host's resolv.conf.
+    container_dns: Option<IpAddr>,
     /// Shared health states map so callbacks can update ServiceManager-level health
     health_states: Option<Arc<RwLock<HashMap<String, HealthState>>>>,
     /// Most recently observed image digest after a successful pull. Used by
@@ -64,6 +69,7 @@ impl ServiceInstance {
             overlay_manager,
             proxy_manager: None,
             dns_server: None,
+            container_dns: None,
             health_states: None,
             last_pulled_digest: tokio::sync::RwLock::new(None),
             node_id: 0,
@@ -86,6 +92,7 @@ impl ServiceInstance {
             overlay_manager,
             proxy_manager: Some(proxy_manager),
             dns_server: None,
+            container_dns: None,
             health_states: None,
             last_pulled_digest: tokio::sync::RwLock::new(None),
             node_id: 0,
@@ -133,6 +140,35 @@ impl ServiceInstance {
     /// Set the DNS server for service discovery
     pub fn set_dns_server(&mut self, dns_server: Arc<DnsServer>) {
         self.dns_server = Some(dns_server);
+    }
+
+    /// Set the container-injectable overlay resolver IP and apply it to the
+    /// instance's spec.
+    ///
+    /// When `container_dns` is set and the spec is eligible (not host-network,
+    /// no user-supplied `dns`), this pre-populates `spec.dns` with the overlay
+    /// resolver so containers resolve through `<ip>:53` instead of inheriting
+    /// the host's `/etc/resolv.conf`.
+    ///
+    /// Why this exists: on overlay-enabled hosts the netbird `~.`
+    /// systemd-resolved hijack swallows the host resolver, so a container that
+    /// inherits the host resolv.conf cannot resolve anything. The overlay DNS
+    /// server forwards non-overlay queries upstream, so pointing the container
+    /// at it fixes resolution AND gives it service-name discovery.
+    ///
+    /// Port-53 constraint: `resolv.conf` `nameserver` lines (and Docker's
+    /// `--dns`) carry no port — they are always port 53. The injected IP is
+    /// therefore only useful because the daemon binds the overlay resolver on
+    /// `<ip>:53` (see `daemon.rs` Phase 4); the injected value is the bare IP,
+    /// not a `host:port`.
+    ///
+    /// User-supplied `spec.dns` is left untouched: an explicit resolver from
+    /// the deployment spec always wins.
+    pub fn set_container_dns(&mut self, container_dns: IpAddr) {
+        self.container_dns = Some(container_dns);
+        if !self.spec.host_network && self.spec.dns.is_empty() {
+            self.spec.dns = vec![container_dns.to_string()];
+        }
     }
 
     /// Set the proxy manager for health-aware load balancing
@@ -1125,6 +1161,11 @@ pub struct ServiceManager {
     proxy_manager: Option<Arc<ProxyManager>>,
     /// DNS server for service discovery
     dns_server: Option<Arc<DnsServer>>,
+    /// Container-injectable overlay resolver IP. When set, new service
+    /// instances inject `<ip>` into their `spec.dns` so containers resolve
+    /// through the overlay DNS server (bound on `<ip>:53`) rather than the
+    /// hijacked host resolv.conf.
+    container_dns: Option<IpAddr>,
     /// Deployment name (used for generating hostnames)
     deployment_name: Option<String>,
     /// Health states for dependency condition checking
@@ -1165,6 +1206,7 @@ pub struct ServiceManagerBuilder {
     proxy_manager: Option<Arc<ProxyManager>>,
     stream_registry: Option<Arc<StreamRegistry>>,
     dns_server: Option<Arc<DnsServer>>,
+    container_dns: Option<IpAddr>,
     deployment_name: Option<String>,
     job_executor: Option<Arc<JobExecutor>>,
     cron_scheduler: Option<Arc<CronScheduler>>,
@@ -1181,6 +1223,7 @@ impl ServiceManagerBuilder {
             proxy_manager: None,
             stream_registry: None,
             dns_server: None,
+            container_dns: None,
             deployment_name: None,
             job_executor: None,
             cron_scheduler: None,
@@ -1214,6 +1257,19 @@ impl ServiceManagerBuilder {
     #[must_use]
     pub fn dns_server(mut self, dns: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns);
+        self
+    }
+
+    /// Set the container-injectable overlay resolver IP.
+    ///
+    /// The daemon passes the IP it bound the overlay DNS server on at port 53
+    /// (see `daemon.rs` Phase 4). New service instances inject it into
+    /// `spec.dns` so containers resolve through the overlay instead of the
+    /// hijacked host resolv.conf. The port is implicitly 53 (resolv.conf has no
+    /// port syntax), which is why only the bare IP is threaded here.
+    #[must_use]
+    pub fn container_dns(mut self, ip: IpAddr) -> Self {
+        self.container_dns = Some(ip);
         self
     }
 
@@ -1281,6 +1337,7 @@ impl ServiceManagerBuilder {
             stream_registry: self.stream_registry,
             proxy_manager: self.proxy_manager,
             dns_server: self.dns_server,
+            container_dns: self.container_dns,
             deployment_name: self.deployment_name,
             health_states: Arc::new(RwLock::new(HashMap::new())),
             job_executor: self.job_executor,
@@ -1319,6 +1376,7 @@ impl ServiceManager {
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
+            container_dns: None,
             deployment_name: None,
             health_states: Arc::new(RwLock::new(HashMap::new())),
             job_executor: None,
@@ -1342,6 +1400,7 @@ impl ServiceManager {
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
+            container_dns: None,
             deployment_name: None,
             health_states: Arc::new(RwLock::new(HashMap::new())),
             job_executor: None,
@@ -1366,6 +1425,7 @@ impl ServiceManager {
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
+            container_dns: None,
             deployment_name: Some(deployment_name),
             health_states: Arc::new(RwLock::new(HashMap::new())),
             job_executor: None,
@@ -1776,6 +1836,12 @@ impl ServiceManager {
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
                     }
+                    // Re-apply overlay resolver injection: the spec was just
+                    // replaced wholesale, so any prior injection on the old
+                    // spec is gone. Honors host_network / user-supplied dns.
+                    if let Some(ip) = self.container_dns {
+                        instance.set_container_dns(ip);
+                    }
 
                     let effective = spec.image.pull_policy;
                     let old_digest = instance.last_pulled_digest().await;
@@ -1884,6 +1950,12 @@ impl ServiceManager {
                 if let Some(dns) = &self.dns_server {
                     instance.set_dns_server(Arc::clone(dns));
                 }
+                // Inject the overlay resolver into the spec so containers use it
+                // instead of the hijacked host resolv.conf (no-op for
+                // host_network / user-supplied dns).
+                if let Some(ip) = self.container_dns {
+                    instance.set_container_dns(ip);
+                }
                 // Wire shared health states so callbacks bridge back to ServiceManager
                 instance.set_health_states(Arc::clone(&self.health_states));
                 // Register HTTP routes via proxy manager
@@ -1952,6 +2024,11 @@ impl ServiceManager {
                     // Set DNS server if configured
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
+                    }
+                    // Inject the overlay resolver (no-op for host_network /
+                    // user-supplied dns).
+                    if let Some(ip) = self.container_dns {
+                        instance.set_container_dns(ip);
                     }
                     services.insert(name, instance);
                 }
@@ -3171,6 +3248,45 @@ services:
         .services
         .remove("test")
         .unwrap()
+    }
+
+    #[test]
+    fn test_set_container_dns_injects_when_empty() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let spec = mock_spec(); // spec.dns defaults to empty, host_network false
+        let mut instance =
+            ServiceInstance::new("web".to_string(), spec, Arc::clone(&runtime), None);
+        instance.set_container_dns("10.42.0.1".parse().unwrap());
+        assert_eq!(instance.spec.dns, vec!["10.42.0.1".to_string()]);
+    }
+
+    #[test]
+    fn test_set_container_dns_skips_host_network() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let mut spec = mock_spec();
+        spec.host_network = true;
+        let mut instance =
+            ServiceInstance::new("web".to_string(), spec, Arc::clone(&runtime), None);
+        instance.set_container_dns("10.42.0.1".parse().unwrap());
+        assert!(
+            instance.spec.dns.is_empty(),
+            "host_network containers must inherit the host resolv.conf"
+        );
+    }
+
+    #[test]
+    fn test_set_container_dns_preserves_user_dns() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let mut spec = mock_spec();
+        spec.dns = vec!["1.1.1.1".to_string()];
+        let mut instance =
+            ServiceInstance::new("web".to_string(), spec, Arc::clone(&runtime), None);
+        instance.set_container_dns("10.42.0.1".parse().unwrap());
+        assert_eq!(
+            instance.spec.dns,
+            vec!["1.1.1.1".to_string()],
+            "user-supplied spec.dns must win over the overlay resolver"
+        );
     }
 
     /// Helper to create a `ServiceSpec` with dependencies

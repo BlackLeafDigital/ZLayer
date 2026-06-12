@@ -85,7 +85,8 @@ async fn test_stun_discover_reflexive_address() {
         }
     };
 
-    match client.query_server(resolved, "Google STUN").await {
+    // Empty interface name => no physical-NIC pinning (test doesn't depend on it).
+    match client.query_server(resolved, "Google STUN", "").await {
         Ok(reflexive) => {
             assert!(
                 !reflexive.address.ip().is_unspecified(),

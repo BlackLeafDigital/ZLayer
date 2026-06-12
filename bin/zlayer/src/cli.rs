@@ -886,6 +886,26 @@ pub(crate) enum Commands {
         /// (`secrets.blackleafdigital.com`).
         #[clap(long, env = "ZLAYER_SECRETS_ONLY")]
         secrets_only: bool,
+
+        /// Override auto-detection of the address advertised to peers.
+        ///
+        /// On the zero-config first-init path the daemon normally resolves the
+        /// advertised address automatically, preferring the physical NIC over
+        /// mesh/VPN interfaces (netbird `wt*`, `WireGuard` `wg*`, Tailscale
+        /// `utun*`, …). Set this when that resolution picks the wrong address —
+        /// the value is used verbatim and persisted into `node_config.json`.
+        #[clap(long, value_name = "IP", env = "ZLAYER_ADVERTISE_ADDR")]
+        advertise_addr: Option<String>,
+
+        /// Explicit upstream resolvers for non-overlay DNS forwarding (comma-
+        /// separated, e.g. `192.168.1.1:53,1.1.1.1:53`).
+        ///
+        /// Entries without a port get `:53` appended. Overrides
+        /// `/etc/resolv.conf` auto-detection of the upstreams the overlay DNS
+        /// server forwards non-overlay queries to. An invalid entry is a hard
+        /// startup error.
+        #[clap(long, value_name = "ADDR,ADDR", env = "ZLAYER_DNS_UPSTREAMS")]
+        dns_upstreams: Option<String>,
     },
 
     /// Manage the zlayer background daemon (systemd on Linux, launchd on

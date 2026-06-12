@@ -55,6 +55,28 @@ pub struct OverlayConfig {
     /// a test/dev daemon hermetic.
     #[serde(default = "OverlayConfig::default_uapi_sock_dir")]
     pub uapi_sock_dir: PathBuf,
+
+    /// MTU applied to the overlay tunnel interface.
+    ///
+    /// Defaults to `1420`: the standard `WireGuard` tunnel MTU (1500-byte
+    /// underlay MTU minus 80 bytes of `WireGuard` encapsulation overhead).
+    /// Matches the Windows Wintun default in `transport.rs`.
+    ///
+    /// Applied to the TUN interface on Linux/macOS at configure time. On
+    /// Windows, Wintun exposes no per-adapter MTU setter, so this value is
+    /// advisory there (IP Helper may override it). Lowering it matters when
+    /// running `WireGuard`-in-`WireGuard` — e.g. the overlay riding over
+    /// another mesh such as netbird — where stacked encapsulation shrinks
+    /// the usable payload and an over-large MTU causes silent blackholing
+    /// of oversized packets that can't be fragmented.
+    #[serde(default = "default_mtu")]
+    pub mtu: u32,
+}
+
+/// Default overlay tunnel MTU: 1500-byte underlay minus 80 bytes of
+/// `WireGuard` encapsulation overhead.
+fn default_mtu() -> u32 {
+    1420
 }
 
 impl OverlayConfig {
@@ -94,6 +116,7 @@ impl Default for OverlayConfig {
             #[cfg(feature = "nat")]
             nat: NatConfig::default(),
             uapi_sock_dir: Self::default_uapi_sock_dir(),
+            mtu: default_mtu(),
         }
     }
 }
@@ -197,5 +220,36 @@ mod tests {
             ..OverlayConfig::default()
         };
         assert_eq!(config.overlay_cidr, "fd00:200::/48");
+    }
+
+    #[test]
+    fn test_overlay_config_default_mtu() {
+        let config = OverlayConfig::default();
+        assert_eq!(config.mtu, 1420);
+    }
+
+    #[test]
+    fn test_overlay_config_mtu_serde_round_trip() {
+        let config = OverlayConfig {
+            mtu: 1280,
+            ..OverlayConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(json.contains("\"mtu\":1280"));
+        let decoded: OverlayConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.mtu, 1280);
+    }
+
+    #[test]
+    fn test_overlay_config_missing_mtu_defaults() {
+        // An on-disk config written before the `mtu` field existed must
+        // still deserialize cleanly and pick up the 1420 default.
+        let json = r#"{
+            "local_endpoint": "0.0.0.0:51820",
+            "private_key": ""
+        }"#;
+        let config: OverlayConfig = serde_json::from_str(json).expect("deserialize without mtu");
+        assert_eq!(config.mtu, 1420);
     }
 }

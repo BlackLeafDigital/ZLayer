@@ -209,6 +209,56 @@ pub async fn set_link_up_by_name(name: &str) -> Result<(), NetlinkError> {
         .map_err(|e| NetlinkError::Netlink(format!("link set up failed for {name}: {e}")))
 }
 
+/// Set the MTU on the link identified by `name`.
+///
+/// Replaces the shell-out:
+///   ip link set dev `<name>` mtu `<mtu>`
+///
+/// The overlay TUN device is WireGuard-in-WireGuard over a mesh, so the
+/// effective payload budget is smaller than the physical link MTU. An
+/// un-tuned MTU silently blackholes oversized packets, so the caller
+/// drives this explicitly from `OverlayConfig.mtu`.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError::NotFound`] if no link with the given name
+/// exists in the current netns. Returns [`NetlinkError::Netlink`] for
+/// any other RTNETLINK failure (permission denied, etc.).
+pub async fn set_link_mtu_by_name(name: &str, mtu: u32) -> Result<(), NetlinkError> {
+    use futures_util::stream::TryStreamExt;
+
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| NetlinkError::Netlink(format!("new_connection failed: {e}")))?;
+    tokio::spawn(connection);
+
+    let link = handle
+        .link()
+        .get()
+        .match_name(name.to_string())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("No such device") {
+                NetlinkError::NotFound(name.to_string())
+            } else {
+                NetlinkError::Netlink(format!("link lookup failed for {name}: {msg}"))
+            }
+        })?
+        .ok_or_else(|| NetlinkError::NotFound(name.to_string()))?;
+
+    let index = link.header.index;
+
+    handle
+        .link()
+        .set(index)
+        .mtu(mtu)
+        .execute()
+        .await
+        .map_err(|e| NetlinkError::Netlink(format!("link set mtu failed for {name}: {e}")))
+}
+
 /// Add an IP address (v4 or v6) to the link identified by `name` in
 /// the current network namespace.
 ///
@@ -347,5 +397,30 @@ pub async fn add_route_via_dev(
                     "route add v6 {d}/{prefix_len} dev {dev_name} failed: {e}"
                 ))
             }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `set_link_mtu_by_name` against a guaranteed-nonexistent interface
+    /// must error cleanly (never panic). In a privileged netns the lookup
+    /// resolves to `NotFound`; in a sandboxed / unprivileged environment
+    /// the RTNETLINK connection or lookup may fail for other reasons —
+    /// either way we accept the error and skip gracefully, mirroring the
+    /// egress.rs graceful-skip pattern.
+    #[tokio::test]
+    async fn set_mtu_on_missing_link_errors_cleanly() {
+        let name = "zl-no-such-iface-xyz";
+        match set_link_mtu_by_name(name, 1420).await {
+            Ok(()) => panic!("setting MTU on a nonexistent link should not succeed"),
+            Err(NetlinkError::NotFound(n)) => assert_eq!(n, name),
+            Err(e) => {
+                // Unprivileged / sandboxed: RTNETLINK refused before the
+                // lookup could distinguish ENODEV. Accept and skip.
+                eprintln!("skipping: RTNETLINK unavailable in this environment: {e}");
+            }
+        }
     }
 }

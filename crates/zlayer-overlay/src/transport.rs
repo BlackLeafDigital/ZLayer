@@ -485,6 +485,14 @@ impl OverlayTransport {
         #[cfg(not(target_os = "macos"))]
         let name = self.interface_name.clone();
 
+        // boringtun 0.7's `DeviceConfig` exposes no hook to inject the
+        // WireGuard *data* socket: `uapi_fd` is the UAPI *control* socket
+        // only (the `wg`-style configuration channel), not the UDP transport
+        // socket. There is therefore no supported way to pin the data socket
+        // with SO_BINDTODEVICE to a specific egress NIC. Source-IP selection
+        // is instead achieved via `local_endpoint` (the bind address) plus a
+        // correctly advertised peer endpoint — that is the full extent of the
+        // egress control surface boringtun 0.7 gives us.
         let cfg = DeviceConfig {
             n_threads: 2,
             use_connected_socket: true,
@@ -559,7 +567,10 @@ impl OverlayTransport {
         }
 
         let iface_name = self.interface_name.clone();
-        let mtu = 1420; // Standard WireGuard MTU. IP Helper can override later.
+        // MTU is driven by OverlayConfig (default 1420). Wintun fixes the MTU
+        // at adapter-create time and exposes no per-adapter setter afterward,
+        // so this is the only place it can be applied on Windows.
+        let mtu = self.config.mtu;
 
         // WindowsTun::new is synchronous — wrap in spawn_blocking so we
         // don't stall the runtime if Wintun's load_from_path / adapter
@@ -1081,6 +1092,26 @@ impl OverlayTransport {
             if !msg.contains("File exists") && !msg.contains("EEXIST") {
                 return Err(format!("Failed to assign IP: {msg}").into());
             }
+        }
+
+        // Set the MTU before bringing the interface up. The overlay TUN
+        // carries WireGuard-in-WireGuard over a mesh, so the effective
+        // payload budget is below the physical link MTU; an un-tuned MTU
+        // silently blackholes oversized packets. `self.interface_name` is
+        // the kernel-assigned utunN name on macOS (discovered during
+        // `create_interface` before this runs). A failure here is logged
+        // and tolerated — a degraded (un-tuned) MTU is strictly better
+        // than aborting overlay bring-up entirely.
+        if let Err(e) = iface_ops
+            .set_mtu(&self.interface_name, self.config.mtu)
+            .await
+        {
+            tracing::warn!(
+                interface = %self.interface_name,
+                mtu = self.config.mtu,
+                error = %e,
+                "Failed to set overlay interface MTU; continuing with the kernel default (oversized packets may blackhole)"
+            );
         }
 
         // Bring interface up. On macOS this is redundant with the
@@ -1879,6 +1910,7 @@ errno=0\n";
             #[cfg(feature = "nat")]
             nat: crate::nat::NatConfig::default(),
             uapi_sock_dir: std::path::PathBuf::from("/var/run/wireguard"),
+            mtu: 1420,
         };
 
         // On macOS, boringtun uses "utun" and the kernel assigns utunN.
@@ -1930,6 +1962,7 @@ errno=0\n";
             #[cfg(feature = "nat")]
             nat: crate::nat::NatConfig::default(),
             uapi_sock_dir: std::path::PathBuf::from("/var/run/wireguard"),
+            mtu: 1420,
         };
 
         #[cfg(target_os = "macos")]

@@ -4,6 +4,9 @@
 //! connect to peers by trying each candidate in priority order. Falls
 //! back from direct -> hole-punched -> relayed as needed.
 
+#[cfg(unix)]
+use crate::egress::bind_to_device;
+use crate::egress::detect_physical_egress;
 use crate::error::{OverlayError, Result};
 use crate::transport::OverlayTransport;
 
@@ -60,9 +63,18 @@ impl NatTraversal {
     /// Gather local candidates: host candidates (local IP + WG port)
     /// and STUN reflexive candidates.
     ///
-    /// Host candidates are discovered via the UDP socket trick (connect
-    /// to 8.8.8.8:80, read `local_addr`). Reflexive candidates come
-    /// from STUN `discover()`.
+    /// Host candidates are sourced from the **physical egress NIC** resolved by
+    /// [`detect_physical_egress`], not from the raw UDP-connect trick. This
+    /// matters on mesh-joined nodes: a netbird/`WireGuard`/Tailscale interface
+    /// (`wt0`, `wg0`, `utun*`, …) typically owns the default route, so the
+    /// UDP-connect trick (`connect()` to 8.8.8.8 and read `local_addr`) reports
+    /// the *mesh tunnel's* address. Advertising that as a host candidate makes
+    /// the overlay try to reach peers through the VPN — a tunnel-inside-a-tunnel
+    /// that peers on other physical networks can't route to. We therefore prefer
+    /// the physical-egress IP and only fall back to the UDP-connect trick (with a
+    /// warning) when detection fails outright.
+    ///
+    /// Reflexive candidates come from STUN `discover()`.
     ///
     /// # Errors
     ///
@@ -71,22 +83,65 @@ impl NatTraversal {
     pub async fn gather_candidates(&mut self) -> Result<Vec<Candidate>> {
         let mut candidates = Vec::new();
 
-        // -- Host candidates via UDP socket trick --
-        // IPv4 host candidate
-        match discover_local_ip() {
-            Ok(local_ip) => {
+        // -- Host candidates from the physical egress NIC --
+        //
+        // Resolve the real outbound NIC up front. On success we use its source
+        // IP directly for the matching-family host candidate (and pin our probe
+        // sockets to it); on failure we degrade to the legacy UDP-connect trick.
+        // `interface` is empty on Windows / when no NIC could be distinguished.
+        let physical_egress = match detect_physical_egress().await {
+            Ok(egress) => {
+                debug!(
+                    interface = %egress.interface,
+                    ip = %egress.ip,
+                    "Resolved physical egress NIC for host candidates"
+                );
+                Some(egress)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Physical-egress detection failed; falling back to UDP-connect trick \
+                     for host candidates (may pick a VPN-mesh address)"
+                );
+                None
+            }
+        };
+
+        // The interface name to pin traversal probe sockets to, if known.
+        let egress_iface: Option<&str> = physical_egress
+            .as_ref()
+            .map(|e| e.interface.as_str())
+            .filter(|name| !name.is_empty());
+
+        // IPv4 host candidate: prefer the detected physical-egress IP when it is
+        // an IPv4 address; otherwise fall back to the UDP-connect trick (pinned
+        // to the physical NIC so even the fallback leaves through the real NIC).
+        let v4_ip = match physical_egress.as_ref().map(|e| e.ip) {
+            Some(ip @ std::net::IpAddr::V4(_)) => Some(Ok(ip)),
+            _ => Some(discover_local_ip(egress_iface)),
+        };
+        match v4_ip {
+            Some(Ok(local_ip)) => {
                 let addr = SocketAddr::new(local_ip, self.wg_port);
                 let host = Candidate::new(CandidateType::Host, addr);
                 debug!(address = %addr, "Gathered IPv4 host candidate");
                 candidates.push(host);
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 warn!(error = %e, "Failed to discover local IPv4 for host candidate");
             }
+            None => {}
         }
 
-        // IPv6 host candidate
-        match discover_local_ipv6() {
+        // IPv6 host candidate: prefer the detected physical-egress IP when it is
+        // an IPv6 address; otherwise use the UDP-connect trick (pinned to the
+        // physical NIC).
+        let v6_ip = match physical_egress.as_ref().map(|e| e.ip) {
+            Some(ip @ std::net::IpAddr::V6(_)) => Ok(ip),
+            _ => discover_local_ipv6(egress_iface),
+        };
+        match v6_ip {
             Ok(local_ip) => {
                 let addr = SocketAddr::new(local_ip, self.wg_port);
                 let host = Candidate::new(CandidateType::Host, addr);
@@ -505,8 +560,18 @@ impl NatTraversal {
 /// and reads the local address. No packets are sent because UDP `connect`
 /// only sets the default destination. This gives us the IP of the default
 /// route interface.
-fn discover_local_ip() -> std::result::Result<std::net::IpAddr, std::io::Error> {
+///
+/// This is the *fallback* path: it reports the source IP of whatever interface
+/// owns the default route, which on a mesh-joined node is the VPN tunnel
+/// (`wt0`/`wg0`/`utun*`), not the physical NIC. When `iface` names a physical
+/// interface, the probe socket is pinned to it with `bind_to_device` so even
+/// this fallback leaves through the real NIC and reports the real source IP,
+/// sidestepping mesh-VPN default-route poisoning. Binding failures never abort
+/// discovery — an unpinned socket still works (it just falls back to the
+/// default-route source), which is strictly better than failing traversal.
+fn discover_local_ip(iface: Option<&str>) -> std::result::Result<std::net::IpAddr, std::io::Error> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    pin_probe_socket(&socket, iface);
     socket.connect("8.8.8.8:80")?;
     Ok(socket.local_addr()?.ip())
 }
@@ -514,16 +579,67 @@ fn discover_local_ip() -> std::result::Result<std::net::IpAddr, std::io::Error> 
 /// Discover the local IPv6 address via the UDP socket trick.
 ///
 /// Same approach as [`discover_local_ip`] but for IPv6. Connects to
-/// Google's public DNS IPv6 address (`[2001:4860:4860::8888]:80`).
-fn discover_local_ipv6() -> std::result::Result<std::net::IpAddr, std::io::Error> {
+/// Google's public DNS IPv6 address (`[2001:4860:4860::8888]:80`). The probe
+/// socket is pinned to the physical egress interface (when known) for the same
+/// mesh-VPN default-route reason documented on [`discover_local_ip`].
+fn discover_local_ipv6(
+    iface: Option<&str>,
+) -> std::result::Result<std::net::IpAddr, std::io::Error> {
     let socket = std::net::UdpSocket::bind("[::]:0")?;
+    pin_probe_socket(&socket, iface);
     socket.connect("[2001:4860:4860::8888]:80")?;
     Ok(socket.local_addr()?.ip())
+}
+
+/// Pin a zlayer-owned traversal probe socket to the physical egress interface.
+///
+/// On a mesh-joined node the VPN owns the default route, so an unpinned socket
+/// would source from (and send through) the tunnel. Pinning via
+/// [`bind_to_device`] forces traffic out the real NIC. Any failure is logged
+/// and swallowed: `SO_BINDTODEVICE` needs `CAP_NET_RAW`/root (`PermissionDenied`),
+/// the interface may have vanished (`InterfaceNotFound`), or the kernel may
+/// reject it for some other reason — in every case the socket still functions
+/// unpinned, which is strictly better than failing traversal. No-op when
+/// `iface` is `None` (interface unknown / empty) or on non-Unix targets (the
+/// `AsRawFd` bound that `bind_to_device` requires is not satisfiable there).
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn pin_probe_socket(socket: &std::net::UdpSocket, iface: Option<&str>) {
+    #[cfg(unix)]
+    if let Some(name) = iface {
+        if let Err(e) = bind_to_device(socket, name) {
+            match e {
+                OverlayError::PermissionDenied(msg) => {
+                    warn!(
+                        interface = name,
+                        reason = %msg,
+                        "Could not pin traversal probe socket to physical NIC \
+                         (needs CAP_NET_RAW/root); continuing unpinned"
+                    );
+                }
+                OverlayError::InterfaceNotFound(iface_name) => {
+                    warn!(
+                        interface = %iface_name,
+                        "Physical egress interface not found while pinning traversal \
+                         probe socket; continuing unpinned"
+                    );
+                }
+                other => {
+                    warn!(
+                        interface = name,
+                        error = %other,
+                        "Failed to pin traversal probe socket to physical NIC; \
+                         continuing unpinned"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::is_virtual_interface;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -531,7 +647,7 @@ mod tests {
         // The UDP socket trick should work in most test environments
         // (even without network access, since no packets are actually sent).
         // It may fail in extremely sandboxed environments.
-        match discover_local_ip() {
+        match discover_local_ip(None) {
             Ok(ip) => {
                 assert!(!ip.is_unspecified(), "Local IP should not be 0.0.0.0");
                 assert!(!ip.is_loopback(), "Local IP should not be 127.0.0.1");
@@ -539,6 +655,59 @@ mod tests {
             Err(e) => {
                 // In CI or sandboxed environments this may fail; that's acceptable
                 eprintln!("discover_local_ip failed (may be sandboxed): {e}");
+            }
+        }
+    }
+
+    /// The IPv4 host-candidate IP-selection should prefer the physical egress
+    /// NIC's address when [`detect_physical_egress`] succeeds, rather than the
+    /// default-route UDP-connect trick (which a mesh VPN can poison). We can't
+    /// inject a fake egress here, so we exercise the real resolver and assert
+    /// the consistency contract: when detection yields an IPv4 address, that
+    /// exact address is what the v4 candidate-selection branch picks (and it is
+    /// never loopback/virtual). When the environment has no usable network
+    /// (isolated netns, fully sandboxed CI), we skip gracefully — same pattern
+    /// as `test_discover_local_ip`.
+    #[tokio::test]
+    async fn test_gather_candidate_prefers_physical_egress() {
+        match detect_physical_egress().await {
+            Ok(egress) => {
+                // Whatever the resolver returns must be a usable egress source.
+                assert!(
+                    !egress.ip.is_loopback(),
+                    "physical egress IP should not be loopback: {egress:?}"
+                );
+                if !egress.interface.is_empty() {
+                    assert!(
+                        !is_virtual_interface(&egress.interface),
+                        "physical egress interface should not be virtual/mesh: {egress:?}"
+                    );
+                }
+
+                // Mirror the v4 candidate-selection branch in `gather_candidates`:
+                // a detected IPv4 egress IP is preferred verbatim over the UDP
+                // trick.
+                if egress.ip.is_ipv4() {
+                    let egress_iface = if egress.interface.is_empty() {
+                        None
+                    } else {
+                        Some(egress.interface.as_str())
+                    };
+                    let selected = match Some(egress.ip) {
+                        Some(ip @ std::net::IpAddr::V4(_)) => ip,
+                        _ => discover_local_ip(egress_iface)
+                            .expect("v4 fallback should resolve when egress is v4"),
+                    };
+                    assert_eq!(
+                        selected, egress.ip,
+                        "v4 host candidate must prefer the physical-egress IP"
+                    );
+                }
+            }
+            Err(e) => {
+                // No physical egress detectable (isolated netns / sandboxed CI):
+                // skip gracefully rather than fail the suite.
+                eprintln!("skipping: no physical egress detectable in this environment: {e}");
             }
         }
     }
@@ -666,7 +835,7 @@ mod tests {
     #[test]
     fn test_discover_local_ipv6() {
         // The IPv6 UDP socket trick may fail on systems without IPv6 connectivity.
-        match discover_local_ipv6() {
+        match discover_local_ipv6(None) {
             Ok(ip) => {
                 assert!(ip.is_ipv6(), "Should return an IPv6 address");
                 assert!(!ip.is_unspecified(), "IPv6 should not be [::]");

@@ -92,6 +92,24 @@ impl InterfaceOps for MacIfconfigOps {
         Ok(())
     }
 
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), OverlayError> {
+        // `ifconfig <name> mtu <mtu>` — mirrors the other ifconfig
+        // invocations in this module.
+        let mtu_str = mtu.to_string();
+        let output = Command::new("ifconfig")
+            .args([name, "mtu", &mtu_str])
+            .output()
+            .await
+            .map_err(OverlayError::Io)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(OverlayError::NetworkConfig(format!(
+                "failed to set MTU {mtu} on {name}: {stderr}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn add_address(
         &self,
         name: &str,

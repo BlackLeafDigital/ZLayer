@@ -4,7 +4,8 @@ use hickory_client::client::{Client, SyncClient};
 use hickory_client::udp::UdpClientConnection;
 use hickory_server::authority::{Catalog, ZoneType};
 use hickory_server::proto::rr::rdata::{A, AAAA};
-use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_server::proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use hickory_server::resolver::config::NameServerConfigGroup;
 use hickory_server::server::ServerFuture;
 use hickory_server::store::in_memory::InMemoryAuthority;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,26 @@ use tokio::sync::RwLock;
 /// Default DNS port for overlay service discovery (non-standard to avoid conflicts)
 pub const DEFAULT_DNS_PORT: u16 = 15353;
 
+/// Standard DNS port used for upstream forwarding when a resolv.conf entry
+/// (or the public fallback) does not carry an explicit port.
+const STANDARD_DNS_PORT: u16 = 53;
+
+/// Well-known public recursive resolvers used as a last-resort fallback when
+/// no usable host upstream can be detected.
+///
+/// Cloudflare (`1.1.1.1`) is listed first, Google (`8.8.8.8`) second. These are
+/// only ever reached when [`resolve_upstreams`] cannot extract a single
+/// non-loopback nameserver from `/etc/resolv.conf` — i.e. the host resolver is
+/// either absent or wholly stub-based (the netbird / systemd-resolved failure
+/// mode this forwarder exists to route around).
+const PUBLIC_FALLBACK_UPSTREAMS: [IpAddr; 2] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+];
+
+/// Path to the host resolver configuration parsed for default upstreams.
+pub(crate) const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
 /// Configuration for DNS integration with overlay network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
@@ -28,6 +49,24 @@ pub struct DnsConfig {
     pub port: u16,
     /// Bind address (default: overlay IP)
     pub bind_addr: IpAddr,
+    /// Explicit upstream resolvers for non-overlay queries.
+    ///
+    /// When `Some`, this list wins outright over any host-resolver detection:
+    /// the overlay DNS server forwards every query *outside* [`Self::zone`] to
+    /// these addresses (in order) and never consults `/etc/resolv.conf`. This
+    /// is the production-safe override for hosts where a mesh VPN (netbird,
+    /// Tailscale, …) has hijacked systemd-resolved with a `~.` catch-all and
+    /// poisoned the host resolver for everything else.
+    ///
+    /// When `None` (the default), the server detects upstreams at startup by
+    /// parsing `/etc/resolv.conf` and filtering out loopback / resolved-stub
+    /// addresses; see [`resolve_upstreams`] for the exact precedence and the
+    /// public fallback.
+    ///
+    /// Each entry is a full `SocketAddr` so a non-standard upstream port can be
+    /// expressed; detection synthesises port [`STANDARD_DNS_PORT`] (53).
+    #[serde(default)]
+    pub upstreams: Option<Vec<SocketAddr>>,
 }
 
 impl DnsConfig {
@@ -38,6 +77,7 @@ impl DnsConfig {
             zone: zone.to_string(),
             port: DEFAULT_DNS_PORT,
             bind_addr,
+            upstreams: None,
         }
     }
 
@@ -46,6 +86,367 @@ impl DnsConfig {
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
+    }
+
+    /// Set explicit upstream resolvers for non-overlay queries.
+    ///
+    /// Supplying this disables host-resolver auto-detection entirely (the
+    /// config override always wins). Pass full `SocketAddr`s; for the common
+    /// case of "this IP on port 53" build them as `SocketAddr::new(ip, 53)`.
+    #[must_use]
+    pub fn with_upstreams(mut self, upstreams: Vec<SocketAddr>) -> Self {
+        self.upstreams = Some(upstreams);
+        self
+    }
+}
+
+/// Returns `true` for addresses that must never be used as an overlay DNS
+/// upstream because forwarding to them would either loop back into a broken
+/// host resolver or hit the systemd-resolved stub.
+///
+/// Filtered out:
+/// - `127.0.0.53` — the systemd-resolved stub listener. This is the exact
+///   address a mesh VPN hijacks; forwarding here re-introduces the failure we
+///   exist to bypass.
+/// - any other IPv4/IPv6 loopback (`127.0.0.0/8`, `::1`) — a resolver that is
+///   only reachable on loopback is, from a *container's* perspective, useless
+///   (the container has its own loopback) and is almost always the host stub.
+/// - the unspecified address (`0.0.0.0`, `::`) — never a valid nameserver.
+fn is_unusable_upstream(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+/// Parse `nameserver` directives out of resolv.conf-formatted text.
+///
+/// Only the `nameserver <ip>` directive is honoured (the sole directive that
+/// names an upstream); `search`, `domain`, `options`, comments (`#`/`;`) and
+/// blank lines are ignored. Loopback / stub / unspecified entries are filtered
+/// via [`is_unusable_upstream`] so a systemd-resolved `nameserver 127.0.0.53`
+/// line never survives. Surviving entries are returned as `SocketAddr`s on
+/// [`STANDARD_DNS_PORT`] (resolv.conf has no port syntax).
+///
+/// Duplicates are de-duplicated while preserving first-seen order.
+fn parse_resolv_conf(contents: &str) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(addr_str) = parts.next() else {
+            continue;
+        };
+        // resolv.conf may carry a scoped IPv6 like `fe80::1%eth0`; strip the
+        // zone id since `IpAddr` does not parse it.
+        let addr_str = addr_str.split('%').next().unwrap_or(addr_str);
+        let Ok(ip) = IpAddr::from_str(addr_str) else {
+            continue;
+        };
+        if is_unusable_upstream(ip) {
+            continue;
+        }
+        let sock = SocketAddr::new(ip, STANDARD_DNS_PORT);
+        if !out.contains(&sock) {
+            out.push(sock);
+        }
+    }
+    out
+}
+
+/// Resolve the effective upstream resolver list for non-overlay forwarding.
+///
+/// Precedence (documented because every choice here is load-bearing for the
+/// production failure this guards against):
+///
+/// 1. **Config override wins.** A non-empty `config.upstreams` is used verbatim
+///    and detection is skipped — this is the operator's escape hatch when the
+///    host resolver is unusable.
+/// 2. **Host `/etc/resolv.conf`, filtered.** Otherwise we parse the host
+///    resolver config and keep only non-loopback, non-stub nameservers (see
+///    [`parse_resolv_conf`]). This deliberately drops `127.0.0.53` so a
+///    netbird/systemd-resolved `~.` hijack cannot poison the overlay path:
+///    containers no longer inherit the broken stub, they hit the *real*
+///    upstreams resolv.conf points at.
+/// 3. **Public fallback.** If the filter leaves nothing usable (host is
+///    stub-only or resolv.conf is missing), fall back to
+///    [`PUBLIC_FALLBACK_UPSTREAMS`] (1.1.1.1, 8.8.8.8) and `warn!` loudly so
+///    the operator knows no host upstream survived.
+///
+/// `resolv_conf_path` is injectable for tests; production passes
+/// [`RESOLV_CONF_PATH`].
+pub(crate) fn resolve_upstreams(config: &DnsConfig, resolv_conf_path: &str) -> Vec<SocketAddr> {
+    if let Some(explicit) = &config.upstreams {
+        if !explicit.is_empty() {
+            tracing::debug!(
+                count = explicit.len(),
+                "using explicit overlay DNS upstreams from config (host detection skipped)",
+            );
+            return explicit.clone();
+        }
+    }
+
+    let detected = match std::fs::read_to_string(resolv_conf_path) {
+        Ok(contents) => parse_resolv_conf(&contents),
+        Err(e) => {
+            tracing::warn!(
+                path = resolv_conf_path,
+                error = %e,
+                "could not read host resolv.conf for overlay DNS upstream detection",
+            );
+            Vec::new()
+        }
+    };
+
+    if detected.is_empty() {
+        let fallback: Vec<SocketAddr> = PUBLIC_FALLBACK_UPSTREAMS
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, STANDARD_DNS_PORT))
+            .collect();
+        tracing::warn!(
+            fallback = ?fallback,
+            "no usable host DNS upstreams found (resolv.conf empty, missing, or stub-only); \
+             falling back to public resolvers for overlay forwarding",
+        );
+        fallback
+    } else {
+        tracing::info!(
+            upstreams = ?detected,
+            "overlay DNS forwarding to host upstreams (loopback/stub filtered out)",
+        );
+        detected
+    }
+}
+
+/// Build the bounded async resolver used to forward non-overlay queries.
+///
+/// hickory-server 0.24 *does* ship a [`ForwardAuthority`], but when every
+/// upstream is unreachable its lookup error flows through the [`Catalog`]'s
+/// `build_response` and lands in a documented-TODO branch that leaves the
+/// response code at the initialised `NoError` and emits an *empty* answer
+/// section — i.e. total-upstream-failure surfaces to a container as "this name
+/// has no A record" instead of `SERVFAIL`. That silent failure is exactly the
+/// production hazard we are guarding against, so instead of registering a
+/// `ForwardAuthority` in the catalog we drive a [`TokioAsyncResolver`] directly
+/// from [`ForwardingCatalog`] and map its error kinds to precise response codes
+/// (see [`ForwardingCatalog::handle_request`]).
+///
+/// `from_ips_clear` builds plain UDP+TCP nameservers (no DoT/DoH). Upstreams are
+/// bucketed by port so a non-standard upstream port is honoured; the common
+/// case is a single port (53). The resolver is bounded — 2s per-query timeout,
+/// 2 attempts — so a dead/blackholed upstream fails fast rather than hanging
+/// containers.
+///
+/// Returns `Err` only if the upstream set is empty (callers must not call this
+/// with an empty list — they gate on `!upstreams.is_empty()`).
+pub(crate) fn build_forward_resolver(
+    upstreams: &[SocketAddr],
+) -> Result<hickory_server::resolver::TokioAsyncResolver, DnsError> {
+    use hickory_server::resolver::config::{ResolverConfig, ResolverOpts};
+
+    if upstreams.is_empty() {
+        return Err(DnsError::Server("no upstreams for forward resolver".into()));
+    }
+
+    let mut group = NameServerConfigGroup::new();
+    let mut by_port: std::collections::BTreeMap<u16, Vec<IpAddr>> =
+        std::collections::BTreeMap::new();
+    for addr in upstreams {
+        by_port.entry(addr.port()).or_default().push(addr.ip());
+    }
+    for (port, ips) in by_port {
+        // trust_negative_responses = true: these are recursive resolvers we
+        // delegate to wholesale, so a negative response from them is final.
+        group.merge(NameServerConfigGroup::from_ips_clear(&ips, port, true));
+    }
+
+    // `ResolverOpts` is `#[non_exhaustive]`, so we cannot build it with a struct
+    // literal from this crate — start from defaults and override the two fields
+    // that matter for fail-fast behaviour.
+    let mut options = ResolverOpts::default();
+    options.timeout = Duration::from_secs(2);
+    options.attempts = 2;
+    // Forwarders must emit intermediate CNAMEs (RFC 1034 §4.3.2).
+    options.preserve_intermediates = true;
+
+    let config = ResolverConfig::from_parts(None, vec![], group);
+    Ok(hickory_server::resolver::TokioAsyncResolver::tokio(
+        config, options,
+    ))
+}
+
+/// A [`RequestHandler`] that serves the overlay zone from an [`InMemoryAuthority`]
+/// (via the wrapped [`Catalog`]) and forwards everything else to upstream
+/// resolvers, mapping resolver outcomes to precise DNS response codes.
+///
+/// Routing: a query whose name is within `zone_origin` is handed to the catalog
+/// unchanged (the [`InMemoryAuthority`] answers it). Any other query is resolved
+/// through `resolver` and answered directly. When `resolver` is `None` (no
+/// usable upstreams were configured) non-overlay queries fall through to the
+/// catalog, which answers `REFUSED` — the pre-forwarder behaviour.
+///
+/// Response-code mapping for forwarded queries:
+/// - resolver `Ok` → `NoError` with the resolved records as answers;
+/// - `NoRecordsFound { response_code: NXDomain }` → `NXDomain`;
+/// - `NoRecordsFound { response_code: NoError }` (genuine NODATA) → empty
+///   `NoError`;
+/// - timeout / IO / no-connections / any other error (total upstream failure)
+///   → `SERVFAIL`, never a panic and never a silent empty `NoError`.
+///
+/// The forwarder is only ever reachable on the sockets the server already binds
+/// (overlay IP / localhost / explicit secondary). No wildcard bind is added, so
+/// open recursion is not exposed to the world.
+struct ForwardingCatalog {
+    catalog: Catalog,
+    zone_origin: LowerName,
+    resolver: Option<Arc<hickory_server::resolver::TokioAsyncResolver>>,
+}
+
+impl ForwardingCatalog {
+    /// Build the `NoError` answer message for a successful forward lookup.
+    fn forward_answer_response<'a>(
+        request: &'a hickory_server::server::Request,
+        answers: &'a [Record],
+    ) -> hickory_server::authority::MessageResponse<
+        'a,
+        'a,
+        std::slice::Iter<'a, Record>,
+        std::iter::Empty<&'a Record>,
+        std::iter::Empty<&'a Record>,
+        std::iter::Empty<&'a Record>,
+    > {
+        use hickory_server::authority::MessageResponseBuilder;
+        use hickory_server::proto::op::ResponseCode;
+
+        let mut header = hickory_server::proto::op::Header::response_from_request(request.header());
+        header.set_recursion_available(true);
+        header.set_response_code(ResponseCode::NoError);
+        // Forwarded answers are non-authoritative by definition.
+        header.set_authoritative(false);
+
+        MessageResponseBuilder::from_message_request(request).build(
+            header,
+            answers.iter(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+    }
+
+    /// Build an answer-less response carrying just `code` (used for NXDOMAIN,
+    /// NODATA, and SERVFAIL on the forward path).
+    fn forward_code_response(
+        request: &hickory_server::server::Request,
+        code: hickory_server::proto::op::ResponseCode,
+    ) -> hickory_server::authority::MessageResponse<
+        '_,
+        '_,
+        impl Iterator<Item = &Record> + Send,
+        impl Iterator<Item = &Record> + Send,
+        impl Iterator<Item = &Record> + Send,
+        impl Iterator<Item = &Record> + Send,
+    > {
+        use hickory_server::authority::MessageResponseBuilder;
+        MessageResponseBuilder::from_message_request(request).error_msg(request.header(), code)
+    }
+
+    /// Resolve `name`/`rtype` through the upstream resolver and send the mapped
+    /// response. Returns the wire [`ResponseInfo`].
+    async fn forward<R: hickory_server::server::ResponseHandler>(
+        &self,
+        resolver: &hickory_server::resolver::TokioAsyncResolver,
+        request: &hickory_server::server::Request,
+        mut response_handle: R,
+    ) -> hickory_server::server::ResponseInfo {
+        use hickory_server::proto::op::ResponseCode;
+        use hickory_server::resolver::error::ResolveErrorKind;
+
+        let query = request.request_info().query;
+        let name = Name::from(query.name());
+        let rtype = query.query_type();
+
+        match resolver.lookup(name, rtype).await {
+            Ok(lookup) => {
+                let records: Vec<Record> = lookup.records().to_vec();
+                let response = Self::forward_answer_response(request, &records);
+                Self::send_or_servfail(&mut response_handle, response).await
+            }
+            Err(e) => {
+                let code = match e.kind() {
+                    // Upstream answered authoritatively: respect its verdict.
+                    ResolveErrorKind::NoRecordsFound { response_code, .. }
+                        if *response_code == ResponseCode::NXDomain =>
+                    {
+                        ResponseCode::NXDomain
+                    }
+                    // Name exists but no record of this type (genuine NODATA).
+                    ResolveErrorKind::NoRecordsFound { response_code, .. }
+                        if *response_code == ResponseCode::NoError =>
+                    {
+                        ResponseCode::NoError
+                    }
+                    // Timeout / IO / no-connections / anything else: the upstream
+                    // path is broken. SERVFAIL — never a silent empty NoError,
+                    // never a panic.
+                    _ => {
+                        tracing::debug!(error = %e, "overlay DNS upstream forward failed; SERVFAIL");
+                        ResponseCode::ServFail
+                    }
+                };
+                let response = Self::forward_code_response(request, code);
+                Self::send_or_servfail(&mut response_handle, response).await
+            }
+        }
+    }
+
+    /// Send `response`, degrading a send error to a SERVFAIL `ResponseInfo`
+    /// (mirrors how the inner catalog handles its own send failures).
+    async fn send_or_servfail<'a, R, A, N, S, D>(
+        response_handle: &mut R,
+        response: hickory_server::authority::MessageResponse<'_, 'a, A, N, S, D>,
+    ) -> hickory_server::server::ResponseInfo
+    where
+        R: hickory_server::server::ResponseHandler,
+        A: Iterator<Item = &'a Record> + Send + 'a,
+        N: Iterator<Item = &'a Record> + Send + 'a,
+        S: Iterator<Item = &'a Record> + Send + 'a,
+        D: Iterator<Item = &'a Record> + Send + 'a,
+    {
+        match response_handle.send_response(response).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to send overlay DNS forward response");
+                let mut header = hickory_server::proto::op::Header::new();
+                header.set_response_code(hickory_server::proto::op::ResponseCode::ServFail);
+                header.into()
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl hickory_server::server::RequestHandler for ForwardingCatalog {
+    async fn handle_request<R: hickory_server::server::ResponseHandler>(
+        &self,
+        request: &hickory_server::server::Request,
+        response_handle: R,
+    ) -> hickory_server::server::ResponseInfo {
+        // Overlay-zone queries (and anything when we have no upstream resolver)
+        // go straight to the catalog / InMemoryAuthority. Everything else is
+        // forwarded.
+        let query_name = request.request_info().query.name().clone();
+        let is_overlay = self.zone_origin.zone_of(&query_name);
+
+        match (&self.resolver, is_overlay) {
+            (Some(resolver), false) => self.forward(resolver, request, response_handle).await,
+            _ => self.catalog.handle_request(request, response_handle).await,
+        }
     }
 }
 
@@ -189,15 +590,50 @@ pub struct DnsServer {
     authority: Arc<InMemoryAuthority>,
     zone_origin: Name,
     serial: Arc<RwLock<u32>>,
+    /// Upstream resolvers for non-overlay queries.
+    ///
+    /// Resolved once at construction (config override > filtered resolv.conf >
+    /// public fallback). Every catalog this server builds — the primary
+    /// listener and any secondary / Windows-fallback listener — is wrapped in a
+    /// [`ForwardingCatalog`] that forwards non-overlay queries here, so a query
+    /// that does not match the overlay zone is forwarded instead of refused.
+    /// Empty only in the theoretical case where resolution yields nothing (it
+    /// always returns at least the public fallback), in which case no forwarder
+    /// is installed and non-overlay queries get the pre-existing REFUSED
+    /// behaviour.
+    upstreams: Vec<SocketAddr>,
 }
 
 impl DnsServer {
-    /// Create a new DNS server for the given zone
+    /// Create a new DNS server for the given zone.
+    ///
+    /// Upstreams for non-overlay forwarding are auto-detected from the host
+    /// `/etc/resolv.conf` (loopback/stub filtered, public fallback if empty).
+    /// Use [`Self::from_config`] with [`DnsConfig::with_upstreams`] to override.
     ///
     /// # Errors
     ///
     /// Returns `DnsError::InvalidName` if the zone name is invalid.
     pub fn new(listen_addr: SocketAddr, zone: &str) -> Result<Self, DnsError> {
+        let upstreams =
+            resolve_upstreams(&DnsConfig::new(zone, listen_addr.ip()), RESOLV_CONF_PATH);
+        Self::new_with_upstreams(listen_addr, zone, upstreams)
+    }
+
+    /// Create a DNS server with an explicit, already-resolved upstream list.
+    ///
+    /// Bypasses resolv.conf detection entirely — `upstreams` is used verbatim
+    /// for the root-zone forwarder. Primarily an internal/testing seam so a
+    /// stub upstream can be injected without touching the host `/etc/resolv.conf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the zone name is invalid.
+    pub fn new_with_upstreams(
+        listen_addr: SocketAddr,
+        zone: &str,
+        upstreams: Vec<SocketAddr>,
+    ) -> Result<Self, DnsError> {
         let zone_origin =
             Name::from_str(zone).map_err(|e| DnsError::InvalidName(format!("{zone}: {e}")))?;
 
@@ -214,17 +650,78 @@ impl DnsServer {
             authority,
             zone_origin,
             serial: Arc::new(RwLock::new(1)),
+            upstreams,
         })
     }
 
     /// Create from a `DnsConfig`
+    ///
+    /// Upstreams follow [`resolve_upstreams`] precedence: `config.upstreams`
+    /// override wins, else filtered `/etc/resolv.conf`, else public fallback.
     ///
     /// # Errors
     ///
     /// Returns `DnsError::InvalidName` if the zone name is invalid.
     pub fn from_config(config: &DnsConfig) -> Result<Self, DnsError> {
         let listen_addr = SocketAddr::new(config.bind_addr, config.port);
-        Self::new(listen_addr, &config.zone)
+        let upstreams = resolve_upstreams(config, RESOLV_CONF_PATH);
+        Self::new_with_upstreams(listen_addr, &config.zone, upstreams)
+    }
+
+    /// The upstream resolvers this server forwards non-overlay queries to.
+    #[must_use]
+    pub fn upstreams(&self) -> &[SocketAddr] {
+        &self.upstreams
+    }
+
+    /// Build the request handler for a listener: a [`ForwardingCatalog`] that
+    /// serves the overlay zone from `authority` (via an inner [`Catalog`]) and
+    /// forwards every non-overlay query to `upstreams`, mapping total upstream
+    /// failure to `SERVFAIL` rather than a silent empty `NoError`.
+    ///
+    /// Shared by every listener (primary + secondary) so forwarding behaviour
+    /// is identical across the sockets this server binds. A resolver-build
+    /// failure (only possible with an empty upstream set, which is gated out
+    /// here) degrades to "overlay-only": non-overlay queries fall through to the
+    /// catalog and get `REFUSED`, but overlay service discovery keeps working.
+    fn build_catalog(
+        zone_origin: Name,
+        authority: Arc<InMemoryAuthority>,
+        upstreams: &[SocketAddr],
+    ) -> ForwardingCatalog {
+        let lower_origin = LowerName::from(zone_origin.clone());
+
+        let mut catalog = Catalog::new();
+        // The catalog accepts Arc<dyn AuthorityObject> - InMemoryAuthority implements this
+        catalog.upsert(zone_origin.into(), Box::new(authority));
+
+        let resolver = if upstreams.is_empty() {
+            None
+        } else {
+            match build_forward_resolver(upstreams) {
+                Ok(r) => {
+                    tracing::debug!(
+                        upstreams = ?upstreams,
+                        "overlay DNS forwarder ready for non-overlay queries",
+                    );
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to build overlay DNS forwarder; non-overlay queries \
+                         will be refused (overlay zone still served)",
+                    );
+                    None
+                }
+            }
+        };
+
+        ForwardingCatalog {
+            catalog,
+            zone_origin: lower_origin,
+            resolver,
+        }
     }
 
     /// Get a handle for managing DNS records
@@ -274,10 +771,11 @@ impl DnsServer {
         let listen_addr = self.listen_addr;
         let zone_origin = self.zone_origin.clone();
         let authority = Arc::clone(&self.authority);
+        let upstreams = self.upstreams.clone();
 
         // Spawn the server in a background task
         tokio::spawn(async move {
-            if let Err(e) = Self::run_server(listen_addr, zone_origin, authority).await {
+            if let Err(e) = Self::run_server(listen_addr, zone_origin, authority, upstreams).await {
                 tracing::error!("DNS server error: {}", e);
             }
         });
@@ -300,9 +798,10 @@ impl DnsServer {
         let listen_addr = self.listen_addr;
         let zone_origin = self.zone_origin.clone();
         let authority = Arc::clone(&self.authority);
+        let upstreams = self.upstreams.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::run_server(listen_addr, zone_origin, authority).await {
+            if let Err(e) = Self::run_server(listen_addr, zone_origin, authority, upstreams).await {
                 tracing::error!("DNS server error: {}", e);
             }
         });
@@ -362,6 +861,7 @@ impl DnsServer {
         let handle = self.handle();
         let zone_origin = self.zone_origin.clone();
         let authority = Arc::clone(&self.authority);
+        let upstreams = self.upstreams.clone();
 
         // Pre-bind the sockets synchronously so binding failures surface here
         // instead of being swallowed by the detached task. On success we hand
@@ -370,8 +870,7 @@ impl DnsServer {
         let tcp_listener = TcpListener::bind(listen_addr).await?;
 
         tokio::spawn(async move {
-            let mut catalog = Catalog::new();
-            catalog.upsert(zone_origin.into(), Box::new(authority));
+            let catalog = Self::build_catalog(zone_origin, authority, &upstreams);
             let mut server = ServerFuture::new(catalog);
             server.register_socket(udp_socket);
             server.register_listener(tcp_listener, Duration::from_secs(30));
@@ -392,12 +891,11 @@ impl DnsServer {
         listen_addr: SocketAddr,
         zone_origin: Name,
         authority: Arc<InMemoryAuthority>,
+        upstreams: Vec<SocketAddr>,
     ) -> Result<(), DnsError> {
-        // Create the catalog and add our authority
-        let mut catalog = Catalog::new();
-
-        // The catalog accepts Arc<dyn AuthorityObject> - InMemoryAuthority implements this
-        catalog.upsert(zone_origin.into(), Box::new(authority));
+        // Create the catalog: overlay zone authority + (optional) root-zone
+        // forwarder for everything else.
+        let catalog = Self::build_catalog(zone_origin, authority, &upstreams);
 
         // Create the server
         let mut server = ServerFuture::new(catalog);
@@ -907,5 +1405,269 @@ mod tests {
         let v4 = peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let v6 = peer_hostname(IpAddr::V6("fd00::1".parse().unwrap()));
         assert_ne!(v4, v6);
+    }
+
+    // ---- resolv.conf parsing / upstream resolution -------------------------
+
+    #[test]
+    fn test_parse_resolv_conf_filters_stub_and_loopback() {
+        // A systemd-resolved stub line plus a plain loopback must be dropped;
+        // the real upstream survives on port 53.
+        let contents = "\
+            # generated by netbird\n\
+            nameserver 127.0.0.53\n\
+            nameserver 127.0.0.1\n\
+            nameserver 192.168.1.1\n\
+            search example.com\n\
+            options edns0\n";
+        let parsed = parse_resolv_conf(contents);
+        assert_eq!(
+            parsed,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                53
+            )],
+            "127.0.0.53 stub and 127.0.0.1 loopback must be filtered out",
+        );
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_dedup_and_comments() {
+        let contents = "\
+            ; a comment\n\
+            nameserver 8.8.8.8\n\
+            nameserver 8.8.8.8\n\
+            nameserver fe80::1%eth0\n\
+            nameserver 0.0.0.0\n";
+        let parsed = parse_resolv_conf(contents);
+        // 8.8.8.8 de-duplicated; scoped link-local kept (zone stripped);
+        // 0.0.0.0 unspecified dropped.
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)
+        );
+        assert_eq!(parsed[1].ip(), "fe80::1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_upstreams_config_override_wins() {
+        // An explicit config upstream must be returned verbatim with no
+        // resolv.conf consultation (we point the path at a bogus file).
+        let explicit = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)), 5300);
+        let config = DnsConfig::new("overlay.local.", IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_upstreams(vec![explicit]);
+        let resolved = resolve_upstreams(&config, "/nonexistent/resolv.conf");
+        assert_eq!(resolved, vec![explicit]);
+    }
+
+    #[test]
+    fn test_resolve_upstreams_falls_back_to_public_when_missing() {
+        // Missing resolv.conf => public fallback (1.1.1.1, 8.8.8.8).
+        let config = DnsConfig::new("overlay.local.", IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let resolved = resolve_upstreams(&config, "/definitely/not/a/real/resolv.conf");
+        assert_eq!(
+            resolved,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+            ],
+        );
+    }
+
+    // ---- end-to-end forwarding ---------------------------------------------
+
+    /// Spawn a minimal stub upstream DNS responder on an ephemeral UDP port.
+    ///
+    /// It answers *every* A query with `answer_ip` (echoing the queried name)
+    /// so a forwarded query can be observed flowing through. Returns the bound
+    /// `SocketAddr` so the caller can point the overlay forwarder at it.
+    async fn spawn_stub_upstream(answer_ip: Ipv4Addr) -> SocketAddr {
+        use hickory_server::proto::op::{Message, MessageType, ResponseCode};
+
+        let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind stub upstream");
+        let addr = sock.local_addr().expect("stub local_addr");
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            loop {
+                let Ok((len, from)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let Ok(request) = Message::from_vec(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::new();
+                resp.set_id(request.id());
+                resp.set_message_type(MessageType::Response);
+                resp.set_recursion_available(true);
+                resp.set_response_code(ResponseCode::NoError);
+                for q in request.queries() {
+                    resp.add_query(q.clone());
+                    if q.query_type() == RecordType::A {
+                        let rec =
+                            Record::from_rdata(q.name().clone(), 60, RData::A(A::from(answer_ip)));
+                        resp.add_answer(rec);
+                    }
+                }
+                if let Ok(bytes) = resp.to_vec() {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// Send a raw A query to `server` and return the first A answer, if any.
+    /// Returns `Err` carrying the `ResponseCode` on a non-NoError response so
+    /// SERVFAIL can be asserted distinctly from "no answer".
+    async fn raw_query_a(
+        server: SocketAddr,
+        name: &str,
+    ) -> Result<Option<Ipv4Addr>, hickory_server::proto::op::ResponseCode> {
+        use hickory_server::proto::op::{Message, MessageType, Query, ResponseCode};
+
+        let client = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind client");
+
+        let qname = Name::from_str(name).expect("query name");
+        let mut msg = Message::new();
+        msg.set_id(0x1234);
+        msg.set_message_type(MessageType::Query);
+        msg.set_recursion_desired(true);
+        msg.add_query(Query::query(qname, RecordType::A));
+        let bytes = msg.to_vec().expect("encode query");
+
+        client.send_to(&bytes, server).await.expect("send query");
+
+        let mut buf = vec![0u8; 1500];
+        // Generous client deadline: the forwarder's own bounded retry budget
+        // (2 attempts x 2s) means a SERVFAIL for a dead upstream arrives within
+        // ~4s; this must exceed that so the test observes SERVFAIL rather than
+        // tripping its own client timeout first.
+        let len = tokio::time::timeout(Duration::from_secs(12), client.recv(&mut buf))
+            .await
+            .expect("query timed out")
+            .expect("recv response");
+        let resp = Message::from_vec(&buf[..len]).expect("decode response");
+
+        if resp.response_code() != ResponseCode::NoError {
+            return Err(resp.response_code());
+        }
+        for ans in resp.answers() {
+            if let Some(RData::A(a)) = ans.data() {
+                return Ok(Some((*a).into()));
+            }
+        }
+        Ok(None)
+    }
+
+    #[tokio::test]
+    async fn test_forwarding_overlay_answered_and_nonoverlay_forwarded() {
+        // Stub upstream answers everything with 203.0.113.7.
+        let upstream_answer = Ipv4Addr::new(203, 0, 113, 7);
+        let upstream = spawn_stub_upstream(upstream_answer).await;
+
+        // `start` binds the listener internally, so grab a concrete ephemeral
+        // port first (bind + drop) and build the server on it — that lets the
+        // test client send queries to a known address.
+        let bound = {
+            let probe = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let a = probe.local_addr().unwrap();
+            drop(probe);
+            a
+        };
+
+        // Overlay server with the stub as its only upstream (no resolv.conf
+        // detection — upstreams injected directly).
+        let overlay_ip = Ipv4Addr::new(10, 200, 0, 5);
+        let server =
+            DnsServer::new_with_upstreams(bound, "overlay.local.", vec![upstream]).unwrap();
+        let handle = server.handle();
+        handle
+            .add_record("svc", IpAddr::V4(overlay_ip))
+            .await
+            .unwrap();
+        let _running = server.start().await.unwrap();
+
+        // Give the listener a moment to bind.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Overlay-zone query is answered from the authority (NOT the stub).
+        let overlay = raw_query_a(bound, "svc.overlay.local.")
+            .await
+            .expect("overlay query should not SERVFAIL");
+        assert_eq!(
+            overlay,
+            Some(overlay_ip),
+            "overlay name must be answered from InMemoryAuthority",
+        );
+
+        // Non-overlay query is forwarded to the stub upstream.
+        let forwarded = raw_query_a(bound, "example.com.")
+            .await
+            .expect("forwarded query should not SERVFAIL");
+        assert_eq!(
+            forwarded,
+            Some(upstream_answer),
+            "non-overlay name must be forwarded to the upstream stub",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forwarding_total_upstream_failure_is_servfail_not_panic() {
+        use hickory_server::proto::op::ResponseCode;
+
+        // Point the forwarder at a dead upstream (nothing listening). The
+        // server must return SERVFAIL for non-overlay queries, never panic,
+        // and still serve the overlay zone.
+        let dead_upstream = {
+            // Bind+drop to grab a free port nobody is listening on.
+            let s = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        };
+
+        let bound = {
+            let s = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        };
+
+        let server =
+            DnsServer::new_with_upstreams(bound, "overlay.local.", vec![dead_upstream]).unwrap();
+        let handle = server.handle();
+        handle
+            .add_record("svc", IpAddr::V4(Ipv4Addr::new(10, 200, 0, 9)))
+            .await
+            .unwrap();
+        let _running = server.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Overlay zone still works.
+        let overlay = raw_query_a(bound, "svc.overlay.local.")
+            .await
+            .expect("overlay query should still succeed");
+        assert_eq!(overlay, Some(Ipv4Addr::new(10, 200, 0, 9)));
+
+        // Non-overlay query against a dead upstream => SERVFAIL (not a panic,
+        // not a hang past the resolver's own timeout).
+        match raw_query_a(bound, "example.com.").await {
+            Err(ResponseCode::ServFail) => {} // expected
+            Err(other) => panic!("expected SERVFAIL, got {other:?}"),
+            Ok(answer) => panic!("expected SERVFAIL, got answer {answer:?}"),
+        }
     }
 }

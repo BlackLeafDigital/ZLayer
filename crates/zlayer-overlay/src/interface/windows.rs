@@ -83,6 +83,11 @@ impl InterfaceOps for WindowsIpHelperOps {
         Ok(())
     }
 
+    async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), OverlayError> {
+        // Wintun exposes no per-adapter MTU setter via IP Helper; the MTU is fixed at adapter-create time, so this is a no-op.
+        Ok(())
+    }
+
     async fn add_address(
         &self,
         name: &str,
