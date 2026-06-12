@@ -6,6 +6,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -93,13 +94,36 @@ pub enum NatBehavior {
 /// A lightweight STUN client that discovers reflexive addresses.
 pub struct StunClient {
     servers: Vec<StunServerConfig>,
+    /// The resolver-bypass (overlay upstreams), built lazily and cached for the
+    /// lifetime of this client.
+    ///
+    /// Building it parses `/etc/resolv.conf` via [`resolve_upstreams`], which
+    /// emits a WARN ("no usable host DNS upstreams found … falling back to
+    /// public resolvers") on hosts whose resolv.conf is stub-only (e.g. a
+    /// systemd-resolved `127.0.0.53` catch-all). [`Self::discover`] runs on
+    /// every NAT-maintenance tick (`stun_refresh_interval_secs`, 60s by
+    /// default); re-resolving on each tick spammed that WARN once per tick. By
+    /// caching here, resolv.conf is parsed exactly once per client lifetime and
+    /// the fallback WARN fires at most once per process.
+    ///
+    /// Tradeoff: a host that edits `/etc/resolv.conf` after the client is
+    /// constructed will not pick up the new upstreams until the overlay process
+    /// is restarted. This is acceptable — resolv.conf changes on a running
+    /// overlay host are rare and a restart is the documented way to re-read host
+    /// network config. The inner `Option` mirrors `build_bypass_resolver`'s
+    /// return: `None` means no resolver could be built and callers lean on the
+    /// `tokio::net::lookup_host` fallback.
+    bypass_resolver: OnceLock<Option<hickory_server::resolver::TokioAsyncResolver>>,
 }
 
 impl StunClient {
     /// Create a new STUN client with the given server list.
     #[must_use]
     pub fn new(servers: Vec<StunServerConfig>) -> Self {
-        Self { servers }
+        Self {
+            servers,
+            bypass_resolver: OnceLock::new(),
+        }
     }
 
     /// Query a single STUN server for our reflexive address.
@@ -261,10 +285,13 @@ impl StunClient {
             }
         };
 
-        // Build the resolver-bypass once per pass: forward STUN hostname lookups
-        // through the overlay's own upstreams (stub/loopback filtered) rather
-        // than the host resolver a mesh VPN may have hijacked.
-        let bypass_resolver = build_bypass_resolver();
+        // Resolve STUN hostnames through the overlay's own upstreams
+        // (stub/loopback filtered) rather than the host resolver a mesh VPN may
+        // have hijacked. Built once and cached on the client: `discover` runs
+        // every NAT-maintenance tick (60s), and re-parsing resolv.conf each time
+        // spammed a WARN per tick on stub-only hosts. See the field doc on
+        // `bypass_resolver` for the resolv.conf-change tradeoff.
+        let bypass_resolver = self.bypass_resolver.get_or_init(build_bypass_resolver);
 
         let mut set = tokio::task::JoinSet::new();
 
@@ -924,6 +951,42 @@ mod tests {
         }];
         let client = StunClient::new(servers);
         assert_eq!(client.servers.len(), 1);
+        // A fresh client must start with an *empty* bypass-resolver cell: the
+        // resolv.conf parse (and its fallback WARN) is deferred to first use.
+        assert!(
+            client.bypass_resolver.get().is_none(),
+            "bypass_resolver must be lazily initialized, not built at construction"
+        );
+    }
+
+    #[test]
+    fn test_bypass_resolver_initializes_once_and_is_stable() {
+        // The production bug was that `discover` rebuilt the bypass resolver on
+        // every 60s NAT tick, re-parsing resolv.conf and re-emitting a WARN each
+        // time. The fix caches it in a `OnceLock`. This exercises that exact seam
+        // — `get_or_init(build_bypass_resolver)` — the way `discover` does, but
+        // without any network: the closure runs at most once, and every
+        // subsequent call hands back the *same* cached instance.
+        let client = StunClient::new(vec![]);
+
+        // First access: the cell is empty, so the closure runs and the cell is
+        // populated.
+        assert!(client.bypass_resolver.get().is_none());
+        let first: *const Option<_> = client.bypass_resolver.get_or_init(build_bypass_resolver);
+        assert!(
+            client.bypass_resolver.get().is_some(),
+            "cell must be populated after the first get_or_init"
+        );
+
+        // Second access must NOT re-run the closure; it returns the identical
+        // cached value (same address), proving resolv.conf is parsed once.
+        let second: *const Option<_> = client.bypass_resolver.get_or_init(|| {
+            panic!("build_bypass_resolver must not be called a second time");
+        });
+        assert!(
+            std::ptr::eq(first, second),
+            "repeated get_or_init must return the same cached resolver instance"
+        );
     }
 
     // ---- IPv6 tests ---------------------------------------------------------
