@@ -23,6 +23,10 @@ jobs:
         image:
           - upstream: docker.io/library/alpine:latest
             mirror: ghcr.io/blackleafdigital/zlayer-test-alpine:latest
+          - upstream: docker.io/library/nginx:1.28-alpine
+            mirror: ghcr.io/blackleafdigital/zlayer-test-nginx:1.28-alpine
+          - upstream: docker.io/library/nginx:1.29-alpine
+            mirror: ghcr.io/blackleafdigital/zlayer-test-nginx:1.29-alpine
     env:
       # skopeo's default auth path is /run/containers/$UID/auth.json which
       # is not writable in the Actions container. Point it at a tempfile.
