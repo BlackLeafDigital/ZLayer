@@ -2280,6 +2280,7 @@ impl Runtime for VzLinuxRuntime {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn pull_image_with_policy(
         &self,
         image: &str,
