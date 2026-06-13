@@ -3877,6 +3877,9 @@ mod tests {
         let bare_rootfs = rt.images_dir().join("alpine_latest").join("rootfs");
         std::fs::create_dir_all(bare_rootfs.join("bin")).unwrap();
         std::fs::write(bare_rootfs.join("bin").join("sh"), b"#!/bin/sh\n").unwrap();
+        // Mark the pull complete — `rootfs_is_populated` now requires the sibling
+        // `rootfs.complete` marker (non-empty alone no longer counts as present).
+        std::fs::write(rootfs_complete_marker(&bare_rootfs).unwrap(), b"").unwrap();
 
         // Found directly by the bare ref.
         assert_eq!(
