@@ -13000,6 +13000,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "num_cpus",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "serde_yaml",

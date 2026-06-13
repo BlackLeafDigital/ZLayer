@@ -494,8 +494,9 @@ async fn resolve_task(state: &SocketState, id: &str) -> Result<Option<Task>, Str
 /// Forwards the daemon's logs stream verbatim using Docker's framed
 /// multiplexed wire format (the daemon honours `format=raw`, which emits
 /// the 8-byte stdcopy header per chunk). The handler mirrors
-/// `socket/containers.rs::container_logs` so Docker SDKs that decode the
-/// `application/vnd.docker.raw-stream` content type work unchanged.
+/// `socket/containers.rs::container_logs`: the framed body is labelled
+/// `application/vnd.docker.multiplexed-stream` so Content-Type-driven
+/// clients demux instead of leaking the 8-byte headers into the text.
 async fn task_logs(
     State(state): State<SocketState>,
     Path(id): Path<String>,
@@ -558,7 +559,7 @@ async fn task_logs(
     if let Some(headers) = response.headers_mut() {
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.docker.raw-stream"),
+            HeaderValue::from_static("application/vnd.docker.multiplexed-stream"),
         );
         headers.insert(
             header::CACHE_CONTROL,

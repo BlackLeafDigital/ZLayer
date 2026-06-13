@@ -22,6 +22,19 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Deserialize a collection field that Docker clients may send as JSON
+/// `null` (Go marshals nil slices/maps as `null`, and dockerd accepts
+/// that). `#[serde(default)]` alone only covers a MISSING key; an explicit
+/// `null` fails with "invalid type: null, expected a sequence" — which is
+/// exactly how `docker run` through the shim used to die on `"Env": null`.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Top-level body of `POST /containers/create`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -38,7 +51,7 @@ pub struct ContainerCreateBody {
     pub attach_stdout: Option<bool>,
     #[serde(default)]
     pub attach_stderr: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub exposed_ports: HashMap<String, EmptyObject>,
     #[serde(default)]
     pub tty: Option<bool>,
@@ -47,7 +60,7 @@ pub struct ContainerCreateBody {
     #[serde(default)]
     pub stdin_once: Option<bool>,
     /// Environment variables in `"KEY=VALUE"` form.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub env: Vec<String>,
     #[serde(default)]
     pub cmd: Option<Vec<String>>,
@@ -57,7 +70,7 @@ pub struct ContainerCreateBody {
     pub args_escaped: Option<bool>,
     /// Image reference to launch (required).
     pub image: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub volumes: HashMap<String, EmptyObject>,
     #[serde(default)]
     pub working_dir: Option<String>,
@@ -69,7 +82,7 @@ pub struct ContainerCreateBody {
     pub mac_address: Option<String>,
     #[serde(default)]
     pub on_build: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub stop_signal: Option<String>,
@@ -98,7 +111,7 @@ pub struct EmptyObject {}
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct HealthcheckBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub test: Vec<String>,
     /// Interval between checks, in nanoseconds.
     #[serde(default)]
@@ -120,16 +133,16 @@ pub struct HealthcheckBody {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct HostConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub binds: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub mounts: Vec<MountSpec>,
     #[serde(default)]
     pub network_mode: Option<String>,
     /// Map of `"<port>/<proto>"` keys to host bindings. Docker emits `null`
     /// (rather than an empty array) when a key has no host bindings — both
     /// forms are accepted here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub port_bindings: HashMap<String, Option<Vec<PortBindingHost>>>,
     #[serde(default)]
     pub restart_policy: Option<RestartPolicy>,
@@ -137,11 +150,11 @@ pub struct HostConfig {
     pub auto_remove: Option<bool>,
     #[serde(default)]
     pub volume_driver: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub volumes_from: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub cap_add: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub cap_drop: Vec<String>,
     #[serde(default)]
     pub privileged: Option<bool>,
@@ -149,16 +162,16 @@ pub struct HostConfig {
     pub publish_all_ports: Option<bool>,
     #[serde(default)]
     pub readonly_rootfs: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub dns: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub dns_options: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub dns_search: Vec<String>,
     /// `"hostname:ip"` entries appended to `/etc/hosts`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub extra_hosts: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub group_add: Vec<String>,
     #[serde(default)]
     pub ipc_mode: Option<String>,
@@ -166,17 +179,17 @@ pub struct HostConfig {
     pub cgroup: Option<String>,
     #[serde(default)]
     pub cgroup_parent: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub links: Vec<String>,
     #[serde(default)]
     pub oom_score_adj: Option<i32>,
     #[serde(default)]
     pub pid_mode: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub security_opt: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub storage_opt: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tmpfs: HashMap<String, String>,
     #[serde(default)]
     pub uts_mode: Option<String>,
@@ -184,15 +197,15 @@ pub struct HostConfig {
     pub userns_mode: Option<String>,
     #[serde(default)]
     pub shm_size: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub sysctls: HashMap<String, String>,
     #[serde(default)]
     pub runtime: Option<String>,
     #[serde(default)]
     pub init: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub devices: Vec<DeviceMapping>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub ulimits: Vec<UlimitMapping>,
 
     // Resource fields ------------------------------------------------------
@@ -282,7 +295,7 @@ pub struct BindOptions {
 pub struct VolumeOptions {
     #[serde(default)]
     pub no_copy: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub driver_config: Option<DriverConfig>,
@@ -294,7 +307,7 @@ pub struct VolumeOptions {
 pub struct DriverConfig {
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub options: HashMap<String, String>,
 }
 
@@ -355,7 +368,7 @@ pub struct UlimitMapping {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct NetworkingConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub endpoints_config: HashMap<String, EndpointConfig>,
 }
 
@@ -363,9 +376,9 @@ pub struct NetworkingConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EndpointConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub aliases: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub links: Vec<String>,
     #[serde(default)]
     pub network_id: Option<String>,
@@ -389,7 +402,7 @@ pub struct EndpointIpamConfig {
     pub ipv4_address: Option<String>,
     #[serde(default)]
     pub ipv6_address: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub link_local_ips: Vec<String>,
 }
 
@@ -404,6 +417,43 @@ mod tests {
         assert_eq!(body.image, "nginx");
         assert!(body.host_config.is_none());
         assert!(body.networking_config.is_none());
+    }
+
+    /// The docker CLI (Go) marshals nil slices/maps as JSON `null` — the
+    /// exact body `docker run -d --name x --network host --restart no img`
+    /// sends includes `"Env": null`. Every collection field must accept
+    /// `null` as empty, like dockerd does.
+    #[test]
+    fn parse_body_with_null_collections() {
+        let body: ContainerCreateBody = serde_json::from_value(serde_json::json!({
+            "Image": "ghcr.io/blackleafdigital/zlayer-test-nginx:1.29-alpine",
+            "Env": null,
+            "Cmd": null,
+            "ExposedPorts": null,
+            "Volumes": null,
+            "Labels": null,
+            "HostConfig": {
+                "Binds": null,
+                "Mounts": null,
+                "PortBindings": null,
+                "CapAdd": null,
+                "CapDrop": null,
+                "Dns": null,
+                "ExtraHosts": null,
+                "Devices": null,
+                "Ulimits": null,
+                "NetworkMode": "host",
+                "RestartPolicy": { "Name": "no" }
+            },
+            "NetworkingConfig": { "EndpointsConfig": null }
+        }))
+        .expect("null collections must deserialize as empty");
+        assert!(body.env.is_empty());
+        assert!(body.labels.is_empty());
+        let hc = body.host_config.expect("host config");
+        assert!(hc.binds.is_empty());
+        assert!(hc.port_bindings.is_empty());
+        assert_eq!(hc.network_mode.as_deref(), Some("host"));
     }
 
     #[test]

@@ -79,6 +79,7 @@ crossterm = "0.28"
 # Optional dependencies
 zlayer-builder = { workspace = true, optional = true }
 blake3 = "1.8.5"
+reqwest.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

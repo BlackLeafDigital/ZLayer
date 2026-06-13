@@ -21,6 +21,7 @@ on:
           - youki
           - wasm
           - docker
+          - komodo
           - manager-unit
           - manager-intellitester
           - manager-intellitester:login.test.yaml
@@ -302,6 +303,113 @@ jobs:
           mode: mark
           version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
           step: e2e-docker
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # E2E Tests (Komodo <-> docker shim)
+  #
+  # Boots Komodo (mongo + core + periphery, host-docker siblings) with
+  # periphery's DOCKER_HOST pointed at zlayer's Docker-compat socket, then
+  # drives the Komodo API: server handshake, container listing, a real
+  # deploy, and container-log fetch. Catches the bug class where the shim
+  # diverges from dockerd's wire contract (missing routes answered with
+  # bare 404s, stdcopy frames mislabelled raw-stream) that only a real
+  # bollard/docker-CLI consumer notices.
+  #
+  # The shim socket is created inside this job container but must be
+  # bind-mountable into the periphery SIBLING container (host docker), so
+  # it lives on the named volume `zlayer-komodo-e2e-sock`, mounted here at
+  # /zlayer-e2e-sock and into periphery by the test (ZLAYER_E2E_SOCK_MOUNT_SRC).
+  # ===========================================
+  komodo-e2e-tests:
+    name: E2E Tests (Komodo)
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-bullseye
+      options: --privileged --cgroupns=host --cap-add=NET_ADMIN --device=/dev/net/tun -v /var/run/docker.sock:/var/run/docker.sock -v zlayer-komodo-e2e-sock:/zlayer-e2e-sock
+    if: inputs.test == '' || inputs.test == 'komodo'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Compute step fingerprint
+        id: fingerprint
+        run: |
+          SRC_HASH=$(git ls-tree -r HEAD -- crates/zlayer-docker crates/zlayer-api crates/zlayer-client crates/zlayer-agent Cargo.toml Cargo.lock .forgejo/workflows/e2e.yml rust-toolchain.toml \
+            | sha256sum | cut -c1-16)
+          echo "src-hash=$SRC_HASH" >> $GITHUB_OUTPUT
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-komodo
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'sudo protobuf-compiler libseccomp-dev docker.io curl'
+
+      - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      # Auth for BOTH consumers: the docker CLI (host-docker pulls of the
+      # komodo/mongo images) and zlayer's AuthResolver (the daemon pulls
+      # the GHCR-mirrored nginx test image while its package visibility
+      # may still be internal).
+      - name: Seed registry credentials
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          mkdir -p ~/.docker
+          HUB_AUTH=$(printf '%s' "zachhandley:${{ secrets.DOCKERHUB_TOKEN }}" | base64 -w0)
+          GHCR_AUTH=$(printf '%s' "zachhandley:${{ secrets.GH_ACCESS_TOKEN }}" | base64 -w0)
+          printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"},"ghcr.io":{"auth":"%s"}}}\n' "$HUB_AUTH" "$GHCR_AUTH" > ~/.docker/config.json
+
+      - name: Build zlayer
+        if: steps.check.outputs.completed != 'true'
+        run: cargo build --package zlayer
+
+      - name: Run Komodo E2E test
+        if: steps.check.outputs.completed != 'true'
+        run: cargo test --package zlayer-docker --test komodo_e2e -- --ignored --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: info
+          ZLAYER_BIN: target/debug/zlayer
+          ZLAYER_E2E_SOCK_DIR: /zlayer-e2e-sock
+          ZLAYER_E2E_SOCK_MOUNT_SRC: zlayer-komodo-e2e-sock
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version || steps.fingerprint.outputs.src-hash }}
+          step: e2e-komodo
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}

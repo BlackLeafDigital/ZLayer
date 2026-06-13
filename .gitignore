@@ -24,6 +24,7 @@ target/
 CLAUDE.md
 HANDOFF_*.md
 TODO_DELME.md
+*DELME*.md
 __pycache__
 crates/zlayer-manager/node_modules
 clients/typescript/node_modules/

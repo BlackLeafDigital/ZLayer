@@ -157,6 +157,52 @@ sudo rm -f "${INSTALL_DIR}/${BINARY}"
 sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
 sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
+# --- macOS: make sure the VZ entitlement survives the install ---
+# The VZ runtimes (and `zlayer build`, which routes through the
+# zlayer-buildd VZ-Linux sidecar) can only boot guest VMs when the binary
+# is signed with com.apple.security.virtualization. Release binaries are
+# signed in CI on the Mac runner; older releases and locally built
+# tarballs may not be. Re-sign ad-hoc ONLY when the entitlement is
+# missing — re-signing an already-entitled binary would downgrade a
+# Developer ID signature to ad-hoc. Without this, the installed binary
+# silently can't start any VZ guest (zlayer-buildd sits 0/1 pending).
+if [ "$OS" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+    # A real (Developer ID) signature carrying the entitlement is kept as-is.
+    # An AD-HOC signature is re-signed even if it carries the entitlement:
+    # ad-hoc only reliably counts on the machine that produced it, and
+    # re-signing ad-hoc locally costs nothing.
+    if codesign -d --entitlements :- "${INSTALL_DIR}/${BINARY}" 2>/dev/null | grep -q "com.apple.security.virtualization" \
+        && ! codesign -dv "${INSTALL_DIR}/${BINARY}" 2>&1 | grep -q "Signature=adhoc"; then
+        echo "VZ entitlement present on ${BINARY} (keeping existing signature)"
+    else
+        echo "Signing ${BINARY} with the VZ entitlement (ad-hoc)..."
+        ENT_FILE="$(mktemp /tmp/zlayer-entitlements.XXXXXX)"
+        cat > "$ENT_FILE" <<'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+        if sudo codesign --force --options runtime --sign - --entitlements "$ENT_FILE" "${INSTALL_DIR}/${BINARY}" \
+            && codesign -d --entitlements :- "${INSTALL_DIR}/${BINARY}" 2>/dev/null | grep -q "com.apple.security.virtualization"; then
+            echo "VZ entitlement applied (ad-hoc signature)."
+        else
+            echo "WARNING: could not sign ${BINARY} with the virtualization entitlement." >&2
+            echo "         VZ guests (including 'zlayer build' via zlayer-buildd) will not" >&2
+            echo "         start until the binary is signed; from a repo checkout run:" >&2
+            echo "         sudo bash scripts/sign-vz.sh ${INSTALL_DIR}/${BINARY}" >&2
+        fi
+        rm -f "$ENT_FILE"
+    fi
+fi
+
 # Install zlayer-buildd alongside zlayer when the tarball ships it. The Go
 # sidecar provides the native `imagebuildah.BuildDockerfiles` code path
 # that handles WORKDIR against shell-less bases (distroless, scratch);

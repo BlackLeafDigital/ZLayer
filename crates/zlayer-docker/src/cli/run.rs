@@ -62,8 +62,10 @@ pub struct RunArgs {
     /// Image to run
     pub image: String,
 
-    /// Command to run in the container
-    #[clap(trailing_var_arg = true)]
+    /// Command to run in the container. Everything after the image is
+    /// passed verbatim — including flag-like tokens (`docker run alpine
+    /// ls -la /` needs no `--`), matching the real docker CLI.
+    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 

@@ -558,6 +558,12 @@ async fn probe_health(handle: &BuilddHandle) -> bool {
 }
 
 /// Poll `Health` until `SERVING` or timeout.
+///
+/// On timeout the error carries the container's ACTUAL state (`zlayer ps`
+/// line + last log lines) — the spawn failure that crash-loops the sidecar
+/// (e.g. `spawn /usr/local/bin/zlayer-buildd: No such file or directory`
+/// from a truncated rootfs) only lived in daemon.log, leaving the operator
+/// with an opaque "not SERVING within 60s".
 async fn wait_for_health(handle: &BuilddHandle) -> Result<()> {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     loop {
@@ -565,12 +571,75 @@ async fn wait_for_health(handle: &BuilddHandle) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            let diagnosis = buildd_failure_diagnosis().await;
             bail!(
-                "zlayer-buildd did not report Health=SERVING within {HEALTH_TIMEOUT:?} \
-                 (check `zlayer logs --deployment {BUILDD_NAME} {BUILDD_NAME}`)"
+                "zlayer-buildd did not report Health=SERVING within {HEALTH_TIMEOUT:?}\n\
+                 {diagnosis}\n\
+                 (full detail: `zlayer logs --deployment {BUILDD_NAME} {BUILDD_NAME}` \
+                 and the daemon log)"
             );
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// Best-effort snapshot of the buildd container's state for the
+/// health-timeout error: its `zlayer ps` line (state + restart churn shows
+/// up here) and the tail of its logs. Never fails — diagnosis text only.
+async fn buildd_failure_diagnosis() -> String {
+    let Ok(exe) = zlayer_exe() else {
+        return "  (could not resolve the zlayer executable for diagnosis)".to_string();
+    };
+
+    let mut out = String::new();
+
+    if let Ok(ps) = tokio::process::Command::new(&exe).arg("ps").output().await {
+        let stdout = String::from_utf8_lossy(&ps.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(BUILDD_NAME))
+            .unwrap_or("  (no zlayer-buildd entry in `zlayer ps`)");
+        out.push_str("  state: ");
+        out.push_str(line.trim());
+        out.push('\n');
+    }
+
+    if let Ok(logs) = tokio::process::Command::new(&exe)
+        .args(["logs", "--deployment", BUILDD_NAME, BUILDD_NAME])
+        .output()
+        .await
+    {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        let tail: Vec<&str> = combined
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(5)
+            .collect();
+        if tail.is_empty() {
+            out.push_str(
+                "  logs: (none — the container likely never started; \
+                 a spawn failure such as a missing entrypoint binary only \
+                 appears in the daemon log)",
+            );
+        } else {
+            out.push_str("  last log lines:\n");
+            for line in tail.into_iter().rev() {
+                out.push_str("    ");
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+        }
+    }
+
+    if out.is_empty() {
+        "  (no diagnosis available)".to_string()
+    } else {
+        out.trim_end().to_string()
     }
 }
 

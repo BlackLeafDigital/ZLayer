@@ -690,8 +690,10 @@ fn parse_bool(value: Option<&str>) -> bool {
 ///
 /// The daemon's per-service log endpoint returns plain text (one line per
 /// log entry). We frame each chunk with Docker's stdcopy multiplex header
-/// so clients that decode the `application/vnd.docker.raw-stream` content
-/// type continue to work. Lines from the daemon all originate from the
+/// and label the body `application/vnd.docker.multiplexed-stream` (the
+/// dockerd API ≥ 1.42 label for framed bodies) so clients that pick their
+/// decoder off the Content-Type demux correctly instead of leaking the
+/// 8-byte headers into the text. Lines from the daemon all originate from the
 /// container's stdout — `ZLayer` does not split stdout/stderr at the API
 /// boundary today — so when only `stderr=1` is requested with no `stdout`,
 /// we still emit on stdout.
@@ -764,7 +766,7 @@ async fn service_logs(
     if let Some(headers) = response.headers_mut() {
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.docker.raw-stream"),
+            HeaderValue::from_static("application/vnd.docker.multiplexed-stream"),
         );
         headers.insert(
             header::CACHE_CONTROL,

@@ -16,6 +16,7 @@ mod listener_unix;
 mod listener_windows;
 mod manifest;
 mod networks;
+mod registry_login;
 pub mod streaming;
 mod swarm;
 mod system;
@@ -163,10 +164,19 @@ fn router(state: SocketState) -> Router {
         .merge(volumes::routes(state.clone()))
         .merge(networks::routes(state.clone()))
         .merge(system::routes(state.clone()))
+        .merge(registry_login::routes(state.clone()))
         .merge(buildkit::routes())
         .merge(swarm::routes(state))
         .merge(manifest::routes())
-        .merge(trust::routes());
+        .merge(trust::routes())
+        // Docker-shaped JSON 404 for any path no module registers. Real
+        // dockerd answers unknown routes with `{"message":"page not found"}`;
+        // axum's default fallback is an EMPTY plain 404, which Docker SDKs
+        // (bollard, docker-py) try to JSON-decode and then surface as a
+        // parse error ("expected value at line 1 column 1") instead of a
+        // clean not-found — exactly what Komodo hit on endpoints the shim
+        // didn't implement.
+        .fallback(unknown_route);
 
     // Strip the Docker `/v1.NN` version prefix BEFORE routing. A plain
     // `inner.layer(strip)` does NOT work for version-prefixed paths: in axum
@@ -180,4 +190,17 @@ fn router(state: SocketState) -> Router {
     Router::new()
         .fallback_service(inner)
         .layer(axum::middleware::from_fn(version_middleware::strip_version))
+}
+
+/// Fallback for paths no socket module registers: dockerd's wire shape
+/// (`404` + `{"message":"page not found"}`) so Docker SDKs report a clean
+/// not-found instead of a JSON parse error on an empty body.
+async fn unknown_route(uri: axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tracing::debug!(path = %uri.path(), "docker API: unimplemented route");
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({ "message": "page not found" })),
+    )
+        .into_response()
 }

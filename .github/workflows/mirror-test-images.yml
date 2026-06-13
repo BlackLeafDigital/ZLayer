@@ -27,6 +27,10 @@ jobs:
             mirror: ghcr.io/blackleafdigital/zlayer-test-nginx:1.28-alpine
           - upstream: docker.io/library/nginx:1.29-alpine
             mirror: ghcr.io/blackleafdigital/zlayer-test-nginx:1.29-alpine
+          # MongoDB backs Komodo core in the komodo e2e suite. Komodo's own
+          # compose tracks `mongo` (:latest), so the mirror does too.
+          - upstream: docker.io/library/mongo:latest
+            mirror: ghcr.io/blackleafdigital/zlayer-test-mongo:latest
     env:
       # skopeo's default auth path is /run/containers/$UID/auth.json which
       # is not writable in the Actions container. Point it at a tempfile.

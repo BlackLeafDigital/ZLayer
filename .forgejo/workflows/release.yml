@@ -281,54 +281,45 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      # zlayer-rootfs.tar.gz is the WSL2 distro tarball produced by
+      # build.yml's build-rootfs job (Alpine minirootfs + iproute2 +
+      # iptables + /usr/local/bin/zlayer). It gets published as a
+      # release asset alongside the platform binaries so a fresh
+      # Windows host can `wsl --import` it directly from the release
+      # URL without needing the OCI registry. The docker-push job
+      # additionally publishes the same tarball as an OCI image.
+      # zlayer-linux-amd64-musl.tar.gz is a fully static (musl) build of
+      # the same `zlayer` binary, produced by build.yml's
+      # build-linux-amd64-musl job. It's the binary baked into the WSL2
+      # rootfs (Alpine/musl), and we ship it as a release asset too so
+      # users on Alpine/musl hosts (or any glibc-less environment) can
+      # grab a working portable binary without rebuilding.
+      # zlayer-windows-amd64-hcs.exe is a compat alias: the same binary
+      # as the one inside zlayer-windows-amd64.zip, kept for one release
+      # so anything pinning the pre-F-7a name keeps working. Remove after
+      # the next release.
+      #
+      # download-resumable resumes each retry from the bytes already on
+      # disk (-C -) and converts a stalled transfer into a fast retry —
+      # a fixed --max-time restart loop against a slow forge burned 40
+      # minutes on the 46 MB rootfs and never finished (4 × 600 s
+      # timeouts at ~7 KB/s, restarting from zero each time).
       - name: Download artifacts from temp storage
         if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          BASE_URL="${{ needs.pre-check.outputs.resolved_temp_url }}"
-          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
-          mkdir -p artifacts
-
-          # zlayer-rootfs.tar.gz is the WSL2 distro tarball produced by
-          # build.yml's build-rootfs job (Alpine minirootfs + iproute2 +
-          # iptables + /usr/local/bin/zlayer). It gets published as a
-          # release asset alongside the platform binaries so a fresh
-          # Windows host can `wsl --import` it directly from the release
-          # URL without needing the OCI registry. The docker-push job
-          # additionally publishes the same tarball as an OCI image.
-          # zlayer-linux-amd64-musl.tar.gz is a fully static (musl) build of
-          # the same `zlayer` binary, produced by build.yml's
-          # build-linux-amd64-musl job. It's the binary baked into the WSL2
-          # rootfs (Alpine/musl), and we ship it as a release asset too so
-          # users on Alpine/musl hosts (or any glibc-less environment) can
-          # grab a working portable binary without rebuilding.
-          for name in zlayer-linux-amd64 zlayer-linux-amd64-musl zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-completions zlayer-rootfs; do
-            echo "Downloading ${name}.tar.gz..."
-            curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-              --user "$AUTH" \
-              -o "artifacts/${name}.tar.gz" \
-              "${BASE_URL}/${name}.tar.gz"
-            echo "OK ${name}.tar.gz"
-          done
-
-          # Download Windows artifact (zip format)
-          echo "Downloading zlayer-windows-amd64.zip..."
-          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-            --user "$AUTH" \
-            -o "artifacts/zlayer-windows-amd64.zip" \
-            "${BASE_URL}/zlayer-windows-amd64.zip"
-          echo "OK zlayer-windows-amd64.zip"
-
-          # Compat alias: zlayer-windows-amd64-hcs.exe is the same binary as
-          # the one inside zlayer-windows-amd64.zip, kept for one release so
-          # anything pinning the pre-F-7a name keeps working. Remove after
-          # the next release.
-          echo "Downloading zlayer-windows-amd64-hcs.exe (compat alias)..."
-          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-            --user "$AUTH" \
-            -o "artifacts/zlayer-windows-amd64-hcs.exe" \
-            "${BASE_URL}/zlayer-windows-amd64-hcs.exe"
-          echo "OK zlayer-windows-amd64-hcs.exe"
+        uses: https://forge.blackleafdigital.com/Public/actions/download-resumable@main
+        with:
+          output-dir: artifacts
+          basic-auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          urls: |
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-amd64.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-amd64-musl.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-arm64.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-darwin-amd64.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-darwin-arm64.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-completions.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-rootfs.tar.gz
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-windows-amd64.zip
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-windows-amd64-hcs.exe
 
       - name: Upload to Forgejo Packages
         if: steps.check.outputs.completed != 'true'
@@ -605,30 +596,22 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y buildah
 
-      - name: Download pre-built image archives
+      # Resumable downloads: the forge can serve these multi-hundred-MB
+      # archives slowly under load; a fixed --max-time loop restarts from
+      # zero on every retry and can spend 40 minutes delivering nothing
+      # (observed on the 46 MB rootfs at ~7 KB/s). download-resumable
+      # picks up each retry at the byte offset already on disk.
+      - name: Download pre-built image archives + WSL2 rootfs
         if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          for img in zlayer-node zlayer-web zlayer-manager; do
-            echo "Downloading ${img}-oci.tar..."
-            curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
-              "${{ needs.pre-check.outputs.resolved_temp_url }}/${img}-oci.tar" \
-              --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              -o "${img}-oci.tar"
-            echo "OK ${img}-oci.tar downloaded"
-          done
-
-      - name: Download WSL2 rootfs tarball
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Downloading zlayer-rootfs.tar.gz..."
-          curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
-            "${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-rootfs.tar.gz" \
-            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            -o "zlayer-rootfs.tar.gz"
-          ls -la zlayer-rootfs.tar.gz
+        uses: https://forge.blackleafdigital.com/Public/actions/download-resumable@main
+        with:
+          output-dir: .
+          basic-auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          urls: |
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-node-oci.tar
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-web-oci.tar
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-manager-oci.tar
+            ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-rootfs.tar.gz
 
       - name: Login to Forgejo registry
         if: steps.check.outputs.completed != 'true'
@@ -652,14 +635,11 @@ jobs:
 
       - name: Download binary archive for CLI image
         if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
-          echo "Downloading zlayer-linux-amd64.tar.gz..."
-          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-            --user "$AUTH" \
-            -o "zlayer-linux-amd64.tar.gz" \
-            "${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-amd64.tar.gz"
+        uses: https://forge.blackleafdigital.com/Public/actions/download-resumable@main
+        with:
+          url: ${{ needs.pre-check.outputs.resolved_temp_url }}/zlayer-linux-amd64.tar.gz
+          output: zlayer-linux-amd64.tar.gz
+          basic-auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
       - name: Load, tag, and push images
         if: steps.check.outputs.completed != 'true'

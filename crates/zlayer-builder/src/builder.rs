@@ -1670,9 +1670,16 @@ impl ImageBuilder {
         }
 
         // Extract the Dockerfile from the BuildOutput.
-        let BuildOutput::Dockerfile(dockerfile) = build_output else {
+        let BuildOutput::Dockerfile(mut dockerfile) = build_output else {
             unreachable!("WasmArtifact case handled above");
         };
+        // Docker semantics: ARGs declared before the first FROM participate
+        // in FROM-line expansion (`FROM ${BASE_IMAGE}`), with build args
+        // overriding their defaults. The parser keeps such targets as raw
+        // stage strings (it has no build args), so resolve them here — for
+        // every struct-consuming backend — or multi-stage Dockerfiles with
+        // parameterised bases fail with "Stage '${...}' not found".
+        dockerfile.resolve_from_args(&self.options.build_args);
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
         // L-5: Static guard — catch `RUN choco install ...` /

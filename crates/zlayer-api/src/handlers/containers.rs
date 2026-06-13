@@ -3635,8 +3635,9 @@ fn ndjson_line_for_error(err: &zlayer_agent::AgentError) -> Bytes {
 ///   application/json`.
 ///
 /// * `format=raw` — emit Docker's multiplexed stdcopy framing
-///   (`application/vnd.docker.raw-stream`). Consumed by the Docker compat
-///   shim in `zlayer-docker`.
+///   (`application/vnd.docker.multiplexed-stream`, dockerd's API ≥ 1.42
+///   label for framed bodies). Consumed by the Docker compat shim in
+///   `zlayer-docker`.
 ///
 /// `follow=true` keeps the stream open until the runtime reports EOF or the
 /// client disconnects. Stream errors mid-flight are emitted as a final
@@ -3724,7 +3725,10 @@ pub async fn get_container_logs(
                     }
                 }
             });
-            ("application/vnd.docker.raw-stream", Box::pin(mapped))
+            (
+                "application/vnd.docker.multiplexed-stream",
+                Box::pin(mapped),
+            )
         }
     };
 

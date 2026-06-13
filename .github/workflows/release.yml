@@ -50,13 +50,39 @@ jobs:
 
           echo "Downloading from: ${BASE_URL}"
 
+          # Resumable download with stall detection. The forge can serve
+          # these archives slowly under load; each retry resumes from the
+          # bytes already on disk (-C -) instead of restarting, and a
+          # transfer stalled below 1 KB/s for 60 s fails fast. HTTP-level
+          # rejections (curl exit 22, e.g. a 404 for an artifact this
+          # release doesn't ship) return immediately so the SKIP path
+          # stays fast. (Mirrors Public/actions/download-resumable, which
+          # a public GitHub repo can't `uses:` from the private mirror.)
+          dl() {
+            url="$1"; out="$2"; attempt=1
+            while [ "$attempt" -le 5 ]; do
+              if curl -fSL -C - --no-progress-meter --connect-timeout 30 \
+                   --speed-limit 1000 --speed-time 60 \
+                   --user "${AUTH}" -o "${out}" "${url}"; then
+                return 0
+              fi
+              rc=$?
+              if [ "$rc" -eq 22 ]; then rm -f "${out}"; return 22; fi
+              if [ "$rc" -eq 33 ]; then rm -f "${out}"; fi
+              echo "  retry ${attempt}/5 (curl exit ${rc}) for ${url}"
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+            return 1
+          }
+
           # Download zlayer binary for all platforms
           for os in linux darwin; do
             for arch in amd64 arm64; do
               artifact="zlayer-${os}-${arch}.tar.gz"
               output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
-              if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
+              if dl "${BASE_URL}/${artifact}" "${output}"; then
                 echo "  OK ${artifact}"
               else
                 rm -f "${output}"
@@ -69,7 +95,7 @@ jobs:
           artifact="zlayer-windows-amd64.zip"
           output="artifacts/zlayer-${VERSION}-windows-amd64.zip"
           echo "Downloading ${artifact}..."
-          if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
+          if dl "${BASE_URL}/${artifact}" "${output}"; then
             echo "  OK ${artifact}"
           else
             rm -f "${output}"
@@ -81,7 +107,7 @@ jobs:
             artifact="${img}-${VERSION}-oci.tar"
             output="artifacts/${artifact}"
             echo "Downloading ${artifact}..."
-            if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
+            if dl "${BASE_URL}/${artifact}" "${output}"; then
               echo "  OK ${artifact}"
             else
               rm -f "${output}"

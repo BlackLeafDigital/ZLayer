@@ -423,6 +423,28 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target aarch64-apple-darwin --package zlayer
+      - name: Sign with VZ entitlement
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # The VZ runtimes (macos_vz / macos_vz_linux) can only create/boot
+          # guest VMs when the binary carries com.apple.security.virtualization.
+          # Sign here on the Mac runner with its keychain identity so the
+          # released binary boots VMs after install; an unsigned release binary
+          # leaves `zlayer build` dead on macOS (zlayer-buildd stuck 0/1
+          # pending because no VZ guest can start). Prefer a Developer ID
+          # identity, fall back to the first valid codesigning identity, then
+          # ad-hoc (`-`) so runners without a keychain identity still produce
+          # a locally-valid signature.
+          IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+              | awk -F'"' 'NF > 1 { print $2; exit }')"
+          fi
+          : "${IDENTITY:=-}"
+          echo "Signing identity: ${IDENTITY}"
+          scripts/sign-vz.sh "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" "$IDENTITY"
       - name: Generate shell completions
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -983,6 +1005,22 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
+      - name: Sign with VZ entitlement
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # Same as the arm64 job: carry com.apple.security.virtualization so
+          # the released binary can boot VZ guests after install. codesign on
+          # an arm64 Mac signs an x86_64 slice fine.
+          IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+              | awk -F'"' 'NF > 1 { print $2; exit }')"
+          fi
+          : "${IDENTITY:=-}"
+          echo "Signing identity: ${IDENTITY}"
+          scripts/sign-vz.sh "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/zlayer" "$IDENTITY"
       - name: Download shell completions
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/download-artifact@main

@@ -2089,9 +2089,11 @@ pub(crate) struct RunArgs {
     /// Image to run (e.g. `rust:1.91`, `nginx:latest`).
     pub image: String,
 
-    /// Command (and args) to run in the container. Use `--` to separate
-    /// from zlayer flags, e.g. `zlayer run rust:1.91 -- cargo build`.
-    #[arg(trailing_var_arg = true, num_args = 0..)]
+    /// Command (and args) to run in the container. Everything after the
+    /// image is passed to the container verbatim — including flag-like
+    /// tokens (`zlayer run alpine ls -la /` works without `--`), matching
+    /// `docker run` semantics. A `--` separator still works.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub command: Vec<String>,
 
     // ---- ZLayer secret-environment selectors ----

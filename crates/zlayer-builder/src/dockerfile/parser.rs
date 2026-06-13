@@ -129,6 +129,74 @@ impl Stage {
     }
 }
 
+/// Expand Docker build-arg references in a `FROM` target string.
+///
+/// Supports the forms Docker accepts in `FROM` lines: `${VAR}`,
+/// `${VAR:-default}` (default when unset or empty), `${VAR:+alt}` (alt
+/// when set and non-empty), and bare `$VAR`. Unknown variables expand to
+/// the empty string, matching `docker build`.
+fn expand_from_args(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(&(_, '{')) => {
+                chars.next(); // consume '{'
+                let mut body = String::new();
+                let mut closed = false;
+                for (_, bc) in chars.by_ref() {
+                    if bc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    body.push(bc);
+                }
+                if !closed {
+                    // Unterminated `${...` — emit verbatim.
+                    out.push_str("${");
+                    out.push_str(&body);
+                    continue;
+                }
+                if let Some((name, default)) = body.split_once(":-") {
+                    match vars.get(name).filter(|v| !v.is_empty()) {
+                        Some(v) => out.push_str(v),
+                        None => out.push_str(default),
+                    }
+                } else if let Some((name, alt)) = body.split_once(":+") {
+                    if vars.get(name).is_some_and(|v| !v.is_empty()) {
+                        out.push_str(alt);
+                    }
+                } else {
+                    out.push_str(vars.get(&body).map_or("", String::as_str));
+                }
+            }
+            Some(&(_, next)) if next.is_ascii_alphabetic() || next == '_' => {
+                let mut name = String::new();
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str(vars.get(&name).map_or("", String::as_str));
+            }
+            // BuildKit escape: `$$` is a literal dollar sign.
+            Some(&(_, '$')) => {
+                chars.next();
+                out.push('$');
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 /// A parsed Dockerfile
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dockerfile {
@@ -140,6 +208,61 @@ pub struct Dockerfile {
 }
 
 impl Dockerfile {
+    /// Expand pre-FROM `ARG`s in every stage's `FROM` target.
+    ///
+    /// Docker semantics: only ARGs declared BEFORE the first `FROM`
+    /// participate in `FROM`-line expansion (`FROM ${BASE_IMAGE}` /
+    /// `FROM img:${TAG:-latest}`), with `--build-arg` values overriding
+    /// their defaults. The parser can't do this (it has no build args), so
+    /// targets containing `$` end up classified as [`DockerfileFromTarget::Stage`]
+    /// — and struct-consuming backends then fail with `Stage '${BASE_IMAGE}'
+    /// not found`. Call this with the effective build args before handing
+    /// the Dockerfile to a backend.
+    ///
+    /// Expanded targets are re-classified: `scratch`, a previously declared
+    /// stage name, an OCI image reference, or (still) a stage string. A
+    /// target that expands to an empty string is left untouched so the
+    /// eventual error names the unexpanded variable instead of a blank.
+    pub fn resolve_from_args(&mut self, build_args: &HashMap<String, String>) {
+        // Effective FROM-scope variables: declared global ARGs only,
+        // defaults overridden by matching build args (an undeclared build
+        // arg does NOT leak into FROM lines, per Docker).
+        let mut vars: HashMap<String, String> = HashMap::new();
+        for arg in &self.global_args {
+            let value = build_args
+                .get(&arg.name)
+                .cloned()
+                .or_else(|| arg.default.clone())
+                .unwrap_or_default();
+            vars.insert(arg.name.clone(), value);
+        }
+
+        let mut known_stage_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for stage in &mut self.stages {
+            if let DockerfileFromTarget::Stage(raw) = &stage.base_image {
+                if raw.contains('$') {
+                    let expanded = expand_from_args(raw, &vars);
+                    if !expanded.trim().is_empty() {
+                        let mut target = DockerfileFromTarget::parse(&expanded);
+                        // Same post-hoc stage promotion as `from_raw`: a bare
+                        // name that matches an earlier stage alias is a stage
+                        // reference even though it parses as an OCI ref.
+                        if matches!(target, DockerfileFromTarget::Image(_))
+                            && known_stage_names.contains(expanded.trim())
+                        {
+                            target = DockerfileFromTarget::Stage(expanded.trim().to_string());
+                        }
+                        stage.base_image = target;
+                    }
+                }
+            }
+            if let Some(name) = &stage.name {
+                known_stage_names.insert(name.clone());
+            }
+        }
+    }
+
     /// Parse a Dockerfile from a string
     ///
     /// # Errors
@@ -622,6 +745,95 @@ RUN /usr/local/bin/uv --version
         // The parser must NOT treat the external ref as a stage; only the
         // top-level `FROM alpine:3.18` should appear in the stage list.
         assert!(dockerfile.get_stage("ghcr.io/astral-sh/uv:0.5.0").is_none());
+    }
+
+    #[test]
+    fn expand_from_args_all_forms() {
+        let vars: HashMap<String, String> = [
+            ("BASE".to_string(), "ghcr.io/org/img".to_string()),
+            ("TAG".to_string(), "1.2".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            expand_from_args("${BASE}:${TAG}", &vars),
+            "ghcr.io/org/img:1.2"
+        );
+        assert_eq!(expand_from_args("$BASE", &vars), "ghcr.io/org/img");
+        assert_eq!(
+            expand_from_args("img:${MISSING:-latest}", &vars),
+            "img:latest"
+        );
+        assert_eq!(
+            expand_from_args("img:${EMPTY:-fallback}", &vars),
+            "img:fallback"
+        );
+        assert_eq!(expand_from_args("img:${TAG:+pinned}", &vars), "img:pinned");
+        assert_eq!(expand_from_args("img:${MISSING:+pinned}", &vars), "img:");
+        assert_eq!(expand_from_args("${MISSING}", &vars), "");
+        // BuildKit `$$` escape yields a literal dollar; a trailing `$`
+        // passes through.
+        assert_eq!(expand_from_args("a$$b", &vars), "a$b");
+        assert_eq!(expand_from_args("price$", &vars), "price$");
+    }
+
+    #[test]
+    fn resolve_from_args_expands_from_lines() {
+        let content = r"
+ARG BASE_IMAGE=ghcr.io/org/alpine:latest
+ARG BASE_TAG=latest
+FROM ${BASE_IMAGE} AS builder
+RUN echo hi
+FROM ghcr.io/org/alpine:${BASE_TAG}
+COPY --from=builder /x /x
+";
+        let mut dockerfile = Dockerfile::parse(content).unwrap();
+        // Pre-resolution both FROM targets are (mis)classified as stages.
+        assert!(dockerfile.stages[0].base_image.is_stage());
+        assert!(dockerfile.stages[1].base_image.is_stage());
+
+        let build_args: HashMap<String, String> = [("BASE_TAG".to_string(), "3.20".to_string())]
+            .into_iter()
+            .collect();
+        dockerfile.resolve_from_args(&build_args);
+
+        match &dockerfile.stages[0].base_image {
+            DockerfileFromTarget::Image(r) => {
+                assert_eq!(r.to_string(), "ghcr.io/org/alpine:latest");
+            }
+            other => panic!("stage 0 not resolved to an image: {other:?}"),
+        }
+        match &dockerfile.stages[1].base_image {
+            DockerfileFromTarget::Image(r) => {
+                // The build arg overrides the declared default.
+                assert_eq!(r.to_string(), "ghcr.io/org/alpine:3.20");
+            }
+            other => panic!("stage 1 not resolved to an image: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_args_keeps_stage_references() {
+        let content = r"
+ARG BASE=ghcr.io/org/alpine:latest
+FROM ${BASE} AS builder
+RUN echo hi
+FROM builder
+RUN echo again
+";
+        let mut dockerfile = Dockerfile::parse(content).unwrap();
+        dockerfile.resolve_from_args(&HashMap::new());
+        assert!(matches!(
+            &dockerfile.stages[0].base_image,
+            DockerfileFromTarget::Image(_)
+        ));
+        // `FROM builder` must stay a stage reference.
+        assert_eq!(
+            dockerfile.stages[1].base_image,
+            DockerfileFromTarget::Stage("builder".to_string())
+        );
     }
 
     #[test]

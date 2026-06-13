@@ -159,6 +159,14 @@ pub struct LayerUnpacker {
     rootfs_dir: PathBuf,
     /// Track deleted paths from whiteouts
     deleted_paths: HashSet<PathBuf>,
+    /// Hard links whose target didn't exist yet when their entry was
+    /// reached, retried after the rest of the layer has been extracted.
+    /// Layer tars are NOT guaranteed to place a hard link's target before
+    /// the link entry (buildah emits alphabetical ordering, so Fedora's
+    /// `etc/pki/ca-trust/extracted/openssl/... -> .../pem/...` link comes
+    /// FIRST) — failing immediately truncated the whole rootfs.
+    /// `(link_path, link_target)` pairs, both absolute under `rootfs_dir`.
+    pending_hardlinks: Vec<(PathBuf, PathBuf)>,
 }
 
 impl LayerUnpacker {
@@ -168,6 +176,7 @@ impl LayerUnpacker {
         Self {
             rootfs_dir,
             deleted_paths: HashSet::new(),
+            pending_hardlinks: Vec::new(),
         }
     }
 
@@ -344,6 +353,28 @@ impl LayerUnpacker {
             self.extract_entry(&mut entry, &full_path)?;
         }
 
+        self.resolve_pending_hardlinks()
+    }
+
+    /// Retry hard links whose target hadn't been extracted yet when their
+    /// entry was reached. A target that STILL doesn't exist after the whole
+    /// layer is on disk is a hard error — silently skipping is how a
+    /// truncated rootfs used to masquerade as a successful unpack.
+    fn resolve_pending_hardlinks(&mut self) -> Result<()> {
+        for (link_path, target_full) in std::mem::take(&mut self.pending_hardlinks) {
+            fs::hard_link(&target_full, &link_path).map_err(|e| {
+                RegistryError::Cache(CacheError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to create deferred hard link {} -> {} \
+                         (target absent after full layer extraction): {}",
+                        link_path.display(),
+                        target_full.display(),
+                        e
+                    ),
+                )))
+            })?;
+        }
         Ok(())
     }
 
@@ -466,7 +497,7 @@ impl LayerUnpacker {
 
     /// Extract a single tar entry to the filesystem
     fn extract_entry<R: Read>(
-        &self,
+        &mut self,
         entry: &mut tar::Entry<'_, R>,
         full_path: &Path,
     ) -> Result<()> {
@@ -529,17 +560,25 @@ impl LayerUnpacker {
                     let target_full = self.rootfs_dir.join(&*target);
                     // Remove existing file if present
                     let _ = fs::remove_file(full_path);
-                    fs::hard_link(&target_full, full_path).map_err(|e| {
-                        RegistryError::Cache(CacheError::Io(std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "failed to create hard link {} -> {}: {}",
-                                full_path.display(),
-                                target_full.display(),
-                                e
-                            ),
-                        )))
-                    })?;
+                    if target_full.exists() {
+                        fs::hard_link(&target_full, full_path).map_err(|e| {
+                            RegistryError::Cache(CacheError::Io(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "failed to create hard link {} -> {}: {}",
+                                    full_path.display(),
+                                    target_full.display(),
+                                    e
+                                ),
+                            )))
+                        })?;
+                    } else {
+                        // Forward reference: the link's target appears later
+                        // in this layer (tar entry order is not guaranteed).
+                        // Defer and retry once the whole layer is extracted.
+                        self.pending_hardlinks
+                            .push((full_path.to_path_buf(), target_full));
+                    }
                 }
             }
             tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
@@ -669,6 +708,95 @@ mod tests {
 
         // Compress with zstd
         zstd::encode_all(std::io::Cursor::new(tar_data), 3).unwrap()
+    }
+
+    /// A hard-link entry whose TARGET appears later in the same layer tar
+    /// (buildah emits alphabetical entry order, so Fedora's ca-trust tree
+    /// links `extracted/openssl/... -> extracted/pem/...` forward). The
+    /// unpacker must defer the link, not die — an immediate failure used to
+    /// truncate the whole VZ rootfs at that point.
+    #[tokio::test]
+    async fn test_unpack_forward_referencing_hardlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        // 1. The LINK entry first (forward reference).
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Link);
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        builder
+            .append_link(&mut link_header, "dir/a-link.txt", "dir/z-target.txt")
+            .unwrap();
+        // 2. The target file afterwards.
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_path("dir/z-target.txt").unwrap();
+        file_header.set_size(12);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        builder.append(&file_header, &b"link content"[..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let layer = encoder.finish().unwrap();
+
+        let mut unpacker = LayerUnpacker::new(rootfs.clone());
+        unpacker
+            .unpack_layer(&layer, media_types::TAR_GZIP)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(rootfs.join("dir/z-target.txt")).unwrap(),
+            "link content"
+        );
+        assert_eq!(
+            fs::read_to_string(rootfs.join("dir/a-link.txt")).unwrap(),
+            "link content",
+            "forward-referencing hard link must resolve after the layer"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(rootfs.join("dir/a-link.txt")).unwrap().ino(),
+                fs::metadata(rootfs.join("dir/z-target.txt")).unwrap().ino(),
+                "must be a hard link, not a copy"
+            );
+        }
+    }
+
+    /// A hard link whose target never appears must be a LOUD error — the
+    /// silent-skip behavior is what let truncated rootfs unpacks masquerade
+    /// as success.
+    #[tokio::test]
+    async fn test_unpack_dangling_hardlink_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Link);
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        builder
+            .append_link(&mut link_header, "orphan-link.txt", "never-exists.txt")
+            .unwrap();
+        let tar_data = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let layer = encoder.finish().unwrap();
+
+        let mut unpacker = LayerUnpacker::new(rootfs.clone());
+        let err = unpacker
+            .unpack_layer(&layer, media_types::TAR_GZIP)
+            .await
+            .expect_err("dangling hard link must fail the unpack");
+        assert!(
+            err.to_string().contains("deferred hard link"),
+            "error should name the deferred-link failure: {err}"
+        );
     }
 
     #[tokio::test]

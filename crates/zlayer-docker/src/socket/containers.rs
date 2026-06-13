@@ -332,7 +332,12 @@ struct ListContainersQuery {
     size: Option<String>,
 }
 
-/// Parse Docker's `filters` query parameter, a JSON-encoded map of
+/// Parse Docker's `filters` query parameter.
+///
+/// Docker accepts BOTH wire shapes: the modern array form
+/// `{"key": ["v1", "v2"]}` and the legacy map form
+/// `{"key": {"v1": true, "v2": true}}` — bollard (Komodo periphery) still
+/// emits the legacy form for label filters. Both normalise to
 /// `key → Vec<String>`.
 ///
 /// Returns `None` if the parameter is absent, empty, or fails to
@@ -343,17 +348,53 @@ fn parse_filters(raw: Option<&str>) -> Option<HashMap<String, Vec<String>>> {
     if raw.is_empty() {
         return None;
     }
-    match serde_json::from_str::<HashMap<String, Vec<String>>>(raw) {
-        Ok(map) => Some(map),
+    let value = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(other) => {
+            tracing::warn!(
+                raw = %raw,
+                kind = %match other {
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::String(_) => "string",
+                    _ => "non-object",
+                },
+                "docker /containers/json: ignoring non-object filters query parameter"
+            );
+            return None;
+        }
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 raw = %raw,
                 "docker /containers/json: ignoring unparseable filters query parameter"
             );
-            None
+            return None;
         }
+    };
+
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, v) in value {
+        let values: Vec<String> = match v {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect(),
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .filter_map(|(k, val)| (val.as_bool() == Some(true)).then_some(k))
+                .collect(),
+            other => {
+                tracing::warn!(
+                    key = %key,
+                    value = %other,
+                    "docker /containers/json: ignoring filter with unsupported value shape"
+                );
+                continue;
+            }
+        };
+        out.insert(key, values);
     }
+    Some(out)
 }
 
 /// Apply Docker's `filters` semantics to a single [`ContainerSummary`].
@@ -1221,6 +1262,12 @@ async fn inspect_container(State(state): State<SocketState>, Path(id): Path<Stri
             "AttachStdin": false,
             "AttachStdout": false,
             "AttachStderr": false,
+            // Truthful, not a stub: zlayer never allocates a PTY for a
+            // container's main process, so every container is Tty=false.
+            // Load-bearing for log demux — `docker logs` (and any client
+            // that inspects before reading logs) demultiplexes the stdcopy
+            // frames iff Config.Tty is false, and `/containers/{id}/logs`
+            // always emits framed bytes.
             "Tty": false,
             "OpenStdin": false,
             "StdinOnce": false,
@@ -1327,12 +1374,16 @@ impl LogsParams {
 /// Forwards the daemon's logs stream verbatim using Docker's framed
 /// multiplexed wire format (the daemon honours `format=raw`, which emits
 /// the 8-byte stdcopy header per chunk). The response uses
-/// `Content-Type: application/vnd.docker.raw-stream`, which Docker CLI
-/// and bollard-style clients recognise as the multiplexed stdcopy
-/// envelope. We always emit raw-stream framing regardless of the
-/// container's `Tty` setting — Docker's TTY-only `vnd.docker.multiplexed-stream`
-/// content type is reserved for a future improvement; `raw-stream` is
-/// the safer default because every Docker SDK can decode it.
+/// `Content-Type: application/vnd.docker.multiplexed-stream` — the label
+/// dockerd (API ≥ 1.42) puts on stdcopy-framed bodies. Clients that pick
+/// their decoder off the Content-Type (bollard, the Docker SDKs) demux on
+/// this label; advertising `raw-stream` while sending framed bytes makes
+/// them emit the 8-byte headers as text (a leading `\x01` per chunk —
+/// exactly what broke Komodo's log parsing). `ZLayer` never allocates a
+/// PTY for a container's main process, so the body is unconditionally
+/// framed and `multiplexed-stream` is always the truthful label; the
+/// TTY/raw-stream case cannot arise (inspect reports `Tty: false` for
+/// every container, see the inspect builder above).
 async fn container_logs(
     State(state): State<SocketState>,
     Path(id): Path<String>,
@@ -1381,7 +1432,7 @@ async fn container_logs(
     if let Some(headers) = response.headers_mut() {
         headers.insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.docker.raw-stream"),
+            HeaderValue::from_static("application/vnd.docker.multiplexed-stream"),
         );
         headers.insert(
             header::CACHE_CONTROL,
@@ -3954,8 +4005,27 @@ mod tests {
         // Must not panic; just return None.
         assert!(parse_filters(Some("not json")).is_none());
         assert!(parse_filters(Some("{")).is_none());
-        // Wrong shape (values must be arrays of strings).
-        assert!(parse_filters(Some(r#"{"label":"env=prod"}"#)).is_none());
+        // A key with an unsupported value shape is dropped, not fatal.
+        let parsed = parse_filters(Some(r#"{"label":"env=prod"}"#)).expect("object parses");
+        assert!(!parsed.contains_key("label"));
+    }
+
+    /// bollard (Komodo periphery) still emits Docker's LEGACY filters
+    /// shape — `{"key": {"value": true}}` — which dockerd accepts
+    /// alongside the modern array form.
+    #[test]
+    fn parse_filters_accepts_legacy_map_shape() {
+        let raw =
+            r#"{"label":{"com.docker.compose.project":true,"dropped":false},"status":["running"]}"#;
+        let parsed = parse_filters(Some(raw)).expect("parses");
+        assert_eq!(
+            parsed.get("label").map(Vec::as_slice),
+            Some(["com.docker.compose.project".to_owned()].as_slice())
+        );
+        assert_eq!(
+            parsed.get("status").map(Vec::as_slice),
+            Some(["running".to_owned()].as_slice())
+        );
     }
 
     #[test]

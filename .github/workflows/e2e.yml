@@ -23,6 +23,7 @@ on:
           - youki
           - wasm
           - docker
+          - komodo
           - manager-unit
           - manager-intellitester
           - manager-intellitester:login.test.yaml
@@ -179,6 +180,65 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
+
+  # ===========================================
+  # E2E Tests (Komodo <-> docker shim)
+  #
+  # Boots Komodo (mongo + core + periphery) with periphery's DOCKER_HOST
+  # pointed at zlayer's Docker-compat socket and drives the Komodo API:
+  # server handshake, container listing, a deploy, and log fetch. Runs
+  # directly on the runner (no job container), so the shim socket dir is
+  # an ordinary host path the periphery container bind-mounts.
+  # ===========================================
+  komodo-e2e-tests:
+    name: E2E Tests (Komodo)
+    runs-on: ubuntu-latest
+    if: inputs.test == '' || inputs.test == 'komodo'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-komodo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      # Auth for BOTH consumers: the docker CLI (pulls of the komodo/mongo
+      # images) and zlayer's AuthResolver (the daemon pulls the GHCR
+      # mirrored nginx test image while its package visibility may still
+      # be internal). Root's config too — the test runs under sudo.
+      - name: Seed registry credentials
+        run: |
+          GHCR_AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w0)
+          for home in "$HOME" /root; do
+            sudo mkdir -p "$home/.docker"
+            printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$GHCR_AUTH" | sudo tee "$home/.docker/config.json" >/dev/null
+          done
+
+      - name: Build zlayer
+        run: cargo build --package zlayer
+
+      - name: Run Komodo E2E test
+        # sudo: the zlayer daemon spawned by the test runs real containers.
+        run: sudo -E "$(command -v cargo)" test --package zlayer-docker --test komodo_e2e -- --ignored --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: info
+          ZLAYER_BIN: target/debug/zlayer
 
   # ===========================================
   # E2E Tests (Manager UI)

@@ -1072,9 +1072,24 @@ fn sanitize_image_name(image: &str) -> String {
 /// created the directory and then failed (or was interrupted) before extracting
 /// any layers; treating it as "present" would let an `IfNotPresent` pull
 /// short-circuit forever and would share an empty filesystem into the guest
-/// (no `/bin/sh`). So "present" requires non-empty.
+/// (no `/bin/sh`). So "present" requires non-empty AND the completion marker
+/// written after a fully successful unpack — "non-empty" alone let a rootfs
+/// truncated mid-extraction (observed: 1.3 MB of a 227 MB buildd image, no
+/// `usr/`, container crash-looping on a missing entrypoint) be cached and
+/// reused forever. A marker-less rootfs re-pulls; the layers are normally
+/// still in the local blob cache, so the heal is a re-extract, not a
+/// re-download.
 fn rootfs_is_populated(rootfs_dir: &std::path::Path) -> bool {
-    std::fs::read_dir(rootfs_dir).is_ok_and(|mut entries| entries.next().is_some())
+    let non_empty = std::fs::read_dir(rootfs_dir).is_ok_and(|mut entries| entries.next().is_some());
+    non_empty && rootfs_complete_marker(rootfs_dir).is_some_and(|m| m.exists())
+}
+
+/// Path of the unpack-completion marker for a given `…/<image>/rootfs` dir:
+/// `…/<image>/rootfs.complete` (sibling, so it never ships into the guest).
+/// `None` only for a rootless path (no parent), which never occurs for real
+/// image dirs.
+fn rootfs_complete_marker(rootfs_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    rootfs_dir.parent().map(|p| p.join("rootfs.complete"))
 }
 
 /// Decide whether the VZ-Linux kernel bundle must be (re-)extracted into the
@@ -2381,13 +2396,38 @@ impl Runtime for VzLinuxRuntime {
         );
 
         let mut unpacker = zlayer_registry::LayerUnpacker::new(rootfs_dir.clone());
-        unpacker
-            .unpack_layers(&layers)
-            .await
-            .map_err(|e| AgentError::PullFailed {
+        if let Err(e) = unpacker.unpack_layers(&layers).await {
+            // LOUD failure + no poisoned cache: a partial rootfs left on disk
+            // used to satisfy the populated-rootfs probe forever, so every
+            // later create shared a truncated filesystem into the guest.
+            tracing::error!(
+                image = %image,
+                rootfs = %rootfs_dir.display(),
+                error = %e,
+                "vz-linux: rootfs extraction failed; removing partial rootfs"
+            );
+            let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
+            if let Some(marker) = rootfs_complete_marker(&rootfs_dir) {
+                let _ = tokio::fs::remove_file(&marker).await;
+            }
+            return Err(AgentError::PullFailed {
                 image: image.to_string(),
                 reason: format!("extract rootfs: {e}"),
-            })?;
+            });
+        }
+
+        // Marker AFTER a fully-successful unpack; its absence is what makes
+        // `rootfs_is_populated` reject interrupted/truncated extractions.
+        if let Some(marker) = rootfs_complete_marker(&rootfs_dir) {
+            if let Err(e) = tokio::fs::write(&marker, b"").await {
+                tracing::warn!(
+                    marker = %marker.display(),
+                    error = %e,
+                    "vz-linux: could not write rootfs completion marker; \
+                     the image will re-extract on next use"
+                );
+            }
+        }
 
         self.image_rootfs
             .write()
@@ -3857,15 +3897,24 @@ mod tests {
     fn rootfs_is_populated_distinguishes_empty_from_nonempty() {
         let tmp =
             std::env::temp_dir().join(format!("zlayer-vzlinux-rootfs-test-{}", std::process::id()));
-        let empty = tmp.join("empty");
-        let full = tmp.join("full");
+        // Image-dir layout: <image>/rootfs + sibling <image>/rootfs.complete.
+        let empty = tmp.join("img-empty").join("rootfs");
+        let full = tmp.join("img-full").join("rootfs");
+        let truncated = tmp.join("img-truncated").join("rootfs");
         std::fs::create_dir_all(&empty).unwrap();
         std::fs::create_dir_all(full.join("bin")).unwrap();
         std::fs::write(full.join("bin").join("sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(rootfs_complete_marker(&full).unwrap(), b"").unwrap();
+        // Non-empty but NO completion marker: the truncated-unpack residue
+        // that used to be cached and reused forever.
+        std::fs::create_dir_all(truncated.join("etc")).unwrap();
+        std::fs::write(truncated.join("etc").join("hostname"), b"x\n").unwrap();
 
-        // Missing dir, empty dir -> not populated; non-empty dir -> populated.
+        // Missing dir, empty dir, marker-less dir -> not populated;
+        // non-empty dir WITH marker -> populated.
         assert!(!rootfs_is_populated(&tmp.join("does-not-exist")));
         assert!(!rootfs_is_populated(&empty));
+        assert!(!rootfs_is_populated(&truncated));
         assert!(rootfs_is_populated(&full));
 
         let _ = std::fs::remove_dir_all(&tmp);
